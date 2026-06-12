@@ -4503,8 +4503,20 @@ impl StudioVfs {
         }
 
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
+        let has_local_overlay = self.inode_has_local_overlay(ino);
+        let has_live_extents = !self.live_extent_records_for_inode(ino).is_empty();
+        let has_pending_epoch_finalization = self
+            .state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .iter()
+            .any(|pending| pending.0 == ino);
         if Self::is_fully_published_regular_file(attr)
             && !has_pending_uploads
+            && !has_local_overlay
+            && !has_live_extents
+            && !has_pending_epoch_finalization
             && !self.has_pending_local_dirty_payloads_for_inode(ino)
             && !self.state.writer_stack.has_dirty_writers(ino)
             && !self.state.deferred_materialize_inflight.contains(ino)
@@ -4524,8 +4536,6 @@ impl StudioVfs {
                 .insert(ino, next_state.clone());
             return next_state;
         }
-
-        let has_local_overlay = self.inode_has_local_overlay(ino);
 
         let mut states = self.state.incarnation.inode_incarnations.lock();
         let previous = states

@@ -510,18 +510,16 @@ impl StudioVfs {
 
         let upload_ops: Vec<_> = retained
             .iter()
-            .map(
-                |(object_id, (offset, object_file_offset, payload_end, _))| {
-                    (
-                        ino,
-                        *offset,
-                        *object_file_offset,
-                        *object_id,
-                        content_epoch,
-                        payload_end.saturating_sub(*object_file_offset),
-                    )
-                },
-            )
+            .map(|(object_id, (_, object_file_offset, payload_end, _))| {
+                (
+                    ino,
+                    *object_file_offset,
+                    *object_file_offset,
+                    *object_id,
+                    content_epoch,
+                    payload_end.saturating_sub(*object_file_offset),
+                )
+            })
             .collect();
         let live_extents: Vec<_> = retained
             .into_iter()

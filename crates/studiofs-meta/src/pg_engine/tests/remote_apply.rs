@@ -4811,6 +4811,101 @@ fn sparse_ready_foreign_publish_preserves_disjoint_base_ranges_when_not_complete
 }
 
 #[test]
+fn protected_sparse_ready_publish_with_holes_preserves_newer_disjoint_payload() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"sparse-ready-hole-protected.txt", 0, 0, 0o644)
+        .expect("create file");
+    let logical_size = u64::from(DEFAULT_CHUNK_SIZE) + 4096;
+    set_file_state(&pg, file.ino, logical_size, 5);
+
+    let newer_local_tail = PayloadRef::new_partial(77_155, 4096);
+    let tail_block = DEFAULT_CHUNK_SIZE / DEFAULT_BLOCK_SIZE;
+    pg.stage_payload_slice(file.ino, tail_block, &newer_local_tail)
+        .expect("stage protected local tail");
+    mark_overlay_objects_uploaded(&pg, file.ino, 5, &[newer_local_tail.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 5)
+            .expect("publish local tail"),
+        "local protected tail publish should succeed"
+    );
+
+    let older_remote_middle = PayloadRef::new_partial(77_156, 4096);
+    let chunk_slices = vec![
+        (
+            ChunkId(0),
+            vec![
+                SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 4096).expect("remote payload range"),
+                    payload: Some(older_remote_middle.clone()),
+                    payload_state: PayloadRefState::Published,
+                },
+                SliceRecord {
+                    slice_id: SliceId(1),
+                    order: SliceOrder(1),
+                    range: SliceRange::new(4096, DEFAULT_CHUNK_SIZE).expect("remote hole range"),
+                    payload: None,
+                    payload_state: PayloadRefState::Published,
+                },
+            ],
+        ),
+        (
+            ChunkId(1),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, 4096).expect("remote eof hole range"),
+                payload: None,
+                payload_state: PayloadRefState::Published,
+            }],
+        ),
+    ];
+    let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices,
+    };
+    let mut remote_attr = pg.get_attr(file.ino).expect("load attr");
+    remote_attr.size = logical_size;
+    remote_attr.committed_size = logical_size;
+    remote_attr.content_epoch = 6;
+    remote_attr.committed_content_epoch = 6;
+    remote_attr.upload_state = UploadState::Ready;
+    let remote_batch = vec![
+        remote_publish,
+        MetaEvent::SetAttr {
+            attr: remote_attr.clone(),
+        },
+    ];
+    assert!(
+        RemoteApplyCoordinator::batch_publish_covers_committed_extent(
+            &remote_batch,
+            file.ino,
+            logical_size,
+        ),
+        "hole/tombstone slices reproduce the range-complete sparse publish"
+    );
+
+    apply_foreign_batch(
+        &pg,
+        &remote_batch,
+        &OverlayConflictSets::default(),
+        &HashSet::from([file.ino]),
+    )
+    .expect("apply protected sparse ready publish");
+
+    let object_ids =
+        lookup_object_ids(&pg, file.ino, logical_size).expect("lookup merged sparse graph");
+    assert_eq!(
+        object_ids,
+        vec![older_remote_middle.object_id, newer_local_tail.object_id],
+        "range-complete sparse publish with holes must not erase protected disjoint payload ranges"
+    );
+}
+
+#[test]
 fn sparse_ready_self_batch_preserves_imported_disjoint_base_ranges_when_not_complete() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

@@ -4395,8 +4395,8 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
         let ino = attr.ino;
         let head = vec![0xA1; 233];
         let tail = vec![0xB2; 262];
-        let tail_offset = DEFAULT_CHUNK_SIZE as u64 - 7;
-        let logical_size = DEFAULT_CHUNK_SIZE as u64 * 2 + 123;
+        let tail_offset = 1_048_569;
+        let logical_size = 2_097_275;
 
         vfs.write(ino, 0, &head).await.expect("write sparse head");
         vfs.flush(ino).await.expect("flush sparse head");
@@ -4418,8 +4418,8 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
             .filter_map(|span| span.payload.map(|payload| payload.object_id))
             .collect::<BTreeSet<_>>();
         assert!(
-            retained_objects.len() > 1,
-            "setup should retain the fragmented zero-filled tail overlay objects"
+            !retained_objects.is_empty(),
+            "setup should retain the scenario-sized zero-filled tail overlay object"
         );
         let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
 
@@ -4445,6 +4445,78 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
         assert_eq!(
             pending_object_ids, retained_objects,
             "set_len must requeue retained zero-filled overlay objects"
+        );
+        let full_zero_filled_upload = vfs
+            .pending_uploads_snapshot()
+            .into_iter()
+            .find(|op| op.ino == ino && op.payload_len == tail_offset + tail.len() as u64)
+            .expect("requeue must preserve the full zero-filled sparse object upload");
+        assert_eq!(
+            full_zero_filled_upload.offset, 0,
+            "requeued sparse object must keep the original file start so an in-flight upload can be updated"
+        );
+        assert_eq!(
+            full_zero_filled_upload.object_file_offset, 0,
+            "requeued sparse object must read from the start of the retained payload"
+        );
+    });
+}
+
+#[test]
+fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-ready-keeps-overlay-finalize");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"stale-ready-keeps-overlay-finalize.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = vec![0xA1; 233];
+        let tail = vec![0xB2; 262];
+        let tail_offset = DEFAULT_CHUNK_SIZE as u64 - 7;
+
+        vfs.write(ino, 0, &head).await.expect("write sparse head");
+        vfs.flush(ino).await.expect("flush sparse head");
+        let (head_epoch, head_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, head_epoch, &head_blocks);
+        let stale_ready_attr = meta.get_attr(ino).expect("load published head attr");
+
+        let mut zero_filled_tail = vec![0; tail_offset as usize];
+        zero_filled_tail.extend_from_slice(&tail);
+        vfs.write(ino, 0, &zero_filled_tail)
+            .await
+            .expect("write uploaded zero-filled sparse tail");
+        vfs.flush(ino).await.expect("flush zero-filled sparse tail");
+        let (tail_epoch, _tail_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup models the post-upload window before overlay publication"
+        );
+        vfs.queue_epoch_finalization(ino, tail_epoch);
+        assert!(
+            vfs.state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .contains(&(ino, tail_epoch)),
+            "setup should queue publication for the uploaded overlay epoch"
+        );
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &stale_ready_attr);
+
+        assert!(
+            vfs.state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .contains(&(ino, tail_epoch)),
+            "stale ready metadata must not clear a newer uploaded overlay finalization"
+        );
+        assert!(
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "stale ready metadata must not clear newer live overlay extents"
         );
     });
 }

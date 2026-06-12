@@ -737,6 +737,54 @@ impl<'a> RemoteApplyCoordinator<'a> {
         false
     }
 
+    fn batch_publish_payload_covers_committed_extent(
+        batch_events: &[MetaEvent],
+        target_ino: Ino,
+        committed_size: u64,
+    ) -> bool {
+        if committed_size == 0 {
+            return false;
+        }
+
+        let mut ranges = Vec::new();
+        for event in batch_events {
+            let MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } = event else {
+                continue;
+            };
+            if *ino != target_ino {
+                continue;
+            }
+            for (chunk_id, slices) in chunk_slices {
+                let chunk_start = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
+                for slice in slices {
+                    if slice.payload.is_none() {
+                        continue;
+                    }
+                    let start = chunk_start.saturating_add(u64::from(slice.range.start));
+                    let end = chunk_start
+                        .saturating_add(u64::from(slice.range.end))
+                        .min(committed_size);
+                    if start < end {
+                        ranges.push((start, end));
+                    }
+                }
+            }
+        }
+
+        ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+        let mut covered_until = 0;
+        for (start, end) in ranges {
+            if start > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(end);
+            if covered_until >= committed_size {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(super) fn preserve_published_content_state_for_attr_only_events(
         &self,
         batch_events: &[MetaEvent],
@@ -860,8 +908,19 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 attr.ino,
                 attr.committed_size,
             );
-            if attr.committed_size > current.committed_size
-                || attr.content_epoch > current.content_epoch
+            let remote_payload_covers_complete_graph =
+                Self::batch_publish_payload_covers_committed_extent(
+                    batch_events,
+                    attr.ino,
+                    attr.committed_size,
+                );
+            let remote_should_replace_protected_graph = attr.committed_size
+                < current.committed_size
+                || (remote_carries_complete_graph
+                    && remote_payload_covers_complete_graph
+                    && (attr.committed_size > current.committed_size
+                        || attr.content_epoch > current.content_epoch));
+            if remote_should_replace_protected_graph
                 || (attr.content_epoch == current.content_epoch
                     && (attr.mtime >= current.mtime || remote_carries_complete_graph))
             {
