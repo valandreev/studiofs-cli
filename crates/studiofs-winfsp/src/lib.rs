@@ -444,10 +444,10 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. Tests or
-    // targeted multi-client invalidation runs can bound this with
-    // STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS.
-    // Write-capable handles still opt out of the OS file cache at Create/Open time.
+    // Keep WinFSP metadata timeouts configurable while regular file data handles
+    // opt out of the OS file cache at Create/Open time. The VFS owns payload
+    // caching and cross-client metadata invalidation; WinFSP file data caching
+    // can otherwise retain same-size remote overwrites after notifications.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }

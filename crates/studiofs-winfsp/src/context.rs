@@ -242,7 +242,7 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
 }
 
 fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
-    !is_dir && open_flags_allow_write(open_flags)
+    !is_dir && (open_flags == OpenFlags::RDONLY || open_flags_allow_write(open_flags))
 }
 
 fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
@@ -2006,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn read_handles_with_metadata_access_keep_winfsp_file_cache() {
+    fn regular_file_read_handles_disable_winfsp_file_cache() {
         let read_metadata_access = FILE_READ_DATA_ACCESS
             | FILE_READ_ATTRIBUTES_ACCESS
             | FILE_WRITE_ATTRIBUTES_ACCESS
@@ -2016,12 +2016,16 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(!should_disable_winfsp_file_cache(false, flags));
+        assert!(should_disable_winfsp_file_cache(false, flags));
+        assert!(
+            !should_disable_winfsp_file_cache(true, flags),
+            "directory handles should keep WinFSP metadata/cache behavior"
+        );
     }
 
     #[test]
     fn write_capable_file_handles_disable_winfsp_file_cache() {
-        assert!(!should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
+        assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::WRONLY));
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));

@@ -265,6 +265,12 @@ uses `inval_inode(ino, 0, -1)` when cached pages are unsafe, while same-mount
 publication of already accepted local bytes uses attribute-only invalidation so
 macOS does not evict freshly written UBC pages after upload completion.
 
+On Windows, regular-file WinFSP handles set `DisableCache` for both read-only
+and write-capable opens. StudioFS owns payload caching in the VFS/local cache
+layer, and metadata notifications are not a strong data-page invalidation
+primitive for same-size remote overwrites. Directory handles keep WinFSP's
+metadata/cache-manager behavior so namespace enumeration remains efficient.
+
 `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` preserves the older strict rollback
 mode: mount options include `direct_io`, `nolocalcaches`, and `auto_cache`, and
 all opens use direct I/O.
