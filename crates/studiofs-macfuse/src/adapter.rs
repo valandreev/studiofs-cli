@@ -1042,38 +1042,6 @@ impl StudioVfsAdapter {
         self.write_capable_state.active_count(ino) > 0
     }
 
-    fn safe_open_cache_snapshot(
-        &self,
-        ino: u64,
-    ) -> Option<(MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind)> {
-        let Ok(attr) = self.vfs.getattr(ino) else {
-            return None;
-        };
-        if attr.kind != FileType::RegularFile {
-            return None;
-        }
-        if self.vfs.inode_has_local_dirty_state(ino) {
-            return None;
-        }
-        if self.has_active_write_capable_handles(ino) {
-            return None;
-        }
-        let graph = match self.open_cache_graph_signature(ino, attr.size) {
-            Ok(graph) => graph,
-            Err(error) => {
-                debug!(
-                    ino,
-                    ?error,
-                    "macFUSE open cache could not read file graph signature"
-                );
-                return None;
-            }
-        };
-        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
-        let kind = snapshot.kind;
-        Some((snapshot, kind))
-    }
-
     fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
         let Ok(attr) = self.vfs.getattr(ino) else {
             self.clear_open_cache_snapshot(ino, "unknown_state");
@@ -1167,42 +1135,6 @@ impl StudioVfsAdapter {
         };
         self.vfs.record_macfuse_open_cache_decision(decision);
         false
-    }
-
-    fn seed_open_cache_snapshot_after_clean_release(&self, ino: u64) {
-        let Some((snapshot, kind)) = self.safe_open_cache_snapshot(ino) else {
-            self.clear_open_cache_snapshot(ino, "clean_release_not_cacheable");
-            return;
-        };
-        let content_epoch = snapshot.content_epoch;
-        let size = snapshot.size;
-        let mut snapshots = self.open_cache_snapshots.lock();
-        if self.has_active_write_capable_handles(ino) {
-            snapshots.pop(&ino);
-            debug!(
-                ino,
-                reason = "active_write_capable",
-                "macFUSE kernel cache snapshot invalidated"
-            );
-            return;
-        }
-        snapshots.put(ino, snapshot);
-        let decision = match kind {
-            MacFuseOpenCacheSnapshotKind::RemoteReady => {
-                VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded
-            }
-            MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
-                VfsMacFuseOpenCacheDecision::LocalStableWriteReleaseSeeded
-            }
-        };
-        self.vfs.record_macfuse_open_cache_decision(decision);
-        debug!(
-            ino,
-            content_epoch,
-            size,
-            reason = "clean_write_release",
-            "macFUSE open cache snapshot seeded after clean write release"
-        );
     }
 
     fn open_cache_graph_signature(
@@ -1761,7 +1693,7 @@ impl StudioVfsAdapter {
         self.read_windows.invalidate_handle(file_handle);
         result?;
         if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
-            self.seed_open_cache_snapshot_after_clean_release(released.ino);
+            self.clear_open_cache_snapshot(released.ino, "clean_write_release");
         }
         Ok(())
     }
@@ -2263,8 +2195,10 @@ fn current_gid() -> u32 {
 mod open_cache_snapshot_tests {
     use super::{
         MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
+        StudioVfsAdapter,
     };
     use studiofs_meta::{InodeAttr, UploadState};
+    use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
 
     #[test]
     fn open_cache_snapshot_identity_includes_publication_state() {
@@ -2298,6 +2232,32 @@ mod open_cache_snapshot_tests {
         assert_ne!(
             local_stable, remote_ready,
             "publication transitions with unchanged graph must still drop kernel pages once"
+        );
+    }
+
+    #[test]
+    fn write_release_leaves_next_read_open_to_drop_kernel_cache() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-write-release")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"cache-after-write.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let opened = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open write-capable file");
+        let fh = opened.file_handle();
+        adapter
+            .write(attr.ino, fh, 0, b"fresh sparse payload")
+            .expect("write payload");
+        adapter.flush(attr.ino, fh).expect("flush payload");
+        adapter.release(attr.ino, fh).expect("release writer");
+
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "the first read-only open after a write must drop kernel pages before cache can be kept"
         );
     }
 }
