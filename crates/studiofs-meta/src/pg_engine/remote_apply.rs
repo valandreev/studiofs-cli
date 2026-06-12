@@ -514,7 +514,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         publish_inodes
             .into_iter()
             .filter(|ino| match ready_sizes.get(ino) {
-                Some(committed_size) => !Self::batch_publish_covers_committed_extent(
+                Some(committed_size) => !Self::batch_publish_payload_covers_committed_extent(
                     batch_events,
                     *ino,
                     *committed_size,

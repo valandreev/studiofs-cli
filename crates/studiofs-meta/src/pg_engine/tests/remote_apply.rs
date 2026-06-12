@@ -4969,6 +4969,105 @@ fn sparse_ready_self_batch_preserves_imported_disjoint_base_ranges_when_not_comp
 }
 
 #[test]
+fn sparse_ready_self_batch_with_holes_preserves_disjoint_payload_ranges() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"sparse-ready-self-hole-merge.txt", 0, 0, 0o644)
+        .expect("create file");
+    let logical_size = u64::from(DEFAULT_CHUNK_SIZE) + 4096;
+    set_file_state(&pg, file.ino, logical_size, 5);
+
+    let existing_tail = PayloadRef::new_partial(77_159, 4096);
+    let tail_block = DEFAULT_CHUNK_SIZE / DEFAULT_BLOCK_SIZE;
+    pg.stage_payload_slice(file.ino, tail_block, &existing_tail)
+        .expect("stage existing tail");
+    mark_overlay_objects_uploaded(&pg, file.ino, 5, &[existing_tail.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 5)
+            .expect("publish existing tail"),
+        "existing sparse tail publish should succeed"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, logical_size).expect("lookup setup graph"),
+        vec![existing_tail.object_id],
+        "setup should have a disjoint tail before self replay"
+    );
+
+    let local_head = PayloadRef::new_partial(77_160, 4096);
+    let local_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![
+            (
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).expect("head payload range"),
+                        payload: Some(local_head.clone()),
+                        payload_state: PayloadRefState::Published,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(1),
+                        order: SliceOrder(1),
+                        range: SliceRange::new(4096, DEFAULT_CHUNK_SIZE).expect("first hole range"),
+                        payload: None,
+                        payload_state: PayloadRefState::Published,
+                    },
+                ],
+            ),
+            (
+                ChunkId(1),
+                vec![SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 4096).expect("eof hole range"),
+                    payload: None,
+                    payload_state: PayloadRefState::Published,
+                }],
+            ),
+        ],
+    };
+    let mut local_attr = pg.get_attr(file.ino).expect("load attr");
+    local_attr.size = logical_size;
+    local_attr.committed_size = logical_size;
+    local_attr.content_epoch = 6;
+    local_attr.committed_content_epoch = 6;
+    local_attr.upload_state = UploadState::Ready;
+    let self_batch = vec![
+        local_publish,
+        MetaEvent::SetAttr {
+            attr: local_attr.clone(),
+        },
+    ];
+    assert!(
+        RemoteApplyCoordinator::batch_publish_covers_committed_extent(
+            &self_batch,
+            file.ino,
+            logical_size,
+        ),
+        "hole/tombstone slices reproduce the range-complete sparse publish"
+    );
+    assert!(
+        RemoteApplyCoordinator::partial_regular_file_publish_inodes(&self_batch)
+            .contains(&file.ino),
+        "range-complete sparse self publish is still partial when payloads do not cover committed EOF"
+    );
+
+    apply_visible_self_batch(&pg, &self_batch)
+        .expect("apply visible self sparse publish with holes");
+
+    let object_ids =
+        lookup_object_ids(&pg, file.ino, logical_size).expect("lookup merged sparse graph");
+    assert_eq!(
+        object_ids,
+        vec![local_head.object_id, existing_tail.object_id],
+        "a sparse self publish with holes must not erase disjoint published payload ranges"
+    );
+}
+
+#[test]
 fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial() {
     let (_writer_dir, writer) = temp_pg_engine_for_unit();
     let (_remote_dir, remote) = temp_pg_engine_for_unit();
