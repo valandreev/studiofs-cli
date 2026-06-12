@@ -10888,6 +10888,56 @@ fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
 }
 
 #[test]
+fn release_fh_materializes_sparse_cross_chunk_tail_before_size_extend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-cross-chunk-tail-before-extend");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sparse-cross-chunk-tail-before-extend.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let head = vec![0xA1; 233];
+        let tail = vec![0xB2; 262];
+        let tail_offset = u64::from(studiofs_meta::schema::DEFAULT_CHUNK_SIZE).saturating_sub(7);
+        let logical_size = tail_offset + 262 + 1_048_444;
+
+        let head_fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(head_fh, ino, 0, &head).await.unwrap();
+        vfs.release_fh_with_outcome(head_fh).await.unwrap();
+
+        let tail_fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(tail_fh, ino, tail_offset, &tail)
+            .await
+            .unwrap();
+        vfs.release_fh_with_outcome(tail_fh).await.unwrap();
+
+        let truncate_fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.setattr_with_handle(Some(truncate_fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF after sparse tail release");
+        vfs.release_fh_with_outcome(truncate_fh).await.unwrap();
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, logical_size)
+            .expect("load sparse graph after separate write releases");
+        let tail_range_start = u32::try_from(tail_offset).expect("tail offset fits in range start");
+        let published_offsets = spans
+            .iter()
+            .filter(|span| span.payload.is_some())
+            .map(|span| span.range.start)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            published_offsets.contains(&0),
+            "prefix payload should remain in the sparse graph: {spans:?}"
+        );
+        assert!(
+            published_offsets.contains(&tail_range_start),
+            "cross-chunk sparse payload must be materialized before size-only extend: {spans:?}"
+        );
+    });
+}
+
+#[test]
 fn deferred_materialization_drains_idle_tail_before_close() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
