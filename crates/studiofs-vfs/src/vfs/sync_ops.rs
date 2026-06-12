@@ -244,14 +244,18 @@ impl StudioVfs {
             return;
         }
 
-        let Some((entry, guard)) = self.state.deferred_materialize_inflight.try_register(ino)
+        let Some((entry, guard)) = self
+            .state
+            .deferred_materialize_inflight
+            .try_register_or_update_occupied(ino, || {
+                if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+                    self.state
+                        .deferred_materialize_reschedule_needed
+                        .lock()
+                        .insert(ino);
+                }
+            })
         else {
-            if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
-                self.state
-                    .deferred_materialize_reschedule_needed
-                    .lock()
-                    .insert(ino);
-            }
             // #region debug log
             self.debug_write_probe(
                 "H2",
@@ -447,22 +451,20 @@ impl StudioVfs {
         allow_reschedule: bool,
     ) {
         let ino = entry.ino;
-        let reschedule_needed = self
+        let next_task = self
             .state
-            .deferred_materialize_reschedule_needed
-            .lock()
-            .remove(&ino);
-        let should_reschedule = allow_reschedule
-            && reschedule_needed
-            && !self.shutdown_requested()
-            && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0;
-        let next_task = if should_reschedule {
-            self.state
-                .deferred_materialize_inflight
-                .replace_if_current(&entry)
-        } else {
-            None
-        };
+            .deferred_materialize_inflight
+            .replace_if_current_or_remove(&entry, || {
+                let reschedule_needed = self
+                    .state
+                    .deferred_materialize_reschedule_needed
+                    .lock()
+                    .remove(&ino);
+                allow_reschedule
+                    && reschedule_needed
+                    && !self.shutdown_requested()
+                    && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0
+            });
         let Some((next_entry, next_guard)) = next_task else {
             return;
         };

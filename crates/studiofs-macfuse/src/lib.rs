@@ -1414,6 +1414,57 @@ mod tests {
     }
 
     #[test]
+    fn adapter_write_schedules_deferred_materialization_for_opportunistic_callback() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-write-deferred-materialize",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"deferred.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open writer through macFUSE adapter");
+        let payload = vec![0x5Au8; 5 * 1024 * 1024];
+
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, &payload)
+            .expect("write payload through macFUSE adapter");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let snapshot = vfs.write_path_observability_snapshot();
+            if snapshot.vfs_write_path.materialize_completed.calls > 0 {
+                break;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "macFUSE adapter write did not schedule background materialization; pending_uploads={:?}, local_dirty={}, snapshot={:?}",
+                vfs.pending_uploads_for_inode(attr.ino),
+                vfs.inode_has_local_dirty_state(attr.ino),
+                snapshot.vfs_write_path
+            );
+            fixture.runtime().block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+        }
+
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer");
+    }
+
+    #[test]
     fn adapter_flush_fsync_release_and_truncate_preserve_local_first_bytes() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-write-flush-fsync-release-truncate",

@@ -22,7 +22,8 @@ use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::ResolvedSliceSource;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{
-    KernelInvalidator, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot, VfsMacFuseOpenCacheDecision,
+    KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
+    VfsMacFuseOpenCacheDecision,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -1615,7 +1616,13 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let written = self
             .runtime_handle
-            .block_on(self.vfs.write_fh(file_handle, ino, offset, data))
+            .block_on(self.vfs.write_fh_with_deferred_materialize(
+                file_handle,
+                ino,
+                offset,
+                data,
+                LocalSyncPolicy::Opportunistic,
+            ))
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.read_windows.invalidate_inode(ino);
         Ok(written)

@@ -2614,15 +2614,30 @@ impl DeferredInodeGate {
         (task_lock, guard)
     }
 
+    #[cfg(test)]
     fn try_register(
         &self,
         ino: Ino,
     ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        self.try_register_or_update_occupied(ino, || {})
+    }
+
+    fn try_register_or_update_occupied<F>(
+        &self,
+        ino: Ino,
+        on_occupied: F,
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)>
+    where
+        F: FnOnce(),
+    {
         use std::collections::hash_map::Entry;
 
         let mut entries = self.entries.lock();
         match entries.entry(ino) {
-            Entry::Occupied(_) => None,
+            Entry::Occupied(_) => {
+                on_occupied();
+                None
+            }
             Entry::Vacant(entry) => {
                 let (task_lock, guard) = Self::create_task_lock();
                 entry.insert(Arc::clone(&task_lock));
@@ -2664,15 +2679,31 @@ impl DeferredInodeGate {
         self.entries.lock().contains_key(&ino)
     }
 
+    #[cfg(test)]
     fn replace_if_current(
         &self,
         current_entry: &DeferredInodeGateEntry,
     ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        self.replace_if_current_or_remove(current_entry, || true)
+    }
+
+    fn replace_if_current_or_remove<F>(
+        &self,
+        current_entry: &DeferredInodeGateEntry,
+        should_replace: F,
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)>
+    where
+        F: FnOnce() -> bool,
+    {
         use std::collections::hash_map::Entry;
 
         let mut entries = self.entries.lock();
         match entries.entry(current_entry.ino) {
             Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &current_entry.task_lock) => {
+                if !should_replace() {
+                    entry.remove();
+                    return None;
+                }
                 let (task_lock, guard) = Self::create_task_lock();
                 entry.insert(Arc::clone(&task_lock));
                 Some((

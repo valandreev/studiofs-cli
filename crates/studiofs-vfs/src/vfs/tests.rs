@@ -11264,6 +11264,66 @@ fn deferred_inode_gate_entry_drop_removes_current_entry() {
 }
 
 #[test]
+fn deferred_inode_gate_occupied_callback_blocks_current_entry_cleanup() {
+    let gate = DeferredInodeGate::default();
+    let ino = 46;
+    let (entry, _guard) = gate
+        .try_register(ino)
+        .expect("first registration should own the inode gate");
+    let (callback_entered_tx, callback_entered_rx) = std::sync::mpsc::channel();
+    let (release_callback_tx, release_callback_rx) = std::sync::mpsc::channel();
+    let cleanup_finished = Arc::new(AtomicBool::new(false));
+
+    let occupied_gate = gate.clone();
+    let occupied = std::thread::spawn(move || {
+        let registered = occupied_gate.try_register_or_update_occupied(ino, || {
+            callback_entered_tx
+                .send(())
+                .expect("signal occupied callback entry");
+            release_callback_rx
+                .recv()
+                .expect("wait for cleanup contention check");
+        });
+        assert!(
+            registered.is_none(),
+            "occupied registration should not create a second gate entry"
+        );
+    });
+    callback_entered_rx
+        .recv()
+        .expect("occupied callback should start");
+
+    let cleanup_gate = gate.clone();
+    let cleanup_finished_for_thread = Arc::clone(&cleanup_finished);
+    let cleanup = std::thread::spawn(move || {
+        let replacement = cleanup_gate.replace_if_current_or_remove(&entry, || false);
+        assert!(
+            replacement.is_none(),
+            "cleanup without reschedule should remove the current entry"
+        );
+        cleanup_finished_for_thread.store(true, AtomicOrdering::SeqCst);
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        !cleanup_finished.load(AtomicOrdering::SeqCst),
+        "current entry cleanup must wait until the occupied callback has recorded its reschedule marker"
+    );
+
+    release_callback_tx
+        .send(())
+        .expect("release occupied callback");
+    occupied
+        .join()
+        .expect("occupied registration should finish");
+    cleanup.join().expect("cleanup should finish");
+    assert!(
+        !gate.contains(ino),
+        "cleanup should remove the current gate entry after the occupied callback completes"
+    );
+}
+
+#[test]
 fn deferred_inode_gate_wait_returns_when_guard_released_before_entry_cleanup() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
