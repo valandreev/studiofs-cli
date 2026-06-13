@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,9 +128,9 @@ impl FilePayloadStore {
                     shards: array::from_fn(|_| {
                         Mutex::new(LruCache::new(read_fd_cache_shard_cap()))
                     }),
-                    hits: AtomicU64::new(0),
-                    misses: AtomicU64::new(0),
-                    evictions: AtomicU64::new(0),
+                    hits: CachePaddedAtomicU64::new(0),
+                    misses: CachePaddedAtomicU64::new(0),
+                    evictions: CachePaddedAtomicU64::new(0),
                 },
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
@@ -1128,16 +1129,17 @@ impl FilePayloadStore {
 
     #[cfg(test)]
     fn shared_state_arc_count_for_test(&self) -> usize {
-        1
+        Arc::strong_count(&self.shared)
     }
 }
 
+#[repr(align(64))]
 #[derive(Debug)]
 struct ReadHandleCache {
     shards: [Mutex<LruCache<u64, Arc<File>>>; READ_FD_CACHE_SHARDS],
-    hits: AtomicU64,
-    misses: AtomicU64,
-    evictions: AtomicU64,
+    hits: CachePaddedAtomicU64,
+    misses: CachePaddedAtomicU64,
+    evictions: CachePaddedAtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -1147,23 +1149,43 @@ struct PendingGroupedSync {
 }
 
 #[cfg(test)]
+#[repr(align(64))]
 #[derive(Debug, Default)]
 struct PayloadWriteCounters {
-    unbuffered_write_attempts: AtomicU64,
-    unbuffered_write_successes: AtomicU64,
-    unbuffered_write_fallbacks: AtomicU64,
-    active_staging_writes: AtomicU64,
-    max_staging_writes: AtomicU64,
-    staging_worker_starts: AtomicU64,
-    staging_delay_ms: AtomicU64,
+    unbuffered_write_attempts: CachePaddedAtomicU64,
+    unbuffered_write_successes: CachePaddedAtomicU64,
+    unbuffered_write_fallbacks: CachePaddedAtomicU64,
+    active_staging_writes: CachePaddedAtomicU64,
+    max_staging_writes: CachePaddedAtomicU64,
+    staging_worker_starts: CachePaddedAtomicU64,
+    staging_delay_ms: CachePaddedAtomicU64,
 }
 
+#[repr(align(64))]
 #[derive(Debug, Default)]
 struct SyncBarrierCounters {
-    per_put_file_sync_calls: AtomicU64,
-    per_put_dir_sync_calls: AtomicU64,
-    grouped_file_sync_calls: AtomicU64,
-    grouped_dir_sync_calls: AtomicU64,
+    per_put_file_sync_calls: CachePaddedAtomicU64,
+    per_put_dir_sync_calls: CachePaddedAtomicU64,
+    grouped_file_sync_calls: CachePaddedAtomicU64,
+    grouped_dir_sync_calls: CachePaddedAtomicU64,
+}
+
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct CachePaddedAtomicU64(AtomicU64);
+
+impl CachePaddedAtomicU64 {
+    fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+}
+
+impl Deref for CachePaddedAtomicU64 {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -1297,6 +1319,23 @@ mod tests {
         let store = FilePayloadStore::open(layout).unwrap();
 
         assert_eq!(store.shared_state_arc_count_for_test(), 1);
+    }
+
+    #[test]
+    fn payload_store_shared_state_count_reflects_live_store_clones() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        let _clone = store.clone();
+
+        assert_eq!(store.shared_state_arc_count_for_test(), 2);
+    }
+
+    #[test]
+    fn hot_atomic_counter_groups_are_cache_line_aligned() {
+        assert!(std::mem::align_of::<ReadHandleCache>() >= 64);
+        assert!(std::mem::align_of::<PayloadWriteCounters>() >= 64);
+        assert!(std::mem::align_of::<SyncBarrierCounters>() >= 64);
     }
 
     #[test]

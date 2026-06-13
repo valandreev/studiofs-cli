@@ -85,11 +85,11 @@ pub(crate) struct StudioVfsAdapter {
 
 #[derive(Debug)]
 struct AdapterSharedState {
-    open_cache_snapshots: ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>,
+    open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     read_admission: Arc<Semaphore>,
     read_buffers: Arc<ReadBufferPool>,
-    read_windows: ReadWindowStore,
-    read_diagnostics: Arc<AsyncReadDiagnostics>,
+    read_windows: Arc<ReadWindowStore>,
+    read_diagnostics: AsyncReadDiagnostics,
 }
 
 #[derive(Debug)]
@@ -421,14 +421,15 @@ impl ReadWindowStore {
 }
 
 struct ReadWindowKernelInvalidator {
-    shared: Arc<AdapterSharedState>,
+    read_windows: Arc<ReadWindowStore>,
+    open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     inner: Arc<dyn KernelInvalidator>,
 }
 
 impl KernelInvalidator for ReadWindowKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.shared.read_windows.invalidate_inode(ino);
-        self.shared.open_cache_snapshots.lock().pop(&ino);
+        self.read_windows.invalidate_inode(ino);
+        self.open_cache_snapshots.lock().pop(&ino);
         self.inner.inval_inode(ino);
     }
 
@@ -718,17 +719,17 @@ enum AsyncReadOutcome {
 
 struct AsyncReadTaskGuard {
     size: u32,
-    diagnostics: Arc<AsyncReadDiagnostics>,
+    shared: Arc<AdapterSharedState>,
     vfs: Arc<StudioVfs>,
     outcome: AsyncReadOutcome,
 }
 
 impl AsyncReadTaskGuard {
-    fn new(size: u32, diagnostics: Arc<AsyncReadDiagnostics>, vfs: Arc<StudioVfs>) -> Self {
-        diagnostics.on_queued(size);
+    fn new(size: u32, shared: Arc<AdapterSharedState>, vfs: Arc<StudioVfs>) -> Self {
+        shared.read_diagnostics.on_queued(size);
         Self {
             size,
-            diagnostics,
+            shared,
             vfs,
             outcome: AsyncReadOutcome::Failed,
         }
@@ -741,8 +742,12 @@ impl AsyncReadTaskGuard {
 
 impl Drop for AsyncReadTaskGuard {
     fn drop(&mut self) {
-        let pending_reads = self.diagnostics.on_finished(self.size, self.outcome);
-        self.diagnostics
+        let pending_reads = self
+            .shared
+            .read_diagnostics
+            .on_finished(self.size, self.outcome);
+        self.shared
+            .read_diagnostics
             .publish_snapshot_after_finish(&self.vfs, pending_reads);
     }
 }
@@ -838,15 +843,13 @@ impl StudioVfsAdapter {
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
             shared: Arc::new(AdapterSharedState {
-                open_cache_snapshots: ParkingMutex::new(LruCache::new(
+                open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
-                )),
+                ))),
                 read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
                 read_buffers: Arc::new(ReadBufferPool::default()),
-                read_windows: ReadWindowStore::default(),
-                read_diagnostics: Arc::new(AsyncReadDiagnostics::new(
-                    read_queue_byte_limit as usize,
-                )),
+                read_windows: Arc::new(ReadWindowStore::default()),
+                read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
             }),
             write_capable_state: WriteCapableState::default(),
             file_flags: ParkingMutex::new(HashMap::new()),
@@ -870,7 +873,7 @@ impl StudioVfsAdapter {
 
     #[cfg(test)]
     pub(crate) fn hot_path_shared_state_arc_count_for_test(&self) -> usize {
-        1
+        Arc::strong_count(&self.shared)
     }
 
     #[cfg(test)]
@@ -916,7 +919,8 @@ impl StudioVfsAdapter {
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
         Arc::new(ReadWindowKernelInvalidator {
-            shared: Arc::clone(&self.shared),
+            read_windows: Arc::clone(&self.shared.read_windows),
+            open_cache_snapshots: Arc::clone(&self.shared.open_cache_snapshots),
             inner,
         })
     }
@@ -1382,7 +1386,6 @@ impl StudioVfsAdapter {
             let _ = Reply::new(request).error(libc::EINVAL);
             return;
         };
-        let admission = Arc::clone(&self.shared.read_admission);
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
@@ -1391,13 +1394,15 @@ impl StudioVfsAdapter {
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
-        let diagnostics = Arc::clone(&self.shared.read_diagnostics);
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
             let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-            let mut read_guard =
-                AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
+            let mut read_guard = AsyncReadTaskGuard::new(
+                admission_bytes,
+                Arc::clone(&state.shared),
+                Arc::clone(&state.vfs),
+            );
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
                 log_callback_error("read", MACFUSE_READ_INTERRUPTED_ERRNO);
@@ -1405,9 +1410,9 @@ impl StudioVfsAdapter {
                 return;
             }
             let _permit = match acquire_read_admission(
-                admission,
+                Arc::clone(&state.shared.read_admission),
                 admission_bytes,
-                &read_guard.diagnostics,
+                &read_guard.shared.read_diagnostics,
                 &cancellation,
             )
             .await
@@ -1486,7 +1491,6 @@ impl StudioVfsAdapter {
         size: u32,
     ) -> Result<QueuedReadForTest, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let admission = Arc::clone(&self.shared.read_admission);
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
@@ -1495,21 +1499,23 @@ impl StudioVfsAdapter {
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
-        let diagnostics = Arc::clone(&self.shared.read_diagnostics);
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
                 let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                let mut read_guard =
-                    AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
+                let mut read_guard = AsyncReadTaskGuard::new(
+                    admission_bytes,
+                    Arc::clone(&state.shared),
+                    Arc::clone(&state.vfs),
+                );
                 if cancellation.is_cancelled() {
                     read_guard.finish_with(AsyncReadOutcome::Canceled);
                     return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
                 let _permit = acquire_read_admission(
-                    admission,
+                    Arc::clone(&state.shared.read_admission),
                     admission_bytes,
-                    &read_guard.diagnostics,
+                    &read_guard.shared.read_diagnostics,
                     &cancellation,
                 )
                 .await
@@ -1555,7 +1561,6 @@ impl StudioVfsAdapter {
         size: u32,
     ) -> Result<CancelableQueuedReadForTest, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let admission = Arc::clone(&self.shared.read_admission);
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
@@ -1565,7 +1570,6 @@ impl StudioVfsAdapter {
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let worker_cancellation = cancellation.clone();
-        let diagnostics = Arc::clone(&self.shared.read_diagnostics);
         Ok(CancelableQueuedReadForTest {
             cancellation,
             queued: QueuedReadForTest {
@@ -1574,7 +1578,7 @@ impl StudioVfsAdapter {
                     let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
                     let mut read_guard = AsyncReadTaskGuard::new(
                         admission_bytes,
-                        diagnostics,
+                        Arc::clone(&state.shared),
                         Arc::clone(&state.vfs),
                     );
                     if worker_cancellation.is_cancelled() {
@@ -1582,9 +1586,9 @@ impl StudioVfsAdapter {
                         return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                     }
                     let _permit = acquire_read_admission(
-                        admission,
+                        Arc::clone(&state.shared.read_admission),
                         admission_bytes,
-                        &read_guard.diagnostics,
+                        &read_guard.shared.read_diagnostics,
                         &worker_cancellation,
                     )
                     .await
@@ -3686,6 +3690,16 @@ mod tests {
         let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
 
         assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 1);
+    }
+
+    #[test]
+    fn adapter_hot_path_state_count_reflects_live_shared_clones() {
+        let fixture = ContractVfsFixture::new("macfuse-hot-path-shared-state-clone")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let _shared = Arc::clone(&adapter.shared);
+
+        assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 2);
     }
 
     #[test]
