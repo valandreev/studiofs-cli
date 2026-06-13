@@ -240,6 +240,22 @@ fn strip_cfg_test_items_handles_utf8_before_test_item() {
 }
 
 #[test]
+fn strip_cfg_test_items_keeps_nested_cfg_test_items_in_scope() {
+    let contents = r#"
+struct ProductionType;
+
+impl ProductionType {
+    #[cfg(test)]
+    fn nested_test_only() {}
+}
+"#;
+
+    let filtered = strip_cfg_test_items(contents);
+
+    assert!(filtered.contains("nested_test_only"));
+}
+
+#[test]
 fn expect_reason_only_covers_the_immediately_annotated_violation() {
     let contents = r#"
 #[expect(clippy::unwrap_used, reason = "checked in test")]
