@@ -923,9 +923,13 @@ impl TrackerState {
     }
 
     fn async_write_notifier(&mut self, targets: &[BarrierTarget]) -> Arc<Notify> {
-        let Some((key, _, _)) = targets.first() else {
-            return Arc::new(Notify::new());
-        };
+        #[expect(
+            clippy::expect_used,
+            reason = "caller only enables async wait after a non-empty barrier target check"
+        )]
+        let (key, _, _) = targets
+            .first()
+            .expect("pending write barrier targets must not be empty while waiting");
         let ino = key.0;
         Arc::clone(
             self.async_write_notifiers

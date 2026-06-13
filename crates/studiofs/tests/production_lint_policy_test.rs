@@ -76,6 +76,9 @@ fn path_is_production_source(path: &Path) -> bool {
 }
 
 fn collect_panic_policy_violations(path: &str, contents: &str) -> Vec<String> {
+    // This is intentionally a narrow policy tripwire for the current production
+    // allowlist. A broader repository policy should move to AST-based matching
+    // instead of extending these textual needles.
     let mut violations = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
         if line.trim_start().starts_with("#[expect(") {
@@ -107,10 +110,6 @@ fn has_local_expect_reason(contents: &str, line_index: usize, lint: &str) -> boo
 }
 
 fn strip_cfg_test_items(contents: &str) -> String {
-    if let Some((production_prefix, _)) = contents.split_once("#[cfg(test)]") {
-        return production_prefix.to_string();
-    }
-
     let Ok(file) = syn::parse_file(contents) else {
         return contents.to_string();
     };
