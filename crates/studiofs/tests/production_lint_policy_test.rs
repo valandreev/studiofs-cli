@@ -171,6 +171,10 @@ fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
         return false;
     }
 
+    // Keep this intentionally narrow: only exact test-only cfg predicates are
+    // stripped. Broader cfg expressions such as `any(test, feature = "...")`
+    // may also compile in production feature sets and must remain visible to
+    // this policy check.
     attr.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
         .map(|args| {
             args.into_iter().any(|meta| match meta {
@@ -215,10 +219,24 @@ fn line_column_to_offset(contents: &str, line_starts: &[usize], location: LineCo
         .copied()
         .unwrap_or(contents.len());
     let line = &contents[line_start..line_end];
-    let byte_in_line = line
-        .char_indices()
-        .nth(location.column)
-        .map(|(index, _)| index)
-        .unwrap_or(line.len());
+    let byte_in_line = location.column.min(line.len());
     (line_start + byte_in_line).min(contents.len())
+}
+
+#[test]
+fn line_column_to_offset_treats_column_as_utf8_byte_offset() {
+    let contents = "// café\nfn marker() {}\n";
+    let line_starts = line_start_offsets(contents);
+    let byte_column = "// café".len();
+
+    let offset = line_column_to_offset(
+        contents,
+        &line_starts,
+        LineColumn {
+            line: 1,
+            column: byte_column,
+        },
+    );
+
+    assert_eq!(offset, byte_column);
 }
