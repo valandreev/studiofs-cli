@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1188,6 +1188,12 @@ impl Deref for CachePaddedAtomicU64 {
     }
 }
 
+impl DerefMut for CachePaddedAtomicU64 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SyncBarrierSnapshot {
@@ -1336,6 +1342,15 @@ mod tests {
         assert!(std::mem::align_of::<ReadHandleCache>() >= 64);
         assert!(std::mem::align_of::<PayloadWriteCounters>() >= 64);
         assert!(std::mem::align_of::<SyncBarrierCounters>() >= 64);
+    }
+
+    #[test]
+    fn cache_padded_atomic_allows_exclusive_mutable_access() {
+        let mut counter = CachePaddedAtomicU64::new(7);
+
+        *counter.get_mut() = 11;
+
+        assert_eq!(counter.load(Ordering::Relaxed), 11);
     }
 
     #[test]
