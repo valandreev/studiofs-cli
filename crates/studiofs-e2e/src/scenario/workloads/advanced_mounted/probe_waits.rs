@@ -292,24 +292,23 @@ impl MountedProbeLimiter {
             return Err(self.worker_limit_reached());
         }
 
+        let mut current = self.active_workers.load(Ordering::Acquire);
         loop {
-            let active_workers = self.active_workers.load(Ordering::Acquire);
-            if active_workers >= self.max_active_workers {
+            if current >= self.max_active_workers {
                 return Err(self.worker_limit_reached());
             }
-            if self
-                .active_workers
-                .compare_exchange(
-                    active_workers,
-                    active_workers.saturating_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(MountedProbePermit {
-                    active_workers: Arc::clone(&self.active_workers),
-                });
+            match self.active_workers.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(MountedProbePermit {
+                        active_workers: Arc::clone(&self.active_workers),
+                    });
+                }
+                Err(actual) => current = actual,
             }
         }
     }

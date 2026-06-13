@@ -85,6 +85,13 @@ pub(in crate::scenario) fn run_sparse_range_operations(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<(Vec<NamespaceCollisionOperation>, SparseRangeSummary), ScenarioError> {
+    if clients.len() < 3 {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: 3,
+            actual: clients.len(),
+        });
+    }
+
     let started = Instant::now();
     let writer = &clients[0];
     let reader = &clients[1];

@@ -8,6 +8,13 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
 ) -> Result<(Vec<NamespaceCollisionOperation>, LwwReconnectOracle), ScenarioError> {
+    if clients.len() < 4 {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: 4,
+            actual: clients.len(),
+        });
+    }
+
     let started = Instant::now();
     let mut operations = Vec::new();
     let path = isolation.path("winner.txt");
@@ -137,6 +144,13 @@ pub(in crate::scenario) fn run_open_handle_operations(
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    if clients.len() < 2 {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: 2,
+            actual: clients.len(),
+        });
+    }
+
     let started = Instant::now();
     let mut operations = Vec::new();
     seed_open_handle_initial_tree(context, clients, isolation, OPEN_HANDLE_OPERATION_TIMEOUT)?;
@@ -265,14 +279,19 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
         let mut stderr_reader = drain_child_stderr(&mut child);
-        write_hotspot_helper_process_metadata(
+        if let Err(error) = write_hotspot_helper_process_metadata(
             context,
             child.id(),
             client_a,
             "open-handle",
             unlink_path,
             Some(rename_dest),
-        )?;
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
+            return Err(error);
+        }
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
@@ -426,7 +445,19 @@ pub(in crate::scenario) fn run_sparse_helper_process(
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
         let mut stderr_reader = drain_child_stderr(&mut child);
-        write_hotspot_helper_process_metadata(context, child.id(), client, operation, path, None)?;
+        if let Err(error) = write_hotspot_helper_process_metadata(
+            context,
+            child.id(),
+            client,
+            operation,
+            path,
+            None,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
+            return Err(error);
+        }
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();

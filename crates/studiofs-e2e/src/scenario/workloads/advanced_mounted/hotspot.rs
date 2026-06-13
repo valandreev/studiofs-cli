@@ -27,6 +27,13 @@ pub(in crate::scenario) fn run_hotspot_churn_operations_with_timeout(
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    if clients.len() < 3 {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: 3,
+            actual: clients.len(),
+        });
+    }
+
     let started = Instant::now();
     let mut operations = Vec::new();
     let mkdir_client = clients[0].clone();
@@ -385,14 +392,19 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
         let mut stderr_reader = drain_child_stderr(&mut child);
-        write_hotspot_helper_process_metadata(
+        if let Err(error) = write_hotspot_helper_process_metadata(
             context,
             child.id(),
             client,
             operation,
             path,
             target,
-        )?;
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
+            return Err(error);
+        }
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
