@@ -30,7 +30,7 @@ smallvec.workspace = true
 
 [dev-dependencies]
 studiofs-data = { workspace = true, features = ["test-utils"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 bytes.workspace = true
 aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "rt-tokio"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
