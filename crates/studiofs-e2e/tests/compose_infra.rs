@@ -113,6 +113,43 @@ services:
 }
 
 #[test]
+fn compose_preflight_accepts_yaml_aliases_for_baseline_images() {
+    let temp = tempdir().unwrap();
+    let compose_file = temp.path().join("compose.e2e.yml");
+    std::fs::write(
+        &compose_file,
+        r#"
+x-images:
+  postgres: &postgres-image postgres:18-alpine
+  rustfs: &rustfs-image rustfs/rustfs:1.0.0-alpha.94
+
+services:
+  postgres:
+    image: *postgres-image
+  rustfs:
+    image: *rustfs-image
+"#,
+    )
+    .unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-aliased-images".to_string(),
+        sandbox: temp.path().join("compose-aliased-images"),
+        compose_file,
+        port_range: Some("31300-31310".to_string()),
+        wait_timeout_secs: 90,
+    })
+    .unwrap();
+
+    let checks = stack.preflight(&RecordingExecutor::default());
+    let baseline = checks
+        .iter()
+        .find(|check| check.name == "compose baseline contract")
+        .expect("baseline contract check");
+
+    assert!(baseline.passed, "{baseline:?}");
+}
+
+#[test]
 fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() {
     let temp = tempdir().unwrap();
     let stack = DockerComposeStack::new(ComposeConfig {

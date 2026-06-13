@@ -542,7 +542,7 @@ pub enum InfraError {
     Json(#[from] serde_json::Error),
     /// YAML encoding/decoding failure.
     #[error("infra YAML failed: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_saphyr::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -1031,21 +1031,17 @@ LEFT JOIN LATERAL (
     }
 }
 
-fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, serde_yaml::Error> {
-    let document: serde_yaml::Value = serde_yaml::from_str(compose)?;
-    let Some(services) = mapping_value(&document, "services") else {
+fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, serde_saphyr::Error> {
+    let document: serde_json::Value = serde_saphyr::from_str(compose)?;
+    let Some(services) = document.get("services") else {
         return Ok(Vec::new());
     };
-    let Some(services) = services.as_mapping() else {
+    let Some(services) = services.as_object() else {
         return Ok(Vec::new());
     };
     let mut images = Vec::new();
-    for (name, service) in services {
-        let Some(service_name) = name.as_str() else {
-            continue;
-        };
-        let Some(image) = mapping_value(service, "image").and_then(serde_yaml::Value::as_str)
-        else {
+    for (service_name, service) in services {
+        let Some(image) = service.get("image").and_then(serde_json::Value::as_str) else {
             continue;
         };
         images.push(ComposeServiceImage {
@@ -1055,12 +1051,6 @@ fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, ser
     }
     images.sort_by(|left, right| left.service.cmp(&right.service));
     Ok(images)
-}
-
-fn mapping_value<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
-    value
-        .as_mapping()?
-        .get(serde_yaml::Value::String(key.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
