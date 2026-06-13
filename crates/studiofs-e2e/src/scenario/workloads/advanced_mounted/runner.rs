@@ -2,6 +2,9 @@
 
 use super::*;
 
+const EXPECT_ACTION_PAYLOAD_MSG: &str =
+    "create and overwrite operations must have an action payload";
+
 pub(in crate::scenario) fn run_advanced_mounted_with_controller(
     context: &ScenarioContext,
     kind: AdvancedMountedKind,
@@ -717,7 +720,7 @@ pub(in crate::scenario) fn run_stale_remount_warm_history(
         if matches!(operation, "create" | "overwrite") && path != delete_target {
             wait_for_mounted_initial_payloads_until(
                 clients,
-                &[(&path, action.as_deref().unwrap())],
+                &[(&path, action.as_deref().expect(EXPECT_ACTION_PAYLOAD_MSG))],
                 Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
                 "stale remount warm history",
@@ -861,7 +864,7 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
             "create" if path == delete_target || path == rename_source => {
                 wait_for_mounted_initial_payloads_until(
                     clients,
-                    &[(&path, action.as_deref().unwrap())],
+                    &[(&path, action.as_deref().expect(EXPECT_ACTION_PAYLOAD_MSG))],
                     Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                     ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
                     "cold observer warm history",
@@ -870,7 +873,7 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
             "create" | "overwrite" if path == overwrite_target => {
                 wait_for_mounted_initial_payloads_until(
                     clients,
-                    &[(&path, action.as_deref().unwrap())],
+                    &[(&path, action.as_deref().expect(EXPECT_ACTION_PAYLOAD_MSG))],
                     Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                     ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
                     "cold observer warm history",

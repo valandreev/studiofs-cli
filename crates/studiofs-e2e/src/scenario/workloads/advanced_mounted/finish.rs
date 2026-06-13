@@ -148,11 +148,11 @@ pub(in crate::scenario) fn validate_long_history_snapshots(
     let checksum_path = long_history_checksum_path(history);
 
     for snapshot in snapshots {
-        let entries_by_path = snapshot
+        let entries_by_path: std::collections::HashMap<_, _> = snapshot
             .entries
             .iter()
             .map(|entry| (entry.path.as_str(), entry))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect();
         for expected_path in &history.expected_present_paths {
             let Some(entry) = entries_by_path.get(expected_path.as_str()) else {
                 missing_present_paths.push(format!("{}:{expected_path}", snapshot.client));
