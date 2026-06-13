@@ -142,6 +142,10 @@ const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(not(target_os = "macos"))]
 const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(target_os = "macos")]
+const MOUNTED_SPARSE_WRITE_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(target_os = "macos"))]
+const MOUNTED_SPARSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
 const BOUNDED_MOUNTED_IO_MAX_WORKERS: usize = 1;
 #[cfg(test)]

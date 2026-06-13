@@ -177,6 +177,23 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
 }
 
 #[test]
+fn sparse_write_timeout_allows_winfsp_cleanup_purge_slack() {
+    assert!(
+        MOUNTED_SPARSE_WRITE_TIMEOUT >= MOUNTED_WRITE_READBACK_TIMEOUT,
+        "sparse range writes and truncates must not have less time than generic mounted readback"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        MOUNTED_SPARSE_WRITE_TIMEOUT > MOUNTED_WRITE_READBACK_TIMEOUT,
+        "WinFSP sparse range writes need slack beyond the generic mounted readback timeout"
+    );
+    assert!(
+        MOUNTED_SPARSE_WRITE_TIMEOUT >= HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        "sparse range writes should use the mounted helper operation timeout budget"
+    );
+}
+
+#[test]
 fn sparse_helper_payload_mismatch_detail_reports_checksums_and_first_diff() {
     let detail = payload_mismatch_detail(b"abcdef", b"abcxef");
 

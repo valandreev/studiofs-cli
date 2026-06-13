@@ -119,7 +119,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@0"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 writer,
                 "write-range",
                 &sparse_path,
@@ -140,7 +140,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@1048569"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 writer,
                 "write-range",
                 &sparse_path,
@@ -161,7 +161,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@{initial_logical_size}"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 writer,
                 "truncate",
                 &sparse_path,
@@ -215,7 +215,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@{shrunk_logical_size}"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 reader,
                 "truncate",
                 &sparse_path,
@@ -248,7 +248,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@{final_logical_size}"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 extender,
                 "truncate",
                 &sparse_path,
@@ -269,7 +269,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@2097147"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 extender,
                 "write-range",
                 &sparse_path,
@@ -290,7 +290,7 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             &format!("{sparse_path}@3145900"),
             run_sparse_helper_process(
                 context,
-                MOUNTED_WRITE_READBACK_TIMEOUT,
+                MOUNTED_SPARSE_WRITE_TIMEOUT,
                 writer,
                 "write-range",
                 &sparse_path,
