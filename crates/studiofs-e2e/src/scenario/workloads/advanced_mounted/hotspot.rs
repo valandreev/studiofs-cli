@@ -403,7 +403,7 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
             let _ = child.kill();
             let _ = child.wait();
             let _ = collect_child_stderr(&mut stderr_reader);
-            return Err(error);
+            return Err(ScenarioError::Io(error));
         }
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
