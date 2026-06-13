@@ -1217,12 +1217,17 @@ impl CachedStoreWriterSlice {
                     remaining.min(self.config.page_size),
                 ));
             }
-            if let Some(page) = self.pages.back_mut() {
-                let remaining = target_len - self.dirty_len;
-                let append = remaining.min(self.config.page_size - page.len());
-                page.resize(page.len() + append, 0);
-                self.dirty_len += append;
-            }
+            // INVARIANT: the branch above creates a page whenever the deque is
+            // empty or the previous tail cannot accept more bytes.
+            #[expect(
+                clippy::expect_used,
+                reason = "page deque is populated by the preceding branch"
+            )]
+            let page = self.pages.back_mut().expect("page exists after push");
+            let remaining = target_len - self.dirty_len;
+            let append = remaining.min(self.config.page_size - page.len());
+            page.resize(page.len() + append, 0);
+            self.dirty_len += append;
         }
     }
 
@@ -1311,14 +1316,26 @@ impl CachedStoreWriterSlice {
             return Bytes::new();
         }
         let payload = match self.pages.front().map(BytesMut::len) {
-            Some(front_len) if len == front_len => self
-                .pages
-                .pop_front()
-                .map_or_else(Bytes::new, BytesMut::freeze),
-            Some(front_len) if len < front_len => self
-                .pages
-                .front_mut()
-                .map_or_else(Bytes::new, |front| front.split_to(len).freeze()),
+            Some(front_len) if len == front_len => {
+                // INVARIANT: front_len came from the current front page.
+                #[expect(
+                    clippy::expect_used,
+                    reason = "front length was read from the current front page"
+                )]
+                self.pages.pop_front().expect("front page exists").freeze()
+            }
+            Some(front_len) if len < front_len => {
+                // INVARIANT: front_len came from the current front page.
+                #[expect(
+                    clippy::expect_used,
+                    reason = "front length was read from the current front page"
+                )]
+                self.pages
+                    .front_mut()
+                    .expect("front page exists")
+                    .split_to(len)
+                    .freeze()
+            }
             _ => {
                 let payload = self.copy_prefix_to_bytes(len);
                 self.drop_prefix(len);

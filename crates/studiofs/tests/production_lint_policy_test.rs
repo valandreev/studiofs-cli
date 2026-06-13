@@ -100,6 +100,10 @@ fn collect_panic_policy_violations(path: &str, contents: &str) -> Vec<String> {
 }
 
 fn has_local_expect_reason(contents: &str, line_index: usize, lint: &str) -> bool {
+    // This line-based association deliberately handles the common local
+    // statement/block forms used in the allowlist. Repeated identical
+    // violations inside one expression remain a known limitation for a future
+    // AST-based checker.
     let lines = contents.lines().collect::<Vec<_>>();
     let current_statement = lines[line_index];
     if current_statement.contains("#[expect(")
@@ -137,6 +141,9 @@ fn strip_cfg_test_items(contents: &str) -> String {
     let Ok(file) = syn::parse_file(contents) else {
         return contents.to_string();
     };
+    // This scoped tripwire only strips top-level test-only items. Keep nested
+    // test helpers out of production impl/module bodies until this moves to an
+    // AST visitor or a compiler lint.
     let mut excluded_ranges: Vec<_> = file
         .items
         .iter()
