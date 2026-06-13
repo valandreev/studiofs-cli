@@ -856,10 +856,10 @@ impl<'a> ReadMetadataResolver<'a> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
-        if let Some(attr) = self.dirty_attr() {
+        if let Some(attr) = self.dirty_attr_async().await? {
             return Ok(attr);
         }
-        if let Some(attr) = self.cached_attr() {
+        if let Some(attr) = self.cached_attr_async().await? {
             return Ok(attr);
         }
         self.load_attr_from_meta().await
@@ -872,7 +872,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 resolved_slices: Arc::from(Vec::<ResolvedSliceSpan>::new()),
             });
         }
-        if let Some(attr) = self.dirty_attr() {
+        if let Some(attr) = self.dirty_attr_async().await? {
             let resolved_slices = self
                 .resolve_slices_for_attr(&attr, offset, buffer_len, true)
                 .await?;
@@ -881,7 +881,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 resolved_slices,
             });
         }
-        if let Some(attr) = self.cached_attr() {
+        if let Some(attr) = self.cached_attr_async().await? {
             let resolved_slices = self
                 .resolve_slices_for_attr(&attr, offset, buffer_len, false)
                 .await?;
@@ -945,6 +945,59 @@ impl<'a> ReadMetadataResolver<'a> {
         Some(dirty_attr)
     }
 
+    async fn dirty_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
+        let Some(dirty_attr) = self
+            .vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&self.ino)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        if MetadataRefreshDecision::for_local_attr(
+            &dirty_attr,
+            self.vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino),
+            self.vfs.inode_has_dirty_writer_stack(self.ino),
+            self.vfs.inode_has_pending_uploads(self.ino),
+        ) == MetadataRefreshDecision::UseLocal
+        {
+            return Ok(Some(dirty_attr));
+        }
+
+        let ino = self.ino;
+        let meta = self.vfs.meta.clone();
+        let remote_attr =
+            match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
+                Ok(remote_attr) => remote_attr,
+                Err(error) => {
+                    warn!(
+                        ino = self.ino,
+                        error = %error,
+                        "failed to refresh drained dirty attr from authoritative metadata"
+                    );
+                    return Ok(Some(dirty_attr));
+                }
+            };
+        if self
+            .vfs
+            .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
+        {
+            self.vfs.clear_superseded_local_regular_file_state(
+                self.ino,
+                remote_attr.committed_content_epoch,
+                false,
+            );
+            return Ok(Some(remote_attr));
+        }
+
+        Ok(Some(dirty_attr))
+    }
+
     fn cached_attr(&self) -> Option<InodeAttr> {
         let cached_attr = self
             .vfs
@@ -987,6 +1040,56 @@ impl<'a> ReadMetadataResolver<'a> {
         }
 
         Some(cached_attr)
+    }
+
+    async fn cached_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
+        let Some(cached_attr) = self
+            .vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .get(self.ino, Instant::now())
+        else {
+            return Ok(None);
+        };
+
+        if MetadataRefreshDecision::for_local_attr(
+            &cached_attr,
+            self.vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino),
+            self.vfs.inode_has_dirty_writer_stack(self.ino),
+            self.vfs.inode_has_pending_uploads(self.ino),
+        ) == MetadataRefreshDecision::UseLocal
+        {
+            return Ok(Some(cached_attr));
+        }
+
+        let ino = self.ino;
+        let meta = self.vfs.meta.clone();
+        let remote_attr =
+            match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
+                Ok(remote_attr) => remote_attr,
+                Err(error) => {
+                    warn!(
+                        ino = self.ino,
+                        error = %error,
+                        "failed to refresh cached pending attr from authoritative metadata"
+                    );
+                    return Ok(Some(cached_attr));
+                }
+            };
+        if StudioVfs::is_fully_published_regular_file(&remote_attr) {
+            self.vfs.clear_superseded_local_regular_file_state(
+                self.ino,
+                remote_attr.committed_content_epoch,
+                false,
+            );
+            self.cache_attr(&remote_attr);
+            return Ok(Some(remote_attr));
+        }
+
+        Ok(Some(cached_attr))
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
@@ -1333,11 +1436,36 @@ impl StudioVfs {
         offset: u64,
         requested_len: usize,
     ) -> VfsResult<PreparedForegroundRead> {
+        let debug_path = self.debug_pending_target_path(ino);
+        if let Some(path) = &debug_path {
+            info!(
+                ino,
+                path = %path,
+                offset,
+                requested_len,
+                "debug target prepare_foreground_read resolving metadata"
+            );
+        }
         let (attr, resolved_slices) = self
             .resolve_read_metadata_async(ino, offset, requested_len as u64)
             .await?;
         let context = ReadRequestContext::from_attr(self, ino, attr);
         let read_len = context.read_len(offset, requested_len);
+        if let Some(path) = &debug_path {
+            info!(
+                ino,
+                path = %path,
+                offset,
+                requested_len,
+                read_len,
+                attr_size = context.attr.size,
+                attr_upload_state = ?context.attr.upload_state,
+                attr_content_epoch = context.attr.content_epoch,
+                attr_committed_content_epoch = context.attr.committed_content_epoch,
+                resolved_slice_count = resolved_slices.len(),
+                "debug target prepare_foreground_read resolved metadata"
+            );
+        }
         Ok(PreparedForegroundRead {
             context,
             resolved_slices,

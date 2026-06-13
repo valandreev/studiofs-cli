@@ -121,6 +121,16 @@ impl StudioVfs {
         self.note_vfs_read_call(buffer.len());
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
+        if let Some(path) = &debug_path {
+            tracing::info!(
+                ino,
+                fh = fh.unwrap_or_default(),
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                "debug target read_into_impl access granted"
+            );
+        }
         if let Some(attr) = self.ignored_entry_attr(ino) {
             let end = offset.saturating_add(buffer.len() as u64).min(attr.size);
             let len = end.saturating_sub(offset) as usize;
