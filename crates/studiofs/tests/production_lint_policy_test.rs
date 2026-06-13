@@ -37,6 +37,10 @@ fn production_rust_sources_do_not_use_unscoped_panic_or_unwrap() {
 }
 
 fn production_rust_sources() -> Vec<PathBuf> {
+    // SFS-504 intentionally starts with a scoped production allowlist. Do not
+    // expand this to every workspace member until the remaining crates have
+    // adopted the no-panic policy and their production/test boundaries are
+    // represented by an AST-based checker.
     [
         "crates/studiofs-cache/src/cached_store.rs",
         "crates/studiofs-cache/src/payload_index.rs",
