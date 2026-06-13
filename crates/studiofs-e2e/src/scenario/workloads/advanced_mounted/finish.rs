@@ -148,12 +148,13 @@ pub(in crate::scenario) fn validate_long_history_snapshots(
     let checksum_path = long_history_checksum_path(history);
 
     for snapshot in snapshots {
+        let entries_by_path = snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
         for expected_path in &history.expected_present_paths {
-            let Some(entry) = snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.path == *expected_path)
-            else {
+            let Some(entry) = entries_by_path.get(expected_path.as_str()) else {
                 missing_present_paths.push(format!("{}:{expected_path}", snapshot.client));
                 continue;
             };
@@ -169,11 +170,7 @@ pub(in crate::scenario) fn validate_long_history_snapshots(
             }
         }
         for absent_path in &history.expected_absent_paths {
-            if snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.path == *absent_path)
-            {
+            if entries_by_path.contains_key(absent_path.as_str()) {
                 unexpected_present_paths.push(format!("{}:{absent_path}", snapshot.client));
             }
         }
@@ -204,33 +201,33 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
     kind: AdvancedMountedKind,
     started: Instant,
 ) -> Vec<NamespaceCollisionOperation> {
-    let spec = match kind {
-        AdvancedMountedKind::CrashBeforeWriteAcceptance => vec![(
+    let spec: &[(&str, &str, &str)] = match kind {
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => &[(
             "client-a",
             "before_write",
             "crash-before-write-acceptance/before-write.txt",
         )],
-        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => vec![(
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => &[(
             "client-a",
             "partial_write",
             "crash-after-partial-write-acceptance/partial-write.txt",
         )],
-        AdvancedMountedKind::CrashAfterFullWriteAcceptance => vec![(
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => &[(
             "client-a",
             "full_write",
             "crash-after-full-write-acceptance/full-write.txt",
         )],
-        AdvancedMountedKind::MountedChaos => vec![
+        AdvancedMountedKind::MountedChaos => &[
             ("client-a", "rename", "chaos/rename-source.txt"),
             ("client-b", "unlink", "chaos/unlink-target.txt"),
             ("client-c", "append", "chaos/append-target.txt"),
         ],
-        AdvancedMountedKind::HotspotChurn => vec![
+        AdvancedMountedKind::HotspotChurn => &[
             ("client-a", "overwrite", "hotspot/slot-0.txt"),
             ("client-b", "append", "hotspot/slot-0.txt"),
             ("client-c", "readdir", "hotspot"),
         ],
-        AdvancedMountedKind::FaultChaos => vec![
+        AdvancedMountedKind::FaultChaos => &[
             ("client-a", "stop_postgres", "compose/postgres"),
             (
                 "client-a",
@@ -240,13 +237,13 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
             ("client-b", "stop_rustfs", "compose/rustfs"),
             ("client-d", "cold_observer_readdir", "fault-chaos"),
         ],
-        AdvancedMountedKind::LwwReconnectChaos => vec![
+        AdvancedMountedKind::LwwReconnectChaos => &[
             ("client-c", "stale_writer_offline", "client-c"),
             ("client-b", "write", "lww-chaos/winner.txt"),
             ("client-c", "write_lww_winner", "lww-chaos/winner.txt"),
             ("client-e", "late_observer_read", "lww-chaos/winner.txt"),
         ],
-        AdvancedMountedKind::OpenHandle => vec![
+        AdvancedMountedKind::OpenHandle => &[
             ("client-a", "open", "open-handles/unlink-target.txt"),
             ("client-b", "unlink", "open-handles/unlink-target.txt"),
             ("client-b", "rename", "open-handles/rename-source.txt"),
@@ -256,7 +253,7 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
                 "open-handles/unlink-target.txt",
             ),
         ],
-        AdvancedMountedKind::SparseRange => vec![
+        AdvancedMountedKind::SparseRange => &[
             ("client-a", "write_range", "sparse/shared.bin@0"),
             ("client-a", "write_range", "sparse/shared.bin@1048569"),
             ("client-b", "read_probe", "sparse/shared.bin@65536"),
@@ -265,7 +262,7 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
             ("client-c", "write_range", "sparse/shared.bin@2097147"),
             ("client-a", "read_probe", "sparse/shared.bin@3145900"),
         ],
-        AdvancedMountedKind::ColdObserverLongHistory => vec![
+        AdvancedMountedKind::ColdObserverLongHistory => &[
             ("client-a", "mkdir", "cold-observer/nested"),
             ("client-a", "create", "cold-observer/delete-target.txt"),
             ("client-b", "delete", "cold-observer/delete-target.txt"),
@@ -286,7 +283,7 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
             ("client-d", "cold_discover_after_history", "client-d"),
             ("client-d", "cold_mount_after_history", "client-d"),
         ],
-        AdvancedMountedKind::StaleRemountColdDiscoverCatchup => vec![
+        AdvancedMountedKind::StaleRemountColdDiscoverCatchup => &[
             (
                 "client-c",
                 "initial_baseline",
@@ -331,7 +328,7 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
             ("client-c", "stale_remount_after_history", "client-c"),
             ("client-d", "cold_discover_after_history", "client-d"),
         ],
-        AdvancedMountedKind::InvalidationDropoutFallback => vec![
+        AdvancedMountedKind::InvalidationDropoutFallback => &[
             ("client-c", "observer_dropout_start", "client-c"),
             (
                 "client-a",
@@ -364,7 +361,7 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
                 "invalidation-dropout/fallback-target.txt",
             ),
         ],
-        AdvancedMountedKind::SymlinkAttribute => vec![
+        AdvancedMountedKind::SymlinkAttribute => &[
             (
                 "client-a",
                 "symlink_target_write",
@@ -397,10 +394,10 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
             ),
         ],
     };
-    spec.into_iter()
+    spec.iter()
         .enumerate()
         .map(
-            |(index, (client, operation, path))| NamespaceCollisionOperation {
+            |(index, &(client, operation, path))| NamespaceCollisionOperation {
                 order: index + 1,
                 client: client.to_string(),
                 operation: operation.to_string(),
