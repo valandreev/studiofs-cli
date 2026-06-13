@@ -3707,6 +3707,25 @@ mod tests {
         assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 2);
     }
 
+    #[derive(Debug)]
+    struct NoopKernelInvalidator;
+
+    impl KernelInvalidator for NoopKernelInvalidator {
+        fn inval_inode(&self, _ino: u64) {}
+
+        fn inval_inode_attrs(&self, _ino: u64) {}
+    }
+
+    #[test]
+    fn kernel_invalidator_does_not_retain_entire_adapter_shared_state() {
+        let fixture = ContractVfsFixture::new("macfuse-kernel-invalidator-narrow-state")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let _invalidator = adapter.kernel_invalidator_for_test(Arc::new(NoopKernelInvalidator));
+
+        assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 1);
+    }
+
     #[test]
     fn read_window_store_rejects_stale_cache_fill_after_invalidation() {
         let store = ReadWindowStore::default();
