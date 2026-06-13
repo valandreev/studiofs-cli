@@ -685,25 +685,23 @@ pub(in crate::scenario) fn append_sparse_timeout_diagnostics_event(
         .create(true)
         .append(true)
         .open(context.scenario_dir.join("operations.ndjson"))?;
-    serde_json::to_writer(
-        &mut log,
-        &json!({
-            "run_id": context.run_id,
-            "scenario": AdvancedMountedKind::SparseRange.name(),
-            "operation": "sparse_timeout_diagnostics",
-            "label": label,
-            "path": diagnostics.sparse_path,
-            "logical_size": diagnostics.logical_size,
-            "artifact": format!(
-                "artifacts/scenarios/{}/{}",
-                AdvancedMountedKind::SparseRange.name(),
-                artifact
-            ),
-            "missing": diagnostics.missing,
-            "clients": diagnostics.clients,
-        }),
-    )?;
-    log.write_all(b"\n")?;
+    let mut buffer = serde_json::to_vec(&json!({
+        "run_id": context.run_id,
+        "scenario": AdvancedMountedKind::SparseRange.name(),
+        "operation": "sparse_timeout_diagnostics",
+        "label": label,
+        "path": diagnostics.sparse_path,
+        "logical_size": diagnostics.logical_size,
+        "artifact": format!(
+            "artifacts/scenarios/{}/{}",
+            AdvancedMountedKind::SparseRange.name(),
+            artifact
+        ),
+        "missing": diagnostics.missing,
+        "clients": diagnostics.clients,
+    }))?;
+    buffer.push(b'\n');
+    log.write_all(&buffer)?;
     Ok(())
 }
 

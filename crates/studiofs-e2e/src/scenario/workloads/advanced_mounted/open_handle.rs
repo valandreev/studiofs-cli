@@ -264,6 +264,7 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
+        let mut stderr_reader = drain_child_stderr(&mut child);
         write_hotspot_helper_process_metadata(
             context,
             child.id(),
@@ -275,6 +276,7 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
             ScenarioError::Io(io::Error::new(
                 error.kind(),
                 format!("failed to isolate open handle helper process: {error}"),
@@ -285,16 +287,10 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
         loop {
             if let Some(status) = child.try_wait()? {
                 if status.success() {
+                    let _ = collect_child_stderr(&mut stderr_reader);
                     return Ok(());
                 }
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut stderr| {
-                        let mut output = String::new();
-                        stderr.read_to_string(&mut output).ok().map(|_| output)
-                    })
-                    .unwrap_or_default();
+                let stderr = collect_child_stderr(&mut stderr_reader);
                 let progress = read_hotspot_helper_progress_tail(&progress_path);
                 return Err(ScenarioError::Io(io::Error::other(format!(
                     "open handle helper failed for {pending_label}: status={status}; stderr={}; progress={}",
@@ -429,10 +425,12 @@ pub(in crate::scenario) fn run_sparse_helper_process(
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
+        let mut stderr_reader = drain_child_stderr(&mut child);
         write_hotspot_helper_process_metadata(context, child.id(), client, operation, path, None)?;
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
             ScenarioError::Io(io::Error::new(
                 error.kind(),
                 format!("failed to isolate sparse helper process: {error}"),
@@ -443,16 +441,10 @@ pub(in crate::scenario) fn run_sparse_helper_process(
         loop {
             if let Some(status) = child.try_wait()? {
                 if status.success() {
+                    let _ = collect_child_stderr(&mut stderr_reader);
                     return Ok(());
                 }
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut stderr| {
-                        let mut output = String::new();
-                        stderr.read_to_string(&mut output).ok().map(|_| output)
-                    })
-                    .unwrap_or_default();
+                let stderr = collect_child_stderr(&mut stderr_reader);
                 let progress = read_hotspot_helper_progress_tail(&progress_path);
                 return Err(ScenarioError::Io(io::Error::other(format!(
                     "sparse helper failed for {pending_label}: status={status}; stderr={}; progress={}",

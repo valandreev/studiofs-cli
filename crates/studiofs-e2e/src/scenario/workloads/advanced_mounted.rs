@@ -52,6 +52,29 @@ impl ScenarioIsolation {
     }
 }
 
+#[cfg(not(test))]
+pub(in crate::scenario) fn drain_child_stderr(
+    child: &mut std::process::Child,
+) -> Option<std::thread::JoinHandle<String>> {
+    child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut output);
+            output
+        })
+    })
+}
+
+#[cfg(not(test))]
+pub(in crate::scenario) fn collect_child_stderr(
+    stderr_reader: &mut Option<std::thread::JoinHandle<String>>,
+) -> String {
+    stderr_reader
+        .take()
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::scenario) enum AdvancedMountedKind {
     CrashBeforeWriteAcceptance,

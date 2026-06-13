@@ -384,6 +384,7 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
+        let mut stderr_reader = drain_child_stderr(&mut child);
         write_hotspot_helper_process_metadata(
             context,
             child.id(),
@@ -395,6 +396,7 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = collect_child_stderr(&mut stderr_reader);
             ScenarioError::Io(io::Error::new(
                 error.kind(),
                 format!("failed to isolate hotspot helper process: {error}"),
@@ -405,16 +407,10 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
         loop {
             if let Some(status) = child.try_wait()? {
                 if status.success() {
+                    let _ = collect_child_stderr(&mut stderr_reader);
                     return Ok(());
                 }
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut stderr| {
-                        let mut output = String::new();
-                        stderr.read_to_string(&mut output).ok().map(|_| output)
-                    })
-                    .unwrap_or_default();
+                let stderr = collect_child_stderr(&mut stderr_reader);
                 let progress = read_hotspot_helper_progress_tail(&progress_path);
                 let progress_suffix = progress
                     .as_ref()
