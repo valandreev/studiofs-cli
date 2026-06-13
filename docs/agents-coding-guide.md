@@ -28,6 +28,17 @@ This file stores detailed project instructions that do not belong in the root `A
   broad Clippy groups such as `all`, `pedantic`, `unwrap_used`, or
   `expect_used` across the workspace unless that cleanup is planned and
   validated separately.
+- Production no-panic policy is enforced incrementally by
+  `crates/studiofs/tests/production_lint_policy_test.rs`. It scans scoped
+  production runtime files, strips `#[cfg(test)]` items, and requires any
+  remaining `unwrap`, `expect`, or `panic!` site to carry a local
+  `#[expect(clippy::<lint>, reason = "...")]` rationale. Add new production
+  files to that test as they are cleaned up; do not expand it to test helpers
+  or fixture-only sources.
+- Crates without unsafe requirements should use `#![forbid(unsafe_code)]`.
+  Bridge crates that are platform or FFI boundaries must keep unsafe scopes
+  narrow and document each boundary with `SAFETY:` comments when unsafe code is
+  introduced.
 - Prefer domain errors with `thiserror` for library code:
   - `pub enum <ErrorName> { ... }`
 - Use `Result<T, E>` for recoverable failures, avoid panics in library logic.

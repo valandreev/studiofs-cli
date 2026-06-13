@@ -5,6 +5,8 @@
 //! metadata, xattr flags, Unicode normalization, and cache policy stay in the
 //! concrete bridge crates.
 
+#![forbid(unsafe_code)]
+
 #[cfg(unix)]
 /// POSIX bridge conversions shared by Unix bridge adapters.
 pub mod posix;

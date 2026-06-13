@@ -1,5 +1,7 @@
 //! Shared logical scenario operation model for E2E artifacts and simulation.
 
+#![forbid(unsafe_code)]
+
 pub mod client;
 pub mod collision;
 pub mod crash_replay;

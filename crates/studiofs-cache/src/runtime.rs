@@ -36,6 +36,9 @@ pub mod file_payload_store;
 pub mod layout;
 /// Platform-specific helpers used by the local payload runtime.
 #[path = "payload_platform.rs"]
+// SAFETY: This module owns the Windows disk-alignment FFI boundary for
+// unbuffered local payload writes and documents each unsafe call locally.
+#[allow(unsafe_code)]
 pub mod platform;
 /// Startup reconciliation logic for repairing on-disk cache artifacts.
 #[path = "startup_recovery.rs"]

@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use smallvec::{SmallVec, smallvec};
@@ -190,10 +190,59 @@ impl SharedTracker {
     }
 
     fn record_barrier_wait(&self, elapsed: std::time::Duration) {
+        self.lock_admission().record_barrier_wait(elapsed);
+    }
+
+    fn lock_admission(&self) -> MutexGuard<'_, GlobalAdmissionState> {
+        // INVARIANT: pending write admission is only mutated while holding this
+        // mutex; poisoning means a prior holder panicked while the tracker was
+        // mid-mutation, so continuing could corrupt write admission accounting.
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned write admission"
+        )]
         self.admission
             .lock()
             .expect("pending write admission poisoned")
-            .record_barrier_wait(elapsed);
+    }
+
+    fn wait_admission<'a>(
+        &self,
+        admission: MutexGuard<'a, GlobalAdmissionState>,
+    ) -> MutexGuard<'a, GlobalAdmissionState> {
+        // INVARIANT: condvar wait returns the same admission mutex; poisoning is
+        // the same fail-closed accounting condition as lock acquisition.
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned write admission"
+        )]
+        self.admission_changed
+            .wait(admission)
+            .expect("pending write admission poisoned")
+    }
+}
+
+impl TrackerShard {
+    fn lock_state(&self) -> MutexGuard<'_, TrackerState> {
+        // INVARIANT: shard state owns pending sequence, lifecycle, and sticky
+        // error bookkeeping; after poisoning we cannot safely infer write order.
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned pending write shard"
+        )]
+        self.state.lock().expect("pending write tracker poisoned")
+    }
+
+    fn wait_state<'a>(&self, state: MutexGuard<'a, TrackerState>) -> MutexGuard<'a, TrackerState> {
+        // INVARIANT: condvar wait returns the same shard mutex; poisoning means
+        // the pending-write state may have been left inconsistent.
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned pending write shard"
+        )]
+        self.writes_changed
+            .wait(state)
+            .expect("pending write tracker poisoned")
     }
 }
 
@@ -245,11 +294,7 @@ impl PendingWriteTracker {
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         let mut wait_started = None;
         loop {
-            let mut admission = self
-                .shared
-                .admission
-                .lock()
-                .expect("pending write admission poisoned");
+            let mut admission = self.shared.lock_admission();
             let shard_index = SharedTracker::shard_index(ino);
             let shard = &self.shared.shards[shard_index];
             while admission.global_error(bytes, limits)
@@ -258,13 +303,9 @@ impl PendingWriteTracker {
                 if wait_started.is_none() {
                     wait_started = Some(Instant::now());
                 }
-                admission = self
-                    .shared
-                    .admission_changed
-                    .wait(admission)
-                    .expect("pending write admission poisoned");
+                admission = self.shared.wait_admission(admission);
             }
-            let mut state = shard.state.lock().expect("pending write tracker poisoned");
+            let mut state = shard.lock_state();
             if state.per_handle_admission_error((ino, fh), bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
@@ -272,10 +313,7 @@ impl PendingWriteTracker {
                 if wait_started.is_none() {
                     wait_started = Some(Instant::now());
                 }
-                let state = shard
-                    .writes_changed
-                    .wait(state)
-                    .expect("pending write tracker poisoned");
+                let state = shard.wait_state(state);
                 drop(state);
                 continue;
             }
@@ -294,11 +332,7 @@ impl PendingWriteTracker {
     }
 
     pub(super) fn admission_metrics(&self) -> PendingWriteAdmissionMetrics {
-        let admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("pending write admission poisoned");
+        let admission = self.shared.lock_admission();
         PendingWriteAdmissionMetrics {
             waits: admission.admission_waits,
             wait_ns: admission.admission_wait_ns,
@@ -306,11 +340,7 @@ impl PendingWriteTracker {
     }
 
     pub(super) fn snapshot(&self) -> PendingWriteTrackerSnapshot {
-        let admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("pending write admission poisoned");
+        let admission = self.shared.lock_admission();
         PendingWriteTrackerSnapshot {
             mutation_generation: admission.mutation_generation,
             pending_writes: admission.total_pending_writes,
@@ -327,11 +357,7 @@ impl PendingWriteTracker {
     }
 
     fn barrier_metrics(&self) -> PendingWriteBarrierMetrics {
-        let admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("pending write admission poisoned");
+        let admission = self.shared.lock_admission();
         PendingWriteBarrierMetrics {
             waits: admission.barrier_waits,
             wait_ns: admission.barrier_wait_ns,
@@ -345,17 +371,13 @@ impl PendingWriteTracker {
         bytes: usize,
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
-        let mut admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("pending write admission poisoned");
+        let mut admission = self.shared.lock_admission();
         if let Some(error) = admission.global_error(bytes, limits) {
             return Err(error);
         }
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         if let Some(error) = state.per_handle_admission_error((ino, fh), bytes, limits) {
             return Err(error);
         }
@@ -407,7 +429,7 @@ impl PendingWriteTracker {
     pub(super) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         let (sequence, generation) = state
             .inodes
             .get(&ino)
@@ -428,7 +450,7 @@ impl PendingWriteTracker {
     pub(super) fn inode_barrier(&self, ino: Ino) -> PendingWriteBarrier {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         let targets: SmallVec<[BarrierTarget; 1]> = state
             .inodes
             .get(&ino)
@@ -462,7 +484,7 @@ impl PendingWriteTracker {
     ) -> Result<PendingWriteBarrier, WriteRegistrationError> {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         let generation = state.inode_generation(ino);
         let target = {
             let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
@@ -486,7 +508,7 @@ impl PendingWriteTracker {
 
     pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
         let shard = self.shared.shard_for_inode(ino);
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         if let Some(handles) = state.inodes.get_mut(&ino) {
             match handles.get_mut(&fh) {
                 Some(handle) if handle.pending.is_empty() => {
@@ -523,7 +545,7 @@ impl PendingWriteTurn {
     pub(super) async fn wait(mut self) {
         let shard = &self.shared.shards[self.shard_index];
         {
-            let state = shard.state.lock().expect("pending write tracker poisoned");
+            let state = shard.lock_state();
             if state.is_registration_turn(self.key, self.sequence) {
                 return;
             }
@@ -541,7 +563,7 @@ impl PendingWriteRegistration {
         }
 
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         let mut should_remove_closed_handle = false;
         let mut next_turn = None;
         let mut inode_sticky_error = None;
@@ -587,11 +609,7 @@ impl PendingWriteRegistration {
             state.remove_handle(self.key);
         }
         drop(state);
-        let mut admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("pending write admission poisoned");
+        let mut admission = self.shared.lock_admission();
         admission.total_pending_bytes = admission.total_pending_bytes.saturating_sub(self.bytes);
         admission.total_pending_writes = admission.total_pending_writes.saturating_sub(1);
         match completion {
@@ -629,20 +647,17 @@ impl Drop for PendingWriteRegistration {
 impl PendingWriteBarrier {
     pub(super) fn is_ready(&self) -> bool {
         let shard = &self.shared.shards[self.shard_index];
-        let state = shard.state.lock().expect("pending write tracker poisoned");
+        let state = shard.lock_state();
         barrier_ready(&state, &self.targets)
     }
 
     pub(super) fn wait(&self) -> Result<(), i32> {
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         let mut waited_since = None;
         while !barrier_ready(&state, &self.targets) {
             waited_since.get_or_insert_with(Instant::now);
-            state = shard
-                .writes_changed
-                .wait(state)
-                .expect("pending write tracker poisoned");
+            state = shard.wait_state(state);
         }
         if let Some(started) = waited_since {
             self.shared.record_barrier_wait(started.elapsed());
@@ -674,7 +689,7 @@ impl PendingWriteBarrier {
 
     fn new_enabled_async_notification(&self) -> AsyncBarrierWait {
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         if barrier_ready(&state, &self.targets) {
             return AsyncBarrierWait::Ready(
                 barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err),
@@ -690,7 +705,7 @@ impl PendingWriteBarrier {
         mut notified: Pin<&mut OwnedNotified>,
     ) -> Option<Result<(), i32>> {
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         if barrier_ready(&state, &self.targets) {
             return Some(
                 barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err),
@@ -713,7 +728,7 @@ impl Drop for PendingWriteBarrier {
             return;
         }
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut state = shard.lock_state();
         for (key, _, generation) in &self.targets {
             state.decrement_barrier_count(key.0, *generation);
             state.remove_async_write_notifier_if_unused(key.0);
@@ -908,10 +923,14 @@ impl TrackerState {
     }
 
     fn async_write_notifier(&mut self, targets: &[BarrierTarget]) -> Arc<Notify> {
-        let ino = targets
+        #[expect(
+            clippy::expect_used,
+            reason = "caller only enables async wait after a non-empty barrier target check"
+        )]
+        let (key, _, _) = targets
             .first()
-            .map(|(key, _, _)| key.0)
             .expect("pending write barrier targets must not be empty while waiting");
+        let ino = key.0;
         Arc::clone(
             self.async_write_notifiers
                 .entry(ino)

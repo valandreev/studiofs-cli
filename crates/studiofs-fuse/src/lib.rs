@@ -12,7 +12,7 @@
 mod fs;
 
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -234,7 +234,7 @@ struct SignalWatcher {
 
 impl SignalWatcher {
     fn restore_handlers(&self) {
-        let _ = self.handlers.lock().expect("signal handler lock").take();
+        let _ = lock_signal_handlers(&self.handlers).take();
     }
 }
 
@@ -279,7 +279,7 @@ fn spawn_signal_watcher(
             }
             SHUTDOWN_REQUESTED.store(true, Ordering::Release);
             tracing::info!("received shutdown request, unmounting {mp} …");
-            let _ = watcher_handlers.lock().expect("signal handler lock").take();
+            let _ = lock_signal_handlers(&watcher_handlers).take();
             let _ = unmount.unmount();
         })?;
     Ok(SignalWatcher {
@@ -287,6 +287,19 @@ fn spawn_signal_watcher(
         handlers,
         thread: Some(thread),
     })
+}
+
+fn lock_signal_handlers(
+    handlers: &Mutex<Option<CliSignalHandlers>>,
+) -> MutexGuard<'_, Option<CliSignalHandlers>> {
+    // INVARIANT: this lock owns process signal-handler installation state.
+    // If a holder panicked mid-restore, continuing could leave handlers leaked
+    // or restored in the wrong order, so the FUSE backend fails closed.
+    #[expect(
+        clippy::expect_used,
+        reason = "fail closed on poisoned signal handler state"
+    )]
+    handlers.lock().expect("signal handler lock")
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
