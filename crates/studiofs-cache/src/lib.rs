@@ -6,6 +6,8 @@
 //! by `studiofs test-cache`.
 //! `runtime` provides the production local payload object backend.
 
+#![deny(unsafe_code)]
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

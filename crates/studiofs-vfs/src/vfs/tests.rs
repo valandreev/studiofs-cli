@@ -4081,11 +4081,15 @@ fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
 
         vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend logical EOF before deferred sparse tail materializes");
-        let grown_attr = meta.get_attr(ino).expect("load grown attr");
+        let grown_attr = vfs.getattr(ino).expect("load grown attr");
         assert_eq!(grown_attr.size, logical_size);
 
         drop(guard);
         vfs.finish_deferred_materialization_task(entry, true);
+        vfs.wait_for_deferred_materialization_inflight(ino).await;
+        vfs.flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("background local-dirty flush should commit deferred sparse slices");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let pending_offsets = vfs

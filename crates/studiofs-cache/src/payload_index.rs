@@ -1551,6 +1551,10 @@ fn touch_access_lru_cap() -> NonZeroUsize {
         .max(1);
     // A capacity of zero is never valid for LruCache; we clamp to 1 so behavior
     // stays defined even under pathological tuning values.
+    #[expect(
+        clippy::expect_used,
+        reason = "capacity is clamped to a non-zero value"
+    )]
     NonZeroUsize::new(cap).expect("touch access LRU capacity must be non-zero")
 }
 

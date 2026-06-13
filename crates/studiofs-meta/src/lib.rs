@@ -3,6 +3,7 @@
 //! Provides metadata storage for the virtual filesystem using redb as the embedded KV store.
 //! All filesystem structure (inodes, directory entries, chunk/slice mappings) is managed here.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 /// Async adapters for invoking synchronous metadata capabilities from Tokio.

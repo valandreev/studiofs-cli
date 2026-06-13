@@ -180,7 +180,12 @@ pub(crate) fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
 
 pub(crate) fn ensure_winfsp_runtime_loaded_or_panic() {
     if let Err(err) = ensure_winfsp_runtime_loaded() {
-        panic!("WinFSP runtime preload failed before using WinFSP FFI types: {err}");
+        // INVARIANT: WinFSP FFI types must not be used unless the runtime DLL
+        // is loaded first; this wrapper exists for call sites that cannot
+        // return a typed preload error before touching WinFSP.
+        std::panic::panic_any(format!(
+            "WinFSP runtime preload failed before using WinFSP FFI types: {err}"
+        ));
     }
 }
 
