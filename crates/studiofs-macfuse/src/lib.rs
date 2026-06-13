@@ -726,6 +726,58 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_queued_read_does_not_clone_shared_state_for_guard() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-shared")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"shared.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"shared macFUSE read"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            7,
+        );
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        let held_capacity = adapter.hold_read_capacity_for_test(7);
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
+            .expect("read should wait for bounded queue capacity");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while adapter.hot_path_shared_state_arc_count_for_test() == 1
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let guard_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while adapter.hot_path_shared_state_arc_count_for_test() < 3
+            && std::time::Instant::now() < guard_deadline
+        {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 2);
+
+        drop(held_capacity);
+        let bytes = queued.wait().expect("queued read should complete");
+        assert_eq!(&bytes[..], b"shared ");
+    }
+
+    #[test]
     fn read_only_adapter_canceled_queued_read_skips_vfs_work() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-async-read-canceled-before-vfs",

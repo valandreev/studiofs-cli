@@ -26,7 +26,7 @@ use studiofs_vfs::{
     VfsMacFuseOpenCacheDecision,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -86,7 +86,7 @@ pub(crate) struct StudioVfsAdapter {
 #[derive(Debug)]
 struct AdapterSharedState {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    read_admission: Arc<Semaphore>,
+    read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: AsyncReadDiagnostics,
@@ -717,15 +717,15 @@ enum AsyncReadOutcome {
     Canceled,
 }
 
-struct AsyncReadTaskGuard {
+struct AsyncReadTaskGuard<'a> {
     size: u32,
-    shared: Arc<AdapterSharedState>,
-    vfs: Arc<StudioVfs>,
+    shared: &'a AdapterSharedState,
+    vfs: &'a StudioVfs,
     outcome: AsyncReadOutcome,
 }
 
-impl AsyncReadTaskGuard {
-    fn new(size: u32, shared: Arc<AdapterSharedState>, vfs: Arc<StudioVfs>) -> Self {
+impl<'a> AsyncReadTaskGuard<'a> {
+    fn new(size: u32, shared: &'a AdapterSharedState, vfs: &'a StudioVfs) -> Self {
         shared.read_diagnostics.on_queued(size);
         Self {
             size,
@@ -740,7 +740,7 @@ impl AsyncReadTaskGuard {
     }
 }
 
-impl Drop for AsyncReadTaskGuard {
+impl Drop for AsyncReadTaskGuard<'_> {
     fn drop(&mut self) {
         let pending_reads = self
             .shared
@@ -748,7 +748,7 @@ impl Drop for AsyncReadTaskGuard {
             .on_finished(self.size, self.outcome);
         self.shared
             .read_diagnostics
-            .publish_snapshot_after_finish(&self.vfs, pending_reads);
+            .publish_snapshot_after_finish(self.vfs, pending_reads);
     }
 }
 
@@ -846,7 +846,7 @@ impl StudioVfsAdapter {
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
                 ))),
-                read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
+                read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
@@ -880,9 +880,9 @@ impl StudioVfsAdapter {
     pub(crate) fn hold_read_capacity_for_test(
         &self,
         bytes: u32,
-    ) -> tokio::sync::OwnedSemaphorePermit {
+    ) -> tokio::sync::SemaphorePermit<'_> {
         self.runtime_handle
-            .block_on(self.shared.read_admission.clone().acquire_many_owned(bytes))
+            .block_on(self.shared.read_admission.acquire_many(bytes))
             .expect("test read capacity should be available")
     }
 
@@ -1279,7 +1279,7 @@ impl StudioVfsAdapter {
     }
 
     async fn perform_read(
-        state: ReadExecutionState,
+        state: &ReadExecutionState,
         request: ReadExecutionRequest,
         started: Instant,
         cancellation: ReadCancellationToken,
@@ -1398,11 +1398,8 @@ impl StudioVfsAdapter {
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
             let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-            let mut read_guard = AsyncReadTaskGuard::new(
-                admission_bytes,
-                Arc::clone(&state.shared),
-                Arc::clone(&state.vfs),
-            );
+            let mut read_guard =
+                AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
                 log_callback_error("read", MACFUSE_READ_INTERRUPTED_ERRNO);
@@ -1410,7 +1407,7 @@ impl StudioVfsAdapter {
                 return;
             }
             let _permit = match acquire_read_admission(
-                Arc::clone(&state.shared.read_admission),
+                &state.shared.read_admission,
                 admission_bytes,
                 &read_guard.shared.read_diagnostics,
                 &cancellation,
@@ -1442,7 +1439,7 @@ impl StudioVfsAdapter {
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
             match Self::perform_read(
-                state,
+                &state,
                 ReadExecutionRequest {
                     ino,
                     file_handle,
@@ -1503,17 +1500,14 @@ impl StudioVfsAdapter {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
                 let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                let mut read_guard = AsyncReadTaskGuard::new(
-                    admission_bytes,
-                    Arc::clone(&state.shared),
-                    Arc::clone(&state.vfs),
-                );
+                let mut read_guard =
+                    AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                 if cancellation.is_cancelled() {
                     read_guard.finish_with(AsyncReadOutcome::Canceled);
                     return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
                 let _permit = acquire_read_admission(
-                    Arc::clone(&state.shared.read_admission),
+                    &state.shared.read_admission,
                     admission_bytes,
                     &read_guard.shared.read_diagnostics,
                     &cancellation,
@@ -1528,7 +1522,7 @@ impl StudioVfsAdapter {
                     read_guard.finish_with(outcome);
                 })?;
                 let result = Self::perform_read(
-                    state,
+                    &state,
                     ReadExecutionRequest {
                         ino,
                         file_handle,
@@ -1576,17 +1570,14 @@ impl StudioVfsAdapter {
                 runtime_handle: self.runtime_handle.clone(),
                 handle: self.runtime_handle.spawn(async move {
                     let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                    let mut read_guard = AsyncReadTaskGuard::new(
-                        admission_bytes,
-                        Arc::clone(&state.shared),
-                        Arc::clone(&state.vfs),
-                    );
+                    let mut read_guard =
+                        AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                     if worker_cancellation.is_cancelled() {
                         read_guard.finish_with(AsyncReadOutcome::Canceled);
                         return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                     }
                     let _permit = acquire_read_admission(
-                        Arc::clone(&state.shared.read_admission),
+                        &state.shared.read_admission,
                         admission_bytes,
                         &read_guard.shared.read_diagnostics,
                         &worker_cancellation,
@@ -1601,7 +1592,7 @@ impl StudioVfsAdapter {
                         read_guard.finish_with(outcome);
                     })?;
                     let result = Self::perform_read(
-                        state,
+                        &state,
                         ReadExecutionRequest {
                             ino,
                             file_handle,
@@ -3615,13 +3606,13 @@ fn macfuse_set_xattr_flags(name: &[u8], flags: u32) -> u32 {
     }
 }
 
-async fn acquire_read_admission(
-    admission: Arc<Semaphore>,
+async fn acquire_read_admission<'a>(
+    admission: &'a Semaphore,
     size: u32,
     diagnostics: &AsyncReadDiagnostics,
     cancellation: &ReadCancellationToken,
-) -> Result<OwnedSemaphorePermit, i32> {
-    match Arc::clone(&admission).try_acquire_many_owned(size) {
+) -> Result<SemaphorePermit<'a>, i32> {
+    match admission.try_acquire_many(size) {
         Ok(permit) => return Ok(permit),
         Err(tokio::sync::TryAcquireError::Closed) => return Err(libc::EIO),
         Err(tokio::sync::TryAcquireError::NoPermits) => {}
@@ -3629,7 +3620,7 @@ async fn acquire_read_admission(
 
     let admission_started = Instant::now();
     tokio::select! {
-        permit = admission.acquire_many_owned(size) => {
+        permit = admission.acquire_many(size) => {
             let permit = permit.map_err(|_| libc::EIO)?;
             diagnostics.on_admitted(admission_started.elapsed());
             Ok(permit)

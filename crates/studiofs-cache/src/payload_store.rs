@@ -93,7 +93,7 @@ struct PayloadStoreSharedState {
     read_handles: ReadHandleCache,
     pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
-    write_counters: Arc<PayloadWriteCounters>,
+    write_counters: PayloadWriteCounters,
     barrier_counters: SyncBarrierCounters,
 }
 
@@ -134,7 +134,7 @@ impl FilePayloadStore {
                 },
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
-                write_counters: Arc::new(PayloadWriteCounters::default()),
+                write_counters: PayloadWriteCounters::default(),
                 barrier_counters: SyncBarrierCounters::default(),
             }),
         })
@@ -862,7 +862,7 @@ impl FilePayloadStore {
     }
 
     #[cfg(test)]
-    fn enter_test_staging_probe(&self) -> TestStagingProbeGuard {
+    fn enter_test_staging_probe(&self) -> TestStagingProbeGuard<'_> {
         let active = self
             .shared
             .write_counters
@@ -879,7 +879,7 @@ impl FilePayloadStore {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         TestStagingProbeGuard {
-            counters: Arc::clone(&self.shared.write_counters),
+            counters: &self.shared.write_counters,
         }
     }
 
@@ -1210,12 +1210,12 @@ struct PayloadWriteSnapshot {
 }
 
 #[cfg(test)]
-struct TestStagingProbeGuard {
-    counters: Arc<PayloadWriteCounters>,
+struct TestStagingProbeGuard<'a> {
+    counters: &'a PayloadWriteCounters,
 }
 
 #[cfg(test)]
-impl Drop for TestStagingProbeGuard {
+impl Drop for TestStagingProbeGuard<'_> {
     fn drop(&mut self) {
         self.counters
             .active_staging_writes
