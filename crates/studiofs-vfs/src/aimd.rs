@@ -156,13 +156,12 @@ impl AimdController {
             // pattern to avoid lost wake-ups with `tokio::sync::Notify`.
             let notified = self.notify.notified();
             {
-                let now = Instant::now();
                 let mut st = self.state.lock();
-                revalidate_idle_locked(&mut st, now);
+                let now = revalidate_idle_if_enabled_locked(&mut st);
                 let limit = effective_limit_from_state(&st);
                 if st.in_flight < limit {
                     st.in_flight += 1;
-                    st.last_activity = now;
+                    update_last_activity_if_enabled(&mut st, now);
                     return AimdPermit {
                         controller: self,
                         resolved: false,
@@ -176,13 +175,12 @@ impl AimdController {
     /// Non-blocking attempt to acquire a permit.  Returns `None` if the
     /// window is fully utilised.
     pub fn try_acquire(&self) -> Option<AimdPermit<'_>> {
-        let now = Instant::now();
         let mut st = self.state.lock();
-        revalidate_idle_locked(&mut st, now);
+        let now = revalidate_idle_if_enabled_locked(&mut st);
         let limit = effective_limit_from_state(&st);
         if st.in_flight < limit {
             st.in_flight += 1;
-            st.last_activity = now;
+            update_last_activity_if_enabled(&mut st, now);
             Some(AimdPermit {
                 controller: self,
                 resolved: false,
@@ -207,12 +205,11 @@ impl AimdController {
     /// Record a successful completion and release one in-flight slot.
     fn on_success(&self) {
         self.successes.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
         let grew;
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
-            st.last_activity = now;
+            update_last_activity_if_enabled(&mut st, None);
             let old_floor = floor_to_usize(st.window);
             st.window = (st.window + st.increase_step).min(st.max_window);
             let new_floor = floor_to_usize(st.window);
@@ -253,11 +250,10 @@ impl AimdController {
     /// the window.  Used by the `Drop` impl when the caller forgets to
     /// call `success()` / `failure()`.
     fn release(&self) {
-        let now = Instant::now();
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
-            st.last_activity = now;
+            update_last_activity_if_enabled(&mut st, None);
         }
         self.notify.notify_one();
     }
@@ -266,9 +262,8 @@ impl AimdController {
 
     /// Current window size (float), after applying any pending idle reset.
     pub fn window(&self) -> f64 {
-        let now = Instant::now();
         let mut st = self.state.lock();
-        revalidate_idle_locked(&mut st, now);
+        revalidate_idle_if_enabled_locked(&mut st);
         st.window
     }
 
@@ -282,9 +277,8 @@ impl AimdController {
     /// The returned value is the floor of the current window, clamped to
     /// `min_window`.
     pub fn effective_limit(&self) -> usize {
-        let now = Instant::now();
         let mut st = self.state.lock();
-        revalidate_idle_locked(&mut st, now);
+        revalidate_idle_if_enabled_locked(&mut st);
         effective_limit_from_state(&st)
     }
 
@@ -318,6 +312,19 @@ fn sanitize_window_max(raw_max_window: f64, min_window: f64) -> f64 {
 fn revalidate_idle_locked(st: &mut AimdState, now: Instant) {
     let idle_for = now.saturating_duration_since(st.last_activity);
     revalidate_idle_duration_locked(st, idle_for);
+}
+
+fn revalidate_idle_if_enabled_locked(st: &mut AimdState) -> Option<Instant> {
+    st.idle_reset_after?;
+    let now = Instant::now();
+    revalidate_idle_locked(st, now);
+    Some(now)
+}
+
+fn update_last_activity_if_enabled(st: &mut AimdState, now: Option<Instant>) {
+    if st.idle_reset_after.is_some() {
+        st.last_activity = now.unwrap_or_else(Instant::now);
+    }
 }
 
 fn revalidate_idle_duration_locked(st: &mut AimdState, idle_for: Duration) {
