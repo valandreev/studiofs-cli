@@ -101,15 +101,33 @@ fn collect_panic_policy_violations(path: &str, contents: &str) -> Vec<String> {
 
 fn has_local_expect_reason(contents: &str, line_index: usize, lint: &str) -> bool {
     let lines = contents.lines().collect::<Vec<_>>();
-    let mut start = line_index;
-    while start > 0 {
-        let previous = lines[start - 1].trim();
-        if previous.ends_with(';') || previous == "}" || previous == "}," {
+    let current_statement = lines[line_index];
+    if current_statement.contains("#[expect(")
+        && current_statement.contains(&format!("clippy::{lint}"))
+        && current_statement.contains("reason =")
+    {
+        return true;
+    }
+
+    let prior_violation_needle = match lint {
+        "unwrap_used" => ".unwrap(",
+        "expect_used" => ".expect(",
+        "panic" => "panic!",
+        _ => return false,
+    };
+    let mut window = Vec::new();
+    for previous in lines[..line_index].iter().rev().take(16) {
+        let trimmed = previous.trim();
+        if trimmed.contains(prior_violation_needle) {
             break;
         }
-        start -= 1;
+        window.push(trimmed);
+        if trimmed.starts_with("#[expect(") {
+            break;
+        }
     }
-    let window = lines[start..=line_index].join(" ");
+    window.reverse();
+    let window = window.join(" ");
     window.contains("#[expect(")
         && window.contains(&format!("clippy::{lint}"))
         && window.contains("reason =")
@@ -230,6 +248,21 @@ fn expect_reason_covers_multiline_statement_chain() {
 self.state
     .lock()
     .expect("state poisoned")
+"#;
+
+    let violations = collect_panic_policy_violations("sample.rs", contents);
+
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+#[test]
+fn expect_reason_covers_block_expression_with_internal_semicolon() {
+    let contents = r#"
+#[expect(clippy::expect_used, reason = "block expression validates state")]
+let value = {
+    prepare();
+    result.expect("validated result")
+};
 "#;
 
     let violations = collect_panic_policy_violations("sample.rs", contents);
