@@ -596,16 +596,52 @@ impl ReadCancellationToken {
 struct AsyncReadDiagnostics {
     started_at: Instant,
     max_pending_bytes: usize,
-    pending_reads: AtomicUsize,
-    pending_bytes: AtomicUsize,
-    peak_pending_reads: AtomicUsize,
-    peak_pending_bytes: AtomicUsize,
-    completed_reads: AtomicU64,
-    failed_reads: AtomicU64,
-    canceled_reads: AtomicU64,
-    admission_waits: AtomicU64,
-    admission_wait_total_ns: AtomicU64,
-    last_snapshot_publish_ns: AtomicU64,
+    pending_reads: CachePaddedAtomicUsize,
+    pending_bytes: CachePaddedAtomicUsize,
+    peak_pending_reads: CachePaddedAtomicUsize,
+    peak_pending_bytes: CachePaddedAtomicUsize,
+    completed_reads: CachePaddedAtomicU64,
+    failed_reads: CachePaddedAtomicU64,
+    canceled_reads: CachePaddedAtomicU64,
+    admission_waits: CachePaddedAtomicU64,
+    admission_wait_total_ns: CachePaddedAtomicU64,
+    last_snapshot_publish_ns: CachePaddedAtomicU64,
+}
+
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct CachePaddedAtomicUsize(AtomicUsize);
+
+impl CachePaddedAtomicUsize {
+    fn new(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+}
+
+impl Deref for CachePaddedAtomicUsize {
+    type Target = AtomicUsize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct CachePaddedAtomicU64(AtomicU64);
+
+impl CachePaddedAtomicU64 {
+    fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+}
+
+impl Deref for CachePaddedAtomicU64 {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl AsyncReadDiagnostics {
@@ -613,16 +649,16 @@ impl AsyncReadDiagnostics {
         Self {
             started_at: Instant::now(),
             max_pending_bytes,
-            pending_reads: AtomicUsize::new(0),
-            pending_bytes: AtomicUsize::new(0),
-            peak_pending_reads: AtomicUsize::new(0),
-            peak_pending_bytes: AtomicUsize::new(0),
-            completed_reads: AtomicU64::new(0),
-            failed_reads: AtomicU64::new(0),
-            canceled_reads: AtomicU64::new(0),
-            admission_waits: AtomicU64::new(0),
-            admission_wait_total_ns: AtomicU64::new(0),
-            last_snapshot_publish_ns: AtomicU64::new(0),
+            pending_reads: CachePaddedAtomicUsize::new(0),
+            pending_bytes: CachePaddedAtomicUsize::new(0),
+            peak_pending_reads: CachePaddedAtomicUsize::new(0),
+            peak_pending_bytes: CachePaddedAtomicUsize::new(0),
+            completed_reads: CachePaddedAtomicU64::new(0),
+            failed_reads: CachePaddedAtomicU64::new(0),
+            canceled_reads: CachePaddedAtomicU64::new(0),
+            admission_waits: CachePaddedAtomicU64::new(0),
+            admission_wait_total_ns: CachePaddedAtomicU64::new(0),
+            last_snapshot_publish_ns: CachePaddedAtomicU64::new(0),
         }
     }
 
@@ -3686,6 +3722,15 @@ mod tests {
             read_execution_size(u32::MAX, oversized_queue_limit),
             MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32
         );
+    }
+
+    #[test]
+    fn async_read_diagnostic_counters_are_cache_line_aligned() {
+        assert!(std::mem::align_of::<AsyncReadDiagnostics>() >= 128);
+        assert_eq!(std::mem::align_of::<CachePaddedAtomicUsize>(), 128);
+        assert_eq!(std::mem::size_of::<CachePaddedAtomicUsize>(), 128);
+        assert_eq!(std::mem::align_of::<CachePaddedAtomicU64>(), 128);
+        assert_eq!(std::mem::size_of::<CachePaddedAtomicU64>(), 128);
     }
 
     #[test]

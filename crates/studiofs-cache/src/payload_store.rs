@@ -1133,7 +1133,7 @@ impl FilePayloadStore {
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Debug)]
 struct ReadHandleCache {
     shards: [Mutex<LruCache<u64, Arc<File>>>; READ_FD_CACHE_SHARDS],
@@ -1149,7 +1149,7 @@ struct PendingGroupedSync {
 }
 
 #[cfg(test)]
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Debug, Default)]
 struct PayloadWriteCounters {
     unbuffered_write_attempts: CachePaddedAtomicU64,
@@ -1161,7 +1161,7 @@ struct PayloadWriteCounters {
     staging_delay_ms: CachePaddedAtomicU64,
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Debug, Default)]
 struct SyncBarrierCounters {
     per_put_file_sync_calls: CachePaddedAtomicU64,
@@ -1170,7 +1170,7 @@ struct SyncBarrierCounters {
     grouped_dir_sync_calls: CachePaddedAtomicU64,
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Debug, Default)]
 struct CachePaddedAtomicU64(AtomicU64);
 
@@ -1339,9 +1339,11 @@ mod tests {
 
     #[test]
     fn hot_atomic_counter_groups_are_cache_line_aligned() {
-        assert!(std::mem::align_of::<ReadHandleCache>() >= 64);
-        assert!(std::mem::align_of::<PayloadWriteCounters>() >= 64);
-        assert!(std::mem::align_of::<SyncBarrierCounters>() >= 64);
+        assert!(std::mem::align_of::<ReadHandleCache>() >= 128);
+        assert!(std::mem::align_of::<PayloadWriteCounters>() >= 128);
+        assert!(std::mem::align_of::<SyncBarrierCounters>() >= 128);
+        assert_eq!(std::mem::align_of::<CachePaddedAtomicU64>(), 128);
+        assert_eq!(std::mem::size_of::<CachePaddedAtomicU64>(), 128);
     }
 
     #[test]
