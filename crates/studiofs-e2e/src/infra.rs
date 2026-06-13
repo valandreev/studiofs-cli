@@ -1,5 +1,6 @@
 //! Docker Compose infrastructure for real E2E runs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::net::TcpListener;
@@ -1031,25 +1032,29 @@ LEFT JOIN LATERAL (
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ComposeFile<'a> {
+    #[serde(borrow, default)]
+    services: BTreeMap<&'a str, ComposeService<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeService<'a> {
+    #[serde(borrow)]
+    image: Option<&'a str>,
+}
+
 fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, serde_saphyr::Error> {
-    let document: serde_json::Value = serde_saphyr::from_str(compose)?;
-    let Some(services) = document.get("services") else {
-        return Ok(Vec::new());
-    };
-    let Some(services) = services.as_object() else {
-        return Ok(Vec::new());
-    };
-    let mut images = Vec::new();
-    for (service_name, service) in services {
-        let Some(image) = service.get("image").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        images.push(ComposeServiceImage {
-            service: service_name.to_string(),
-            image: image.to_string(),
-        });
+    let compose_file: ComposeFile<'_> = serde_saphyr::from_str(compose)?;
+    let mut images = Vec::with_capacity(compose_file.services.len());
+    for (service_name, service) in compose_file.services {
+        if let Some(image) = service.image {
+            images.push(ComposeServiceImage {
+                service: service_name.to_string(),
+                image: image.to_string(),
+            });
+        }
     }
-    images.sort_by(|left, right| left.service.cmp(&right.service));
     Ok(images)
 }
 
