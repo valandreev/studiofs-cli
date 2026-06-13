@@ -877,6 +877,14 @@ impl StudioVfsAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn pending_async_read_count_for_test(&self) -> usize {
+        self.shared
+            .read_diagnostics
+            .pending_reads
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn hold_read_capacity_for_test(
         &self,
         bytes: u32,
@@ -1390,6 +1398,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
         };
+        // CONTEXT: Guard and semaphore permit borrows below depend on this moved
+        // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
@@ -1492,6 +1502,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
         };
+        // CONTEXT: Guard and semaphore permit borrows below depend on this moved
+        // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
@@ -1559,6 +1571,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
         };
+        // CONTEXT: Guard and semaphore permit borrows below depend on this moved
+        // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();

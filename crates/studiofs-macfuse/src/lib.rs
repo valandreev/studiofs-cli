@@ -757,18 +757,21 @@ mod tests {
         let queued = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
             .expect("read should wait for bounded queue capacity");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while adapter.hot_path_shared_state_arc_count_for_test() == 1
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
-        let guard_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while adapter.hot_path_shared_state_arc_count_for_test() < 3
-            && std::time::Instant::now() < guard_deadline
-        {
-            std::thread::yield_now();
-        }
+        fixture.runtime().block_on(async {
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if adapter.pending_async_read_count_for_test() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                observed.is_ok(),
+                "queued read should publish pending diagnostics"
+            );
+        });
 
         assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 2);
 
