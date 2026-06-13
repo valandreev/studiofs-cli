@@ -84,7 +84,8 @@ fn collect_panic_policy_violations(path: &str, contents: &str) -> Vec<String> {
     // instead of extending these textual needles.
     let mut violations = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
-        if line.trim_start().starts_with("#[expect(") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("#[expect(") {
             continue;
         }
         for (needle, lint) in [
@@ -274,6 +275,19 @@ let value = {
     prepare();
     result.expect("validated result")
 };
+"#;
+
+    let violations = collect_panic_policy_violations("sample.rs", contents);
+
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+#[test]
+fn comment_only_lines_do_not_trigger_panic_policy() {
+    let contents = r#"
+// This comment mentions .unwrap( and panic! without executable code.
+/// This doc comment mentions .expect( as an example.
+let value = 1;
 "#;
 
     let violations = collect_panic_policy_violations("sample.rs", contents);
