@@ -1294,20 +1294,12 @@ impl CachedStoreWriterSlice {
 
     fn drop_prefix(&mut self, mut len: usize) {
         while len > 0 {
-            let Some(front_len) = self.pages.front().map(BytesMut::len) else {
+            let Some(front) = self.pages.front_mut() else {
                 break;
             };
+            let front_len = front.len();
             if len < front_len {
-                // INVARIANT: front_len came from the current front page.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "front length was read from the current front page"
-                )]
-                let _ = self
-                    .pages
-                    .front_mut()
-                    .expect("front page exists")
-                    .split_to(len);
+                let _ = front.split_to(len);
                 break;
             }
             self.pages.pop_front();
@@ -1323,32 +1315,26 @@ impl CachedStoreWriterSlice {
         if len == 0 {
             return Bytes::new();
         }
-        let payload = match self.pages.front().map(BytesMut::len) {
-            Some(front_len) if len == front_len => {
-                // INVARIANT: front_len came from the current front page.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "front length was read from the current front page"
-                )]
-                self.pages.pop_front().expect("front page exists").freeze()
-            }
-            Some(front_len) if len < front_len => {
-                // INVARIANT: front_len came from the current front page.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "front length was read from the current front page"
-                )]
-                self.pages
-                    .front_mut()
-                    .expect("front page exists")
-                    .split_to(len)
-                    .freeze()
-            }
-            _ => {
+        let payload = if self.pages.front().is_some_and(|front| len == front.len()) {
+            if let Some(page) = self.pages.pop_front() {
+                page.freeze()
+            } else {
                 let payload = self.copy_prefix_to_bytes(len);
                 self.drop_prefix(len);
                 payload
             }
+        } else if let Some(front) = self.pages.front_mut() {
+            if len < front.len() {
+                front.split_to(len).freeze()
+            } else {
+                let payload = self.copy_prefix_to_bytes(len);
+                self.drop_prefix(len);
+                payload
+            }
+        } else {
+            let payload = self.copy_prefix_to_bytes(len);
+            self.drop_prefix(len);
+            payload
         };
         while self.pages.front().is_some_and(BytesMut::is_empty) {
             self.pages.pop_front();

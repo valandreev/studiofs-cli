@@ -3,7 +3,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::LineColumn;
 use syn::spanned::Spanned as _;
 
 fn repo_root() -> PathBuf {
@@ -102,8 +101,15 @@ fn collect_panic_policy_violations(path: &str, contents: &str) -> Vec<String> {
 
 fn has_local_expect_reason(contents: &str, line_index: usize, lint: &str) -> bool {
     let lines = contents.lines().collect::<Vec<_>>();
-    let start = line_index.saturating_sub(8);
-    let window = lines[start..line_index].join(" ");
+    let mut start = line_index;
+    while start > 0 {
+        let previous = lines[start - 1].trim();
+        if previous.ends_with(';') || previous == "}" || previous == "}," {
+            break;
+        }
+        start -= 1;
+    }
+    let window = lines[start..=line_index].join(" ");
     window.contains("#[expect(")
         && window.contains(&format!("clippy::{lint}"))
         && window.contains("reason =")
@@ -113,12 +119,11 @@ fn strip_cfg_test_items(contents: &str) -> String {
     let Ok(file) = syn::parse_file(contents) else {
         return contents.to_string();
     };
-    let line_starts = line_start_offsets(contents);
     let mut excluded_ranges: Vec<_> = file
         .items
         .iter()
         .filter(|item| item_has_cfg_test(item))
-        .filter_map(|item| item_source_range(contents, &line_starts, item))
+        .filter_map(item_source_range)
         .collect();
 
     if excluded_ranges.is_empty() {
@@ -186,57 +191,48 @@ fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
         .unwrap_or(false)
 }
 
-fn item_source_range(
-    contents: &str,
-    line_starts: &[usize],
-    item: &syn::Item,
-) -> Option<(usize, usize)> {
+fn item_source_range(item: &syn::Item) -> Option<(usize, usize)> {
     let attrs = item_attrs(item);
-    let start = attrs.first()?.span().start();
-    let end = item.span().end();
-    Some((
-        line_column_to_offset(contents, line_starts, start),
-        line_column_to_offset(contents, line_starts, end),
-    ))
-}
-
-fn line_start_offsets(contents: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (index, byte) in contents.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
-}
-
-fn line_column_to_offset(contents: &str, line_starts: &[usize], location: LineColumn) -> usize {
-    let Some(&line_start) = line_starts.get(location.line.saturating_sub(1)) else {
-        return contents.len();
-    };
-    let line_end = line_starts
-        .get(location.line)
-        .copied()
-        .unwrap_or(contents.len());
-    let line = &contents[line_start..line_end];
-    let byte_in_line = location.column.min(line.len());
-    (line_start + byte_in_line).min(contents.len())
+    let start = attrs.first()?.span().byte_range().start;
+    let end = item.span().byte_range().end;
+    Some((start, end))
 }
 
 #[test]
-fn line_column_to_offset_treats_column_as_utf8_byte_offset() {
-    let contents = "// café\nfn marker() {}\n";
-    let line_starts = line_start_offsets(contents);
-    let byte_column = "// café".len();
+fn strip_cfg_test_items_handles_utf8_before_test_item() {
+    let contents =
+        "const LABEL: &str = \"café\";\n#[cfg(test)]\nfn test_only() {}\nfn production() {}\n";
+    let filtered = strip_cfg_test_items(contents);
 
-    let offset = line_column_to_offset(
-        contents,
-        &line_starts,
-        LineColumn {
-            line: 1,
-            column: byte_column,
-        },
-    );
+    assert!(filtered.contains("const LABEL"));
+    assert!(!filtered.contains("test_only"));
+    assert!(filtered.contains("fn production"));
+}
 
-    assert_eq!(offset, byte_column);
+#[test]
+fn expect_reason_only_covers_the_immediately_annotated_violation() {
+    let contents = r#"
+#[expect(clippy::unwrap_used, reason = "checked in test")]
+let first = value.unwrap();
+let second = other.unwrap();
+"#;
+
+    let violations = collect_panic_policy_violations("sample.rs", contents);
+
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("sample.rs:4"));
+}
+
+#[test]
+fn expect_reason_covers_multiline_statement_chain() {
+    let contents = r#"
+#[expect(clippy::expect_used, reason = "poisoned mutex is unrecoverable")]
+self.state
+    .lock()
+    .expect("state poisoned")
+"#;
+
+    let violations = collect_panic_policy_violations("sample.rs", contents);
+
+    assert!(violations.is_empty(), "{violations:?}");
 }
