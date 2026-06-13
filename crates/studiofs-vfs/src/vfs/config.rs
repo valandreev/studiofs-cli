@@ -5,11 +5,12 @@ use crate::vfs::{
     DEFAULT_ATTR_READ_CACHE_BYTES, DEFAULT_ATTR_READ_CACHE_CAPACITY, DEFAULT_DENTRY_CACHE_BYTES,
     DEFAULT_DENTRY_CACHE_CAPACITY, DEFAULT_DIR_PREFETCH_MAX_BATCH,
     DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY, DEFAULT_FETCH_DECREASE_COOLDOWN_SECS,
-    DEFAULT_FETCH_DECREASE_FACTOR, DEFAULT_FETCH_INCREASE_STEP, DEFAULT_FETCH_INITIAL_WINDOW,
-    DEFAULT_FETCH_MAX_ATTEMPTS, DEFAULT_FETCH_MAX_WINDOW, DEFAULT_FETCH_MIN_WINDOW,
-    DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS, DEFAULT_FETCH_PREFETCH_RESERVE,
-    DEFAULT_FETCH_REQUEST_TIMEOUT_SECS, DEFAULT_FETCH_RETRY_BASE_MS, DEFAULT_FETCH_RETRY_MAX_MS,
-    DEFAULT_JANITOR_INTERVAL, DEFAULT_JANITOR_LEASE_TTL, DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
+    DEFAULT_FETCH_DECREASE_FACTOR, DEFAULT_FETCH_IDLE_RESET_SECS, DEFAULT_FETCH_INCREASE_STEP,
+    DEFAULT_FETCH_INITIAL_WINDOW, DEFAULT_FETCH_MAX_ATTEMPTS, DEFAULT_FETCH_MAX_WINDOW,
+    DEFAULT_FETCH_MIN_WINDOW, DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
+    DEFAULT_FETCH_PREFETCH_RESERVE, DEFAULT_FETCH_REQUEST_TIMEOUT_SECS,
+    DEFAULT_FETCH_RETRY_BASE_MS, DEFAULT_FETCH_RETRY_MAX_MS, DEFAULT_JANITOR_INTERVAL,
+    DEFAULT_JANITOR_LEASE_TTL, DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
     DEFAULT_JANITOR_SKIP_NEWER_THAN, DEFAULT_LOCK_LEASE_TTL, DEFAULT_LOCK_RETRY_BASE_MS,
     DEFAULT_LOCK_RETRY_MAX_MS, DEFAULT_MAX_DIRTY_BYTES, DEFAULT_MAX_DRAIN_BATCH,
     DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS, DEFAULT_PATH_SHORTCUT_CACHE_BYTES,
@@ -25,12 +26,13 @@ use crate::vfs::{
     DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES, DEFAULT_UPLOAD_CACHE_IO_SLOTS,
     DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS, DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS, DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
-    DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS, DEFAULT_UPLOAD_INCREASE_STEP,
-    DEFAULT_UPLOAD_INITIAL_WINDOW, DEFAULT_UPLOAD_MAX_ATTEMPTS, DEFAULT_UPLOAD_MAX_WINDOW,
-    DEFAULT_UPLOAD_MIN_WINDOW, DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS, DEFAULT_UPLOAD_REQUEUE_BASE_MS,
-    DEFAULT_UPLOAD_REQUEUE_MAX_MS, DEFAULT_UPLOAD_RETRY_BASE_MS, DEFAULT_UPLOAD_RETRY_MAX_MS,
-    DEFAULT_UPLOAD_STATS_INTERVAL_SECS, DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
-    DEFAULT_UPLOAD_WORKER_COUNT, DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, DEFAULT_XATTR_MAX_BYTES,
+    DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS, DEFAULT_UPLOAD_IDLE_RESET_SECS,
+    DEFAULT_UPLOAD_INCREASE_STEP, DEFAULT_UPLOAD_INITIAL_WINDOW, DEFAULT_UPLOAD_MAX_ATTEMPTS,
+    DEFAULT_UPLOAD_MAX_WINDOW, DEFAULT_UPLOAD_MIN_WINDOW, DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS,
+    DEFAULT_UPLOAD_REQUEUE_BASE_MS, DEFAULT_UPLOAD_REQUEUE_MAX_MS, DEFAULT_UPLOAD_RETRY_BASE_MS,
+    DEFAULT_UPLOAD_RETRY_MAX_MS, DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
+    DEFAULT_UPLOAD_USER_IDLE_GRACE_MS, DEFAULT_UPLOAD_WORKER_COUNT,
+    DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, DEFAULT_XATTR_MAX_BYTES,
     FOREGROUND_READ_SPEEDOMETER_SHARDS, MIN_UPLOAD_WORKER_COUNT,
 };
 
@@ -305,6 +307,10 @@ pub struct VfsConfig {
     pub fetch_decrease_factor: f64,
     /// Fetch AIMD cooldown.
     pub fetch_decrease_cooldown_secs: u64,
+    /// Reset fetch AIMD window after this many idle seconds.
+    ///
+    /// `0` disables idle reset.
+    pub fetch_idle_reset_secs: u64,
     /// Initial upload window.
     pub upload_initial_window: f64,
     /// Minimum upload window.
@@ -317,6 +323,10 @@ pub struct VfsConfig {
     pub upload_decrease_factor: f64,
     /// Upload AIMD cooldown.
     pub upload_decrease_cooldown_secs: u64,
+    /// Reset upload AIMD window after this many idle seconds.
+    ///
+    /// `0` disables idle reset.
+    pub upload_idle_reset_secs: u64,
     /// Delay uploads for overwrite/delete coalescing.
     pub upload_delay_ms: u64,
     /// Base backoff for exhausted upload requeue.
@@ -470,6 +480,8 @@ pub struct VfsConfigRaw {
     pub fetch_decrease_factor: Option<f64>,
     /// Optional override for fetch decrease cooldown in seconds.
     pub fetch_decrease_cooldown_secs: Option<u64>,
+    /// Optional override for fetch idle reset in seconds.
+    pub fetch_idle_reset_secs: Option<u64>,
     /// Optional override for initial upload window.
     pub upload_initial_window: Option<f64>,
     /// Optional override for minimum upload window.
@@ -482,6 +494,8 @@ pub struct VfsConfigRaw {
     pub upload_decrease_factor: Option<f64>,
     /// Optional override for upload decrease cooldown in seconds.
     pub upload_decrease_cooldown_secs: Option<u64>,
+    /// Optional override for upload idle reset in seconds.
+    pub upload_idle_reset_secs: Option<u64>,
     /// Optional override for upload delay in milliseconds.
     pub upload_delay_ms: Option<u64>,
     /// Optional override for upload requeue base delay in milliseconds.
@@ -665,12 +679,14 @@ impl VfsConfigRaw {
             fetch_increase_step,
             fetch_decrease_factor,
             fetch_decrease_cooldown_secs,
+            fetch_idle_reset_secs,
             upload_initial_window,
             upload_min_window,
             upload_max_window,
             upload_increase_step,
             upload_decrease_factor,
             upload_decrease_cooldown_secs,
+            upload_idle_reset_secs,
             upload_delay_ms,
             upload_requeue_base_ms,
             upload_requeue_max_ms,
@@ -843,12 +859,14 @@ impl From<VfsConfig> for VfsConfigRaw {
             fetch_increase_step: Some(cfg.fetch_increase_step),
             fetch_decrease_factor: Some(cfg.fetch_decrease_factor),
             fetch_decrease_cooldown_secs: Some(cfg.fetch_decrease_cooldown_secs),
+            fetch_idle_reset_secs: Some(cfg.fetch_idle_reset_secs),
             upload_initial_window: Some(cfg.upload_initial_window),
             upload_min_window: Some(cfg.upload_min_window),
             upload_max_window: Some(cfg.upload_max_window),
             upload_increase_step: Some(cfg.upload_increase_step),
             upload_decrease_factor: Some(cfg.upload_decrease_factor),
             upload_decrease_cooldown_secs: Some(cfg.upload_decrease_cooldown_secs),
+            upload_idle_reset_secs: Some(cfg.upload_idle_reset_secs),
             upload_delay_ms: Some(cfg.upload_delay_ms),
             upload_requeue_base_ms: Some(cfg.upload_requeue_base_ms),
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
@@ -927,12 +945,14 @@ impl Default for VfsConfig {
             fetch_increase_step: DEFAULT_FETCH_INCREASE_STEP,
             fetch_decrease_factor: DEFAULT_FETCH_DECREASE_FACTOR,
             fetch_decrease_cooldown_secs: DEFAULT_FETCH_DECREASE_COOLDOWN_SECS,
+            fetch_idle_reset_secs: DEFAULT_FETCH_IDLE_RESET_SECS,
             upload_initial_window: DEFAULT_UPLOAD_INITIAL_WINDOW,
             upload_min_window: DEFAULT_UPLOAD_MIN_WINDOW,
             upload_max_window: DEFAULT_UPLOAD_MAX_WINDOW,
             upload_increase_step: DEFAULT_UPLOAD_INCREASE_STEP,
             upload_decrease_factor: DEFAULT_UPLOAD_DECREASE_FACTOR,
             upload_decrease_cooldown_secs: DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS,
+            upload_idle_reset_secs: DEFAULT_UPLOAD_IDLE_RESET_SECS,
             upload_delay_ms: DEFAULT_UPLOAD_DELAY_MS,
             upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
