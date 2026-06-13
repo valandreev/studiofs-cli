@@ -234,7 +234,7 @@ impl AimdController {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
             st.last_activity = now;
-            if now.duration_since(st.last_decrease) >= st.decrease_cooldown {
+            if now.saturating_duration_since(st.last_decrease) >= st.decrease_cooldown {
                 let old = st.window;
                 st.window = (st.window * st.decrease_factor).max(st.min_window);
                 st.last_decrease = now;

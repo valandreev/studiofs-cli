@@ -2997,7 +2997,7 @@ fn build_upload_aimd_config(config: &VfsConfig) -> crate::aimd::AimdConfig {
 }
 
 fn nonzero_duration_secs(secs: u64) -> Option<Duration> {
-    (secs > 0).then(|| Duration::from_secs(secs))
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {
