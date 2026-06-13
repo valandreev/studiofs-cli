@@ -150,6 +150,39 @@ services:
 }
 
 #[test]
+fn compose_preflight_accepts_escaped_yaml_strings_for_baseline_images() {
+    let temp = tempdir().unwrap();
+    let compose_file = temp.path().join("compose.e2e.yml");
+    std::fs::write(
+        &compose_file,
+        r#"
+services:
+  "postgres":
+    image: "postgres:18-\u0061lpine"
+  "rustfs":
+    image: "rustfs/rustfs:1.0.0-alpha.94"
+"#,
+    )
+    .unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-escaped-images".to_string(),
+        sandbox: temp.path().join("compose-escaped-images"),
+        compose_file,
+        port_range: Some("31400-31410".to_string()),
+        wait_timeout_secs: 90,
+    })
+    .unwrap();
+
+    let checks = stack.preflight(&RecordingExecutor::default());
+    let baseline = checks
+        .iter()
+        .find(|check| check.name == "compose baseline contract")
+        .expect("baseline contract check");
+
+    assert!(baseline.passed, "{baseline:?}");
+}
+
+#[test]
 fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() {
     let temp = tempdir().unwrap();
     let stack = DockerComposeStack::new(ComposeConfig {

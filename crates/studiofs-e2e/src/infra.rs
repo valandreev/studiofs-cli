@@ -1,5 +1,6 @@
 //! Docker Compose infrastructure for real E2E runs.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal as _, Write as _};
@@ -1035,27 +1036,27 @@ LEFT JOIN LATERAL (
 #[derive(Debug, Deserialize)]
 struct ComposeFile<'a> {
     #[serde(borrow, default)]
-    services: BTreeMap<&'a str, ComposeService<'a>>,
+    services: BTreeMap<Cow<'a, str>, ComposeService<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ComposeService<'a> {
     #[serde(borrow)]
-    image: Option<&'a str>,
+    image: Option<Cow<'a, str>>,
 }
 
 fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, serde_saphyr::Error> {
     let compose_file: ComposeFile<'_> = serde_saphyr::from_str(compose)?;
-    let mut images = Vec::with_capacity(compose_file.services.len());
-    for (service_name, service) in compose_file.services {
-        if let Some(image) = service.image {
-            images.push(ComposeServiceImage {
-                service: service_name.to_string(),
-                image: image.to_string(),
-            });
-        }
-    }
-    Ok(images)
+    Ok(compose_file
+        .services
+        .into_iter()
+        .filter_map(|(service_name, service)| {
+            service.image.map(|image| ComposeServiceImage {
+                service: service_name.into_owned(),
+                image: image.into_owned(),
+            })
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
