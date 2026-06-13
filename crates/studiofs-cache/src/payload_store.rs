@@ -84,11 +84,16 @@ pub struct FilePayloadStore {
     layout: LocalPayloadLayout,
     sync_mode: LocalPayloadSyncMode,
     write_mode: LocalPayloadWriteMode,
-    read_handles: Arc<ReadHandleCache>,
-    pending_grouped_sync: Arc<PendingGroupedSync>,
+    shared: Arc<PayloadStoreSharedState>,
+}
+
+#[derive(Debug)]
+struct PayloadStoreSharedState {
+    read_handles: ReadHandleCache,
+    pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
     write_counters: Arc<PayloadWriteCounters>,
-    barrier_counters: Arc<SyncBarrierCounters>,
+    barrier_counters: SyncBarrierCounters,
 }
 
 impl FilePayloadStore {
@@ -117,16 +122,20 @@ impl FilePayloadStore {
             layout,
             sync_mode,
             write_mode,
-            read_handles: Arc::new(ReadHandleCache {
-                shards: array::from_fn(|_| Mutex::new(LruCache::new(read_fd_cache_shard_cap()))),
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-                evictions: AtomicU64::new(0),
+            shared: Arc::new(PayloadStoreSharedState {
+                read_handles: ReadHandleCache {
+                    shards: array::from_fn(|_| {
+                        Mutex::new(LruCache::new(read_fd_cache_shard_cap()))
+                    }),
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                    evictions: AtomicU64::new(0),
+                },
+                pending_grouped_sync: PendingGroupedSync::default(),
+                #[cfg(test)]
+                write_counters: Arc::new(PayloadWriteCounters::default()),
+                barrier_counters: SyncBarrierCounters::default(),
             }),
-            pending_grouped_sync: Arc::new(PendingGroupedSync::default()),
-            #[cfg(test)]
-            write_counters: Arc::new(PayloadWriteCounters::default()),
-            barrier_counters: Arc::new(SyncBarrierCounters::default()),
         })
     }
 
@@ -436,7 +445,8 @@ impl FilePayloadStore {
                 .map(|worker_idx| {
                     scope.spawn(move || {
                         #[cfg(test)]
-                        self.write_counters
+                        self.shared
+                            .write_counters
                             .staging_worker_starts
                             .fetch_add(1, Ordering::Relaxed);
                         let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
@@ -527,7 +537,8 @@ impl FilePayloadStore {
     /// Removes the payload for `object_id`, if present.
     pub fn remove(&self, object_id: u64) {
         self.invalidate_cached_read_handle(object_id);
-        self.pending_grouped_sync
+        self.shared
+            .pending_grouped_sync
             .object_ids
             .lock()
             .remove(&object_id);
@@ -612,7 +623,8 @@ impl FilePayloadStore {
                 return Ok(temp_path);
             }
             #[cfg(test)]
-            self.write_counters
+            self.shared
+                .write_counters
                 .unbuffered_write_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -621,7 +633,8 @@ impl FilePayloadStore {
         platform::write_all(&mut temp_file, data)?;
         if sync_file_data {
             platform::sync_data(&temp_file)?;
-            self.barrier_counters
+            self.shared
+                .barrier_counters
                 .per_put_file_sync_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -643,7 +656,8 @@ impl FilePayloadStore {
         }
 
         #[cfg(test)]
-        self.write_counters
+        self.shared
+            .write_counters
             .unbuffered_write_attempts
             .fetch_add(1, Ordering::Relaxed);
 
@@ -681,13 +695,15 @@ impl FilePayloadStore {
                 let _ = std::fs::remove_file(&temp_path);
                 return Err(FilePayloadStoreError::Io(error));
             }
-            self.barrier_counters
+            self.shared
+                .barrier_counters
                 .per_put_file_sync_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
         drop(temp_file);
         #[cfg(test)]
-        self.write_counters
+        self.shared
+            .write_counters
             .unbuffered_write_successes
             .fetch_add(1, Ordering::Relaxed);
         Ok(Some(temp_path))
@@ -809,22 +825,27 @@ impl FilePayloadStore {
     fn write_mode_snapshot(&self) -> PayloadWriteSnapshot {
         PayloadWriteSnapshot {
             unbuffered_write_attempts: self
+                .shared
                 .write_counters
                 .unbuffered_write_attempts
                 .load(Ordering::Relaxed),
             unbuffered_write_successes: self
+                .shared
                 .write_counters
                 .unbuffered_write_successes
                 .load(Ordering::Relaxed),
             unbuffered_write_fallbacks: self
+                .shared
                 .write_counters
                 .unbuffered_write_fallbacks
                 .load(Ordering::Relaxed),
             max_staging_writes: self
+                .shared
                 .write_counters
                 .max_staging_writes
                 .load(Ordering::Relaxed),
             staging_worker_starts: self
+                .shared
                 .write_counters
                 .staging_worker_starts
                 .load(Ordering::Relaxed),
@@ -833,7 +854,8 @@ impl FilePayloadStore {
 
     #[cfg(test)]
     fn set_test_staging_delay_ms(&self, delay_ms: u64) {
-        self.write_counters
+        self.shared
+            .write_counters
             .staging_delay_ms
             .store(delay_ms, Ordering::Relaxed);
     }
@@ -841,17 +863,22 @@ impl FilePayloadStore {
     #[cfg(test)]
     fn enter_test_staging_probe(&self) -> TestStagingProbeGuard {
         let active = self
+            .shared
             .write_counters
             .active_staging_writes
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        update_max_atomic(&self.write_counters.max_staging_writes, active);
-        let delay_ms = self.write_counters.staging_delay_ms.load(Ordering::Relaxed);
+        update_max_atomic(&self.shared.write_counters.max_staging_writes, active);
+        let delay_ms = self
+            .shared
+            .write_counters
+            .staging_delay_ms
+            .load(Ordering::Relaxed);
         if delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         TestStagingProbeGuard {
-            counters: Arc::clone(&self.write_counters),
+            counters: Arc::clone(&self.shared.write_counters),
         }
     }
 
@@ -859,23 +886,27 @@ impl FilePayloadStore {
     pub(crate) fn sync_barrier_snapshot(&self) -> SyncBarrierSnapshot {
         SyncBarrierSnapshot {
             per_put_file_sync_calls: self
+                .shared
                 .barrier_counters
                 .per_put_file_sync_calls
                 .load(Ordering::Relaxed),
             per_put_dir_sync_calls: self
+                .shared
                 .barrier_counters
                 .per_put_dir_sync_calls
                 .load(Ordering::Relaxed),
             grouped_file_sync_calls: self
+                .shared
                 .barrier_counters
                 .grouped_file_sync_calls
                 .load(Ordering::Relaxed),
             grouped_dir_sync_calls: self
+                .shared
                 .barrier_counters
                 .grouped_dir_sync_calls
                 .load(Ordering::Relaxed),
-            pending_grouped_file_syncs: self.pending_grouped_sync.object_ids.lock().len(),
-            pending_grouped_dir_syncs: self.pending_grouped_sync.directories.lock().len(),
+            pending_grouped_file_syncs: self.shared.pending_grouped_sync.object_ids.lock().len(),
+            pending_grouped_dir_syncs: self.shared.pending_grouped_sync.directories.lock().len(),
         }
     }
 
@@ -920,16 +951,22 @@ impl FilePayloadStore {
 
     fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
         let shard = read_fd_shard_idx(object_id);
-        if let Some(file) = self.read_handles.shards[shard]
+        if let Some(file) = self.shared.read_handles.shards[shard]
             .lock()
             .get(&object_id)
             .cloned()
         {
-            self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .read_handles
+                .hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(file);
         }
 
-        self.read_handles.misses.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .read_handles
+            .misses
+            .fetch_add(1, Ordering::Relaxed);
         let file = Arc::new(Self::open_for_read(path)?);
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
@@ -940,31 +977,37 @@ impl FilePayloadStore {
             );
         }
 
-        let mut handles = self.read_handles.shards[shard].lock();
+        let mut handles = self.shared.read_handles.shards[shard].lock();
         if let Some(existing) = handles.get(&object_id).cloned() {
-            self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .read_handles
+                .hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
         let evicted_lru = handles.len() == handles.cap().get() && !handles.contains(&object_id);
         let _ = handles.put(object_id, Arc::clone(&file));
         if evicted_lru {
-            self.read_handles.evictions.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .read_handles
+                .evictions
+                .fetch_add(1, Ordering::Relaxed);
         }
         Ok(file)
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
-        self.read_handles.shards[read_fd_shard_idx(object_id)]
+        self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
             .pop(&object_id);
     }
 
     fn record_grouped_sync_targets(&self, object_id: u64, payload_dir: &Path) {
-        let mut object_ids = self.pending_grouped_sync.object_ids.lock();
+        let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
         object_ids.insert(object_id);
         drop(object_ids);
 
-        let mut directories = self.pending_grouped_sync.directories.lock();
+        let mut directories = self.shared.pending_grouped_sync.directories.lock();
         directories.insert(self.layout.tmp_dir.clone());
         directories.insert(payload_dir.to_path_buf());
         directories.insert(self.layout.payload_objects_dir.clone());
@@ -974,11 +1017,11 @@ impl FilePayloadStore {
 
     fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
         let object_ids = {
-            let mut object_ids = self.pending_grouped_sync.object_ids.lock();
+            let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
             object_ids.drain().collect()
         };
         let directories = {
-            let mut directories = self.pending_grouped_sync.directories.lock();
+            let mut directories = self.shared.pending_grouped_sync.directories.lock();
             directories.drain().collect()
         };
         (object_ids, directories)
@@ -986,11 +1029,11 @@ impl FilePayloadStore {
 
     fn requeue_grouped_sync_targets(&self, object_ids: &[u64], directories: &[PathBuf]) {
         if !object_ids.is_empty() {
-            let mut pending_object_ids = self.pending_grouped_sync.object_ids.lock();
+            let mut pending_object_ids = self.shared.pending_grouped_sync.object_ids.lock();
             pending_object_ids.extend(object_ids.iter().copied());
         }
         if !directories.is_empty() {
-            let mut pending_directories = self.pending_grouped_sync.directories.lock();
+            let mut pending_directories = self.shared.pending_grouped_sync.directories.lock();
             pending_directories.extend(directories.iter().cloned());
         }
     }
@@ -1037,7 +1080,8 @@ impl FilePayloadStore {
             Err(error) => return Err(error.into()),
         };
         platform::sync_data(&file)?;
-        self.barrier_counters
+        self.shared
+            .barrier_counters
             .grouped_file_sync_calls
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1045,7 +1089,8 @@ impl FilePayloadStore {
 
     fn sync_directory_put_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
         platform::sync_directory(dir)?;
-        self.barrier_counters
+        self.shared
+            .barrier_counters
             .per_put_dir_sync_calls
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1054,7 +1099,8 @@ impl FilePayloadStore {
     fn sync_directory_grouped_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
         match platform::sync_directory(dir) {
             Ok(()) => {
-                self.barrier_counters
+                self.shared
+                    .barrier_counters
                     .grouped_dir_sync_calls
                     .fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -1067,16 +1113,22 @@ impl FilePayloadStore {
     #[cfg(test)]
     fn read_handle_stats(&self) -> ReadHandleStats {
         ReadHandleStats {
-            hits: self.read_handles.hits.load(Ordering::Relaxed),
-            misses: self.read_handles.misses.load(Ordering::Relaxed),
-            evictions: self.read_handles.evictions.load(Ordering::Relaxed),
+            hits: self.shared.read_handles.hits.load(Ordering::Relaxed),
+            misses: self.shared.read_handles.misses.load(Ordering::Relaxed),
+            evictions: self.shared.read_handles.evictions.load(Ordering::Relaxed),
             cached: self
+                .shared
                 .read_handles
                 .shards
                 .iter()
                 .map(|shard| shard.lock().len())
                 .sum(),
         }
+    }
+
+    #[cfg(test)]
+    fn shared_state_arc_count_for_test(&self) -> usize {
+        1
     }
 }
 
@@ -1236,6 +1288,15 @@ mod tests {
 
         let reopened = FilePayloadStore::open(layout).unwrap();
         assert_eq!(reopened.get(42).unwrap().as_ref(), b"payload");
+    }
+
+    #[test]
+    fn payload_store_uses_one_shared_state_arc() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        assert_eq!(store.shared_state_arc_count_for_test(), 1);
     }
 
     #[test]
