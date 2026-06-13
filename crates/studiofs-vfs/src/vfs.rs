@@ -724,12 +724,14 @@ const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_INCREASE_STEP: f64 = 0.0;
 const DEFAULT_FETCH_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_FETCH_DECREASE_COOLDOWN_SECS: u64 = 3;
+const DEFAULT_FETCH_IDLE_RESET_SECS: u64 = 60;
 const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_MIN_WINDOW: f64 = 1.0;
 const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 1.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
+const DEFAULT_UPLOAD_IDLE_RESET_SECS: u64 = 60;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
 const DEFAULT_UPLOAD_WORKER_COUNT: usize = 20;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
@@ -2942,6 +2944,7 @@ fn build_fetch_aimd_config(
             0.85
         },
         decrease_cooldown: Duration::from_secs(config.fetch_decrease_cooldown_secs),
+        idle_reset_after: nonzero_duration_secs(config.fetch_idle_reset_secs),
     }
 }
 
@@ -2989,7 +2992,12 @@ fn build_upload_aimd_config(config: &VfsConfig) -> crate::aimd::AimdConfig {
             0.85
         },
         decrease_cooldown: Duration::from_secs(config.upload_decrease_cooldown_secs),
+        idle_reset_after: nonzero_duration_secs(config.upload_idle_reset_secs),
     }
+}
+
+fn nonzero_duration_secs(secs: u64) -> Option<Duration> {
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {

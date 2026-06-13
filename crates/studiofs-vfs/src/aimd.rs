@@ -11,8 +11,9 @@
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tracing::warn;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -35,6 +36,11 @@ pub struct AimdConfig {
     /// After a decrease, ignore subsequent failures for this duration
     /// to avoid over-reacting to a burst of errors from the same event.
     pub decrease_cooldown: Duration,
+    /// Reset the window to the initial value after this much idle time.
+    ///
+    /// `None` disables idle reset. Fetch and upload callers can choose
+    /// independent values because their traffic shapes differ.
+    pub idle_reset_after: Option<Duration>,
 }
 
 impl AimdConfig {
@@ -47,6 +53,7 @@ impl AimdConfig {
             increase_step: 1.0,
             decrease_factor: 0.5,
             decrease_cooldown: Duration::from_secs(5),
+            idle_reset_after: Some(Duration::from_secs(60)),
         }
     }
 
@@ -59,6 +66,7 @@ impl AimdConfig {
             increase_step: 0.5,
             decrease_factor: 0.5,
             decrease_cooldown: Duration::from_secs(5),
+            idle_reset_after: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -75,6 +83,7 @@ struct AimdState {
     /// Number of requests currently in flight.
     in_flight: usize,
     /// Configuration snapshot.
+    initial_window: f64,
     min_window: f64,
     max_window: f64,
     increase_step: f64,
@@ -82,6 +91,9 @@ struct AimdState {
     /// Timestamp of the last multiplicative decrease.
     last_decrease: Instant,
     decrease_cooldown: Duration,
+    /// Timestamp of the last acquire/release feedback path.
+    last_activity: Instant,
+    idle_reset_after: Option<Duration>,
 }
 
 /// Adaptive concurrency controller using the AIMD algorithm.
@@ -118,6 +130,7 @@ impl AimdController {
             state: Mutex::new(AimdState {
                 window: initial,
                 in_flight: 0,
+                initial_window: initial,
                 min_window,
                 max_window,
                 increase_step: cfg.increase_step,
@@ -126,6 +139,8 @@ impl AimdController {
                 // Fall back to `now` instead of panicking during startup.
                 last_decrease: now.checked_sub(cfg.decrease_cooldown).unwrap_or(now),
                 decrease_cooldown: cfg.decrease_cooldown,
+                last_activity: now,
+                idle_reset_after: cfg.idle_reset_after,
             }),
             notify: Notify::new(),
             successes: AtomicU64::new(0),
@@ -142,9 +157,11 @@ impl AimdController {
             let notified = self.notify.notified();
             {
                 let mut st = self.state.lock();
+                let now = revalidate_idle_if_enabled_locked(&mut st);
                 let limit = effective_limit_from_state(&st);
                 if st.in_flight < limit {
                     st.in_flight += 1;
+                    update_last_activity_if_enabled(&mut st, now);
                     return AimdPermit {
                         controller: self,
                         resolved: false,
@@ -159,9 +176,11 @@ impl AimdController {
     /// window is fully utilised.
     pub fn try_acquire(&self) -> Option<AimdPermit<'_>> {
         let mut st = self.state.lock();
+        let now = revalidate_idle_if_enabled_locked(&mut st);
         let limit = effective_limit_from_state(&st);
         if st.in_flight < limit {
             st.in_flight += 1;
+            update_last_activity_if_enabled(&mut st, now);
             Some(AimdPermit {
                 controller: self,
                 resolved: false,
@@ -190,6 +209,7 @@ impl AimdController {
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
+            update_last_activity_if_enabled(&mut st, None);
             let old_floor = floor_to_usize(st.window);
             st.window = (st.window + st.increase_step).min(st.max_window);
             let new_floor = floor_to_usize(st.window);
@@ -206,11 +226,12 @@ impl AimdController {
     /// Record a failed completion and release one in-flight slot.
     fn on_failure(&self) {
         self.failures.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
-            let now = Instant::now();
-            if now.duration_since(st.last_decrease) >= st.decrease_cooldown {
+            st.last_activity = now;
+            if now.saturating_duration_since(st.last_decrease) >= st.decrease_cooldown {
                 let old = st.window;
                 st.window = (st.window * st.decrease_factor).max(st.min_window);
                 st.last_decrease = now;
@@ -232,15 +253,18 @@ impl AimdController {
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
+            update_last_activity_if_enabled(&mut st, None);
         }
         self.notify.notify_one();
     }
 
     // ── Observability ────────────────────────────────────────────────────
 
-    /// Current window size (float).
+    /// Current window size (float), after applying any pending idle reset.
     pub fn window(&self) -> f64 {
-        self.state.lock().window
+        let mut st = self.state.lock();
+        revalidate_idle_if_enabled_locked(&mut st);
+        st.window
     }
 
     /// Current number of in-flight requests.
@@ -248,9 +272,13 @@ impl AimdController {
         self.state.lock().in_flight
     }
 
-    /// Effective concurrency limit (floor of window, clamped to min_window).
+    /// Effective concurrency limit after applying any pending idle reset.
+    ///
+    /// The returned value is the floor of the current window, clamped to
+    /// `min_window`.
     pub fn effective_limit(&self) -> usize {
-        let st = self.state.lock();
+        let mut st = self.state.lock();
+        revalidate_idle_if_enabled_locked(&mut st);
         effective_limit_from_state(&st)
     }
 
@@ -278,6 +306,36 @@ fn sanitize_window_max(raw_max_window: f64, min_window: f64) -> f64 {
         raw_max_window.max(min_window).max(1.0)
     } else {
         min_window.max(1.0)
+    }
+}
+
+fn revalidate_idle_locked(st: &mut AimdState, now: Instant) {
+    let idle_for = now.saturating_duration_since(st.last_activity);
+    revalidate_idle_duration_locked(st, idle_for);
+}
+
+fn revalidate_idle_if_enabled_locked(st: &mut AimdState) -> Option<Instant> {
+    st.idle_reset_after?;
+    let now = Instant::now();
+    revalidate_idle_locked(st, now);
+    Some(now)
+}
+
+fn update_last_activity_if_enabled(st: &mut AimdState, now: Option<Instant>) {
+    if st.idle_reset_after.is_some() {
+        st.last_activity = now.unwrap_or_else(Instant::now);
+    }
+}
+
+fn revalidate_idle_duration_locked(st: &mut AimdState, idle_for: Duration) {
+    if st.in_flight != 0 {
+        return;
+    }
+    let Some(idle_reset_after) = st.idle_reset_after else {
+        return;
+    };
+    if idle_for >= idle_reset_after {
+        st.window = st.initial_window;
     }
 }
 
@@ -370,6 +428,7 @@ mod tests {
             increase_step: 1.0,
             decrease_factor: 0.5,
             decrease_cooldown: Duration::from_millis(0), // instant for tests
+            idle_reset_after: None,
         }
     }
 
@@ -473,6 +532,56 @@ mod tests {
         // Second failure within cooldown — no further decrease
         c.acquire().await.failure();
         assert_eq!(c.effective_limit(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revalidate_after_idle_resets_stale_high_window_to_initial() {
+        let cfg = AimdConfig {
+            idle_reset_after: Some(Duration::from_secs(30)),
+            ..test_config()
+        };
+        let c = AimdController::new(cfg);
+
+        for _ in 0..4 {
+            c.acquire().await.success();
+        }
+        assert_eq!(c.effective_limit(), 6);
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_eq!(c.effective_limit(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revalidate_after_idle_resets_stale_low_window_to_initial() {
+        let cfg = AimdConfig {
+            idle_reset_after: Some(Duration::from_secs(30)),
+            ..test_config()
+        };
+        let c = AimdController::new(cfg);
+
+        c.acquire().await.failure();
+        assert_eq!(c.effective_limit(), 1);
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_eq!(c.effective_limit(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revalidate_before_idle_threshold_preserves_current_window() {
+        let cfg = AimdConfig {
+            idle_reset_after: Some(Duration::from_secs(30)),
+            ..test_config()
+        };
+        let c = AimdController::new(cfg);
+
+        c.acquire().await.failure();
+        assert_eq!(c.effective_limit(), 1);
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+
+        assert_eq!(c.effective_limit(), 1);
     }
 
     #[tokio::test]

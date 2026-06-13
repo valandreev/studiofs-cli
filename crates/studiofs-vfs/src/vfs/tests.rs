@@ -3,6 +3,7 @@ use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaInodes, MetaPayloadObjects};
@@ -6046,6 +6047,20 @@ fn default_readahead_tracks_the_juicefs_sized_buffer_budget() {
     assert_eq!(readahead_max_width, 75);
     assert_eq!(fetch_aimd.max_window, 75.0);
     assert_eq!(fetch_aimd.initial_window, 18.75);
+    assert_eq!(
+        fetch_aimd.idle_reset_after,
+        Some(Duration::from_secs(DEFAULT_FETCH_IDLE_RESET_SECS))
+    );
+}
+
+#[test]
+fn upload_aimd_uses_independent_idle_reset_policy() {
+    let upload_aimd = build_upload_aimd_config(&VfsConfig {
+        upload_idle_reset_secs: 120,
+        ..VfsConfig::default()
+    });
+
+    assert_eq!(upload_aimd.idle_reset_after, Some(Duration::from_secs(120)));
 }
 
 #[test]
