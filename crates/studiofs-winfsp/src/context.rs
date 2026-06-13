@@ -6,6 +6,7 @@ mod handle_drain;
 mod invalidation;
 mod plans;
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
@@ -736,6 +737,9 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    /// File inodes whose remote invalidation should bypass the WinFSP file-data
+    /// cache on read-only opens.
+    cache_bypass_inodes: Mutex<HashSet<Ino>>,
     callback_barrier_state: CallbackBarrierState,
     #[cfg(test)]
     _test_runtime: Option<Arc<tokio::runtime::Runtime>>,
@@ -760,6 +764,7 @@ impl StudioFsContext {
             rt,
             default_sd,
             invalidation_queue,
+            cache_bypass_inodes: Mutex::new(HashSet::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
             _test_runtime: None,
@@ -784,9 +789,21 @@ impl StudioFsContext {
             rt: rt.handle().clone(),
             default_sd,
             invalidation_queue,
+            cache_bypass_inodes: Mutex::new(HashSet::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
         }
+    }
+
+    fn mark_winfsp_file_cache_bypass(&self, ino: Ino) {
+        self.cache_bypass_inodes.lock().insert(ino);
+    }
+
+    fn should_disable_os_cache_for_handle(&self, handle: &StudioFileHandle) -> bool {
+        should_disable_winfsp_file_cache_for_handle(handle)
+            || (!handle.is_dir
+                && !open_flags_allow_write(handle.open_flags)
+                && self.cache_bypass_inodes.lock().contains(&handle.ino))
     }
 
     #[cfg(test)]
@@ -1137,7 +1154,7 @@ impl FileSystemContext for StudioFsContext {
         Self::write_open_file_info(file_info, &attr);
         let handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
-        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1183,7 +1200,7 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer_is_reparse_point,
         )?;
         let handle = self.execute_create_callback_plan(plan, file_info)?;
-        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1842,6 +1859,7 @@ mod tests {
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
+    use winfsp::notify::NotifyingFileSystemContext;
 
     const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
     const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
@@ -2026,6 +2044,29 @@ mod tests {
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::RDWR));
+    }
+
+    #[test]
+    fn remote_file_invalidation_bypasses_cache_for_read_only_file_handles() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass");
+        let attr = vfs
+            .create(ROOT_INO, b"remote-invalidated.txt", 0, 0, 0o644)
+            .expect("create file");
+        let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
+        let dir_handle = StudioFileHandle::new(ROOT_INO, true, 2, OpenFlags::RDONLY);
+
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
+        queue.lock().push(attr.ino);
+
+        let notifications = ctx.should_notify().expect("pending WinFSP notification");
+        assert!(
+            notifications
+                .iter()
+                .any(|notification| notification.ino == attr.ino)
+        );
+
+        assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
     }
 
     #[test]

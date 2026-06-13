@@ -109,6 +109,9 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 .get_attr(*ino)
                 .map(|a| a.kind)
                 .unwrap_or(FileType::RegularFile);
+            if kind != FileType::Directory {
+                self.mark_winfsp_file_cache_bypass(*ino);
+            }
 
             let Some(info) = build_notify_info(&path, kind) else {
                 warn!(ino, path, "notify path too long, skipping");
