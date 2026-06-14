@@ -92,6 +92,8 @@ pub struct FilePayloadStore {
 #[derive(Debug)]
 struct PayloadStoreSharedState {
     read_handles: ReadHandleCache,
+    buffered_read_fallback_handles: ReadHandleCache,
+    unbuffered_read_scratch: Mutex<platform::UnbufferedReadBuffer>,
     pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
     write_counters: PayloadWriteCounters,
@@ -150,6 +152,15 @@ impl FilePayloadStore {
                     misses: CachePaddedAtomicU64::new(0),
                     evictions: CachePaddedAtomicU64::new(0),
                 },
+                buffered_read_fallback_handles: ReadHandleCache {
+                    shards: array::from_fn(|_| {
+                        Mutex::new(LruCache::new(read_fd_cache_shard_cap()))
+                    }),
+                    hits: CachePaddedAtomicU64::new(0),
+                    misses: CachePaddedAtomicU64::new(0),
+                    evictions: CachePaddedAtomicU64::new(0),
+                },
+                unbuffered_read_scratch: Mutex::new(platform::UnbufferedReadBuffer::new()),
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
                 write_counters: PayloadWriteCounters::default(),
@@ -1049,7 +1060,7 @@ impl FilePayloadStore {
             .unbuffered_read_fallbacks
             .fetch_add(1, Ordering::Relaxed);
 
-        let file = match platform::open_read_only(path) {
+        let file = match self.cached_buffered_read_fallback_handle(object_id, path) {
             Ok(file) => file,
             Err(error) => {
                 warn!(
@@ -1062,7 +1073,7 @@ impl FilePayloadStore {
                 return None;
             }
         };
-        match platform::pread(&file, out, start) {
+        match platform::pread(file.as_ref(), out, start) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -1095,7 +1106,7 @@ impl FilePayloadStore {
             .unbuffered_read_attempts
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut scratch = platform::UnbufferedReadBuffer::new();
+        let mut scratch = self.shared.unbuffered_read_scratch.lock();
         match platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment) {
             Ok(read) => {
                 #[cfg(test)]
@@ -1131,24 +1142,42 @@ impl FilePayloadStore {
     }
 
     fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
+        self.cached_read_handle_from_cache(
+            object_id,
+            path,
+            &self.shared.read_handles,
+            |this, path| this.open_for_read(path),
+        )
+    }
+
+    fn cached_buffered_read_fallback_handle(
+        &self,
+        object_id: u64,
+        path: &Path,
+    ) -> io::Result<Arc<File>> {
+        self.cached_read_handle_from_cache(
+            object_id,
+            path,
+            &self.shared.buffered_read_fallback_handles,
+            |_this, path| platform::open_read_only(path),
+        )
+    }
+
+    fn cached_read_handle_from_cache(
+        &self,
+        object_id: u64,
+        path: &Path,
+        cache: &ReadHandleCache,
+        mut opener: impl FnMut(&Self, &Path) -> io::Result<File>,
+    ) -> io::Result<Arc<File>> {
         let shard = read_fd_shard_idx(object_id);
-        if let Some(file) = self.shared.read_handles.shards[shard]
-            .lock()
-            .get(&object_id)
-            .cloned()
-        {
-            self.shared
-                .read_handles
-                .hits
-                .fetch_add(1, Ordering::Relaxed);
+        if let Some(file) = cache.shards[shard].lock().get(&object_id).cloned() {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(file);
         }
 
-        self.shared
-            .read_handles
-            .misses
-            .fetch_add(1, Ordering::Relaxed);
-        let file = Arc::new(self.open_for_read(path)?);
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+        let file = Arc::new(opener(self, path)?);
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
                 object_id,
@@ -1158,27 +1187,24 @@ impl FilePayloadStore {
             );
         }
 
-        let mut handles = self.shared.read_handles.shards[shard].lock();
+        let mut handles = cache.shards[shard].lock();
         if let Some(existing) = handles.get(&object_id).cloned() {
-            self.shared
-                .read_handles
-                .hits
-                .fetch_add(1, Ordering::Relaxed);
+            cache.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
         let evicted_lru = handles.len() == handles.cap().get() && !handles.contains(&object_id);
         let _ = handles.put(object_id, Arc::clone(&file));
         if evicted_lru {
-            self.shared
-                .read_handles
-                .evictions
-                .fetch_add(1, Ordering::Relaxed);
+            cache.evictions.fetch_add(1, Ordering::Relaxed);
         }
         Ok(file)
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
         self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
+            .lock()
+            .pop(&object_id);
+        self.shared.buffered_read_fallback_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
             .pop(&object_id);
     }
@@ -1294,16 +1320,38 @@ impl FilePayloadStore {
     #[cfg(test)]
     fn read_handle_stats(&self) -> ReadHandleStats {
         ReadHandleStats {
-            hits: self.shared.read_handles.hits.load(Ordering::Relaxed),
-            misses: self.shared.read_handles.misses.load(Ordering::Relaxed),
-            evictions: self.shared.read_handles.evictions.load(Ordering::Relaxed),
+            hits: self.shared.read_handles.hits.load(Ordering::Relaxed)
+                + self
+                    .shared
+                    .buffered_read_fallback_handles
+                    .hits
+                    .load(Ordering::Relaxed),
+            misses: self.shared.read_handles.misses.load(Ordering::Relaxed)
+                + self
+                    .shared
+                    .buffered_read_fallback_handles
+                    .misses
+                    .load(Ordering::Relaxed),
+            evictions: self.shared.read_handles.evictions.load(Ordering::Relaxed)
+                + self
+                    .shared
+                    .buffered_read_fallback_handles
+                    .evictions
+                    .load(Ordering::Relaxed),
             cached: self
                 .shared
                 .read_handles
                 .shards
                 .iter()
                 .map(|shard| shard.lock().len())
-                .sum(),
+                .sum::<usize>()
+                + self
+                    .shared
+                    .buffered_read_fallback_handles
+                    .shards
+                    .iter()
+                    .map(|shard| shard.lock().len())
+                    .sum::<usize>(),
         }
     }
 
@@ -1655,8 +1703,8 @@ mod tests {
         assert_eq!(reads.unbuffered_read_fallbacks, 1);
         assert_eq!(
             store.read_handle_stats().cached,
-            0,
-            "unaligned fallback must not cache an unbuffered read handle"
+            1,
+            "unaligned fallback should cache a separate buffered read handle"
         );
     }
 

@@ -399,11 +399,11 @@ fn read_unbuffered_impl(
     }
 
     if is_windows_unbuffered_ptr_aligned(buf.as_ptr() as usize, alignment) {
-        return pread(file, buf, offset);
+        return pread_raw(file, buf, offset);
     }
 
     let aligned = scratch.aligned_mut(buf.len(), alignment);
-    let read = pread(file, aligned, offset)?;
+    let read = pread_raw(file, aligned, offset)?;
     buf[..read].copy_from_slice(&aligned[..read]);
     Ok(read)
 }

@@ -302,6 +302,11 @@ fn winfsp_index_number(attr: &InodeAttr) -> u64 {
         return attr.ino;
     }
 
+    // WinFSP exposes `IndexNumber` through NT-style file identity APIs. Masking
+    // to the NTFS file-record range avoids leaking sequence-number bits into
+    // clients that expect NTFS-compatible values. This preserves the inode plus
+    // content-epoch identity signal but accepts the theoretical risk that two
+    // active regular files with identical lower 48 inode bits and epoch collide.
     let content_identity = attr.ino
         ^ attr
             .committed_content_epoch
@@ -442,7 +447,8 @@ fn compute_file_attributes(attr: &InodeAttr) -> u32 {
 
 fn winfsp_regular_file_allocation_size(size: u64) -> u64 {
     let allocation_unit = u64::from(crate::DEFAULT_ALLOCATION_UNIT_SIZE);
-    size.next_multiple_of(allocation_unit)
+    size.checked_next_multiple_of(allocation_unit)
+        .unwrap_or(u64::MAX)
 }
 
 /// Convert InodeAttr to WinFSP FileInfo.
@@ -1981,7 +1987,8 @@ mod tests {
         ino_to_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
         open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -2630,6 +2637,12 @@ mod tests {
         let symlink_info = attr_to_file_info(&symlink);
         assert_eq!(symlink_info.reparse_tag, super::IO_REPARSE_TAG_SYMLINK);
         assert_eq!(symlink_info.allocation_size, 4096);
+    }
+
+    #[test]
+    fn regular_file_allocation_size_saturates_on_overflow() {
+        assert_eq!(winfsp_regular_file_allocation_size(u64::MAX), u64::MAX);
+        assert_eq!(winfsp_regular_file_allocation_size(u64::MAX - 1), u64::MAX);
     }
 
     #[test]

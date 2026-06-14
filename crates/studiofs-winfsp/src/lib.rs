@@ -451,9 +451,9 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep WinFSP's cache-manager / fast-I/O path enabled for read-only opens.
-    // Write-capable handles still opt out of the OS file cache at Create/Open time.
-    // Targeted stale-cache investigations can opt into cleanup purge via env.
+    // Keep WinFSP's read cache alive across cleanup by default; this is required
+    // for the hot file-manager read path to stay near OS-cache speeds. Workloads
+    // that need stricter cleanup purge can enable it explicitly via env.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -1054,7 +1054,7 @@ mod tests {
         );
         assert!(
             !opts.flush_and_purge_on_cleanup,
-            "WinFSP cleanup purge should not evict read cache by default"
+            "WinFSP cleanup purge should not evict the hot read cache by default"
         );
     }
 
