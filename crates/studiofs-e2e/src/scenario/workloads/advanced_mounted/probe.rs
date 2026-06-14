@@ -155,8 +155,12 @@ pub(in crate::scenario) fn wait_for_mounted_chaos_initial_tree(
         .map(|(path, payload)| {
             let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
             let mounted_path = isolation.path(logical_path);
-            let payload =
-                isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
+            let payload = mounted_chaos_payload(
+                isolation,
+                "initial",
+                &mounted_path,
+                &String::from_utf8_lossy(payload),
+            );
             (mounted_path, payload)
         })
         .collect::<Vec<_>>();

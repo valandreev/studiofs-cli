@@ -1171,15 +1171,20 @@ pub(in crate::scenario) fn run_mounted_chaos_operations(
         Arc::clone(&active_workers),
     )?;
     record_sparse_operation(context, &mut operations, operation)?;
-    let overwrite_payload =
-        isolation.payload("overwrite", "read-target.txt", "new committed payload\n");
+    let overwrite_path = isolation.path("read-target.txt");
+    let overwrite_payload = mounted_chaos_payload(
+        isolation,
+        "overwrite",
+        &overwrite_path,
+        "new committed payload\n",
+    );
     let operation = timed_hotspot_mount_fs_op(
         context,
         started,
         4,
         &clients[0],
         "overwrite",
-        &isolation.path("read-target.txt"),
+        &overwrite_path,
         HOTSPOT_CHURN_OPERATION_TIMEOUT,
         Some(&overwrite_payload),
         None,
@@ -1222,8 +1227,12 @@ pub(in crate::scenario) fn seed_mounted_chaos_initial_tree(
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
         let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
         let mounted_path = isolation.path(logical_path);
-        let payload =
-            isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
+        let payload = mounted_chaos_payload(
+            isolation,
+            "initial",
+            &mounted_path,
+            &String::from_utf8_lossy(payload),
+        );
         write_mounted_initial_file(
             writer.mount_point.join(mounted_path),
             &payload,

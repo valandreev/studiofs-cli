@@ -9,6 +9,7 @@ mod plans;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use buffers::{SendConstBuffer, SendMutBuffer};
@@ -31,7 +32,7 @@ use studiofs_vfs::{
     classify_vfs_error, is_hidden_platform_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -49,6 +50,7 @@ use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic}
 
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const WINFSP_INDEX_NUMBER_RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
@@ -100,6 +102,12 @@ pub struct StudioFileHandle {
     open_flags: OpenFlags,
     /// Buffered handles defer the strict local barrier to explicit flush/close.
     write_local_sync_policy: LocalSyncPolicy,
+    /// WinFSP `Create.Opened.DisableCache` returned for this handle.
+    disable_os_cache: bool,
+    /// Number of WinFSP read callbacks served by this handle.
+    read_callbacks: AtomicU64,
+    /// Bytes served through WinFSP read callbacks for this handle.
+    read_callback_bytes: AtomicU64,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
 }
@@ -130,8 +138,28 @@ impl StudioFileHandle {
             fh,
             open_flags,
             write_local_sync_policy,
+            disable_os_cache: false,
+            read_callbacks: AtomicU64::new(0),
+            read_callback_bytes: AtomicU64::new(0),
             dir_buffer: DirBuffer::new(),
         }
+    }
+
+    fn set_disable_os_cache(&mut self, disable_os_cache: bool) {
+        self.disable_os_cache = disable_os_cache;
+    }
+
+    fn record_read_callback(&self, bytes: u32) {
+        self.read_callbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_callback_bytes
+            .fetch_add(u64::from(bytes), Ordering::Relaxed);
+    }
+
+    fn read_callback_snapshot(&self) -> (u64, u64) {
+        (
+            self.read_callbacks.load(Ordering::Relaxed),
+            self.read_callback_bytes.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -256,16 +284,36 @@ fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> boo
     should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
 }
 
+fn winfsp_read_cache_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("STUDIOFS_WINFSP_READ_CACHE_DIAGNOSTICS").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+    })
+}
+
 fn winfsp_index_number(attr: &InodeAttr) -> u64 {
     if attr.kind != FileType::RegularFile || attr.committed_content_epoch == 0 {
         return attr.ino;
     }
 
-    attr.ino
+    // WinFSP exposes `IndexNumber` through NT-style file identity APIs. Masking
+    // to the NTFS file-record range avoids leaking sequence-number bits into
+    // clients that expect NTFS-compatible values. This preserves the inode plus
+    // content-epoch identity signal but accepts the theoretical risk that two
+    // active regular files with identical lower 48 inode bits and epoch collide.
+    let content_identity = attr.ino
         ^ attr
             .committed_content_epoch
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .rotate_left(17)
+            .rotate_left(17);
+
+    content_identity & WINFSP_INDEX_NUMBER_RECORD_MASK
 }
 
 fn set_current_winfsp_open_disable_cache(disable_cache: bool) {
@@ -397,6 +445,12 @@ fn compute_file_attributes(attr: &InodeAttr) -> u32 {
     }
 }
 
+fn winfsp_regular_file_allocation_size(size: u64) -> u64 {
+    let allocation_unit = u64::from(crate::DEFAULT_ALLOCATION_UNIT_SIZE);
+    size.checked_next_multiple_of(allocation_unit)
+        .unwrap_or(u64::MAX)
+}
+
 /// Convert InodeAttr to WinFSP FileInfo.
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     let times = normalize_attr_times(attr);
@@ -404,10 +458,10 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     let mut info = FileInfo {
         file_size: attr.size,
-        allocation_size: if attr.kind == FileType::Directory {
-            4096u64.max((attr.size + 4095) & !4095)
-        } else {
-            (attr.size + 4095) & !4095
+        allocation_size: match attr.kind {
+            FileType::RegularFile => winfsp_regular_file_allocation_size(attr.size),
+            FileType::Directory => 4096u64.max((attr.size + 4095) & !4095),
+            FileType::Symlink => (attr.size + 4095) & !4095,
         },
         file_attributes,
         ..Default::default()
@@ -1215,9 +1269,10 @@ impl FileSystemContext for StudioFsContext {
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
-        let handle =
+        let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1235,6 +1290,19 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn close(&self, context: Self::FileContext) {
+        if winfsp_read_cache_diagnostics_enabled() {
+            let (read_callbacks, read_callback_bytes) = context.read_callback_snapshot();
+            info!(
+                ino = context.ino,
+                fh = context.fh,
+                is_dir = context.is_dir,
+                open_flags = context.open_flags.bits(),
+                disable_os_cache = context.disable_os_cache,
+                read_callbacks,
+                read_callback_bytes,
+                "winfsp read cache diagnostics"
+            );
+        }
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
         self.clear_handle_zero_fill_range(context.fh);
@@ -1263,8 +1331,9 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
-        let handle = self.execute_create_callback_plan(plan, file_info)?;
+        let mut handle = self.execute_create_callback_plan(plan, file_info)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1332,6 +1401,7 @@ impl FileSystemContext for StudioFsContext {
 
         match result {
             Ok(n) => {
+                context.record_read_callback(n);
                 trace!(
                     ino,
                     fh,
@@ -1917,7 +1987,8 @@ mod tests {
         ino_to_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
         open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -2111,6 +2182,18 @@ mod tests {
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
         assert!(!should_disable_winfsp_file_cache(false, flags));
+    }
+
+    #[test]
+    fn handle_read_callback_snapshot_tracks_callbacks_and_bytes() {
+        let handle = StudioFileHandle::new(42, false, 7, OpenFlags::RDONLY);
+
+        assert_eq!(handle.read_callback_snapshot(), (0, 0));
+
+        handle.record_read_callback(128);
+        handle.record_read_callback(256);
+
+        assert_eq!(handle.read_callback_snapshot(), (2, 384));
     }
 
     #[test]
@@ -2536,7 +2619,10 @@ mod tests {
         file.mtime = 123;
         file.ctime = 456;
         let file_info = attr_to_file_info(&file);
-        assert_eq!(file_info.allocation_size, 8192);
+        assert_eq!(
+            file_info.allocation_size,
+            u64::from(crate::DEFAULT_ALLOCATION_UNIT_SIZE)
+        );
         assert_eq!(file_info.hard_links, 1);
         assert_eq!(file_info.index_number, 21);
         assert_eq!(file_info.last_write_time, unix_nanos_to_filetime(123));
@@ -2551,6 +2637,12 @@ mod tests {
         let symlink_info = attr_to_file_info(&symlink);
         assert_eq!(symlink_info.reparse_tag, super::IO_REPARSE_TAG_SYMLINK);
         assert_eq!(symlink_info.allocation_size, 4096);
+    }
+
+    #[test]
+    fn regular_file_allocation_size_saturates_on_overflow() {
+        assert_eq!(winfsp_regular_file_allocation_size(u64::MAX), u64::MAX);
+        assert_eq!(winfsp_regular_file_allocation_size(u64::MAX - 1), u64::MAX);
     }
 
     #[test]
@@ -2578,6 +2670,20 @@ mod tests {
             attr_to_file_info(&dir).index_number,
             dir.ino,
             "directory identity should stay tied to namespace inode only"
+        );
+    }
+
+    #[test]
+    fn attr_to_file_info_keeps_committed_regular_file_identity_in_ntfs_record_range() {
+        let mut file = InodeAttr::new_file(21, ROOT_INO, 1000, 1000, 0o644);
+        file.committed_content_epoch = 1;
+
+        let index_number = attr_to_file_info(&file).index_number;
+
+        assert_eq!(
+            index_number & 0xFFFF_0000_0000_0000,
+            0,
+            "published regular file identity should not use NTFS sequence-number bits"
         );
     }
 

@@ -169,6 +169,7 @@ const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_HELPER_PAYLOAD_ID: AtomicUsize = AtomicUsize::new(0);
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const MOUNTED_CHAOS_DIRECT_IO_PAYLOAD_LEN: usize = 4096;
 const MOUNTED_CHAOS_INITIAL_TREE: &[(&str, &[u8])] = &[
     ("chaos/rename-source.txt", b"rename source\n"),
     ("chaos/unlink-target.txt", b"unlink target\n"),
