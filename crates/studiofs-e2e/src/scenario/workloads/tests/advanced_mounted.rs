@@ -219,6 +219,7 @@ fn sparse_observation_uses_range_probes_instead_of_full_file_reads() {
     let payload = b"range payload";
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&sparse_path)
         .unwrap();
