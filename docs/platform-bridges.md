@@ -118,8 +118,10 @@ WinFSP callback barrier semantics:
   modified handle cleanup can purge stale cached file state after truncate or
   `set_len` updates. Write-capable handles set `Create.Opened.DisableCache` so
   writes bypass the OS file cache. Read-only file caching keeps WinFSP
-  cache-manager behavior unless `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is
-  explicitly bounded for an invalidation-focused run.
+  cache-manager behavior except for the short remote-invalidation window before
+  the WinFSP notification is published, unless
+  `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is explicitly bounded for an
+  invalidation-focused run.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer

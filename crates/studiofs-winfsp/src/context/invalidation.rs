@@ -107,6 +107,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
         let mut notifications = Vec::with_capacity(inodes.len());
         for ino in &inodes {
             let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
+                self.clear_winfsp_file_cache_bypass(*ino);
                 trace!(ino, "skipping notify - inode no longer resolvable");
                 continue;
             };
@@ -117,6 +118,8 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 .unwrap_or(FileType::RegularFile);
             if kind != FileType::Directory {
                 self.mark_winfsp_file_cache_bypass(*ino);
+            } else {
+                self.clear_winfsp_file_cache_bypass(*ino);
             }
 
             let Some(info) = build_notify_info(&path, kind) else {
@@ -141,5 +144,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 "WinFSP notify sent"
             );
         }
+        self.clear_winfsp_file_cache_bypass_for_notifications(&notifications);
     }
 }

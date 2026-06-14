@@ -743,8 +743,9 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-    /// File inodes whose remote invalidation should bypass the WinFSP file-data
-    /// cache on read-only opens.
+    /// File inodes whose remote invalidation is waiting for a WinFSP
+    /// notification and should temporarily bypass file-data cache on read-only
+    /// opens.
     cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     /// Per-handle EOF extensions that Windows may read while closing cached
     /// writer handles. The newly exposed range is defined to read as zeros.
@@ -810,6 +811,20 @@ impl StudioFsContext {
 
     fn mark_winfsp_file_cache_bypass(&self, ino: Ino) {
         self.cache_bypass_inodes.lock().insert(ino);
+    }
+
+    fn clear_winfsp_file_cache_bypass(&self, ino: Ino) {
+        self.cache_bypass_inodes.lock().remove(&ino);
+    }
+
+    fn clear_winfsp_file_cache_bypass_for_notifications(
+        &self,
+        notifications: &PreparedWinfspNotifications,
+    ) {
+        let mut cache_bypass_inodes = self.cache_bypass_inodes.lock();
+        for notification in notifications {
+            cache_bypass_inodes.remove(&notification.ino);
+        }
     }
 
     fn should_disable_os_cache_for_handle(&self, handle: &StudioFileHandle) -> bool {
@@ -2146,6 +2161,35 @@ mod tests {
 
         assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
         assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
+    }
+
+    #[test]
+    fn remote_file_invalidation_cache_bypass_clears_after_notify_is_sent() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass_clear");
+        let attr = vfs
+            .create(ROOT_INO, b"remote-invalidated-clear.txt", 0, 0, 0o644)
+            .expect("create file");
+        let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
+        let invalidator =
+            WinfspKernelInvalidator::new(queue.clone(), ctx.cache_bypass_inodes.clone());
+
+        invalidator.inval_inode(attr.ino);
+        assert!(
+            ctx.should_disable_os_cache_for_handle(&read_handle),
+            "pending remote invalidation should bypass stale WinFSP cache"
+        );
+
+        let notifications = ctx.should_notify().expect("pending WinFSP notification");
+        assert!(
+            ctx.should_disable_os_cache_for_handle(&read_handle),
+            "bypass must remain active until the notification is published"
+        );
+
+        ctx.clear_winfsp_file_cache_bypass_for_notifications(&notifications);
+        assert!(
+            !ctx.should_disable_os_cache_for_handle(&read_handle),
+            "published notifications must not leave read-only handles permanently uncached"
+        );
     }
 
     #[test]

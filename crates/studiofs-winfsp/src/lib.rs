@@ -739,8 +739,8 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         .map_err(invalid_input_io_error)?;
 
     // Shared invalidation state: metadata refresh events enqueue inode IDs for
-    // WinFSP notifications and immediately mark file-data cache bypass for the
-    // next read-only open.
+    // WinFSP notifications and temporarily bypass file-data cache on read-only
+    // opens until the notification is published.
     let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
     let cache_bypass_inodes =
         std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
