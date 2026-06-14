@@ -5794,16 +5794,12 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 
 #[test]
 fn soft_dirty_budget_pacing_starts_before_hard_limit() {
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(45, 100, 0), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(3));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(75, 100, 0), Some(6));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(85, 100, 0), Some(10));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(3));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(6));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(45, 100), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100), Some(3));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(75, 100), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(85, 100), Some(10));
 }
 
 #[test]
@@ -5905,6 +5901,74 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
             .expect("admission should unblock after writer-stack pressure drops")
             .expect("admission task should not panic");
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sustained-pre-drain-under-pressure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sustained-pre-drain-under-pressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.set_max_dirty_bytes(64 * 1024 * 1024);
+
+        let seeded_len = 33 * 1024 * 1024;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; seeded_len]),
+            )
+            .unwrap();
+        let now = now_unix_millis();
+        vfs.state.sustained_write_streams.lock().insert(
+            attr.ino,
+            SustainedWriteState {
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DECAY_START_MS),
+                last_write_ms: now.saturating_sub(1),
+                last_end_offset: seeded_len as u64,
+            },
+        );
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(attr.ino)
+            .expect("test should reserve deferred materialization gate");
+
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            attr.ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.state
+                .deferred_materialize_reschedule_needed
+                .lock()
+                .contains(&attr.ino),
+            "sustained pre-drain should request background materialization before admission pacing"
+        );
+        let _ = vfs
+            .state
+            .deferred_materialize_inflight
+            .replace_if_current_or_remove(&entry, || false);
+        drop(guard);
+        vfs.state.writer_stack.clear_inode(attr.ino);
         vfs.release_fh(fh).await.unwrap();
     });
 }

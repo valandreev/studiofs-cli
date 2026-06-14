@@ -175,7 +175,7 @@ impl StudioVfs {
         )
     }
 
-    async fn maybe_pre_drain_sustained_write_buffer(
+    pub(super) async fn maybe_pre_drain_sustained_write_buffer(
         self: &Arc<Self>,
         ino: Ino,
         offset: u64,
@@ -1338,9 +1338,9 @@ impl StudioVfs {
             }
         }
         if local_sync_policy.is_opportunistic() {
-            self.maybe_throttle_write_admission(data.len()).await;
             self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
+            self.maybe_throttle_write_admission(data.len()).await;
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
