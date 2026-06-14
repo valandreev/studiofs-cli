@@ -49,6 +49,7 @@ use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic}
 
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const WINFSP_INDEX_NUMBER_RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
@@ -261,11 +262,13 @@ fn winfsp_index_number(attr: &InodeAttr) -> u64 {
         return attr.ino;
     }
 
-    attr.ino
+    let content_identity = attr.ino
         ^ attr
             .committed_content_epoch
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .rotate_left(17)
+            .rotate_left(17);
+
+    content_identity & WINFSP_INDEX_NUMBER_RECORD_MASK
 }
 
 fn set_current_winfsp_open_disable_cache(disable_cache: bool) {
@@ -2578,6 +2581,20 @@ mod tests {
             attr_to_file_info(&dir).index_number,
             dir.ino,
             "directory identity should stay tied to namespace inode only"
+        );
+    }
+
+    #[test]
+    fn attr_to_file_info_keeps_committed_regular_file_identity_in_ntfs_record_range() {
+        let mut file = InodeAttr::new_file(21, ROOT_INO, 1000, 1000, 0o644);
+        file.committed_content_epoch = 1;
+
+        let index_number = attr_to_file_info(&file).index_number;
+
+        assert_eq!(
+            index_number & 0xFFFF_0000_0000_0000,
+            0,
+            "published regular file identity should not use NTFS sequence-number bits"
         );
     }
 
