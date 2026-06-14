@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -69,22 +68,17 @@ pub(super) fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
 /// so that Explorer and other applications see remote changes promptly.
 pub struct WinfspKernelInvalidator {
     queue: Arc<Mutex<Vec<Ino>>>,
-    cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
 }
 
 impl WinfspKernelInvalidator {
     /// Creates a new invalidator backed by the shared inode queue.
-    pub fn new(queue: Arc<Mutex<Vec<Ino>>>, cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>) -> Self {
-        Self {
-            queue,
-            cache_bypass_inodes,
-        }
+    pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
+        Self { queue }
     }
 }
 
 impl KernelInvalidator for WinfspKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.cache_bypass_inodes.lock().insert(ino);
         self.queue.lock().push(ino);
     }
 }
@@ -107,7 +101,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
         let mut notifications = Vec::with_capacity(inodes.len());
         for ino in &inodes {
             let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
-                self.clear_winfsp_file_cache_bypass(*ino);
                 trace!(ino, "skipping notify - inode no longer resolvable");
                 continue;
             };
@@ -116,11 +109,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 .get_attr(*ino)
                 .map(|a| a.kind)
                 .unwrap_or(FileType::RegularFile);
-            if kind != FileType::Directory {
-                self.mark_winfsp_file_cache_bypass(*ino);
-            } else {
-                self.clear_winfsp_file_cache_bypass(*ino);
-            }
 
             let Some(info) = build_notify_info(&path, kind) else {
                 warn!(ino, path, "notify path too long, skipping");
@@ -144,6 +132,5 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 "WinFSP notify sent"
             );
         }
-        self.clear_winfsp_file_cache_bypass_for_notifications(&notifications);
     }
 }

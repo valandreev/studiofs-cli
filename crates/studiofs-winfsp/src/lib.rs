@@ -739,17 +739,13 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         .map_err(invalid_input_io_error)?;
 
     // Shared invalidation state: metadata refresh events enqueue inode IDs for
-    // WinFSP notifications and temporarily bypass file-data cache on read-only
-    // opens until the notification is published.
+    // WinFSP notifications.
     let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
-    let cache_bypass_inodes =
-        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
     let context = StudioFsContext::new(
         vfs.clone(),
         runtime_handle.clone(),
         invalidation_queue.clone(),
-        cache_bypass_inodes.clone(),
     )
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
 
@@ -777,10 +773,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
 
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
-    let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(
-        invalidation_queue,
-        cache_bypass_inodes,
-    ));
+    let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue));
     vfs.set_kernel_invalidator(invalidator);
 
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");

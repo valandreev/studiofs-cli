@@ -130,9 +130,10 @@ Higher priority (lower tier number) must be acquired first:
 - WinFSP `cleanup`:
   - WinFSP `FlushAndPurgeOnCleanup` is enabled by default; write-capable
     handles use `Create.Opened.DisableCache` so writes bypass the OS file cache.
-    Read-only handles normally keep WinFSP cache-manager behavior; remote file
-    invalidations only bypass cached file data until the WinFSP notification is
-    published.
+    Read-only handles normally keep WinFSP cache-manager behavior. Remote
+    same-inode content changes advance the WinFSP file identity via committed
+    content epoch so cached file data is not reused for a newer published
+    payload.
   - delete + `FspCleanupDelete` finalizes deletion.
   - non-delete StudioFS cleanup callback handling is observational; it should
     not be the ownership point for dirty local persistence.

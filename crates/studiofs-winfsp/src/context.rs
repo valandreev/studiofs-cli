@@ -6,7 +6,7 @@ mod handle_drain;
 mod invalidation;
 mod plans;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
@@ -256,6 +256,18 @@ fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> boo
     should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
 }
 
+fn winfsp_index_number(attr: &InodeAttr) -> u64 {
+    if attr.kind != FileType::RegularFile || attr.committed_content_epoch == 0 {
+        return attr.ino;
+    }
+
+    attr.ino
+        ^ attr
+            .committed_content_epoch
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(17)
+}
+
 fn set_current_winfsp_open_disable_cache(disable_cache: bool) {
     // SAFETY: WinFSP exposes the current operation context only while a callback
     // is running on a dispatcher thread. This helper is called only from the
@@ -413,8 +425,9 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info.last_write_time = unix_nanos_to_filetime(times.mtime_unix_nanos);
     info.change_time = unix_nanos_to_filetime(times.ctime_unix_nanos);
 
-    // Use inode as index
-    info.index_number = attr.ino;
+    // Remote same-inode content changes need a distinct Windows file identity
+    // so WinFSP cache-manager reads cannot reuse stale file-data pages.
+    info.index_number = winfsp_index_number(attr);
     // Report actual nlink count (must be ≥1 for files, ≥2 for dirs)
     info.hard_links = if attr.nlink > 0 { attr.nlink } else { 1 };
 
@@ -743,10 +756,6 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-    /// File inodes whose remote invalidation is waiting for a WinFSP
-    /// notification and should temporarily bypass file-data cache on read-only
-    /// opens.
-    cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     /// Per-handle EOF extensions that Windows may read while closing cached
     /// writer handles. The newly exposed range is defined to read as zeros.
     handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
@@ -766,7 +775,6 @@ impl StudioFsContext {
         vfs: Arc<StudioVfs>,
         rt: Handle,
         invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-        cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
@@ -775,7 +783,6 @@ impl StudioFsContext {
             rt,
             default_sd,
             invalidation_queue,
-            cache_bypass_inodes,
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
@@ -792,7 +799,6 @@ impl StudioFsContext {
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
         invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-        cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
@@ -802,36 +808,14 @@ impl StudioFsContext {
             rt: rt.handle().clone(),
             default_sd,
             invalidation_queue,
-            cache_bypass_inodes,
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
         }
     }
 
-    fn mark_winfsp_file_cache_bypass(&self, ino: Ino) {
-        self.cache_bypass_inodes.lock().insert(ino);
-    }
-
-    fn clear_winfsp_file_cache_bypass(&self, ino: Ino) {
-        self.cache_bypass_inodes.lock().remove(&ino);
-    }
-
-    fn clear_winfsp_file_cache_bypass_for_notifications(
-        &self,
-        notifications: &PreparedWinfspNotifications,
-    ) {
-        let mut cache_bypass_inodes = self.cache_bypass_inodes.lock();
-        for notification in notifications {
-            cache_bypass_inodes.remove(&notification.ino);
-        }
-    }
-
     fn should_disable_os_cache_for_handle(&self, handle: &StudioFileHandle) -> bool {
         should_disable_winfsp_file_cache_for_handle(handle)
-            || (!handle.is_dir
-                && !open_flags_allow_write(handle.open_flags)
-                && self.cache_bypass_inodes.lock().contains(&handle.ino))
     }
 
     fn record_handle_zero_fill_range(&self, fh: u64, old_size: u64, new_size: u64) {
@@ -1936,7 +1920,7 @@ mod tests {
         unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;
     use studiofs_data::store::DataStoreConfig;
@@ -2031,11 +2015,9 @@ mod tests {
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let cache_bypass_inodes = Arc::new(Mutex::new(HashSet::new()));
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
-        let ctx =
-            StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), cache_bypass_inodes);
+        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
         (tmp, vfs, ctx, queue)
     }
 
@@ -2141,8 +2123,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_file_invalidation_bypasses_cache_for_read_only_file_handles() {
-        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass");
+    fn remote_file_invalidation_keeps_read_only_file_handles_cached() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_notify_cached");
         let attr = vfs
             .create(ROOT_INO, b"remote-invalidated.txt", 0, 0, 0o644)
             .expect("create file");
@@ -2150,6 +2132,7 @@ mod tests {
         let dir_handle = StudioFileHandle::new(ROOT_INO, true, 2, OpenFlags::RDONLY);
 
         assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
         queue.lock().push(attr.ino);
 
         let notifications = ctx.should_notify().expect("pending WinFSP notification");
@@ -2159,42 +2142,13 @@ mod tests {
                 .any(|notification| notification.ino == attr.ino)
         );
 
-        assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
         assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
     }
 
     #[test]
-    fn remote_file_invalidation_cache_bypass_clears_after_notify_is_sent() {
-        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass_clear");
-        let attr = vfs
-            .create(ROOT_INO, b"remote-invalidated-clear.txt", 0, 0, 0o644)
-            .expect("create file");
-        let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
-        let invalidator =
-            WinfspKernelInvalidator::new(queue.clone(), ctx.cache_bypass_inodes.clone());
-
-        invalidator.inval_inode(attr.ino);
-        assert!(
-            ctx.should_disable_os_cache_for_handle(&read_handle),
-            "pending remote invalidation should bypass stale WinFSP cache"
-        );
-
-        let notifications = ctx.should_notify().expect("pending WinFSP notification");
-        assert!(
-            ctx.should_disable_os_cache_for_handle(&read_handle),
-            "bypass must remain active until the notification is published"
-        );
-
-        ctx.clear_winfsp_file_cache_bypass_for_notifications(&notifications);
-        assert!(
-            !ctx.should_disable_os_cache_for_handle(&read_handle),
-            "published notifications must not leave read-only handles permanently uncached"
-        );
-    }
-
-    #[test]
-    fn remote_file_invalidation_bypasses_cache_before_notify_timer_drains() {
-        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass_enqueue");
+    fn remote_file_invalidation_enqueues_before_notify_timer_drains() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("remote_file_notify_enqueue");
         let attr = vfs
             .create(
                 ROOT_INO,
@@ -2204,15 +2158,9 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
-        let invalidator =
-            WinfspKernelInvalidator::new(queue.clone(), ctx.cache_bypass_inodes.clone());
-
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
 
         invalidator.inval_inode(attr.ino);
-
-        assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
         assert_eq!(*queue.lock(), vec![attr.ino]);
     }
 
@@ -2603,6 +2551,34 @@ mod tests {
         let symlink_info = attr_to_file_info(&symlink);
         assert_eq!(symlink_info.reparse_tag, super::IO_REPARSE_TAG_SYMLINK);
         assert_eq!(symlink_info.allocation_size, 4096);
+    }
+
+    #[test]
+    fn attr_to_file_info_changes_regular_file_identity_for_committed_content_epoch() {
+        let mut file = InodeAttr::new_file(21, ROOT_INO, 1000, 1000, 0o644);
+        assert_eq!(attr_to_file_info(&file).index_number, file.ino);
+
+        file.committed_content_epoch = 1;
+        let epoch_one_index = attr_to_file_info(&file).index_number;
+        file.committed_content_epoch = 2;
+        let epoch_two_index = attr_to_file_info(&file).index_number;
+
+        assert_ne!(
+            epoch_one_index, file.ino,
+            "published content epoch should contribute to WinFSP file identity"
+        );
+        assert_ne!(
+            epoch_two_index, epoch_one_index,
+            "different published content epochs must not reuse the same cache-manager identity"
+        );
+
+        let mut dir = InodeAttr::new_dir(22, ROOT_INO, 1000, 1000, 0o755);
+        dir.committed_content_epoch = 2;
+        assert_eq!(
+            attr_to_file_info(&dir).index_number,
+            dir.ino,
+            "directory identity should stay tied to namespace inode only"
+        );
     }
 
     #[test]
@@ -3915,21 +3891,12 @@ mod tests {
     #[test]
     fn winfsp_invalidator_enqueues_inode_numbers() {
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let cache_bypass_inodes = Arc::new(Mutex::new(HashSet::new()));
-        let invalidator = WinfspKernelInvalidator::new(queue.clone(), cache_bypass_inodes.clone());
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
 
         invalidator.inval_inode(42);
         invalidator.inval_inode(7);
 
         assert_eq!(*queue.lock(), vec![42, 7]);
-        assert_eq!(
-            cache_bypass_inodes
-                .lock()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([7, 42])
-        );
     }
 
     #[test]

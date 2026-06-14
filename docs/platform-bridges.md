@@ -59,8 +59,11 @@ StudioFS enables WinFSP `FlushAndPurgeOnCleanup` by default so modified handle
 cleanup purges stale cached file state after EOF-changing operations.
 Write-capable file handles also opt out of the WinFSP/Windows file cache at
 `Create`/`Open` time, while read-only handles keep the WinFSP cache-manager /
-fast-I/O path by default. Use a bounded `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS`
-value only for targeted multi-client invalidation experiments.
+fast-I/O path by default. Regular-file `FileInfo.IndexNumber` includes the
+committed content epoch, so remote same-inode overwrites get a new cache-manager
+identity without globally disabling read caching. Use a bounded
+`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` value only for targeted multi-client
+invalidation experiments.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -118,10 +121,9 @@ WinFSP callback barrier semantics:
   modified handle cleanup can purge stale cached file state after truncate or
   `set_len` updates. Write-capable handles set `Create.Opened.DisableCache` so
   writes bypass the OS file cache. Read-only file caching keeps WinFSP
-  cache-manager behavior except for the short remote-invalidation window before
-  the WinFSP notification is published, unless
-  `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is explicitly bounded for an
-  invalidation-focused run.
+  cache-manager behavior; committed content epoch is folded into regular-file
+  `FileInfo.IndexNumber` so remote same-inode content changes do not reuse stale
+  cached file data.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer
