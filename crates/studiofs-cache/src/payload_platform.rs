@@ -31,7 +31,7 @@ impl UnbufferedWriteBuffer {
 #[derive(Debug, Default)]
 /// Scratch buffer used to build aligned reads for unbuffered payload I/O.
 pub struct UnbufferedReadBuffer {
-    #[cfg(any(windows, test))]
+    #[cfg(windows)]
     backing: Vec<u8>,
 }
 

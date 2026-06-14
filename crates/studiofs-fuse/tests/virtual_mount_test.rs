@@ -151,10 +151,11 @@ fn test_virtual_mount_vfs_smoke() {
         .expect("open file for write");
     rt.block_on(vfs.write_fh(fh, file.ino, 0, payload))
         .expect("write payload");
-    vfs.release_fh(fh).expect("release write handle");
+    rt.block_on(vfs.release_fh(fh))
+        .expect("release write handle");
 
     let readback = rt
         .block_on(vfs.read(file.ino, 0, payload.len() as u32))
         .expect("read payload");
-    assert_eq!(readback, payload);
+    assert_eq!(readback.as_ref(), payload);
 }

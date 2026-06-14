@@ -1230,7 +1230,7 @@ impl PreparedMount {
             mount_point: self.plan.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
             read_only: self.plan.read_only_mount,
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "linux")))]
             run_in_foreground: self.plan.run_in_foreground,
         });
         write_path_observability_publisher.stop_and_join();

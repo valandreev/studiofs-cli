@@ -391,8 +391,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options_with_allow_other,
-        validate_volume_name,
+        FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options,
+        build_mount_options_with_allow_other, validate_volume_name,
     };
 
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
