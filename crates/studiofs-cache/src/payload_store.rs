@@ -165,7 +165,26 @@ impl FilePayloadStore {
     /// Returns `None` if the payload is missing or if an error occurs while reading it.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.layout.payload_object_path(object_id);
+        if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            let file = match platform::open_read_only(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    warn!(
+                        object_id,
+                        path = %path.display(),
+                        error = ?error,
+                        "local payload runtime payload get failed to open buffered handle"
+                    );
+                    return None;
+                }
+            };
+            return self.get_with_file(object_id, &path, &file);
+        }
         let file = self.cached_read_handle(object_id, &path).ok()?;
+        self.get_with_file(object_id, &path, file.as_ref())
+    }
+
+    fn get_with_file(&self, object_id: u64, path: &Path, file: &File) -> Option<Bytes> {
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -192,7 +211,7 @@ impl FilePayloadStore {
         };
         let mut payload = vec![0_u8; len];
         if len > 0
-            && let Err(error) = self.read_exact_payload_bytes(file.as_ref(), &path, &mut payload)
+            && let Err(error) = platform::pread_exact(file, &mut payload, 0)
         {
             warn!(
                 object_id,
@@ -215,8 +234,13 @@ impl FilePayloadStore {
         let start = u64::try_from(data_offset).ok()?;
 
         let path = self.layout.payload_object_path(object_id);
-        let file = self.cached_read_handle(object_id, &path).ok()?;
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            let alignment = platform::unbuffered_read_alignment_for_path(&path);
+            if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
+                return self.read_into_buffered_fallback(object_id, data_offset, &path, start, out);
+            }
+
+            let file = self.cached_read_handle(object_id, &path).ok()?;
             match self.try_read_into_unbuffered(file.as_ref(), &path, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
@@ -240,6 +264,7 @@ impl FilePayloadStore {
                 }
             }
         }
+        let file = self.cached_read_handle(object_id, &path).ok()?;
         if out.len() >= READ_HINT_MIN_LEN {
             let hint_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
             if let Err(error) = platform::advise_will_need(file.as_ref(), start, hint_len) {
@@ -1010,19 +1035,6 @@ impl FilePayloadStore {
         }
     }
 
-    fn read_exact_payload_bytes(
-        &self,
-        file: &File,
-        path: &Path,
-        payload: &mut [u8],
-    ) -> io::Result<()> {
-        if self.read_mode != LocalPayloadReadMode::Unbuffered {
-            return platform::pread_exact(file, payload, 0);
-        }
-        let buffered = platform::open_read_only(path)?;
-        platform::pread_exact(&buffered, payload, 0)
-    }
-
     fn read_into_buffered_fallback(
         &self,
         object_id: u64,
@@ -1641,6 +1653,11 @@ mod tests {
         assert_eq!(reads.unbuffered_read_attempts, 0);
         assert_eq!(reads.unbuffered_read_successes, 0);
         assert_eq!(reads.unbuffered_read_fallbacks, 1);
+        assert_eq!(
+            store.read_handle_stats().cached,
+            0,
+            "unaligned fallback must not cache an unbuffered read handle"
+        );
     }
 
     #[test]
