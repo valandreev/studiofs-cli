@@ -565,6 +565,17 @@ impl StudioVfs {
         removed
     }
 
+    pub(super) fn read_cache_invalidation_set(
+        attr_cache_inodes: &HashSet<Ino>,
+        changed_payload_inodes: &HashSet<Ino>,
+    ) -> HashSet<Ino> {
+        attr_cache_inodes
+            .iter()
+            .copied()
+            .chain(changed_payload_inodes.iter().copied())
+            .collect()
+    }
+
     pub(super) fn runtime_namespace_invalidation_inodes(&self) -> HashSet<Ino> {
         let mut inodes = self
             .state
@@ -704,7 +715,9 @@ impl StudioVfs {
                 namespace_changed,
                 runtime_inodes,
             );
-            self.invalidate_attr_read_cache(attr_cache_inodes.iter().copied());
+            let read_cache_inodes =
+                Self::read_cache_invalidation_set(&attr_cache_inodes, &changed_payload_inodes);
+            self.invalidate_attr_read_cache(read_cache_inodes);
             self.invalidate_kernel_inodes(
                 attr_cache_inodes
                     .iter()
@@ -1624,6 +1637,24 @@ mod tests {
         assert!(
             attr_cache_inodes.contains(&20),
             "metadata-only publishes must invalidate newly reachable inode attrs"
+        );
+    }
+
+    #[test]
+    fn metadata_background_invalidation_clears_read_cache_for_payload_only_changes() {
+        let attr_cache_inodes = HashSet::from([10]);
+        let changed_payload_inodes = HashSet::from([20]);
+
+        let read_cache_inodes =
+            StudioVfs::read_cache_invalidation_set(&attr_cache_inodes, &changed_payload_inodes);
+
+        assert!(
+            read_cache_inodes.contains(&20),
+            "payload-only graph updates must drop stale published read plans"
+        );
+        assert!(
+            read_cache_inodes.contains(&10),
+            "attr invalidations must keep clearing read-plan cache entries"
         );
     }
 }

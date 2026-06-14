@@ -540,7 +540,6 @@ pub(in crate::scenario) fn observe_sparse_ranges(
     let mut hole_results = Vec::new();
     let mut missing = Vec::new();
     let mut client_observations = Vec::new();
-    let expected_payload = expected_sparse_payload(expected_ranges, logical_size);
 
     for client in clients {
         let path = client.mount_point.join(sparse_path);
@@ -563,30 +562,20 @@ pub(in crate::scenario) fn observe_sparse_ranges(
             holes: Vec::new(),
         };
 
-        match run_sparse_helper_process(
-            context,
-            MOUNTED_VALIDATION_PROBE_TIMEOUT,
-            client,
-            "read-all-exact",
-            sparse_path,
-            None,
-            None,
-            Some(&expected_payload),
-        ) {
-            Ok(()) => {
-                client_observation.parent_visible = true;
-                client_observation.metadata = SparseMetadataObservation {
-                    ok: true,
-                    len: Some(logical_size),
-                    is_file: Some(true),
-                    error: None,
-                };
-                client_observation.open = SparseOpenObservation {
-                    ok: true,
-                    error: None,
-                };
-                for range in expected_ranges {
-                    let expected_checksum = bytes_sha256(&range.payload);
+        let mut client_missing = Vec::new();
+        for range in expected_ranges {
+            let expected_checksum = bytes_sha256(&range.payload);
+            match run_sparse_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                client,
+                "read-range-exact",
+                sparse_path,
+                Some(range.offset),
+                None,
+                Some(&range.payload),
+            ) {
+                Ok(()) => {
                     client_observation.ranges.push(SparseRangeObservation {
                         label: range.label.to_string(),
                         offset: range.offset,
@@ -604,7 +593,42 @@ pub(in crate::scenario) fn observe_sparse_ranges(
                         matched: true,
                     });
                 }
-                for hole in hole_specs {
+                Err(error) if hotspot_helper_error_is_fatal(&error) => return Err(error),
+                Err(error) => {
+                    let observation = sparse_scenario_error_observation(&error);
+                    client_observation.ranges.push(SparseRangeObservation {
+                        label: range.label.to_string(),
+                        offset: range.offset,
+                        len: range.payload.len(),
+                        expected_checksum_sha256: expected_checksum,
+                        actual_checksum_sha256: None,
+                        matched: Some(false),
+                        error: Some(observation.clone()),
+                    });
+                    client_missing.push(format!(
+                        "{}:{sparse_path}@{} ({error})",
+                        client.name, range.offset
+                    ));
+                    if client_observation.metadata.error.is_none() {
+                        client_observation.metadata.error = Some(observation.clone());
+                        client_observation.open.error = Some(observation);
+                    }
+                }
+            }
+        }
+
+        for hole in hole_specs {
+            match run_sparse_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                client,
+                "read-range-zero",
+                sparse_path,
+                Some(hole.offset),
+                Some(hole.len as u64),
+                None,
+            ) {
+                Ok(()) => {
                     client_observation.holes.push(SparseHoleObservation {
                         offset: hole.offset,
                         len: hole.len,
@@ -618,14 +642,47 @@ pub(in crate::scenario) fn observe_sparse_ranges(
                         all_zero: true,
                     });
                 }
+                Err(error) if hotspot_helper_error_is_fatal(&error) => return Err(error),
+                Err(error) => {
+                    let observation = sparse_scenario_error_observation(&error);
+                    client_observation.holes.push(SparseHoleObservation {
+                        offset: hole.offset,
+                        len: hole.len,
+                        all_zero: Some(false),
+                        error: Some(observation.clone()),
+                    });
+                    client_missing.push(format!(
+                        "{}:{sparse_path}@{} ({error})",
+                        client.name, hole.offset
+                    ));
+                    if client_observation.metadata.error.is_none() {
+                        client_observation.metadata.error = Some(observation.clone());
+                        client_observation.open.error = Some(observation);
+                    }
+                }
             }
-            Err(error) if hotspot_helper_error_is_fatal(&error) => return Err(error),
-            Err(error) => {
+        }
+
+        if client_missing.is_empty() {
+            client_observation.parent_visible = true;
+            client_observation.metadata = SparseMetadataObservation {
+                ok: true,
+                len: Some(logical_size),
+                is_file: Some(true),
+                error: None,
+            };
+            client_observation.open = SparseOpenObservation {
+                ok: true,
+                error: None,
+            };
+        } else {
+            if client_observation.metadata.error.is_none() {
+                let error = ScenarioError::Io(io::Error::other("sparse probes did not match"));
                 let observation = sparse_scenario_error_observation(&error);
                 client_observation.metadata.error = Some(observation.clone());
                 client_observation.open.error = Some(observation);
-                missing.push(format!("{}:{sparse_path} ({error})", client.name));
             }
+            missing.extend(client_missing);
         }
         client_observations.push(client_observation);
     }

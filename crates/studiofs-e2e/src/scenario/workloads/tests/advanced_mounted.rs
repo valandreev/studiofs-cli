@@ -205,6 +205,78 @@ fn sparse_helper_payload_mismatch_detail_reports_checksums_and_first_diff() {
 }
 
 #[test]
+fn sparse_observation_uses_range_probes_instead_of_full_file_reads() {
+    let temp = tempdir().unwrap();
+    let sandbox = temp.path().join("run-1");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(mount.join("sparse")).unwrap();
+    let sparse_path = mount.join("sparse/shared.bin");
+    let payload = b"range payload";
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&sparse_path)
+        .unwrap();
+    file.set_len(4096).unwrap();
+    file.seek(SeekFrom::Start(1024)).unwrap();
+    file.write_all(payload).unwrap();
+    drop(file);
+
+    let clients = vec![client_spec_for(&sandbox, "projectfs", "client-a", mount)];
+    let context = ScenarioContext {
+        run_id: "run-sparse-range-probes".to_string(),
+        seed: 377,
+        sandbox,
+        scenario_dir,
+        client_controller_config: None,
+    };
+    let ranges = [SparseRangeSpec {
+        label: "payload",
+        offset: 1024,
+        payload: payload.to_vec(),
+    }];
+    let holes = [SparseHoleSpec {
+        offset: 2048,
+        len: 128,
+    }];
+
+    let observation = observe_sparse_ranges(
+        &context,
+        &clients,
+        "sparse/shared.bin",
+        4096,
+        &ranges,
+        &holes,
+    )
+    .unwrap();
+
+    assert!(observation.missing.is_empty(), "{:?}", observation.missing);
+    let progress = std::fs::read_dir(context.scenario_dir.join("hotspot-helper-progress"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let body = std::fs::read_to_string(&path).unwrap();
+            format!("{}\n{}", name, body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        progress.contains("read-range-exact") && progress.contains("read-range-zero"),
+        "{progress}"
+    );
+    assert!(
+        !progress.contains("read-all-exact"),
+        "sparse validation probes must not use full-file reads: {progress}"
+    );
+}
+
+#[test]
 fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
     let temp = tempdir().unwrap();
     let mount = temp.path().join("mount");
@@ -355,7 +427,7 @@ fn sparse_wait_timeout_writes_diagnostics_artifacts() {
         diagnostics["clients"][0]["metadata"]["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("read-all-exact")
+            .contains("read-range-exact")
     );
 
     let operations_log =
