@@ -50,6 +50,45 @@ impl ScenarioIsolation {
         )
         .into_bytes()
     }
+
+    pub(in crate::scenario) fn aligned_payload(
+        &self,
+        label: &str,
+        logical_path: &str,
+        body: &str,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut payload = self.payload(label, logical_path, body);
+        assert!(
+            payload.len() <= len,
+            "aligned scenario payload header must fit requested length"
+        );
+        let seed = payload.clone();
+        while payload.len() < len {
+            let remaining = len - payload.len();
+            let take = remaining.min(seed.len());
+            payload.extend_from_slice(&seed[..take]);
+        }
+        payload
+    }
+}
+
+pub(in crate::scenario) fn mounted_chaos_payload(
+    isolation: &ScenarioIsolation,
+    label: &str,
+    logical_path: &str,
+    body: &str,
+) -> Vec<u8> {
+    if logical_path.ends_with("read-target.txt") {
+        isolation.aligned_payload(
+            label,
+            logical_path,
+            body,
+            MOUNTED_CHAOS_DIRECT_IO_PAYLOAD_LEN,
+        )
+    } else {
+        isolation.payload(label, logical_path, body)
+    }
 }
 
 #[cfg(not(test))]

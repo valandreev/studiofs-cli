@@ -32,6 +32,44 @@ fn advanced_mounted_isolation_uses_volume_specific_roots_and_payloads() {
 }
 
 #[test]
+fn mounted_chaos_read_target_payload_is_direct_io_aligned() {
+    let context = ScenarioContext {
+        run_id: "run-1".to_string(),
+        seed: 410,
+        sandbox: PathBuf::from("sandbox"),
+        scenario_dir: PathBuf::from("scenario"),
+        client_controller_config: None,
+    };
+    let isolation =
+        ScenarioIsolation::for_advanced(&context, AdvancedMountedKind::MountedChaos, "volume-a");
+    let read_target = isolation.path("read-target.txt");
+
+    let payload = mounted_chaos_payload(&isolation, "overwrite", &read_target, "new payload\n");
+
+    assert_eq!(payload.len(), MOUNTED_CHAOS_DIRECT_IO_PAYLOAD_LEN);
+    assert!(payload.len().is_multiple_of(4096));
+    assert!(payload.starts_with(isolation.payload_marker.as_bytes()));
+}
+
+#[test]
+fn mounted_chaos_non_read_target_payload_stays_compact() {
+    let context = ScenarioContext {
+        run_id: "run-1".to_string(),
+        seed: 410,
+        sandbox: PathBuf::from("sandbox"),
+        scenario_dir: PathBuf::from("scenario"),
+        client_controller_config: None,
+    };
+    let isolation =
+        ScenarioIsolation::for_advanced(&context, AdvancedMountedKind::MountedChaos, "volume-a");
+    let append_target = isolation.path("append-target.txt");
+
+    let payload = mounted_chaos_payload(&isolation, "append", &append_target, "append\n");
+
+    assert!(payload.len() < MOUNTED_CHAOS_DIRECT_IO_PAYLOAD_LEN);
+}
+
+#[test]
 fn isolated_sparse_ranges_fit_final_logical_size() {
     let context = ScenarioContext {
         run_id: "focused-13-17-20260515".to_string(),
