@@ -9,6 +9,7 @@ mod plans;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use buffers::{SendConstBuffer, SendMutBuffer};
@@ -31,7 +32,7 @@ use studiofs_vfs::{
     classify_vfs_error, is_hidden_platform_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -101,6 +102,12 @@ pub struct StudioFileHandle {
     open_flags: OpenFlags,
     /// Buffered handles defer the strict local barrier to explicit flush/close.
     write_local_sync_policy: LocalSyncPolicy,
+    /// WinFSP `Create.Opened.DisableCache` returned for this handle.
+    disable_os_cache: bool,
+    /// Number of WinFSP read callbacks served by this handle.
+    read_callbacks: AtomicU64,
+    /// Bytes served through WinFSP read callbacks for this handle.
+    read_callback_bytes: AtomicU64,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
 }
@@ -131,8 +138,28 @@ impl StudioFileHandle {
             fh,
             open_flags,
             write_local_sync_policy,
+            disable_os_cache: false,
+            read_callbacks: AtomicU64::new(0),
+            read_callback_bytes: AtomicU64::new(0),
             dir_buffer: DirBuffer::new(),
         }
+    }
+
+    fn set_disable_os_cache(&mut self, disable_os_cache: bool) {
+        self.disable_os_cache = disable_os_cache;
+    }
+
+    fn record_read_callback(&self, bytes: u32) {
+        self.read_callbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_callback_bytes
+            .fetch_add(u64::from(bytes), Ordering::Relaxed);
+    }
+
+    fn read_callback_snapshot(&self) -> (u64, u64) {
+        (
+            self.read_callbacks.load(Ordering::Relaxed),
+            self.read_callback_bytes.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -255,6 +282,19 @@ fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool
 
 fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
     should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
+}
+
+fn winfsp_read_cache_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("STUDIOFS_WINFSP_READ_CACHE_DIAGNOSTICS").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+    })
 }
 
 fn winfsp_index_number(attr: &InodeAttr) -> u64 {
@@ -1223,9 +1263,10 @@ impl FileSystemContext for StudioFsContext {
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
-        let handle =
+        let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1243,6 +1284,19 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn close(&self, context: Self::FileContext) {
+        if winfsp_read_cache_diagnostics_enabled() {
+            let (read_callbacks, read_callback_bytes) = context.read_callback_snapshot();
+            info!(
+                ino = context.ino,
+                fh = context.fh,
+                is_dir = context.is_dir,
+                open_flags = context.open_flags.bits(),
+                disable_os_cache = context.disable_os_cache,
+                read_callbacks,
+                read_callback_bytes,
+                "winfsp read cache diagnostics"
+            );
+        }
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
         self.clear_handle_zero_fill_range(context.fh);
@@ -1271,8 +1325,9 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
-        let handle = self.execute_create_callback_plan(plan, file_info)?;
+        let mut handle = self.execute_create_callback_plan(plan, file_info)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1340,6 +1395,7 @@ impl FileSystemContext for StudioFsContext {
 
         match result {
             Ok(n) => {
+                context.record_read_callback(n);
                 trace!(
                     ino,
                     fh,
@@ -2119,6 +2175,18 @@ mod tests {
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
         assert!(!should_disable_winfsp_file_cache(false, flags));
+    }
+
+    #[test]
+    fn handle_read_callback_snapshot_tracks_callbacks_and_bytes() {
+        let handle = StudioFileHandle::new(42, false, 7, OpenFlags::RDONLY);
+
+        assert_eq!(handle.read_callback_snapshot(), (0, 0));
+
+        handle.record_read_callback(128);
+        handle.record_read_callback(256);
+
+        assert_eq!(handle.read_callback_snapshot(), (2, 384));
     }
 
     #[test]
