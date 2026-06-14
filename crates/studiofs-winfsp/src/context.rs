@@ -400,6 +400,11 @@ fn compute_file_attributes(attr: &InodeAttr) -> u32 {
     }
 }
 
+fn winfsp_regular_file_allocation_size(size: u64) -> u64 {
+    let allocation_unit = u64::from(crate::DEFAULT_ALLOCATION_UNIT_SIZE);
+    size.next_multiple_of(allocation_unit)
+}
+
 /// Convert InodeAttr to WinFSP FileInfo.
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     let times = normalize_attr_times(attr);
@@ -407,10 +412,10 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     let mut info = FileInfo {
         file_size: attr.size,
-        allocation_size: if attr.kind == FileType::Directory {
-            4096u64.max((attr.size + 4095) & !4095)
-        } else {
-            (attr.size + 4095) & !4095
+        allocation_size: match attr.kind {
+            FileType::RegularFile => winfsp_regular_file_allocation_size(attr.size),
+            FileType::Directory => 4096u64.max((attr.size + 4095) & !4095),
+            FileType::Symlink => (attr.size + 4095) & !4095,
         },
         file_attributes,
         ..Default::default()
@@ -2539,7 +2544,10 @@ mod tests {
         file.mtime = 123;
         file.ctime = 456;
         let file_info = attr_to_file_info(&file);
-        assert_eq!(file_info.allocation_size, 8192);
+        assert_eq!(
+            file_info.allocation_size,
+            u64::from(crate::DEFAULT_ALLOCATION_UNIT_SIZE)
+        );
         assert_eq!(file_info.hard_links, 1);
         assert_eq!(file_info.index_number, 21);
         assert_eq!(file_info.last_write_time, unix_nanos_to_filetime(123));
