@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -68,17 +69,22 @@ pub(super) fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
 /// so that Explorer and other applications see remote changes promptly.
 pub struct WinfspKernelInvalidator {
     queue: Arc<Mutex<Vec<Ino>>>,
+    cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
 }
 
 impl WinfspKernelInvalidator {
     /// Creates a new invalidator backed by the shared inode queue.
-    pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
-        Self { queue }
+    pub fn new(queue: Arc<Mutex<Vec<Ino>>>, cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>) -> Self {
+        Self {
+            queue,
+            cache_bypass_inodes,
+        }
     }
 }
 
 impl KernelInvalidator for WinfspKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
+        self.cache_bypass_inodes.lock().insert(ino);
         self.queue.lock().push(ino);
     }
 }

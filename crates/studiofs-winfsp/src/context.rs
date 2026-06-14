@@ -6,7 +6,7 @@ mod handle_drain;
 mod invalidation;
 mod plans;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
@@ -133,6 +133,12 @@ impl StudioFileHandle {
             dir_buffer: DirBuffer::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandleZeroFillRange {
+    start: u64,
+    end: u64,
 }
 
 trait SpawnWaitFallback {
@@ -739,7 +745,10 @@ pub struct StudioFsContext {
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
     /// File inodes whose remote invalidation should bypass the WinFSP file-data
     /// cache on read-only opens.
-    cache_bypass_inodes: Mutex<HashSet<Ino>>,
+    cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
+    /// Per-handle EOF extensions that Windows may read while closing cached
+    /// writer handles. The newly exposed range is defined to read as zeros.
+    handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
     callback_barrier_state: CallbackBarrierState,
     #[cfg(test)]
     _test_runtime: Option<Arc<tokio::runtime::Runtime>>,
@@ -756,6 +765,7 @@ impl StudioFsContext {
         vfs: Arc<StudioVfs>,
         rt: Handle,
         invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+        cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
@@ -764,7 +774,8 @@ impl StudioFsContext {
             rt,
             default_sd,
             invalidation_queue,
-            cache_bypass_inodes: Mutex::new(HashSet::new()),
+            cache_bypass_inodes,
+            handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
             _test_runtime: None,
@@ -780,6 +791,7 @@ impl StudioFsContext {
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
         invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+        cache_bypass_inodes: Arc<Mutex<HashSet<Ino>>>,
     ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
@@ -789,7 +801,8 @@ impl StudioFsContext {
             rt: rt.handle().clone(),
             default_sd,
             invalidation_queue,
-            cache_bypass_inodes: Mutex::new(HashSet::new()),
+            cache_bypass_inodes,
+            handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
         }
@@ -804,6 +817,46 @@ impl StudioFsContext {
             || (!handle.is_dir
                 && !open_flags_allow_write(handle.open_flags)
                 && self.cache_bypass_inodes.lock().contains(&handle.ino))
+    }
+
+    fn record_handle_zero_fill_range(&self, fh: u64, old_size: u64, new_size: u64) {
+        let mut ranges = self.handle_zero_fill_ranges.lock();
+        if new_size > old_size {
+            ranges.insert(
+                fh,
+                HandleZeroFillRange {
+                    start: old_size,
+                    end: new_size,
+                },
+            );
+        } else {
+            ranges.remove(&fh);
+        }
+    }
+
+    fn clear_handle_zero_fill_range(&self, fh: u64) {
+        self.handle_zero_fill_ranges.lock().remove(&fh);
+    }
+
+    fn try_handle_zero_fill_read(
+        &self,
+        handle: &StudioFileHandle,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> Option<u32> {
+        if handle.is_dir || !open_flags_allow_write(handle.open_flags) {
+            return None;
+        }
+        let range = *self.handle_zero_fill_ranges.lock().get(&handle.fh)?;
+        if offset >= range.end {
+            return Some(0);
+        }
+        if offset < range.start {
+            return None;
+        }
+        let len = range.end.saturating_sub(offset).min(buffer.len() as u64) as usize;
+        buffer[..len].fill(0);
+        Some(len as u32)
     }
 
     #[cfg(test)]
@@ -1019,10 +1072,21 @@ impl StudioFsContext {
             FileSizeCallbackAction::KeepLogicalSize => {
                 self.vfs.getattr(ino).map_err(vfs_to_winfsp_err)?
             }
-            FileSizeCallbackAction::SetLogicalSize(new_size) => self
-                .vfs
-                .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
-                .map_err(vfs_to_winfsp_err)?,
+            FileSizeCallbackAction::SetLogicalSize(new_size) => {
+                let old_size = self
+                    .vfs
+                    .peek_dirty_attr(ino)
+                    .map(|attr| attr.size)
+                    .map(Ok)
+                    .unwrap_or_else(|| self.vfs.getattr(ino).map(|attr| attr.size))
+                    .map_err(vfs_to_winfsp_err)?;
+                let attr = self
+                    .vfs
+                    .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
+                    .map_err(vfs_to_winfsp_err)?;
+                self.record_handle_zero_fill_range(fh, old_size, attr.size);
+                attr
+            }
         };
         Self::write_file_info(file_info, &attr);
         Ok(())
@@ -1174,6 +1238,7 @@ impl FileSystemContext for StudioFsContext {
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
+        self.clear_handle_zero_fill_range(context.fh);
         drop(context);
     }
 
@@ -1237,6 +1302,17 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        if let Some(n) = self.try_handle_zero_fill_read(context, buffer, offset) {
+            trace!(
+                ino = context.ino,
+                fh = context.fh,
+                offset,
+                n,
+                "read zero-filled sparse EOF extension"
+            );
+            return Ok(n);
+        }
+
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
@@ -1281,6 +1357,7 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         self.vfs.note_winfsp_write_callback();
+        self.clear_handle_zero_fill_range(context.fh);
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
@@ -1844,7 +1921,7 @@ mod tests {
         unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::sync::Arc;
     use std::sync::Barrier;
     use studiofs_data::store::DataStoreConfig;
@@ -1939,9 +2016,11 @@ mod tests {
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue = Arc::new(Mutex::new(Vec::new()));
+        let cache_bypass_inodes = Arc::new(Mutex::new(HashSet::new()));
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
-        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
+        let ctx =
+            StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), cache_bypass_inodes);
         (tmp, vfs, ctx, queue)
     }
 
@@ -2067,6 +2146,88 @@ mod tests {
 
         assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
         assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
+    }
+
+    #[test]
+    fn remote_file_invalidation_bypasses_cache_before_notify_timer_drains() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_cache_bypass_enqueue");
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"remote-invalidated-before-notify.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create file");
+        let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
+        let invalidator =
+            WinfspKernelInvalidator::new(queue.clone(), ctx.cache_bypass_inodes.clone());
+
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
+
+        invalidator.inval_inode(attr.ino);
+
+        assert!(ctx.should_disable_os_cache_for_handle(&read_handle));
+        assert_eq!(*queue.lock(), vec![attr.ino]);
+    }
+
+    #[test]
+    fn sparse_eof_growth_zero_fills_tail_reads_on_writer_handle() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("sparse_eof_zero_fill");
+        let handle = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
+        ctx.record_handle_zero_fill_range(handle.fh, 1024, 4096);
+
+        let mut before_tail = vec![0xAA; 512];
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&handle, &mut before_tail, 768),
+            None,
+            "reads before the sparse EOF extension must use the normal VFS path"
+        );
+        assert!(before_tail.iter().all(|byte| *byte == 0xAA));
+
+        let mut tail = vec![0xAA; 1024];
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&handle, &mut tail, 2048),
+            Some(1024)
+        );
+        assert!(tail.iter().all(|byte| *byte == 0));
+
+        let mut crossing_eof = vec![0xAA; 1024];
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&handle, &mut crossing_eof, 3584),
+            Some(512)
+        );
+        assert!(crossing_eof[..512].iter().all(|byte| *byte == 0));
+        assert!(crossing_eof[512..].iter().all(|byte| *byte == 0xAA));
+
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&handle, &mut crossing_eof, 4096),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn sparse_eof_zero_fill_is_scoped_to_write_file_handles_and_cleared_on_shrink() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("sparse_eof_zero_fill_scope");
+        let writer = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
+        let reader = StudioFileHandle::new(42, false, 7, OpenFlags::RDONLY);
+        let dir_writer = StudioFileHandle::new(ROOT_INO, true, 8, OpenFlags::WRONLY);
+        ctx.record_handle_zero_fill_range(writer.fh, 1024, 4096);
+
+        let mut buf = vec![0xAA; 16];
+        assert_eq!(ctx.try_handle_zero_fill_read(&reader, &mut buf, 1024), None);
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&dir_writer, &mut buf, 1024),
+            None
+        );
+
+        ctx.record_handle_zero_fill_range(writer.fh, 4096, 2048);
+        assert_eq!(
+            ctx.try_handle_zero_fill_read(&writer, &mut buf, 2048),
+            None,
+            "shrinks must clear stale sparse EOF extension state"
+        );
     }
 
     #[test]
@@ -3710,12 +3871,21 @@ mod tests {
     #[test]
     fn winfsp_invalidator_enqueues_inode_numbers() {
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        let cache_bypass_inodes = Arc::new(Mutex::new(HashSet::new()));
+        let invalidator = WinfspKernelInvalidator::new(queue.clone(), cache_bypass_inodes.clone());
 
         invalidator.inval_inode(42);
         invalidator.inval_inode(7);
 
         assert_eq!(*queue.lock(), vec![42, 7]);
+        assert_eq!(
+            cache_bypass_inodes
+                .lock()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([7, 42])
+        );
     }
 
     #[test]
