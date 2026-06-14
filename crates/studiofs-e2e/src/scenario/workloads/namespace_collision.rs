@@ -439,7 +439,21 @@ pub(in crate::scenario) fn namespace_collision_error_requires_emergency_cleanup(
         ScenarioError::NamespaceCollisionOperationTimeout { .. }
             | ScenarioError::MountedIoTimeout { .. }
             | ScenarioError::MountedIoWorkerLimit { .. }
+    ) || matches!(
+        error,
+        ScenarioError::MountedTree(source)
+            if mounted_tree_error_requires_emergency_cleanup(source)
     )
+}
+
+fn mounted_tree_error_requires_emergency_cleanup(error: &MountedTreeError) -> bool {
+    match error {
+        MountedTreeError::SnapshotAttemptTimedOut { .. } => true,
+        MountedTreeError::SnapshotUnavailableTimedOut { source, .. } => {
+            mounted_tree_error_requires_emergency_cleanup(source)
+        }
+        _ => false,
+    }
 }
 
 pub(in crate::scenario) fn handle_namespace_collision_timeout_error<T>(

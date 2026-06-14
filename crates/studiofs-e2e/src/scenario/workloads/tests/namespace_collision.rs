@@ -250,6 +250,43 @@ fn namespace_collision_mounted_io_timeout_uses_emergency_cleanup() {
 }
 
 #[test]
+fn namespace_collision_mounted_tree_snapshot_timeout_uses_emergency_cleanup() {
+    let temp = tempdir().unwrap();
+    let sandbox = temp.path().join("run-collision-mounted-tree-timeout");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(COLLISION_OVERWRITE_VS_READ);
+    let clients = COLLISION_CLIENT_NAMES
+        .iter()
+        .copied()
+        .map(|name| {
+            let mount = temp.path().join("mounts").join(name);
+            std::fs::create_dir_all(&mount).unwrap();
+            client_spec_for(&sandbox, "projectfs", name, mount)
+        })
+        .collect::<Vec<_>>();
+    let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+    let primary = ScenarioError::MountedTree(MountedTreeError::SnapshotUnavailableTimedOut {
+        attempts: 2,
+        elapsed_ms: 5_258,
+        artifact_dir: scenario_dir.join("validation"),
+        source: Box::new(MountedTreeError::SnapshotAttemptTimedOut { timeout_ms: 5_000 }),
+    });
+
+    let err =
+        handle_namespace_collision_timeout_error::<NamespaceCollisionSummary>(primary, &mut driver)
+            .unwrap_err();
+
+    assert!(matches!(err, ScenarioError::MountedTree(_)));
+    assert_eq!(
+        driver.actions.borrow().as_slice(),
+        ["emergency_kill_all_no_wait"],
+        "mounted tree snapshot timeout should not attempt graceful unmount while a mount callback may be blocked"
+    );
+}
+
+#[test]
 fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-collision-helper-grace");
