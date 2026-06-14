@@ -41,7 +41,8 @@ pub use runtime::{
     LocalPayloadBackendConfig as PersistentLocalPayloadBackendConfig, LocalPayloadBackendKind,
     LocalPayloadBackendOpenError as PersistentLocalPayloadBackendError,
     LocalPayloadBackendRuntime as PersistentLocalPayloadBackend, LocalPayloadLayout,
-    LocalPayloadRuntimeDetection, LocalPayloadSyncMode, LocalPayloadWriteMode,
+    LocalPayloadReadMode, LocalPayloadRuntimeDetection, LocalPayloadSyncMode,
+    LocalPayloadWriteMode,
 };
 pub use upload_queue::PendingUpload;
 

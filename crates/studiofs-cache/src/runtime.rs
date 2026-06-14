@@ -200,6 +200,28 @@ impl LocalPayloadWriteMode {
     }
 }
 
+/// Payload-store data read policy for the current local payload object backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalPayloadReadMode {
+    /// Use the platform's normal buffered file reads.
+    #[default]
+    Buffered,
+    /// Prefer Windows unbuffered reads for aligned object ranges, with buffered
+    /// fallback for ranges that do not satisfy direct-I/O rules.
+    Unbuffered,
+}
+
+impl LocalPayloadReadMode {
+    /// Default read mode for mounted filesystem paths.
+    pub const fn default_for_mount_path() -> Self {
+        if cfg!(windows) {
+            Self::Unbuffered
+        } else {
+            Self::Buffered
+        }
+    }
+}
+
 /// Errors returned while opening the current local payload object backend.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendOpenError {

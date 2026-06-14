@@ -22,7 +22,7 @@ use super::layout::{
     LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION, LocalPayloadLayout,
 };
 use super::platform;
-use super::{LocalPayloadSyncMode, LocalPayloadWriteMode};
+use super::{LocalPayloadReadMode, LocalPayloadSyncMode, LocalPayloadWriteMode};
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
@@ -85,6 +85,7 @@ pub struct FilePayloadStore {
     layout: LocalPayloadLayout,
     sync_mode: LocalPayloadSyncMode,
     write_mode: LocalPayloadWriteMode,
+    read_mode: LocalPayloadReadMode,
     shared: Arc<PayloadStoreSharedState>,
 }
 
@@ -94,6 +95,8 @@ struct PayloadStoreSharedState {
     pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
     write_counters: PayloadWriteCounters,
+    #[cfg(test)]
+    read_counters: PayloadReadCounters,
     barrier_counters: SyncBarrierCounters,
 }
 
@@ -117,12 +120,27 @@ impl FilePayloadStore {
         sync_mode: LocalPayloadSyncMode,
         write_mode: LocalPayloadWriteMode,
     ) -> Result<Self, FilePayloadStoreError> {
+        Self::open_with_modes(
+            layout,
+            sync_mode,
+            write_mode,
+            LocalPayloadReadMode::default_for_mount_path(),
+        )
+    }
+
+    fn open_with_modes(
+        layout: LocalPayloadLayout,
+        sync_mode: LocalPayloadSyncMode,
+        write_mode: LocalPayloadWriteMode,
+        read_mode: LocalPayloadReadMode,
+    ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_objects_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
         Ok(Self {
             layout,
             sync_mode,
             write_mode,
+            read_mode,
             shared: Arc::new(PayloadStoreSharedState {
                 read_handles: ReadHandleCache {
                     shards: array::from_fn(|_| {
@@ -135,6 +153,8 @@ impl FilePayloadStore {
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
                 write_counters: PayloadWriteCounters::default(),
+                #[cfg(test)]
+                read_counters: PayloadReadCounters::default(),
                 barrier_counters: SyncBarrierCounters::default(),
             }),
         })
@@ -172,7 +192,7 @@ impl FilePayloadStore {
         };
         let mut payload = vec![0_u8; len];
         if len > 0
-            && let Err(error) = platform::pread_exact(file.as_ref(), &mut payload, 0)
+            && let Err(error) = self.read_exact_payload_bytes(file.as_ref(), &path, &mut payload)
         {
             warn!(
                 object_id,
@@ -196,6 +216,30 @@ impl FilePayloadStore {
 
         let path = self.layout.payload_object_path(object_id);
         let file = self.cached_read_handle(object_id, &path).ok()?;
+        if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            match self.try_read_into_unbuffered(file.as_ref(), &path, start, out) {
+                Ok(Some(read)) => return Some(read),
+                Ok(None) => {
+                    return self.read_into_buffered_fallback(
+                        object_id,
+                        data_offset,
+                        &path,
+                        start,
+                        out,
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        object_id,
+                        data_offset,
+                        path = %path.display(),
+                        error = ?error,
+                        "local payload runtime payload unbuffered read_into failed"
+                    );
+                    return None;
+                }
+            }
+        }
         if out.len() >= READ_HINT_MIN_LEN {
             let hint_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
             if let Err(error) = platform::advise_will_need(file.as_ref(), start, hint_len) {
@@ -228,6 +272,9 @@ impl FilePayloadStore {
     ///
     /// On supported platforms, this may warm OS caches to reduce subsequent read latency.
     pub fn advise_will_need(&self, object_id: u64) {
+        if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            return;
+        }
         let path = self.layout.payload_object_path(object_id);
         let Ok(file) = self.cached_read_handle(object_id, &path) else {
             return;
@@ -942,8 +989,129 @@ impl FilePayloadStore {
         })
     }
 
-    fn open_for_read(path: &Path) -> io::Result<File> {
-        match platform::open_read_only(path) {
+    #[cfg(test)]
+    fn read_mode_snapshot(&self) -> PayloadReadSnapshot {
+        PayloadReadSnapshot {
+            unbuffered_read_attempts: self
+                .shared
+                .read_counters
+                .unbuffered_read_attempts
+                .load(Ordering::Relaxed),
+            unbuffered_read_successes: self
+                .shared
+                .read_counters
+                .unbuffered_read_successes
+                .load(Ordering::Relaxed),
+            unbuffered_read_fallbacks: self
+                .shared
+                .read_counters
+                .unbuffered_read_fallbacks
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn read_exact_payload_bytes(
+        &self,
+        file: &File,
+        path: &Path,
+        payload: &mut [u8],
+    ) -> io::Result<()> {
+        if self.read_mode != LocalPayloadReadMode::Unbuffered {
+            return platform::pread_exact(file, payload, 0);
+        }
+        let buffered = platform::open_read_only(path)?;
+        platform::pread_exact(&buffered, payload, 0)
+    }
+
+    fn read_into_buffered_fallback(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        path: &Path,
+        start: u64,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        #[cfg(test)]
+        self.shared
+            .read_counters
+            .unbuffered_read_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+
+        let file = match platform::open_read_only(path) {
+            Ok(file) => file,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    data_offset,
+                    path = %path.display(),
+                    error = ?error,
+                    "local payload runtime payload buffered read fallback open failed"
+                );
+                return None;
+            }
+        };
+        match platform::pread(&file, out, start) {
+            Ok(read) => Some(read),
+            Err(error) => {
+                warn!(
+                    object_id,
+                    data_offset,
+                    path = %path.display(),
+                    error = ?error,
+                    "local payload runtime payload buffered read fallback failed"
+                );
+                None
+            }
+        }
+    }
+
+    fn try_read_into_unbuffered(
+        &self,
+        file: &File,
+        path: &Path,
+        start: u64,
+        out: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        let alignment = platform::unbuffered_read_alignment_for_path(path);
+        if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        self.shared
+            .read_counters
+            .unbuffered_read_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut scratch = platform::UnbufferedReadBuffer::new();
+        match platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment) {
+            Ok(read) => {
+                #[cfg(test)]
+                self.shared
+                    .read_counters
+                    .unbuffered_read_successes
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(Some(read))
+            }
+            Err(error) if platform::is_unbuffered_io_unsupported_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_for_read(&self, path: &Path) -> io::Result<File> {
+        let file = if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            match platform::open_read_only_unbuffered(path) {
+                Ok(file) => Ok(file),
+                Err(error) if platform::is_unbuffered_io_unsupported_error(&error) => {
+                    platform::open_read_only(path)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            platform::open_read_only(path)
+        };
+
+        match file {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
             Err(error) => Err(error),
@@ -968,7 +1136,7 @@ impl FilePayloadStore {
             .read_handles
             .misses
             .fetch_add(1, Ordering::Relaxed);
-        let file = Arc::new(Self::open_for_read(path)?);
+        let file = Arc::new(self.open_for_read(path)?);
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
                 object_id,
@@ -1161,6 +1329,15 @@ struct PayloadWriteCounters {
     staging_delay_ms: CachePaddedAtomicU64,
 }
 
+#[cfg(test)]
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct PayloadReadCounters {
+    unbuffered_read_attempts: CachePaddedAtomicU64,
+    unbuffered_read_successes: CachePaddedAtomicU64,
+    unbuffered_read_fallbacks: CachePaddedAtomicU64,
+}
+
 #[repr(align(128))]
 #[derive(Debug, Default)]
 struct SyncBarrierCounters {
@@ -1213,6 +1390,14 @@ struct PayloadWriteSnapshot {
     unbuffered_write_fallbacks: u64,
     max_staging_writes: u64,
     staging_worker_starts: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PayloadReadSnapshot {
+    unbuffered_read_attempts: u64,
+    unbuffered_read_successes: u64,
+    unbuffered_read_fallbacks: u64,
 }
 
 #[cfg(test)]
@@ -1341,6 +1526,7 @@ mod tests {
     fn hot_atomic_counter_groups_are_cache_line_aligned() {
         assert!(std::mem::align_of::<ReadHandleCache>() >= 128);
         assert!(std::mem::align_of::<PayloadWriteCounters>() >= 128);
+        assert!(std::mem::align_of::<PayloadReadCounters>() >= 128);
         assert!(std::mem::align_of::<SyncBarrierCounters>() >= 128);
         assert_eq!(std::mem::align_of::<CachePaddedAtomicU64>(), 128);
         assert_eq!(std::mem::size_of::<CachePaddedAtomicU64>(), 128);
@@ -1401,6 +1587,60 @@ mod tests {
         assert_eq!(writes.unbuffered_write_attempts, 0);
         assert_eq!(writes.unbuffered_write_successes, 0);
         assert_eq!(writes.unbuffered_write_fallbacks, 1);
+    }
+
+    #[test]
+    fn unbuffered_read_mode_roundtrips_aligned_read_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Unbuffered,
+        )
+        .unwrap();
+        let payload = vec![0xCD; 4096];
+
+        store.put(4300, &payload).unwrap();
+
+        let mut out = vec![0_u8; 4096];
+        assert_eq!(store.read_into(4300, 0, &mut out), Some(4096));
+        assert_eq!(out, payload);
+        let reads = store.read_mode_snapshot();
+        if cfg!(windows) {
+            assert_eq!(reads.unbuffered_read_attempts, 1);
+            assert_eq!(
+                reads.unbuffered_read_successes + reads.unbuffered_read_fallbacks,
+                1
+            );
+        } else {
+            assert_eq!(reads.unbuffered_read_attempts, 0);
+            assert_eq!(reads.unbuffered_read_fallbacks, 1);
+        }
+    }
+
+    #[test]
+    fn unbuffered_read_mode_falls_back_for_unaligned_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Unbuffered,
+        )
+        .unwrap();
+
+        store.put(4301, b"abcdef").unwrap();
+
+        let mut out = [0_u8; 3];
+        assert_eq!(store.read_into(4301, 1, &mut out), Some(3));
+        assert_eq!(&out, b"bcd");
+        let reads = store.read_mode_snapshot();
+        assert_eq!(reads.unbuffered_read_attempts, 0);
+        assert_eq!(reads.unbuffered_read_successes, 0);
+        assert_eq!(reads.unbuffered_read_fallbacks, 1);
     }
 
     #[test]

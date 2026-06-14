@@ -28,9 +28,28 @@ impl UnbufferedWriteBuffer {
     }
 }
 
+#[derive(Debug, Default)]
+/// Scratch buffer used to build aligned reads for unbuffered payload I/O.
+pub struct UnbufferedReadBuffer {
+    #[cfg(any(windows, test))]
+    backing: Vec<u8>,
+}
+
+impl UnbufferedReadBuffer {
+    /// Create an empty scratch buffer for unbuffered payload reads.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Open a payload file for read-only access using platform-specific flags.
 pub fn open_read_only(path: &Path) -> io::Result<File> {
     open_read_only_impl(path)
+}
+
+/// Open a payload file for read-only access using unbuffered flags when supported.
+pub fn open_read_only_unbuffered(path: &Path) -> io::Result<File> {
+    open_read_only_unbuffered_impl(path)
 }
 
 /// Read up to `buf.len()` bytes from `file` starting at `offset`.
@@ -106,6 +125,16 @@ pub fn unbuffered_write_alignment_for_path(path: &Path) -> usize {
     unbuffered_write_alignment_for_path_impl(path)
 }
 
+/// Return the required unbuffered-read alignment for files under `path`.
+pub fn unbuffered_read_alignment_for_path(path: &Path) -> usize {
+    unbuffered_read_alignment_for_path_impl(path)
+}
+
+/// Return true when this range can be attempted on the unbuffered read path.
+pub fn can_read_unbuffered_range(offset: u64, len: usize, alignment: usize) -> bool {
+    can_read_unbuffered_range_impl(offset, len, alignment)
+}
+
 /// Write all bytes to an unbuffered payload file.
 pub fn write_all_unbuffered(file: &mut File, buf: &[u8]) -> io::Result<()> {
     let mut scratch = UnbufferedWriteBuffer::new();
@@ -125,6 +154,17 @@ pub fn write_all_unbuffered_with_buffer(
     alignment: usize,
 ) -> io::Result<()> {
     write_all_unbuffered_impl(file, buf, scratch, alignment)
+}
+
+/// Read up to `buf.len()` bytes from an unbuffered payload file.
+pub fn read_unbuffered_with_buffer(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    scratch: &mut UnbufferedReadBuffer,
+    alignment: usize,
+) -> io::Result<usize> {
+    read_unbuffered_impl(file, buf, offset, scratch, alignment)
 }
 
 /// Return true when an I/O error is compatible with falling back to buffered writes.
@@ -209,6 +249,24 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(windows))]
+fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
+    open_read_only(path)
+}
+
+#[cfg(windows)]
+fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)
+}
+
+#[cfg(not(windows))]
 fn create_new_unbuffered_write_impl(path: &Path) -> io::Result<File> {
     create_new_buffered_write(path)
 }
@@ -247,6 +305,27 @@ fn unbuffered_write_alignment_for_path_impl(_path: &Path) -> usize {
 #[cfg(windows)]
 fn unbuffered_write_alignment_for_path_impl(path: &Path) -> usize {
     windows_unbuffered_write_alignment_for_path(path).unwrap_or(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+}
+
+#[cfg(not(windows))]
+fn unbuffered_read_alignment_for_path_impl(_path: &Path) -> usize {
+    1
+}
+
+#[cfg(windows)]
+fn unbuffered_read_alignment_for_path_impl(path: &Path) -> usize {
+    windows_unbuffered_write_alignment_for_path(path).unwrap_or(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+}
+
+#[cfg(not(windows))]
+fn can_read_unbuffered_range_impl(_offset: u64, _len: usize, _alignment: usize) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn can_read_unbuffered_range_impl(offset: u64, len: usize, alignment: usize) -> bool {
+    let alignment = normalized_unbuffered_write_alignment(alignment);
+    len != 0 && offset.is_multiple_of(alignment as u64) && len.is_multiple_of(alignment)
 }
 
 #[cfg(not(windows))]
@@ -292,6 +371,43 @@ fn write_all_unbuffered_impl(
     write_all(file, aligned)
 }
 
+#[cfg(not(windows))]
+fn read_unbuffered_impl(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    _scratch: &mut UnbufferedReadBuffer,
+    _alignment: usize,
+) -> io::Result<usize> {
+    pread(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_unbuffered_impl(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    scratch: &mut UnbufferedReadBuffer,
+    alignment: usize,
+) -> io::Result<usize> {
+    let alignment = normalized_unbuffered_write_alignment(alignment);
+    if !can_read_unbuffered_range(offset, buf.len(), alignment) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unbuffered payload reads must be non-empty and {alignment}-byte aligned"),
+        ));
+    }
+
+    if is_windows_unbuffered_ptr_aligned(buf.as_ptr() as usize, alignment) {
+        return pread(file, buf, offset);
+    }
+
+    let aligned = scratch.aligned_mut(buf.len(), alignment);
+    let read = pread(file, aligned, offset)?;
+    buf[..read].copy_from_slice(&aligned[..read]);
+    Ok(read)
+}
+
 #[cfg(windows)]
 impl UnbufferedWriteBuffer {
     fn aligned_copy(&mut self, buf: &[u8], alignment: usize) -> &[u8] {
@@ -305,6 +421,20 @@ impl UnbufferedWriteBuffer {
         let aligned = &mut self.backing[offset..offset + buf.len()];
         aligned.copy_from_slice(buf);
         aligned
+    }
+}
+
+#[cfg(windows)]
+impl UnbufferedReadBuffer {
+    fn aligned_mut(&mut self, len: usize, alignment: usize) -> &mut [u8] {
+        let alignment = normalized_unbuffered_write_alignment(alignment);
+        let required_len = len.saturating_add(alignment - 1);
+        if self.backing.len() < required_len {
+            self.backing.resize(required_len, 0);
+        }
+        let base = self.backing.as_ptr() as usize;
+        let offset = base.next_multiple_of(alignment) - base;
+        &mut self.backing[offset..offset + len]
     }
 }
 
