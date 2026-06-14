@@ -28,7 +28,7 @@ use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, normalize_attr_times,
+    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -1786,7 +1786,7 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
-            if reply.add(entry.ino, next_offset, ft, OsStr::from_bytes(&entry_name)) {
+            if reply.add(entry.ino, next_offset, ft, OsStr::from_bytes(entry_name)) {
                 break;
             }
         }
@@ -1876,7 +1876,7 @@ impl Filesystem for StudioFuseFs {
             if reply.add(
                 entry.ino,
                 next_offset,
-                OsStr::from_bytes(&entry_name),
+                OsStr::from_bytes(entry_name),
                 &TTL,
                 &fattr,
                 0,

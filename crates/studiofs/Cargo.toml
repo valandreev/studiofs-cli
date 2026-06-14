@@ -63,7 +63,7 @@ pyroscope = { version = "2", default-features = false, features = ["backend-jema
 
 [target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-tray-icon = "0.22.0"
+tray-icon = { version = "0.22.0", default-features = false }
 winit = "0.30.12"
 
 [target.'cfg(windows)'.dependencies]
