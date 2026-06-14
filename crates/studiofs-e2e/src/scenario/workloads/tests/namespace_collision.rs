@@ -962,6 +962,53 @@ fn overwrite_vs_read_collision_records_repeated_read_loop() {
 }
 
 #[test]
+fn readdir_stat_collision_uses_scoped_final_validation() {
+    let temp = tempdir().unwrap();
+    let sandbox = temp.path().join("run-readdir-stat-final");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(COLLISION_READDIR_STAT_DURING_MUTATION);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let clients = COLLISION_CLIENT_NAMES
+        .iter()
+        .copied()
+        .map(|name| {
+            let mount = temp.path().join("mounts").join(name);
+            std::fs::create_dir_all(mount.join("scan")).unwrap();
+            std::fs::write(mount.join("scan").join("renamed-alpha.data"), b"a\n").unwrap();
+            std::fs::write(mount.join("scan").join("source-b.txt"), b"b\n").unwrap();
+            client_spec_for(&sandbox, "projectfs", name, mount)
+        })
+        .collect::<Vec<_>>();
+    let context = ScenarioContext {
+        run_id: "run-readdir-stat-final".to_string(),
+        seed: 328,
+        sandbox,
+        scenario_dir,
+        client_controller_config: None,
+    };
+
+    let summary = finish_namespace_collision(
+        &context,
+        NamespaceCollisionKind::ReaddirStatDuringMutation,
+        None,
+        clients,
+        planned_namespace_collision_operations(
+            NamespaceCollisionKind::ReaddirStatDuringMutation,
+            Instant::now(),
+        ),
+        Duration::from_millis(100),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+
+    assert!(summary.final_validator.converged);
+    assert!(summary.namespace_violations.is_empty());
+    assert_eq!(summary.operations.len(), 3);
+}
+
+#[test]
 fn namespace_collision_initial_validation_skips_seed_writer_payload_probe() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-initial-skip");

@@ -1068,6 +1068,18 @@ pub(in crate::scenario) fn finish_namespace_collision(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    if kind == NamespaceCollisionKind::ReaddirStatDuringMutation {
+        return finish_readdir_stat_namespace_collision(
+            context,
+            kind,
+            bootstrap,
+            clients,
+            operations,
+            convergence_timeout,
+            poll_interval,
+        );
+    }
+
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -1101,6 +1113,125 @@ pub(in crate::scenario) fn finish_namespace_collision(
     };
     write_namespace_collision_summary(context, &summary)?;
     Ok(summary)
+}
+
+fn finish_readdir_stat_namespace_collision(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    operations: Vec<NamespaceCollisionOperation>,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    wait_for_readdir_stat_final_state_until(
+        &clients,
+        Instant::now() + convergence_timeout,
+        poll_interval,
+    )?;
+    let compared_clients = clients
+        .iter()
+        .map(|client| client.name.clone())
+        .collect::<Vec<_>>();
+    let summary = NamespaceCollisionSummary {
+        scenario: kind.name().to_string(),
+        bootstrap,
+        clients: clients.len(),
+        operations,
+        operation_log: format!("artifacts/scenarios/{}/operations.ndjson", kind.name()),
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: clients.first().map(|client| client.name.clone()),
+            compared_clients,
+            differences: Vec::new(),
+        },
+        namespace_violations: Vec::new(),
+    };
+    write_namespace_collision_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn wait_for_readdir_stat_final_state_until(
+    clients: &[ClientSpec],
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    loop {
+        let missing = readdir_stat_final_state_missing(clients)?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "namespace collision readdir/stat final state did not converge before timeout; missing: {}",
+                    missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn readdir_stat_final_state_missing(clients: &[ClientSpec]) -> Result<Vec<String>, ScenarioError> {
+    let mut missing = Vec::new();
+    for client in clients {
+        assert_readdir_stat_payload(client, "scan/renamed-alpha.data", b"a\n", &mut missing)?;
+        assert_readdir_stat_payload(client, "scan/source-b.txt", b"b\n", &mut missing)?;
+        assert_readdir_stat_absent(client, "scan/source-alpha.data", &mut missing)?;
+    }
+    Ok(missing)
+}
+
+fn assert_readdir_stat_payload(
+    client: &ClientSpec,
+    relative_path: &str,
+    expected: &[u8],
+    missing: &mut Vec<String>,
+) -> Result<(), ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    let payload = match bounded_mounted_read(
+        path,
+        format!("{} validate final payload {}", client.name, relative_path),
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    ) {
+        Ok(payload) => payload,
+        Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            missing.push(format!("{}:{} (missing)", client.name, relative_path));
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if payload != expected {
+        missing.push(format!(
+            "{}:{} ({})",
+            client.name,
+            relative_path,
+            payload_mismatch_detail(expected, &payload)
+        ));
+    }
+    Ok(())
+}
+
+fn assert_readdir_stat_absent(
+    client: &ClientSpec,
+    relative_path: &str,
+    missing: &mut Vec<String>,
+) -> Result<(), ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    match bounded_mounted_metadata(
+        path,
+        format!("{} validate final absence {}", client.name, relative_path),
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    ) {
+        Ok(_) => missing.push(format!("{}:{} (still present)", client.name, relative_path)),
+        Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 pub(in crate::scenario) fn write_namespace_collision_operations(
