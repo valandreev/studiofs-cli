@@ -6,7 +6,7 @@ mod pending_write_tracker;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr,
     vfs_err_to_errno as bridge_vfs_err_to_errno,
 };
-use studiofs_meta::types::{SetattrArgs, TimeSpec};
+use studiofs_meta::types::{DirEntry, SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
@@ -955,6 +955,65 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
     }
 }
 
+#[derive(Debug, Default)]
+struct DirectoryHandleStore {
+    next_fh: AtomicU64,
+    handles: Mutex<HashMap<u64, DirectoryHandle>>,
+}
+
+#[derive(Debug)]
+struct DirectoryHandle {
+    ino: u64,
+    entries: Arc<Vec<DirEntry>>,
+}
+
+impl DirectoryHandleStore {
+    fn open(&self, ino: u64, entries: Vec<DirEntry>) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut handles = self
+            .handles
+            .lock()
+            .expect("directory handle mutex poisoned");
+        handles.insert(
+            fh,
+            DirectoryHandle {
+                ino,
+                entries: Arc::new(entries),
+            },
+        );
+        fh
+    }
+
+    fn entries(&self, ino: u64, fh: u64) -> Option<Arc<Vec<DirEntry>>> {
+        if fh == 0 {
+            return None;
+        }
+        let handles = self
+            .handles
+            .lock()
+            .expect("directory handle mutex poisoned");
+        handles.get(&fh).and_then(|handle| {
+            if handle.ino == ino {
+                Some(handle.entries.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn release(&self, ino: u64, fh: u64) -> bool {
+        let mut handles = self
+            .handles
+            .lock()
+            .expect("directory handle mutex poisoned");
+        if !matches!(handles.get(&fh), Some(handle) if handle.ino == ino) {
+            return false;
+        }
+        handles.remove(&fh);
+        true
+    }
+}
+
 // ─── StudioFuseFs ────────────────────────────────────────────────────────────
 
 /// FUSE filesystem adapter that forwards kernel callbacks to `StudioVfs`.
@@ -963,6 +1022,7 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     pending_reads: PendingReadTracker,
+    directory_handles: DirectoryHandleStore,
     async_write_enabled: bool,
     async_read_enabled: bool,
     linux_async_dio_enabled: bool,
@@ -1082,6 +1142,7 @@ impl StudioFuseFs {
             rt,
             pending_writes: PendingWriteTracker::default(),
             pending_reads: PendingReadTracker::default(),
+            directory_handles: DirectoryHandleStore::default(),
             async_write_enabled: options.async_write_enabled,
             async_read_enabled: options.async_read_enabled,
             linux_async_dio_enabled: options.linux_async_dio_enabled,
@@ -1114,6 +1175,26 @@ impl StudioFuseFs {
 
     fn handle_drain(&self) -> FuseHandleDrainFacade<'_> {
         FuseHandleDrainFacade::new(self)
+    }
+
+    fn open_directory_handle(&self, ino: u64) -> Result<u64, VfsError> {
+        let entries = self.vfs.readdir(ino)?;
+        Ok(self.directory_handles.open(ino, entries))
+    }
+
+    fn directory_entries_for_read(
+        &self,
+        ino: u64,
+        fh: u64,
+    ) -> Result<Arc<Vec<DirEntry>>, VfsError> {
+        if let Some(entries) = self.directory_handles.entries(ino, fh) {
+            return Ok(entries);
+        }
+        self.vfs.readdir(ino).map(Arc::new)
+    }
+
+    fn release_directory_handle(&self, ino: u64, fh: u64) -> bool {
+        self.directory_handles.release(ino, fh)
     }
 
     fn wait_pending_writes_for_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -1449,6 +1530,13 @@ impl Filesystem for StudioFuseFs {
             warn!(
                 ?unsupported,
                 "Linux FUSE kernel did not advertise FUSE_ASYNC_DIO; continuing without async direct I/O"
+            );
+        }
+
+        if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_READDIRPLUS_AUTO) {
+            warn!(
+                ?unsupported,
+                "Linux FUSE kernel did not advertise FUSE_READDIRPLUS_AUTO; continuing without automatic readdirplus"
             );
         }
 
@@ -1798,6 +1886,16 @@ impl Filesystem for StudioFuseFs {
                 } else {
                     error!("open({ino}) -> {e}");
                 }
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        match self.open_directory_handle(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => {
+                error!("opendir({ino}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -2223,11 +2321,11 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.vfs.readdir(ino) {
+        let entries = match self.directory_entries_for_read(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdir({ino}) -> {e}");
@@ -2290,11 +2388,11 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        let entries = match self.vfs.readdir(ino) {
+        let entries = match self.directory_entries_for_read(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdirplus({ino}) -> {e}");
@@ -2377,6 +2475,18 @@ impl Filesystem for StudioFuseFs {
             }
         }
 
+        reply.ok();
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.release_directory_handle(ino, fh);
         reply.ok();
     }
 
@@ -2787,7 +2897,7 @@ impl FuseKernelInvalidator {
 mod tests {
     use super::fuse_open_reply_flags;
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
         FuseEmptyReplyGuard, FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL,
         complete_fuse_write_reply, fuse_write_local_sync_policy, is_missing_xattr_error,
@@ -2802,6 +2912,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use studiofs_data::store::DataStoreConfig;
+    use studiofs_meta::DirEntry;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
@@ -2810,6 +2921,14 @@ mod tests {
     use tempfile::TempDir;
 
     type TestDataReplyResult = Result<Vec<u8>, i32>;
+
+    fn dir_entry(ino: u64, name: &[u8]) -> DirEntry {
+        DirEntry {
+            ino,
+            name: name.to_vec(),
+            kind: studiofs_meta::FileType::RegularFile,
+        }
+    }
 
     struct TestDataReply {
         sender: mpsc::Sender<TestDataReplyResult>,
@@ -2896,6 +3015,53 @@ mod tests {
         vfs.start().expect("start vfs background workers");
         let fs = StudioFuseFs::new(vfs.clone(), rt.handle().clone());
         (tmp, rt, vfs, fs)
+    }
+
+    #[test]
+    fn directory_handle_store_reuses_open_snapshot_until_release() {
+        let handles = DirectoryHandleStore::default();
+        let fh = handles.open(10, vec![dir_entry(11, b"before")]);
+
+        let resumed = handles.entries(10, fh).expect("open directory handle");
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].ino, 11);
+        assert_eq!(resumed[0].name, b"before");
+
+        handles.release(10, fh);
+        assert!(handles.entries(10, fh).is_none());
+    }
+
+    #[test]
+    fn directory_handle_store_keeps_handle_when_release_inode_mismatches() {
+        let handles = DirectoryHandleStore::default();
+        let fh = handles.open(10, vec![dir_entry(11, b"before")]);
+
+        assert!(!handles.release(99, fh));
+
+        assert!(handles.entries(10, fh).is_some());
+    }
+
+    #[test]
+    fn fuse_directory_handle_read_uses_snapshot_until_release() {
+        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("dir-handle-snapshot");
+        vfs.create(ROOT_INO, b"before", 0, 0, 0o644)
+            .expect("create initial child");
+
+        let fh = fs.open_directory_handle(ROOT_INO).expect("open directory");
+        vfs.create(ROOT_INO, b"after", 0, 0, 0o644)
+            .expect("create later child");
+
+        let snapshot_entries = fs
+            .directory_entries_for_read(ROOT_INO, fh)
+            .expect("read directory handle");
+        assert!(snapshot_entries.iter().any(|entry| entry.name == b"before"));
+        assert!(!snapshot_entries.iter().any(|entry| entry.name == b"after"));
+
+        assert!(fs.release_directory_handle(ROOT_INO, fh));
+        let fresh_entries = fs
+            .directory_entries_for_read(ROOT_INO, fh)
+            .expect("fallback to fresh directory read");
+        assert!(fresh_entries.iter().any(|entry| entry.name == b"after"));
     }
 
     #[test]
