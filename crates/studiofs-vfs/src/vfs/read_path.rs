@@ -1647,6 +1647,10 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().get(&ino).cloned()
     }
 
+    /// Returns inode attributes after enforcing asynchronous read access checks.
+    ///
+    /// This is the async counterpart to [`getattr`](Self::getattr) for bridge paths that
+    /// already run in an async context and need the same consistent metadata view.
     pub async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_async_unchecked(ino).await?;
         self.enforce_access_async(ino, AccessLevel::ReadOnly)

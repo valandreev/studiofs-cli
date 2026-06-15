@@ -1582,7 +1582,6 @@ impl StudioFuseFs {
             boundary_pool_misses: pool.misses,
             boundary_pool_outstanding_bytes: pool.outstanding_bytes,
             boundary_pool_fallback_allocations: pool.fallback_allocations,
-            ..Default::default()
         });
     }
 }
