@@ -127,7 +127,6 @@ fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/
 fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/<variant>-mixed-rw.json <jobfile>
 fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/<variant>-fsync-heavy.json <jobfile>
 fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/<variant>-metadata-readdir-stat.json <jobfile>
-fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/<variant>-dirty-pressure.json <jobfile>
 fio --output-format=json --output target/sfs-509-linux-fuse-ext4-throughput/fio/<variant>-large-file.json <jobfile>
 ```
 
@@ -155,6 +154,7 @@ Use `flamegraph` or `inferno-flamegraph` to convert the recorded stacks after
 | async-read prototype | not available in this workspace at this decision point |
 | JuiceFS | local sqlite/file-backed JuiceFS baseline passed |
 | fio workloads | ext4, JuiceFS, and StudioFS long-lived matrices passed to artifact completion |
+| dirty-pressure | StudioFS e2e write/read probe captured upload-backlog pressure and pending async write bytes |
 | CPU profiles/flamegraphs | StudioFS `perf record` captured 345 samples; flamegraph rendering blocked because no renderer is installed |
 
 ## Commands run
@@ -258,6 +258,13 @@ Important StudioFS observations:
 - after the backlog drained, the second read pass reached 365.53 MiB/s;
 - the post-drain read did not reenter FUSE and is an OS page-cache hit, not
   StudioFS read-path throughput.
+
+Dirty-pressure coverage comes from the same e2e probe. The write phase created
+109 pending uploads and 448,790,528 pending async write bytes, then the first
+read pass ran while that backlog drained. During that pressure window, read
+throughput was 15.87 MiB/s; after the backlog drained, the next FUSE read pass
+reached 365.53 MiB/s. The retained artifact is
+`target/sfs-509-linux-fuse-ext4-throughput/e2e/artifacts/performance-probe-summary.json`.
 
 ## StudioFS long-lived fio matrix
 
@@ -371,8 +378,8 @@ JuiceFS deployment.
 
 This bottleneck ranking is based on the completed local pass. The evidence is
 enough to rank the measured StudioFS bottlenecks
-for the covered workloads, but not enough to rank unrun variants such as FUSE
-background queue profiles or a future async-read prototype:
+for the covered workloads, including the background queue profile, but not
+enough to rank unavailable variants such as a future async-read prototype:
 
 1. Read throughput collapses while upload backlog is draining: the same 512 MiB
    file read at 15.87 MiB/s during backlog drain and 365.53 MiB/s after drain.
