@@ -798,6 +798,9 @@ impl FuseBoundaryBufferPool {
         buffer.clear();
         buffer.reserve(len);
         if zeroed {
+            // `read_into_fh` accepts `&mut [u8]`, so the reply buffer must be
+            // initialized before handing it to VFS. Avoiding this memset needs
+            // an explicit uninitialized-buffer read API.
             buffer.resize(len, 0);
         }
         self.shared
@@ -817,7 +820,9 @@ impl FuseBoundaryBufferPool {
             return;
         }
         buffer.clear();
-        let mut buffers = self.lock_buffers();
+        let Ok(mut buffers) = self.shared.buffers.lock() else {
+            return;
+        };
         if buffers.len() < self.shared.max_buffers {
             buffers.push(buffer);
         }
@@ -1572,6 +1577,93 @@ impl StudioFuseFs {
         }
     }
 
+    fn write_with_reply<R>(&self, ino: u64, fh: u64, offset: i64, data: &[u8], flags: i32, reply: R)
+    where
+        R: FuseWriteReply + Send + 'static,
+    {
+        let offset = match to_u64_offset(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let callback_started = Instant::now();
+        if self.async_write_enabled {
+            let data_len = data.len();
+            let registration = match self.pending_writes.register_with_admission(
+                ino,
+                fh,
+                data_len,
+                self.async_write_admission_policy.limits,
+            ) {
+                Ok(registration) => registration,
+                Err(e) => {
+                    debug!(
+                        ino,
+                        fh,
+                        offset,
+                        bytes = data_len,
+                        error = ?e,
+                        "async FUSE write admission rejected"
+                    );
+                    reply.error(write_registration_error_to_errno(e));
+                    return;
+                }
+            };
+            trace!(
+                ino,
+                fh,
+                offset,
+                bytes = data_len,
+                sequence = registration.sequence(),
+                "async FUSE write scheduled"
+            );
+            let data = self.write_boundary_buffer_pool.acquire_with_bytes(data);
+            let vfs = Arc::clone(&self.vfs);
+            let local_sync_policy = fuse_write_local_sync_policy(flags);
+            let reply = FuseWriteReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                let mut registration = registration;
+                let turn = registration.turn_waiter();
+                turn.wait().await;
+                let result = vfs
+                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
+                    .await;
+                vfs.record_fuse_write_callback(
+                    data_len,
+                    callback_started.elapsed(),
+                    result.is_err(),
+                );
+                drop(data);
+                complete_fuse_write_reply(reply, result, &registration, ino, offset);
+            });
+            return;
+        }
+
+        let result = self
+            .rt
+            .block_on(self.vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                offset,
+                data,
+                fuse_write_local_sync_policy(flags),
+            ));
+        self.vfs.record_fuse_write_callback(
+            data.len(),
+            callback_started.elapsed(),
+            result.is_err(),
+        );
+        match result {
+            Ok(written) => reply.written(written),
+            Err(e) => {
+                error!("write({ino}, off={offset}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     fn spawn_async_write_diagnostics_publisher(&self) -> JoinHandle<()> {
         let vfs = Arc::clone(&self.vfs);
         let pending_writes = self.pending_writes.clone();
@@ -2102,86 +2194,7 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
-        let callback_started = Instant::now();
-        if self.async_write_enabled {
-            let data_len = data.len();
-            let registration = match self.pending_writes.register_with_admission(
-                ino,
-                fh,
-                data_len,
-                self.async_write_admission_policy.limits,
-            ) {
-                Ok(registration) => registration,
-                Err(e) => {
-                    debug!(
-                        ino,
-                        fh,
-                        offset,
-                        bytes = data_len,
-                        error = ?e,
-                        "async FUSE write admission rejected"
-                    );
-                    reply.error(write_registration_error_to_errno(e));
-                    return;
-                }
-            };
-            trace!(
-                ino,
-                fh,
-                offset,
-                bytes = data_len,
-                sequence = registration.sequence(),
-                "async FUSE write scheduled"
-            );
-            let data = self.write_boundary_buffer_pool.acquire_with_bytes(data);
-            let vfs = Arc::clone(&self.vfs);
-            let local_sync_policy = fuse_write_local_sync_policy(flags);
-            let reply = FuseWriteReplyGuard::new(reply);
-            self.rt.spawn(async move {
-                let mut registration = registration;
-                let turn = registration.turn_waiter();
-                turn.wait().await;
-                let result = vfs
-                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
-                    .await;
-                vfs.record_fuse_write_callback(
-                    data_len,
-                    callback_started.elapsed(),
-                    result.is_err(),
-                );
-                complete_fuse_write_reply(reply, result, &registration, ino, offset);
-            });
-            return;
-        }
-
-        let result = self
-            .rt
-            .block_on(self.vfs.write_fh_with_deferred_materialize(
-                fh,
-                ino,
-                offset,
-                data,
-                fuse_write_local_sync_policy(flags),
-            ));
-        self.vfs.record_fuse_write_callback(
-            data.len(),
-            callback_started.elapsed(),
-            result.is_err(),
-        );
-        match result {
-            Ok(written) => reply.written(written),
-            Err(e) => {
-                error!("write({ino}, off={offset}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-            }
-        }
+        self.write_with_reply(ino, fh, offset, data, flags, reply);
     }
 
     fn flush(
@@ -3121,6 +3134,43 @@ mod tests {
                 .expect("test receiver should be alive");
         }
     }
+
+    type TestWriteReplyResult = Result<u32, i32>;
+
+    struct TestWriteReply {
+        sender: mpsc::Sender<TestWriteReplyResult>,
+        receiver: Cell<Option<mpsc::Receiver<TestWriteReplyResult>>>,
+    }
+
+    impl TestWriteReply {
+        fn new() -> Self {
+            let (sender, receiver) = mpsc::channel();
+            Self {
+                sender,
+                receiver: Cell::new(Some(receiver)),
+            }
+        }
+
+        fn receiver(&self) -> mpsc::Receiver<TestWriteReplyResult> {
+            self.receiver
+                .take()
+                .expect("test reply receiver should only be taken once")
+        }
+    }
+
+    impl super::FuseWriteReply for TestWriteReply {
+        fn written(self, size: u32) {
+            self.sender
+                .send(Ok(size))
+                .expect("test receiver should be alive");
+        }
+
+        fn error(self, errno: i32) {
+            self.sender
+                .send(Err(errno))
+                .expect("test receiver should be alive");
+        }
+    }
     use tokio::runtime::Runtime;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
@@ -3385,6 +3435,23 @@ mod tests {
         let large = pool.acquire_with_bytes(b"abcdefgh");
 
         assert_eq!(pool.snapshot().outstanding_bytes, large.buffer.capacity());
+    }
+
+    #[test]
+    fn boundary_buffer_drop_discards_buffer_when_pool_mutex_is_poisoned() {
+        let pool = super::FuseBoundaryBufferPool::new(8, 1, 8);
+        let buffer = pool.acquire_with_bytes(b"abc");
+        let poison_pool = pool.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison_pool.shared.buffers.lock().expect("lock pool");
+            panic!("poison boundary buffer pool");
+        });
+        assert!(poisoner.join().is_err());
+
+        let drop_result = std::panic::catch_unwind(|| drop(buffer));
+
+        assert!(drop_result.is_ok());
+        assert_eq!(pool.snapshot().outstanding_bytes, 0);
     }
 
     #[test]
@@ -3874,6 +3941,58 @@ mod tests {
             "write reply must be sent before the pending write barrier is unblocked"
         );
         assert!(barrier.is_ready());
+    }
+
+    #[test]
+    fn async_write_returns_boundary_buffer_before_publishing_completion_snapshot() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-write-boundary-release");
+        let attr = vfs
+            .create(ROOT_INO, b"write-pool.txt", 501, 20, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::WRONLY, false)
+            .expect("open file");
+        vfs.reset_diagnostics_observability();
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                async_read_enabled: false,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_writes: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+                async_read_admission_limits: None,
+            },
+        );
+        let reply = TestWriteReply::new();
+        let received = reply.receiver();
+
+        fs.write_with_reply(attr.ino, fh, 0, b"pooled write", 0, reply);
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("async write should reply"),
+            Ok(12)
+        );
+        rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                fs.pending_writes.handle_barrier(attr.ino, fh).wait_async(),
+            )
+            .await
+            .expect("async write should finish")
+            .expect("async write should succeed");
+        });
+        fs.publish_async_write_diagnostics();
+
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert_eq!(snapshot.completed_writes, 1);
+        assert_eq!(snapshot.boundary_pool_misses, 1);
+        assert_eq!(snapshot.boundary_pool_outstanding_bytes, 0);
     }
 
     #[test]
