@@ -148,13 +148,13 @@ Use `flamegraph` or `inferno-flamegraph` to convert the recorded stacks after
 |---|---|
 | Native Linux 6.x ext4 host | available |
 | FUSE device and `fusermount3` | available |
-| StudioFS current defaults | mounted control passed; 512 MiB e2e sequential probe passed |
-| async write opt-in | mounted control passed |
-| async_dio opt-in | mounted control passed |
-| FUSE background queue profiles | not run as a long-lived fio sweep; still requires `STUDIOFS_FUSE_MAX_BACKGROUND` and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` variants |
+| StudioFS current defaults | mounted control passed; 512 MiB e2e sequential probe passed; long-lived fio matrix completed |
+| async write opt-in | mounted control passed; long-lived fio matrix completed |
+| async_dio opt-in | mounted control passed; long-lived fio matrix completed |
+| FUSE background queue profiles | long-lived fio matrix completed with `STUDIOFS_FUSE_MAX_BACKGROUND=50`, `STUDIOFS_FUSE_CONGESTION_THRESHOLD=40` |
 | async-read prototype | not available in this workspace at this decision point |
 | JuiceFS | local sqlite/file-backed JuiceFS baseline passed |
-| fio workloads | ext4 and JuiceFS reference matrix passed; StudioFS has fio mounted smoke only |
+| fio workloads | ext4, JuiceFS, and StudioFS long-lived matrices passed to artifact completion |
 | CPU profiles/flamegraphs | StudioFS `perf record` captured 345 samples; flamegraph rendering blocked because no renderer is installed |
 
 ## Commands run
@@ -166,6 +166,23 @@ STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mo
 STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_opt_in -- --ignored --exact --nocapture
 STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_dio_opt_in -- --ignored --exact --nocapture
 STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_fio_multi_job -- --ignored --exact --nocapture
+```
+
+StudioFS long-lived fio matrix:
+
+```bash
+export STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1
+export STUDIOFS_SFS509_FIO_SIZE=8m
+export STUDIOFS_SFS509_FIO_LARGE_SIZE=32m
+export STUDIOFS_SFS509_FIO_RUNTIME_SECS=3
+export STUDIOFS_SFS509_FIO_TIMEOUT_SECS=20
+export STUDIOFS_SFS509_METADATA_FILES=500
+
+cargo test -p studiofs-fuse --test mount_sanity linux_sfs509_mounted_fio_default_sync -- --ignored --exact --nocapture
+cargo test -p studiofs-fuse --test mount_sanity linux_sfs509_mounted_fio_async_opt_in -- --ignored --exact --nocapture
+cargo test -p studiofs-fuse --test mount_sanity linux_sfs509_mounted_fio_async_dio_opt_in -- --ignored --exact --nocapture
+STUDIOFS_FUSE_MAX_BACKGROUND=50 STUDIOFS_FUSE_CONGESTION_THRESHOLD=40 \
+  cargo test -p studiofs-fuse --test mount_sanity linux_sfs509_mounted_fio_background_queue -- --ignored --exact --nocapture
 ```
 
 StudioFS sustained sequential probe:
@@ -197,6 +214,7 @@ Artifacts:
 
 - `target/sfs-509-linux-fuse-ext4-throughput/preflight/`
 - `target/sfs-509-linux-fuse-ext4-throughput/studiofs/mount-sanity/`
+- `target/sfs-509-linux-fuse-ext4-throughput/studiofs/long-lived-fio/`
 - `target/sfs-509-linux-fuse-ext4-throughput/e2e/mounted-performance-probe-report.json`
 - `target/sfs-509-linux-fuse-ext4-throughput/e2e/artifacts/performance-probe-summary.json`
 - `target/sfs-509-linux-fuse-ext4-throughput/fio/`
@@ -240,6 +258,74 @@ Important StudioFS observations:
 - after the backlog drained, the second read pass reached 365.53 MiB/s;
 - the post-drain read did not reenter FUSE and is an OS page-cache hit, not
   StudioFS read-path throughput.
+
+## StudioFS long-lived fio matrix
+
+The SFS-509 long-lived fio harness keeps one StudioFS FUSE mount alive for the
+full workload sequence in each variant. The completed bounded pass used 8 MiB
+main fio files, a 32 MiB large-file write, 3 second random/mixed runtime
+windows, 20 second per-workload fio timeouts, and 500 metadata files. This
+scale is intentionally smaller than the e2e 512 MiB sequential probe because
+the multi-job and fsync-heavy paths can otherwise hold the mount for many
+minutes without producing additional decision signal.
+
+Throughput values are MiB/s. `multi-job` and `fsync-heavy` timed out at 20 s in
+all four StudioFS variants, so their partial JSON files are recorded via
+`workload-status.tsv` rather than included in the throughput table.
+
+| Variant | Workload | Read MiB/s | Write MiB/s | Read IOPS | Write IOPS |
+|---|---|---:|---:|---:|---:|
+| default sync | sequential write | 0.00 | 66.67 | 0 | 67 |
+| default sync | cold-cache read | 71.43 | 0.00 | 71 | 0 |
+| default sync | warm-cache read | 242.42 | 0.00 | 242 | 0 |
+| default sync | random write | 0.00 | 0.21 | 0 | 53 |
+| default sync | random read | 19.91 | 0.00 | 5097 | 0 |
+| default sync | mixed read/write | 2.68 | 1.16 | 171 | 75 |
+| default sync | large-file write | 0.00 | 55.27 | 0 | 55 |
+| async write opt-in | sequential write | 0.00 | 61.54 | 0 | 62 |
+| async write opt-in | cold-cache read | 76.19 | 0.00 | 76 | 0 |
+| async write opt-in | warm-cache read | 102.56 | 0.00 | 103 | 0 |
+| async write opt-in | random write | 0.00 | 0.22 | 0 | 57 |
+| async write opt-in | random read | 0.08 | 0.00 | 20 | 0 |
+| async write opt-in | mixed read/write | 2.82 | 1.24 | 181 | 79 |
+| async write opt-in | large-file write | 0.00 | 59.70 | 0 | 60 |
+| async_dio opt-in | sequential write | 0.00 | 62.99 | 0 | 63 |
+| async_dio opt-in | cold-cache read | 84.21 | 0.00 | 84 | 0 |
+| async_dio opt-in | warm-cache read | 105.26 | 0.00 | 105 | 0 |
+| async_dio opt-in | random write | 0.00 | 0.23 | 0 | 59 |
+| async_dio opt-in | random read | 3.66 | 0.00 | 936 | 0 |
+| async_dio opt-in | mixed read/write | 2.84 | 1.25 | 182 | 80 |
+| async_dio opt-in | large-file write | 0.00 | 35.75 | 0 | 36 |
+| background queue | sequential write | 0.00 | 61.54 | 0 | 62 |
+| background queue | cold-cache read | 82.47 | 0.00 | 82 | 0 |
+| background queue | warm-cache read | 86.96 | 0.00 | 87 | 0 |
+| background queue | random write | 0.00 | 0.23 | 0 | 60 |
+| background queue | random read | 4.99 | 0.00 | 1277 | 0 |
+| background queue | mixed read/write | 2.74 | 1.19 | 175 | 76 |
+| background queue | large-file write | 0.00 | 35.20 | 0 | 35 |
+
+Long-lived workload status:
+
+| Variant | multi-job | fsync-heavy |
+|---|---:|---:|
+| default sync | timeout, exit 124 | timeout, exit 124 |
+| async write opt-in | timeout, exit 124 | timeout, exit 124 |
+| async_dio opt-in | timeout, exit 124 | timeout, exit 124 |
+| background queue | timeout, exit 124 | timeout, exit 124 |
+
+Metadata-heavy readdir/stat over 500 files:
+
+| Variant | Create elapsed | stat/readdir elapsed |
+|---|---:|---:|
+| default sync | 90.827 s | 0.255 s |
+| async write opt-in | 87.839 s | 0.212 s |
+| async_dio opt-in | 82.798 s | 0.241 s |
+| background queue | 85.437 s | 0.195 s |
+
+The long-lived matrix closes the previous coverage gap for StudioFS current
+defaults, async write opt-in, async_dio opt-in, and background queue profiles.
+It also adds a new result: the multi-job fsync write and fsync-heavy write
+paths fail the 20 second bounded workload window even at 8 MiB.
 
 ## ext4 and JuiceFS fio reference
 
@@ -297,8 +383,12 @@ background queue profiles or a future async-read prototype:
    proof of a faster StudioFS read path.
 4. Smoke-scale fsync-heavy StudioFS writes remain slow at about 930-946 KiB/s
    for the 2 MiB fio mounted test.
-5. Background queue tuning, readdirplus/opendir handle state, and kernel read
-   buffer changes remain unmeasured in this pass.
+5. Background queue tuning did not materially improve the bounded fio matrix:
+   sequential write stayed near async opt-in, mixed read/write stayed near
+   2.7/1.2 MiB/s, and multi-job/fsync-heavy still timed out.
+6. Metadata create is a large bottleneck through the FUSE path: 500 tiny files
+   took 82.8-90.8 s to create, while the subsequent stat/readdir pass took
+   only 0.195-0.255 s.
 
 ## Default-on/default-off recommendations
 
@@ -309,9 +399,10 @@ Based on this pass, keep the Linux defaults unchanged:
 - keep FUSE background queue tuning opt-in;
 - keep any async-read prototype out of defaults until it has sustained
   read-path evidence;
-- add a long-lived StudioFS fio harness before making a default-on decision for
-  the full random/mixed/metadata/cold-cache matrix.
+- treat multi-job fsync and fsync-heavy write timeouts as blockers for any
+  default-on async write decision.
 
 The default-on/default-off recommendations can be revisited after a follow-up
-run covers the missing StudioFS fio matrix variants, FUSE callback latency
-histograms, rendered flamegraphs, and background queue profiles.
+fix specifically improves the multi-job/fsync-heavy paths and repeats this
+long-lived matrix with rendered flamegraphs and FUSE callback latency
+histograms.
