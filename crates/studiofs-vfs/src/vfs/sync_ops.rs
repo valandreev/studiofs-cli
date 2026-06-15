@@ -175,7 +175,7 @@ impl StudioVfs {
         )
     }
 
-    async fn maybe_pre_drain_sustained_write_buffer(
+    pub(super) async fn maybe_pre_drain_sustained_write_buffer(
         self: &Arc<Self>,
         ino: Ino,
         offset: u64,
@@ -1337,10 +1337,11 @@ impl StudioVfs {
                     .await;
             }
         }
+        let validated_open_file = self.enforce_write_access_for_handle(fh, ino)?;
         if local_sync_policy.is_opportunistic() {
-            self.maybe_throttle_write_admission(data.len()).await;
             self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
+            self.maybe_throttle_write_admission(data.len()).await;
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
@@ -1349,9 +1350,8 @@ impl StudioVfs {
                 .enter_op(ino, FileSessionOperation::Write)
                 .await,
         );
-        let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
-            open_file.as_ref(),
+            Some(&validated_open_file),
             ino,
             offset,
             data.len(),
