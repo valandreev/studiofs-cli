@@ -559,11 +559,17 @@ struct PendingReadRegistration {
 }
 
 #[derive(Debug, Clone)]
+/// Bounded FUSE boundary buffer recycler for async callback-owned payloads.
+///
+/// The pool is shared across Tokio tasks through `Arc` and protects only the
+/// idle buffer stack with a mutex. Buffers larger than `max_pooled_buffer_bytes`
+/// are owned by the caller but not retained for reuse.
 struct FuseBoundaryBufferPool {
     shared: Arc<FuseBoundaryBufferPoolShared>,
 }
 
 #[derive(Debug)]
+/// Shared state and counters for one directional FUSE boundary buffer pool.
 struct FuseBoundaryBufferPoolShared {
     buffers: Mutex<Vec<Vec<u8>>>,
     buffer_capacity: usize,
@@ -576,6 +582,7 @@ struct FuseBoundaryBufferPoolShared {
 }
 
 #[derive(Debug)]
+/// Owned FUSE boundary buffer that returns pooled storage on drop.
 struct FuseBoundaryBuffer {
     pool: FuseBoundaryBufferPool,
     buffer: Vec<u8>,
@@ -584,6 +591,7 @@ struct FuseBoundaryBuffer {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Point-in-time counters for a FUSE boundary buffer pool.
 struct FuseBoundaryBufferPoolSnapshot {
     hits: u64,
     misses: u64,
@@ -788,6 +796,7 @@ impl FuseBoundaryBufferPool {
         }
         let mut buffer = buffer.unwrap_or_default();
         buffer.clear();
+        buffer.reserve(len);
         if zeroed {
             buffer.resize(len, 0);
         }
@@ -1131,7 +1140,8 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     pending_reads: PendingReadTracker,
-    boundary_buffer_pool: FuseBoundaryBufferPool,
+    read_boundary_buffer_pool: FuseBoundaryBufferPool,
+    write_boundary_buffer_pool: FuseBoundaryBufferPool,
     async_write_enabled: bool,
     async_read_enabled: bool,
     linux_async_dio_enabled: bool,
@@ -1251,7 +1261,12 @@ impl StudioFuseFs {
             rt,
             pending_writes: PendingWriteTracker::default(),
             pending_reads: PendingReadTracker::default(),
-            boundary_buffer_pool: FuseBoundaryBufferPool::new(
+            read_boundary_buffer_pool: FuseBoundaryBufferPool::new(
+                FUSE_BOUNDARY_POOL_BUFFER_BYTES,
+                FUSE_BOUNDARY_POOL_MAX_BUFFERS,
+                FUSE_BOUNDARY_POOL_MAX_POOLED_BUFFER_BYTES,
+            ),
+            write_boundary_buffer_pool: FuseBoundaryBufferPool::new(
                 FUSE_BOUNDARY_POOL_BUFFER_BYTES,
                 FUSE_BOUNDARY_POOL_MAX_BUFFERS,
                 FUSE_BOUNDARY_POOL_MAX_POOLED_BUFFER_BYTES,
@@ -1323,7 +1338,7 @@ impl StudioFuseFs {
             self.async_write_platform_policy_label(),
             self.async_write_admission_policy.limits,
             &self.pending_writes,
-            &self.boundary_buffer_pool,
+            &self.write_boundary_buffer_pool,
         );
     }
 
@@ -1332,7 +1347,7 @@ impl StudioFuseFs {
             .record_fuse_async_read_snapshot(Self::async_read_snapshot(
                 &self.pending_reads,
                 self.async_read_admission_policy.limits,
-                &self.boundary_buffer_pool,
+                &self.read_boundary_buffer_pool,
             ));
     }
 
@@ -1391,7 +1406,7 @@ impl StudioFuseFs {
             let callback_started = Instant::now();
             let vfs = Arc::clone(&self.vfs);
             let pending_reads = self.pending_reads.clone();
-            let boundary_buffer_pool = self.boundary_buffer_pool.clone();
+            let boundary_buffer_pool = self.read_boundary_buffer_pool.clone();
             let limits = self.async_read_admission_policy.limits;
             let reply = FuseDataReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -1560,7 +1575,7 @@ impl StudioFuseFs {
     fn spawn_async_write_diagnostics_publisher(&self) -> JoinHandle<()> {
         let vfs = Arc::clone(&self.vfs);
         let pending_writes = self.pending_writes.clone();
-        let boundary_buffer_pool = self.boundary_buffer_pool.clone();
+        let boundary_buffer_pool = self.write_boundary_buffer_pool.clone();
         let enabled = self.async_write_enabled;
         let platform_policy = self.async_write_platform_policy_label();
         let limits = self.async_write_admission_policy.limits;
@@ -2125,7 +2140,7 @@ impl Filesystem for StudioFuseFs {
                 sequence = registration.sequence(),
                 "async FUSE write scheduled"
             );
-            let data = self.boundary_buffer_pool.acquire_with_bytes(data);
+            let data = self.write_boundary_buffer_pool.acquire_with_bytes(data);
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
@@ -2187,7 +2202,7 @@ impl Filesystem for StudioFuseFs {
             };
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
-            let boundary_buffer_pool = self.boundary_buffer_pool.clone();
+            let boundary_buffer_pool = self.write_boundary_buffer_pool.clone();
             let admission_limits = self.async_write_admission_policy.limits;
             let platform_policy = self.async_write_platform_policy_label();
             let reply = FuseEmptyReplyGuard::new(reply);
@@ -2280,7 +2295,7 @@ impl Filesystem for StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
             let pending_reads = self.pending_reads.clone();
-            let boundary_buffer_pool = self.boundary_buffer_pool.clone();
+            let boundary_buffer_pool = self.write_boundary_buffer_pool.clone();
             let admission_limits = self.async_write_admission_policy.limits;
             let read_limits = self.async_read_admission_policy.limits;
             let platform_policy = self.async_write_platform_policy_label();
@@ -2401,7 +2416,7 @@ impl Filesystem for StudioFuseFs {
             let barrier = self.pending_writes.inode_barrier(ino);
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
-            let boundary_buffer_pool = self.boundary_buffer_pool.clone();
+            let boundary_buffer_pool = self.write_boundary_buffer_pool.clone();
             let admission_limits = self.async_write_admission_policy.limits;
             let platform_policy = self.async_write_platform_policy_label();
             let reply = FuseEmptyReplyGuard::new(reply);
@@ -3359,6 +3374,61 @@ mod tests {
         buffer[1] = b'Z';
 
         assert_eq!(&*buffer, b"aZc");
+    }
+
+    #[test]
+    fn boundary_buffer_accounts_reallocated_reused_capacity() {
+        let pool = super::FuseBoundaryBufferPool::new(4, 1, 8);
+        let small = pool.acquire_with_bytes(b"abcd");
+        drop(small);
+
+        let large = pool.acquire_with_bytes(b"abcdefgh");
+
+        assert_eq!(pool.snapshot().outstanding_bytes, large.buffer.capacity());
+    }
+
+    #[test]
+    fn async_read_pool_metrics_do_not_appear_in_write_diagnostics() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-write-pool-split");
+        let attr = vfs
+            .create(ROOT_INO, b"split.txt", 501, 20, 0o644)
+            .expect("create file");
+        rt.block_on(vfs.write(attr.ino, 0, b"split async read"))
+            .expect("seed file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        vfs.reset_diagnostics_observability();
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                async_read_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_reads: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+        let reply = TestDataReply::new();
+        let received = reply.receiver();
+
+        fs.read_with_reply(attr.ino, fh, 0, 5, reply);
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("async read should reply"),
+            Ok(b"split".to_vec())
+        );
+        fs.publish_async_write_diagnostics();
+        let snapshot = vfs.write_path_observability_snapshot();
+
+        assert_eq!(snapshot.fuse_async_read.boundary_pool_misses, 1);
+        assert_eq!(snapshot.fuse_async_write.boundary_pool_misses, 0);
     }
 
     #[test]
