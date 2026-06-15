@@ -1044,6 +1044,60 @@ fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
 }
 
 #[test]
+fn linux_fuse_ext4_throughput_baseline_report_covers_sfs509_decision_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-509-linux-fuse-ext4-throughput-baseline.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-509",
+        "native Linux 6.x",
+        "ext4",
+        "not WSL drvfs",
+        "sequential read/write",
+        "random read/write",
+        "mixed read/write",
+        "multi-job",
+        "fsync-heavy",
+        "metadata-heavy readdir/stat",
+        "cold-cache",
+        "warm-cache",
+        "dirty-pressure",
+        "large-file",
+        "StudioFS current defaults",
+        "async write opt-in",
+        "async_dio opt-in",
+        "FUSE background queue profiles",
+        "async-read prototype",
+        "JuiceFS",
+        "StudioFS status snapshots",
+        "pending async write bytes",
+        "FUSE callback latency histograms",
+        "CPU profiles",
+        "flamegraphs",
+        "RSS",
+        "syscall rates",
+        "context switches",
+        "bottleneck ranking",
+        "default-on/default-off recommendations",
+        "target/sfs-509-linux-fuse-ext4-throughput",
+        "fio",
+        "perf record",
+        "perf stat",
+        "cargo test -p studiofs --test architecture_vocabulary_test linux_fuse_ext4_throughput_baseline_report_covers_sfs509_decision_gate -- --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-509 Linux FUSE ext4 throughput baseline report is missing required decision-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn macos_native_bridge_split_note_covers_sfs475_boundary() {
     let doc = read_workspace_file("docs/macos-native-bridge-split.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
