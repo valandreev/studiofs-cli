@@ -1575,6 +1575,12 @@ impl StudioFuseFs {
                     &boundary_buffer_pool,
                 );
                 let mut out = boundary_buffer_pool.acquire_zeroed(clamped_size);
+                StudioFuseFs::record_async_read_snapshot(
+                    &vfs,
+                    &pending_reads,
+                    limits,
+                    &boundary_buffer_pool,
+                );
                 let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
                 vfs.record_fuse_read_callback(
                     clamped_size,
@@ -3223,7 +3229,9 @@ mod tests {
     use studiofs_meta::MetaError;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, ROOT_INO, RedbMetaEngine};
-    use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
+    use studiofs_vfs::{
+        LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsFuseAsyncReadSnapshot,
+    };
     use tempfile::TempDir;
 
     type TestDataReplyResult = Result<Vec<u8>, i32>;
@@ -3307,6 +3315,25 @@ mod tests {
                 .expect("test receiver should be alive");
         }
     }
+
+    fn wait_for_async_read_snapshot(
+        vfs: &StudioVfs,
+        mut predicate: impl FnMut(&VfsFuseAsyncReadSnapshot) -> bool,
+    ) -> VfsFuseAsyncReadSnapshot {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let snapshot = vfs.write_path_observability_snapshot().fuse_async_read;
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for async read snapshot: {snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     use tokio::runtime::Runtime;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
@@ -3580,7 +3607,7 @@ mod tests {
             },
         );
 
-        for _ in 0..2 {
+        for expected_hits in 0..2 {
             let reply = TestDataReply::new();
             let received = reply.receiver();
             fs.read_with_reply(attr.ino, fh, 0, 6, reply);
@@ -3590,6 +3617,11 @@ mod tests {
                     .expect("async read should reply"),
                 Ok(b"pooled".to_vec())
             );
+            wait_for_async_read_snapshot(&vfs, |snapshot| {
+                snapshot.boundary_pool_misses == 1
+                    && snapshot.boundary_pool_hits == expected_hits
+                    && snapshot.boundary_pool_outstanding_bytes == 0
+            });
         }
 
         let snapshot = vfs.write_path_observability_snapshot().fuse_async_read;
@@ -3674,6 +3706,7 @@ mod tests {
                 .expect("async read should reply"),
             Ok(b"split".to_vec())
         );
+        wait_for_async_read_snapshot(&vfs, |snapshot| snapshot.boundary_pool_misses == 1);
         fs.publish_async_write_diagnostics();
         let snapshot = vfs.write_path_observability_snapshot();
 
