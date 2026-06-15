@@ -1647,6 +1647,11 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().get(&ino).cloned()
     }
 
+    /// Returns the persisted inode attributes for `ino` asynchronously, enforcing `ReadOnly` access.
+    ///
+    /// This is the async read-path counterpart to [`getattr`](Self::getattr) for callers that are
+    /// already running inside Tokio tasks and need to avoid blocking the executor while resolving
+    /// metadata and ACL state.
     pub async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_async_unchecked(ino).await?;
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
