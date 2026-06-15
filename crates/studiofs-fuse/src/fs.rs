@@ -971,7 +971,7 @@ struct DirectoryHandle {
 
 impl DirectoryHandleStore {
     fn shard(&self, fh: u64) -> &Mutex<HashMap<u64, DirectoryHandle>> {
-        &self.shards[(fh as usize) % DIR_HANDLE_SHARDS]
+        &self.shards[(fh % DIR_HANDLE_SHARDS as u64) as usize]
     }
 
     fn open(&self, ino: u64, entries: Vec<DirEntry>) -> u64 {
