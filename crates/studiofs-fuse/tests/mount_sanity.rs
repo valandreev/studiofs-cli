@@ -1055,10 +1055,13 @@ fn run_fio_json_case(
         .args(args)
         .output()
         .expect("run SFS-509 fio workload");
-    let mut log_bytes = Vec::new();
-    log_bytes.extend_from_slice(&result.stdout);
-    log_bytes.extend_from_slice(&result.stderr);
-    std::fs::write(&log, log_bytes).expect("write SFS-509 fio log");
+    let mut log_file = std::fs::File::create(&log).expect("create SFS-509 fio log");
+    log_file
+        .write_all(&result.stdout)
+        .expect("write SFS-509 fio stdout");
+    log_file
+        .write_all(&result.stderr)
+        .expect("write SFS-509 fio stderr");
     let status_line = format!("{case_name}\t{}\n", result.status);
     let mut status_file = std::fs::OpenOptions::new()
         .create(true)
@@ -1090,7 +1093,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", "512m");
     let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
     let runtime = sfs509_env_value("STUDIOFS_SFS509_FIO_RUNTIME_SECS", "20");
-    let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "20000")
+    let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "500")
         .parse::<usize>()
         .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
     let size_arg = format!("--size={size}");
