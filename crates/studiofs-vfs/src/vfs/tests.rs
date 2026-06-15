@@ -12167,6 +12167,10 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         admission_wait_total_ms: 5.0,
         barrier_waits: 6,
         barrier_wait_total_ms: 7.0,
+        boundary_pool_hits: 11,
+        boundary_pool_misses: 3,
+        boundary_pool_outstanding_bytes: 64 * 1024,
+        boundary_pool_fallback_allocations: 2,
         ..Default::default()
     });
     vfs.reset_diagnostics_observability();
@@ -12183,6 +12187,10 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         admission_wait_total_ms: 5.0,
         barrier_waits: 6,
         barrier_wait_total_ms: 7.0,
+        boundary_pool_hits: 11,
+        boundary_pool_misses: 3,
+        boundary_pool_outstanding_bytes: 64 * 1024,
+        boundary_pool_fallback_allocations: 2,
         ..Default::default()
     });
     let baseline = vfs.write_path_observability_snapshot().fuse_async_write;
@@ -12194,6 +12202,10 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(baseline.task_failed_writes, 0);
     assert_eq!(baseline.admission_waits, 0);
     assert_eq!(baseline.barrier_waits, 0);
+    assert_eq!(baseline.boundary_pool_hits, 0);
+    assert_eq!(baseline.boundary_pool_misses, 0);
+    assert_eq!(baseline.boundary_pool_outstanding_bytes, 64 * 1024);
+    assert_eq!(baseline.boundary_pool_fallback_allocations, 0);
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 8,
@@ -12209,6 +12221,10 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         admission_wait_total_ms: 6.5,
         barrier_waits: 9,
         barrier_wait_total_ms: 11.0,
+        boundary_pool_hits: 14,
+        boundary_pool_misses: 5,
+        boundary_pool_outstanding_bytes: 128 * 1024,
+        boundary_pool_fallback_allocations: 4,
         ..Default::default()
     });
 
@@ -12225,6 +12241,10 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(after.admission_wait_total_ms, 1.5);
     assert_eq!(after.barrier_waits, 3);
     assert_eq!(after.barrier_wait_total_ms, 4.0);
+    assert_eq!(after.boundary_pool_hits, 3);
+    assert_eq!(after.boundary_pool_misses, 2);
+    assert_eq!(after.boundary_pool_outstanding_bytes, 128 * 1024);
+    assert_eq!(after.boundary_pool_fallback_allocations, 2);
 }
 
 #[test]

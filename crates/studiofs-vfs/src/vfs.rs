@@ -7027,6 +7027,15 @@ impl StudioVfs {
             snapshot.barrier_wait_total_ms,
             baseline.barrier_wait_total_ms,
         );
+        snapshot.boundary_pool_hits = snapshot
+            .boundary_pool_hits
+            .saturating_sub(baseline.boundary_pool_hits);
+        snapshot.boundary_pool_misses = snapshot
+            .boundary_pool_misses
+            .saturating_sub(baseline.boundary_pool_misses);
+        snapshot.boundary_pool_fallback_allocations = snapshot
+            .boundary_pool_fallback_allocations
+            .saturating_sub(baseline.boundary_pool_fallback_allocations);
         snapshot
     }
 

@@ -784,17 +784,17 @@ impl FuseBoundaryBufferPool {
             };
         }
 
-        let mut buffer = {
+        let buffer = {
             let mut buffers = self.lock_buffers();
             buffers.pop()
         };
-        if buffer.is_some() {
+        let mut buffer = if let Some(buffer) = buffer {
             self.shared.hits.fetch_add(1, Ordering::Relaxed);
+            buffer
         } else {
             self.shared.misses.fetch_add(1, Ordering::Relaxed);
-            buffer = Some(Vec::with_capacity(self.shared.buffer_capacity.max(len)));
-        }
-        let mut buffer = buffer.unwrap_or_default();
+            Vec::with_capacity(self.shared.buffer_capacity.max(len))
+        };
         buffer.clear();
         buffer.reserve(len);
         if zeroed {
