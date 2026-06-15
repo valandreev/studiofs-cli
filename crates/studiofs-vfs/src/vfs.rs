@@ -6159,6 +6159,11 @@ impl StudioVfs {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             self.record_write_admission_wait(started.elapsed());
         }
+        let writer_stack_dirty_with_next = self
+            .state
+            .writer_stack
+            .total_dirty_bytes()
+            .saturating_add(next_bytes);
         if write_buffer_admission_delay_ms(writer_stack_dirty_with_next, buffer_budget_bytes)
             .is_some()
         {

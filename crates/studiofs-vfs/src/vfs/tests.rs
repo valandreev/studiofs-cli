@@ -5912,7 +5912,13 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sustained-pre-drain-under-pressure.bin", 0, 0, 0o644)
+            .create(
+                ROOT_INO,
+                b"sustained-pre-drain-under-pressure.bin",
+                0,
+                0,
+                0o644,
+            )
             .unwrap();
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
         vfs.set_max_dirty_bytes(64 * 1024 * 1024);
@@ -5970,6 +5976,49 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
         drop(guard);
         vfs.state.writer_stack.clear_inode(attr.ino);
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn denied_deferred_write_does_not_update_sustained_write_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "denied-deferred-write-sustained-state");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"denied-deferred-write.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+
+        let result = vfs
+            .write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"blocked",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !vfs.state
+                .sustained_write_streams
+                .lock()
+                .contains_key(&attr.ino),
+            "denied writes must not mutate sustained-write admission state"
+        );
+        assert!(
+            !vfs.state
+                .deferred_materialize_reschedule_needed
+                .lock()
+                .contains(&attr.ino),
+            "denied writes must not request deferred materialization"
+        );
+        tokio::time::timeout(Duration::from_secs(1), vfs.release_fh(fh))
+            .await
+            .expect("read-only handle release should not hang")
+            .unwrap();
     });
 }
 
