@@ -1012,11 +1012,11 @@ impl DirectoryHandleStore {
             .shard(fh)
             .lock()
             .expect("directory handle mutex poisoned");
-        if let Entry::Occupied(entry) = handles.entry(fh)
-            && entry.get().ino == ino
-        {
-            entry.remove();
-            return true;
+        if let Entry::Occupied(entry) = handles.entry(fh) {
+            if entry.get().ino == ino {
+                entry.remove();
+                return true;
+            }
         }
         false
     }
