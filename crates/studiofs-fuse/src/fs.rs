@@ -596,6 +596,30 @@ impl PendingReadTracker {
         })
     }
 
+    fn admit_bytes(
+        &self,
+        ino: u64,
+        fh: u64,
+        bytes: usize,
+        limits: StudioFuseAsyncReadAdmissionLimits,
+    ) -> Result<(), i32> {
+        let mut state = self.lock_state();
+        let handle_pending_bytes = state
+            .by_handle
+            .get(&(ino, fh))
+            .map_or(0, |handle| handle.pending_bytes);
+        if exceeds_limit(state.pending_bytes, bytes, limits.max_pending_bytes)
+            || exceeds_limit(handle_pending_bytes, bytes, limits.per_handle_pending_bytes)
+        {
+            return Err(libc::EAGAIN);
+        }
+        let handle = state.by_handle.entry((ino, fh)).or_default();
+        handle.pending_bytes += bytes;
+        state.pending_bytes += bytes;
+        state.peak_pending_bytes = state.peak_pending_bytes.max(state.pending_bytes);
+        Ok(())
+    }
+
     fn wait_for_handle(&self, ino: u64, fh: u64) {
         let mut state = self.lock_state();
         while state
@@ -671,6 +695,16 @@ impl PendingReadTracker {
 }
 
 impl PendingReadRegistration {
+    fn admit_bytes(
+        &mut self,
+        bytes: usize,
+        limits: StudioFuseAsyncReadAdmissionLimits,
+    ) -> Result<(), i32> {
+        self.tracker.admit_bytes(self.ino, self.fh, bytes, limits)?;
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
     fn complete(&mut self, outcome: PendingReadOutcome) {
         if !self.completed {
             self.tracker.finish(self.ino, self.fh, self.bytes, outcome);
@@ -1137,15 +1171,31 @@ impl StudioFuseFs {
             }
         };
         if self.async_read_enabled {
+            let registration = match self.pending_reads.register(
+                ino,
+                fh,
+                0,
+                self.async_read_admission_policy.limits,
+            ) {
+                Ok(registration) => registration,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+            self.publish_async_read_diagnostics();
             let callback_started = Instant::now();
             let vfs = Arc::clone(&self.vfs);
             let pending_reads = self.pending_reads.clone();
             let limits = self.async_read_admission_policy.limits;
             let reply = FuseDataReplyGuard::new(reply);
             self.rt.spawn(async move {
+                let mut registration = registration;
                 let clamped_size = match vfs.getattr_async(ino).await {
                     Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
                     Err(e) => {
+                        registration.complete(PendingReadOutcome::Failed);
+                        vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
                         error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
                         reply.error(vfs_err_to_errno(&e));
                         return;
@@ -1154,21 +1204,27 @@ impl StudioFuseFs {
                 let clamped_size = match usize::try_from(clamped_size) {
                     Ok(clamped_size) => clamped_size,
                     Err(_) => {
+                        registration.complete(PendingReadOutcome::Failed);
+                        vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
                         reply.error(libc::EOVERFLOW);
                         return;
                     }
                 };
                 if clamped_size == 0 {
+                    registration.complete(PendingReadOutcome::Completed);
+                    vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
                     reply.data(&[]);
                     return;
                 }
-                let mut registration = match pending_reads.register(ino, fh, clamped_size, limits) {
-                    Ok(registration) => registration,
+                match registration.admit_bytes(clamped_size, limits) {
+                    Ok(()) => {}
                     Err(errno) => {
+                        registration.complete(PendingReadOutcome::Canceled);
+                        vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
                         reply.error(errno);
                         return;
                     }
-                };
+                }
                 vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
                 let mut out = vec![0u8; clamped_size];
                 let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
@@ -2985,6 +3041,46 @@ mod tests {
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(snapshot.fuse_async_read.pending_reads, 0);
         assert_eq!(snapshot.fuse_async_read.completed_reads, 1);
+    }
+
+    #[test]
+    fn async_read_is_pending_before_spawned_task_runs() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-pre-registration");
+        let attr = vfs
+            .create(ROOT_INO, b"pending.txt", 501, 20, 0o644)
+            .expect("create file");
+        rt.block_on(vfs.write(attr.ino, 0, b"pending async read"))
+            .expect("seed file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        vfs.reset_diagnostics_observability();
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                async_read_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_reads: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+        let reply = TestDataReply::new();
+
+        fs.read_with_reply(attr.ino, fh, 0, 7, reply);
+
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .fuse_async_read
+                .pending_reads,
+            1,
+            "release barriers must see an async read before its task reaches getattr"
+        );
     }
 
     #[test]
