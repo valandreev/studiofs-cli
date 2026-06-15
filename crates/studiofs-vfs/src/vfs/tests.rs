@@ -11911,6 +11911,10 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         admission_wait_total_ms: 6.5,
         barrier_waits: 7,
         barrier_wait_total_ms: 8.5,
+        boundary_pool_hits: 11,
+        boundary_pool_misses: 3,
+        boundary_pool_outstanding_bytes: 64 * 1024,
+        boundary_pool_fallback_allocations: 2,
     });
 
     let snapshot = vfs.write_path_observability_snapshot();
@@ -11931,6 +11935,16 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+    assert_eq!(snapshot.fuse_async_write.boundary_pool_hits, 11);
+    assert_eq!(snapshot.fuse_async_write.boundary_pool_misses, 3);
+    assert_eq!(
+        snapshot.fuse_async_write.boundary_pool_outstanding_bytes,
+        64 * 1024
+    );
+    assert_eq!(
+        snapshot.fuse_async_write.boundary_pool_fallback_allocations,
+        2
+    );
 }
 
 #[test]

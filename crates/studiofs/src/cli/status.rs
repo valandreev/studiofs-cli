@@ -141,7 +141,7 @@ fn format_optional_count(value: Option<usize>) -> String {
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
-fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 5] {
+fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 6] {
     let mode = if snapshot.enabled {
         "enabled"
     } else {
@@ -175,10 +175,17 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
             snapshot.barrier_waits,
             format_finite_ms(snapshot.barrier_wait_total_ms)
         ),
+        format!(
+            "  FUSE async pool:          {} hits, {} misses, {} outstanding, {} fallback allocations",
+            snapshot.boundary_pool_hits,
+            snapshot.boundary_pool_misses,
+            format_bytes(snapshot.boundary_pool_outstanding_bytes as u64),
+            snapshot.boundary_pool_fallback_allocations
+        ),
     ]
 }
 
-fn format_fuse_async_read_diagnostics(snapshot: &VfsFuseAsyncReadSnapshot) -> [String; 4] {
+fn format_fuse_async_read_diagnostics(snapshot: &VfsFuseAsyncReadSnapshot) -> [String; 5] {
     [
         format!(
             "  FUSE async reads pending: {} reads, {} current, {} reads/{} peak",
@@ -199,6 +206,13 @@ fn format_fuse_async_read_diagnostics(snapshot: &VfsFuseAsyncReadSnapshot) -> [S
             "  FUSE async read waits:    admission {}/{}",
             snapshot.admission_waits,
             format_finite_ms(snapshot.admission_wait_total_ms)
+        ),
+        format!(
+            "  FUSE async read pool:     {} hits, {} misses, {} outstanding, {} fallback allocations",
+            snapshot.boundary_pool_hits,
+            snapshot.boundary_pool_misses,
+            format_bytes(snapshot.boundary_pool_outstanding_bytes as u64),
+            snapshot.boundary_pool_fallback_allocations
         ),
     ]
 }
@@ -1072,6 +1086,10 @@ mod tests {
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
             barrier_wait_total_ms: 8.5,
+            boundary_pool_hits: 11,
+            boundary_pool_misses: 3,
+            boundary_pool_outstanding_bytes: 64 * 1024,
+            boundary_pool_fallback_allocations: 2,
         };
 
         let lines = format_fuse_async_write_diagnostics(&snapshot);
@@ -1084,6 +1102,7 @@ mod tests {
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
+                "  FUSE async pool:          11 hits, 3 misses, 64.0KiB outstanding, 2 fallback allocations",
             ]
         );
     }
@@ -1101,6 +1120,10 @@ mod tests {
             canceled_reads: 1,
             admission_waits: 4,
             admission_wait_total_ms: 6.5,
+            boundary_pool_hits: 11,
+            boundary_pool_misses: 3,
+            boundary_pool_outstanding_bytes: 64 * 1024,
+            boundary_pool_fallback_allocations: 2,
         };
 
         let lines = format_fuse_async_read_diagnostics(&snapshot);
@@ -1112,6 +1135,7 @@ mod tests {
                 "  FUSE async read caps:     max 128.0MiB",
                 "  FUSE async read done:     17 ok, 2 errors, 1 canceled",
                 "  FUSE async read waits:    admission 4/6.500ms",
+                "  FUSE async read pool:     11 hits, 3 misses, 64.0KiB outstanding, 2 fallback allocations",
             ]
         );
     }
