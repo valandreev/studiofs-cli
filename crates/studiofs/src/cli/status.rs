@@ -10,7 +10,9 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
-use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
+use studiofs_vfs::{
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot,
+};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -176,6 +178,31 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     ]
 }
 
+fn format_fuse_async_read_diagnostics(snapshot: &VfsFuseAsyncReadSnapshot) -> [String; 4] {
+    [
+        format!(
+            "  FUSE async reads pending: {} reads, {} current, {} reads/{} peak",
+            snapshot.pending_reads,
+            format_bytes(snapshot.pending_bytes as u64),
+            snapshot.peak_pending_reads,
+            format_bytes(snapshot.peak_pending_bytes as u64)
+        ),
+        format!(
+            "  FUSE async read caps:     max {}",
+            format_optional_bytes(snapshot.max_pending_bytes)
+        ),
+        format!(
+            "  FUSE async read done:     {} ok, {} errors, {} canceled",
+            snapshot.completed_reads, snapshot.failed_reads, snapshot.canceled_reads
+        ),
+        format!(
+            "  FUSE async read waits:    admission {}/{}",
+            snapshot.admission_waits,
+            format_finite_ms(snapshot.admission_wait_total_ms)
+        ),
+    ]
+}
+
 fn snapshot_freshness(snapshot_age_ms: u64) -> &'static str {
     if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
         "stale"
@@ -333,6 +360,9 @@ fn print_mounted_write_path_fallback(
         format_ms(snapshot.metadata_commit.max_ms)
     );
     for line in format_fuse_async_write_diagnostics(&snapshot.fuse_async_write) {
+        println!("{line}");
+    }
+    for line in format_fuse_async_read_diagnostics(&snapshot.fuse_async_read) {
         println!("{line}");
     }
 }
@@ -1054,6 +1084,34 @@ mod tests {
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_fuse_async_read_diagnostics() {
+        let snapshot = studiofs_vfs::VfsFuseAsyncReadSnapshot {
+            max_pending_bytes: Some(128 * 1024 * 1024),
+            pending_reads: 3,
+            pending_bytes: 256 * 1024,
+            peak_pending_reads: 5,
+            peak_pending_bytes: 512 * 1024,
+            completed_reads: 17,
+            failed_reads: 2,
+            canceled_reads: 1,
+            admission_waits: 4,
+            admission_wait_total_ms: 6.5,
+        };
+
+        let lines = format_fuse_async_read_diagnostics(&snapshot);
+
+        assert_eq!(
+            lines,
+            [
+                "  FUSE async reads pending: 3 reads, 256.0KiB current, 5 reads/512.0KiB peak",
+                "  FUSE async read caps:     max 128.0MiB",
+                "  FUSE async read done:     17 ok, 2 errors, 1 canceled",
+                "  FUSE async read waits:    admission 4/6.500ms",
             ]
         );
     }

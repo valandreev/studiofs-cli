@@ -380,6 +380,64 @@ fn self_batch_namespace_mutation_advances_namespace_version_token() {
 }
 
 #[test]
+fn conflicting_foreign_batch_does_not_block_later_unrelated_namespace_batch_unit() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    let mut draft_attr = pg.get_attr(draft.ino).expect("get draft attr");
+    draft_attr.size = 4096;
+    pg.set_attr(&draft_attr).expect("set staged size");
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(601, 4096))
+        .expect("set draft block");
+
+    let mut conflicted_attr = draft_attr.clone();
+    conflicted_attr.size = 8192;
+
+    let remote_ino = ROOT_INO + 10_000;
+    let remote_attr = InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755);
+
+    apply_decoded_foreign_batches_locked(
+        &pg,
+        vec![
+            DecodedReplayBatch {
+                batch_version: 1,
+                events: vec![MetaEvent::SetAttr {
+                    attr: conflicted_attr,
+                }],
+                is_self_batch: false,
+            },
+            DecodedReplayBatch {
+                batch_version: 2,
+                events: vec![
+                    MetaEvent::SetAttr {
+                        attr: remote_attr.clone(),
+                    },
+                    MetaEvent::AddEntry {
+                        parent: ROOT_INO,
+                        name: b"unrelated.txt".to_vec(),
+                        entry: DirEntryValue {
+                            ino: remote_ino,
+                            kind: FileType::Directory,
+                        },
+                    },
+                ],
+                is_self_batch: false,
+            },
+        ],
+        None,
+        0,
+    )
+    .expect("apply decoded replay batches");
+
+    let remote = pg
+        .lookup(ROOT_INO, b"unrelated.txt")
+        .expect("lookup unrelated entry");
+    assert_eq!(remote.ino, remote_ino);
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -3012,38 +3070,76 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
     let dentry_payload = postcard::to_stdvec(&dentry_event).expect("encode unrelated dentry event");
 
     run_async(async move {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let conn_task = tokio::spawn(async move {
             let _ = connection.await;
         });
 
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                    VALUES ($1, 1, $2, $3, 'manual-foreign')",
-                &[&volume.volume_id, &conflict_event.kind(), &conflict_payload],
-            )
+        let tx = client
+            .transaction()
             .await
-            .map_err(|e| MetaError::Storage(format!("insert conflict event failed: {e}")))?;
+            .map_err(|e| MetaError::Storage(format!("begin synthetic batch tx failed: {e}")))?;
 
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
-                &[&volume.volume_id, &add_event.kind(), &add_payload],
+        let conflict_batch_version: i64 = tx
+            .query_one(
+                "UPDATE metadata_state SET version = version + 1, updated_at = now() \
+                    WHERE vol = $1 RETURNING version",
+                &[&volume.volume_id],
             )
             .await
-            .map_err(|e| MetaError::Storage(format!("insert remote attr event failed: {e}")))?;
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
-                &[&volume.volume_id, &dentry_event.kind(), &dentry_payload],
+            .map_err(|e| MetaError::Storage(format!("bump conflict batch failed: {e}")))?
+            .get(0);
+        tx.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, $2, $3, $4, 'manual-foreign')",
+            &[
+                &volume.volume_id,
+                &conflict_batch_version,
+                &conflict_event.kind(),
+                &conflict_payload,
+            ],
+        )
+        .await
+        .map_err(|e| MetaError::Storage(format!("insert conflict event failed: {e}")))?;
+
+        let unrelated_batch_version: i64 = tx
+            .query_one(
+                "UPDATE metadata_state SET version = version + 1, updated_at = now() \
+                    WHERE vol = $1 RETURNING version",
+                &[&volume.volume_id],
             )
             .await
-            .map_err(|e| MetaError::Storage(format!("insert remote dentry event failed: {e}")))?;
+            .map_err(|e| MetaError::Storage(format!("bump unrelated batch failed: {e}")))?
+            .get(0);
+        tx.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, $2, $3, $4, 'manual-foreign')",
+            &[
+                &volume.volume_id,
+                &unrelated_batch_version,
+                &add_event.kind(),
+                &add_payload,
+            ],
+        )
+        .await
+        .map_err(|e| MetaError::Storage(format!("insert remote attr event failed: {e}")))?;
+        tx.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, $2, $3, $4, 'manual-foreign')",
+            &[
+                &volume.volume_id,
+                &unrelated_batch_version,
+                &dentry_event.kind(),
+                &dentry_payload,
+            ],
+        )
+        .await
+        .map_err(|e| MetaError::Storage(format!("insert remote dentry event failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| MetaError::Storage(format!("commit synthetic batches failed: {e}")))?;
         conn_task.abort();
         Ok(())
     })
