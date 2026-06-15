@@ -333,6 +333,14 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub barrier_waits: u64,
     /// Total barrier wait time in milliseconds.
     pub barrier_wait_total_ms: f64,
+    /// Pooled boundary buffer acquisitions served from the pool.
+    pub boundary_pool_hits: u64,
+    /// Pooled boundary buffer acquisitions that allocated a new pooled buffer.
+    pub boundary_pool_misses: u64,
+    /// Current bytes owned by pending pooled boundary buffers.
+    pub boundary_pool_outstanding_bytes: usize,
+    /// Boundary buffers allocated outside the pool because the request exceeded the pool cap.
+    pub boundary_pool_fallback_allocations: u64,
 }
 
 /// Async FUSE read bridge diagnostics supplied by the FUSE adapter.
@@ -359,6 +367,14 @@ pub struct VfsFuseAsyncReadSnapshot {
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.
     pub admission_wait_total_ms: f64,
+    /// Pooled boundary buffer acquisitions served from the pool.
+    pub boundary_pool_hits: u64,
+    /// Pooled boundary buffer acquisitions that allocated a new pooled buffer.
+    pub boundary_pool_misses: u64,
+    /// Current bytes owned by pending pooled boundary buffers.
+    pub boundary_pool_outstanding_bytes: usize,
+    /// Boundary buffers allocated outside the pool because the request exceeded the pool cap.
+    pub boundary_pool_fallback_allocations: u64,
 }
 
 /// FUSE I/O callback metrics for one direction.

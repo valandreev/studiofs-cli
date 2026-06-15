@@ -564,7 +564,7 @@ fn evidence_view_filters_by_scope_object_identity_and_marker_span() {
             ),
             sample_scoped_recent_event(
                 2,
-                start.occurred_unix_ms.saturating_add(1),
+                start.occurred_unix_ms,
                 SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 2, "path": "Q:/clips/reel.mov"}),
@@ -578,7 +578,7 @@ fn evidence_view_filters_by_scope_object_identity_and_marker_span() {
             ),
             sample_scoped_recent_event(
                 4,
-                end.occurred_unix_ms.saturating_sub(1),
+                end.occurred_unix_ms,
                 SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 5, "path": "Q:/clips/reel.mov"}),

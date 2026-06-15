@@ -6980,6 +6980,11 @@ impl StudioVfs {
             current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
             current.barrier_waits = snapshot.barrier_waits;
             current.barrier_wait_total_ms = snapshot.barrier_wait_total_ms;
+            current.boundary_pool_hits = snapshot.boundary_pool_hits;
+            current.boundary_pool_misses = snapshot.boundary_pool_misses;
+            current.boundary_pool_outstanding_bytes = snapshot.boundary_pool_outstanding_bytes;
+            current.boundary_pool_fallback_allocations =
+                snapshot.boundary_pool_fallback_allocations;
         }
     }
 
@@ -7022,6 +7027,15 @@ impl StudioVfs {
             snapshot.barrier_wait_total_ms,
             baseline.barrier_wait_total_ms,
         );
+        snapshot.boundary_pool_hits = snapshot
+            .boundary_pool_hits
+            .saturating_sub(baseline.boundary_pool_hits);
+        snapshot.boundary_pool_misses = snapshot
+            .boundary_pool_misses
+            .saturating_sub(baseline.boundary_pool_misses);
+        snapshot.boundary_pool_fallback_allocations = snapshot
+            .boundary_pool_fallback_allocations
+            .saturating_sub(baseline.boundary_pool_fallback_allocations);
         snapshot
     }
 
