@@ -3,10 +3,11 @@
 mod handle_drain;
 mod pending_write_tracker;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -28,7 +29,7 @@ use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
+    VfsError, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -44,6 +45,13 @@ const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
 const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES";
+const STUDIOFS_FUSE_ASYNC_READ_ENV: &str = "STUDIOFS_FUSE_ASYNC_READ";
+const STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES_ENV: &str =
+    "STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES";
+const STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS_ENV: &str =
+    "STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS";
+const STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES_ENV: &str =
+    "STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FuseBackgroundQueuePolicy {
@@ -151,6 +159,64 @@ impl FuseAsyncWriteAdmissionPolicy {
                 ),
                 per_handle_pending_bytes: parse_bridge_optional_usize_env_value(
                     STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV,
+                    per_handle_pending_bytes,
+                    defaults.per_handle_pending_bytes,
+                ),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuseAsyncReadAdmissionPolicy {
+    limits: StudioFuseAsyncReadAdmissionLimits,
+}
+
+impl FuseAsyncReadAdmissionPolicy {
+    fn platform_default() -> Self {
+        Self {
+            limits: StudioFuseAsyncReadAdmissionLimits {
+                max_pending_bytes: Some(128 * 1024 * 1024),
+                max_pending_reads: Some(1024),
+                per_handle_pending_bytes: Some(32 * 1024 * 1024),
+            },
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var(STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_values(
+        max_pending_bytes: Option<&str>,
+        max_pending_reads: Option<&str>,
+        per_handle_pending_bytes: Option<&str>,
+    ) -> Self {
+        let defaults = Self::platform_default().limits;
+        Self {
+            limits: StudioFuseAsyncReadAdmissionLimits {
+                max_pending_bytes: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES_ENV,
+                    max_pending_bytes,
+                    defaults.max_pending_bytes,
+                ),
+                max_pending_reads: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS_ENV,
+                    max_pending_reads,
+                    defaults.max_pending_reads,
+                ),
+                per_handle_pending_bytes: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES_ENV,
                     per_handle_pending_bytes,
                     defaults.per_handle_pending_bytes,
                 ),
@@ -306,6 +372,15 @@ fn should_enable_async_fuse_write_from_env() -> bool {
     resolve_async_fuse_write_enabled(raw.as_deref())
 }
 
+fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
+    parse_bridge_bool_env_value(raw)
+}
+
+fn should_enable_async_fuse_read_from_env() -> bool {
+    std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV)
+        .is_ok_and(|raw| should_enable_async_fuse_read_from_env_value(&raw))
+}
+
 trait FuseWriteReply {
     fn written(self, size: u32);
     fn error(self, errno: i32);
@@ -316,11 +391,20 @@ trait FuseEmptyReply {
     fn error(self, errno: i32);
 }
 
+trait FuseDataReply {
+    fn data(self, data: &[u8]);
+    fn error(self, errno: i32);
+}
+
 struct FuseWriteReplyGuard<R: FuseWriteReply> {
     reply: Option<R>,
 }
 
 struct FuseEmptyReplyGuard<R: FuseEmptyReply> {
+    reply: Option<R>,
+}
+
+struct FuseDataReplyGuard<R: FuseDataReply> {
     reply: Option<R>,
 }
 
@@ -394,6 +478,215 @@ impl FuseEmptyReply for ReplyEmpty {
     fn error(self, errno: i32) {
         self.error(errno);
     }
+}
+
+impl<R: FuseDataReply> FuseDataReplyGuard<R> {
+    fn new(reply: R) -> Self {
+        Self { reply: Some(reply) }
+    }
+
+    fn data(mut self, data: &[u8]) {
+        if let Some(reply) = self.reply.take() {
+            reply.data(data);
+        }
+    }
+
+    fn error(mut self, errno: i32) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(errno);
+        }
+    }
+}
+
+impl<R: FuseDataReply> Drop for FuseDataReplyGuard<R> {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(libc::EIO);
+        }
+    }
+}
+
+impl FuseDataReply for ReplyData {
+    fn data(self, data: &[u8]) {
+        self.data(data);
+    }
+
+    fn error(self, errno: i32) {
+        self.error(errno);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingReadTracker {
+    shared: Arc<PendingReadShared>,
+}
+
+#[derive(Debug, Default)]
+struct PendingReadShared {
+    state: Mutex<PendingReadState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct PendingReadState {
+    by_handle: HashMap<(u64, u64), PendingReadHandleState>,
+    pending_reads: usize,
+    pending_bytes: usize,
+    peak_pending_reads: usize,
+    peak_pending_bytes: usize,
+    completed_reads: u64,
+    failed_reads: u64,
+    canceled_reads: u64,
+}
+
+#[derive(Debug, Default)]
+struct PendingReadHandleState {
+    pending_reads: usize,
+    pending_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingReadRegistration {
+    tracker: PendingReadTracker,
+    ino: u64,
+    fh: u64,
+    bytes: usize,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReadOutcome {
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl PendingReadTracker {
+    fn register(
+        &self,
+        ino: u64,
+        fh: u64,
+        bytes: usize,
+        limits: StudioFuseAsyncReadAdmissionLimits,
+    ) -> Result<PendingReadRegistration, i32> {
+        let mut state = self.lock_state();
+        let handle_pending_bytes = state
+            .by_handle
+            .get(&(ino, fh))
+            .map_or(0, |handle| handle.pending_bytes);
+        if exceeds_limit(state.pending_bytes, bytes, limits.max_pending_bytes)
+            || exceeds_limit(state.pending_reads, 1, limits.max_pending_reads)
+            || exceeds_limit(handle_pending_bytes, bytes, limits.per_handle_pending_bytes)
+        {
+            return Err(libc::EAGAIN);
+        }
+        let handle = state.by_handle.entry((ino, fh)).or_default();
+        handle.pending_reads += 1;
+        handle.pending_bytes += bytes;
+        state.pending_reads += 1;
+        state.pending_bytes += bytes;
+        state.peak_pending_reads = state.peak_pending_reads.max(state.pending_reads);
+        state.peak_pending_bytes = state.peak_pending_bytes.max(state.pending_bytes);
+        Ok(PendingReadRegistration {
+            tracker: self.clone(),
+            ino,
+            fh,
+            bytes,
+            completed: false,
+        })
+    }
+
+    fn wait_for_handle(&self, ino: u64, fh: u64) {
+        let mut state = self.lock_state();
+        while state
+            .by_handle
+            .get(&(ino, fh))
+            .is_some_and(|handle| handle.pending_reads > 0)
+        {
+            state = self.wait_state(state);
+        }
+    }
+
+    async fn wait_for_handle_async(&self, ino: u64, fh: u64) {
+        let tracker = self.clone();
+        let result = tokio::task::spawn_blocking(move || tracker.wait_for_handle(ino, fh)).await;
+        if let Err(error) = result {
+            error!(ino, fh, %error, "pending async read barrier task failed");
+        }
+    }
+
+    fn snapshot(&self, limits: StudioFuseAsyncReadAdmissionLimits) -> VfsFuseAsyncReadSnapshot {
+        let state = self.lock_state();
+        VfsFuseAsyncReadSnapshot {
+            max_pending_bytes: limits.max_pending_bytes,
+            pending_reads: state.pending_reads,
+            pending_bytes: state.pending_bytes,
+            peak_pending_reads: state.peak_pending_reads,
+            peak_pending_bytes: state.peak_pending_bytes,
+            completed_reads: state.completed_reads,
+            failed_reads: state.failed_reads,
+            canceled_reads: state.canceled_reads,
+            ..Default::default()
+        }
+    }
+
+    fn finish(&self, ino: u64, fh: u64, bytes: usize, outcome: PendingReadOutcome) {
+        let mut state = self.lock_state();
+        if let Some(handle) = state.by_handle.get_mut(&(ino, fh)) {
+            handle.pending_reads = handle.pending_reads.saturating_sub(1);
+            handle.pending_bytes = handle.pending_bytes.saturating_sub(bytes);
+            if handle.pending_reads == 0 {
+                state.by_handle.remove(&(ino, fh));
+            }
+        }
+        state.pending_reads = state.pending_reads.saturating_sub(1);
+        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        match outcome {
+            PendingReadOutcome::Completed => state.completed_reads += 1,
+            PendingReadOutcome::Failed => state.failed_reads += 1,
+            PendingReadOutcome::Canceled => state.canceled_reads += 1,
+        }
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, PendingReadState> {
+        #[expect(clippy::expect_used, reason = "fail closed on poisoned read tracker")]
+        self.shared
+            .state
+            .lock()
+            .expect("pending read tracker poisoned")
+    }
+
+    fn wait_state<'a>(
+        &self,
+        state: MutexGuard<'a, PendingReadState>,
+    ) -> MutexGuard<'a, PendingReadState> {
+        #[expect(clippy::expect_used, reason = "fail closed on poisoned read tracker")]
+        self.shared
+            .changed
+            .wait(state)
+            .expect("pending read tracker poisoned")
+    }
+}
+
+impl PendingReadRegistration {
+    fn complete(&mut self, outcome: PendingReadOutcome) {
+        if !self.completed {
+            self.tracker.finish(self.ino, self.fh, self.bytes, outcome);
+            self.completed = true;
+        }
+    }
+}
+
+impl Drop for PendingReadRegistration {
+    fn drop(&mut self) {
+        self.complete(PendingReadOutcome::Canceled);
+    }
+}
+
+fn exceeds_limit(current: usize, incoming: usize, limit: Option<usize>) -> bool {
+    limit.is_some_and(|limit| current.saturating_add(incoming) > limit)
 }
 
 struct PendingFuseCloseGuard {
@@ -635,9 +928,12 @@ pub struct StudioFuseFs {
     vfs: Arc<StudioVfs>,
     rt: Handle,
     pending_writes: PendingWriteTracker,
+    pending_reads: PendingReadTracker,
     async_write_enabled: bool,
+    async_read_enabled: bool,
     linux_async_dio_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
+    async_read_admission_policy: FuseAsyncReadAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
     mount_uid: u32,
@@ -653,12 +949,17 @@ pub struct StudioFuseFs {
 pub struct StudioFuseRuntimeOptions {
     /// Enable the async FUSE write-reply path.
     pub async_write_enabled: bool,
+    /// Enable the async FUSE read-reply path.
+    pub async_read_enabled: bool,
     /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
     /// Ignored on non-Linux platforms.
     pub linux_async_dio_enabled: bool,
     /// Optional custom limits for async write admission control. When omitted,
     /// explicit-runtime construction uses the safe platform defaults.
     pub async_write_admission_limits: Option<StudioFuseAsyncWriteAdmissionLimits>,
+    /// Optional custom limits for async read admission control. When omitted,
+    /// explicit-runtime construction uses the safe platform defaults.
+    pub async_read_admission_limits: Option<StudioFuseAsyncReadAdmissionLimits>,
 }
 
 /// Public async write admission limit overrides for `StudioFuseRuntimeOptions`.
@@ -669,6 +970,17 @@ pub struct StudioFuseAsyncWriteAdmissionLimits {
     /// Maximum async write requests admitted across the mounted FUSE adapter.
     pub max_pending_writes: Option<usize>,
     /// Maximum async write bytes admitted for a single file handle.
+    pub per_handle_pending_bytes: Option<usize>,
+}
+
+/// Public async read admission limit overrides for `StudioFuseRuntimeOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StudioFuseAsyncReadAdmissionLimits {
+    /// Maximum async read bytes admitted across the mounted FUSE adapter.
+    pub max_pending_bytes: Option<usize>,
+    /// Maximum async read requests admitted across the mounted FUSE adapter.
+    pub max_pending_reads: Option<usize>,
+    /// Maximum async read bytes admitted for a single file handle.
     pub per_handle_pending_bytes: Option<usize>,
 }
 
@@ -697,10 +1009,12 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         Self {
             async_write_enabled: should_enable_async_fuse_write_from_env(),
+            async_read_enabled: should_enable_async_fuse_read_from_env(),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
+            async_read_admission_limits: Some(FuseAsyncReadAdmissionPolicy::from_env().limits),
         }
     }
 }
@@ -726,14 +1040,22 @@ impl StudioFuseFs {
             .async_write_admission_limits
             .map(PendingWriteAdmissionLimits::from)
             .unwrap_or_else(|| FuseAsyncWriteAdmissionPolicy::platform_default().limits);
+        let async_read_admission_limits = options
+            .async_read_admission_limits
+            .unwrap_or_else(|| FuseAsyncReadAdmissionPolicy::platform_default().limits);
         let mut fs = Self {
             vfs,
             rt,
             pending_writes: PendingWriteTracker::default(),
+            pending_reads: PendingReadTracker::default(),
             async_write_enabled: options.async_write_enabled,
+            async_read_enabled: options.async_read_enabled,
             linux_async_dio_enabled: options.linux_async_dio_enabled,
             async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
                 limits: async_write_admission_limits,
+            },
+            async_read_admission_policy: FuseAsyncReadAdmissionPolicy {
+                limits: async_read_admission_limits,
             },
             mount_uid,
             mount_gid,
@@ -741,6 +1063,7 @@ impl StudioFuseFs {
             async_write_diagnostics_task: None,
         };
         fs.publish_async_write_diagnostics();
+        fs.publish_async_read_diagnostics();
         if fs.async_write_enabled {
             fs.async_write_diagnostics_task = Some(fs.spawn_async_write_diagnostics_publisher());
         }
@@ -793,6 +1116,125 @@ impl StudioFuseFs {
             self.async_write_admission_policy.limits,
             &self.pending_writes,
         );
+    }
+
+    fn publish_async_read_diagnostics(&self) {
+        self.vfs.record_fuse_async_read_snapshot(
+            self.pending_reads
+                .snapshot(self.async_read_admission_policy.limits),
+        );
+    }
+
+    fn read_with_reply<R>(&self, ino: u64, fh: u64, offset: i64, size: u32, reply: R)
+    where
+        R: FuseDataReply + Send + 'static,
+    {
+        let offset = match to_u64_offset(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let clamped_size = match self.vfs.getattr(ino) {
+            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
+            Err(e) => {
+                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+        let clamped_size = match usize::try_from(clamped_size) {
+            Ok(clamped_size) => clamped_size,
+            Err(_) => {
+                reply.error(libc::EOVERFLOW);
+                return;
+            }
+        };
+        if clamped_size == 0 {
+            reply.data(&[]);
+            return;
+        }
+
+        if self.async_read_enabled {
+            let mut out = vec![0u8; clamped_size];
+            let mut registration = match self.pending_reads.register(
+                ino,
+                fh,
+                clamped_size,
+                self.async_read_admission_policy.limits,
+            ) {
+                Ok(registration) => registration,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+            self.publish_async_read_diagnostics();
+            let callback_started = Instant::now();
+            let vfs = Arc::clone(&self.vfs);
+            let pending_reads = self.pending_reads.clone();
+            let limits = self.async_read_admission_policy.limits;
+            let reply = FuseDataReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
+                vfs.record_fuse_read_callback(
+                    clamped_size,
+                    callback_started.elapsed(),
+                    result.is_err(),
+                );
+                match result {
+                    Ok(n) => {
+                        registration.complete(PendingReadOutcome::Completed);
+                        vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
+                        let n = match usize::try_from(n) {
+                            Ok(n) => n,
+                            Err(_) => {
+                                reply.error(libc::EOVERFLOW);
+                                return;
+                            }
+                        };
+                        reply.data(&out[..n]);
+                    }
+                    Err(e) => {
+                        registration.complete(PendingReadOutcome::Failed);
+                        vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
+                        error!("read({ino}, off={offset}, sz={size}) -> {e}");
+                        reply.error(vfs_err_to_errno(&e));
+                    }
+                }
+            });
+            return;
+        }
+
+        // fuser's ReplyData API accepts an immutable reply slice instead of
+        // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
+        let mut out = vec![0u8; clamped_size];
+        let callback_started = Instant::now();
+        let result = self
+            .rt
+            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out));
+        self.vfs.record_fuse_read_callback(
+            clamped_size,
+            callback_started.elapsed(),
+            result.is_err(),
+        );
+        match result {
+            Ok(n) => {
+                let n = match usize::try_from(n) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        reply.error(libc::EOVERFLOW);
+                        return;
+                    }
+                };
+                reply.data(&out[..n]);
+            }
+            Err(e) => {
+                error!("read({ino}, off={offset}, sz={size}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
     }
 
     fn spawn_async_write_diagnostics_publisher(&self) -> JoinHandle<()> {
@@ -1302,61 +1744,7 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
-        let clamped_size = match self.vfs.getattr(ino) {
-            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
-            Err(e) => {
-                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-                return;
-            }
-        };
-        let clamped_size = match usize::try_from(clamped_size) {
-            Ok(clamped_size) => clamped_size,
-            Err(_) => {
-                reply.error(libc::EOVERFLOW);
-                return;
-            }
-        };
-        if clamped_size == 0 {
-            reply.data(&[]);
-            return;
-        }
-
-        // fuser's ReplyData API accepts an immutable reply slice instead of
-        // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
-        let mut out = vec![0u8; clamped_size];
-        let callback_started = Instant::now();
-        let result = self
-            .rt
-            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out));
-        self.vfs.record_fuse_read_callback(
-            clamped_size,
-            callback_started.elapsed(),
-            result.is_err(),
-        );
-        match result {
-            Ok(n) => {
-                let n = match usize::try_from(n) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        reply.error(libc::EOVERFLOW);
-                        return;
-                    }
-                };
-                reply.data(&out[..n]);
-            }
-            Err(e) => {
-                error!("read({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-            }
-        }
+        self.read_with_reply(ino, fh, offset, size, reply);
     }
 
     fn write(
@@ -1564,8 +1952,11 @@ impl Filesystem for StudioFuseFs {
             };
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
+            let pending_reads = self.pending_reads.clone();
             let admission_limits = self.async_write_admission_policy.limits;
+            let read_limits = self.async_read_admission_policy.limits;
             let platform_policy = self.async_write_platform_policy_label();
+            let async_read_enabled = self.async_read_enabled;
             let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -1583,6 +1974,10 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
+                if async_read_enabled {
+                    pending_reads.wait_for_handle_async(ino, fh).await;
+                    vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(read_limits));
+                }
                 let release_result = vfs.release_fh(fh).await;
                 close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
@@ -1601,6 +1996,33 @@ impl Filesystem for StudioFuseFs {
                     ino,
                     fh,
                 );
+            });
+            return;
+        }
+        if self.async_read_enabled {
+            let vfs = Arc::clone(&self.vfs);
+            let pending_reads = self.pending_reads.clone();
+            let read_limits = self.async_read_admission_policy.limits;
+            let reply = FuseEmptyReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                pending_reads.wait_for_handle_async(ino, fh).await;
+                vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(read_limits));
+                let release_result = vfs.release_fh(fh).await;
+                match release_result {
+                    Ok(()) => {
+                        debug!(
+                            ino,
+                            fh,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "release completed"
+                        );
+                        reply.ok();
+                    }
+                    Err(e) => {
+                        error!("release({ino}, fh={fh}) -> {e}");
+                        reply.error(vfs_err_to_errno(&e));
+                    }
+                }
             });
             return;
         }
@@ -2296,24 +2718,63 @@ mod tests {
     use super::fuse_open_reply_flags;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
-        FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
-        FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
-        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
-        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
+        FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
+        FuseEmptyReplyGuard, FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL,
+        complete_fuse_write_reply, fuse_write_local_sync_policy, is_missing_xattr_error,
+        missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
+        resolve_async_fuse_write_enabled, should_enable_async_fuse_write_from_env_value,
+        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
+        vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
 
     use std::sync::Arc;
+    use std::sync::mpsc;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, ROOT_INO, RedbMetaEngine};
     use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
+
+    type TestDataReplyResult = Result<Vec<u8>, i32>;
+
+    struct TestDataReply {
+        sender: mpsc::Sender<TestDataReplyResult>,
+        receiver: Cell<Option<mpsc::Receiver<TestDataReplyResult>>>,
+    }
+
+    impl TestDataReply {
+        fn new() -> Self {
+            let (sender, receiver) = mpsc::channel();
+            Self {
+                sender,
+                receiver: Cell::new(Some(receiver)),
+            }
+        }
+
+        fn receiver(&self) -> mpsc::Receiver<TestDataReplyResult> {
+            self.receiver
+                .take()
+                .expect("test reply receiver should only be taken once")
+        }
+    }
+
+    impl FuseDataReply for TestDataReply {
+        fn data(self, data: &[u8]) {
+            self.sender
+                .send(Ok(data.to_vec()))
+                .expect("test receiver should be alive");
+        }
+
+        fn error(self, errno: i32) {
+            self.sender
+                .send(Err(errno))
+                .expect("test receiver should be alive");
+        }
+    }
     use tokio::runtime::Runtime;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
@@ -2381,6 +2842,8 @@ mod tests {
                     max_pending_writes: Some(7),
                     per_handle_pending_bytes: Some(1024),
                 }),
+                async_read_enabled: false,
+                async_read_admission_limits: None,
             },
         );
 
@@ -2409,6 +2872,8 @@ mod tests {
                     max_pending_writes: Some(7),
                     per_handle_pending_bytes: Some(1024),
                 }),
+                async_read_enabled: false,
+                async_read_admission_limits: None,
             },
         );
         let first = fs
@@ -2443,6 +2908,115 @@ mod tests {
     }
 
     #[test]
+    fn async_read_diagnostics_publish_policy_and_tracker_state() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-diagnostics");
+        let _fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_enabled: true,
+                async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_reads: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_read;
+
+        assert_eq!(snapshot.max_pending_bytes, Some(4096));
+        assert_eq!(snapshot.pending_reads, 0);
+    }
+
+    #[test]
+    fn async_read_replies_from_task_and_records_completion() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-success");
+        let attr = vfs
+            .create(ROOT_INO, b"hello.txt", 501, 20, 0o644)
+            .expect("create file");
+        rt.block_on(vfs.write(attr.ino, 0, b"hello async read"))
+            .expect("seed file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        vfs.reset_diagnostics_observability();
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                async_read_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_reads: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+        let reply = TestDataReply::new();
+        let received = reply.receiver();
+
+        fs.read_with_reply(attr.ino, fh, 6, 5, reply);
+        let result = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("async read should reply");
+
+        assert_eq!(result, Ok(b"async".to_vec()));
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(snapshot.fuse_async_read.pending_reads, 0);
+        assert_eq!(snapshot.fuse_async_read.completed_reads, 1);
+    }
+
+    #[test]
+    fn async_read_rejects_request_over_pending_byte_cap() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-admission-cap");
+        let attr = vfs
+            .create(ROOT_INO, b"limited.txt", 501, 20, 0o644)
+            .expect("create file");
+        rt.block_on(vfs.write(attr.ino, 0, b"limited async read"))
+            .expect("seed file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                async_read_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
+                    max_pending_bytes: Some(4),
+                    max_pending_reads: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+        let reply = TestDataReply::new();
+        let received = reply.receiver();
+
+        fs.read_with_reply(attr.ino, fh, 0, 8, reply);
+        let result = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("admission rejection should reply");
+
+        assert_eq!(result, Err(libc::EAGAIN));
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .fuse_async_read
+                .pending_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn disabled_async_write_diagnostics_publish_once_without_periodic_task() {
         let (_tmp, rt, vfs, env_fs) =
             make_test_fuse_fs("disabled-async-write-diagnostics-publisher");
@@ -2454,6 +3028,8 @@ mod tests {
                 async_write_enabled: false,
                 linux_async_dio_enabled: false,
                 async_write_admission_limits: None,
+                async_read_enabled: false,
+                async_read_admission_limits: None,
             },
         );
 
@@ -2849,6 +3425,8 @@ mod tests {
                 async_write_enabled: true,
                 linux_async_dio_enabled: false,
                 async_write_admission_limits: None,
+                async_read_enabled: false,
+                async_read_admission_limits: None,
             },
         );
         let pending = fs
