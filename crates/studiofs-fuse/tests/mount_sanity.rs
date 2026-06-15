@@ -55,6 +55,7 @@ enum MountedScenarioOperation {
     MultipleWriters,
     SameHandleAppends,
     FioMultiJob,
+    Sfs509FioMatrix,
     WriteOnlyUntilUnmount,
 }
 
@@ -162,6 +163,26 @@ declare_mounted_scenarios! {
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::FioMultiJob
     },
+    linux_sfs509_mounted_fio_default_sync => {
+        name: "sfs-509-long-lived-fio-default-sync",
+        mode: MountedFuseMode::Sync,
+        operation: MountedScenarioOperation::Sfs509FioMatrix
+    },
+    linux_sfs509_mounted_fio_async_opt_in => {
+        name: "sfs-509-long-lived-fio-async-opt-in",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::Sfs509FioMatrix
+    },
+    linux_sfs509_mounted_fio_async_dio_opt_in => {
+        name: "sfs-509-long-lived-fio-async-dio-opt-in",
+        mode: MountedFuseMode::AsyncWriteDio,
+        operation: MountedScenarioOperation::Sfs509FioMatrix
+    },
+    linux_sfs509_mounted_fio_background_queue => {
+        name: "sfs-509-long-lived-fio-background-queue",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::Sfs509FioMatrix
+    },
 }
 
 #[test]
@@ -184,6 +205,10 @@ fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() 
         "linux-async-opt-in",
         "linux-async-dio-opt-in",
         "linux-fio-multi-job",
+        "sfs-509-long-lived-fio-default-sync",
+        "sfs-509-long-lived-fio-async-opt-in",
+        "sfs-509-long-lived-fio-async-dio-opt-in",
+        "sfs-509-long-lived-fio-background-queue",
         "unmount-after-async-write",
     ] {
         assert!(
@@ -222,6 +247,28 @@ fn async_mounted_matrix_includes_unmount_teardown_scenario() {
         MountedScenarioOperation::WriteOnlyUntilUnmount,
         "unmount-after-async-write must leave write teardown to unmount"
     );
+}
+
+#[test]
+fn async_mounted_matrix_includes_sfs509_long_lived_fio_scenario() {
+    let scenarios = mounted_async_scenarios();
+    let names: BTreeSet<_> = scenarios
+        .iter()
+        .filter(|scenario| scenario.operation == MountedScenarioOperation::Sfs509FioMatrix)
+        .map(|scenario| scenario.name)
+        .collect();
+
+    for expected in [
+        "sfs-509-long-lived-fio-default-sync",
+        "sfs-509-long-lived-fio-async-opt-in",
+        "sfs-509-long-lived-fio-async-dio-opt-in",
+        "sfs-509-long-lived-fio-background-queue",
+    ] {
+        assert!(
+            names.contains(expected),
+            "SFS-509 long-lived fio matrix is missing {expected}"
+        );
+    }
 }
 
 #[test]
@@ -810,13 +857,14 @@ fn with_mounted_fuse(
 
 fn run_mounted_scenario(scenario: MountedAsyncScenario) {
     with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
-        run_mounted_operation(mount_path, scenario.operation)
+        run_mounted_operation(mount_path, scenario.operation, scenario.name)
     });
 }
 
 fn run_mounted_operation(
     mount_path: &Path,
     operation: MountedScenarioOperation,
+    scenario_name: &str,
 ) -> MountedOperationGuard {
     match operation {
         MountedScenarioOperation::SequentialWriteReadback => {
@@ -910,6 +958,10 @@ fn run_mounted_operation(
             run_fio_workload_if_available(mount_path);
             MountedOperationGuard::default()
         }
+        MountedScenarioOperation::Sfs509FioMatrix => {
+            run_sfs509_fio_matrix_if_available(mount_path, scenario_name);
+            MountedOperationGuard::default()
+        }
     }
 }
 
@@ -947,6 +999,300 @@ fn run_fio_workload_if_available(mount_path: &Path) {
         .status()
         .expect("run fio workload");
     assert!(status.success(), "fio workload should exit successfully");
+}
+
+fn sfs509_env_value(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn sfs509_artifact_dir(scenario_name: &str) -> std::path::PathBuf {
+    let dir = workspace_root()
+        .join("target")
+        .join("sfs-509-linux-fuse-ext4-throughput")
+        .join("studiofs")
+        .join("long-lived-fio")
+        .join(scenario_name);
+    std::fs::create_dir_all(&dir).expect("create SFS-509 artifact directory");
+    dir
+}
+
+fn run_fio_json_case(
+    artifact_dir: &Path,
+    mount_path: &Path,
+    case_name: &str,
+    filename: &str,
+    args: &[&str],
+) -> bool {
+    let output = artifact_dir.join(format!("{case_name}.json"));
+    let log = artifact_dir.join(format!("{case_name}.log"));
+    let mut directory_arg = OsString::from("--directory=");
+    directory_arg.push(mount_path);
+    let mut filename_arg = OsString::from("--filename=");
+    filename_arg.push(filename);
+    let mut output_arg = OsString::from("--output=");
+    output_arg.push(&output);
+    let timeout = sfs509_env_value("STUDIOFS_SFS509_FIO_TIMEOUT_SECS", "180");
+    let timeout_arg = format!("{timeout}s");
+
+    let mut command = if command_available("timeout") {
+        let mut command = Command::new("timeout");
+        command.arg("--kill-after=10s").arg(timeout_arg).arg("fio");
+        command
+    } else {
+        Command::new("fio")
+    };
+    let result = command
+        .arg(format!("--name=studiofs-sfs509-{case_name}"))
+        .arg(directory_arg)
+        .arg(filename_arg)
+        .arg("--ioengine=sync")
+        .arg("--group_reporting")
+        .arg("--output-format=json")
+        .arg(output_arg)
+        .args(args)
+        .output()
+        .expect("run SFS-509 fio workload");
+    let mut log_file = std::fs::File::create(&log).expect("create SFS-509 fio log");
+    log_file
+        .write_all(&result.stdout)
+        .expect("write SFS-509 fio stdout");
+    log_file
+        .write_all(&result.stderr)
+        .expect("write SFS-509 fio stderr");
+    let status_line = format!("{case_name}\t{}\n", result.status);
+    let mut status_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifact_dir.join("workload-status.tsv"))
+        .expect("open SFS-509 workload status");
+    status_file
+        .write_all(status_line.as_bytes())
+        .expect("write SFS-509 workload status");
+    if !result.status.success() {
+        eprintln!(
+            "SFS-509 fio workload {case_name} exited with {}; see {}",
+            result.status,
+            log.display()
+        );
+    }
+    result.status.success()
+}
+
+fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
+    assert!(
+        command_available("fio"),
+        "SFS-509 long-lived fio matrix requires fio"
+    );
+
+    raise_nofile_limit_best_effort();
+    let artifact_dir = sfs509_artifact_dir(scenario_name);
+    let _ = std::fs::remove_file(artifact_dir.join("workload-status.tsv"));
+    let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", "512m");
+    let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
+    let runtime = sfs509_env_value("STUDIOFS_SFS509_FIO_RUNTIME_SECS", "20");
+    let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "500")
+        .parse::<usize>()
+        .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
+    let size_arg = format!("--size={size}");
+    let large_size_arg = format!("--size={large_size}");
+    let runtime_arg = format!("--runtime={runtime}");
+    let offset_increment_arg = format!("--offset_increment={size}");
+
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "seq-write",
+        "seq.bin",
+        &[
+            "--rw=write",
+            "--bs=1m",
+            &size_arg,
+            "--numjobs=1",
+            "--fsync_on_close=1",
+        ],
+    );
+    drop_caches_best_effort(&artifact_dir);
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "cold-cache-read",
+        "seq.bin",
+        &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "warm-cache-read",
+        "seq.bin",
+        &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "rand-write",
+        "rand.bin",
+        &[
+            "--rw=randwrite",
+            "--bs=4k",
+            &size_arg,
+            "--numjobs=1",
+            &runtime_arg,
+            "--time_based",
+            "--fsync=32",
+        ],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "rand-read",
+        "rand.bin",
+        &[
+            "--rw=randread",
+            "--bs=4k",
+            &size_arg,
+            "--numjobs=1",
+            &runtime_arg,
+            "--time_based",
+        ],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "mixed-rw",
+        "mixed.bin",
+        &[
+            "--rw=randrw",
+            "--rwmixread=70",
+            "--bs=16k",
+            &size_arg,
+            "--numjobs=2",
+            &runtime_arg,
+            "--time_based",
+            "--fsync=64",
+        ],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "large-file",
+        "large.bin",
+        &[
+            "--rw=write",
+            "--bs=1m",
+            &large_size_arg,
+            "--numjobs=1",
+            "--fsync_on_close=1",
+        ],
+    );
+    run_sfs509_metadata_probe(mount_path, &artifact_dir, metadata_files);
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "multi-job",
+        "multi.bin",
+        &[
+            "--rw=write",
+            "--bs=64k",
+            &size_arg,
+            "--numjobs=4",
+            &offset_increment_arg,
+            "--fsync=1",
+        ],
+    );
+    let _ = run_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "fsync-heavy",
+        "fsync-heavy.bin",
+        &[
+            "--rw=write",
+            "--bs=16k",
+            &size_arg,
+            "--numjobs=1",
+            "--fsync=1",
+        ],
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn raise_nofile_limit_best_effort() {
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let desired = 65_535;
+        let raised = desired.min(limit.rlim_max);
+        if raised > limit.rlim_cur {
+            limit.rlim_cur = raised;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+fn drop_caches_best_effort(artifact_dir: &Path) {
+    let log = artifact_dir.join("drop-caches.log");
+    let result = Command::new("sudo")
+        .arg("-n")
+        .arg("sh")
+        .arg("-c")
+        .arg("sync; echo 3 > /proc/sys/vm/drop_caches")
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            std::fs::write(log, b"drop_caches=success\n").expect("write drop_caches log");
+        }
+        Ok(output) => {
+            let mut bytes = b"drop_caches=skipped\n".to_vec();
+            bytes.extend_from_slice(&output.stderr);
+            std::fs::write(log, bytes).expect("write drop_caches log");
+        }
+        Err(error) => {
+            std::fs::write(log, format!("drop_caches=skipped\n{error}\n"))
+                .expect("write drop_caches log");
+        }
+    }
+}
+
+fn run_sfs509_metadata_probe(mount_path: &Path, artifact_dir: &Path, file_count: usize) {
+    let metadata_dir = mount_path.join("sfs509-metadata-heavy");
+    let _ = std::fs::remove_dir_all(&metadata_dir);
+    std::fs::create_dir_all(&metadata_dir).expect("create SFS-509 metadata directory");
+
+    let create_started = std::time::Instant::now();
+    for index in 0..file_count {
+        let path = metadata_dir.join(format!("file-{index:06}.txt"));
+        std::fs::write(path, format!("payload-{index:06}\n")).expect("write SFS-509 metadata file");
+    }
+    let create_elapsed = create_started.elapsed();
+
+    let stat_started = std::time::Instant::now();
+    let mut total_bytes = 0u64;
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&metadata_dir).expect("read SFS-509 metadata directory") {
+        let entry = entry.expect("read SFS-509 metadata entry");
+        let metadata = entry.metadata().expect("stat SFS-509 metadata entry");
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        seen = seen.saturating_add(1);
+    }
+    let stat_elapsed = stat_started.elapsed();
+    assert_eq!(seen, file_count);
+
+    let summary = format!(
+        "files\tcreate_ms\tstat_ms\ttotal_bytes\n{}\t{}\t{}\t{}\n",
+        file_count,
+        create_elapsed.as_millis(),
+        stat_elapsed.as_millis(),
+        total_bytes
+    );
+    std::fs::write(artifact_dir.join("metadata-readdir-stat.tsv"), summary)
+        .expect("write SFS-509 metadata summary");
 }
 
 /// Verifies that creating and dropping a FUSE session does not panic or leak.
