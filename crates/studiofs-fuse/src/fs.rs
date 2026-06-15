@@ -5,6 +5,7 @@ mod pending_write_tracker;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -747,14 +748,29 @@ impl FuseBoundaryBufferPool {
     }
 
     fn acquire_zeroed(&self, len: usize) -> FuseBoundaryBuffer {
+        self.acquire(len, true)
+    }
+
+    fn acquire_with_bytes(&self, data: &[u8]) -> FuseBoundaryBuffer {
+        let mut buffer = self.acquire(data.len(), false);
+        buffer.buffer.extend_from_slice(data);
+        buffer
+    }
+
+    fn acquire(&self, len: usize, zeroed: bool) -> FuseBoundaryBuffer {
         let pooled = len <= self.shared.max_pooled_buffer_bytes;
         if !pooled {
             self.shared
                 .fallback_allocations
                 .fetch_add(1, Ordering::Relaxed);
+            let buffer = if zeroed {
+                vec![0; len]
+            } else {
+                Vec::with_capacity(len)
+            };
             return FuseBoundaryBuffer {
                 pool: self.clone(),
-                buffer: vec![0; len],
+                buffer,
                 pooled: false,
                 accounted_bytes: 0,
             };
@@ -771,7 +787,10 @@ impl FuseBoundaryBufferPool {
             buffer = Some(Vec::with_capacity(self.shared.buffer_capacity.max(len)));
         }
         let mut buffer = buffer.unwrap_or_default();
-        buffer.resize(len, 0);
+        buffer.clear();
+        if zeroed {
+            buffer.resize(len, 0);
+        }
         self.shared
             .outstanding_bytes
             .fetch_add(buffer.capacity(), Ordering::Relaxed);
@@ -782,12 +801,6 @@ impl FuseBoundaryBufferPool {
             pooled: true,
             accounted_bytes,
         }
-    }
-
-    fn acquire_with_bytes(&self, data: &[u8]) -> FuseBoundaryBuffer {
-        let mut buffer = self.acquire_zeroed(data.len());
-        buffer.as_mut_slice().copy_from_slice(data);
-        buffer
     }
 
     fn release(&self, mut buffer: Vec<u8>) {
@@ -822,13 +835,17 @@ impl FuseBoundaryBufferPool {
     }
 }
 
-impl FuseBoundaryBuffer {
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer
-    }
+impl Deref for FuseBoundaryBuffer {
+    type Target = [u8];
 
-    fn as_slice(&self) -> &[u8] {
+    fn deref(&self) -> &Self::Target {
         &self.buffer
+    }
+}
+
+impl DerefMut for FuseBoundaryBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
     }
 }
 
@@ -1333,6 +1350,19 @@ impl StudioFuseFs {
         snapshot
     }
 
+    fn record_async_read_snapshot(
+        vfs: &StudioVfs,
+        pending_reads: &PendingReadTracker,
+        limits: StudioFuseAsyncReadAdmissionLimits,
+        boundary_buffer_pool: &FuseBoundaryBufferPool,
+    ) {
+        vfs.record_fuse_async_read_snapshot(Self::async_read_snapshot(
+            pending_reads,
+            limits,
+            boundary_buffer_pool,
+        ));
+    }
+
     fn read_with_reply<R>(&self, ino: u64, fh: u64, offset: i64, size: u32, reply: R)
     where
         R: FuseDataReply + Send + 'static,
@@ -1370,11 +1400,12 @@ impl StudioFuseFs {
                     Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
                     Err(e) => {
                         registration.complete(PendingReadOutcome::Failed);
-                        vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                        StudioFuseFs::record_async_read_snapshot(
+                            &vfs,
                             &pending_reads,
                             limits,
                             &boundary_buffer_pool,
-                        ));
+                        );
                         error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
                         reply.error(vfs_err_to_errno(&e));
                         return;
@@ -1384,22 +1415,24 @@ impl StudioFuseFs {
                     Ok(clamped_size) => clamped_size,
                     Err(_) => {
                         registration.complete(PendingReadOutcome::Failed);
-                        vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                        StudioFuseFs::record_async_read_snapshot(
+                            &vfs,
                             &pending_reads,
                             limits,
                             &boundary_buffer_pool,
-                        ));
+                        );
                         reply.error(libc::EOVERFLOW);
                         return;
                     }
                 };
                 if clamped_size == 0 {
                     registration.complete(PendingReadOutcome::Completed);
-                    vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                    StudioFuseFs::record_async_read_snapshot(
+                        &vfs,
                         &pending_reads,
                         limits,
                         &boundary_buffer_pool,
-                    ));
+                    );
                     reply.data(&[]);
                     return;
                 }
@@ -1407,22 +1440,24 @@ impl StudioFuseFs {
                     Ok(()) => {}
                     Err(errno) => {
                         registration.complete(PendingReadOutcome::Canceled);
-                        vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                        StudioFuseFs::record_async_read_snapshot(
+                            &vfs,
                             &pending_reads,
                             limits,
                             &boundary_buffer_pool,
-                        ));
+                        );
                         reply.error(errno);
                         return;
                     }
                 }
-                vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                StudioFuseFs::record_async_read_snapshot(
+                    &vfs,
                     &pending_reads,
                     limits,
                     &boundary_buffer_pool,
-                ));
+                );
                 let mut out = boundary_buffer_pool.acquire_zeroed(clamped_size);
-                let result = vfs.read_into_fh(fh, ino, offset, out.as_mut_slice()).await;
+                let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
                 vfs.record_fuse_read_callback(
                     clamped_size,
                     callback_started.elapsed(),
@@ -1435,34 +1470,35 @@ impl StudioFuseFs {
                             Err(_) => {
                                 drop(out);
                                 registration.complete(PendingReadOutcome::Failed);
-                                vfs.record_fuse_async_read_snapshot(
-                                    StudioFuseFs::async_read_snapshot(
-                                        &pending_reads,
-                                        limits,
-                                        &boundary_buffer_pool,
-                                    ),
+                                StudioFuseFs::record_async_read_snapshot(
+                                    &vfs,
+                                    &pending_reads,
+                                    limits,
+                                    &boundary_buffer_pool,
                                 );
                                 reply.error(libc::EOVERFLOW);
                                 return;
                             }
                         };
-                        reply.data(&out.as_slice()[..n]);
+                        reply.data(&out[..n]);
                         drop(out);
                         registration.complete(PendingReadOutcome::Completed);
-                        vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                        StudioFuseFs::record_async_read_snapshot(
+                            &vfs,
                             &pending_reads,
                             limits,
                             &boundary_buffer_pool,
-                        ));
+                        );
                     }
                     Err(e) => {
                         drop(out);
                         registration.complete(PendingReadOutcome::Failed);
-                        vfs.record_fuse_async_read_snapshot(StudioFuseFs::async_read_snapshot(
+                        StudioFuseFs::record_async_read_snapshot(
+                            &vfs,
                             &pending_reads,
                             limits,
                             &boundary_buffer_pool,
-                        ));
+                        );
                         error!("read({ino}, off={offset}, sz={size}) -> {e}");
                         reply.error(vfs_err_to_errno(&e));
                     }
@@ -2098,13 +2134,7 @@ impl Filesystem for StudioFuseFs {
                 let turn = registration.turn_waiter();
                 turn.wait().await;
                 let result = vfs
-                    .write_fh_with_deferred_materialize(
-                        fh,
-                        ino,
-                        offset,
-                        data.as_slice(),
-                        local_sync_policy,
-                    )
+                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
                     .await;
                 vfs.record_fuse_write_callback(
                     data_len,
@@ -3319,6 +3349,16 @@ mod tests {
         assert_eq!(snapshot.boundary_pool_hits, 1);
         assert_eq!(snapshot.boundary_pool_outstanding_bytes, 0);
         assert_eq!(snapshot.boundary_pool_fallback_allocations, 0);
+    }
+
+    #[test]
+    fn boundary_buffer_derefs_to_owned_payload_slice() {
+        let pool = super::FuseBoundaryBufferPool::new(8, 1, 8);
+
+        let mut buffer = pool.acquire_with_bytes(b"abc");
+        buffer[1] = b'Z';
+
+        assert_eq!(&*buffer, b"aZc");
     }
 
     #[test]
