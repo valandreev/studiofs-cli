@@ -3,7 +3,7 @@
 mod handle_drain;
 mod pending_write_tracker;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -955,10 +955,12 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
     }
 }
 
-#[derive(Debug, Default)]
+const DIR_HANDLE_SHARDS: usize = 16;
+
+#[derive(Debug)]
 struct DirectoryHandleStore {
     next_fh: AtomicU64,
-    handles: Mutex<HashMap<u64, DirectoryHandle>>,
+    shards: [Mutex<HashMap<u64, DirectoryHandle>>; DIR_HANDLE_SHARDS],
 }
 
 #[derive(Debug)]
@@ -968,10 +970,14 @@ struct DirectoryHandle {
 }
 
 impl DirectoryHandleStore {
+    fn shard(&self, fh: u64) -> &Mutex<HashMap<u64, DirectoryHandle>> {
+        &self.shards[(fh as usize) % DIR_HANDLE_SHARDS]
+    }
+
     fn open(&self, ino: u64, entries: Vec<DirEntry>) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
         let mut handles = self
-            .handles
+            .shard(fh)
             .lock()
             .expect("directory handle mutex poisoned");
         handles.insert(
@@ -989,7 +995,7 @@ impl DirectoryHandleStore {
             return None;
         }
         let handles = self
-            .handles
+            .shard(fh)
             .lock()
             .expect("directory handle mutex poisoned");
         handles.get(&fh).and_then(|handle| {
@@ -1003,14 +1009,25 @@ impl DirectoryHandleStore {
 
     fn release(&self, ino: u64, fh: u64) -> bool {
         let mut handles = self
-            .handles
+            .shard(fh)
             .lock()
             .expect("directory handle mutex poisoned");
-        if !matches!(handles.get(&fh), Some(handle) if handle.ino == ino) {
-            return false;
+        if let Entry::Occupied(entry) = handles.entry(fh)
+            && entry.get().ino == ino
+        {
+            entry.remove();
+            return true;
         }
-        handles.remove(&fh);
-        true
+        false
+    }
+}
+
+impl Default for DirectoryHandleStore {
+    fn default() -> Self {
+        Self {
+            next_fh: AtomicU64::new(0),
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
     }
 }
 
