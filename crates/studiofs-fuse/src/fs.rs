@@ -1136,47 +1136,41 @@ impl StudioFuseFs {
                 return;
             }
         };
-        let clamped_size = match self.vfs.getattr(ino) {
-            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
-            Err(e) => {
-                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-                return;
-            }
-        };
-        let clamped_size = match usize::try_from(clamped_size) {
-            Ok(clamped_size) => clamped_size,
-            Err(_) => {
-                reply.error(libc::EOVERFLOW);
-                return;
-            }
-        };
-        if clamped_size == 0 {
-            reply.data(&[]);
-            return;
-        }
-
         if self.async_read_enabled {
-            let mut out = vec![0u8; clamped_size];
-            let mut registration = match self.pending_reads.register(
-                ino,
-                fh,
-                clamped_size,
-                self.async_read_admission_policy.limits,
-            ) {
-                Ok(registration) => registration,
-                Err(errno) => {
-                    reply.error(errno);
-                    return;
-                }
-            };
-            self.publish_async_read_diagnostics();
             let callback_started = Instant::now();
             let vfs = Arc::clone(&self.vfs);
             let pending_reads = self.pending_reads.clone();
             let limits = self.async_read_admission_policy.limits;
             let reply = FuseDataReplyGuard::new(reply);
             self.rt.spawn(async move {
+                let clamped_size = match vfs.getattr_async(ino).await {
+                    Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
+                    Err(e) => {
+                        error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
+                        reply.error(vfs_err_to_errno(&e));
+                        return;
+                    }
+                };
+                let clamped_size = match usize::try_from(clamped_size) {
+                    Ok(clamped_size) => clamped_size,
+                    Err(_) => {
+                        reply.error(libc::EOVERFLOW);
+                        return;
+                    }
+                };
+                if clamped_size == 0 {
+                    reply.data(&[]);
+                    return;
+                }
+                let mut registration = match pending_reads.register(ino, fh, clamped_size, limits) {
+                    Ok(registration) => registration,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
+                vfs.record_fuse_async_read_snapshot(pending_reads.snapshot(limits));
+                let mut out = vec![0u8; clamped_size];
                 let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
                 vfs.record_fuse_read_callback(
                     clamped_size,
@@ -1204,6 +1198,26 @@ impl StudioFuseFs {
                     }
                 }
             });
+            return;
+        }
+
+        let clamped_size = match self.vfs.getattr(ino) {
+            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
+            Err(e) => {
+                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+        let clamped_size = match usize::try_from(clamped_size) {
+            Ok(clamped_size) => clamped_size,
+            Err(_) => {
+                reply.error(libc::EOVERFLOW);
+                return;
+            }
+        };
+        if clamped_size == 0 {
+            reply.data(&[]);
             return;
         }
 
