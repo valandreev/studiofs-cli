@@ -535,6 +535,7 @@ impl<R: FuseAttrReply> FuseAttrReplyGuard<R> {
 impl<R: FuseAttrReply> Drop for FuseAttrReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseAttrReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -571,6 +572,7 @@ impl<R: FuseOpenReply> FuseOpenReplyGuard<R> {
 impl<R: FuseOpenReply> Drop for FuseOpenReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseOpenReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -607,6 +609,7 @@ impl<R: FuseWriteReply> FuseWriteReplyGuard<R> {
 impl<R: FuseWriteReply> Drop for FuseWriteReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseWriteReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -649,6 +652,7 @@ impl<R: FuseDirectoryReply> FuseDirectoryReplyGuard<R> {
 impl<R: FuseDirectoryReply> Drop for FuseDirectoryReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseDirectoryReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -689,6 +693,7 @@ impl<R: FuseEmptyReply> FuseEmptyReplyGuard<R> {
 impl<R: FuseEmptyReply> Drop for FuseEmptyReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseEmptyReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -725,6 +730,7 @@ impl<R: FuseDataReply> FuseDataReplyGuard<R> {
 impl<R: FuseDataReply> Drop for FuseDataReplyGuard<R> {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
+            warn!("FuseDataReplyGuard dropped without explicit reply, failing with EIO");
             reply.error(libc::EIO);
         }
     }
@@ -1766,23 +1772,14 @@ impl StudioFuseFs {
             let cached_entries = self.directory_handles.entries(ino, fh);
             let reply = FuseDirectoryReplyGuard::new(reply);
             self.rt.spawn(async move {
-                let entries = if let Some(entries) = cached_entries {
-                    Ok(DirectoryEntriesForReply::Cached(entries))
-                } else {
-                    let vfs_for_readdir = Arc::clone(&vfs);
-                    match tokio::task::spawn_blocking(move || vfs_for_readdir.readdir(ino)).await {
-                        Ok(Ok(entries)) => Ok(DirectoryEntriesForReply::Owned(entries)),
-                        Ok(Err(e)) => Err(e),
-                        Err(error) => {
-                            error!(ino, fh, %error, "async metadata readdir task failed");
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                    }
-                };
                 // Keep hidden-entry healing off Tokio worker threads:
                 // spawn_blocking(move || StudioFuseFs::complete_readdir_reply(...)).
                 let result = tokio::task::spawn_blocking(move || {
+                    let entries = if let Some(entries) = cached_entries {
+                        Ok(DirectoryEntriesForReply::Cached(entries))
+                    } else {
+                        vfs.readdir(ino).map(DirectoryEntriesForReply::Owned)
+                    };
                     StudioFuseFs::complete_readdir_reply(&vfs, ino, fh, offset, entries, reply)
                 })
                 .await;

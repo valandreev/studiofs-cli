@@ -1155,6 +1155,9 @@ fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
         "DirectoryEntriesForReply",
         "async metadata disables readdirplus auto",
         "spawn_blocking(move || StudioFuseFs::complete_readdir_reply",
+        "FuseAttrReplyGuard dropped without explicit reply",
+        "FuseOpenReplyGuard dropped without explicit reply",
+        "FuseDirectoryReplyGuard dropped without explicit reply",
     ];
 
     let mut source = String::new();
@@ -1192,6 +1195,10 @@ fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
     assert!(
         !source.contains("Ok(Arc::new(entries))"),
         "SFS-514 async readdir cache miss should not allocate an Arc just for reply completion"
+    );
+    assert!(
+        !source.contains("async metadata readdir task failed"),
+        "SFS-514 async readdir should load entries and complete the reply in one blocking task"
     );
 }
 
