@@ -116,10 +116,6 @@ pub struct FuseCapabilityReport {
     pub io_uring_available: bool,
     /// Whether FUSE-over-io_uring was both requested and enabled.
     pub io_uring_enabled: bool,
-    /// Whether the kernel advertised clone-fd support.
-    pub clone_fd_available: bool,
-    /// Whether clone-fd was both requested and enabled.
-    pub clone_fd_enabled: bool,
 }
 
 impl FuseCapabilities {
@@ -142,10 +138,8 @@ impl FuseCapabilities {
     pub const SPLICE_MOVE: Self = Self { bits: 1 << 8 };
     /// `FUSE_CAP_SPLICE_READ`: allow splice-based reads to the kernel.
     pub const SPLICE_READ: Self = Self { bits: 1 << 9 };
-    /// `FUSE_CAP_CLONE_FD`: allow cloned `/dev/fuse` descriptors for multi-loop service.
-    pub const CLONE_FD: Self = Self { bits: 1 << 28 };
-    /// `FUSE_CAP_OVER_IO_URING`: kernel advertises FUSE request delivery over io_uring.
-    pub const OVER_IO_URING: Self = Self { bits: 1 << 50 };
+    /// `FUSE_OVER_IO_URING`: kernel advertises FUSE request delivery over io_uring.
+    pub const OVER_IO_URING: Self = Self { bits: 1 << 41 };
 
     /// Returns true when all bits in `capability` are present.
     pub fn contains(self, capability: Self) -> bool {
@@ -179,8 +173,6 @@ impl FuseCapabilities {
             disabled: self.difference(enabled),
             io_uring_available: kernel.contains(Self::OVER_IO_URING),
             io_uring_enabled: enabled.contains(Self::OVER_IO_URING),
-            clone_fd_available: kernel.contains(Self::CLONE_FD),
-            clone_fd_enabled: enabled.contains(Self::CLONE_FD),
         }
     }
 
@@ -357,7 +349,6 @@ mod tests {
     fn capability_negotiation_enables_only_requested_kernel_supported_flags() {
         let requested = FuseCapabilities::ASYNC_READ
             | FuseCapabilities::BIG_WRITES
-            | FuseCapabilities::CLONE_FD
             | FuseCapabilities::OVER_IO_URING;
         let kernel = FuseCapabilities::ASYNC_READ
             | FuseCapabilities::AUTO_INVAL_DATA
@@ -372,11 +363,15 @@ mod tests {
     }
 
     #[test]
-    fn capability_report_enumerates_io_uring_and_clone_fd_availability() {
+    fn io_uring_capability_uses_linux_uapi_bit_41() {
+        assert_eq!(FuseCapabilities::OVER_IO_URING.low_bits(), 0);
+        assert_eq!(FuseCapabilities::OVER_IO_URING.high_bits(), 1 << 9);
+    }
+
+    #[test]
+    fn capability_report_enumerates_io_uring_availability() {
         let requested = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
-        let kernel = FuseCapabilities::ASYNC_READ
-            | FuseCapabilities::CLONE_FD
-            | FuseCapabilities::OVER_IO_URING;
+        let kernel = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
 
         let report = requested.report_negotiation(kernel);
 
@@ -384,8 +379,6 @@ mod tests {
         assert_eq!(report.disabled, FuseCapabilities::empty());
         assert!(report.io_uring_available);
         assert!(report.io_uring_enabled);
-        assert!(report.clone_fd_available);
-        assert!(!report.clone_fd_enabled);
     }
 
     #[test]
@@ -399,7 +392,7 @@ mod tests {
                 .low_bits()
                 .to_le_bytes(),
         );
-        payload.extend_from_slice(&(1_u32 << 18).to_le_bytes());
+        payload.extend_from_slice(&FuseCapabilities::OVER_IO_URING.high_bits().to_le_bytes());
 
         let init = FuseInitRequest::parse(&payload).expect("INIT payload should parse");
 
