@@ -45,6 +45,12 @@ studiofs (CLI)
   └── studiofs-e2e        real mounted E2E runner
 ```
 
+The future owned Linux platform boundary is defined in
+[linux-native-bridge-contract.md](./linux-native-bridge-contract.md). It
+supersedes the canceled fuser 0.17 implementation plan for new Linux native
+bridge work while the current `studiofs-fuse` crate remains the shipped fuser
+0.16 bridge.
+
 Future deterministic simulation work is scoped in
 [deterministic-simulation-architecture.md](./deterministic-simulation-architecture.md).
 That layer is planned as a seed-reproducible logical multi-client test surface

@@ -1146,6 +1146,68 @@ fn linux_fuse_adapter_benchmark_report_covers_sfs516_decision_gate() {
 }
 
 #[test]
+fn linux_native_bridge_contract_covers_sfs524_architecture_gate() {
+    let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-524",
+        "LinuxNativeBridge",
+        "owned Linux platform boundary",
+        "not a fuser/fuse-rs adaptation layer",
+        "fuser 0.17 is no longer the implementation basis",
+        "Classic /dev/fuse",
+        "FUSE-over-io_uring",
+        "FuseTransport",
+        "typed requests",
+        "typed replies",
+        "daemon-side notifications",
+        "interrupts",
+        "Classic fallback remains mandatory",
+        "capability probing",
+        "kernel/module detection",
+        "queue-depth config",
+        "per-CPU queue",
+        "Unsafe FUSE ABI parsing",
+        "syscall/io_uring transport",
+        "Async dispatch",
+        "VFS business logic",
+        "Mount lifecycle",
+        "request/reply ownership",
+        "VFS adapter API",
+        "kernel cache policy",
+        "local-cache read/write paths",
+        "telemetry",
+        "Rollout Decision Gates",
+        "Curvine",
+        "raw FUSE session",
+        "clone fd",
+        "async sender/receiver",
+        "splice/vmsplice",
+        "capability negotiation",
+        "JuiceFS",
+        "kernel page-cache validity policy",
+        "bounded readahead",
+        "separate prefetch",
+        "singleflight/cache-miss behavior",
+        "partial-cache controls",
+        "cache/coherency rules",
+        "benchmark gates",
+        "stop and revisit architecture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-524 LinuxNativeBridge contract is missing required architecture surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn linux_fuse_concurrent_dispatch_audit_covers_sfs514_decision() {
     let doc = read_workspace_file("docs/perf/sfs-514-linux-fuse-concurrent-dispatch-audit.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

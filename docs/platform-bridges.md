@@ -169,6 +169,12 @@ Current signature includes additional policy controls:
 
 ## FUSE Bridge (`studiofs-fuse`)
 
+The current Linux implementation uses `fuser` through `studiofs-fuse`. New
+Linux native bridge work is governed by
+[linux-native-bridge-contract.md](./linux-native-bridge-contract.md), which
+defines `LinuxNativeBridge` as an owned Linux platform boundary with classic
+`/dev/fuse` and optional FUSE-over-io_uring transports behind one contract.
+
 ### Requirements
 
 - Linux: `libfuse3-dev` (or `fuse3`)
