@@ -39,6 +39,8 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_LINUX_FUSE_MAX_BACKGROUND: u16 = 50;
+const DEFAULT_LINUX_FUSE_CONGESTION_THRESHOLD: u16 = 40;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
@@ -73,17 +75,15 @@ struct LinuxFuseCapabilityPolicy {
 }
 
 impl LinuxFuseCapabilityPolicy {
-    fn from_env(async_dio_enabled: bool) -> Self {
-        let parallel_dirops = std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV).ok();
-        let readdirplus_auto = std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV).ok();
-
-        Self::from_env_values(
-            async_dio_enabled,
-            parallel_dirops.as_deref(),
-            readdirplus_auto.as_deref(),
-        )
+    fn from_runtime_options(options: &StudioFuseRuntimeOptions) -> Self {
+        Self {
+            async_dio: options.linux_async_dio_enabled,
+            parallel_dirops: options.linux_parallel_dirops_enabled,
+            readdirplus_auto: options.linux_readdirplus_auto_enabled,
+        }
     }
 
+    #[cfg(test)]
     fn from_env_values(
         async_dio: bool,
         parallel_dirops: Option<&str>,
@@ -92,9 +92,7 @@ impl LinuxFuseCapabilityPolicy {
         Self {
             async_dio,
             parallel_dirops: parallel_dirops.is_some_and(parse_bridge_bool_env_value),
-            readdirplus_auto: readdirplus_auto
-                .map(parse_bridge_bool_env_value)
-                .unwrap_or(true),
+            readdirplus_auto: readdirplus_auto.map_or(true, parse_bridge_bool_env_value),
         }
     }
 }
@@ -102,8 +100,8 @@ impl LinuxFuseCapabilityPolicy {
 impl FuseBackgroundQueuePolicy {
     fn platform_default() -> Self {
         Self {
-            max_background: Some(50),
-            congestion_threshold: Some(40),
+            max_background: Some(DEFAULT_LINUX_FUSE_MAX_BACKGROUND),
+            congestion_threshold: Some(DEFAULT_LINUX_FUSE_CONGESTION_THRESHOLD),
         }
     }
 
@@ -145,6 +143,7 @@ impl FuseBackgroundQueuePolicy {
     }
 }
 
+#[must_use]
 fn retry_optional_fuse_queue_tuning(
     control_name: &'static str,
     requested: u16,
@@ -1279,7 +1278,7 @@ pub struct StudioFuseFs {
     directory_handles: DirectoryHandleStore,
     async_write_enabled: bool,
     async_read_enabled: bool,
-    linux_async_dio_enabled: bool,
+    linux_capability_policy: LinuxFuseCapabilityPolicy,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     async_read_admission_policy: FuseAsyncReadAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
@@ -1293,7 +1292,7 @@ pub struct StudioFuseFs {
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
 /// environment during tests or embedded use.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StudioFuseRuntimeOptions {
     /// Enable the async FUSE write-reply path.
     pub async_write_enabled: bool,
@@ -1302,6 +1301,10 @@ pub struct StudioFuseRuntimeOptions {
     /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
     /// Ignored on non-Linux platforms.
     pub linux_async_dio_enabled: bool,
+    /// Request Linux `FUSE_PARALLEL_DIROPS` when the userspace/kernel ABI supports it.
+    pub linux_parallel_dirops_enabled: bool,
+    /// Request Linux `FUSE_READDIRPLUS_AUTO` during FUSE init when supported.
+    pub linux_readdirplus_auto_enabled: bool,
     /// Optional custom limits for async write admission control. When omitted,
     /// explicit-runtime construction uses the safe platform defaults.
     pub async_write_admission_limits: Option<StudioFuseAsyncWriteAdmissionLimits>,
@@ -1332,6 +1335,20 @@ pub struct StudioFuseAsyncReadAdmissionLimits {
     pub per_handle_pending_bytes: Option<usize>,
 }
 
+impl Default for StudioFuseRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            async_write_enabled: false,
+            async_read_enabled: false,
+            linux_async_dio_enabled: false,
+            linux_parallel_dirops_enabled: false,
+            linux_readdirplus_auto_enabled: true,
+            async_write_admission_limits: None,
+            async_read_admission_limits: None,
+        }
+    }
+}
+
 impl From<StudioFuseAsyncWriteAdmissionLimits> for PendingWriteAdmissionLimits {
     fn from(limits: StudioFuseAsyncWriteAdmissionLimits) -> Self {
         Self {
@@ -1359,6 +1376,11 @@ impl StudioFuseRuntimeOptions {
             async_write_enabled: should_enable_async_fuse_write_from_env(),
             async_read_enabled: should_enable_async_fuse_read_from_env(),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
+            linux_parallel_dirops_enabled: std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV)
+                .is_ok_and(|raw| parse_bridge_bool_env_value(&raw)),
+            linux_readdirplus_auto_enabled: std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
+                .ok()
+                .map_or(true, |raw| parse_bridge_bool_env_value(&raw)),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
@@ -1391,6 +1413,7 @@ impl StudioFuseFs {
         let async_read_admission_limits = options
             .async_read_admission_limits
             .unwrap_or_else(|| FuseAsyncReadAdmissionPolicy::platform_default().limits);
+        let linux_capability_policy = LinuxFuseCapabilityPolicy::from_runtime_options(&options);
         let mut fs = Self {
             vfs,
             rt,
@@ -1409,7 +1432,7 @@ impl StudioFuseFs {
             directory_handles: DirectoryHandleStore::default(),
             async_write_enabled: options.async_write_enabled,
             async_read_enabled: options.async_read_enabled,
-            linux_async_dio_enabled: options.linux_async_dio_enabled,
+            linux_capability_policy,
             async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
                 limits: async_write_admission_limits,
             },
@@ -1940,7 +1963,7 @@ impl Filesystem for StudioFuseFs {
                 supported_limit,
                 "requested FUSE max_background is outside kernel-supported limits; clamping"
             );
-            retry_optional_fuse_queue_tuning(
+            let _ = retry_optional_fuse_queue_tuning(
                 "max_background",
                 max_background,
                 supported_limit,
@@ -1955,7 +1978,7 @@ impl Filesystem for StudioFuseFs {
                 supported_limit,
                 "requested FUSE congestion_threshold is outside kernel-supported limits; clamping"
             );
-            retry_optional_fuse_queue_tuning(
+            let _ = retry_optional_fuse_queue_tuning(
                 "congestion_threshold",
                 congestion_threshold,
                 supported_limit,
@@ -1971,7 +1994,7 @@ impl Filesystem for StudioFuseFs {
             "configured FUSE bridge I/O policy"
         );
 
-        let capability_policy = LinuxFuseCapabilityPolicy::from_env(self.linux_async_dio_enabled);
+        let capability_policy = self.linux_capability_policy;
         if capability_policy.async_dio
             && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
         {
@@ -3512,6 +3535,8 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: true,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -3542,6 +3567,8 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -3592,6 +3619,8 @@ mod tests {
                 async_write_enabled: false,
                 async_read_enabled: false,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: None,
             },
@@ -3609,6 +3638,8 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: false,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_enabled: true,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
@@ -3644,6 +3675,8 @@ mod tests {
                 async_write_enabled: false,
                 async_read_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -3685,6 +3718,8 @@ mod tests {
                 async_write_enabled: false,
                 async_read_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -3775,6 +3810,8 @@ mod tests {
                 async_write_enabled: true,
                 async_read_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -3820,6 +3857,8 @@ mod tests {
                 async_write_enabled: false,
                 async_read_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -3859,6 +3898,8 @@ mod tests {
                 async_write_enabled: false,
                 async_read_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4),
@@ -3895,6 +3936,8 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: false,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_enabled: false,
                 async_read_admission_limits: None,
@@ -4094,6 +4137,11 @@ mod tests {
         let policy = LinuxFuseCapabilityPolicy::from_env_values(false, None, Some("0"));
 
         assert!(!policy.readdirplus_auto);
+    }
+
+    #[test]
+    fn runtime_options_default_keep_readdirplus_auto_enabled() {
+        assert!(super::StudioFuseRuntimeOptions::default().linux_readdirplus_auto_enabled);
     }
 
     #[test]
@@ -4305,6 +4353,8 @@ mod tests {
                 async_write_enabled: true,
                 async_read_enabled: false,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -4386,6 +4436,8 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_parallel_dirops_enabled: false,
+                linux_readdirplus_auto_enabled: true,
                 async_write_admission_limits: None,
                 async_read_enabled: false,
                 async_read_admission_limits: None,
