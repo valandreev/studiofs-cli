@@ -59,7 +59,23 @@ pub struct FuseCapabilities {
     bits: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseCapabilityReport {
+    pub requested: FuseCapabilities,
+    pub kernel: FuseCapabilities,
+    pub enabled: FuseCapabilities,
+    pub disabled: FuseCapabilities,
+    pub io_uring_available: bool,
+    pub io_uring_enabled: bool,
+    pub clone_fd_available: bool,
+    pub clone_fd_enabled: bool,
+}
+
 impl FuseCapabilities {
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
     pub const ASYNC_READ: Self = Self { bits: 1 << 0 };
     pub const BIG_WRITES: Self = Self { bits: 1 << 5 };
     pub const AUTO_INVAL_DATA: Self = Self { bits: 1 << 12 };
@@ -88,9 +104,29 @@ impl FuseCapabilities {
         }
     }
 
+    pub fn report_negotiation(self, kernel: Self) -> FuseCapabilityReport {
+        let enabled = self.negotiate(kernel);
+        FuseCapabilityReport {
+            requested: self,
+            kernel,
+            enabled,
+            disabled: self.difference(enabled),
+            io_uring_available: kernel.contains(Self::OVER_IO_URING),
+            io_uring_enabled: enabled.contains(Self::OVER_IO_URING),
+            clone_fd_available: kernel.contains(Self::CLONE_FD),
+            clone_fd_enabled: enabled.contains(Self::CLONE_FD),
+        }
+    }
+
     pub fn from_kernel_flags(flags: u32, flags2: u32) -> Self {
         Self {
             bits: u64::from(flags) | (u64::from(flags2) << 32),
+        }
+    }
+
+    fn difference(self, other: Self) -> Self {
+        Self {
+            bits: self.bits & !other.bits,
         }
     }
 }
@@ -267,6 +303,23 @@ mod tests {
             enabled,
             FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING
         );
+    }
+
+    #[test]
+    fn capability_report_enumerates_io_uring_and_clone_fd_availability() {
+        let requested = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
+        let kernel = FuseCapabilities::ASYNC_READ
+            | FuseCapabilities::CLONE_FD
+            | FuseCapabilities::OVER_IO_URING;
+
+        let report = requested.report_negotiation(kernel);
+
+        assert_eq!(report.enabled, requested);
+        assert_eq!(report.disabled, FuseCapabilities::empty());
+        assert!(report.io_uring_available);
+        assert!(report.io_uring_enabled);
+        assert!(report.clone_fd_available);
+        assert!(!report.clone_fd_enabled);
     }
 
     #[test]

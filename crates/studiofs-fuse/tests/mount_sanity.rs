@@ -14,6 +14,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
+use studiofs_fuse::native::dispatcher::{MinimalNativeHandler, NativeDispatcher};
+use studiofs_fuse::native::lifecycle::{
+    DirectMountOptions, FuseDevice, Fusermount3MountSystem, LibcMountSyscalls, LinuxMountSystem,
+    NativeMountLifecycle,
+};
+use studiofs_fuse::native::protocol::FuseCapabilities;
+use studiofs_fuse::native::session::{NativeFuseSession, NativeSessionConfig};
+use studiofs_fuse::native::transport::ClassicReadWriteTransport;
 use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
@@ -272,6 +280,16 @@ fn async_mounted_matrix_includes_sfs509_long_lived_fio_scenario() {
 }
 
 #[test]
+fn native_mount_smoke_is_available_as_sfs525_opt_in_gate() {
+    let source = include_str!("mount_sanity.rs");
+
+    assert!(
+        source.contains("native_mount_session_mount_and_unmount_smoke"),
+        "SFS-525 native mount smoke must stay available behind the opt-in mounted test gate"
+    );
+}
+
+#[test]
 fn command_path_is_available_only_when_executable() {
     let tmp = target_tempdir("command-availability-");
     let command_path = tmp.path().join("fio");
@@ -434,6 +452,225 @@ fn mounted_tests_enabled() -> bool {
     std::env::var(MOUNT_TESTS_ENV).as_deref() == Ok("1")
 }
 
+fn current_uid_gid() -> (libc::uid_t, libc::gid_t) {
+    // SAFETY: `getuid` and `getgid` do not require preconditions and return
+    // the process credentials.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+fn status_has_effective_capability(status: &str, capability: u32) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1_u64 << capability) != 0)
+}
+
+fn process_has_effective_cap_sys_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .map(|status| status_has_effective_capability(&status, 21))
+        .unwrap_or(false)
+}
+
+fn mount_path_device(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).expect("mount path metadata").dev()
+}
+
+fn native_direct_mount_options() -> DirectMountOptions {
+    DirectMountOptions {
+        source: "studiofs".into(),
+        fs_name: "studiofs-native-smoke".into(),
+        subtype: Some("studiofs".into()),
+        read_only: false,
+        allow_other: false,
+        default_permissions: false,
+    }
+}
+
+#[test]
+fn status_capability_parser_detects_effective_cap_sys_admin() {
+    assert!(status_has_effective_capability(
+        "Name:\ttest\nCapEff:\t0000000000200000\n",
+        21
+    ));
+    assert!(!status_has_effective_capability(
+        "Name:\ttest\nCapEff:\t0000000000000000\n",
+        21
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, direct mount permissions, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_mount_session_mount_and_unmount_smoke() {
+    if !mounted_tests_enabled() {
+        eprintln!("skipping native mount smoke because {MOUNT_TESTS_ENV}=1 is not set");
+        return;
+    }
+    if !process_has_effective_cap_sys_admin() {
+        eprintln!(
+            "skipping native direct mount smoke because this process lacks effective CAP_SYS_ADMIN"
+        );
+        return;
+    }
+
+    let tmp = target_tempdir("native-mount-smoke-");
+    let mount_path = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_path).expect("create native mount point");
+    let before_dev = mount_path_device(&mount_path);
+    let fuse = FuseDevice::open_default().expect("open /dev/fuse for native smoke");
+    let (uid, gid) = current_uid_gid();
+    let options = native_direct_mount_options();
+    let mut lifecycle = NativeMountLifecycle::new(LinuxMountSystem::new(LibcMountSyscalls));
+
+    lifecycle
+        .mount_direct(
+            mount_path.to_str().expect("mount path should be utf-8"),
+            std::os::fd::AsRawFd::as_raw_fd(&fuse),
+            uid,
+            gid,
+            &options,
+        )
+        .expect("native direct FUSE mount should succeed");
+    let after_dev = mount_path_device(&mount_path);
+    assert_ne!(
+        before_dev, after_dev,
+        "native direct FUSE mount should change the mountpoint device"
+    );
+
+    lifecycle
+        .unmount(mount_path.to_str().expect("mount path should be utf-8"))
+        .expect("native direct FUSE unmount should succeed");
+    assert!(
+        wait_for_fuse_mount_path_to_clear(&mount_path, before_dev, Duration::from_secs(2)),
+        "native direct FUSE mount path should clear after unmount"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_fusermount3_mount_and_unmount_smoke() {
+    if !mounted_tests_enabled() {
+        eprintln!("skipping native fusermount3 smoke because {MOUNT_TESTS_ENV}=1 is not set");
+        return;
+    }
+    if Command::new("fusermount3").arg("-V").status().is_err() {
+        eprintln!("skipping native fusermount3 smoke because fusermount3 is unavailable");
+        return;
+    }
+
+    let tmp = target_tempdir("native-fusermount3-smoke-");
+    let mount_path = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_path).expect("create native fusermount3 mount point");
+    let options = native_direct_mount_options();
+    let request = options
+        .fusermount_request(mount_path.to_str().expect("mount path should be utf-8"))
+        .expect("build native fusermount3 request");
+    let system = Fusermount3MountSystem::default();
+
+    let fuse = system
+        .mount(&request)
+        .expect("native fusermount3 FUSE mount should return a device fd");
+    assert!(
+        mountinfo_contains_path(&mount_path),
+        "native fusermount3 FUSE mount should appear in mountinfo"
+    );
+
+    force_unmount_fuse_mount_path(&mount_path).expect("native fusermount3 unmount should succeed");
+    drop(fuse);
+    assert!(
+        wait_for_mountinfo_path_to_clear(&mount_path, Duration::from_secs(2)),
+        "native fusermount3 FUSE mount path should clear from mountinfo after unmount"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_fusermount3_classic_session_init_and_unmount_smoke() {
+    if !mounted_tests_enabled() {
+        eprintln!(
+            "skipping native fusermount3 classic session smoke because {MOUNT_TESTS_ENV}=1 is not set"
+        );
+        return;
+    }
+    if Command::new("fusermount3").arg("-V").status().is_err() {
+        eprintln!(
+            "skipping native fusermount3 classic session smoke because fusermount3 is unavailable"
+        );
+        return;
+    }
+
+    let tmp = target_tempdir("native-fusermount3-session-smoke-");
+    let mount_path = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_path).expect("create native fusermount3 session mount point");
+    let options = native_direct_mount_options();
+    let request = options
+        .fusermount_request(mount_path.to_str().expect("mount path should be utf-8"))
+        .expect("build native fusermount3 session request");
+    let system = Fusermount3MountSystem::default();
+
+    let fuse = system
+        .mount(&request)
+        .expect("native fusermount3 FUSE mount should return a device fd");
+    assert!(
+        mountinfo_contains_path(&mount_path),
+        "native fusermount3 session mount should appear in mountinfo"
+    );
+
+    let (handshake_tx, handshake_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let session_thread = std::thread::spawn(move || {
+        let transport = ClassicReadWriteTransport::new(fuse.into_file());
+        let config = NativeSessionConfig {
+            requested_capabilities: FuseCapabilities::ASYNC_READ
+                | FuseCapabilities::BIG_WRITES
+                | FuseCapabilities::AUTO_INVAL_DATA
+                | FuseCapabilities::READDIRPLUS,
+            max_readahead: 1024 * 1024,
+            max_write: 1024 * 1024,
+            max_background: 16,
+            congestion_threshold: 12,
+            max_pages: 256,
+        };
+        let mut session = NativeFuseSession::new(transport, config);
+        let handshake = session.handshake();
+        let handshake_ok = handshake.is_ok();
+        handshake_tx
+            .send(handshake.map(|negotiated| negotiated.capabilities))
+            .expect("send native handshake result");
+        if !handshake_ok {
+            return;
+        }
+        let transport = session.into_transport();
+        let mut dispatcher = NativeDispatcher::new(transport, MinimalNativeHandler);
+        let result = dispatcher.run_until_destroy();
+        done_tx.send(result).expect("send native dispatcher result");
+    });
+
+    let negotiated_caps = handshake_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("native fusermount3 session should complete INIT handshake")
+        .expect("native fusermount3 session INIT should succeed");
+    assert!(
+        negotiated_caps.contains(FuseCapabilities::ASYNC_READ),
+        "native fusermount3 INIT should negotiate async read when offered by the kernel"
+    );
+
+    force_unmount_fuse_mount_path(&mount_path)
+        .expect("native fusermount3 session unmount should succeed");
+    let dispatch_result = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("native fusermount3 dispatcher should finish after unmount");
+    dispatch_result.expect("native fusermount3 dispatcher should shut down cleanly");
+    session_thread
+        .join()
+        .expect("native fusermount3 session thread should not panic");
+    assert!(
+        wait_for_mountinfo_path_to_clear(&mount_path, Duration::from_secs(2)),
+        "native fusermount3 session mount path should clear from mountinfo after unmount"
+    );
+}
+
 fn finish_mounted_fuse_test(
     test_result: std::thread::Result<MountedOperationGuard>,
     unmount_result: io::Result<()>,
@@ -512,6 +749,30 @@ fn fuse_mount_metadata_error_is_cleared(error: io::Error) -> bool {
 fn wait_for_fuse_mount_path_to_clear(mount_path: &Path, pre_dev: u64, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while !fuse_mount_path_cleared(mount_path, pre_dev) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
+fn mountinfo_contains_path(mount_path: &Path) -> bool {
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let mount_path = mount_path.to_string_lossy();
+    mountinfo.lines().any(|line| {
+        line.split(" - ")
+            .next()
+            .and_then(|prefix| prefix.split_whitespace().nth(4))
+            .is_some_and(|field| field == mount_path)
+    })
+}
+
+fn wait_for_mountinfo_path_to_clear(mount_path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while mountinfo_contains_path(mount_path) {
         if std::time::Instant::now() >= deadline {
             return false;
         }

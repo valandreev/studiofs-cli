@@ -96,6 +96,12 @@ mod tests {
     }
 
     #[test]
+    fn abi_header_lengths_match_linux_fuse_layout() {
+        assert_eq!(std::mem::size_of::<FuseInHeader>(), FUSE_IN_HEADER_LEN);
+        assert_eq!(FUSE_OUT_HEADER_LEN, 16);
+    }
+
+    #[test]
     fn parse_in_header_reads_linux_fuse_header_fields() {
         let frame = frame_with_header(56, 26, 0xfeed_beef, 1, 1000, 1001, 42);
 

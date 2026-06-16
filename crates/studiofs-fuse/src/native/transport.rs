@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN};
 use crate::native::protocol::{FuseReply, FuseRequest};
 
+const CLASSIC_READ_BUFFER_LEN: usize = 1024 * 1024 + 4096;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error(transparent)]
@@ -19,12 +21,16 @@ pub enum TransportError {
 pub trait FuseTransport {
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError>;
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError>;
+    fn request_shutdown(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct FrameQueueTransport {
     inbound: VecDeque<Vec<u8>>,
     sent_replies: Vec<FuseReply>,
+    shutdown_requested: bool,
 }
 
 impl FrameQueueTransport {
@@ -32,6 +38,7 @@ impl FrameQueueTransport {
         Self {
             inbound: inbound.into_iter().collect(),
             sent_replies: Vec::new(),
+            shutdown_requested: false,
         }
     }
 
@@ -42,6 +49,9 @@ impl FrameQueueTransport {
 
 impl FuseTransport for FrameQueueTransport {
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+        if self.shutdown_requested {
+            return Ok(None);
+        }
         self.inbound
             .pop_front()
             .map(|frame| FuseRequest::from_frame(&frame).map_err(TransportError::from))
@@ -52,16 +62,25 @@ impl FuseTransport for FrameQueueTransport {
         self.sent_replies.push(reply);
         Ok(())
     }
+
+    fn request_shutdown(&mut self) -> Result<(), TransportError> {
+        self.shutdown_requested = true;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct ClassicReadWriteTransport<T> {
     io: T,
+    shutdown_requested: bool,
 }
 
 impl<T> ClassicReadWriteTransport<T> {
     pub fn new(io: T) -> Self {
-        Self { io }
+        Self {
+            io,
+            shutdown_requested: false,
+        }
     }
 
     pub fn into_inner(self) -> T {
@@ -71,14 +90,32 @@ impl<T> ClassicReadWriteTransport<T> {
 
 impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
-        let mut header = [0; FUSE_IN_HEADER_LEN];
-        match self.io.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(err) => return Err(TransportError::Io(err)),
+        if self.shutdown_requested {
+            return Ok(None);
         }
 
-        let frame_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let mut frame = vec![0; CLASSIC_READ_BUFFER_LEN];
+        let bytes_read = loop {
+            match self.io.read(&mut frame) {
+                Ok(bytes_read) => break bytes_read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if fuse_teardown_read_error(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+        if bytes_read < FUSE_IN_HEADER_LEN {
+            return Err(AbiParseError::FrameTooShort {
+                expected: FUSE_IN_HEADER_LEN,
+                actual: bytes_read,
+            }
+            .into());
+        }
+        frame.truncate(bytes_read);
+
+        let frame_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
         if frame_len < FUSE_IN_HEADER_LEN {
             return Err(AbiParseError::FrameTooShort {
                 expected: FUSE_IN_HEADER_LEN,
@@ -86,11 +123,15 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             }
             .into());
         }
+        if frame_len > bytes_read {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "classic FUSE read returned a partial request frame",
+            )
+            .into());
+        }
+        frame.truncate(frame_len);
 
-        let mut frame = Vec::with_capacity(frame_len);
-        frame.extend_from_slice(&header);
-        frame.resize(frame_len, 0);
-        self.io.read_exact(&mut frame[FUSE_IN_HEADER_LEN..])?;
         FuseRequest::from_frame(&frame)
             .map(Some)
             .map_err(TransportError::from)
@@ -100,6 +141,15 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
         self.io.write_all(&reply.bytes)?;
         Ok(())
     }
+
+    fn request_shutdown(&mut self) -> Result<(), TransportError> {
+        self.shutdown_requested = true;
+        Ok(())
+    }
+}
+
+fn fuse_teardown_read_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(errno) if errno == libc::ENODEV || errno == libc::EAGAIN)
 }
 
 #[cfg(test)]
@@ -186,6 +236,68 @@ mod tests {
         }
     }
 
+    struct FuseDeviceLikeReader {
+        frame: Vec<u8>,
+        min_read_len: usize,
+        output: Vec<u8>,
+    }
+
+    impl Read for FuseDeviceLikeReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() < self.min_read_len {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            if self.frame.is_empty() {
+                return Ok(0);
+            }
+            let len = self.frame.len();
+            buf[..len].copy_from_slice(&self.frame);
+            self.frame.clear();
+            Ok(len)
+        }
+    }
+
+    impl Write for FuseDeviceLikeReader {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ErroringFuseDevice {
+        errors: VecDeque<io::Error>,
+        frame: Vec<u8>,
+    }
+
+    impl Read for ErroringFuseDevice {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(error) = self.errors.pop_front() {
+                return Err(error);
+            }
+            if self.frame.is_empty() {
+                return Ok(0);
+            }
+            let len = self.frame.len();
+            buf[..len].copy_from_slice(&self.frame);
+            self.frame.clear();
+            Ok(len)
+        }
+    }
+
+    impl Write for ErroringFuseDevice {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn classic_read_write_transport_reads_frame_and_writes_reply_bytes() {
         let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(frame(26, 0x77)));
@@ -206,5 +318,66 @@ mod tests {
             .expect("classic send should write reply");
 
         assert_eq!(transport.into_inner().output, bytes);
+    }
+
+    #[test]
+    fn classic_read_write_transport_reads_fuse_device_frames_with_large_buffer() {
+        let mut transport = ClassicReadWriteTransport::new(FuseDeviceLikeReader {
+            frame: frame(26, 0x88),
+            min_read_len: 8192,
+            output: Vec::new(),
+        });
+
+        let request = transport
+            .receive_request()
+            .expect("transport should use a large read buffer")
+            .expect("transport should parse one frame");
+
+        assert_eq!(request.header.unique, 0x88);
+    }
+
+    #[test]
+    fn classic_read_write_transport_treats_fuse_teardown_errors_as_end_of_stream() {
+        for errno in [libc::ENODEV, libc::EAGAIN] {
+            let mut transport = ClassicReadWriteTransport::new(ErroringFuseDevice {
+                errors: VecDeque::from([io::Error::from_raw_os_error(errno)]),
+                frame: Vec::new(),
+            });
+
+            let request = transport
+                .receive_request()
+                .expect("teardown read error should not fail dispatcher");
+
+            assert_eq!(request, None);
+        }
+    }
+
+    #[test]
+    fn classic_read_write_transport_retries_interrupted_read() {
+        let mut transport = ClassicReadWriteTransport::new(ErroringFuseDevice {
+            errors: VecDeque::from([io::Error::from(io::ErrorKind::Interrupted)]),
+            frame: frame(26, 0x99),
+        });
+
+        let request = transport
+            .receive_request()
+            .expect("interrupted read should be retried")
+            .expect("request should be read after retry");
+
+        assert_eq!(request.header.unique, 0x99);
+    }
+
+    #[test]
+    fn transport_shutdown_stops_future_intake_without_dropping_sent_replies() {
+        let mut transport = FrameQueueTransport::new([frame(26, 0x77)]);
+        transport
+            .request_shutdown()
+            .expect("shutdown request should be accepted");
+
+        let request = transport
+            .receive_request()
+            .expect("receive after shutdown should not error");
+
+        assert_eq!(request, None);
     }
 }
