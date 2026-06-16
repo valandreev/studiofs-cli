@@ -545,10 +545,11 @@ impl FusermountFdReceiver {
         // a valid control message within the control buffer or null.
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
         let fd = fd_from_scm_rights_cmsg(cmsg)?;
-        set_close_on_exec(fd)?;
         // SAFETY: ownership of the received descriptor transfers to this
         // process via SCM_RIGHTS; `File` will close it on drop.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        let file = unsafe { File::from_raw_fd(fd) };
+        set_close_on_exec(file.as_raw_fd())?;
+        Ok(file)
     }
 }
 
