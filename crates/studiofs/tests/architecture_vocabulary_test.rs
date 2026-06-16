@@ -1098,6 +1098,95 @@ fn linux_fuse_ext4_throughput_baseline_report_covers_sfs509_decision_gate() {
 }
 
 #[test]
+fn linux_fuse_concurrent_dispatch_audit_covers_sfs514_decision() {
+    let doc = read_workspace_file("docs/perf/sfs-514-linux-fuse-concurrent-dispatch-audit.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-514",
+        "fuser 0.16",
+        "fuser 0.17.0",
+        "Config::n_threads",
+        "FUSE_DEV_IOC_CLONE",
+        "Filesystem trait methods use &self",
+        "Send + Sync + 'static",
+        "AsyncFilesystem",
+        "breaking API migration",
+        "owned async replies",
+        "STUDIOFS_FUSE_ASYNC_METADATA",
+        "slow read",
+        "slow getattr",
+        "slow readdir",
+        "metadata operations during slow reads",
+        "release/flush ordering",
+        "mount shutdown with pending replies",
+        "deterministic shutdown",
+        "notifier registration",
+        "mount error behavior",
+        "existing async write barriers",
+        "selected approach",
+        "migration risks",
+        "callback-level async is the safer route",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-514 Linux FUSE concurrent dispatch audit is missing required decision-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
+    let required_terms = [
+        "STUDIOFS_FUSE_ASYNC_METADATA",
+        "async_metadata_enabled",
+        "should_enable_async_fuse_metadata_from_env",
+        "getattr_with_reply",
+        "readdir_with_reply",
+        "FuseAttrReplyGuard",
+        "FuseDirectoryReplyGuard",
+    ];
+
+    let mut source = String::new();
+    let mut stack = vec![repo_root().join("crates/studiofs-fuse/src")];
+    while let Some(current) = stack.pop() {
+        let metadata = fs::metadata(&current).unwrap_or_else(|error| {
+            panic!("failed to stat '{}': {error}", current.display());
+        });
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&current).unwrap_or_else(|error| {
+                panic!("failed to read dir '{}': {error}", current.display());
+            }) {
+                source.push('\n');
+                stack.push(entry.expect("read dir entry").path());
+            }
+            continue;
+        }
+        if current.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            source.push_str(&fs::read_to_string(&current).unwrap_or_else(|error| {
+                panic!("failed to read '{}': {error}", current.display());
+            }));
+            source.push('\n');
+        }
+    }
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !source.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-514 async metadata prototype terms are missing from studiofs-fuse sources:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn macos_native_bridge_split_note_covers_sfs475_boundary() {
     let doc = read_workspace_file("docs/macos-native-bridge-split.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
