@@ -76,20 +76,25 @@ struct LinuxFuseCapabilityPolicy {
 impl LinuxFuseCapabilityPolicy {
     fn from_env(async_dio_enabled: bool) -> Self {
         Self::from_env_values(
-            async_dio_enabled.then_some("1"),
+            async_dio_enabled,
             std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
                 .ok()
                 .as_deref(),
         )
     }
 
-    fn from_env_values(async_dio: Option<&str>, parallel_dirops: Option<&str>) -> Self {
+    fn from_env_values(
+        async_dio: bool,
+        parallel_dirops: Option<&str>,
+        readdirplus_auto: Option<&str>,
+    ) -> Self {
         Self {
-            async_dio: async_dio.is_some_and(should_request_fuse_async_dio_from_env_value),
+            async_dio,
             parallel_dirops: parallel_dirops.is_some_and(parse_bridge_bool_env_value),
-            readdirplus_auto: std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
-                .ok()
-                .as_deref()
+            readdirplus_auto: readdirplus_auto
                 .map(parse_bridge_bool_env_value)
                 .unwrap_or(true),
             writeback_cache: false,
@@ -99,11 +104,9 @@ impl LinuxFuseCapabilityPolicy {
 
 impl FuseBackgroundQueuePolicy {
     fn platform_default() -> Self {
-        {
-            Self {
-                max_background: Some(50),
-                congestion_threshold: Some(40),
-            }
+        Self {
+            max_background: Some(50),
+            congestion_threshold: Some(40),
         }
     }
 
@@ -4030,7 +4033,7 @@ mod tests {
 
     #[test]
     fn linux_fuse_capability_policy_keeps_unsafe_modes_opt_in() {
-        let policy = LinuxFuseCapabilityPolicy::from_env_values(None, None);
+        let policy = LinuxFuseCapabilityPolicy::from_env_values(false, None, None);
 
         assert_eq!(
             policy,
@@ -4041,6 +4044,20 @@ mod tests {
                 writeback_cache: false,
             }
         );
+    }
+
+    #[test]
+    fn linux_fuse_capability_policy_value_parser_ignores_process_environment() {
+        let policy = LinuxFuseCapabilityPolicy::from_env_values(false, None, None);
+
+        assert!(policy.readdirplus_auto);
+    }
+
+    #[test]
+    fn linux_fuse_capability_policy_readdirplus_auto_can_be_disabled() {
+        let policy = LinuxFuseCapabilityPolicy::from_env_values(false, None, Some("0"));
+
+        assert!(!policy.readdirplus_auto);
     }
 
     #[test]
