@@ -399,11 +399,12 @@ enough to rank unavailable variants such as a future async-read prototype:
 
 ## Default-on/default-off recommendations
 
-Based on this pass, keep the Linux defaults unchanged:
+Based on this pass and SFS-513, keep Linux async behaviors conservative while
+making the already-measured background queue candidate sticky:
 
 - keep async write default-off;
 - keep async_dio default-off;
-- keep FUSE background queue tuning opt-in;
+- make the Linux 6.x FUSE background queue profile `50/40` the safe default;
 - keep any async-read prototype out of defaults until it has sustained
   read-path evidence;
 - treat multi-job fsync and fsync-heavy write timeouts as blockers for any
