@@ -1098,6 +1098,54 @@ fn linux_fuse_ext4_throughput_baseline_report_covers_sfs509_decision_gate() {
 }
 
 #[test]
+fn linux_fuse_adapter_benchmark_report_covers_sfs516_decision_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-516-linux-fuse-adapter-benchmark.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-516",
+        "Benchmark Linux FUSE adapter options",
+        "current fuser 0.16 implementation",
+        "fuser 0.17 prototype",
+        "fuse3 Linux-only adapter prototype",
+        "sequential reads",
+        "random reads",
+        "getattr / lookup / readdir / readdirplus",
+        "mixed read + metadata concurrency",
+        "write + flush/release/fsync ordering",
+        "mount shutdown behavior with pending work",
+        "throughput",
+        "latency distribution",
+        "CPU cost",
+        "context switching",
+        "scheduling overhead",
+        "failure modes",
+        "kernel",
+        "libfuse",
+        "feature flag",
+        "runtime settings",
+        "target/sfs-516-linux-fuse-adapter-benchmark",
+        "fio",
+        "perf stat",
+        "perf record",
+        "raw artifacts",
+        "decision status",
+        "SFS-515 remains separate",
+        "cargo test -p studiofs --test architecture_vocabulary_test linux_fuse_adapter_benchmark_report_covers_sfs516_decision_gate -- --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-516 Linux FUSE adapter benchmark report is missing required decision-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn linux_fuse_concurrent_dispatch_audit_covers_sfs514_decision() {
     let doc = read_workspace_file("docs/perf/sfs-514-linux-fuse-concurrent-dispatch-audit.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
