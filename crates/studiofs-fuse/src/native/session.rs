@@ -225,7 +225,14 @@ impl<L: FuseMountSystem, T: FuseTransport, H: FuseOperationHandler> MountedNativ
         match (run_result, unmount_result) {
             (Ok(summary), Ok(())) => Ok(summary),
             (Ok(_), Err(error)) => Err(error.into()),
-            (Err(error), _) => Err(error),
+            (Err(run_error), Err(unmount_error)) => {
+                tracing::error!(
+                    ?unmount_error,
+                    "failed to unmount after native FUSE session error"
+                );
+                Err(run_error)
+            }
+            (Err(run_error), Ok(())) => Err(run_error),
         }
     }
 }
@@ -239,7 +246,10 @@ mod tests {
     use crate::native::lifecycle::{DirectMountRequest, LifecycleError};
     use crate::native::protocol::{FuseReply, FuseRequest};
     use crate::native::transport::FrameQueueTransport;
+    use std::io;
     use std::sync::{Arc, Mutex};
+    use tracing::span::{Attributes, Record};
+    use tracing::{Event, Id, Level, Metadata, Subscriber};
 
     fn init_frame(unique: u64, max_readahead: u32, capabilities: FuseCapabilities) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -323,6 +333,7 @@ mod tests {
     struct SharedRecordingLifecycleSystem {
         mounted: Arc<Mutex<Vec<String>>>,
         unmounted: Arc<Mutex<Vec<String>>>,
+        fail_unmount: bool,
     }
 
     impl FuseMountSystem for SharedRecordingLifecycleSystem {
@@ -339,8 +350,42 @@ mod tests {
                 .lock()
                 .expect("unmounted recorder should not be poisoned")
                 .push(mount_point.to_owned());
+            if self.fail_unmount {
+                return Err(io::Error::other("test unmount failure").into());
+            }
             Ok(())
         }
+    }
+
+    struct CountingErrorSubscriber {
+        error_events: Arc<Mutex<usize>>,
+    }
+
+    impl Subscriber for CountingErrorSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= Level::ERROR
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == Level::ERROR {
+                *self
+                    .error_events
+                    .lock()
+                    .expect("error event counter should not be poisoned") += 1;
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
     }
 
     #[derive(Default)]
@@ -449,6 +494,53 @@ mod tests {
                 .expect("unmounted recorder should not be poisoned")
                 .as_slice(),
             ["/mnt/studiofs"]
+        );
+    }
+
+    #[test]
+    fn mounted_native_session_logs_unmount_failure_after_session_failure() {
+        let lifecycle_system = SharedRecordingLifecycleSystem {
+            fail_unmount: true,
+            ..SharedRecordingLifecycleSystem::default()
+        };
+        let config = NativeSessionConfig {
+            requested_capabilities: FuseCapabilities::ASYNC_READ,
+            max_readahead: 1024 * 1024,
+            max_write: 16 * 1024 * 1024,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_pages: 256,
+        };
+        let mounted = MountedNativeSession::new(MountedNativeSessionParts {
+            lifecycle: NativeMountLifecycle::new(lifecycle_system),
+            mount_point: "/mnt/studiofs".to_owned(),
+            fuse_fd: 7,
+            uid: 1000,
+            gid: 1000,
+            mount_options: DirectMountOptions {
+                source: "studiofs".into(),
+                fs_name: "studiofs-volume".into(),
+                subtype: Some("studiofs".into()),
+                read_only: false,
+                allow_other: false,
+                default_permissions: false,
+            },
+            session: NativeFuseSession::new(FrameQueueTransport::new([]), config),
+            handler: ReplyingHandler,
+        });
+        let error_events = Arc::new(Mutex::new(0));
+        let subscriber = CountingErrorSubscriber {
+            error_events: error_events.clone(),
+        };
+
+        let result = tracing::subscriber::with_default(subscriber, || mounted.run());
+
+        assert!(matches!(result, Err(SessionError::MissingInit)));
+        assert_eq!(
+            *error_events
+                .lock()
+                .expect("error event counter should not be poisoned"),
+            1
         );
     }
 }

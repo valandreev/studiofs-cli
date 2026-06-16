@@ -5,7 +5,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
 use thiserror::Error;
@@ -243,6 +242,41 @@ fn cmsg_space_for_fd() -> usize {
     unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as libc::c_uint) as usize }
 }
 
+fn cmsg_len_for_fd() -> usize {
+    // SAFETY: `CMSG_LEN` is a pure size computation for the supplied payload
+    // length; no pointers are dereferenced.
+    unsafe { libc::CMSG_LEN(mem::size_of::<RawFd>() as libc::c_uint) as usize }
+}
+
+fn fd_from_scm_rights_cmsg(cmsg: *mut libc::cmsghdr) -> io::Result<RawFd> {
+    if cmsg.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount3 response did not contain a control message",
+        ));
+    }
+
+    // SAFETY: caller passes a control-message pointer returned by
+    // `CMSG_FIRSTHDR`; the null case is handled above.
+    let cmsg_ref = unsafe { &*cmsg };
+    if cmsg_ref.cmsg_level != libc::SOL_SOCKET || cmsg_ref.cmsg_type != libc::SCM_RIGHTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount3 response did not contain SCM_RIGHTS",
+        ));
+    }
+    if cmsg_ref.cmsg_len < cmsg_len_for_fd() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount3 response control message too short",
+        ));
+    }
+
+    // SAFETY: the level/type and length checks above prove the control message
+    // contains at least one complete RawFd payload.
+    Ok(unsafe { *(libc::CMSG_DATA(cmsg).cast::<RawFd>()) })
+}
+
 struct AncillaryFdBuffer {
     storage: Vec<usize>,
     len_bytes: usize,
@@ -416,7 +450,7 @@ impl Fusermount3MountRequest {
 }
 
 impl Fusermount3Command {
-    fn spawn(&self, parent_fd_to_close: RawFd) -> io::Result<Child> {
+    fn spawn(&self, _parent_fd_to_close: RawFd) -> io::Result<Child> {
         let mut command = Command::new(&self.program);
         command
             .args(self.argv.iter().skip(1))
@@ -424,19 +458,6 @@ impl Fusermount3Command {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-
-        // SAFETY: the pre-exec hook only invokes the async-signal-safe
-        // `close(2)` syscall on the child copy of the receiver socket.
-        unsafe {
-            command.pre_exec(move || {
-                let result = libc::close(parent_fd_to_close);
-                if result == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
         command.spawn()
     }
 }
@@ -458,6 +479,7 @@ impl UnixSocketPair {
         let parent = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         // SAFETY: see above; this is the peer descriptor.
         let child = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        set_close_on_exec(parent.as_raw_fd())?;
         Ok(Self { parent, child })
     }
 
@@ -522,27 +544,7 @@ impl FusermountFdReceiver {
         // SAFETY: `msg` was filled by `recvmsg`; `CMSG_FIRSTHDR` either returns
         // a valid control message within the control buffer or null.
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-        if cmsg.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "fusermount3 response did not contain a control message",
-            )
-            .into());
-        }
-
-        // SAFETY: `cmsg` is non-null and points into `control`, validated above.
-        let cmsg_ref = unsafe { &*cmsg };
-        if cmsg_ref.cmsg_level != libc::SOL_SOCKET || cmsg_ref.cmsg_type != libc::SCM_RIGHTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "fusermount3 response did not contain SCM_RIGHTS",
-            )
-            .into());
-        }
-
-        // SAFETY: SCM_RIGHTS payload contains at least one descriptor when sent
-        // by fusermount3/libfuse; copy the descriptor value before wrapping it.
-        let fd = unsafe { *(libc::CMSG_DATA(cmsg).cast::<RawFd>()) };
+        let fd = fd_from_scm_rights_cmsg(cmsg)?;
         set_close_on_exec(fd)?;
         // SAFETY: ownership of the received descriptor transfers to this
         // process via SCM_RIGHTS; `File` will close it on drop.
@@ -896,6 +898,33 @@ mod tests {
 
         assert_eq!(ptr % mem::align_of::<libc::cmsghdr>(), 0);
         assert!(buffer.len_bytes() >= cmsg_space_for_fd());
+    }
+
+    #[test]
+    fn scm_rights_decoder_rejects_control_message_without_full_fd_payload() {
+        let mut control = AncillaryFdBuffer::for_fd();
+        let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        // SAFETY: `cmsg` points into the mutable control buffer above.
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(0) as usize;
+        }
+
+        let error = fd_from_scm_rights_cmsg(cmsg).expect_err("short SCM_RIGHTS should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unix_socket_pair_marks_parent_fd_close_on_exec() {
+        let sockets = UnixSocketPair::open().expect("socketpair should open");
+
+        // SAFETY: `fcntl(F_GETFD)` only reads descriptor flags for an open fd.
+        let flags = unsafe { libc::fcntl(sockets.parent_fd(), libc::F_GETFD) };
+
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
