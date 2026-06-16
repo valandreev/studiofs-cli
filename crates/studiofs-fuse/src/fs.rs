@@ -70,19 +70,17 @@ struct LinuxFuseCapabilityPolicy {
     async_dio: bool,
     parallel_dirops: bool,
     readdirplus_auto: bool,
-    writeback_cache: bool,
 }
 
 impl LinuxFuseCapabilityPolicy {
     fn from_env(async_dio_enabled: bool) -> Self {
+        let parallel_dirops = std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV).ok();
+        let readdirplus_auto = std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV).ok();
+
         Self::from_env_values(
             async_dio_enabled,
-            std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV)
-                .ok()
-                .as_deref(),
-            std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
-                .ok()
-                .as_deref(),
+            parallel_dirops.as_deref(),
+            readdirplus_auto.as_deref(),
         )
     }
 
@@ -97,7 +95,6 @@ impl LinuxFuseCapabilityPolicy {
             readdirplus_auto: readdirplus_auto
                 .map(parse_bridge_bool_env_value)
                 .unwrap_or(true),
-            writeback_cache: false,
         }
     }
 }
@@ -146,6 +143,25 @@ impl FuseBackgroundQueuePolicy {
             congestion_threshold,
         }
     }
+}
+
+fn retry_optional_fuse_queue_tuning(
+    control_name: &'static str,
+    requested: u16,
+    supported_limit: u16,
+    retry: impl FnOnce(u16) -> Result<u16, u16>,
+) -> bool {
+    if retry(supported_limit).is_ok() {
+        return true;
+    }
+
+    warn!(
+        control = control_name,
+        requested,
+        supported_limit,
+        "failed to apply optional FUSE queue tuning after kernel clamp; continuing with kernel defaults"
+    );
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1924,9 +1940,12 @@ impl Filesystem for StudioFuseFs {
                 supported_limit,
                 "requested FUSE max_background is outside kernel-supported limits; clamping"
             );
-            if config.set_max_background(supported_limit).is_err() {
-                return Err(libc::EINVAL);
-            }
+            retry_optional_fuse_queue_tuning(
+                "max_background",
+                max_background,
+                supported_limit,
+                |limit| config.set_max_background(limit),
+            );
         }
         if let Some(congestion_threshold) = background_queue_policy.congestion_threshold
             && let Err(supported_limit) = config.set_congestion_threshold(congestion_threshold)
@@ -1936,9 +1955,12 @@ impl Filesystem for StudioFuseFs {
                 supported_limit,
                 "requested FUSE congestion_threshold is outside kernel-supported limits; clamping"
             );
-            if config.set_congestion_threshold(supported_limit).is_err() {
-                return Err(libc::EINVAL);
-            }
+            retry_optional_fuse_queue_tuning(
+                "congestion_threshold",
+                congestion_threshold,
+                supported_limit,
+                |limit| config.set_congestion_threshold(limit),
+            );
         }
 
         debug!(
@@ -3261,8 +3283,9 @@ mod tests {
         StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
-        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
-        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
+        retry_optional_fuse_queue_tuning, should_enable_async_fuse_write_from_env_value,
+        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
+        vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -3984,6 +4007,20 @@ mod tests {
     }
 
     #[test]
+    fn retry_optional_fuse_queue_tuning_reports_retry_failure_as_nonfatal() {
+        let applied = retry_optional_fuse_queue_tuning("max_background", 50, 32, |_| Err(16));
+
+        assert!(!applied);
+    }
+
+    #[test]
+    fn retry_optional_fuse_queue_tuning_reports_clamped_success() {
+        let applied = retry_optional_fuse_queue_tuning("max_background", 50, 32, Ok);
+
+        assert!(applied);
+    }
+
+    #[test]
     fn fuse_kernel_cache_ttl_matches_platform_policy() {
         assert_eq!(TTL, std::time::Duration::from_secs(1));
     }
@@ -4041,7 +4078,6 @@ mod tests {
                 async_dio: false,
                 parallel_dirops: false,
                 readdirplus_auto: true,
-                writeback_cache: false,
             }
         );
     }
