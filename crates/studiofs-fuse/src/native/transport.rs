@@ -8,25 +8,37 @@ use thiserror::Error;
 use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN};
 use crate::native::protocol::{FuseReply, FuseRequest};
 
-const CLASSIC_READ_BUFFER_LEN: usize = 1024 * 1024 + 4096;
+const DEFAULT_CLASSIC_MAX_WRITE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
+/// Errors returned by FUSE transport implementations.
 pub enum TransportError {
+    /// A raw frame could not be decoded according to the FUSE ABI.
     #[error(transparent)]
     Abi(#[from] AbiParseError),
+    /// The underlying file descriptor or stream returned an I/O error.
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
+/// Boundary between typed FUSE requests and a concrete I/O backend.
+///
+/// Implementations can use classic blocking `read(2)`/`write(2)`, in-memory
+/// frames for tests, or a future io_uring backend without changing dispatcher
+/// logic.
 pub trait FuseTransport {
+    /// Receives the next request, or `Ok(None)` when the session ended cleanly.
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError>;
+    /// Sends one reply frame back to the kernel.
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError>;
+    /// Requests a local shutdown so future receives stop without an I/O error.
     fn request_shutdown(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
 }
 
 #[derive(Debug, Default)]
+/// In-memory transport used by protocol and dispatcher tests.
 pub struct FrameQueueTransport {
     inbound: VecDeque<Vec<u8>>,
     sent_replies: Vec<FuseReply>,
@@ -34,6 +46,7 @@ pub struct FrameQueueTransport {
 }
 
 impl FrameQueueTransport {
+    /// Creates a queue transport from raw inbound FUSE frames.
     pub fn new(inbound: impl IntoIterator<Item = Vec<u8>>) -> Self {
         Self {
             inbound: inbound.into_iter().collect(),
@@ -42,6 +55,7 @@ impl FrameQueueTransport {
         }
     }
 
+    /// Returns every reply sent through this test transport.
     pub fn sent_replies(&self) -> &[FuseReply] {
         &self.sent_replies
     }
@@ -70,6 +84,10 @@ impl FuseTransport for FrameQueueTransport {
 }
 
 #[derive(Debug)]
+/// Classic blocking read/write transport for a FUSE device descriptor.
+///
+/// The kernel expects request reads to use a sufficiently large buffer. This
+/// transport owns and reuses that buffer so sessions do not allocate per frame.
 pub struct ClassicReadWriteTransport<T> {
     io: T,
     read_buffer: Vec<u8>,
@@ -77,14 +95,21 @@ pub struct ClassicReadWriteTransport<T> {
 }
 
 impl<T> ClassicReadWriteTransport<T> {
+    /// Wraps an I/O object using Linux's default 16 MiB `max_write` frame size.
     pub fn new(io: T) -> Self {
+        Self::with_max_write(io, DEFAULT_CLASSIC_MAX_WRITE)
+    }
+
+    /// Wraps an I/O object sized for a negotiated or configured `max_write`.
+    pub fn with_max_write(io: T, max_write: usize) -> Self {
         Self {
             io,
-            read_buffer: vec![0; CLASSIC_READ_BUFFER_LEN],
+            read_buffer: vec![0; FUSE_IN_HEADER_LEN + max_write],
             shutdown_requested: false,
         }
     }
 
+    /// Consumes the transport and returns the wrapped I/O object.
     pub fn into_inner(self) -> T {
         self.io
     }
@@ -174,6 +199,14 @@ mod tests {
         frame.extend_from_slice(&1000_u32.to_le_bytes());
         frame.extend_from_slice(&77_u32.to_le_bytes());
         frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame
+    }
+
+    fn frame_with_payload(opcode: u32, unique: u64, payload_len: usize) -> Vec<u8> {
+        let len = FUSE_IN_HEADER_LEN + payload_len;
+        let mut frame = frame(opcode, unique);
+        frame[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+        frame.resize(len, 0xab);
         frame
     }
 
@@ -368,6 +401,21 @@ mod tests {
     }
 
     #[test]
+    fn classic_read_write_transport_reads_default_linux_max_write_frame() {
+        let payload_len = 16 * 1024 * 1024;
+        let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(
+            frame_with_payload(26, 0x8a, payload_len),
+        ));
+
+        let request = transport
+            .receive_request()
+            .expect("transport should read a Linux-default max_write frame")
+            .expect("transport should parse the large frame");
+
+        assert_eq!(request.payload.len(), payload_len);
+    }
+
+    #[test]
     fn classic_read_write_transport_reuses_large_read_buffer_between_requests() {
         let mut transport = ClassicReadWriteTransport::new(SequenceFuseDevice {
             frames: VecDeque::from([frame(26, 0x88), frame(38, 0x89)]),
@@ -385,7 +433,7 @@ mod tests {
             .expect("second request should be present");
 
         assert_eq!(transport.read_buffer.as_ptr(), initial_buffer);
-        assert!(transport.read_buffer.len() >= CLASSIC_READ_BUFFER_LEN);
+        assert!(transport.read_buffer.len() >= FUSE_IN_HEADER_LEN + DEFAULT_CLASSIC_MAX_WRITE);
     }
 
     #[test]

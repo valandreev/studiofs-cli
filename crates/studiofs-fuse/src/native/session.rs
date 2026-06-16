@@ -12,42 +12,68 @@ use crate::native::protocol::{FuseCapabilities, FuseInitReply, FuseInitRequest, 
 use crate::native::transport::{FuseTransport, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Local policy for the native FUSE INIT negotiation.
 pub struct NativeSessionConfig {
+    /// Capabilities StudioFS is willing to enable when the kernel also supports them.
     pub requested_capabilities: FuseCapabilities,
+    /// Maximum readahead advertised back to the kernel.
     pub max_readahead: u32,
+    /// Maximum write payload size accepted by the session.
     pub max_write: u32,
+    /// Maximum number of in-flight background requests requested from the kernel.
     pub max_background: u16,
+    /// Background request threshold where the kernel should consider congestion.
     pub congestion_threshold: u16,
+    /// Maximum number of memory pages accepted in one request.
     pub max_pages: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of a completed FUSE INIT handshake.
 pub struct NegotiatedSession {
+    /// Kernel FUSE protocol major version.
     pub protocol_major: u32,
+    /// Kernel FUSE protocol minor version.
     pub protocol_minor: u32,
+    /// Capability bits accepted by both the kernel and StudioFS.
     pub capabilities: FuseCapabilities,
+    /// Effective readahead limit after clamping local and kernel preferences.
     pub max_readahead: u32,
+    /// Effective maximum write payload size.
     pub max_write: u32,
+    /// Effective background request limit.
     pub max_background: u16,
+    /// Effective congestion threshold for background requests.
     pub congestion_threshold: u16,
+    /// Effective maximum request size in pages.
     pub max_pages: u16,
 }
 
 #[derive(Debug, Error)]
+/// Errors produced while mounting, negotiating, or dispatching a native session.
 pub enum SessionError {
+    /// The transport ended before the kernel sent the mandatory INIT request.
     #[error("FUSE session ended before INIT")]
     MissingInit,
+    /// The first request was not the mandatory FUSE INIT request.
     #[error("first FUSE request was {0:?}, expected INIT")]
     ExpectedInit(FuseOpcode),
+    /// The transport failed while reading the INIT request or writing a reply.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The request dispatcher failed after negotiation.
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
+    /// The mount lifecycle failed while attaching or detaching the filesystem.
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
 }
 
 #[derive(Debug)]
+/// Native FUSE session state before and after INIT negotiation.
+///
+/// This type owns the transport until negotiation completes. After a successful
+/// handshake, callers can recover the transport and hand it to the dispatcher.
 pub struct NativeFuseSession<T> {
     transport: T,
     config: NativeSessionConfig,
@@ -55,6 +81,7 @@ pub struct NativeFuseSession<T> {
 }
 
 impl<T> NativeFuseSession<T> {
+    /// Creates a session with no negotiated kernel state yet.
     pub fn new(transport: T, config: NativeSessionConfig) -> Self {
         Self {
             transport,
@@ -63,16 +90,23 @@ impl<T> NativeFuseSession<T> {
         }
     }
 
+    /// Returns the negotiated state if the INIT handshake has completed.
     pub fn negotiated(&self) -> Option<NegotiatedSession> {
         self.negotiated
     }
 
+    /// Consumes the session and returns the underlying transport.
     pub fn into_transport(self) -> T {
         self.transport
     }
 }
 
 impl<T: FuseTransport> NativeFuseSession<T> {
+    /// Performs the mandatory FUSE INIT handshake.
+    ///
+    /// The first kernel request must be INIT. The reply advertises the
+    /// intersection of local and kernel capabilities and records the negotiated
+    /// limits for the caller.
     pub fn handshake(&mut self) -> Result<NegotiatedSession, SessionError> {
         let request = self
             .transport
@@ -117,6 +151,7 @@ impl<T: FuseTransport> NativeFuseSession<T> {
     }
 }
 
+/// Direct-mounted native FUSE session with its lifecycle and dispatcher inputs.
 pub struct MountedNativeSession<L, T, H> {
     lifecycle: NativeMountLifecycle<L>,
     mount_point: String,
@@ -128,18 +163,28 @@ pub struct MountedNativeSession<L, T, H> {
     handler: H,
 }
 
+/// Construction parts for `MountedNativeSession`.
 pub struct MountedNativeSessionParts<L, T, H> {
+    /// Mount lifecycle used to attach and detach the filesystem.
     pub lifecycle: NativeMountLifecycle<L>,
+    /// Target path for the direct mount.
     pub mount_point: String,
+    /// Already opened FUSE descriptor passed to the kernel mount request.
     pub fuse_fd: std::os::fd::RawFd,
+    /// User id advertised to the kernel for permission checks.
     pub uid: libc::uid_t,
+    /// Group id advertised to the kernel for permission checks.
     pub gid: libc::gid_t,
+    /// Mount identity and permission options.
     pub mount_options: DirectMountOptions,
+    /// Session that will perform INIT negotiation after the mount is active.
     pub session: NativeFuseSession<T>,
+    /// Operation handler used by the dispatcher after negotiation.
     pub handler: H,
 }
 
 impl<L, T, H> MountedNativeSession<L, T, H> {
+    /// Builds a mounted session from explicit lifecycle, session, and handler parts.
     pub fn new(parts: MountedNativeSessionParts<L, T, H>) -> Self {
         Self {
             lifecycle: parts.lifecycle,
@@ -155,22 +200,33 @@ impl<L, T, H> MountedNativeSession<L, T, H> {
 }
 
 impl<L: FuseMountSystem, T: FuseTransport, H: FuseOperationHandler> MountedNativeSession<L, T, H> {
+    /// Mounts, negotiates INIT, dispatches requests until DESTROY, and unmounts.
     pub fn run(mut self) -> Result<(NegotiatedSession, DispatchSummary), SessionError> {
+        let mount_point = self.mount_point.clone();
         self.lifecycle.mount_direct(
-            self.mount_point.clone(),
+            mount_point.clone(),
             self.fuse_fd,
             self.uid,
             self.gid,
             &self.mount_options,
         )?;
-        let negotiated = self.session.handshake()?;
-        let transport = self.session.into_transport();
-        let mut dispatcher = NativeDispatcher::new(transport, self.handler);
-        let dispatch = dispatcher.run_until_destroy()?;
-        let (mut transport, _handler) = dispatcher.into_parts();
-        transport.request_shutdown()?;
-        self.lifecycle.unmount(&self.mount_point)?;
-        Ok((negotiated, dispatch))
+
+        let run_result = (|| {
+            let negotiated = self.session.handshake()?;
+            let transport = self.session.into_transport();
+            let mut dispatcher = NativeDispatcher::new(transport, self.handler);
+            let dispatch = dispatcher.run_until_destroy()?;
+            let (mut transport, _handler) = dispatcher.into_parts();
+            transport.request_shutdown()?;
+            Ok((negotiated, dispatch))
+        })();
+
+        let unmount_result = self.lifecycle.unmount(&mount_point);
+        match (run_result, unmount_result) {
+            (Ok(summary), Ok(())) => Ok(summary),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Err(error), _) => Err(error),
+        }
     }
 }
 
@@ -183,6 +239,7 @@ mod tests {
     use crate::native::lifecycle::{DirectMountRequest, LifecycleError};
     use crate::native::protocol::{FuseReply, FuseRequest};
     use crate::native::transport::FrameQueueTransport;
+    use std::sync::{Arc, Mutex};
 
     fn init_frame(unique: u64, max_readahead: u32, capabilities: FuseCapabilities) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -262,6 +319,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct SharedRecordingLifecycleSystem {
+        mounted: Arc<Mutex<Vec<String>>>,
+        unmounted: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FuseMountSystem for SharedRecordingLifecycleSystem {
+        fn mount(&mut self, request: &DirectMountRequest) -> Result<(), LifecycleError> {
+            self.mounted
+                .lock()
+                .expect("mounted recorder should not be poisoned")
+                .push(request.mount_point.clone());
+            Ok(())
+        }
+
+        fn unmount(&mut self, mount_point: &str) -> Result<(), LifecycleError> {
+            self.unmounted
+                .lock()
+                .expect("unmounted recorder should not be poisoned")
+                .push(mount_point.to_owned());
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct ReplyingHandler;
 
@@ -326,6 +407,48 @@ mod tests {
                 handled_requests: 1,
                 saw_destroy: true,
             }
+        );
+    }
+
+    #[test]
+    fn mounted_native_session_unmounts_after_handshake_failure() {
+        let lifecycle_system = SharedRecordingLifecycleSystem::default();
+        let unmounted = lifecycle_system.unmounted.clone();
+        let config = NativeSessionConfig {
+            requested_capabilities: FuseCapabilities::ASYNC_READ,
+            max_readahead: 1024 * 1024,
+            max_write: 16 * 1024 * 1024,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_pages: 256,
+        };
+        let mounted = MountedNativeSession::new(MountedNativeSessionParts {
+            lifecycle: NativeMountLifecycle::new(lifecycle_system),
+            mount_point: "/mnt/studiofs".to_owned(),
+            fuse_fd: 7,
+            uid: 1000,
+            gid: 1000,
+            mount_options: DirectMountOptions {
+                source: "studiofs".into(),
+                fs_name: "studiofs-volume".into(),
+                subtype: Some("studiofs".into()),
+                read_only: false,
+                allow_other: false,
+                default_permissions: false,
+            },
+            session: NativeFuseSession::new(FrameQueueTransport::new([]), config),
+            handler: ReplyingHandler,
+        });
+
+        let result = mounted.run();
+
+        assert!(matches!(result, Err(SessionError::MissingInit)));
+        assert_eq!(
+            unmounted
+                .lock()
+                .expect("unmounted recorder should not be poisoned")
+                .as_slice(),
+            ["/mnt/studiofs"]
         );
     }
 }

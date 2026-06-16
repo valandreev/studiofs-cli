@@ -2,26 +2,85 @@
 
 use thiserror::Error;
 
+/// Size in bytes of Linux `struct fuse_in_header`.
+///
+/// The native bridge parses this prefix from every request frame read from
+/// `/dev/fuse`. Keeping the size explicit makes ABI layout assumptions visible
+/// in tests and transport code.
 pub const FUSE_IN_HEADER_LEN: usize = 40;
+
+/// Size in bytes of Linux `struct fuse_out_header`.
+///
+/// Every response written to `/dev/fuse` starts with this header before any
+/// operation-specific payload bytes.
 pub const FUSE_OUT_HEADER_LEN: usize = 16;
 
+/// Parsed Linux FUSE request header.
+///
+/// This is the transport-neutral representation of the fixed request prefix
+/// supplied by the kernel. It intentionally stores only the common envelope;
+/// operation-specific bytes remain in the request payload.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuseInHeader {
+    /// Total request frame length, including this header.
     pub len: u32,
+    /// Raw Linux FUSE opcode number.
     pub opcode: u32,
+    /// Kernel-assigned request id that must be echoed in the reply header.
     pub unique: u64,
+    /// FUSE node id the request targets.
     pub nodeid: u64,
+    /// User id of the process that triggered the request.
     pub uid: u32,
+    /// Group id of the process that triggered the request.
     pub gid: u32,
+    /// Process id of the task that triggered the request.
     pub pid: u32,
+    _padding: u32,
 }
 
+#[cfg(test)]
+impl FuseInHeader {
+    pub(crate) fn new(
+        len: u32,
+        opcode: u32,
+        unique: u64,
+        nodeid: u64,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> Self {
+        Self {
+            len,
+            opcode,
+            unique,
+            nodeid,
+            uid,
+            gid,
+            pid,
+            _padding: 0,
+        }
+    }
+}
+
+/// Error returned when a raw FUSE frame cannot be decoded safely.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AbiParseError {
+    /// The buffer did not contain enough bytes for the expected ABI structure.
     #[error("FUSE frame too short: expected at least {expected} bytes, got {actual}")]
-    FrameTooShort { expected: usize, actual: usize },
+    FrameTooShort {
+        /// Minimum number of bytes required for the structure being parsed.
+        expected: usize,
+        /// Number of bytes actually present in the supplied frame.
+        actual: usize,
+    },
 }
 
+/// Parses the fixed `fuse_in_header` prefix from a raw kernel request frame.
+///
+/// The parser is little-endian because Linux FUSE frames use the native kernel
+/// ABI on little-endian targets supported by StudioFS today.
 pub fn parse_in_header(frame: &[u8]) -> Result<FuseInHeader, AbiParseError> {
     if frame.len() < FUSE_IN_HEADER_LEN {
         return Err(AbiParseError::FrameTooShort {
@@ -38,9 +97,14 @@ pub fn parse_in_header(frame: &[u8]) -> Result<FuseInHeader, AbiParseError> {
         uid: read_u32(frame, 24),
         gid: read_u32(frame, 28),
         pid: read_u32(frame, 32),
+        _padding: read_u32(frame, 36),
     })
 }
 
+/// Builds an error-only FUSE reply header for `unique`.
+///
+/// Linux expects negative errno values in `fuse_out_header.error`; callers pass
+/// a positive libc errno such as `libc::ENOENT`.
 pub fn error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_LEN] {
     let mut reply = [0; FUSE_OUT_HEADER_LEN];
     reply[0..4].copy_from_slice(&(FUSE_OUT_HEADER_LEN as u32).to_le_bytes());
@@ -49,6 +113,9 @@ pub fn error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_LEN] {
     reply
 }
 
+/// Builds a successful FUSE reply containing the fixed header and `payload`.
+///
+/// The returned vector is ready to write to the active FUSE transport.
 pub fn ok_reply(unique: u64, payload: &[u8]) -> Vec<u8> {
     let mut reply = Vec::with_capacity(FUSE_OUT_HEADER_LEN + payload.len());
     reply.extend_from_slice(&((FUSE_OUT_HEADER_LEN + payload.len()) as u32).to_le_bytes());
@@ -117,6 +184,7 @@ mod tests {
                 uid: 1000,
                 gid: 1001,
                 pid: 42,
+                _padding: 0,
             }
         );
     }

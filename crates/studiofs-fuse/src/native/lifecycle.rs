@@ -11,69 +11,110 @@ use std::process::{Child, Command, Stdio};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Options shared by direct `mount(2)` and `fusermount3` FUSE mounts.
+///
+/// These values describe the user-visible mount identity and the kernel mount
+/// policy. They deliberately do not include a FUSE file descriptor because
+/// direct mounts and `fusermount3` obtain that descriptor through different
+/// paths.
 pub struct DirectMountOptions {
+    /// Source string passed to the kernel as the mount source.
     pub source: String,
+    /// Filesystem name exposed in FUSE mount options.
     pub fs_name: String,
+    /// Optional FUSE subtype used to build `fuse.<subtype>` mount types.
     pub subtype: Option<String>,
+    /// Whether the mounted filesystem should reject write operations.
     pub read_only: bool,
+    /// Whether users other than the mounting user may access the mount.
     pub allow_other: bool,
+    /// Whether the kernel should enforce mode bits before forwarding requests.
     pub default_permissions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Fully materialized request for a direct Linux `mount(2)` FUSE mount.
 pub struct DirectMountRequest {
+    /// Target path where the FUSE filesystem should be mounted.
     pub mount_point: String,
+    /// Source value passed to `mount(2)`.
     pub source: String,
+    /// Filesystem type, usually `fuse` or `fuse.<subtype>`.
     pub fs_type: String,
+    /// Kernel mount flags such as `MS_NOSUID`, `MS_NODEV`, and `MS_RDONLY`.
     pub flags: libc::c_ulong,
+    /// Comma-separated FUSE data string containing the fd and identity options.
     pub data: CString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request passed to the `fusermount3` helper.
+///
+/// This path is used when StudioFS should let the setuid helper perform the
+/// mount and return the opened FUSE descriptor via a Unix socket.
 pub struct Fusermount3MountRequest {
+    /// Target path where the helper should mount the filesystem.
     pub mount_point: String,
+    /// Comma-separated `-o` option string accepted by `fusermount3`.
     pub options: CString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Spawn plan for a `fusermount3` invocation.
 pub struct Fusermount3Command {
+    /// Executable name or path for the helper.
     pub program: String,
+    /// Argument vector, including `program` as `argv[0]`.
     pub argv: Vec<String>,
+    /// Extra environment variables used for the helper communication fds.
     pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Error)]
+/// Errors returned while opening, mounting, unmounting, or receiving FUSE fds.
 pub enum LifecycleError {
+    /// A mount string contained an interior NUL byte and cannot be passed to C.
     #[error("mount option contains NUL")]
     Nul(#[from] NulError),
+    /// The operating system rejected a lifecycle syscall or helper operation.
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
 #[derive(Debug)]
+/// Owned handle to an open FUSE device descriptor.
+///
+/// The descriptor may come from `/dev/fuse` for direct mounts or from
+/// `fusermount3` over SCM_RIGHTS. In both cases dropping this value closes the
+/// descriptor.
 pub struct FuseDevice {
     file: File,
 }
 
 impl FuseDevice {
+    /// Opens the platform default FUSE device, `/dev/fuse`.
     pub fn open_default() -> Result<Self, LifecycleError> {
         Self::open("/dev/fuse")
     }
 
+    /// Opens a FUSE device at `path` for request reads and reply writes.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, LifecycleError> {
         Ok(Self {
             file: OpenOptions::new().read(true).write(true).open(path)?,
         })
     }
 
+    /// Wraps an already opened FUSE descriptor.
     pub fn from_file(file: File) -> Self {
         Self { file }
     }
 
+    /// Returns the underlying file without transferring ownership.
     pub fn file(&self) -> &File {
         &self.file
     }
 
+    /// Consumes the device and returns the owned file descriptor.
     pub fn into_file(self) -> File {
         self.file
     }
@@ -85,16 +126,25 @@ impl AsRawFd for FuseDevice {
     }
 }
 
+/// Mount backend used by native sessions.
+///
+/// Implementations isolate the high-level lifecycle from real syscalls so the
+/// direct mount flow can be unit-tested without requiring privileges.
 pub trait FuseMountSystem {
+    /// Mounts the filesystem described by `request`.
     fn mount(&mut self, request: &DirectMountRequest) -> Result<(), LifecycleError>;
+    /// Detaches the filesystem mounted at `mount_point`.
     fn unmount(&mut self, mount_point: &str) -> Result<(), LifecycleError>;
 }
 
+/// Coordinates mount and unmount operations for a native FUSE session.
 pub struct NativeMountLifecycle<S> {
     system: S,
 }
 
+/// Low-level Linux mount syscalls used by `LinuxMountSystem`.
 pub trait MountSyscalls {
+    /// Invokes `mount(2)` with FUSE-specific source, target, type, and data.
     fn mount(
         &mut self,
         source: &CString,
@@ -103,55 +153,71 @@ pub trait MountSyscalls {
         flags: libc::c_ulong,
         data: &CString,
     ) -> io::Result<()>;
+    /// Invokes `umount2(2)` for the target mount point.
     fn umount2(&mut self, target: &CString, flags: libc::c_int) -> io::Result<()>;
 }
 
+/// Kernel ioctl boundary for attaching cloned `/dev/fuse` descriptors.
 pub trait CloneFdSyscalls {
+    /// Attaches `clone_fd` to the FUSE connection represented by `source_fd`.
     fn attach_clone_fd(&mut self, source_fd: RawFd, clone_fd: RawFd) -> io::Result<()>;
 }
 
 const FUSE_DEV_IOC_CLONE: libc::c_ulong = ioc_read(229 as libc::c_ulong, 0, 4);
 
 #[derive(Debug)]
+/// Direct Linux `mount(2)` implementation of `FuseMountSystem`.
 pub struct LinuxMountSystem<C> {
     syscalls: C,
 }
 
 #[derive(Debug, Default)]
+/// Production `MountSyscalls` implementation backed by libc.
 pub struct LibcMountSyscalls;
 
 #[derive(Debug, Default)]
+/// Production `CloneFdSyscalls` implementation backed by libc `ioctl`.
 pub struct LibcCloneFdSyscalls;
 
+/// Helper for the `FUSE_DEV_IOC_CLONE` ioctl.
+///
+/// Cloned FUSE descriptors are used by multi-threaded classic FUSE servers so
+/// each worker can block in `read(2)` without serializing on one descriptor.
 pub struct FuseCloneFd<C> {
     syscalls: C,
 }
 
 #[derive(Debug)]
+/// Parent/child Unix socket pair for `fusermount3` fd passing.
 pub struct UnixSocketPair {
     parent: OwnedFd,
     child: OwnedFd,
 }
 
 #[derive(Debug, Default)]
+/// Receives the FUSE descriptor sent by `fusermount3` over SCM_RIGHTS.
 pub struct FusermountFdReceiver;
 
 #[derive(Debug, Clone)]
+/// Mount backend that delegates privileged work to `fusermount3`.
 pub struct Fusermount3MountSystem {
     program: String,
 }
 
 impl<C> FuseCloneFd<C> {
+    /// Creates a clone-fd helper around the supplied syscall implementation.
     pub fn new(syscalls: C) -> Self {
         Self { syscalls }
     }
 
+    /// Returns the wrapped syscall implementation.
     pub fn into_inner(self) -> C {
         self.syscalls
     }
 }
 
 impl<C: CloneFdSyscalls> FuseCloneFd<C> {
+    /// Attaches `clone_fd` to the same kernel FUSE connection as `source_fd`.
     pub fn attach(&mut self, source_fd: RawFd, clone_fd: RawFd) -> Result<(), LifecycleError> {
         self.syscalls.attach_clone_fd(source_fd, clone_fd)?;
         Ok(())
@@ -219,26 +285,34 @@ fn set_close_on_exec(fd: RawFd) -> io::Result<()> {
 }
 
 impl<C> LinuxMountSystem<C> {
+    /// Creates a direct mount backend from a syscall adapter.
     pub fn new(syscalls: C) -> Self {
         Self { syscalls }
     }
 
+    /// Returns the wrapped syscall adapter.
     pub fn into_inner(self) -> C {
         self.syscalls
     }
 }
 
 impl<S> NativeMountLifecycle<S> {
+    /// Creates a mount lifecycle around a concrete mount backend.
     pub fn new(system: S) -> Self {
         Self { system }
     }
 
+    /// Returns the wrapped mount backend.
     pub fn into_inner(self) -> S {
         self.system
     }
 }
 
 impl DirectMountOptions {
+    /// Builds the kernel-facing request for a direct FUSE mount.
+    ///
+    /// The resulting data string includes the opened FUSE descriptor and the
+    /// user/group identity required by the kernel FUSE mount contract.
     pub fn mount_request(
         &self,
         mount_point: impl Into<String>,
@@ -277,6 +351,10 @@ impl DirectMountOptions {
         })
     }
 
+    /// Builds the helper-facing request for a `fusermount3` mount.
+    ///
+    /// Unlike direct mounts, the helper opens the FUSE device and returns it
+    /// over the communication socket configured in the spawned command.
     pub fn fusermount_request(
         &self,
         mount_point: impl Into<String>,
@@ -309,6 +387,10 @@ impl DirectMountOptions {
 }
 
 impl Fusermount3MountRequest {
+    /// Builds the helper command and communication environment.
+    ///
+    /// The `_FUSE_COMMFD` values match libfuse/fusermount conventions and let
+    /// the helper send the opened FUSE fd back to this process.
     pub fn command_for_comm_fds(
         &self,
         program: impl Into<String>,
@@ -360,6 +442,7 @@ impl Fusermount3Command {
 }
 
 impl UnixSocketPair {
+    /// Opens a connected Unix stream socket pair for helper communication.
     pub fn open() -> Result<Self, LifecycleError> {
         let mut fds = [-1; 2];
         // SAFETY: `fds` points to storage for exactly two descriptors, as
@@ -378,10 +461,12 @@ impl UnixSocketPair {
         Ok(Self { parent, child })
     }
 
+    /// Returns the descriptor kept by the parent process.
     pub fn parent_fd(&self) -> RawFd {
         self.parent.as_raw_fd()
     }
 
+    /// Returns the descriptor inherited by the helper child process.
     pub fn child_fd(&self) -> RawFd {
         self.child.as_raw_fd()
     }
@@ -392,6 +477,11 @@ impl UnixSocketPair {
 }
 
 impl FusermountFdReceiver {
+    /// Receives one FUSE device fd from `fusermount3`.
+    ///
+    /// The received descriptor is marked close-on-exec before being wrapped in
+    /// `File`, preserving ownership and avoiding descriptor leaks into later
+    /// child processes.
     pub fn receive(comm_fd: RawFd) -> Result<File, LifecycleError> {
         let mut byte = [0_u8; 1];
         let mut iov = libc::iovec {
@@ -467,12 +557,14 @@ impl Default for Fusermount3MountSystem {
 }
 
 impl Fusermount3MountSystem {
+    /// Creates a helper mount backend using `program` as the executable.
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
         }
     }
 
+    /// Runs `fusermount3`, receives its FUSE descriptor, and returns it.
     pub fn mount(&self, request: &Fusermount3MountRequest) -> Result<FuseDevice, LifecycleError> {
         let sockets = UnixSocketPair::open()?;
         let command = request.command_for_comm_fds(
@@ -494,6 +586,7 @@ impl Fusermount3MountSystem {
 }
 
 impl<S: FuseMountSystem> NativeMountLifecycle<S> {
+    /// Performs a direct mount using an already opened FUSE descriptor.
     pub fn mount_direct(
         &mut self,
         mount_point: impl Into<String>,
@@ -506,6 +599,7 @@ impl<S: FuseMountSystem> NativeMountLifecycle<S> {
         self.system.mount(&request)
     }
 
+    /// Detaches the mount point through the configured backend.
     pub fn unmount(&mut self, mount_point: &str) -> Result<(), LifecycleError> {
         self.system.unmount(mount_point)
     }

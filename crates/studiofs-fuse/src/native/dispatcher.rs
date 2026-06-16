@@ -6,10 +6,20 @@ use crate::native::abi::error_reply;
 use crate::native::protocol::{FuseOpcode, FuseReply, FuseRequest};
 use crate::native::transport::{FuseTransport, TransportError};
 
+/// Operation layer invoked by the transport-independent dispatcher.
+///
+/// Implementations translate typed FUSE request envelopes into fully framed
+/// replies. The trait deliberately has no dependency on classic read/write or
+/// future io_uring transport details.
 pub trait FuseOperationHandler {
+    /// Handles one decoded request and returns bytes ready for the transport.
     fn handle(&mut self, request: FuseRequest) -> FuseReply;
 }
 
+/// Minimal handler used while wiring the native transport foundation.
+///
+/// It replies `ENOSYS` for every operation, which lets mount, negotiation, and
+/// teardown paths be exercised before the StudioFS VFS adapter is connected.
 #[derive(Debug, Default)]
 pub struct MinimalNativeHandler;
 
@@ -22,34 +32,50 @@ impl FuseOperationHandler for MinimalNativeHandler {
     }
 }
 
+/// Summary returned after a dispatcher loop exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchSummary {
+    /// Number of requests handed to the operation handler.
     pub handled_requests: usize,
+    /// Whether loop termination happened after receiving `FUSE_DESTROY`.
     pub saw_destroy: bool,
 }
 
+/// Error returned by the native dispatcher.
 #[derive(Debug, Error)]
 pub enum DispatchError {
+    /// The underlying transport failed while receiving a request or sending a reply.
     #[error(transparent)]
     Transport(#[from] TransportError),
 }
 
+/// Transport-independent request loop for a native FUSE session.
+///
+/// The dispatcher owns a transport and an operation handler and repeatedly
+/// receives decoded requests, delegates operation behavior, and sends replies.
 pub struct NativeDispatcher<T, H> {
     transport: T,
     handler: H,
 }
 
 impl<T, H> NativeDispatcher<T, H> {
+    /// Creates a dispatcher from a transport backend and operation handler.
     pub fn new(transport: T, handler: H) -> Self {
         Self { transport, handler }
     }
 
+    /// Returns the owned transport and handler after the loop is no longer needed.
     pub fn into_parts(self) -> (T, H) {
         (self.transport, self.handler)
     }
 }
 
 impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
+    /// Runs requests until transport EOF/shutdown or `FUSE_DESTROY`.
+    ///
+    /// A transport that returns `Ok(None)` ends the loop cleanly. `FUSE_DESTROY`
+    /// is still delivered to the handler so the operation layer can perform any
+    /// final accounting before the loop exits.
     pub fn run_until_destroy(&mut self) -> Result<DispatchSummary, DispatchError> {
         let mut summary = DispatchSummary {
             handled_requests: 0,
@@ -147,15 +173,15 @@ mod tests {
             FuseOpcode::Other(999),
         ] {
             let request = FuseRequest {
-                header: crate::native::abi::FuseInHeader {
-                    len: FUSE_IN_HEADER_LEN as u32,
-                    opcode: 0,
-                    unique: 0x55,
-                    nodeid: 1,
-                    uid: 1000,
-                    gid: 1000,
-                    pid: 77,
-                },
+                header: crate::native::abi::FuseInHeader::new(
+                    FUSE_IN_HEADER_LEN as u32,
+                    0,
+                    0x55,
+                    1,
+                    1000,
+                    1000,
+                    77,
+                ),
                 opcode,
                 payload: Vec::new(),
             };

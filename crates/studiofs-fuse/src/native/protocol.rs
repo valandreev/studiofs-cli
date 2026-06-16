@@ -5,105 +5,171 @@ use crate::native::abi::{
 };
 use std::ops::BitOr;
 
+/// Linux FUSE operation codes understood at the native transport boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuseOpcode {
+    /// `FUSE_LOOKUP`: resolve a child name under a directory node.
     Lookup,
+    /// `FUSE_GETATTR`: fetch attributes for a node.
     Getattr,
+    /// `FUSE_OPEN`: open a regular file.
     Open,
+    /// `FUSE_READ`: read file data from an open file handle or node.
     Read,
+    /// `FUSE_STATFS`: fetch filesystem-level capacity and limit information.
     Statfs,
+    /// `FUSE_RELEASE`: close a previously opened file handle.
     Release,
+    /// `FUSE_INIT`: negotiate protocol version, limits, and capabilities.
     Init,
+    /// `FUSE_OPENDIR`: open a directory stream.
     Opendir,
+    /// `FUSE_READDIR`: read directory entries from an open directory stream.
     Readdir,
+    /// `FUSE_DESTROY`: terminate the kernel connection.
     Destroy,
+    /// Any opcode not yet modeled by the native bridge.
     Other(u32),
 }
 
+/// Transport-independent FUSE request envelope.
+///
+/// The dispatcher and operation layer consume this type instead of raw bytes so
+/// classic `/dev/fuse` and future io_uring backends can share the same request
+/// handling path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuseRequest {
+    /// Fixed kernel request header.
     pub header: FuseInHeader,
+    /// Decoded opcode for routing.
     pub opcode: FuseOpcode,
+    /// Operation-specific request bytes following [`FuseInHeader`].
     pub payload: Vec<u8>,
 }
 
+/// Fully framed FUSE reply ready for transport writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuseReply {
+    /// Request id this reply answers.
     pub unique: u64,
+    /// Complete `fuse_out_header` plus any operation-specific payload.
     pub bytes: Vec<u8>,
 }
 
+/// Parsed `FUSE_INIT` request payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuseInitRequest {
+    /// Kernel protocol major version.
     pub major: u32,
+    /// Kernel protocol minor version.
     pub minor: u32,
+    /// Maximum readahead requested by the kernel.
     pub max_readahead: u32,
+    /// Capability bits advertised by the kernel.
     pub capabilities: FuseCapabilities,
 }
 
+/// Negotiated `FUSE_INIT` response payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuseInitReply {
+    /// Protocol major version accepted by the daemon.
     pub major: u32,
+    /// Protocol minor version accepted by the daemon.
     pub minor: u32,
+    /// Readahead limit accepted by the daemon.
     pub max_readahead: u32,
+    /// Capability bits enabled for this session.
     pub capabilities: FuseCapabilities,
+    /// Maximum number of background requests the daemon accepts.
     pub max_background: u16,
+    /// Kernel congestion threshold for background requests.
     pub congestion_threshold: u16,
+    /// Maximum write size accepted by the daemon.
     pub max_write: u32,
+    /// Attribute timestamp granularity in nanoseconds.
     pub time_gran: u32,
+    /// Maximum number of pages per request for kernels that support it.
     pub max_pages: u16,
 }
 
+/// Set of Linux FUSE capability bits represented as a 64-bit mask.
+///
+/// The kernel splits these over `flags` and `flags2` in INIT payloads. This
+/// wrapper keeps negotiation code independent of that wire split.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FuseCapabilities {
     bits: u64,
 }
 
+/// Result of comparing requested daemon capabilities with kernel support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuseCapabilityReport {
+    /// Capability mask the daemon asked to enable.
     pub requested: FuseCapabilities,
+    /// Capability mask advertised by the kernel.
     pub kernel: FuseCapabilities,
+    /// Intersection that will be enabled for the session.
     pub enabled: FuseCapabilities,
+    /// Requested bits that were not enabled because the kernel did not offer them.
     pub disabled: FuseCapabilities,
+    /// Whether the kernel advertised FUSE-over-io_uring support.
     pub io_uring_available: bool,
+    /// Whether FUSE-over-io_uring was both requested and enabled.
     pub io_uring_enabled: bool,
+    /// Whether the kernel advertised clone-fd support.
     pub clone_fd_available: bool,
+    /// Whether clone-fd was both requested and enabled.
     pub clone_fd_enabled: bool,
 }
 
 impl FuseCapabilities {
+    /// Empty capability mask.
     pub const fn empty() -> Self {
         Self { bits: 0 }
     }
 
+    /// `FUSE_CAP_ASYNC_READ`: allow the kernel to issue asynchronous reads.
     pub const ASYNC_READ: Self = Self { bits: 1 << 0 };
+    /// `FUSE_CAP_BIG_WRITES`: allow writes larger than the legacy 4 KiB limit.
     pub const BIG_WRITES: Self = Self { bits: 1 << 5 };
+    /// `FUSE_CAP_AUTO_INVAL_DATA`: kernel invalidates cached data on mtime/size changes.
     pub const AUTO_INVAL_DATA: Self = Self { bits: 1 << 12 };
+    /// `FUSE_CAP_READDIRPLUS`: allow directory reads to include entry attributes.
     pub const READDIRPLUS: Self = Self { bits: 1 << 13 };
+    /// `FUSE_CAP_SPLICE_WRITE`: allow splice-based writes from the kernel.
     pub const SPLICE_WRITE: Self = Self { bits: 1 << 7 };
+    /// `FUSE_CAP_SPLICE_MOVE`: allow moving pages with splice where supported.
     pub const SPLICE_MOVE: Self = Self { bits: 1 << 8 };
+    /// `FUSE_CAP_SPLICE_READ`: allow splice-based reads to the kernel.
     pub const SPLICE_READ: Self = Self { bits: 1 << 9 };
+    /// `FUSE_CAP_CLONE_FD`: allow cloned `/dev/fuse` descriptors for multi-loop service.
     pub const CLONE_FD: Self = Self { bits: 1 << 28 };
+    /// `FUSE_CAP_OVER_IO_URING`: kernel advertises FUSE request delivery over io_uring.
     pub const OVER_IO_URING: Self = Self { bits: 1 << 50 };
 
+    /// Returns true when all bits in `capability` are present.
     pub fn contains(self, capability: Self) -> bool {
         self.bits & capability.bits == capability.bits
     }
 
+    /// Lower 32 capability bits as stored in the INIT `flags` field.
     pub fn low_bits(self) -> u32 {
         self.bits as u32
     }
 
+    /// Upper 32 capability bits as stored in the INIT `flags2` field.
     pub fn high_bits(self) -> u32 {
         (self.bits >> 32) as u32
     }
 
+    /// Enables only capabilities requested by the daemon and offered by the kernel.
     pub fn negotiate(self, kernel: Self) -> Self {
         Self {
             bits: self.bits & kernel.bits,
         }
     }
 
+    /// Builds a structured report for telemetry and tests around negotiation.
     pub fn report_negotiation(self, kernel: Self) -> FuseCapabilityReport {
         let enabled = self.negotiate(kernel);
         FuseCapabilityReport {
@@ -118,6 +184,7 @@ impl FuseCapabilities {
         }
     }
 
+    /// Combines the kernel INIT `flags` and `flags2` fields into one mask.
     pub fn from_kernel_flags(flags: u32, flags2: u32) -> Self {
         Self {
             bits: u64::from(flags) | (u64::from(flags2) << 32),
@@ -132,6 +199,10 @@ impl FuseCapabilities {
 }
 
 impl FuseInitRequest {
+    /// Parses a `FUSE_INIT` request payload.
+    ///
+    /// Kernels before the extended flags field are accepted by treating
+    /// missing `flags2` as zero.
     pub fn parse(payload: &[u8]) -> Result<Self, AbiParseError> {
         const FUSE_INIT_IN_MIN_LEN: usize = 16;
         if payload.len() < FUSE_INIT_IN_MIN_LEN {
@@ -157,6 +228,7 @@ impl FuseInitRequest {
 }
 
 impl FuseInitReply {
+    /// Serializes this INIT reply into a complete FUSE response frame.
     pub fn into_reply(self, unique: u64) -> FuseReply {
         const FUSE_INIT_OUT_PAYLOAD_LEN: usize = 64;
         let mut payload = Vec::with_capacity(FUSE_INIT_OUT_PAYLOAD_LEN);
@@ -197,6 +269,7 @@ impl BitOr for FuseCapabilities {
 }
 
 impl FuseRequest {
+    /// Parses a raw request frame into a typed envelope.
     pub fn from_frame(frame: &[u8]) -> Result<Self, AbiParseError> {
         let header = parse_in_header(frame)?;
         Ok(Self {
@@ -251,22 +324,15 @@ mod tests {
 
         let request = FuseRequest::from_frame(&frame).expect("INIT frame should parse");
 
-        assert_eq!(
-            request,
-            FuseRequest {
-                header: FuseInHeader {
-                    len: 56,
-                    opcode: 26,
-                    unique: 0x1234,
-                    nodeid: 1,
-                    uid: 1000,
-                    gid: 1000,
-                    pid: 77,
-                },
-                opcode: FuseOpcode::Init,
-                payload: payload.to_vec(),
-            }
-        );
+        assert_eq!(request.header.len, 56);
+        assert_eq!(request.header.opcode, 26);
+        assert_eq!(request.header.unique, 0x1234);
+        assert_eq!(request.header.nodeid, 1);
+        assert_eq!(request.header.uid, 1000);
+        assert_eq!(request.header.gid, 1000);
+        assert_eq!(request.header.pid, 77);
+        assert_eq!(request.opcode, FuseOpcode::Init);
+        assert_eq!(request.payload, payload);
     }
 
     #[test]
@@ -356,7 +422,9 @@ mod tests {
             major: 7,
             minor: 38,
             max_readahead: 1024 * 1024,
-            capabilities: FuseCapabilities::ASYNC_READ | FuseCapabilities::BIG_WRITES,
+            capabilities: FuseCapabilities::ASYNC_READ
+                | FuseCapabilities::BIG_WRITES
+                | FuseCapabilities::OVER_IO_URING,
             max_background: 50,
             congestion_threshold: 40,
             max_write: 16 * 1024 * 1024,
@@ -374,7 +442,9 @@ mod tests {
         assert_eq!(&reply.bytes[24..28], &(1024 * 1024_u32).to_le_bytes());
         assert_eq!(
             &reply.bytes[28..32],
-            &(FuseCapabilities::ASYNC_READ | FuseCapabilities::BIG_WRITES)
+            &(FuseCapabilities::ASYNC_READ
+                | FuseCapabilities::BIG_WRITES
+                | FuseCapabilities::OVER_IO_URING)
                 .low_bits()
                 .to_le_bytes()
         );
@@ -383,5 +453,14 @@ mod tests {
         assert_eq!(&reply.bytes[36..40], &(16 * 1024 * 1024_u32).to_le_bytes());
         assert_eq!(&reply.bytes[40..44], &1_u32.to_le_bytes());
         assert_eq!(&reply.bytes[44..46], &256_u16.to_le_bytes());
+        assert_eq!(&reply.bytes[46..48], &0_u16.to_le_bytes());
+        assert_eq!(
+            &reply.bytes[48..52],
+            &(FuseCapabilities::ASYNC_READ
+                | FuseCapabilities::BIG_WRITES
+                | FuseCapabilities::OVER_IO_URING)
+                .high_bits()
+                .to_le_bytes()
+        );
     }
 }
