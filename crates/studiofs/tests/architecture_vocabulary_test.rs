@@ -1152,6 +1152,7 @@ fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
         "readdir_with_reply",
         "FuseAttrReplyGuard",
         "FuseDirectoryReplyGuard",
+        "DirectoryEntriesForReply",
         "async metadata disables readdirplus auto",
         "spawn_blocking(move || StudioFuseFs::complete_readdir_reply",
     ];
@@ -1187,6 +1188,10 @@ fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
         missing.is_empty(),
         "SFS-514 async metadata prototype terms are missing from studiofs-fuse sources:\n{}",
         missing.join("\n")
+    );
+    assert!(
+        !source.contains("Ok(Arc::new(entries))"),
+        "SFS-514 async readdir cache miss should not allocate an Arc just for reply completion"
     );
 }
 

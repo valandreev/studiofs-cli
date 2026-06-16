@@ -454,11 +454,14 @@ fn should_enable_async_fuse_metadata_from_env() -> bool {
         .is_ok_and(|raw| should_enable_async_fuse_metadata_from_env_value(&raw))
 }
 
+/// Abstracts attribute replies so async metadata paths can use real fuser
+/// replies and unit-test replies through the same fail-closed guard.
 trait FuseAttrReply {
     fn attr(self, ttl: &Duration, attr: &FileAttr);
     fn error(self, errno: i32);
 }
 
+/// Abstracts open replies for async `opendir` scheduling and unit tests.
 trait FuseOpenReply {
     fn opened(self, fh: u64, flags: u32);
     fn error(self, errno: i32);
@@ -469,6 +472,8 @@ trait FuseWriteReply {
     fn error(self, errno: i32);
 }
 
+/// Abstracts directory replies so sync and async `readdir` paths share reply
+/// completion logic.
 trait FuseDirectoryReply {
     fn add(&mut self, ino: u64, offset: i64, kind: FuseFileType, name: &OsStr) -> bool;
     fn ok(self);
@@ -1371,6 +1376,20 @@ struct DirectoryHandle {
     entries: Arc<Vec<DirEntry>>,
 }
 
+enum DirectoryEntriesForReply {
+    Cached(Arc<Vec<DirEntry>>),
+    Owned(Vec<DirEntry>),
+}
+
+impl DirectoryEntriesForReply {
+    fn as_slice(&self) -> &[DirEntry] {
+        match self {
+            Self::Cached(entries) => entries,
+            Self::Owned(entries) => entries,
+        }
+    }
+}
+
 impl DirectoryHandleStore {
     fn shard(&self, fh: u64) -> &Mutex<HashMap<u64, DirectoryHandle>> {
         &self.shared.shards[(fh % DIR_HANDLE_SHARDS as u64) as usize]
@@ -1701,11 +1720,11 @@ impl StudioFuseFs {
         &self,
         ino: u64,
         fh: u64,
-    ) -> Result<Arc<Vec<DirEntry>>, VfsError> {
+    ) -> Result<DirectoryEntriesForReply, VfsError> {
         if let Some(entries) = self.directory_handles.entries(ino, fh) {
-            return Ok(entries);
+            return Ok(DirectoryEntriesForReply::Cached(entries));
         }
-        self.vfs.readdir(ino).map(Arc::new)
+        self.vfs.readdir(ino).map(DirectoryEntriesForReply::Owned)
     }
 
     fn getattr_with_reply<R>(&self, ino: u64, reply: R)
@@ -1748,11 +1767,11 @@ impl StudioFuseFs {
             let reply = FuseDirectoryReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let entries = if let Some(entries) = cached_entries {
-                    Ok(entries)
+                    Ok(DirectoryEntriesForReply::Cached(entries))
                 } else {
                     let vfs_for_readdir = Arc::clone(&vfs);
                     match tokio::task::spawn_blocking(move || vfs_for_readdir.readdir(ino)).await {
-                        Ok(Ok(entries)) => Ok(Arc::new(entries)),
+                        Ok(Ok(entries)) => Ok(DirectoryEntriesForReply::Owned(entries)),
                         Ok(Err(e)) => Err(e),
                         Err(error) => {
                             error!(ino, fh, %error, "async metadata readdir task failed");
@@ -1790,13 +1809,14 @@ impl StudioFuseFs {
         ino: u64,
         fh: u64,
         offset: i64,
-        entries: Result<Arc<Vec<DirEntry>>, VfsError>,
+        entries: Result<DirectoryEntriesForReply, VfsError>,
         mut reply: FuseDirectoryReplyGuard<R>,
     ) where
         R: FuseDirectoryReply,
     {
         match entries {
             Ok(entries) => {
+                let entries = entries.as_slice();
                 let mut idx = match clamp_offset_to_usize(offset) {
                     Ok(start) => start,
                     Err(errno) => {
@@ -3147,7 +3167,7 @@ impl Filesystem for StudioFuseFs {
         }
 
         // Regular entries with full attributes
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, entry) in entries.as_slice().iter().enumerate() {
             if should_hide_linux_root_metadata_entry(ino, &entry.name) {
                 heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
@@ -3940,14 +3960,29 @@ mod tests {
         let snapshot_entries = fs
             .directory_entries_for_read(ROOT_INO, fh)
             .expect("read directory handle");
-        assert!(snapshot_entries.iter().any(|entry| entry.name == b"before"));
-        assert!(!snapshot_entries.iter().any(|entry| entry.name == b"after"));
+        assert!(
+            snapshot_entries
+                .as_slice()
+                .iter()
+                .any(|entry| entry.name == b"before")
+        );
+        assert!(
+            !snapshot_entries
+                .as_slice()
+                .iter()
+                .any(|entry| entry.name == b"after")
+        );
 
         assert!(fs.release_directory_handle(ROOT_INO, fh));
         let fresh_entries = fs
             .directory_entries_for_read(ROOT_INO, fh)
             .expect("fallback to fresh directory read");
-        assert!(fresh_entries.iter().any(|entry| entry.name == b"after"));
+        assert!(
+            fresh_entries
+                .as_slice()
+                .iter()
+                .any(|entry| entry.name == b"after")
+        );
     }
 
     #[test]
@@ -4156,6 +4191,7 @@ mod tests {
             .expect("opendir should cache directory entries");
         assert!(
             entries
+                .as_slice()
                 .iter()
                 .any(|entry| entry.ino == attr.ino && entry.name == b"opendir-child.txt")
         );
