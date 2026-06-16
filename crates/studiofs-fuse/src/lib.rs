@@ -10,6 +10,7 @@
 #![cfg(target_os = "linux")]
 
 mod fs;
+pub mod native;
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
