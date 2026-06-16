@@ -1,6 +1,8 @@
 //! Transport-independent FUSE protocol types.
 
-use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN, FuseInHeader, parse_in_header};
+use crate::native::abi::{
+    AbiParseError, FUSE_IN_HEADER_LEN, FuseInHeader, ok_reply, parse_in_header,
+};
 use std::ops::BitOr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,27 @@ pub struct FuseReply {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseInitRequest {
+    pub major: u32,
+    pub minor: u32,
+    pub max_readahead: u32,
+    pub capabilities: FuseCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseInitReply {
+    pub major: u32,
+    pub minor: u32,
+    pub max_readahead: u32,
+    pub capabilities: FuseCapabilities,
+    pub max_background: u16,
+    pub congestion_threshold: u16,
+    pub max_write: u32,
+    pub time_gran: u32,
+    pub max_pages: u16,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FuseCapabilities {
     bits: u64,
@@ -51,11 +74,80 @@ impl FuseCapabilities {
         self.bits & capability.bits == capability.bits
     }
 
+    pub fn low_bits(self) -> u32 {
+        self.bits as u32
+    }
+
+    pub fn high_bits(self) -> u32 {
+        (self.bits >> 32) as u32
+    }
+
     pub fn negotiate(self, kernel: Self) -> Self {
         Self {
             bits: self.bits & kernel.bits,
         }
     }
+
+    pub fn from_kernel_flags(flags: u32, flags2: u32) -> Self {
+        Self {
+            bits: u64::from(flags) | (u64::from(flags2) << 32),
+        }
+    }
+}
+
+impl FuseInitRequest {
+    pub fn parse(payload: &[u8]) -> Result<Self, AbiParseError> {
+        const FUSE_INIT_IN_MIN_LEN: usize = 16;
+        if payload.len() < FUSE_INIT_IN_MIN_LEN {
+            return Err(AbiParseError::FrameTooShort {
+                expected: FUSE_INIT_IN_MIN_LEN,
+                actual: payload.len(),
+            });
+        }
+
+        let flags2 = if payload.len() >= 20 {
+            read_u32(payload, 16)
+        } else {
+            0
+        };
+
+        Ok(Self {
+            major: read_u32(payload, 0),
+            minor: read_u32(payload, 4),
+            max_readahead: read_u32(payload, 8),
+            capabilities: FuseCapabilities::from_kernel_flags(read_u32(payload, 12), flags2),
+        })
+    }
+}
+
+impl FuseInitReply {
+    pub fn into_reply(self, unique: u64) -> FuseReply {
+        const FUSE_INIT_OUT_PAYLOAD_LEN: usize = 64;
+        let mut payload = Vec::with_capacity(FUSE_INIT_OUT_PAYLOAD_LEN);
+        payload.extend_from_slice(&self.major.to_le_bytes());
+        payload.extend_from_slice(&self.minor.to_le_bytes());
+        payload.extend_from_slice(&self.max_readahead.to_le_bytes());
+        payload.extend_from_slice(&self.capabilities.low_bits().to_le_bytes());
+        payload.extend_from_slice(&self.max_background.to_le_bytes());
+        payload.extend_from_slice(&self.congestion_threshold.to_le_bytes());
+        payload.extend_from_slice(&self.max_write.to_le_bytes());
+        payload.extend_from_slice(&self.time_gran.to_le_bytes());
+        payload.extend_from_slice(&self.max_pages.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&self.capabilities.high_bits().to_le_bytes());
+        payload.resize(FUSE_INIT_OUT_PAYLOAD_LEN, 0);
+
+        FuseReply {
+            unique,
+            bytes: ok_reply(unique, &payload),
+        }
+    }
+}
+
+fn read_u32(frame: &[u8], offset: usize) -> u32 {
+    let mut value = [0; 4];
+    value.copy_from_slice(&frame[offset..offset + 4]);
+    u32::from_le_bytes(value)
 }
 
 impl BitOr for FuseCapabilities {
@@ -175,5 +267,68 @@ mod tests {
             enabled,
             FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING
         );
+    }
+
+    #[test]
+    fn init_request_parse_reads_protocol_limits_and_split_capability_flags() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7_u32.to_le_bytes());
+        payload.extend_from_slice(&38_u32.to_le_bytes());
+        payload.extend_from_slice(&(2 * 1024 * 1024_u32).to_le_bytes());
+        payload.extend_from_slice(
+            &(FuseCapabilities::ASYNC_READ | FuseCapabilities::BIG_WRITES)
+                .low_bits()
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(&(1_u32 << 18).to_le_bytes());
+
+        let init = FuseInitRequest::parse(&payload).expect("INIT payload should parse");
+
+        assert_eq!(
+            init,
+            FuseInitRequest {
+                major: 7,
+                minor: 38,
+                max_readahead: 2 * 1024 * 1024,
+                capabilities: FuseCapabilities::ASYNC_READ
+                    | FuseCapabilities::BIG_WRITES
+                    | FuseCapabilities::OVER_IO_URING,
+            }
+        );
+    }
+
+    #[test]
+    fn init_reply_serializes_negotiated_payload_inside_ok_reply_header() {
+        let init = FuseInitReply {
+            major: 7,
+            minor: 38,
+            max_readahead: 1024 * 1024,
+            capabilities: FuseCapabilities::ASYNC_READ | FuseCapabilities::BIG_WRITES,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_write: 16 * 1024 * 1024,
+            time_gran: 1,
+            max_pages: 256,
+        };
+
+        let reply = init.into_reply(0x99);
+
+        assert_eq!(&reply.bytes[0..4], &80_u32.to_le_bytes());
+        assert_eq!(&reply.bytes[4..8], &0_i32.to_le_bytes());
+        assert_eq!(&reply.bytes[8..16], &0x99_u64.to_le_bytes());
+        assert_eq!(&reply.bytes[16..20], &7_u32.to_le_bytes());
+        assert_eq!(&reply.bytes[20..24], &38_u32.to_le_bytes());
+        assert_eq!(&reply.bytes[24..28], &(1024 * 1024_u32).to_le_bytes());
+        assert_eq!(
+            &reply.bytes[28..32],
+            &(FuseCapabilities::ASYNC_READ | FuseCapabilities::BIG_WRITES)
+                .low_bits()
+                .to_le_bytes()
+        );
+        assert_eq!(&reply.bytes[32..34], &50_u16.to_le_bytes());
+        assert_eq!(&reply.bytes[34..36], &40_u16.to_le_bytes());
+        assert_eq!(&reply.bytes[36..40], &(16 * 1024 * 1024_u32).to_le_bytes());
+        assert_eq!(&reply.bytes[40..44], &1_u32.to_le_bytes());
+        assert_eq!(&reply.bytes[44..46], &256_u16.to_le_bytes());
     }
 }

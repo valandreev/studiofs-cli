@@ -49,6 +49,15 @@ pub fn error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_LEN] {
     reply
 }
 
+pub fn ok_reply(unique: u64, payload: &[u8]) -> Vec<u8> {
+    let mut reply = Vec::with_capacity(FUSE_OUT_HEADER_LEN + payload.len());
+    reply.extend_from_slice(&((FUSE_OUT_HEADER_LEN + payload.len()) as u32).to_le_bytes());
+    reply.extend_from_slice(&0_i32.to_le_bytes());
+    reply.extend_from_slice(&unique.to_le_bytes());
+    reply.extend_from_slice(payload);
+    reply
+}
+
 fn read_u32(frame: &[u8], offset: usize) -> u32 {
     let mut value = [0; 4];
     value.copy_from_slice(&frame[offset..offset + 4]);
