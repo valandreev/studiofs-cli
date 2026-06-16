@@ -1692,21 +1692,15 @@ impl StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let directory_handles = self.directory_handles.clone();
             let reply = FuseOpenReplyGuard::new(reply);
-            self.rt.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    vfs.readdir(ino)
-                        .map(|entries| directory_handles.open(ino, entries))
-                })
-                .await;
-                match result {
-                    Ok(Ok(fh)) => reply.opened(fh, 0),
-                    Ok(Err(e)) => {
+            self.rt.spawn_blocking(move || {
+                match vfs
+                    .readdir(ino)
+                    .map(|entries| directory_handles.open(ino, entries))
+                {
+                    Ok(fh) => reply.opened(fh, 0),
+                    Err(e) => {
                         error!("opendir({ino}) -> {e}");
                         reply.error(vfs_err_to_errno(&e));
-                    }
-                    Err(error) => {
-                        error!(ino, %error, "async metadata opendir task failed");
-                        reply.error(libc::EIO);
                     }
                 }
             });
@@ -1771,21 +1765,13 @@ impl StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let cached_entries = self.directory_handles.entries(ino, fh);
             let reply = FuseDirectoryReplyGuard::new(reply);
-            self.rt.spawn(async move {
-                // Keep hidden-entry healing off Tokio worker threads:
-                // spawn_blocking(move || StudioFuseFs::complete_readdir_reply(...)).
-                let result = tokio::task::spawn_blocking(move || {
-                    let entries = if let Some(entries) = cached_entries {
-                        Ok(DirectoryEntriesForReply::Cached(entries))
-                    } else {
-                        vfs.readdir(ino).map(DirectoryEntriesForReply::Owned)
-                    };
-                    StudioFuseFs::complete_readdir_reply(&vfs, ino, fh, offset, entries, reply)
-                })
-                .await;
-                if let Err(error) = result {
-                    error!(ino, fh, %error, "async metadata readdir reply task failed");
-                }
+            self.rt.spawn_blocking(move || {
+                let entries = if let Some(entries) = cached_entries {
+                    Ok(DirectoryEntriesForReply::Cached(entries))
+                } else {
+                    vfs.readdir(ino).map(DirectoryEntriesForReply::Owned)
+                };
+                StudioFuseFs::complete_readdir_reply(&vfs, ino, fh, offset, entries, reply);
             });
             return;
         }
@@ -4223,6 +4209,27 @@ mod tests {
                 .any(|(ino, _, _, name)| *ino == attr.ino && name == b"child.txt"),
             "async readdir reply should include seeded child: {entries:?}"
         );
+    }
+
+    #[test]
+    fn async_metadata_blocking_directory_callbacks_avoid_double_spawn() {
+        let source = include_str!("fs.rs");
+        for callback_name in ["opendir_with_reply", "readdir_with_reply"] {
+            let callback_start = source
+                .find(&format!("fn {callback_name}"))
+                .unwrap_or_else(|| panic!("{callback_name} should exist"));
+            let callback_tail = &source[callback_start..];
+            let next_callback = callback_tail
+                .find("\n    fn ")
+                .expect("callback should be followed by another method");
+            let callback_source = &callback_tail[..next_callback];
+
+            assert!(
+                !callback_source.contains("self.rt.spawn(async move")
+                    || !callback_source.contains("tokio::task::spawn_blocking"),
+                "{callback_name} should use the runtime blocking pool directly instead of nesting spawn_blocking inside an async task"
+            );
+        }
     }
 
     #[test]
