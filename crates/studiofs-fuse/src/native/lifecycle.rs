@@ -177,6 +177,30 @@ fn cmsg_space_for_fd() -> usize {
     unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as libc::c_uint) as usize }
 }
 
+struct AncillaryFdBuffer {
+    storage: Vec<usize>,
+    len_bytes: usize,
+}
+
+impl AncillaryFdBuffer {
+    fn for_fd() -> Self {
+        let len_bytes = cmsg_space_for_fd();
+        let word_len = len_bytes.div_ceil(mem::size_of::<usize>());
+        Self {
+            storage: vec![0; word_len],
+            len_bytes,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        self.storage.as_mut_ptr().cast()
+    }
+
+    fn len_bytes(&self) -> usize {
+        self.len_bytes
+    }
+}
+
 fn set_close_on_exec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fcntl` operates on an fd received from the kernel/helper. It
     // does not outlive this call, and errors are propagated.
@@ -374,14 +398,14 @@ impl FusermountFdReceiver {
             iov_base: byte.as_mut_ptr().cast(),
             iov_len: byte.len(),
         };
-        let mut control = vec![0_u8; cmsg_space_for_fd()];
+        let mut control = AncillaryFdBuffer::for_fd();
         // SAFETY: zeroed `msghdr` is valid because every pointer/length field
         // used by `recvmsg` is assigned immediately below.
         let mut msg: libc::msghdr = unsafe { mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len();
+        msg.msg_control = control.as_mut_ptr();
+        msg.msg_controllen = control.len_bytes();
 
         loop {
             // SAFETY: `msg` references valid iovec and control buffers for the
@@ -724,14 +748,14 @@ mod tests {
             iov_base: byte.as_mut_ptr().cast(),
             iov_len: byte.len(),
         };
-        let mut control = vec![0_u8; cmsg_space_for_fd()];
+        let mut control = AncillaryFdBuffer::for_fd();
         // SAFETY: zeroed `msghdr` is valid because all used fields are assigned
         // before `sendmsg`.
         let mut msg: libc::msghdr = unsafe { mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len();
+        msg.msg_control = control.as_mut_ptr();
+        msg.msg_controllen = control.len_bytes();
 
         // SAFETY: `msg` has a valid control buffer large enough for one fd.
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -769,6 +793,15 @@ mod tests {
                 "sendmsg did not send the fd notification byte",
             ));
         }
+    }
+
+    #[test]
+    fn ancillary_fd_buffer_is_aligned_for_cmsghdr() {
+        let mut buffer = AncillaryFdBuffer::for_fd();
+        let ptr = buffer.as_mut_ptr() as usize;
+
+        assert_eq!(ptr % mem::align_of::<libc::cmsghdr>(), 0);
+        assert!(buffer.len_bytes() >= cmsg_space_for_fd());
     }
 
     #[test]

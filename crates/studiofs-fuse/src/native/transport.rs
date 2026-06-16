@@ -72,6 +72,7 @@ impl FuseTransport for FrameQueueTransport {
 #[derive(Debug)]
 pub struct ClassicReadWriteTransport<T> {
     io: T,
+    read_buffer: Vec<u8>,
     shutdown_requested: bool,
 }
 
@@ -79,6 +80,7 @@ impl<T> ClassicReadWriteTransport<T> {
     pub fn new(io: T) -> Self {
         Self {
             io,
+            read_buffer: vec![0; CLASSIC_READ_BUFFER_LEN],
             shutdown_requested: false,
         }
     }
@@ -94,9 +96,8 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             return Ok(None);
         }
 
-        let mut frame = vec![0; CLASSIC_READ_BUFFER_LEN];
         let bytes_read = loop {
-            match self.io.read(&mut frame) {
+            match self.io.read(&mut self.read_buffer) {
                 Ok(bytes_read) => break bytes_read,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if fuse_teardown_read_error(&error) => return Ok(None),
@@ -113,9 +114,13 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             }
             .into());
         }
-        frame.truncate(bytes_read);
 
-        let frame_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let frame_len = u32::from_le_bytes([
+            self.read_buffer[0],
+            self.read_buffer[1],
+            self.read_buffer[2],
+            self.read_buffer[3],
+        ]) as usize;
         if frame_len < FUSE_IN_HEADER_LEN {
             return Err(AbiParseError::FrameTooShort {
                 expected: FUSE_IN_HEADER_LEN,
@@ -130,9 +135,8 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             )
             .into());
         }
-        frame.truncate(frame_len);
 
-        FuseRequest::from_frame(&frame)
+        FuseRequest::from_frame(&self.read_buffer[..frame_len])
             .map(Some)
             .map_err(TransportError::from)
     }
@@ -288,6 +292,33 @@ mod tests {
         }
     }
 
+    struct SequenceFuseDevice {
+        frames: VecDeque<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for SequenceFuseDevice {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(frame) = self.frames.pop_front() else {
+                return Ok(0);
+            };
+            let len = frame.len();
+            buf[..len].copy_from_slice(&frame);
+            Ok(len)
+        }
+    }
+
+    impl Write for SequenceFuseDevice {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Write for ErroringFuseDevice {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             Ok(buf.len())
@@ -334,6 +365,27 @@ mod tests {
             .expect("transport should parse one frame");
 
         assert_eq!(request.header.unique, 0x88);
+    }
+
+    #[test]
+    fn classic_read_write_transport_reuses_large_read_buffer_between_requests() {
+        let mut transport = ClassicReadWriteTransport::new(SequenceFuseDevice {
+            frames: VecDeque::from([frame(26, 0x88), frame(38, 0x89)]),
+            output: Vec::new(),
+        });
+        let initial_buffer = transport.read_buffer.as_ptr();
+
+        transport
+            .receive_request()
+            .expect("first frame should parse")
+            .expect("first request should be present");
+        transport
+            .receive_request()
+            .expect("second frame should parse")
+            .expect("second request should be present");
+
+        assert_eq!(transport.read_buffer.as_ptr(), initial_buffer);
+        assert!(transport.read_buffer.len() >= CLASSIC_READ_BUFFER_LEN);
     }
 
     #[test]
