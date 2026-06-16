@@ -163,6 +163,13 @@ fn retry_optional_fuse_queue_tuning(
     false
 }
 
+fn async_write_platform_policy_label_for_target(target_os: &str) -> &'static str {
+    match target_os {
+        "macos" => "macos-asyncfuse",
+        _ => "linux6-safe",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FuseAsyncWriteAdmissionPolicy {
     limits: PendingWriteAdmissionLimits,
@@ -1507,7 +1514,7 @@ impl StudioFuseFs {
     }
 
     fn async_write_platform_policy_label(&self) -> &'static str {
-        "linux6-safe"
+        async_write_platform_policy_label_for_target(std::env::consts::OS)
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -3303,9 +3310,9 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
         FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseCapabilityPolicy, PendingFuseCloseGuard,
-        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        StudioFuseFs, TTL, async_write_platform_policy_label_for_target, complete_fuse_write_reply,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
         retry_optional_fuse_queue_tuning, should_enable_async_fuse_write_from_env_value,
         should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
         vfs_err_to_errno,
@@ -3626,7 +3633,22 @@ mod tests {
             },
         );
 
-        assert_eq!(fs.async_write_platform_policy_label(), "linux6-safe");
+        assert_eq!(
+            fs.async_write_platform_policy_label(),
+            async_write_platform_policy_label_for_target(std::env::consts::OS)
+        );
+    }
+
+    #[test]
+    fn async_write_platform_policy_label_helper_distinguishes_linux_and_macos() {
+        assert_eq!(
+            async_write_platform_policy_label_for_target("linux"),
+            "linux6-safe"
+        );
+        assert_eq!(
+            async_write_platform_policy_label_for_target("macos"),
+            "macos-asyncfuse"
+        );
     }
 
     #[test]
