@@ -37,6 +37,48 @@ safer route for the SFS-514 prototype.
 
 Decision summary: callback-level async is the safer route.
 
+## Candidate Library Audit
+
+The second SFS-514 audit track covers whether StudioFS should replace or
+upgrade its Linux-only FUSE boundary instead of only adding callback-level async
+replies.
+
+`fuse3` is the strongest replacement candidate for a follow-up prototype. It
+has async filesystem traits, async handler dispatch, inode-based APIs,
+`readdirplus`, notify support, and init replies that can configure `max_write`,
+`max_background`, and `congestion_threshold`. The current crate requires
+Rust 1.91, which is compatible with the StudioFS workspace `rust-version =
+"1.95"`. The migration is still larger than SFS-514's first prototype because
+it would replace the Linux adapter surface rather than only moving slow
+callbacks out of the fuser dispatch path.
+
+`fuser 0.17` should stay the lower-risk alternative to evaluate before a full
+library swap. Its `Config::n_threads`, multiple event loops per session,
+`FUSE_DEV_IOC_CLONE`, `&self` filesystem callbacks, and experimental
+`AsyncFilesystem` API might be enough to remove the current dispatcher
+bottleneck without replacing the whole library. That path still needs a
+separate migration because the API is breaking across StudioFS callbacks and
+mount configuration.
+
+`fuser-iouring` should not be treated as a production replacement for SFS-514.
+The current code is an early prototype with a single io_uring queue over normal
+/dev/fuse read/write operations, not the newer FUSE-over-io_uring kernel
+transport. It also does not cover the full StudioFS operation, capability, and
+notify surface needed by the Linux adapter.
+
+`fuse-mt` is not a good fit for StudioFS. It is a wrapper over fuser 0.16,
+path-oriented, and only dispatches a subset of operations to a thread pool while
+leaving other operations synchronous on the main thread. That does not match
+StudioFS's inode-oriented local-first bridge or the SFS-514 goal of removing
+the central dispatcher bottleneck.
+
+Recommendation: split the follow-up spike into two tracks. First, prototype
+fuse3 behind a Linux-only adapter and measure the adapter, capability, notify,
+and shutdown costs. In parallel, measure whether upgrading to fuser 0.17 is
+enough to remove the dispatcher bottleneck. Keep the FUSE-over-io_uring
+transport as SFS-515, because none of the audited libraries currently provides
+StudioFS with a ready production FUSE-over-io_uring transport.
+
 ## Prototype Scope
 
 The opt-in prototype should extend `STUDIOFS_FUSE_ASYNC_READ` with
