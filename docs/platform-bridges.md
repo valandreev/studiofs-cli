@@ -183,10 +183,13 @@ Current signature includes additional policy controls:
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
-| Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
-| Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
+| Kernel `max_background` | `50` by default on macOS and Linux 6.x. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
+| Kernel `congestion_threshold` | `40` by default on macOS and Linux 6.x. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
 | FUSE async write replies | macOS: enabled by default. Linux: disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
+| Linux: `parallel_dirops` capability | Disabled by default. `STUDIOFS_FUSE_PARALLEL_DIROPS=1` records an opt-in request, but the current `fuser` build does not expose the ABI flag, so StudioFS continues without requesting it |
+| Linux: `readdirplus_auto` capability | Enabled by default and requested only when the kernel advertises `FUSE_READDIRPLUS_AUTO`. Roll back with `STUDIOFS_FUSE_READDIRPLUS_AUTO=0` |
+| Linux: `writeback_cache` capability | Disabled; StudioFS does not request `FUSE_WRITEBACK_CACHE` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `winfsp` target policy by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for strict rollback mode |
@@ -194,15 +197,19 @@ Current signature includes additional policy controls:
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
 `STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
-the primary FUSE bridge throughput controls for local payload I/O. Linux keeps
-the kernel/fuser background queue defaults unless the background queue env vars
-are explicitly set. macOS defaults to the current candidate `50/40` background
-queue policy. Set either background queue env var to an empty string to leave
-that value at the kernel/fuser default; `0` has the same opt-out meaning for
-these two background queue controls. StudioFS clamps congestion thresholds above
-an explicitly configured `max_background`; when only
-`STUDIOFS_FUSE_CONGESTION_THRESHOLD` is set, fuser may still clamp it against
-its own default `max_background` during the FUSE init reply.
+the primary FUSE bridge throughput controls for local payload I/O. The Linux
+6.x profile is named `linux6-safe` in mounted status diagnostics. It uses
+`max_write=16777216`, `max_readahead=16777216`, `max_background=50`, and
+`congestion_threshold=40`. The background queue values match the candidate
+profile exercised in the SFS-509 native Linux 6.x ext4 matrix and stay close to
+the conservative macOS bridge profile while avoiding the larger JuiceFS-style
+queue expansion until StudioFS has stronger local-first evidence. Set either
+background queue env var to an empty string to leave that value at the
+kernel/fuser default; `0` has the same opt-out meaning for these two background
+queue controls. StudioFS clamps congestion thresholds above an explicitly
+configured `max_background`; when only `STUDIOFS_FUSE_CONGESTION_THRESHOLD` is
+set, fuser may still clamp it against its own default `max_background` during
+the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
@@ -222,6 +229,15 @@ metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
 turn on global direct I/O and does not change the buffered read cache policy.
+Per-open or global direct I/O disables the kernel page-cache path for those
+reads, so Linux page-cache readahead cannot carry sequential reads in the same
+way it does for buffered opens. StudioFS keeps direct I/O out of defaults for
+that reason.
+
+`FUSE_WRITEBACK_CACHE` remains disabled because the kernel may acknowledge and
+merge dirty cached writes before userspace has committed StudioFS local-first
+metadata and payload state. Enabling it needs a separate correctness proof for
+flush, fsync, release, remote invalidation, and peer-publication semantics.
 
 ### macOS cache and I/O policy
 

@@ -47,6 +47,8 @@ const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MA
 const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES";
 const STUDIOFS_FUSE_ASYNC_READ_ENV: &str = "STUDIOFS_FUSE_ASYNC_READ";
+const STUDIOFS_FUSE_PARALLEL_DIROPS_ENV: &str = "STUDIOFS_FUSE_PARALLEL_DIROPS";
+const STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV: &str = "STUDIOFS_FUSE_READDIRPLUS_AUTO";
 const STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_BYTES";
 const STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS_ENV: &str =
@@ -63,12 +65,44 @@ struct FuseBackgroundQueuePolicy {
     congestion_threshold: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxFuseCapabilityPolicy {
+    async_dio: bool,
+    parallel_dirops: bool,
+    readdirplus_auto: bool,
+    writeback_cache: bool,
+}
+
+impl LinuxFuseCapabilityPolicy {
+    fn from_env(async_dio_enabled: bool) -> Self {
+        Self::from_env_values(
+            async_dio_enabled.then_some("1"),
+            std::env::var(STUDIOFS_FUSE_PARALLEL_DIROPS_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_values(async_dio: Option<&str>, parallel_dirops: Option<&str>) -> Self {
+        Self {
+            async_dio: async_dio.is_some_and(should_request_fuse_async_dio_from_env_value),
+            parallel_dirops: parallel_dirops.is_some_and(parse_bridge_bool_env_value),
+            readdirplus_auto: std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
+                .ok()
+                .as_deref()
+                .map(parse_bridge_bool_env_value)
+                .unwrap_or(true),
+            writeback_cache: false,
+        }
+    }
+}
+
 impl FuseBackgroundQueuePolicy {
     fn platform_default() -> Self {
         {
             Self {
-                max_background: None,
-                congestion_threshold: None,
+                max_background: Some(50),
+                congestion_threshold: Some(40),
             }
         }
     }
@@ -1431,7 +1465,7 @@ impl StudioFuseFs {
     }
 
     fn async_write_platform_policy_label(&self) -> &'static str {
-        "linux"
+        "linux6-safe"
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -1912,7 +1946,8 @@ impl Filesystem for StudioFuseFs {
             "configured FUSE bridge I/O policy"
         );
 
-        if self.linux_async_dio_enabled
+        let capability_policy = LinuxFuseCapabilityPolicy::from_env(self.linux_async_dio_enabled);
+        if capability_policy.async_dio
             && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
         {
             warn!(
@@ -1921,7 +1956,15 @@ impl Filesystem for StudioFuseFs {
             );
         }
 
-        if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_READDIRPLUS_AUTO) {
+        if capability_policy.parallel_dirops {
+            warn!(
+                "FUSE_PARALLEL_DIROPS requested but not enabled in this fuser build; continuing without parallel directory operations"
+            );
+        }
+
+        if capability_policy.readdirplus_auto
+            && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_READDIRPLUS_AUTO)
+        {
             warn!(
                 ?unsupported,
                 "Linux FUSE kernel did not advertise FUSE_READDIRPLUS_AUTO; continuing without automatic readdirplus"
@@ -3211,12 +3254,12 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
-        FuseEmptyReplyGuard, FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL,
-        complete_fuse_write_reply, fuse_write_local_sync_policy, is_missing_xattr_error,
-        missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
-        resolve_async_fuse_write_enabled, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
-        vfs_err_to_errno,
+        FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseCapabilityPolicy, PendingFuseCloseGuard,
+        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
+        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -3511,6 +3554,24 @@ mod tests {
         assert_eq!(snapshot.task_failed_writes, 0);
 
         second.complete(super::PendingWriteCompletion::Error(libc::EIO));
+    }
+
+    #[test]
+    fn async_write_platform_policy_label_names_linux6_safe_profile() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("linux6-safe-policy-label");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs,
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                async_read_enabled: false,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+                async_read_admission_limits: None,
+            },
+        );
+
+        assert_eq!(fs.async_write_platform_policy_label(), "linux6-safe");
     }
 
     #[test]
@@ -3853,8 +3914,8 @@ mod tests {
         assert_eq!(
             policy,
             FuseBackgroundQueuePolicy {
-                max_background: None,
-                congestion_threshold: None,
+                max_background: Some(50),
+                congestion_threshold: Some(40),
             }
         );
     }
@@ -3965,6 +4026,21 @@ mod tests {
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(should_request_fuse_async_dio_from_env_value(true_value));
         }
+    }
+
+    #[test]
+    fn linux_fuse_capability_policy_keeps_unsafe_modes_opt_in() {
+        let policy = LinuxFuseCapabilityPolicy::from_env_values(None, None);
+
+        assert_eq!(
+            policy,
+            LinuxFuseCapabilityPolicy {
+                async_dio: false,
+                parallel_dirops: false,
+                readdirplus_auto: true,
+                writeback_cache: false,
+            }
+        );
     }
 
     #[test]
