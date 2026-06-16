@@ -274,7 +274,7 @@ fn fd_from_scm_rights_cmsg(cmsg: *mut libc::cmsghdr) -> io::Result<RawFd> {
 
     // SAFETY: the level/type and length checks above prove the control message
     // contains at least one complete RawFd payload.
-    Ok(unsafe { *(libc::CMSG_DATA(cmsg).cast::<RawFd>()) })
+    Ok(unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>()) })
 }
 
 struct AncillaryFdBuffer {
@@ -523,7 +523,7 @@ impl FusermountFdReceiver {
             // SAFETY: `msg` references valid iovec and control buffers for the
             // duration of the call; `comm_fd` is expected to be a Unix stream
             // socket owned by the caller.
-            let received = unsafe { libc::recvmsg(comm_fd, &mut msg, 0) };
+            let received = unsafe { libc::recvmsg(comm_fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
             if received == -1 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {

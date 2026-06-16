@@ -459,11 +459,17 @@ fn current_uid_gid() -> (libc::uid_t, libc::gid_t) {
 }
 
 fn status_has_effective_capability(status: &str, capability: u32) -> bool {
-    status
+    match status
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
         .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-        .is_some_and(|mask| mask & (1_u64 << capability) != 0)
+    {
+        Some(mask) => match 1_u64.checked_shl(capability) {
+            Some(shift) => mask & shift != 0,
+            None => false,
+        },
+        None => false,
+    }
 }
 
 fn process_has_effective_cap_sys_admin() -> bool {
@@ -497,6 +503,14 @@ fn status_capability_parser_detects_effective_cap_sys_admin() {
     assert!(!status_has_effective_capability(
         "Name:\ttest\nCapEff:\t0000000000000000\n",
         21
+    ));
+}
+
+#[test]
+fn status_capability_parser_rejects_out_of_range_capability_index() {
+    assert!(!status_has_effective_capability(
+        "Name:\ttest\nCapEff:\tffffffffffffffff\n",
+        64
     ));
 }
 

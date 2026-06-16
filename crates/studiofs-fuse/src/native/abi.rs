@@ -108,7 +108,7 @@ pub fn parse_in_header(frame: &[u8]) -> Result<FuseInHeader, AbiParseError> {
 pub fn error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_LEN] {
     let mut reply = [0; FUSE_OUT_HEADER_LEN];
     reply[0..4].copy_from_slice(&(FUSE_OUT_HEADER_LEN as u32).to_le_bytes());
-    reply[4..8].copy_from_slice(&(-errno).to_le_bytes());
+    reply[4..8].copy_from_slice(&errno.wrapping_neg().to_le_bytes());
     reply[8..16].copy_from_slice(&unique.to_le_bytes());
     reply
 }
@@ -199,5 +199,12 @@ mod tests {
                 16, 0, 0, 0, 254, 255, 255, 255, 239, 190, 237, 254, 0, 0, 0, 0,
             ]
         );
+    }
+
+    #[test]
+    fn error_reply_wraps_min_errno_without_panicking() {
+        let reply = error_reply(0xfeed_beef, i32::MIN);
+
+        assert_eq!(&reply[4..8], &i32::MIN.to_le_bytes());
     }
 }
