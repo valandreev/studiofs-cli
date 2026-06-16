@@ -80,7 +80,10 @@ impl LinuxFuseCapabilityPolicy {
         Self {
             async_dio: options.linux_async_dio_enabled,
             parallel_dirops: options.linux_parallel_dirops_enabled,
-            readdirplus_auto: options.linux_readdirplus_auto_enabled,
+            // async metadata disables readdirplus auto until the readdirplus
+            // callback has its own owned-reply async path.
+            readdirplus_auto: options.linux_readdirplus_auto_enabled
+                && !options.async_metadata_enabled,
         }
     }
 
@@ -164,7 +167,7 @@ fn retry_optional_fuse_queue_tuning(
     false
 }
 
-fn async_write_platform_policy_label_for_target(_target_os: &str) -> &'static str {
+fn async_write_platform_policy_label() -> &'static str {
     "linux6-safe"
 }
 
@@ -456,6 +459,11 @@ trait FuseAttrReply {
     fn error(self, errno: i32);
 }
 
+trait FuseOpenReply {
+    fn opened(self, fh: u64, flags: u32);
+    fn error(self, errno: i32);
+}
+
 trait FuseWriteReply {
     fn written(self, size: u32);
     fn error(self, errno: i32);
@@ -478,6 +486,10 @@ trait FuseDataReply {
 }
 
 struct FuseAttrReplyGuard<R: FuseAttrReply> {
+    reply: Option<R>,
+}
+
+struct FuseOpenReplyGuard<R: FuseOpenReply> {
     reply: Option<R>,
 }
 
@@ -526,6 +538,42 @@ impl<R: FuseAttrReply> Drop for FuseAttrReplyGuard<R> {
 impl FuseAttrReply for ReplyAttr {
     fn attr(self, ttl: &Duration, attr: &FileAttr) {
         self.attr(ttl, attr);
+    }
+
+    fn error(self, errno: i32) {
+        self.error(errno);
+    }
+}
+
+impl<R: FuseOpenReply> FuseOpenReplyGuard<R> {
+    fn new(reply: R) -> Self {
+        Self { reply: Some(reply) }
+    }
+
+    fn opened(mut self, fh: u64, flags: u32) {
+        if let Some(reply) = self.reply.take() {
+            reply.opened(fh, flags);
+        }
+    }
+
+    fn error(mut self, errno: i32) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(errno);
+        }
+    }
+}
+
+impl<R: FuseOpenReply> Drop for FuseOpenReplyGuard<R> {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(libc::EIO);
+        }
+    }
+}
+
+impl FuseOpenReply for ReplyOpen {
+    fn opened(self, fh: u64, flags: u32) {
+        self.opened(fh, flags);
     }
 
     fn error(self, errno: i32) {
@@ -1306,8 +1354,13 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
 
 const DIR_HANDLE_SHARDS: usize = 16;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DirectoryHandleStore {
+    shared: Arc<DirectoryHandleStoreShared>,
+}
+
+#[derive(Debug)]
+struct DirectoryHandleStoreShared {
     next_fh: AtomicU64,
     shards: [Mutex<HashMap<u64, DirectoryHandle>>; DIR_HANDLE_SHARDS],
 }
@@ -1320,11 +1373,15 @@ struct DirectoryHandle {
 
 impl DirectoryHandleStore {
     fn shard(&self, fh: u64) -> &Mutex<HashMap<u64, DirectoryHandle>> {
-        &self.shards[(fh % DIR_HANDLE_SHARDS as u64) as usize]
+        &self.shared.shards[(fh % DIR_HANDLE_SHARDS as u64) as usize]
     }
 
     fn open(&self, ino: u64, entries: Vec<DirEntry>) -> u64 {
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
+        let fh = self.shared.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned directory handle store"
+        )]
         let mut handles = self
             .shard(fh)
             .lock()
@@ -1343,6 +1400,10 @@ impl DirectoryHandleStore {
         if fh == 0 {
             return None;
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned directory handle store"
+        )]
         let handles = self
             .shard(fh)
             .lock()
@@ -1357,6 +1418,10 @@ impl DirectoryHandleStore {
     }
 
     fn release(&self, ino: u64, fh: u64) -> bool {
+        #[expect(
+            clippy::expect_used,
+            reason = "fail closed on poisoned directory handle store"
+        )]
         let mut handles = self
             .shard(fh)
             .lock()
@@ -1374,8 +1439,10 @@ impl DirectoryHandleStore {
 impl Default for DirectoryHandleStore {
     fn default() -> Self {
         Self {
-            next_fh: AtomicU64::new(0),
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shared: Arc::new(DirectoryHandleStoreShared {
+                next_fh: AtomicU64::new(0),
+                shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            }),
         }
     }
 }
@@ -1592,6 +1659,44 @@ impl StudioFuseFs {
         Ok(self.directory_handles.open(ino, entries))
     }
 
+    fn opendir_with_reply<R>(&self, ino: u64, reply: R)
+    where
+        R: FuseOpenReply + Send + 'static,
+    {
+        if self.async_metadata_enabled {
+            let vfs = Arc::clone(&self.vfs);
+            let directory_handles = self.directory_handles.clone();
+            let reply = FuseOpenReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    vfs.readdir(ino)
+                        .map(|entries| directory_handles.open(ino, entries))
+                })
+                .await;
+                match result {
+                    Ok(Ok(fh)) => reply.opened(fh, 0),
+                    Ok(Err(e)) => {
+                        error!("opendir({ino}) -> {e}");
+                        reply.error(vfs_err_to_errno(&e));
+                    }
+                    Err(error) => {
+                        error!(ino, %error, "async metadata opendir task failed");
+                        reply.error(libc::EIO);
+                    }
+                }
+            });
+            return;
+        }
+
+        match self.open_directory_handle(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => {
+                error!("opendir({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     fn directory_entries_for_read(
         &self,
         ino: u64,
@@ -1656,7 +1761,15 @@ impl StudioFuseFs {
                         }
                     }
                 };
-                StudioFuseFs::complete_readdir_reply(&vfs, ino, fh, offset, entries, reply);
+                // Keep hidden-entry healing off Tokio worker threads:
+                // spawn_blocking(move || StudioFuseFs::complete_readdir_reply(...)).
+                let result = tokio::task::spawn_blocking(move || {
+                    StudioFuseFs::complete_readdir_reply(&vfs, ino, fh, offset, entries, reply)
+                })
+                .await;
+                if let Err(error) = result {
+                    error!(ino, fh, %error, "async metadata readdir reply task failed");
+                }
             });
             return;
         }
@@ -1764,7 +1877,7 @@ impl StudioFuseFs {
     }
 
     fn async_write_platform_policy_label(&self) -> &'static str {
-        async_write_platform_policy_label_for_target(std::env::consts::OS)
+        async_write_platform_policy_label()
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -2622,13 +2735,7 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.open_directory_handle(ino) {
-            Ok(fh) => reply.opened(fh, 0),
-            Err(e) => {
-                error!("opendir({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-            }
-        }
+        self.opendir_with_reply(ino, reply);
     }
 
     fn read(
@@ -3498,7 +3605,7 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
         FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseCapabilityPolicy, PendingFuseCloseGuard,
-        StudioFuseFs, TTL, async_write_platform_policy_label_for_target, complete_fuse_write_reply,
+        StudioFuseFs, TTL, async_write_platform_policy_label, complete_fuse_write_reply,
         fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
         normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
         retry_optional_fuse_queue_tuning, should_enable_async_fuse_metadata_from_env_value,
@@ -3553,6 +3660,43 @@ mod tests {
         fn attr(self, _ttl: &Duration, attr: &fuser::FileAttr) {
             self.sender
                 .send(Ok(*attr))
+                .expect("test receiver should be alive");
+        }
+
+        fn error(self, errno: i32) {
+            self.sender
+                .send(Err(errno))
+                .expect("test receiver should be alive");
+        }
+    }
+
+    type TestOpenReplyResult = Result<(u64, u32), i32>;
+
+    struct TestOpenReply {
+        sender: mpsc::Sender<TestOpenReplyResult>,
+        receiver: Cell<Option<mpsc::Receiver<TestOpenReplyResult>>>,
+    }
+
+    impl TestOpenReply {
+        fn new() -> Self {
+            let (sender, receiver) = mpsc::channel();
+            Self {
+                sender,
+                receiver: Cell::new(Some(receiver)),
+            }
+        }
+
+        fn receiver(&self) -> mpsc::Receiver<TestOpenReplyResult> {
+            self.receiver
+                .take()
+                .expect("test reply receiver should only be taken once")
+        }
+    }
+
+    impl super::FuseOpenReply for TestOpenReply {
+        fn opened(self, fh: u64, flags: u32) {
+            self.sender
+                .send(Ok((fh, flags)))
                 .expect("test receiver should be alive");
         }
 
@@ -3911,16 +4055,13 @@ mod tests {
 
         assert_eq!(
             fs.async_write_platform_policy_label(),
-            async_write_platform_policy_label_for_target(std::env::consts::OS)
+            async_write_platform_policy_label()
         );
     }
 
     #[test]
     fn async_write_platform_policy_label_helper_uses_linux_safe_profile() {
-        assert_eq!(
-            async_write_platform_policy_label_for_target("linux"),
-            "linux6-safe"
-        );
+        assert_eq!(async_write_platform_policy_label(), "linux6-safe");
     }
 
     #[test]
@@ -3984,6 +4125,40 @@ mod tests {
             .expect("async getattr should succeed");
 
         assert_eq!(result.ino, attr.ino);
+    }
+
+    #[test]
+    fn async_metadata_opendir_replies_from_task_and_caches_directory_entries() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-metadata-opendir");
+        let attr = vfs
+            .create(ROOT_INO, b"opendir-child.txt", 501, 20, 0o644)
+            .expect("create file");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs,
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_metadata_enabled: true,
+                ..Default::default()
+            },
+        );
+        let reply = TestOpenReply::new();
+        let received = reply.receiver();
+
+        fs.opendir_with_reply(ROOT_INO, reply);
+        let (fh, flags) = received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("async opendir should reply")
+            .expect("async opendir should succeed");
+
+        assert_eq!(flags, 0);
+        let entries = fs
+            .directory_entries_for_read(ROOT_INO, fh)
+            .expect("opendir should cache directory entries");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.ino == attr.ino && entry.name == b"opendir-child.txt")
+        );
     }
 
     #[test]
@@ -4509,6 +4684,18 @@ mod tests {
     #[test]
     fn runtime_options_default_keep_readdirplus_auto_enabled() {
         assert!(super::StudioFuseRuntimeOptions::default().linux_readdirplus_auto_enabled);
+    }
+
+    #[test]
+    fn linux_fuse_capability_policy_disables_readdirplus_auto_for_async_metadata() {
+        let policy =
+            LinuxFuseCapabilityPolicy::from_runtime_options(&super::StudioFuseRuntimeOptions {
+                async_metadata_enabled: true,
+                linux_readdirplus_auto_enabled: true,
+                ..Default::default()
+            });
+
+        assert!(!policy.readdirplus_auto);
     }
 
     #[test]

@@ -1146,10 +1146,14 @@ fn linux_fuse_concurrent_dispatch_prototype_exposes_sfs514_opt_in() {
         "STUDIOFS_FUSE_ASYNC_METADATA",
         "async_metadata_enabled",
         "should_enable_async_fuse_metadata_from_env",
+        "opendir_with_reply",
+        "FuseOpenReplyGuard",
         "getattr_with_reply",
         "readdir_with_reply",
         "FuseAttrReplyGuard",
         "FuseDirectoryReplyGuard",
+        "async metadata disables readdirplus auto",
+        "spawn_blocking(move || StudioFuseFs::complete_readdir_reply",
     ];
 
     let mut source = String::new();
