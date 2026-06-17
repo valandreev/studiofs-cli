@@ -1117,7 +1117,9 @@ mod tests {
 
     #[test]
     fn async_dispatcher_uses_mpmc_worker_queue() {
-        assert!(NativeAsyncDispatcher::<RecordedReplySink>::USES_MPMC_WORKER_QUEUE);
+        const {
+            assert!(NativeAsyncDispatcher::<RecordedReplySink>::USES_MPMC_WORKER_QUEUE);
+        }
     }
 
     #[test]
