@@ -568,7 +568,7 @@ where
             Ok(()) => Ok(()),
             Err(TrySendError::Disconnected(envelope)) => {
                 self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::Relaxed);
-                envelope.reply.drop_without_reply();
+                envelope.reply.send_errno(libc::EIO);
                 Err(DispatchError::Shutdown)
             }
             Err(TrySendError::Full(envelope)) => {
@@ -1075,7 +1075,18 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(dispatcher.telemetry().queue_depth(RequestClass::Read), 0);
-        assert_eq!(sink.completed_unique_ids(), [0xa1]);
+
+        let disconnected = dispatcher.submit(OwnedFuseRequest::classic(
+            request(FuseOpcode::Read, 0xa2),
+            sink.clone(),
+        ));
+
+        assert_eq!(disconnected, Err(DispatchError::Shutdown));
+        assert_eq!(sink.completed_unique_ids(), [0xa1, 0xa2]);
+        assert_eq!(
+            &sink.completed_replies()[1].to_vec()[4..8],
+            &(-(libc::EIO)).to_le_bytes()
+        );
         assert_eq!(dispatcher.shutdown(), Err(DispatchError::WorkerPanicked));
     }
 

@@ -88,7 +88,7 @@ impl FuseReply {
     /// Builds a successful data reply with separate header and payload storage.
     pub fn segmented_data(unique: u64, payload: Vec<u8>) -> Self {
         let mut header = [0; FUSE_OUT_HEADER_LEN];
-        let len = (FUSE_OUT_HEADER_LEN + payload.len()) as u32;
+        let len = fuse_out_len_for_payload(payload.len());
         header[0..4].copy_from_slice(&len.to_le_bytes());
         header[4..8].copy_from_slice(&0_i32.to_le_bytes());
         header[8..16].copy_from_slice(&unique.to_le_bytes());
@@ -128,6 +128,13 @@ impl FuseReply {
             FuseReplyFrame::Segmented { .. } => None,
         }
     }
+}
+
+fn fuse_out_len_for_payload(payload_len: usize) -> u32 {
+    let len = FUSE_OUT_HEADER_LEN
+        .checked_add(payload_len)
+        .expect("FUSE reply length must fit in u32");
+    u32::try_from(len).expect("FUSE reply length must fit in u32")
 }
 
 /// Fixed-size vectored reply slices.
@@ -570,5 +577,11 @@ mod tests {
                 .high_bits()
                 .to_le_bytes()
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "FUSE reply length must fit in u32")]
+    fn segmented_reply_length_panics_when_payload_exceeds_u32_frame_limit() {
+        let _ = fuse_out_len_for_payload(usize::MAX);
     }
 }
