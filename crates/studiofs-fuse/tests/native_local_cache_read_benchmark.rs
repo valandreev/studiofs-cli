@@ -1,3 +1,5 @@
+//! SFS-529 benchmark evidence for native local-cache read strategies.
+
 use std::fs;
 use std::io::{Cursor, Seek, Write};
 use std::os::fd::AsRawFd;
