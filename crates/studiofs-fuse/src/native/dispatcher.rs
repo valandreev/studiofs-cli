@@ -202,6 +202,8 @@ impl BarrierShared {
     }
 }
 
+const _: () = assert!(BarrierShared::SHARD_COUNT.is_power_of_two());
+
 impl Default for BarrierShared {
     fn default() -> Self {
         Self {

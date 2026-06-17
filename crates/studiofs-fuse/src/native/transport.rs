@@ -211,6 +211,10 @@ fn pending_reply_slices<'a>(
     slices: &'a [io::IoSlice<'a>],
     mut offset: usize,
 ) -> PendingReplySlices<'a> {
+    debug_assert!(
+        slices.len() <= 2,
+        "pending_reply_slices only supports up to 2 slices"
+    );
     let mut pending = [io::IoSlice::new(&[]), io::IoSlice::new(&[])];
     let mut len = 0;
     for slice in slices {
