@@ -1,12 +1,13 @@
 //! Transport-independent native FUSE dispatcher.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Sender, TrySendError};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::native::abi::error_reply;
@@ -153,10 +154,12 @@ struct BarrierState {
     entries: HashMap<ResourceKey, BarrierEntry>,
 }
 
+const PENDING_WRITE_INLINE_CAPACITY: usize = 8;
+
 #[derive(Debug)]
 struct BarrierEntry {
     next_sequence: u64,
-    pending_writes: BTreeSet<u64>,
+    pending_writes: SmallVec<[u64; PENDING_WRITE_INLINE_CAPACITY]>,
     waiters: usize,
     changed: Arc<Condvar>,
 }
@@ -165,7 +168,7 @@ impl Default for BarrierEntry {
     fn default() -> Self {
         Self {
             next_sequence: 0,
-            pending_writes: BTreeSet::new(),
+            pending_writes: SmallVec::new(),
             waiters: 0,
             changed: Arc::new(Condvar::new()),
         }
@@ -220,7 +223,7 @@ impl OperationBarrierGates {
         let entry = state.entries.entry(resource).or_default();
         entry.next_sequence += 1;
         let sequence = entry.next_sequence;
-        entry.pending_writes.insert(sequence);
+        entry.pending_writes.push(sequence);
         PendingWriteGuard {
             resource,
             sequence,
@@ -240,7 +243,8 @@ impl OperationBarrierGates {
         while state.entries.get(&resource).is_some_and(|entry| {
             entry
                 .pending_writes
-                .first()
+                .iter()
+                .min()
                 .is_some_and(|sequence| *sequence <= barrier_sequence)
         }) {
             let changed = {
@@ -281,7 +285,13 @@ impl Drop for PendingWriteGuard {
         let mut changed = None;
         let mut remove_entry = false;
         if let Some(entry) = state.entries.get_mut(&self.resource) {
-            entry.pending_writes.remove(&self.sequence);
+            if let Some(index) = entry
+                .pending_writes
+                .iter()
+                .position(|sequence| *sequence == self.sequence)
+            {
+                entry.pending_writes.swap_remove(index);
+            }
             if entry.waiters > 0 {
                 changed = Some(Arc::clone(&entry.changed));
             }
@@ -477,18 +487,14 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
         let mut workers = Vec::with_capacity(RequestClass::ALL.len());
 
         for class in RequestClass::ALL {
-            let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
-            let receiver = Arc::new(Mutex::new(receiver));
+            let (sender, receiver) = crossbeam_channel::bounded(self.capacities[class.index()]);
             for _ in 0..self.worker_counts[class.index()] {
                 let handler = self.handler.clone();
                 let worker_telemetry = Arc::clone(&telemetry);
-                let worker_receiver = Arc::clone(&receiver);
+                let worker_receiver = receiver.clone();
                 let worker = thread::spawn(move || {
                     loop {
-                        let envelope = {
-                            let receiver = lock_or_recover(&worker_receiver);
-                            receiver.recv()
-                        };
+                        let envelope = worker_receiver.recv();
                         let Ok(envelope) = envelope else {
                             break;
                         };
@@ -512,7 +518,7 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 
 /// Bounded worker dispatcher for owned native FUSE requests.
 pub struct NativeAsyncDispatcher<S: ReplySink> {
-    senders: Vec<SyncSender<OwnedFuseRequest<S>>>,
+    senders: Vec<Sender<OwnedFuseRequest<S>>>,
     workers: Vec<JoinHandle<()>>,
     capacities: [usize; RequestClass::CLASS_COUNT],
     telemetry: Arc<DispatchTelemetryState>,
@@ -619,6 +625,8 @@ where
 
 impl<S: ReplySink> NativeAsyncDispatcher<S> {
     const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Whether worker receivers use an MPMC queue rather than a mutex-wrapped MPSC receiver.
+    pub const USES_MPMC_WORKER_QUEUE: bool = true;
 }
 
 #[cfg(test)]
@@ -1092,6 +1100,16 @@ mod tests {
     #[test]
     fn request_class_count_matches_class_table() {
         assert_eq!(RequestClass::ALL.len(), RequestClass::CLASS_COUNT);
+    }
+
+    #[test]
+    fn async_dispatcher_uses_mpmc_worker_queue() {
+        assert!(NativeAsyncDispatcher::<RecordedReplySink>::USES_MPMC_WORKER_QUEUE);
+    }
+
+    #[test]
+    fn barrier_entry_keeps_common_pending_writes_inline() {
+        assert_eq!(PENDING_WRITE_INLINE_CAPACITY, 8);
     }
 
     #[test]

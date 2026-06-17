@@ -21,6 +21,7 @@ features = ["abi-7-22"]
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 smallvec.workspace = true
+crossbeam-channel.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
