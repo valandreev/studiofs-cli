@@ -1032,6 +1032,59 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_forget_final_lookup_drops_trusted_open_cache_state() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    cached_content_epoch: None,
+                    size: 8192,
+                    cached_size: None,
+                    mtime_ns: 123,
+                    cached_mtime_ns: None,
+                    invalidation_generation: 3,
+                    observed_invalidation_generation: 3,
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.handle(lookup_request(1, b"cached.txt"));
+        bridge.handle(lookup_request(1, b"cached-again.txt"));
+        let first = bridge.handle(open_request(99, libc::O_RDONLY));
+        let first = first
+            .bytes()
+            .expect("first open reply should be contiguous");
+        bridge.handle(forget_request(99, 1));
+        let still_trusted = bridge.handle(open_request(99, libc::O_RDONLY));
+        let still_trusted = still_trusted
+            .bytes()
+            .expect("still trusted open reply should be contiguous");
+        bridge.handle(forget_request(99, 1));
+        let after_final_forget = bridge.handle(open_request(99, libc::O_RDONLY));
+        let after_final_forget = after_final_forget
+            .bytes()
+            .expect("post-forget open reply should be contiguous");
+
+        assert_eq!(open_reply_flags(first), 0);
+        assert_eq!(open_reply_flags(still_trusted), 1 << 1);
+        assert_eq!(open_reply_flags(after_final_forget), 0);
+    }
+
+    #[test]
     fn native_bridge_release_calls_vfs_and_returns_empty_success() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,

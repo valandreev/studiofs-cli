@@ -478,7 +478,7 @@ pub struct LinuxNativeBridge<V> {
     vfs: V,
     lookup_counts: NativeLookupCountStore,
     open_cache_metrics: NativeOpenCacheMetrics,
-    trusted_open_cache_states: Mutex<HashMap<u64, NativeInodeCacheState>>,
+    trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
 }
 
 impl<V> LinuxNativeBridge<V> {
@@ -488,7 +488,7 @@ impl<V> LinuxNativeBridge<V> {
             vfs,
             lookup_counts: NativeLookupCountStore::default(),
             open_cache_metrics: NativeOpenCacheMetrics::default(),
-            trusted_open_cache_states: Mutex::new(HashMap::new()),
+            trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
         }
     }
 
@@ -885,7 +885,9 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     }
 
     fn forget_lookup(&self, ino: u64, nlookup: u64) {
-        self.lookup_counts.forget(ino, nlookup);
+        if self.lookup_counts.forget(ino, nlookup) {
+            self.trusted_open_cache_states.remove(ino);
+        }
     }
 
     fn open_cache_decision(
@@ -918,8 +920,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     }
 
     fn apply_trusted_open_cache_state(&self, ino: u64, state: &mut NativeInodeCacheState) {
-        let trusted = self.trusted_open_cache_states();
-        let trusted = trusted.get(&ino).cloned();
+        let trusted = self.trusted_open_cache_states.get(ino);
         let Some(trusted) = trusted else {
             return;
         };
@@ -937,11 +938,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     }
 
     fn remember_trusted_open_cache_state(&self, ino: u64, state: &NativeInodeCacheState) {
-        self.trusted_open_cache_states().insert(ino, state.clone());
-    }
-
-    fn trusted_open_cache_states(&self) -> MutexGuard<'_, HashMap<u64, NativeInodeCacheState>> {
-        lock_or_recover(&self.trusted_open_cache_states, "trusted_open_cache_states")
+        self.trusted_open_cache_states.insert(ino, state.clone());
     }
 }
 
@@ -1419,6 +1416,44 @@ impl NativeDirectoryHandleStore {
 }
 
 #[derive(Debug)]
+struct NativeTrustedOpenCacheStateStore {
+    shards: [Mutex<HashMap<u64, NativeInodeCacheState>>; Self::SHARD_COUNT],
+}
+
+impl NativeTrustedOpenCacheStateStore {
+    const SHARD_COUNT: usize = 64;
+
+    fn shard(ino: u64) -> usize {
+        NativeLookupCountStore::shard_index(ino)
+    }
+
+    fn get(&self, ino: u64) -> Option<NativeInodeCacheState> {
+        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states")
+            .get(&ino)
+            .cloned()
+    }
+
+    fn insert(&self, ino: u64, state: NativeInodeCacheState) {
+        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states")
+            .insert(ino, state);
+    }
+
+    fn remove(&self, ino: u64) {
+        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states").remove(&ino);
+    }
+}
+
+const _: () = assert!(NativeTrustedOpenCacheStateStore::SHARD_COUNT.is_power_of_two());
+
+impl Default for NativeTrustedOpenCacheStateStore {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct NativeLookupCountStore {
     shards: [Mutex<HashMap<u64, u64>>; Self::SHARD_COUNT],
 }
@@ -1446,15 +1481,17 @@ impl NativeLookupCountStore {
         *count = count.saturating_add(nlookup);
     }
 
-    fn forget(&self, ino: u64, nlookup: u64) {
+    fn forget(&self, ino: u64, nlookup: u64) -> bool {
         let mut lookup_counts = lock_or_recover(self.shard(ino), "lookup_counts");
         let Some(count) = lookup_counts.get_mut(&ino) else {
-            return;
+            return false;
         };
         if *count <= nlookup {
             lookup_counts.remove(&ino);
+            true
         } else {
             *count -= nlookup;
+            false
         }
     }
 
