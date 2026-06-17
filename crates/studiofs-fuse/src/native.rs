@@ -1,6 +1,7 @@
 //! Linux-native FUSE bridge building blocks.
 
 pub mod abi;
+pub mod cache_policy;
 pub mod dispatcher;
 pub mod lifecycle;
 pub mod protocol;
@@ -15,6 +16,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::native::abi::{FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader};
+    use crate::native::cache_policy::{NativeInodeCacheState, TrustedCacheState};
     use crate::native::dispatcher::FuseOperationHandler;
     use crate::native::protocol::{FuseOpcode, FuseRequest};
     use crate::native::vfs_adapter::{
@@ -32,6 +34,7 @@ mod tests {
         getattrs: Mutex<Vec<u64>>,
         getattr_errors: Mutex<HashMap<u64, i32>>,
         opens: Mutex<Vec<(u64, i32)>>,
+        open_cache_states: Mutex<HashMap<u64, NativeInodeCacheState>>,
         releases: Mutex<Vec<u64>>,
         reads: Mutex<Vec<(u64, u64, u64, u32)>>,
         writes: Mutex<Vec<WriteCall>>,
@@ -86,6 +89,14 @@ mod tests {
                 .expect("open calls lock should not be poisoned")
                 .push((ino, flags));
             Ok(self.fh)
+        }
+
+        fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
+            self.open_cache_states
+                .lock()
+                .expect("open cache states lock should not be poisoned")
+                .get(&ino)
+                .cloned()
         }
 
         fn release(&self, fh: u64) -> Result<(), i32> {
@@ -679,6 +690,12 @@ mod tests {
         u64::from_le_bytes(raw)
     }
 
+    fn open_reply_flags(reply: &[u8]) -> u32 {
+        let mut raw = [0; 4];
+        raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN + 8..FUSE_OUT_HEADER_LEN + 12]);
+        u32::from_le_bytes(raw)
+    }
+
     fn write_reply_size(reply: &[u8]) -> u32 {
         let mut raw = [0; 4];
         raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN..FUSE_OUT_HEADER_LEN + 4]);
@@ -690,6 +707,13 @@ mod tests {
         let offset = FUSE_OUT_HEADER_LEN + 128;
         raw.copy_from_slice(&reply[offset..offset + 8]);
         u64::from_le_bytes(raw)
+    }
+
+    fn create_reply_flags(reply: &[u8]) -> u32 {
+        let mut raw = [0; 4];
+        let offset = FUSE_OUT_HEADER_LEN + 128 + 8;
+        raw.copy_from_slice(&reply[offset..offset + 4]);
+        u32::from_le_bytes(raw)
     }
 
     fn direntplus_reply_nodeid(reply: &[u8]) -> u64 {
@@ -713,6 +737,7 @@ mod tests {
             getattrs: Mutex::new(Vec::new()),
             getattr_errors: Mutex::new(HashMap::new()),
             opens: Mutex::new(Vec::new()),
+            open_cache_states: Mutex::new(HashMap::new()),
             releases: Mutex::new(Vec::new()),
             reads: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
@@ -866,6 +891,195 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(open_reply_fh(reply), 7001);
+    }
+
+    #[test]
+    fn native_bridge_open_without_cache_state_uses_normal_cached_flags() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(open_request(99, libc::O_RDONLY));
+        let reply = reply.bytes().expect("open reply should be contiguous");
+
+        assert_eq!(open_reply_flags(reply), 0);
+    }
+
+    #[test]
+    fn native_bridge_open_uses_direct_io_when_policy_reports_dirty_writer_state() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    size: 8192,
+                    mtime_ns: 123,
+                    invalidation_generation: 3,
+                    trusted: Some(TrustedCacheState {
+                        content_epoch: 7,
+                        size: 8192,
+                        mtime_ns: 123,
+                        invalidation_generation: 3,
+                    }),
+                    writer_active: false,
+                    dirty: true,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(open_request(99, libc::O_RDONLY));
+        let reply = reply.bytes().expect("open reply should be contiguous");
+
+        assert_eq!(reply_error(reply), 0);
+        assert_eq!(open_reply_flags(reply) & 1, 1);
+    }
+
+    #[test]
+    fn native_bridge_open_records_cache_policy_metrics() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    size: 8192,
+                    mtime_ns: 123,
+                    invalidation_generation: 3,
+                    trusted: Some(TrustedCacheState {
+                        content_epoch: 7,
+                        size: 8192,
+                        mtime_ns: 123,
+                        invalidation_generation: 3,
+                    }),
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(open_request(99, libc::O_RDONLY));
+        let reply = reply.bytes().expect("open reply should be contiguous");
+
+        assert_eq!(open_reply_flags(reply), 1 << 1);
+        assert_eq!(bridge.open_cache_metrics_snapshot().keep, 1);
+    }
+
+    #[test]
+    fn native_bridge_repeated_read_only_open_keeps_cache_after_trusted_cached_open() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    size: 8192,
+                    mtime_ns: 123,
+                    invalidation_generation: 3,
+                    trusted: None,
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let first = bridge.handle(open_request(99, libc::O_RDONLY));
+        let first = first
+            .bytes()
+            .expect("first open reply should be contiguous");
+        let second = bridge.handle(open_request(99, libc::O_RDONLY));
+        let second = second
+            .bytes()
+            .expect("second open reply should be contiguous");
+
+        assert_eq!(open_reply_flags(first), 0);
+        assert_eq!(open_reply_flags(second), 1 << 1);
+    }
+
+    #[test]
+    fn native_bridge_forget_final_lookup_drops_trusted_open_cache_state() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    size: 8192,
+                    mtime_ns: 123,
+                    invalidation_generation: 3,
+                    trusted: None,
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.handle(lookup_request(1, b"cached.txt"));
+        bridge.handle(lookup_request(1, b"cached-again.txt"));
+        let first = bridge.handle(open_request(99, libc::O_RDONLY));
+        let first = first
+            .bytes()
+            .expect("first open reply should be contiguous");
+        bridge.handle(forget_request(99, 1));
+        let still_trusted = bridge.handle(open_request(99, libc::O_RDONLY));
+        let still_trusted = still_trusted
+            .bytes()
+            .expect("still trusted open reply should be contiguous");
+        bridge.handle(forget_request(99, 1));
+        let after_final_forget = bridge.handle(open_request(99, libc::O_RDONLY));
+        let after_final_forget = after_final_forget
+            .bytes()
+            .expect("post-forget open reply should be contiguous");
+
+        assert_eq!(open_reply_flags(first), 0);
+        assert_eq!(open_reply_flags(still_trusted), 1 << 1);
+        assert_eq!(open_reply_flags(after_final_forget), 0);
     }
 
     #[test]
@@ -1248,6 +1462,40 @@ mod tests {
         assert_eq!(reply_error(reply), 0);
         assert_eq!(entry_reply_nodeid(reply), 202);
         assert_eq!(create_reply_fh(reply), 7001);
+    }
+
+    #[test]
+    fn native_bridge_create_uses_cache_state_for_open_flags() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 42,
+            size: 0,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                42,
+                NativeInodeCacheState {
+                    content_epoch: 1,
+                    size: 0,
+                    mtime_ns: 123,
+                    invalidation_generation: 0,
+                    trusted: None,
+                    writer_active: true,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(create_request(1, b"created.txt", 0o644, libc::O_RDWR));
+        let reply = reply.bytes().expect("create reply should be contiguous");
+
+        assert_eq!(create_reply_flags(reply) & 1, 1);
     }
 
     #[test]
