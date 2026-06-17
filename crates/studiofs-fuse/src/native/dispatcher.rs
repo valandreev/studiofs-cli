@@ -32,10 +32,10 @@ pub struct MinimalNativeHandler;
 
 impl FuseOperationHandler for MinimalNativeHandler {
     fn handle(&mut self, request: FuseRequest) -> FuseReply {
-        FuseReply {
-            unique: request.header.unique,
-            bytes: error_reply(request.header.unique, libc::ENOSYS).to_vec(),
-        }
+        FuseReply::contiguous(
+            request.header.unique,
+            error_reply(request.header.unique, libc::ENOSYS).to_vec(),
+        )
     }
 }
 
@@ -406,34 +406,28 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
         let mut workers = Vec::with_capacity(RequestClass::ALL.len());
 
         for class in RequestClass::ALL {
-            let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
-            let receiver = Arc::new(Mutex::new(receiver));
+            let mut class_senders = Vec::with_capacity(self.worker_counts[class.index()]);
             for _ in 0..self.worker_counts[class.index()] {
+                let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
+                class_senders.push(sender);
                 let handler = self.handler.clone();
                 let worker_telemetry = Arc::clone(&telemetry);
-                let worker_receiver = Arc::clone(&receiver);
                 let worker = thread::spawn(move || {
-                    loop {
-                        let envelope = {
-                            let receiver = lock_or_recover(&worker_receiver);
-                            receiver.recv()
-                        };
-                        let Ok(envelope) = envelope else {
-                            break;
-                        };
+                    while let Ok(envelope) = receiver.recv() {
                         handler.handle(envelope);
                         worker_telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
                     }
                 });
                 workers.push(worker);
             }
-            senders.push(Some(sender));
+            senders.push(class_senders);
         }
 
         NativeAsyncDispatcher::<S> {
             senders,
             workers,
             capacities: self.capacities,
+            next_workers: std::array::from_fn(|_| AtomicUsize::new(0)),
             telemetry,
         }
     }
@@ -441,9 +435,10 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 
 /// Bounded worker dispatcher for owned native FUSE requests.
 pub struct NativeAsyncDispatcher<S: ReplySink> {
-    senders: Vec<Option<SyncSender<OwnedFuseRequest<S>>>>,
+    senders: Vec<Vec<SyncSender<OwnedFuseRequest<S>>>>,
     workers: Vec<JoinHandle<()>>,
     capacities: [usize; 5],
+    next_workers: [AtomicUsize; 5],
     telemetry: Arc<DispatchTelemetryState>,
 }
 
@@ -485,27 +480,40 @@ where
             return Err(DispatchError::QueueFull { class });
         }
 
-        let Some(sender) = self.senders[class.index()].as_ref() else {
+        let class_senders = &self.senders[class.index()];
+        if class_senders.is_empty() {
             self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
             envelope.reply.drop_without_reply();
             return Err(DispatchError::Shutdown);
-        };
+        }
 
-        match sender.try_send(envelope) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(envelope)) => {
-                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
-                self.telemetry
-                    .backpressure_events
-                    .fetch_add(1, Ordering::Relaxed);
-                envelope.reply.send_errno(libc::EAGAIN);
-                Err(DispatchError::QueueFull { class })
+        let start = self.next_workers[class.index()].fetch_add(1, Ordering::Relaxed);
+        let mut envelope = envelope;
+        let mut saw_disconnected = false;
+        for offset in 0..class_senders.len() {
+            let index = (start + offset) % class_senders.len();
+            match class_senders[index].try_send(envelope) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    envelope = returned;
+                }
+                Err(TrySendError::Disconnected(returned)) => {
+                    saw_disconnected = true;
+                    envelope = returned;
+                }
             }
-            Err(TrySendError::Disconnected(envelope)) => {
-                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
-                envelope.reply.drop_without_reply();
-                Err(DispatchError::QueueFull { class })
-            }
+        }
+
+        self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
+        if saw_disconnected {
+            envelope.reply.drop_without_reply();
+            Err(DispatchError::Shutdown)
+        } else {
+            self.telemetry
+                .backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+            envelope.reply.send_errno(libc::EAGAIN);
+            Err(DispatchError::QueueFull { class })
         }
     }
 
@@ -516,8 +524,8 @@ where
 
     /// Stops intake and waits for worker queues to drain.
     pub fn shutdown(mut self) -> Result<(), DispatchError> {
-        for sender in &mut self.senders {
-            sender.take();
+        for class_senders in &mut self.senders {
+            class_senders.clear();
         }
         for worker in self.workers {
             worker.join().map_err(|_| DispatchError::WorkerPanicked)?;
@@ -558,10 +566,7 @@ mod tests {
     impl FuseOperationHandler for RecordingHandler {
         fn handle(&mut self, request: FuseRequest) -> FuseReply {
             self.opcodes.push(request.opcode);
-            FuseReply {
-                unique: request.header.unique,
-                bytes: ok_reply(request.header.unique, &[]),
-            }
+            FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
         }
     }
 
@@ -618,10 +623,11 @@ mod tests {
             };
 
             let reply = handler.handle(request);
+            let bytes = reply.to_vec();
 
-            assert_eq!(&reply.bytes[0..4], &16_u32.to_le_bytes());
-            assert_eq!(&reply.bytes[4..8], &(-(libc::ENOSYS)).to_le_bytes());
-            assert_eq!(&reply.bytes[8..16], &0x55_u64.to_le_bytes());
+            assert_eq!(&bytes[0..4], &16_u32.to_le_bytes());
+            assert_eq!(&bytes[4..8], &(-(libc::ENOSYS)).to_le_bytes());
+            assert_eq!(&bytes[8..16], &0x55_u64.to_le_bytes());
         }
     }
 
@@ -634,7 +640,7 @@ mod tests {
 
         assert_eq!(sink.completed_unique_ids(), [0x71]);
         assert_eq!(
-            sink.completed_replies()[0].bytes[16..],
+            sink.completed_replies()[0].to_vec()[16..],
             [0xde, 0xad, 0xbe, 0xef]
         );
     }
@@ -648,21 +654,22 @@ mod tests {
 
         assert_eq!(sink.completed_unique_ids(), [0x72]);
         assert_eq!(
-            &sink.completed_replies()[0].bytes[4..8],
+            &sink.completed_replies()[0].to_vec()[4..8],
             &(-(libc::ENOENT)).to_le_bytes()
         );
     }
 
     #[test]
-    fn reply_token_send_data_takes_slice_to_make_payload_copy_explicit() {
+    fn reply_token_send_data_keeps_payload_separate_for_vectored_write() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_classic(0x74, sink.clone());
-        let payload = [1, 2, 3, 4];
+        let payload = vec![1, 2, 3, 4];
 
-        token.send_data(&payload);
+        token.send_data(payload.clone());
 
         assert_eq!(sink.completed_unique_ids(), [0x74]);
-        assert_eq!(sink.completed_replies()[0].bytes[16..], payload);
+        assert_eq!(sink.completed_replies()[0].to_vec()[16..], payload);
+        assert_eq!(sink.completed_replies()[0].io_slices().len(), 2);
     }
 
     #[test]
@@ -675,7 +682,7 @@ mod tests {
         assert_eq!(sink.dropped_unique_ids(), [0x73]);
         assert_eq!(sink.completed_unique_ids(), [0x73]);
         assert_eq!(
-            &sink.completed_replies()[0].bytes[4..8],
+            &sink.completed_replies()[0].to_vec()[4..8],
             &(-(libc::EIO)).to_le_bytes()
         );
     }
@@ -812,7 +819,9 @@ mod tests {
         let second = started_rx
             .recv_timeout(Duration::from_millis(250))
             .expect("second worker should start without waiting for first completion");
-        assert_eq!([first, second], [0x91, 0x92]);
+        let mut started = [first, second];
+        started.sort();
+        assert_eq!(started, [0x91, 0x92]);
 
         unblock_tx.send(()).expect("first read should unblock");
         unblock_tx.send(()).expect("second read should unblock");

@@ -167,7 +167,38 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     }
 
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
-        self.io.write_all(&reply.bytes)?;
+        let slices = reply.io_slices();
+        if slices.len() == 1 {
+            self.io.write_all(slices[0].as_ref())?;
+        } else {
+            let mut written = 0;
+            let expected = slices.iter().map(|slice| slice.len()).sum();
+            while written < expected {
+                let mut start = written;
+                let pending: Vec<_> = slices
+                    .iter()
+                    .filter_map(|slice| {
+                        if start >= slice.len() {
+                            start -= slice.len();
+                            None
+                        } else {
+                            let pending = io::IoSlice::new(&slice.as_ref()[start..]);
+                            start = 0;
+                            Some(pending)
+                        }
+                    })
+                    .collect();
+                let bytes = self.io.write_vectored(&pending)?;
+                if bytes == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "classic FUSE write accepted zero reply bytes",
+                    )
+                    .into());
+                }
+                written += bytes;
+            }
+        }
         Ok(())
     }
 
@@ -221,10 +252,10 @@ mod tests {
 
         assert_eq!(request.opcode, FuseOpcode::Init);
 
-        let reply = FuseReply {
-            unique: request.header.unique,
-            bytes: error_reply(request.header.unique, libc::ENOSYS).to_vec(),
-        };
+        let reply = FuseReply::contiguous(
+            request.header.unique,
+            error_reply(request.header.unique, libc::ENOSYS).to_vec(),
+        );
         transport
             .send_reply(reply)
             .expect("transport send should accept reply");
@@ -375,10 +406,7 @@ mod tests {
 
         let bytes = error_reply(request.header.unique, libc::EIO).to_vec();
         transport
-            .send_reply(FuseReply {
-                unique: request.header.unique,
-                bytes: bytes.clone(),
-            })
+            .send_reply(FuseReply::contiguous(request.header.unique, bytes.clone()))
             .expect("classic send should write reply");
 
         assert_eq!(transport.into_inner().output, bytes);

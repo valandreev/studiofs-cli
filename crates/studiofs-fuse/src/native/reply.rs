@@ -68,26 +68,23 @@ impl<S: ReplySink> ReplyToken<S> {
 
     /// Sends a successful reply with the supplied payload.
     pub fn send_success(mut self, payload: &[u8]) {
-        self.complete(FuseReply {
-            unique: self.unique,
-            bytes: ok_reply(self.unique, payload),
-        });
+        self.complete(FuseReply::contiguous(
+            self.unique,
+            ok_reply(self.unique, payload),
+        ));
     }
 
     /// Sends an errno reply.
     pub fn send_errno(mut self, errno: i32) {
-        self.complete(FuseReply {
-            unique: self.unique,
-            bytes: error_reply(self.unique, errno).to_vec(),
-        });
+        self.complete(FuseReply::contiguous(
+            self.unique,
+            error_reply(self.unique, errno).to_vec(),
+        ));
     }
 
-    /// Sends a data reply, copying the payload behind a FUSE reply header.
-    pub fn send_data(mut self, data: &[u8]) {
-        self.complete(FuseReply {
-            unique: self.unique,
-            bytes: ok_reply(self.unique, data),
-        });
+    /// Sends a data reply with separate header and payload segments.
+    pub fn send_data(mut self, data: Vec<u8>) {
+        self.complete(FuseReply::segmented_data(self.unique, data));
     }
 
     /// Marks the token as intentionally dropped without replying to the kernel.
@@ -109,10 +106,7 @@ impl<S: ReplySink> Drop for ReplyToken<S> {
             self.sink.dropped(self.origin, self.unique);
             self.sink.complete(
                 self.origin,
-                FuseReply {
-                    unique: self.unique,
-                    bytes: error_reply(self.unique, libc::EIO).to_vec(),
-                },
+                FuseReply::contiguous(self.unique, error_reply(self.unique, libc::EIO).to_vec()),
             );
         }
     }
