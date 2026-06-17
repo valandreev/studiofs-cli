@@ -223,9 +223,10 @@ impl FuseReply {
             FuseReplyFrame::Segmented { header, .. } => header,
             FuseReplyFrame::LocalCacheRange { header, .. } => header,
         };
-        Some(i32::from_le_bytes(
-            header[4..8].try_into().expect("slice length"),
-        ))
+        let bytes = header.get(4..8)?;
+        let mut raw = [0; 4];
+        raw.copy_from_slice(bytes);
+        Some(i32::from_le_bytes(raw))
     }
 
     /// Returns the total serialized frame length.
@@ -720,6 +721,19 @@ mod tests {
         let reply = FuseReply::contiguous(0x55, error_reply(0x55, libc::EIO).to_vec());
 
         assert_eq!(reply.error_code(), Some(-libc::EIO));
+    }
+
+    #[test]
+    fn fuse_reply_error_code_avoids_panicking_header_slices() {
+        let source = include_str!("protocol.rs");
+        let body = source
+            .split("pub fn error_code(&self)")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn frame_len(&self)").next())
+            .expect("error_code body should be present");
+
+        assert!(!body.contains("expect("));
+        assert!(body.contains(".get(4..8)"));
     }
 
     #[test]

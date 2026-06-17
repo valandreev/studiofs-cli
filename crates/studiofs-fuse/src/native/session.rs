@@ -64,10 +64,11 @@ impl NativeSessionConfig {
 }
 
 fn parse_native_bool_env_value(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let raw = raw.trim();
+    raw == "1"
+        || raw.eq_ignore_ascii_case("true")
+        || raw.eq_ignore_ascii_case("yes")
+        || raw.eq_ignore_ascii_case("on")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +412,21 @@ mod tests {
             },
             result => panic!("expected structured INIT receive error, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn native_bool_env_parser_avoids_lowercase_allocation() {
+        let source = include_str!("session.rs");
+        let parser = source
+            .split("fn parse_native_bool_env_value")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+                    .next()
+            })
+            .expect("native bool parser body should be present");
+
+        assert!(!parser.contains("to_ascii_lowercase"));
     }
 
     #[test]

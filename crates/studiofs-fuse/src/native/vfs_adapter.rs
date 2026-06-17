@@ -4,7 +4,7 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
@@ -55,39 +55,6 @@ const SUPPORTED_SETATTR_VALID: u32 =
     FATTR_FH | FATTR_SIZE | FATTR_MTIME | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
-const NATIVE_ASYNC_WRITE_WORKERS: usize = 4;
-
-type NativeAsyncWriteJob = Box<dyn FnOnce() + Send + 'static>;
-
-struct NativeAsyncWriteExecutor {
-    sender: crossbeam_channel::Sender<NativeAsyncWriteJob>,
-}
-
-impl NativeAsyncWriteExecutor {
-    fn new() -> Self {
-        let (sender, receiver) = crossbeam_channel::unbounded::<NativeAsyncWriteJob>();
-        for _ in 0..NATIVE_ASYNC_WRITE_WORKERS {
-            let worker_receiver = receiver.clone();
-            std::thread::spawn(move || {
-                while let Ok(job) = worker_receiver.recv() {
-                    job();
-                }
-            });
-        }
-        Self { sender }
-    }
-
-    fn submit(&self, job: NativeAsyncWriteJob) -> Result<(), NativeAsyncWriteJob> {
-        self.sender
-            .send(job)
-            .map_err(|crossbeam_channel::SendError(job)| job)
-    }
-}
-
-fn native_async_write_executor() -> &'static NativeAsyncWriteExecutor {
-    static EXECUTOR: OnceLock<NativeAsyncWriteExecutor> = OnceLock::new();
-    EXECUTOR.get_or_init(NativeAsyncWriteExecutor::new)
-}
 
 /// Stable local cache file range that a native Linux read transport may use.
 pub type NativeLocalCacheReadRange = FuseLocalCacheReadRange;
@@ -196,6 +163,14 @@ pub trait NativeVfs {
     /// Record native async write admission and barrier telemetry.
     fn record_async_write_snapshot(&self, _snapshot: NativeAsyncWriteSnapshot) {}
 
+    /// Run a native async write job without blocking the FUSE callback thread.
+    fn spawn_native_async_write_job<J>(&self, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        std::thread::spawn(job);
+    }
+
     /// Flush dirty state for a file handle or inode.
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32>;
 
@@ -294,6 +269,13 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot) {
         (**self).record_async_write_snapshot(snapshot);
+    }
+
+    fn spawn_native_async_write_job<J>(&self, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        (**self).spawn_native_async_write_job(job);
     }
 
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -519,6 +501,13 @@ impl NativeVfs for StudioVfsNativeAdapter {
                 barrier_wait_total_ms: snapshot.barrier_wait_total_ms,
                 ..Default::default()
             });
+    }
+
+    fn spawn_native_async_write_job<J>(&self, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        drop(self.rt.spawn_blocking(job));
     }
 
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -1080,7 +1069,7 @@ where
         let fh = write.fh;
         let offset = write.offset;
         let flags = write.flags;
-        let job = Box::new(move || {
+        self.vfs.spawn_native_async_write_job(move || {
             let mut registration = registration;
             let turn = registration.turn_waiter();
             turn.wait_blocking();
@@ -1091,9 +1080,6 @@ where
             registration.complete(completion);
             vfs.record_async_write_snapshot(native_async_write_snapshot(&pending_writes, &config));
         });
-        if let Err(job) = native_async_write_executor().submit(job) {
-            job();
-        }
 
         FuseReply::contiguous(unique, ok_reply(unique, &write_payload(data_len as u32)))
     }
@@ -1143,9 +1129,9 @@ where
             self.publish_async_write_snapshot();
             let fsync_result = self.vfs.fsync(request.header.nodeid, datasync);
             if let Err(errno) = fsync_result {
-                eprintln!(
-                    "native FSYNC failed: ino={} datasync={} errno={errno}",
-                    request.header.nodeid, datasync
+                warn!(
+                    ino = request.header.nodeid,
+                    datasync, errno, "native FSYNC failed"
                 );
             }
             return empty_barrier_reply(request.header.unique, pending_result, fsync_result);
@@ -2933,6 +2919,10 @@ mod tests {
     #[test]
     fn handle_async_write_uses_shared_executor_instead_of_per_write_threads() {
         let source = include_str!("vfs_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
         let body = source
             .split("fn handle_async_write(")
             .nth(1)
@@ -2941,6 +2931,22 @@ mod tests {
 
         assert!(!body.contains("std::thread::spawn"));
         assert!(!body.contains("new_current_thread"));
+        assert!(!production.contains("NativeAsyncWriteExecutor"));
+        assert!(!production.contains("native_async_write_executor"));
+        assert!(body.contains("spawn_native_async_write_job"));
+    }
+
+    #[test]
+    fn handle_fsync_logs_failures_through_tracing() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn handle_fsync(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_opendir(").next())
+            .expect("handle_fsync body should be present");
+
+        assert!(!body.contains("eprintln!"));
+        assert!(body.contains("warn!"));
     }
 
     #[test]
