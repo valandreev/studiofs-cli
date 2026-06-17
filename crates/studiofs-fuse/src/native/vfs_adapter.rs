@@ -18,7 +18,7 @@ use crate::native::cache_policy::{
     NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadPolicy,
     NativeReadAheadState, decide_native_open_cache, decide_native_read_ahead,
 };
-use crate::native::dispatcher::FuseOperationHandler;
+use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
 
 const FUSE_ENTRY_OUT_PAYLOAD_LEN: usize = 128;
@@ -564,6 +564,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
 #[derive(Debug)]
 pub struct LinuxNativeBridge<V> {
     vfs: V,
+    barrier_gates: OperationBarrierGates,
     lookup_counts: NativeLookupCountStore,
     open_cache_metrics: NativeOpenCacheMetrics,
     read_metrics: NativeReadMetrics,
@@ -615,6 +616,7 @@ impl<V> LinuxNativeBridge<V> {
     pub fn new(vfs: V) -> Self {
         Self {
             vfs,
+            barrier_gates: OperationBarrierGates::default(),
             lookup_counts: NativeLookupCountStore::default(),
             open_cache_metrics: NativeOpenCacheMetrics::default(),
             read_metrics: NativeReadMetrics::default(),
@@ -737,6 +739,8 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.release(fh) {
             Ok(()) => {
                 lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
@@ -830,6 +834,9 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        let _pending_write = self
+            .barrier_gates
+            .begin_write(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.write(
             write.fh,
             request.header.nodeid,
@@ -851,6 +858,8 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.flush(request.header.nodeid, fh) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
@@ -865,6 +874,8 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.fsync(request.header.nodeid, datasync) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
@@ -2191,6 +2202,367 @@ mod tests {
                 0,
             ),
             opcode: FuseOpcode::Read,
+            payload,
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingWriteVfs {
+        write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_write: Mutex<std::sync::mpsc::Receiver<()>>,
+        flushes: AtomicU64,
+        fsyncs: AtomicU64,
+        releases: AtomicU64,
+    }
+
+    struct BlockingWriteFixture {
+        vfs: Arc<BlockingWriteVfs>,
+        bridge: Arc<LinuxNativeBridge<Arc<BlockingWriteVfs>>>,
+        write_started: std::sync::mpsc::Receiver<()>,
+        release_write: std::sync::mpsc::Sender<()>,
+    }
+
+    fn blocking_write_fixture() -> BlockingWriteFixture {
+        let (write_started_tx, write_started) = std::sync::mpsc::channel();
+        let (release_write, release_write_rx) = std::sync::mpsc::channel();
+        let vfs = Arc::new(BlockingWriteVfs {
+            write_started: Mutex::new(Some(write_started_tx)),
+            release_write: Mutex::new(release_write_rx),
+            flushes: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+        });
+        let bridge = Arc::new(LinuxNativeBridge::new(Arc::clone(&vfs)));
+
+        BlockingWriteFixture {
+            vfs,
+            bridge,
+            write_started,
+            release_write,
+        }
+    }
+
+    impl NativeVfs for BlockingWriteVfs {
+        fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn getattr(&self, _ino: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn open(&self, _ino: u64, _flags: i32) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn release(&self, _fh: u64) -> Result<(), i32> {
+            self.releases.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn read(&self, _fh: u64, _ino: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn write(
+            &self,
+            _fh: u64,
+            _ino: u64,
+            _offset: u64,
+            data: &[u8],
+            _flags: i32,
+        ) -> Result<u32, i32> {
+            if let Some(started) = self
+                .write_started
+                .lock()
+                .expect("write_started lock should not be poisoned")
+                .take()
+            {
+                started.send(()).expect("test should observe write start");
+            }
+            self.release_write
+                .lock()
+                .expect("release_write lock should not be poisoned")
+                .recv()
+                .expect("test should release blocked write");
+            Ok(data.len() as u32)
+        }
+
+        fn flush(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn fsync(&self, _ino: u64, _datasync: bool) -> Result<(), i32> {
+            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn opendir(&self, _ino: u64) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn releasedir(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn readdir(&self, _ino: u64, _fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn mkdir(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+        ) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn create(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+            _flags: i32,
+        ) -> Result<(NativeAttr, u64), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn unlink(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rmdir(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rename(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _new_parent: u64,
+            _new_name: &[u8],
+        ) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn truncate(&self, _ino: u64, _fh: Option<u64>, _size: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn statfs(&self) -> Result<NativeStatFs, i32> {
+            unimplemented!("not used by this test")
+        }
+    }
+
+    #[test]
+    fn handle_flush_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (flush_done_tx, flush_done_rx) = std::sync::mpsc::channel();
+        let flush_bridge = Arc::clone(&fixture.bridge);
+        let flusher = std::thread::spawn(move || {
+            let reply = flush_bridge.handle_flush(flush_request_for_fh(20, 7));
+            flush_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe flush result");
+        });
+
+        assert!(
+            flush_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "flush must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            flush_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("flush should finish after write drains"),
+            0
+        );
+        flusher.join().expect("flush thread should finish");
+        assert_eq!(fixture.vfs.flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_fsync_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (fsync_done_tx, fsync_done_rx) = std::sync::mpsc::channel();
+        let fsync_bridge = Arc::clone(&fixture.bridge);
+        let fsyncer = std::thread::spawn(move || {
+            let reply = fsync_bridge.handle_fsync(fsync_request_for_datasync(20, true));
+            fsync_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe fsync result");
+        });
+
+        assert!(
+            fsync_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "fsync must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            fsync_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("fsync should finish after write drains"),
+            0
+        );
+        fsyncer.join().expect("fsync thread should finish");
+        assert_eq!(fixture.vfs.fsyncs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_release_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (release_done_tx, release_done_rx) = std::sync::mpsc::channel();
+        let release_bridge = Arc::clone(&fixture.bridge);
+        let releaser = std::thread::spawn(move || {
+            let reply = release_bridge.handle_release(release_request_for_fh(20, 7));
+            release_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe release result");
+        });
+
+        assert!(
+            release_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "release must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            release_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("release should finish after write drains"),
+            0
+        );
+        releaser.join().expect("release thread should finish");
+        assert_eq!(fixture.vfs.releases.load(Ordering::Relaxed), 1);
+    }
+
+    fn write_request_for_data(ino: u64, fh: u64, offset: u64, data: &[u8]) -> FuseRequest {
+        let mut payload = vec![0; FUSE_WRITE_IN_LEN + data.len()];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        payload[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        payload[FUSE_WRITE_IN_LEN..].copy_from_slice(data);
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + payload.len()) as u32,
+                16,
+                100,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Write,
+            payload,
+        }
+    }
+
+    fn fsync_request_for_datasync(ino: u64, datasync: bool) -> FuseRequest {
+        let mut payload = vec![0; FUSE_FSYNC_IN_LEN];
+        payload[8..12].copy_from_slice(&(u32::from(datasync)).to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_FSYNC_IN_LEN) as u32,
+                20,
+                102,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Fsync,
+            payload,
+        }
+    }
+
+    fn release_request_for_fh(ino: u64, fh: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_RELEASE_IN_LEN];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_RELEASE_IN_LEN) as u32,
+                18,
+                103,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Release,
+            payload,
+        }
+    }
+
+    fn flush_request_for_fh(ino: u64, fh: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_FLUSH_IN_LEN];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_FLUSH_IN_LEN) as u32,
+                25,
+                101,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Flush,
             payload,
         }
     }
