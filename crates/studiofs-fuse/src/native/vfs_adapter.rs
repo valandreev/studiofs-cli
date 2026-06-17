@@ -12,7 +12,8 @@ use tracing::warn;
 
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::cache_policy::{
-    NativeInodeCacheState, NativeOpenCacheAction, decide_native_open_cache,
+    NativeInodeCacheState, NativeOpenCacheAction, NativeOpenCacheDecision, NativeOpenCacheMetrics,
+    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, decide_native_open_cache,
 };
 use crate::native::dispatcher::FuseOperationHandler;
 use crate::native::protocol::{FuseOpcode, FuseReply, FuseRequest};
@@ -318,6 +319,14 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
+        let attr = self.vfs.getattr(ino).ok()?;
+        Some(native_open_cache_state_from_attr(
+            attr,
+            self.vfs.inode_has_local_dirty_state(ino),
+        ))
+    }
+
     fn release(&self, fh: u64) -> Result<(), i32> {
         self.rt
             .block_on(self.vfs.release_fh(fh))
@@ -468,6 +477,8 @@ impl NativeVfs for StudioVfsNativeAdapter {
 pub struct LinuxNativeBridge<V> {
     vfs: V,
     lookup_counts: NativeLookupCountStore,
+    open_cache_metrics: NativeOpenCacheMetrics,
+    trusted_open_cache_states: Mutex<HashMap<u64, NativeInodeCacheState>>,
 }
 
 impl<V> LinuxNativeBridge<V> {
@@ -476,12 +487,19 @@ impl<V> LinuxNativeBridge<V> {
         Self {
             vfs,
             lookup_counts: NativeLookupCountStore::default(),
+            open_cache_metrics: NativeOpenCacheMetrics::default(),
+            trusted_open_cache_states: Mutex::new(HashMap::new()),
         }
     }
 
     /// Returns the kernel lookup reference count currently tracked for `ino`.
     pub fn kernel_lookup_count(&self, ino: u64) -> u64 {
         self.lookup_counts.count(ino)
+    }
+
+    /// Snapshot native Linux open cache policy metrics.
+    pub fn open_cache_metrics_snapshot(&self) -> NativeOpenCacheMetricsSnapshot {
+        self.open_cache_metrics.snapshot()
     }
 }
 
@@ -557,13 +575,17 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         };
 
         match self.vfs.open(request.header.nodeid, flags) {
-            Ok(fh) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(
+            Ok(fh) => {
+                let decision = self.open_cache_decision(
+                    request.header.nodeid,
+                    flags,
+                    self.vfs.open_cache_state(request.header.nodeid),
+                );
+                FuseReply::contiguous(
                     request.header.unique,
-                    &open_payload(fh, flags, self.vfs.open_cache_state(request.header.nodeid)),
-                ),
-            ),
+                    ok_reply(request.header.unique, &open_payload(fh, decision)),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -653,7 +675,10 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         match self.vfs.opendir(request.header.nodeid) {
             Ok(fh) => FuseReply::contiguous(
                 request.header.unique,
-                ok_reply(request.header.unique, &open_payload(fh, 0, None)),
+                ok_reply(
+                    request.header.unique,
+                    &open_payload(fh, cached_open_decision()),
+                ),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
@@ -766,12 +791,14 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         ) {
             Ok((attr, fh)) => {
                 self.add_lookup(attr.ino, 1);
+                let decision = self.open_cache_decision(
+                    attr.ino,
+                    create.flags,
+                    self.vfs.open_cache_state(attr.ino),
+                );
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(
-                        request.header.unique,
-                        &create_payload(attr, fh, create.flags, None),
-                    ),
+                    ok_reply(request.header.unique, &create_payload(attr, fh, decision)),
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -859,6 +886,69 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
 
     fn forget_lookup(&self, ino: u64, nlookup: u64) {
         self.lookup_counts.forget(ino, nlookup);
+    }
+
+    fn open_cache_decision(
+        &self,
+        ino: u64,
+        flags: i32,
+        cache_state: Option<NativeInodeCacheState>,
+    ) -> NativeOpenCacheDecision {
+        let Some(mut state) = cache_state else {
+            let decision = cached_open_decision();
+            self.open_cache_metrics.record(decision);
+            return decision;
+        };
+
+        self.apply_trusted_open_cache_state(ino, &mut state);
+        let (open_flags, _) = posix_flags_to_open_flags(flags);
+        let read_only =
+            !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR);
+        let decision = decide_native_open_cache(read_only, &state);
+        self.open_cache_metrics.record(decision);
+        if matches!(
+            decision.action,
+            NativeOpenCacheAction::KeepCache
+                | NativeOpenCacheAction::Cached
+                | NativeOpenCacheAction::InvalidateThenCached
+        ) {
+            self.remember_trusted_open_cache_state(ino, &state);
+        }
+        decision
+    }
+
+    fn apply_trusted_open_cache_state(&self, ino: u64, state: &mut NativeInodeCacheState) {
+        let trusted = self.trusted_open_cache_states();
+        let trusted = trusted.get(&ino).cloned();
+        let Some(trusted) = trusted else {
+            return;
+        };
+
+        if state.cached_content_epoch.is_none() {
+            state.cached_content_epoch = Some(trusted.content_epoch);
+        }
+        if state.cached_size.is_none() {
+            state.cached_size = Some(trusted.size);
+        }
+        if state.cached_mtime_ns.is_none() {
+            state.cached_mtime_ns = Some(trusted.mtime_ns);
+        }
+        state.observed_invalidation_generation = trusted.invalidation_generation;
+    }
+
+    fn remember_trusted_open_cache_state(&self, ino: u64, state: &NativeInodeCacheState) {
+        self.trusted_open_cache_states().insert(ino, state.clone());
+    }
+
+    fn trusted_open_cache_states(&self) -> MutexGuard<'_, HashMap<u64, NativeInodeCacheState>> {
+        lock_or_recover(&self.trusted_open_cache_states, "trusted_open_cache_states")
+    }
+}
+
+fn cached_open_decision() -> NativeOpenCacheDecision {
+    NativeOpenCacheDecision {
+        action: NativeOpenCacheAction::Cached,
+        reason: NativeOpenCacheReason::Cached,
     }
 }
 
@@ -1086,22 +1176,17 @@ fn attr_out_payload(attr: NativeAttr) -> Vec<u8> {
     payload
 }
 
-fn open_payload(fh: u64, flags: i32, cache_state: Option<NativeInodeCacheState>) -> Vec<u8> {
+fn open_payload(fh: u64, decision: NativeOpenCacheDecision) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16);
     payload.extend_from_slice(&fh.to_le_bytes());
-    payload.extend_from_slice(&open_reply_flags(flags, cache_state).to_le_bytes());
+    payload.extend_from_slice(&open_reply_flags(decision).to_le_bytes());
     payload.extend_from_slice(&0_u32.to_le_bytes());
     payload
 }
 
-fn create_payload(
-    attr: NativeAttr,
-    fh: u64,
-    flags: i32,
-    cache_state: Option<NativeInodeCacheState>,
-) -> Vec<u8> {
+fn create_payload(attr: NativeAttr, fh: u64, decision: NativeOpenCacheDecision) -> Vec<u8> {
     let mut payload = entry_payload(attr);
-    payload.extend_from_slice(&open_payload(fh, flags, cache_state));
+    payload.extend_from_slice(&open_payload(fh, decision));
     payload
 }
 
@@ -1230,22 +1315,27 @@ fn write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
     }
 }
 
-fn open_reply_flags(flags: i32, cache_state: Option<NativeInodeCacheState>) -> u32 {
-    let (open_flags, _) = posix_flags_to_open_flags(flags);
-    if let Some(state) = cache_state {
-        let read_only =
-            !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR);
-        return match decide_native_open_cache(read_only, state).action {
-            NativeOpenCacheAction::KeepCache => FOPEN_KEEP_CACHE,
-            NativeOpenCacheAction::Cached | NativeOpenCacheAction::InvalidateThenCached => 0,
-            NativeOpenCacheAction::DirectIo => FOPEN_DIRECT_IO,
-        };
+fn open_reply_flags(decision: NativeOpenCacheDecision) -> u32 {
+    match decision.action {
+        NativeOpenCacheAction::KeepCache => FOPEN_KEEP_CACHE,
+        NativeOpenCacheAction::Cached | NativeOpenCacheAction::InvalidateThenCached => 0,
+        NativeOpenCacheAction::DirectIo => FOPEN_DIRECT_IO,
     }
+}
 
-    if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-        FOPEN_KEEP_CACHE
-    } else {
-        0
+fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInodeCacheState {
+    NativeInodeCacheState {
+        content_epoch: attr.content_epoch,
+        cached_content_epoch: None,
+        size: attr.size,
+        cached_size: None,
+        mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
+        cached_mtime_ns: None,
+        invalidation_generation: 0,
+        observed_invalidation_generation: 0,
+        writer_active: dirty,
+        dirty,
+        local_materialized: true,
     }
 }
 
@@ -1528,6 +1618,23 @@ mod tests {
             kind: NativeFileType::RegularFile,
             name: name.to_vec(),
         }
+    }
+
+    #[test]
+    fn native_open_cache_state_from_attr_maps_epoch_size_mtime_and_dirty_state() {
+        let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
+        attr.size = 4096;
+        attr.mtime = 123_456;
+        attr.content_epoch = 9;
+
+        let state = native_open_cache_state_from_attr(attr, true);
+
+        assert_eq!(state.content_epoch, 9);
+        assert_eq!(state.size, 4096);
+        assert_eq!(state.mtime_ns, 123_456);
+        assert!(state.writer_active);
+        assert!(state.dirty);
+        assert!(state.local_materialized);
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub struct NativeOpenCacheDecision {
 }
 
 /// Per-inode state used to decide whether kernel pages are still coherent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeInodeCacheState {
     /// Current StudioFS content epoch.
     pub content_epoch: u64,
@@ -145,7 +145,7 @@ impl NativeOpenCacheMetrics {
 /// Chooses the Linux native kernel page-cache behavior for an open.
 pub fn decide_native_open_cache(
     read_only: bool,
-    state: NativeInodeCacheState,
+    state: &NativeInodeCacheState,
 ) -> NativeOpenCacheDecision {
     if state.writer_active || state.dirty {
         return NativeOpenCacheDecision {
@@ -173,13 +173,7 @@ pub fn decide_native_open_cache(
         };
     }
 
-    if read_only
-        && state.local_materialized
-        && state.cached_content_epoch == Some(state.content_epoch)
-        && state.cached_size == Some(state.size)
-        && state.cached_mtime_ns == Some(state.mtime_ns)
-        && state.observed_invalidation_generation == state.invalidation_generation
-    {
+    if read_only && state.cached_content_epoch.is_some() {
         return NativeOpenCacheDecision {
             action: NativeOpenCacheAction::KeepCache,
             reason: NativeOpenCacheReason::Keep,
@@ -214,7 +208,8 @@ mod tests {
 
     #[test]
     fn read_only_open_keeps_kernel_cache_when_epoch_size_mtime_and_generation_match() {
-        let decision = decide_native_open_cache(true, clean_trusted_state());
+        let state = clean_trusted_state();
+        let decision = decide_native_open_cache(true, &state);
 
         assert_eq!(
             decision,
@@ -229,7 +224,7 @@ mod tests {
     fn read_only_open_invalidates_before_cached_io_when_content_epoch_changed() {
         let decision = decide_native_open_cache(
             true,
-            NativeInodeCacheState {
+            &NativeInodeCacheState {
                 content_epoch: 8,
                 ..clean_trusted_state()
             },
@@ -248,7 +243,7 @@ mod tests {
     fn read_only_open_uses_direct_io_when_writer_state_is_dirty() {
         let decision = decide_native_open_cache(
             true,
-            NativeInodeCacheState {
+            &NativeInodeCacheState {
                 dirty: true,
                 ..clean_trusted_state()
             },
@@ -267,7 +262,7 @@ mod tests {
     fn read_only_open_invalidates_when_local_cache_was_evicted() {
         let decision = decide_native_open_cache(
             true,
-            NativeInodeCacheState {
+            &NativeInodeCacheState {
                 local_materialized: false,
                 ..clean_trusted_state()
             },
