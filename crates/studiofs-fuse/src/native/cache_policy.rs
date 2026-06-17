@@ -122,6 +122,7 @@ impl NativeOpenCacheMetrics {
             }
         }
         match decision.reason {
+            // Keep/Cached reasons are already counted by the action counters above.
             NativeOpenCacheReason::StalePrevented => {
                 self.stale_prevented.fetch_add(1, Ordering::Relaxed);
             }

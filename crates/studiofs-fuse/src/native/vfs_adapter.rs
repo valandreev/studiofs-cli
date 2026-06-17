@@ -320,7 +320,17 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
-        let attr = self.vfs.getattr(ino).ok()?;
+        let attr = match self.vfs.getattr(ino) {
+            Ok(attr) => attr,
+            Err(error) => {
+                warn!(
+                    ino,
+                    error = ?error,
+                    "native open cache state unavailable after getattr failure"
+                );
+                return None;
+            }
+        };
         Some(native_open_cache_state_from_attr(
             attr,
             self.vfs.inode_has_local_dirty_state(ino),
@@ -1319,6 +1329,8 @@ fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInod
         content_epoch: attr.content_epoch,
         size: attr.size,
         mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
+        // Native Linux does not yet install a kernel invalidator generation source;
+        // content epoch, size, and mtime remain the active production coherency keys.
         invalidation_generation: 0,
         trusted: None,
         writer_active: dirty,
@@ -1737,6 +1749,20 @@ mod tests {
             .expect("open cache decision body should be present");
 
         assert!(!open_cache_decision.contains("NativeOpenCacheAction::KeepCache"));
+    }
+
+    #[test]
+    fn studio_vfs_native_adapter_open_cache_state_logs_getattr_errors() {
+        let source = include_str!("vfs_adapter.rs");
+        let open_cache_state = source
+            .split("impl NativeVfs for StudioVfsNativeAdapter")
+            .nth(1)
+            .and_then(|rest| rest.split("fn release").next())
+            .expect("studio vfs native adapter open_cache_state should be present");
+
+        assert!(!open_cache_state.contains(".ok()?"));
+        assert!(open_cache_state.contains("warn!"));
+        assert!(open_cache_state.contains("native open cache state unavailable"));
     }
 
     #[test]
