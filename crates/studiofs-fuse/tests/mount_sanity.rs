@@ -588,6 +588,21 @@ fn docs_list_sfs530_native_evidence_command() {
 }
 
 #[test]
+fn mounted_tests_enabled_falls_back_to_workspace_dotenv_value() {
+    assert!(mounted_tests_enabled_from_values(None, Some("1")));
+}
+
+#[test]
+fn mounted_tests_enabled_prefers_process_env_value() {
+    assert!(!mounted_tests_enabled_from_values(Some("0"), Some("1")));
+}
+
+#[test]
+fn mounted_tests_enabled_treats_empty_process_env_as_unset() {
+    assert!(mounted_tests_enabled_from_values(Some(""), Some("1")));
+}
+
+#[test]
 fn native_sfs530_mounted_scenarios_are_exposed_as_opt_in_tests() {
     let source = include_str!("mount_sanity.rs");
 
@@ -866,7 +881,18 @@ fn make_test_vfs(
 }
 
 fn mounted_tests_enabled() -> bool {
-    std::env::var(MOUNT_TESTS_ENV).as_deref() == Ok("1")
+    load_test_env();
+    mounted_tests_enabled_from_values(
+        std::env::var(MOUNT_TESTS_ENV).ok().as_deref(),
+        workspace_dotenv_var(MOUNT_TESTS_ENV).as_deref(),
+    )
+}
+
+fn mounted_tests_enabled_from_values(process_env: Option<&str>, dotenv_env: Option<&str>) -> bool {
+    process_env
+        .filter(|value| !value.trim().is_empty())
+        .or(dotenv_env)
+        .is_some_and(|value| value == "1")
 }
 
 fn current_uid_gid() -> (libc::uid_t, libc::gid_t) {
