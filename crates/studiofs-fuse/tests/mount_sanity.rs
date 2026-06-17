@@ -616,6 +616,19 @@ fn parse_fio_size_bytes_accepts_binary_suffixes() {
 }
 
 #[test]
+fn parse_fio_size_bytes_avoids_lowercase_allocation() {
+    let source = include_str!("mount_sanity.rs");
+    let parser = source
+        .rsplit("fn parse_fio_size_bytes(value: &str) -> Option<u64> {")
+        .next()
+        .and_then(|rest| rest.split("fn sfs509_cache_budget_bytes").next())
+        .expect("fio size parser should be present");
+
+    assert!(!parser.contains("to_ascii_lowercase"));
+    assert!(parser.contains("eq_ignore_ascii_case"));
+}
+
+#[test]
 fn sfs509_cache_budget_covers_large_file_workload() {
     let budget = sfs509_cache_budget_bytes("1536m");
 
@@ -960,12 +973,26 @@ fn parse_fio_size_bytes(value: &str) -> Option<u64> {
         return None;
     }
     let amount = digits.parse::<u64>().ok()?;
-    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        _ => return None,
+    let suffix = suffix.trim();
+    let multiplier = if suffix.is_empty() || suffix.eq_ignore_ascii_case("b") {
+        1
+    } else if suffix.eq_ignore_ascii_case("k")
+        || suffix.eq_ignore_ascii_case("kb")
+        || suffix.eq_ignore_ascii_case("kib")
+    {
+        1024
+    } else if suffix.eq_ignore_ascii_case("m")
+        || suffix.eq_ignore_ascii_case("mb")
+        || suffix.eq_ignore_ascii_case("mib")
+    {
+        1024 * 1024
+    } else if suffix.eq_ignore_ascii_case("g")
+        || suffix.eq_ignore_ascii_case("gb")
+        || suffix.eq_ignore_ascii_case("gib")
+    {
+        1024 * 1024 * 1024
+    } else {
+        return None;
     };
 
     amount.checked_mul(multiplier)
