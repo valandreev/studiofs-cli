@@ -167,28 +167,16 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     }
 
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
-        let slices = reply.io_slices();
+        let io_slices = reply.io_slices();
+        let slices = io_slices.as_slice();
         if slices.len() == 1 {
             self.io.write_all(slices[0].as_ref())?;
         } else {
             let mut written = 0;
-            let expected = slices.iter().map(|slice| slice.len()).sum();
+            let expected: usize = slices.iter().map(|slice| slice.len()).sum();
             while written < expected {
-                let mut start = written;
-                let pending: Vec<_> = slices
-                    .iter()
-                    .filter_map(|slice| {
-                        if start >= slice.len() {
-                            start -= slice.len();
-                            None
-                        } else {
-                            let pending = io::IoSlice::new(&slice.as_ref()[start..]);
-                            start = 0;
-                            Some(pending)
-                        }
-                    })
-                    .collect();
-                let bytes = self.io.write_vectored(&pending)?;
+                let pending = pending_reply_slices(slices, written);
+                let bytes = self.io.write_vectored(pending.as_slice())?;
                 if bytes == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -205,6 +193,38 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     fn request_shutdown(&mut self) -> Result<(), TransportError> {
         self.shutdown_requested = true;
         Ok(())
+    }
+}
+
+struct PendingReplySlices<'a> {
+    slices: [io::IoSlice<'a>; 2],
+    len: usize,
+}
+
+impl<'a> PendingReplySlices<'a> {
+    fn as_slice(&self) -> &[io::IoSlice<'a>] {
+        &self.slices[..self.len]
+    }
+}
+
+fn pending_reply_slices<'a>(
+    slices: &'a [io::IoSlice<'a>],
+    mut offset: usize,
+) -> PendingReplySlices<'a> {
+    let mut pending = [io::IoSlice::new(&[]), io::IoSlice::new(&[])];
+    let mut len = 0;
+    for slice in slices {
+        if offset >= slice.len() {
+            offset -= slice.len();
+            continue;
+        }
+        pending[len] = io::IoSlice::new(&slice.as_ref()[offset..]);
+        len += 1;
+        offset = 0;
+    }
+    PendingReplySlices {
+        slices: pending,
+        len,
     }
 }
 

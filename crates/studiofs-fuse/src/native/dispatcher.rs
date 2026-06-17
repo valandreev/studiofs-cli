@@ -205,8 +205,8 @@ impl OperationBarrierGates {
         while state.entries.get(&resource).is_some_and(|entry| {
             entry
                 .pending_writes
-                .iter()
-                .any(|sequence| *sequence <= barrier_sequence)
+                .first()
+                .is_some_and(|sequence| *sequence <= barrier_sequence)
         }) {
             let changed = {
                 let entry = state
@@ -292,6 +292,23 @@ impl DispatchTelemetryState {
                 .map(|depth| depth.load(Ordering::Relaxed)),
             backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
         }
+    }
+}
+
+struct QueueDepthGuard {
+    telemetry: Arc<DispatchTelemetryState>,
+    class: RequestClass,
+}
+
+impl QueueDepthGuard {
+    fn new(telemetry: Arc<DispatchTelemetryState>, class: RequestClass) -> Self {
+        Self { telemetry, class }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        self.telemetry.queue_depths[self.class.index()].fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -414,8 +431,8 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
                 let worker_telemetry = Arc::clone(&telemetry);
                 let worker = thread::spawn(move || {
                     while let Ok(envelope) = receiver.recv() {
+                        let _depth = QueueDepthGuard::new(Arc::clone(&worker_telemetry), class);
                         handler.handle(envelope);
-                        worker_telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
                     }
                 });
                 workers.push(worker);
@@ -707,6 +724,20 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PanickingAsyncHandler {
+        started: mpsc::Sender<()>,
+    }
+
+    impl AsyncFuseOperationHandler<RecordedReplySink> for PanickingAsyncHandler {
+        fn handle(&self, _envelope: OwnedFuseRequest<RecordedReplySink>) {
+            self.started
+                .send(())
+                .expect("test should receive handler start");
+            panic!("intentional handler panic");
+        }
+    }
+
     #[test]
     fn async_dispatcher_submits_hot_operation_without_waiting_for_handler_reply() {
         let sink = RecordedReplySink::default();
@@ -828,6 +859,38 @@ mod tests {
         dispatcher
             .shutdown()
             .expect("dispatcher should join workers");
+    }
+
+    #[test]
+    fn async_dispatcher_releases_queue_depth_when_handler_panics() {
+        let sink = RecordedReplySink::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let dispatcher =
+            NativeAsyncDispatcher::<RecordedReplySink>::builder(PanickingAsyncHandler {
+                started: started_tx,
+            })
+            .queue_capacity(RequestClass::Read, 1)
+            .spawn();
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0xa1),
+                sink.clone(),
+            ))
+            .expect("read should enter bounded queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("handler should start and panic");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while dispatcher.telemetry().queue_depth(RequestClass::Read) != 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(dispatcher.telemetry().queue_depth(RequestClass::Read), 0);
+        assert_eq!(sink.completed_unique_ids(), [0xa1]);
+        assert_eq!(dispatcher.shutdown(), Err(DispatchError::WorkerPanicked));
     }
 
     #[test]

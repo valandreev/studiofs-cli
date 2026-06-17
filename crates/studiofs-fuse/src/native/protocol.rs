@@ -111,12 +111,12 @@ impl FuseReply {
         }
     }
 
-    /// Returns vectored slices for transport writeback.
-    pub fn io_slices(&self) -> Vec<IoSlice<'_>> {
+    /// Returns vectored slices for transport writeback without heap allocation.
+    pub fn io_slices(&self) -> FuseReplyIoSlices<'_> {
         match &self.frame {
-            FuseReplyFrame::Contiguous(bytes) => vec![IoSlice::new(bytes)],
+            FuseReplyFrame::Contiguous(bytes) => FuseReplyIoSlices::one(IoSlice::new(bytes)),
             FuseReplyFrame::Segmented { header, payload } => {
-                vec![IoSlice::new(header), IoSlice::new(payload)]
+                FuseReplyIoSlices::two(IoSlice::new(header), IoSlice::new(payload))
             }
         }
     }
@@ -127,6 +127,43 @@ impl FuseReply {
             FuseReplyFrame::Contiguous(bytes) => Some(bytes),
             FuseReplyFrame::Segmented { .. } => None,
         }
+    }
+}
+
+/// Fixed-size vectored reply slices.
+pub struct FuseReplyIoSlices<'a> {
+    slices: [IoSlice<'a>; 2],
+    len: usize,
+}
+
+impl<'a> FuseReplyIoSlices<'a> {
+    fn one(first: IoSlice<'a>) -> Self {
+        Self {
+            slices: [first, IoSlice::new(&[])],
+            len: 1,
+        }
+    }
+
+    fn two(first: IoSlice<'a>, second: IoSlice<'a>) -> Self {
+        Self {
+            slices: [first, second],
+            len: 2,
+        }
+    }
+
+    /// Returns active slices.
+    pub fn as_slice(&self) -> &[IoSlice<'a>] {
+        &self.slices[..self.len]
+    }
+
+    /// Returns active slice count.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether there are no active slices.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
