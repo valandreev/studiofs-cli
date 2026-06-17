@@ -13,6 +13,8 @@ pub enum FuseOpcode {
     Lookup,
     /// `FUSE_GETATTR`: fetch attributes for a node.
     Getattr,
+    /// `FUSE_SETATTR`: update attributes for a node.
+    Setattr,
     /// `FUSE_OPEN`: open a regular file.
     Open,
     /// `FUSE_READ`: read file data from an open file handle or node.
@@ -33,6 +35,18 @@ pub enum FuseOpcode {
     Opendir,
     /// `FUSE_READDIR`: read directory entries from an open directory stream.
     Readdir,
+    /// `FUSE_RELEASEDIR`: close a previously opened directory stream.
+    Releasedir,
+    /// `FUSE_READDIRPLUS`: read directory entries with attributes.
+    Readdirplus,
+    /// `FUSE_MKDIR`: create a directory.
+    Mkdir,
+    /// `FUSE_CREATE`: create and open a regular file.
+    Create,
+    /// `FUSE_UNLINK`: remove a regular file name.
+    Unlink,
+    /// `FUSE_RENAME`: rename a namespace entry.
+    Rename,
     /// `FUSE_DESTROY`: terminate the kernel connection.
     Destroy,
     /// Any opcode not yet modeled by the native bridge.
@@ -392,6 +406,10 @@ impl FuseOpcode {
         match opcode {
             1 => Self::Lookup,
             3 => Self::Getattr,
+            4 => Self::Setattr,
+            9 => Self::Mkdir,
+            10 => Self::Unlink,
+            12 => Self::Rename,
             14 => Self::Open,
             15 => Self::Read,
             16 => Self::Write,
@@ -402,7 +420,10 @@ impl FuseOpcode {
             26 => Self::Init,
             27 => Self::Opendir,
             28 => Self::Readdir,
+            29 => Self::Releasedir,
+            35 => Self::Create,
             38 => Self::Destroy,
+            44 => Self::Readdirplus,
             other => Self::Other(other),
         }
     }
@@ -450,6 +471,10 @@ mod tests {
         for (raw, expected) in [
             (1, FuseOpcode::Lookup),
             (3, FuseOpcode::Getattr),
+            (4, FuseOpcode::Setattr),
+            (9, FuseOpcode::Mkdir),
+            (10, FuseOpcode::Unlink),
+            (12, FuseOpcode::Rename),
             (14, FuseOpcode::Open),
             (15, FuseOpcode::Read),
             (16, FuseOpcode::Write),
@@ -460,7 +485,10 @@ mod tests {
             (26, FuseOpcode::Init),
             (27, FuseOpcode::Opendir),
             (28, FuseOpcode::Readdir),
+            (29, FuseOpcode::Releasedir),
+            (35, FuseOpcode::Create),
             (38, FuseOpcode::Destroy),
+            (44, FuseOpcode::Readdirplus),
         ] {
             assert_eq!(FuseOpcode::from_raw(raw), expected);
         }

@@ -91,15 +91,24 @@ impl RequestClass {
         match opcode {
             FuseOpcode::Read => Self::Read,
             FuseOpcode::Write => Self::Write,
-            FuseOpcode::Flush | FuseOpcode::Fsync | FuseOpcode::Release => Self::Barrier,
+            FuseOpcode::Flush
+            | FuseOpcode::Fsync
+            | FuseOpcode::Release
+            | FuseOpcode::Releasedir
+            | FuseOpcode::Setattr => Self::Barrier,
             FuseOpcode::Other(_) => Self::Background,
             FuseOpcode::Lookup
             | FuseOpcode::Getattr
+            | FuseOpcode::Mkdir
+            | FuseOpcode::Create
+            | FuseOpcode::Unlink
+            | FuseOpcode::Rename
             | FuseOpcode::Open
             | FuseOpcode::Statfs
             | FuseOpcode::Init
             | FuseOpcode::Opendir
             | FuseOpcode::Readdir
+            | FuseOpcode::Readdirplus
             | FuseOpcode::Destroy => Self::Metadata,
         }
     }
