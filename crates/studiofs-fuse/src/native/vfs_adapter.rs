@@ -33,6 +33,7 @@ const NATIVE_MAX_READ_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const POSIX_STAT_BLOCK_SIZE: u64 = 512;
 const FATTR_FH: u32 = 1 << 0;
 const FATTR_SIZE: u32 = 1 << 3;
+const SUPPORTED_SETATTR_VALID: u32 = FATTR_FH | FATTR_SIZE;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 /// File kind used by the native operation adapter before Linux ABI encoding.
@@ -371,19 +372,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn readdir(&self, ino: u64, fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
-        if let Some(entries) = self.directory_handles.entries(ino, fh) {
-            return Ok(entries);
-        }
-        self.vfs
-            .readdir(ino)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(native_dir_entry)
-                    .collect::<Vec<_>>()
-                    .into()
-            })
-            .map_err(|error| vfs_err_to_errno(&error))
+        self.directory_handles.entries(ino, fh).ok_or(libc::EINVAL)
     }
 
     fn mkdir(
@@ -866,8 +855,11 @@ fn errno_reply(unique: u64, errno: i32) -> FuseReply {
 }
 
 fn lookup_name(payload: &[u8]) -> Option<&[u8]> {
-    let name = payload.strip_suffix(&[0]).unwrap_or(payload);
-    (!name.is_empty()).then_some(name)
+    let name = payload.strip_suffix(&[0])?;
+    if name.is_empty() || name.contains(&0) {
+        return None;
+    }
+    Some(name)
 }
 
 fn open_flags(payload: &[u8]) -> Option<i32> {
@@ -1016,7 +1008,7 @@ struct TruncateRequest {
 fn truncate_request(payload: &[u8]) -> Option<TruncateRequest> {
     let bytes = payload.get(..FUSE_SETATTR_IN_LEN)?;
     let valid = read_u32(bytes, 0)?;
-    if valid & FATTR_SIZE == 0 {
+    if valid & !SUPPORTED_SETATTR_VALID != 0 || valid & FATTR_SIZE == 0 {
         return None;
     }
     let fh = if valid & FATTR_FH != 0 {
@@ -1582,6 +1574,15 @@ mod tests {
         assert!(!store.release(21, fh));
         assert!(store.entries(20, fh).is_some());
         assert!(store.release(20, fh));
+    }
+
+    #[test]
+    fn directory_handle_store_entries_rejects_unknown_or_mismatched_handles() {
+        let store = NativeDirectoryHandleStore::default();
+        let fh = store.open(20, Arc::from([dir_entry(21, b"child")]));
+
+        assert!(store.entries(20, fh + 1).is_none());
+        assert!(store.entries(21, fh).is_none());
     }
 
     #[test]

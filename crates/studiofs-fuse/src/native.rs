@@ -249,6 +249,10 @@ mod tests {
     fn lookup_request(parent: u64, name: &[u8]) -> FuseRequest {
         let mut payload = Vec::from(name);
         payload.push(0);
+        lookup_request_with_payload(parent, payload)
+    }
+
+    fn lookup_request_with_payload(parent: u64, payload: Vec<u8>) -> FuseRequest {
         FuseRequest {
             header: FuseInHeader::new(
                 (FUSE_IN_HEADER_LEN + payload.len()) as u32,
@@ -537,8 +541,12 @@ mod tests {
     fn truncate_request(ino: u64, fh: Option<u64>, size: u64) -> FuseRequest {
         const FATTR_FH: u32 = 1 << 0;
         const FATTR_SIZE: u32 = 1 << 3;
-        let mut payload = Vec::new();
         let valid = FATTR_SIZE | if fh.is_some() { FATTR_FH } else { 0 };
+        setattr_request(ino, valid, fh, size)
+    }
+
+    fn setattr_request(ino: u64, valid: u32, fh: Option<u64>, size: u64) -> FuseRequest {
+        let mut payload = Vec::new();
         payload.extend_from_slice(&valid.to_le_bytes());
         payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&fh.unwrap_or(0).to_le_bytes());
@@ -765,6 +773,54 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(entry_reply_nodeid(reply), 42);
+    }
+
+    #[test]
+    fn native_bridge_lookup_rejects_missing_name_terminator_without_calling_vfs() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 42,
+            size: 4096,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(lookup_request_with_payload(1, b"alpha.txt".to_vec()));
+        let reply = reply.bytes().expect("lookup error should be contiguous");
+
+        assert_eq!(reply_error(reply), -libc::EINVAL);
+        assert!(
+            vfs.lookups
+                .lock()
+                .expect("lookup calls lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_bridge_lookup_rejects_embedded_nul_without_calling_vfs() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 42,
+            size: 4096,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(lookup_request_with_payload(1, b"alpha\0beta\0".to_vec()));
+        let reply = reply.bytes().expect("lookup error should be contiguous");
+
+        assert_eq!(reply_error(reply), -libc::EINVAL);
+        assert!(
+            vfs.lookups
+                .lock()
+                .expect("lookup calls lock should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1273,6 +1329,30 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_rename_rejects_embedded_nul_in_new_name_without_calling_vfs() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 0,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(rename_request(1, b"old", 2, b"new\0suffix"));
+        let reply = reply.bytes().expect("rename error should be contiguous");
+
+        assert_eq!(reply_error(reply), -libc::EINVAL);
+        assert!(
+            vfs.renames
+                .lock()
+                .expect("rename calls lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn native_bridge_statfs_calls_vfs_and_returns_statfs_reply() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,
@@ -1321,6 +1401,32 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(attr_reply_size(reply), 1234);
+    }
+
+    #[test]
+    fn native_bridge_setattr_rejects_unsupported_bits_without_truncating() {
+        const FATTR_SIZE: u32 = 1 << 3;
+        const FATTR_MODE: u32 = 1 << 1;
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(setattr_request(99, FATTR_SIZE | FATTR_MODE, None, 1234));
+        let reply = reply.bytes().expect("setattr error should be contiguous");
+
+        assert_eq!(reply_error(reply), -libc::EINVAL);
+        assert!(
+            vfs.truncates
+                .lock()
+                .expect("truncate calls lock should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
