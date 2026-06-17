@@ -168,9 +168,34 @@ impl Default for BarrierEntry {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BarrierShared {
-    state: Mutex<BarrierState>,
+    shards: [Mutex<BarrierState>; Self::SHARD_COUNT],
+}
+
+impl BarrierShared {
+    const SHARD_COUNT: usize = 64;
+
+    fn shard_index(resource: ResourceKey) -> usize {
+        let value = match resource {
+            ResourceKey::Inode(inode) => inode,
+            ResourceKey::Handle(handle) => handle.rotate_left(32) ^ 0xa5a5_a5a5_a5a5_a5a5,
+        };
+
+        (value as usize) & (Self::SHARD_COUNT - 1)
+    }
+
+    fn shard(&self, resource: ResourceKey) -> &Mutex<BarrierState> {
+        &self.shards[Self::shard_index(resource)]
+    }
+}
+
+impl Default for BarrierShared {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(BarrierState::default())),
+        }
+    }
 }
 
 /// Per-resource gates for write and barrier operation ordering.
@@ -182,7 +207,7 @@ pub struct OperationBarrierGates {
 impl OperationBarrierGates {
     /// Records a pending write for `resource` until the returned guard drops.
     pub fn begin_write(&self, resource: ResourceKey) -> PendingWriteGuard {
-        let mut state = lock_or_recover(&self.shared.state);
+        let mut state = lock_or_recover(self.shared.shard(resource));
         let entry = state.entries.entry(resource).or_default();
         entry.next_sequence += 1;
         let sequence = entry.next_sequence;
@@ -196,7 +221,8 @@ impl OperationBarrierGates {
 
     /// Waits until writes for `resource` drain.
     pub fn wait_for_barrier(&self, resource: ResourceKey) {
-        let mut state = lock_or_recover(&self.shared.state);
+        let shard = self.shared.shard(resource);
+        let mut state = lock_or_recover(shard);
         let barrier_sequence = state
             .entries
             .get(&resource)
@@ -242,7 +268,7 @@ pub struct PendingWriteGuard {
 
 impl Drop for PendingWriteGuard {
     fn drop(&mut self) {
-        let mut state = lock_or_recover(&self.shared.state);
+        let mut state = lock_or_recover(self.shared.shard(self.resource));
         let mut changed = None;
         let mut remove_entry = false;
         if let Some(entry) = state.entries.get_mut(&self.resource) {
@@ -952,6 +978,15 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_millis(250))
             .expect("barrier should not wait for other inode writes");
+    }
+
+    #[test]
+    fn barrier_gate_shards_independent_resource_state() {
+        assert_ne!(
+            BarrierShared::shard_index(ResourceKey::Inode(20)),
+            BarrierShared::shard_index(ResourceKey::Inode(21))
+        );
+        assert_eq!(BarrierShared::SHARD_COUNT, 64);
     }
 
     #[test]
