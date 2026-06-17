@@ -120,6 +120,7 @@ pub struct NativeReadAheadPolicy {
 pub struct NativeReadAheadState {
     last_end: Option<u64>,
     sequential_reads: u32,
+    last_prefetch_end: Option<u64>,
 }
 
 /// File range selected for local-cache prefetch.
@@ -201,6 +202,7 @@ pub fn decide_native_read_ahead(
     state.sequential_reads = if sequential {
         state.sequential_reads.saturating_add(1)
     } else {
+        state.last_prefetch_end = None;
         1
     };
     state.last_end = Some(end);
@@ -212,7 +214,25 @@ pub fn decide_native_read_ahead(
         };
     }
 
-    let available = file_size - end;
+    if let Some(last_prefetch_end) = state.last_prefetch_end {
+        let remaining_prefetched = last_prefetch_end.saturating_sub(end);
+        if end < last_prefetch_end && remaining_prefetched > policy.max_prefetch_bytes / 2 {
+            return NativeReadAheadDecision {
+                prefetch: None,
+                read_amplification_bytes: 0,
+            };
+        }
+    }
+
+    let prefetch_start = state.last_prefetch_end.unwrap_or(end).max(end);
+    if prefetch_start >= file_size {
+        return NativeReadAheadDecision {
+            prefetch: None,
+            read_amplification_bytes: 0,
+        };
+    }
+
+    let available = file_size - prefetch_start;
     let len = available.min(policy.max_prefetch_bytes);
     if len == 0 {
         NativeReadAheadDecision {
@@ -220,8 +240,12 @@ pub fn decide_native_read_ahead(
             read_amplification_bytes: 0,
         }
     } else {
+        state.last_prefetch_end = Some(prefetch_start + len);
         NativeReadAheadDecision {
-            prefetch: Some(NativePrefetchRange { offset: end, len }),
+            prefetch: Some(NativePrefetchRange {
+                offset: prefetch_start,
+                len,
+            }),
             read_amplification_bytes: len,
         }
     }
@@ -434,6 +458,38 @@ mod tests {
             Some(NativePrefetchRange {
                 offset: 8192,
                 len: 128 * 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn sequential_reads_do_not_repeat_prefetch_inside_existing_window() {
+        let policy = NativeReadAheadPolicy {
+            max_prefetch_bytes: 16 * 1024,
+            sequential_window_bytes: 4096,
+            min_sequential_reads: 2,
+        };
+        let mut history = NativeReadAheadState::default();
+
+        let first = decide_native_read_ahead(&policy, &mut history, 0, 4096, 1024 * 1024);
+        let second = decide_native_read_ahead(&policy, &mut history, 4096, 4096, 1024 * 1024);
+        let third = decide_native_read_ahead(&policy, &mut history, 8192, 4096, 1024 * 1024);
+        let fourth = decide_native_read_ahead(&policy, &mut history, 12_288, 4096, 1024 * 1024);
+
+        assert_eq!(first.prefetch, None);
+        assert_eq!(
+            second.prefetch,
+            Some(NativePrefetchRange {
+                offset: 8192,
+                len: 16 * 1024,
+            })
+        );
+        assert_eq!(third.prefetch, None);
+        assert_eq!(
+            fourth.prefetch,
+            Some(NativePrefetchRange {
+                offset: 24_576,
+                len: 16 * 1024,
             })
         );
     }
