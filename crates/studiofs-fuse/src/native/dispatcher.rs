@@ -375,6 +375,30 @@ pub enum DispatchError {
     /// The underlying transport failed while receiving a request or sending a reply.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The underlying transport failed while receiving the next request.
+    #[error("receive FUSE request failed")]
+    Receive {
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
+    /// The underlying transport failed while sending a reply.
+    #[error(
+        "send FUSE reply failed: opcode={opcode:?}; unique={unique}; reply_len={reply_len}; reply_error={reply_error:?}"
+    )]
+    SendReply {
+        /// Request opcode whose reply failed.
+        opcode: FuseOpcode,
+        /// Request id whose reply failed.
+        unique: u64,
+        /// Serialized reply length.
+        reply_len: usize,
+        /// FUSE reply error code from the output header, when present.
+        reply_error: Option<i32>,
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
     /// A bounded operation queue has no capacity for another request.
     #[error("native FUSE dispatcher queue full for {class:?}")]
     QueueFull {
@@ -457,21 +481,18 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
             handled_requests: 0,
             saw_destroy: false,
         };
-        while let Some(request) = self.transport.receive_request().map_err(|error| {
-            DispatchError::Transport(TransportError::Io(std::io::Error::other(format!(
-                "receive FUSE request: {error}"
-            ))))
-        })? {
+        while let Some(request) = self
+            .transport
+            .receive_request()
+            .map_err(|error| DispatchError::Receive { source: error })?
+        {
             let is_destroy = request.opcode == FuseOpcode::Destroy;
             let opcode = request.opcode;
             let unique = request.header.unique;
             let reply = self.handler.handle(request);
             if !reply.is_no_reply() {
-                let reply_bytes = reply.to_vec();
-                let reply_len = reply_bytes.len();
-                let reply_error = reply_bytes
-                    .get(4..8)
-                    .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("slice length")));
+                let reply_len = reply.frame_len();
+                let reply_error = reply.error_code();
                 if let Err(error) = self.transport.send_reply(reply) {
                     if opcode == FuseOpcode::Release
                         && reply_error == Some(0)
@@ -480,11 +501,13 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                         summary.handled_requests += 1;
                         continue;
                     }
-                    return Err(DispatchError::Transport(TransportError::Io(
-                        std::io::Error::other(format!(
-                            "send FUSE reply: {error}; opcode={opcode:?}; unique={unique}; reply_len={reply_len}; reply_error={reply_error:?}"
-                        )),
-                    )));
+                    return Err(DispatchError::SendReply {
+                        opcode,
+                        unique,
+                        reply_len,
+                        reply_error,
+                        source: error,
+                    });
                 }
             }
             summary.handled_requests += 1;
@@ -804,6 +827,36 @@ mod tests {
         );
         assert_eq!(handler.handled, 1);
         assert!(transport.sent_replies().is_empty());
+    }
+
+    struct EioOnReplyTransport {
+        inner: FrameQueueTransport,
+    }
+
+    impl FuseTransport for EioOnReplyTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, _reply: FuseReply) -> Result<(), TransportError> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+        }
+    }
+
+    #[test]
+    fn dispatcher_preserves_send_reply_transport_source_errno() {
+        let transport = EioOnReplyTransport {
+            inner: FrameQueueTransport::new([frame(1, 0x21)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        match dispatcher.run_until_destroy() {
+            Err(DispatchError::SendReply { source, .. }) => {
+                assert_eq!(transport_error_raw_errno(&source), Some(libc::EIO));
+            }
+            result => panic!("expected structured send reply error, got {result:?}"),
+        }
     }
 
     #[test]

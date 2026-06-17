@@ -574,6 +574,19 @@ impl PendingWriteRegistration {
 }
 
 impl PendingWriteTurn {
+    pub(crate) fn wait_blocking(mut self) {
+        let shard = &self.shared.shards[self.shard_index];
+        {
+            let state = shard.lock_state();
+            if state.is_registration_turn(self.key, self.sequence) {
+                return;
+            }
+        }
+        if let Some(receiver) = self.turn_receiver.take() {
+            let _ = receiver.blocking_recv();
+        }
+    }
+
     pub(crate) async fn wait(mut self) {
         let shard = &self.shared.shards[self.shard_index];
         {

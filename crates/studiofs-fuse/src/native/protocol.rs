@@ -215,6 +215,31 @@ impl FuseReply {
         }
     }
 
+    /// Returns the `fuse_out_header.error` field when this reply has an output header.
+    pub fn error_code(&self) -> Option<i32> {
+        let header = match &self.frame {
+            FuseReplyFrame::NoReply => return None,
+            FuseReplyFrame::Contiguous(bytes) => bytes.get(..FUSE_OUT_HEADER_LEN)?,
+            FuseReplyFrame::Segmented { header, .. } => header,
+            FuseReplyFrame::LocalCacheRange { header, .. } => header,
+        };
+        Some(i32::from_le_bytes(
+            header[4..8].try_into().expect("slice length"),
+        ))
+    }
+
+    /// Returns the total serialized frame length.
+    pub fn frame_len(&self) -> usize {
+        match &self.frame {
+            FuseReplyFrame::NoReply => 0,
+            FuseReplyFrame::Contiguous(bytes) => bytes.len(),
+            FuseReplyFrame::Segmented { header, payload } => header.len() + payload.len(),
+            FuseReplyFrame::LocalCacheRange { header, range, .. } => {
+                header.len() + range.len as usize
+            }
+        }
+    }
+
     /// Returns vectored slices for transport writeback without heap allocation.
     pub fn io_slices(&self) -> FuseReplyIoSlices<'_> {
         match &self.frame {
@@ -578,6 +603,7 @@ impl FuseOpcode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::abi::error_reply;
 
     fn frame_with_payload(opcode: u32, unique: u64, payload: &[u8]) -> Vec<u8> {
         let len = (FUSE_IN_HEADER_LEN + payload.len()) as u32;
@@ -687,6 +713,13 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuse_reply_error_code_reads_fuse_out_header_errno() {
+        let reply = FuseReply::contiguous(0x55, error_reply(0x55, libc::EIO).to_vec());
+
+        assert_eq!(reply.error_code(), Some(-libc::EIO));
     }
 
     #[test]

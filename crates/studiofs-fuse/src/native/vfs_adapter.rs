@@ -4,7 +4,7 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
@@ -55,6 +55,39 @@ const SUPPORTED_SETATTR_VALID: u32 =
     FATTR_FH | FATTR_SIZE | FATTR_MTIME | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const NATIVE_ASYNC_WRITE_WORKERS: usize = 4;
+
+type NativeAsyncWriteJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct NativeAsyncWriteExecutor {
+    sender: crossbeam_channel::Sender<NativeAsyncWriteJob>,
+}
+
+impl NativeAsyncWriteExecutor {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded::<NativeAsyncWriteJob>();
+        for _ in 0..NATIVE_ASYNC_WRITE_WORKERS {
+            let worker_receiver = receiver.clone();
+            std::thread::spawn(move || {
+                while let Ok(job) = worker_receiver.recv() {
+                    job();
+                }
+            });
+        }
+        Self { sender }
+    }
+
+    fn submit(&self, job: NativeAsyncWriteJob) -> Result<(), NativeAsyncWriteJob> {
+        self.sender
+            .send(job)
+            .map_err(|crossbeam_channel::SendError(job)| job)
+    }
+}
+
+fn native_async_write_executor() -> &'static NativeAsyncWriteExecutor {
+    static EXECUTOR: OnceLock<NativeAsyncWriteExecutor> = OnceLock::new();
+    EXECUTOR.get_or_init(NativeAsyncWriteExecutor::new)
+}
 
 /// Stable local cache file range that a native Linux read transport may use.
 pub type NativeLocalCacheReadRange = FuseLocalCacheReadRange;
@@ -1027,7 +1060,7 @@ where
         config: &NativeAsyncWriteConfig,
     ) -> FuseReply {
         let data_len = write.data.len();
-        let registration = match self.pending_writes.try_register_with_admission(
+        let registration = match self.pending_writes.register_with_admission(
             ino,
             write.fh,
             data_len,
@@ -1047,20 +1080,10 @@ where
         let fh = write.fh;
         let offset = write.offset;
         let flags = write.flags;
-        std::thread::spawn(move || {
+        let job = Box::new(move || {
             let mut registration = registration;
             let turn = registration.turn_waiter();
-            let turn_wait_result = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .map(|rt| rt.block_on(turn.wait()));
-            if turn_wait_result.is_err() {
-                registration.complete(PendingWriteCompletion::TaskFailed);
-                vfs.record_async_write_snapshot(native_async_write_snapshot(
-                    &pending_writes,
-                    &config,
-                ));
-                return;
-            }
+            turn.wait_blocking();
             let completion = match vfs.write(fh, ino, offset, &data, flags) {
                 Ok(_) => PendingWriteCompletion::Success,
                 Err(errno) => PendingWriteCompletion::Error(errno),
@@ -1068,6 +1091,9 @@ where
             registration.complete(completion);
             vfs.record_async_write_snapshot(native_async_write_snapshot(&pending_writes, &config));
         });
+        if let Err(job) = native_async_write_executor().submit(job) {
+            job();
+        }
 
         FuseReply::contiguous(unique, ok_reply(unique, &write_payload(data_len as u32)))
     }
@@ -2848,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_write_rejects_async_admission_when_pending_bytes_are_full() {
+    fn handle_write_waits_for_async_admission_when_pending_bytes_are_full() {
         let fixture = blocking_write_fixture();
         let bridge = Arc::new(
             LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
@@ -2870,22 +2896,51 @@ mod tests {
             .recv_timeout(std::time::Duration::from_millis(250))
             .expect("first async write should enter backend and hold admission bytes");
 
-        let rejected = bridge.handle_write(write_request_for_data(20, 8, 7, b"blocked"));
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let second_bridge = Arc::clone(&bridge);
+        let second = std::thread::spawn(move || {
+            let reply = second_bridge.handle_write(write_request_for_data(20, 8, 7, b"blocked"));
+            second_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe second write reply");
+        });
 
-        assert_eq!(reply_errno(&rejected), -libc::EAGAIN);
         assert!(
-            fixture
-                .write_started
+            second_done_rx
                 .recv_timeout(std::time::Duration::from_millis(50))
                 .is_err(),
-            "rejected write must not enter backend"
+            "second blocking write must wait for admission instead of returning EAGAIN"
         );
 
         fixture
             .release_write
             .send(())
-            .expect("test should unblock write");
+            .expect("test should unblock first write");
         writer.join().expect("write thread should finish");
+        assert_eq!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("second write should be admitted after first write completes"),
+            0
+        );
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock second write");
+        second.join().expect("second write thread should finish");
+    }
+
+    #[test]
+    fn handle_async_write_uses_shared_executor_instead_of_per_write_threads() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn handle_async_write(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_flush(").next())
+            .expect("handle_async_write body should be present");
+
+        assert!(!body.contains("std::thread::spawn"));
+        assert!(!body.contains("new_current_thread"));
     }
 
     #[test]

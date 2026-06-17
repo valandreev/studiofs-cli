@@ -97,6 +97,31 @@ pub enum SessionError {
     /// The transport ended before the kernel sent the mandatory INIT request.
     #[error("FUSE session ended before INIT")]
     MissingInit,
+    /// The transport failed while reading the mandatory INIT request.
+    #[error("receive INIT failed")]
+    InitReceive {
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
+    /// The INIT request payload could not be parsed.
+    #[error("parse INIT failed")]
+    InitParse {
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
+    /// The transport failed while writing the INIT reply.
+    #[error("send INIT reply failed; kernel_caps={kernel_caps:?}; negotiated={negotiated:?}")]
+    InitReply {
+        /// Kernel capability bits from the INIT request.
+        kernel_caps: FuseCapabilities,
+        /// Negotiated session values attempted in the reply.
+        negotiated: NegotiatedSession,
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
     /// The first request was not the mandatory FUSE INIT request.
     #[error("first FUSE request was {0:?}, expected INIT")]
     ExpectedInit(FuseOpcode),
@@ -153,9 +178,7 @@ impl<T: FuseTransport> NativeFuseSession<T> {
         let request = self
             .transport
             .receive_request()
-            .map_err(|error| {
-                TransportError::Io(std::io::Error::other(format!("receive INIT: {error}")))
-            })?
+            .map_err(|error| SessionError::InitReceive { source: error })?
             .ok_or(SessionError::MissingInit)?;
         if request.opcode != FuseOpcode::Init {
             return Err(SessionError::ExpectedInit(request.opcode));
@@ -163,9 +186,7 @@ impl<T: FuseTransport> NativeFuseSession<T> {
 
         let init = FuseInitRequest::parse(&request.payload)
             .map_err(TransportError::from)
-            .map_err(|error| {
-                TransportError::Io(std::io::Error::other(format!("parse INIT: {error}")))
-            })?;
+            .map_err(|error| SessionError::InitParse { source: error })?;
         let capabilities = self
             .config
             .requested_capabilities
@@ -194,12 +215,13 @@ impl<T: FuseTransport> NativeFuseSession<T> {
             max_pages: negotiated.max_pages,
         }
         .into_reply(request.header.unique);
-        self.transport.send_reply(reply).map_err(|error| {
-            TransportError::Io(std::io::Error::other(format!(
-                "send INIT reply: {error}; kernel_caps={:?}; negotiated={negotiated:?}",
-                init.capabilities
-            )))
-        })?;
+        self.transport
+            .send_reply(reply)
+            .map_err(|error| SessionError::InitReply {
+                kernel_caps: init.capabilities,
+                negotiated,
+                source: error,
+            })?;
         self.negotiated = Some(negotiated);
         Ok(negotiated)
     }
@@ -363,6 +385,32 @@ mod tests {
         );
         assert_eq!(session.negotiated(), Some(negotiated));
         assert_eq!(session.transport.sent_replies().len(), 1);
+    }
+
+    struct EioReceiveTransport;
+
+    impl FuseTransport for EioReceiveTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            Err(io::Error::from_raw_os_error(libc::EIO).into())
+        }
+
+        fn send_reply(&mut self, _reply: FuseReply) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn handshake_preserves_init_receive_transport_source_errno() {
+        let config = NativeSessionConfig::linux6_safe(false);
+        let mut session = NativeFuseSession::new(EioReceiveTransport, config);
+
+        match session.handshake() {
+            Err(SessionError::InitReceive { source }) => match source {
+                TransportError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+                other => panic!("expected io transport error, got {other:?}"),
+            },
+            result => panic!("expected structured INIT receive error, got {result:?}"),
+        }
     }
 
     #[test]
