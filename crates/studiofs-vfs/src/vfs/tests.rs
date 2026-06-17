@@ -6531,6 +6531,49 @@ fn release_fh_clears_per_stream_read_tracking() {
 }
 
 #[test]
+fn enqueue_native_read_ahead_sends_prefetch_batch_for_touched_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "native-read-ahead-enqueue");
+    let mut channels = vfs
+        .startup
+        .lifecycle
+        .lock()
+        .channels
+        .take()
+        .expect("unstarted vfs should retain startup channels");
+    let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+
+    vfs.enqueue_native_read_ahead(42, 0, 0)
+        .expect("zero-length read-ahead is a no-op");
+    assert!(matches!(
+        channels.prefetch_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    vfs.enqueue_native_read_ahead(42, block_size + 123, block_size * 2)
+        .expect("enqueue native read-ahead");
+    let work_item = channels
+        .prefetch_rx
+        .try_recv()
+        .expect("native read-ahead should enqueue prefetch work");
+    let PrefetchWorkItem::Batch(batch) = work_item else {
+        panic!("native read-ahead should enqueue a prefetch batch");
+    };
+    assert_eq!(batch.ino, 42);
+    assert_eq!(batch.block_indices, vec![1, 2, 3]);
+    assert!(batch.read_context.is_none());
+
+    assert!(
+        vfs.enqueue_native_read_ahead(42, u64::MAX, 1).is_err(),
+        "overflowing read-ahead ranges should be rejected"
+    );
+    assert!(matches!(
+        channels.prefetch_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn active_open_overlay_tracks_only_mutating_handles() {
     assert!(!StudioVfs::active_open_overlay_required(
         OpenFlags::RDONLY,

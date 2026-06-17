@@ -124,16 +124,18 @@ fn run_pread_transport(fd: i32) -> StrategyMeasurement {
     let mut transport = ClassicReadWriteTransport::new(Cursor::new(Vec::new()));
     for iteration in 0..ITERATIONS {
         let op_started = Instant::now();
+        let reply = FuseReply::local_cache_range_data(
+            iteration as u64 + 1,
+            FuseLocalCacheReadRange::borrowed(
+                fd,
+                ((iteration * CHUNK_LEN) % DATA_LEN) as u64,
+                CHUNK_LEN as u32,
+                1,
+            ),
+        )
+        .expect("build pread local cache reply");
         transport
-            .send_reply(FuseReply::local_cache_range_data(
-                iteration as u64 + 1,
-                FuseLocalCacheReadRange::borrowed(
-                    fd,
-                    ((iteration * CHUNK_LEN) % DATA_LEN) as u64,
-                    CHUNK_LEN as u32,
-                    1,
-                ),
-            ))
+            .send_reply(reply)
             .expect("send pread local cache reply");
         latencies.push(op_started.elapsed());
     }

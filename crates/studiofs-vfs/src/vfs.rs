@@ -5173,6 +5173,28 @@ impl StudioVfs {
         cached
     }
 
+    /// Enqueues a best-effort read-ahead range for Linux native local-cache reads.
+    pub fn enqueue_native_read_ahead(&self, ino: Ino, offset: u64, len: u64) -> VfsResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            VfsError::Other(format!(
+                "native read-ahead range overflow: ino={ino}, offset={offset}, len={len}"
+            ))
+        })?;
+        let first_block = block_index_from_offset(offset, self.block_size);
+        let last_block = block_index_from_offset(end.saturating_sub(1), self.block_size);
+        let block_indices: Vec<u32> = (first_block..=last_block).collect();
+        self.prefetch_tx
+            .send(PrefetchWorkItem::Batch(PrefetchBatch::new(
+                ino,
+                block_indices,
+                None,
+            )))
+            .map_err(|_| VfsError::Other("native read-ahead queue is closed".to_string()))
+    }
+
     async fn payload_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         if let Some(payload) = self.upload_hot_get(object_id) {
             return Ok(Some(payload));

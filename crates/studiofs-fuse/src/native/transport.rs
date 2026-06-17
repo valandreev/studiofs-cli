@@ -1,5 +1,6 @@
 //! Transport boundary for Linux-native FUSE sessions.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -12,6 +13,19 @@ use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseReply, FuseRequest};
 
 const DEFAULT_CLASSIC_MAX_WRITE: usize = 16 * 1024 * 1024;
+
+thread_local! {
+    static SPLICE_PIPE: RefCell<Option<SplicePipe>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+static SPLICE_PIPE_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct SplicePipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
 
 /// Local cache read reply strategy selected by a native Linux transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +163,7 @@ pub struct ClassicReadWriteTransport<T> {
     read_buffer: Vec<u8>,
     shutdown_requested: bool,
     local_cache_strategy: LocalCacheReplyStrategy,
+    local_cache_output_fd: Option<RawFd>,
     local_cache_metrics: Arc<LocalCacheReplyMetrics>,
 }
 
@@ -165,8 +180,16 @@ impl<T> ClassicReadWriteTransport<T> {
             read_buffer: vec![0; FUSE_IN_HEADER_LEN + max_write],
             shutdown_requested: false,
             local_cache_strategy: LocalCacheReplyStrategy::PreadBytes,
+            local_cache_output_fd: None,
             local_cache_metrics: Arc::new(LocalCacheReplyMetrics::default()),
         }
+    }
+
+    /// Wraps an I/O object and records its raw output fd for splice replies.
+    pub fn with_output_fd(io: T, output_fd: RawFd) -> Self {
+        let mut transport = Self::new(io);
+        transport.local_cache_output_fd = Some(output_fd);
+        transport
     }
 
     /// Selects the local-cache read reply strategy for this transport.
@@ -260,11 +283,14 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
                     copy_local_cache_range_with_pread(owned_range, &mut self.io)?;
                 }
                 LocalCacheReplyStrategy::Splice => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "splice local-cache replies require a raw FUSE fd transport",
-                    )
-                    .into());
+                    let Some(output_fd) = self.local_cache_output_fd else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "splice local-cache replies require a raw FUSE fd transport",
+                        )
+                        .into());
+                    };
+                    splice_local_cache_range_to_fd(owned_range, output_fd)?;
                 }
             }
             self.local_cache_metrics
@@ -318,7 +344,7 @@ fn copy_local_cache_range_with_pread<W: Write>(
             "local cache read range offset exceeds off_t",
         )
     })?;
-    let mut buffer = [0; COPY_BUFFER_LEN];
+    let mut buffer = vec![0; COPY_BUFFER_LEN];
 
     while remaining > 0 {
         let request_len = remaining.min(buffer.len());
@@ -374,6 +400,23 @@ pub fn splice_local_cache_range_to_fd(
     range: FuseLocalCacheReadRange,
     output_fd: RawFd,
 ) -> io::Result<()> {
+    with_thread_local_splice_pipe(|pipe| splice_local_cache_range_with_pipe(range, output_fd, pipe))
+}
+
+fn with_thread_local_splice_pipe<R>(f: impl FnOnce(&SplicePipe) -> io::Result<R>) -> io::Result<R> {
+    SPLICE_PIPE.with(|pipe| {
+        let mut pipe = pipe.borrow_mut();
+        if pipe.is_none() {
+            *pipe = Some(create_splice_pipe()?);
+        }
+        let pipe = pipe
+            .as_ref()
+            .ok_or_else(|| io::Error::other("thread-local splice pipe was not initialized"))?;
+        f(pipe)
+    })
+}
+
+fn create_splice_pipe() -> io::Result<SplicePipe> {
     let mut pipe_fds = [-1; 2];
     // SAFETY: `pipe_fds` points to storage for exactly two descriptors.
     let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -385,7 +428,19 @@ pub fn splice_local_cache_range_to_fd(
     let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     // SAFETY: see `pipe_read`.
     let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+    #[cfg(test)]
+    SPLICE_PIPE_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    Ok(SplicePipe {
+        read: pipe_read,
+        write: pipe_write,
+    })
+}
 
+fn splice_local_cache_range_with_pipe(
+    range: FuseLocalCacheReadRange,
+    output_fd: RawFd,
+    pipe: &SplicePipe,
+) -> io::Result<()> {
     let mut remaining = usize::try_from(range.len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -403,7 +458,7 @@ pub fn splice_local_cache_range_to_fd(
         let moved_into_pipe = splice_once(
             range.fd,
             Some(&mut source_offset),
-            pipe_write.as_raw_fd(),
+            pipe.write.as_raw_fd(),
             None,
             remaining,
         )?;
@@ -417,7 +472,7 @@ pub fn splice_local_cache_range_to_fd(
         let mut pipe_remaining = moved_into_pipe;
         while pipe_remaining > 0 {
             let moved_out =
-                splice_once(pipe_read.as_raw_fd(), None, output_fd, None, pipe_remaining)?;
+                splice_once(pipe.read.as_raw_fd(), None, output_fd, None, pipe_remaining)?;
             if moved_out == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -431,6 +486,19 @@ pub fn splice_local_cache_range_to_fd(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn reset_splice_pipe_pool_for_test() {
+    SPLICE_PIPE.with(|pipe| {
+        *pipe.borrow_mut() = None;
+    });
+    SPLICE_PIPE_CREATE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn splice_pipe_create_count_for_test() -> u64 {
+    SPLICE_PIPE_CREATE_COUNT.load(Ordering::Relaxed)
 }
 
 fn splice_once(
@@ -725,11 +793,13 @@ mod tests {
         cache_file.rewind().expect("rewind cache file");
         let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(Vec::new()));
 
+        let reply = FuseReply::local_cache_range_data(
+            0x88,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 6, 9),
+        )
+        .expect("build local cache range reply");
         transport
-            .send_reply(FuseReply::local_cache_range_data(
-                0x88,
-                FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 6, 9),
-            ))
+            .send_reply(reply)
             .expect("classic send should write local cache range");
 
         let metrics = transport.local_cache_reply_metrics_snapshot();
@@ -737,6 +807,19 @@ mod tests {
         assert_eq!(metrics.payload_bytes, 6);
         let output = transport.into_inner().output;
         assert_eq!(&output[16..], b"456789");
+    }
+
+    #[test]
+    fn pread_local_cache_copy_buffer_is_heap_allocated() {
+        let source = include_str!("transport.rs");
+        let copy_fn = source
+            .split("fn copy_local_cache_range_with_pread")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn splice_local_cache_range_to_fd").next())
+            .expect("pread copy function should be present");
+
+        assert!(copy_fn.contains("vec![0; COPY_BUFFER_LEN]"));
+        assert!(!copy_fn.contains("let mut buffer = [0; COPY_BUFFER_LEN]"));
     }
 
     #[test]
@@ -748,7 +831,8 @@ mod tests {
         let reply = FuseReply::local_cache_range_data(
             0x89,
             FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 7, 2, 9),
-        );
+        )
+        .expect("build local cache range reply");
         drop(cache_file);
         let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(Vec::new()));
 
@@ -780,6 +864,59 @@ mod tests {
             .read_to_string(&mut output)
             .expect("read output");
         assert_eq!(output, "klmnopqr");
+    }
+
+    #[test]
+    fn splice_local_cache_range_reuses_thread_local_pipe() {
+        reset_splice_pipe_pool_for_test();
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"abcdefghijklmnopqrstuvwxyz")
+            .expect("write cache contents");
+        let output_file = tempfile::tempfile().expect("create output file");
+
+        splice_local_cache_range_to_fd(
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 0, 4, 11),
+            output_file.as_raw_fd(),
+        )
+        .expect("first splice local cache range");
+        splice_local_cache_range_to_fd(
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 4, 11),
+            output_file.as_raw_fd(),
+        )
+        .expect("second splice local cache range");
+
+        assert_eq!(splice_pipe_create_count_for_test(), 1);
+    }
+
+    #[test]
+    fn classic_read_write_transport_splices_local_cache_range_when_output_fd_is_available() {
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"0123456789abcdef")
+            .expect("write cache contents");
+        let output_file = tempfile::tempfile().expect("create output file");
+        let output_fd = output_file.as_raw_fd();
+        let mut transport = ClassicReadWriteTransport::with_output_fd(output_file, output_fd)
+            .with_local_cache_strategy(LocalCacheReplyStrategy::Splice);
+        let reply = FuseReply::local_cache_range_data(
+            0x90,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 8, 4, 12),
+        )
+        .expect("build local cache range reply");
+
+        transport
+            .send_reply(reply)
+            .expect("classic transport should splice when output fd is available");
+
+        let metrics = transport.local_cache_reply_metrics_snapshot();
+        assert_eq!(metrics.splice_replies, 1);
+        assert_eq!(metrics.payload_bytes, 4);
+        let mut output_file = transport.into_inner();
+        output_file.rewind().expect("rewind output file");
+        let mut output = Vec::new();
+        output_file.read_to_end(&mut output).expect("read output");
+        assert_eq!(&output[16..], b"89ab");
     }
 
     #[test]

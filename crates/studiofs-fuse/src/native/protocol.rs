@@ -124,17 +124,6 @@ impl FuseLocalCacheReadRange {
     }
 }
 
-impl PartialEq for FuseLocalCacheReadRange {
-    fn eq(&self, other: &Self) -> bool {
-        self.fd == other.fd
-            && self.file_offset == other.file_offset
-            && self.len == other.len
-            && self.content_epoch == other.content_epoch
-    }
-}
-
-impl Eq for FuseLocalCacheReadRange {}
-
 /// Owned FUSE reply frame storage.
 #[derive(Debug, Clone)]
 pub enum FuseReplyFrame {
@@ -191,25 +180,24 @@ impl FuseReply {
     }
 
     /// Builds a successful read reply backed by a local cache file range.
-    pub fn local_cache_range_data(unique: u64, range: FuseLocalCacheReadRange) -> Self {
+    pub fn local_cache_range_data(unique: u64, range: FuseLocalCacheReadRange) -> io::Result<Self> {
         let source = match &range.source {
             Some(source) => Arc::clone(source),
-            None => duplicate_fd(range.fd)
-                .expect("local cache read range must contain a valid source file descriptor"),
+            None => duplicate_fd(range.fd)?,
         };
         let mut header = [0; FUSE_OUT_HEADER_LEN];
         let len = fuse_out_len_for_payload(range.len as usize);
         header[0..4].copy_from_slice(&len.to_le_bytes());
         header[4..8].copy_from_slice(&0_i32.to_le_bytes());
         header[8..16].copy_from_slice(&unique.to_le_bytes());
-        Self {
+        Ok(Self {
             unique,
             frame: FuseReplyFrame::LocalCacheRange {
                 header,
                 range,
                 source,
             },
-        }
+        })
     }
 
     /// Returns a contiguous copy of the reply frame.
@@ -685,6 +673,16 @@ mod tests {
         assert_eq!(report.disabled, FuseCapabilities::empty());
         assert!(report.io_uring_available);
         assert!(report.io_uring_enabled);
+    }
+
+    #[test]
+    fn local_cache_range_data_returns_error_for_invalid_borrowed_fd() {
+        let result = FuseReply::local_cache_range_data(
+            0x55,
+            FuseLocalCacheReadRange::borrowed(-1, 0, 4096, 7),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
