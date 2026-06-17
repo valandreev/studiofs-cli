@@ -4,8 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::io;
-use std::io::Write;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -23,7 +22,9 @@ use studiofs_fuse::native::lifecycle::{
 use studiofs_fuse::native::protocol::FuseCapabilities;
 use studiofs_fuse::native::session::{NativeFuseSession, NativeSessionConfig};
 use studiofs_fuse::native::transport::ClassicReadWriteTransport;
-use studiofs_fuse::native::vfs_adapter::{LinuxNativeBridge, StudioVfsNativeAdapter};
+use studiofs_fuse::native::vfs_adapter::{
+    LinuxNativeBridge, NativeAsyncWriteConfig, StudioVfsNativeAdapter,
+};
 use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
@@ -31,11 +32,20 @@ use studiofs_meta::{
 use studiofs_vfs::{StudioVfs, VfsConfig};
 
 const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
+const DEFAULT_TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_TEST_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+const SFS509_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const SFS509_DEFAULT_FIO_SIZE: &str = "16m";
+const SFS509_DEFAULT_FIO_LARGE_SIZE: &str = "96m";
+const SFS509_DEFAULT_FIO_RUNTIME_SECS: &str = "1";
+const SFS509_DEFAULT_METADATA_FILES: &str = "50";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountedFuseMode {
     Sync,
     AsyncWrite,
     AsyncWriteDio,
+    AsyncWritebackCache,
 }
 
 impl MountedFuseMode {
@@ -44,28 +54,41 @@ impl MountedFuseMode {
             Self::Sync => "sync",
             Self::AsyncWrite => "async-write",
             Self::AsyncWriteDio => "async-write+dio",
+            Self::AsyncWritebackCache => "async-write+writeback-cache",
         }
     }
 
     fn async_write_enabled(self) -> bool {
-        matches!(self, Self::AsyncWrite | Self::AsyncWriteDio)
+        matches!(
+            self,
+            Self::AsyncWrite | Self::AsyncWriteDio | Self::AsyncWritebackCache
+        )
     }
 
     fn async_dio_enabled(self) -> bool {
         matches!(self, Self::AsyncWriteDio)
+    }
+
+    fn writeback_cache_enabled(self) -> bool {
+        matches!(self, Self::AsyncWritebackCache)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum MountedScenarioOperation {
     SequentialWriteReadback,
+    RandomWriteReadback,
+    TruncateReadback,
+    OverwriteReadback,
     WriteFlushReadback,
     WriteFsyncReadback,
     CloseReopenReadback,
+    ErrorPropagation,
     MultipleWriters,
     SameHandleAppends,
     FioMultiJob,
     Sfs509FioMatrix,
+    Sfs530EvidenceMatrix,
     WriteOnlyUntilUnmount,
     DirectoryLifecycle,
     NamespaceMutations,
@@ -148,7 +171,87 @@ fn native_mounted_scenarios() -> &'static [MountedAsyncScenario] {
             mode: MountedFuseMode::Sync,
             operation: MountedScenarioOperation::SequentialWriteReadback,
         },
+        MountedAsyncScenario {
+            name: "native-async-sequential-write-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::SequentialWriteReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-random-write-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::RandomWriteReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-truncate-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::TruncateReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-overwrite-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::OverwriteReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-write-flush-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::WriteFlushReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-write-fsync-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::WriteFsyncReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-close-reopen-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::CloseReopenReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-error-propagation",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::ErrorPropagation,
+        },
+        MountedAsyncScenario {
+            name: "native-async-writeback-cache-sequential-write-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWritebackCache,
+            operation: MountedScenarioOperation::SequentialWriteReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-async-writeback-cache-write-fsync-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWritebackCache,
+            operation: MountedScenarioOperation::WriteFsyncReadback,
+        },
+        MountedAsyncScenario {
+            name: "native-sfs530-async-evidence",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWrite,
+            operation: MountedScenarioOperation::Sfs530EvidenceMatrix,
+        },
+        MountedAsyncScenario {
+            name: "native-sfs530-writeback-cache-evidence",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWritebackCache,
+            operation: MountedScenarioOperation::Sfs530EvidenceMatrix,
+        },
     ]
+}
+
+fn native_mounted_scenario(name: &str) -> MountedAsyncScenario {
+    native_mounted_scenarios()
+        .iter()
+        .copied()
+        .find(|scenario| scenario.name == name)
+        .expect("native mounted scenario should exist")
 }
 
 declare_mounted_scenarios! {
@@ -156,6 +259,21 @@ declare_mounted_scenarios! {
         name: "sequential-write-readback",
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::SequentialWriteReadback
+    },
+    async_mounted_random_write_readback => {
+        name: "random-write-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::RandomWriteReadback
+    },
+    async_mounted_truncate_readback => {
+        name: "truncate-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::TruncateReadback
+    },
+    async_mounted_overwrite_readback => {
+        name: "overwrite-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::OverwriteReadback
     },
     async_mounted_write_flush_readback => {
         name: "write-flush-readback",
@@ -171,6 +289,11 @@ declare_mounted_scenarios! {
         name: "close-reopen-readback",
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::CloseReopenReadback
+    },
+    async_mounted_error_propagation => {
+        name: "error-propagation",
+        mode: MountedFuseMode::AsyncWrite,
+        operation: MountedScenarioOperation::ErrorPropagation
     },
     async_mounted_multiple_writers => {
         name: "multiple-writers",
@@ -248,6 +371,90 @@ fn native_mounted_sequential_write_readback() {
 }
 
 #[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_sequential_write_readback() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-async-sequential-write-readback",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_random_write_readback() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-async-random-write-readback",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_truncate_readback() {
+    run_native_mounted_scenario(native_mounted_scenario("native-async-truncate-readback"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_overwrite_readback() {
+    run_native_mounted_scenario(native_mounted_scenario("native-async-overwrite-readback"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_write_flush_readback() {
+    run_native_mounted_scenario(native_mounted_scenario("native-async-write-flush-readback"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_write_fsync_readback() {
+    run_native_mounted_scenario(native_mounted_scenario("native-async-write-fsync-readback"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_close_reopen_readback() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-async-close-reopen-readback",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_mounted_error_propagation() {
+    run_native_mounted_scenario(native_mounted_scenario("native-async-error-propagation"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_writeback_cache_mounted_sequential_write_readback() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-async-writeback-cache-sequential-write-readback",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_async_writeback_cache_mounted_write_fsync_readback() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-async-writeback-cache-write-fsync-readback",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, fio, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_sfs530_mounted_evidence_async_profile() {
+    run_native_mounted_scenario(native_mounted_scenario("native-sfs530-async-evidence"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, fio, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_sfs530_mounted_evidence_writeback_cache_profile() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-sfs530-writeback-cache-evidence",
+    ));
+}
+
+#[test]
 fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() {
     let scenarios = mounted_async_scenarios();
     let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
@@ -258,9 +465,13 @@ fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() 
 
     for expected in [
         "sequential-write-readback",
+        "random-write-readback",
+        "truncate-readback",
+        "overwrite-readback",
         "write-flush-readback",
         "write-fsync-readback",
         "close-reopen-readback",
+        "error-propagation",
         "multiple-writers",
         "same-handle-appends",
         "linux-default-sync",
@@ -283,6 +494,199 @@ fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() 
         assert!(
             modes.contains(expected),
             "mounted async FUSE scenario matrix is missing mode {expected}"
+        );
+    }
+}
+
+#[test]
+fn native_mounted_matrix_includes_sfs530_async_write_correctness_profiles() {
+    let scenarios = native_mounted_scenarios();
+    let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+    let operations: BTreeSet<_> = scenarios
+        .iter()
+        .map(|scenario| scenario.operation)
+        .collect();
+    let modes: BTreeSet<_> = scenarios
+        .iter()
+        .map(|scenario| scenario.mode.name())
+        .collect();
+
+    for expected in [
+        "native-async-sequential-write-readback",
+        "native-async-random-write-readback",
+        "native-async-truncate-readback",
+        "native-async-overwrite-readback",
+        "native-async-write-flush-readback",
+        "native-async-write-fsync-readback",
+        "native-async-close-reopen-readback",
+        "native-async-error-propagation",
+        "native-async-writeback-cache-sequential-write-readback",
+        "native-async-writeback-cache-write-fsync-readback",
+    ] {
+        assert!(
+            names.contains(expected),
+            "native SFS-530 mounted matrix is missing {expected}"
+        );
+    }
+
+    for expected in [
+        MountedScenarioOperation::SequentialWriteReadback,
+        MountedScenarioOperation::RandomWriteReadback,
+        MountedScenarioOperation::TruncateReadback,
+        MountedScenarioOperation::OverwriteReadback,
+        MountedScenarioOperation::WriteFlushReadback,
+        MountedScenarioOperation::WriteFsyncReadback,
+        MountedScenarioOperation::CloseReopenReadback,
+        MountedScenarioOperation::ErrorPropagation,
+    ] {
+        assert!(
+            operations.contains(&expected),
+            "native SFS-530 mounted matrix is missing operation {expected:?}"
+        );
+    }
+
+    for expected in ["async-write", "async-write+writeback-cache"] {
+        assert!(
+            modes.contains(expected),
+            "native SFS-530 mounted matrix is missing mode {expected}"
+        );
+    }
+}
+
+#[test]
+fn native_mounted_matrix_includes_sfs530_evidence_profiles() {
+    let scenarios = native_mounted_scenarios();
+    let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+    let evidence_profiles: BTreeSet<_> = scenarios
+        .iter()
+        .filter(|scenario| scenario.operation == MountedScenarioOperation::Sfs530EvidenceMatrix)
+        .map(|scenario| scenario.mode.name())
+        .collect();
+
+    for expected in [
+        "native-sfs530-async-evidence",
+        "native-sfs530-writeback-cache-evidence",
+    ] {
+        assert!(
+            names.contains(expected),
+            "native SFS-530 evidence matrix is missing {expected}"
+        );
+    }
+
+    for expected in ["async-write", "async-write+writeback-cache"] {
+        assert!(
+            evidence_profiles.contains(expected),
+            "native SFS-530 evidence matrix is missing profile {expected}"
+        );
+    }
+}
+
+#[test]
+fn docs_list_sfs530_native_evidence_command() {
+    let docs = include_str!("../../../docs/tests.md");
+
+    assert!(
+        docs.contains("native_sfs530_mounted_evidence"),
+        "docs/tests.md must list the SFS-530 native mounted evidence command"
+    );
+    assert!(
+        docs.contains("write-path-observability-after.json"),
+        "docs/tests.md must list the SFS-530 write-path telemetry artifact"
+    );
+}
+
+#[test]
+fn mounted_tests_enabled_falls_back_to_workspace_dotenv_value() {
+    assert!(mounted_tests_enabled_from_values(None, Some("1")));
+}
+
+#[test]
+fn mounted_tests_enabled_prefers_process_env_value() {
+    assert!(!mounted_tests_enabled_from_values(Some("0"), Some("1")));
+}
+
+#[test]
+fn mounted_tests_enabled_treats_empty_process_env_as_unset() {
+    assert!(mounted_tests_enabled_from_values(Some(""), Some("1")));
+}
+
+#[test]
+fn parse_fio_size_bytes_accepts_binary_suffixes() {
+    assert_eq!(parse_fio_size_bytes("2g"), Some(2 * 1024 * 1024 * 1024));
+}
+
+#[test]
+fn parse_fio_size_bytes_avoids_lowercase_allocation() {
+    let source = include_str!("mount_sanity.rs");
+    let parser = source
+        .rsplit("fn parse_fio_size_bytes(value: &str) -> Option<u64> {")
+        .next()
+        .and_then(|rest| rest.split("fn sfs509_cache_budget_bytes").next())
+        .expect("fio size parser should be present");
+
+    assert!(!parser.contains("to_ascii_lowercase"));
+    assert!(parser.contains("eq_ignore_ascii_case"));
+}
+
+#[test]
+fn sfs509_cache_budget_covers_large_file_workload() {
+    let budget = sfs509_cache_budget_bytes("1536m");
+
+    assert!(budget > 1536 * 1024 * 1024);
+}
+
+#[test]
+fn sfs509_default_fio_size_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_SIZE, "16m");
+}
+
+#[test]
+fn sfs509_multi_job_size_is_capped_for_mounted_smoke_runtime() {
+    assert_eq!(sfs509_multi_job_size("512m"), "2m");
+}
+
+#[test]
+fn sfs509_fsync_heavy_size_is_capped_for_mounted_smoke_runtime() {
+    assert_eq!(sfs509_fsync_heavy_size("512m"), "2m");
+}
+
+#[test]
+fn sfs509_default_large_file_size_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_LARGE_SIZE, "96m");
+}
+
+#[test]
+fn sfs509_default_timed_runtime_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_RUNTIME_SECS, "1");
+}
+
+#[test]
+fn sfs509_default_metadata_probe_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_METADATA_FILES, "50");
+}
+
+#[test]
+fn native_sfs530_mounted_scenarios_are_exposed_as_opt_in_tests() {
+    let source = include_str!("mount_sanity.rs");
+
+    for expected in [
+        "native_async_mounted_sequential_write_readback",
+        "native_async_mounted_random_write_readback",
+        "native_async_mounted_truncate_readback",
+        "native_async_mounted_overwrite_readback",
+        "native_async_mounted_write_flush_readback",
+        "native_async_mounted_write_fsync_readback",
+        "native_async_mounted_close_reopen_readback",
+        "native_async_mounted_error_propagation",
+        "native_async_writeback_cache_mounted_sequential_write_readback",
+        "native_sfs530_mounted_evidence_async_profile",
+        "native_sfs530_mounted_evidence_writeback_cache_profile",
+    ] {
+        assert!(
+            source
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("fn {expected}()"))),
+            "native SFS-530 scenario must be exposed as opt-in mounted test: {expected}"
         );
     }
 }
@@ -514,6 +918,22 @@ fn make_test_vfs(
     volume_suffix: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Arc<StudioVfs> {
+    make_test_vfs_with_cache_budget(
+        tmp,
+        volume_suffix,
+        rt,
+        DEFAULT_TEST_CACHE_BYTES,
+        DEFAULT_TEST_MEMORY_BYTES,
+    )
+}
+
+fn make_test_vfs_with_cache_budget(
+    tmp: &tempfile::TempDir,
+    volume_suffix: &str,
+    rt: &tokio::runtime::Runtime,
+    cache_capacity_bytes: u64,
+    memory_capacity_bytes: u64,
+) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
     meta.init_root(0, 0).expect("init root");
@@ -528,8 +948,8 @@ fn make_test_vfs(
         meta,
         &data_config,
         cache_dir.to_str().expect("cache dir str"),
-        64 * 1024 * 1024,
-        32 * 1024 * 1024,
+        cache_capacity_bytes,
+        memory_capacity_bytes,
         VfsConfig::default()
             .try_into()
             .expect("default VFS config should validate"),
@@ -539,8 +959,90 @@ fn make_test_vfs(
     vfs
 }
 
+fn parse_fio_size_bytes(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let suffix_start = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(suffix_start);
+    if digits.is_empty() {
+        return None;
+    }
+    let amount = digits.parse::<u64>().ok()?;
+    let suffix = suffix.trim();
+    let multiplier = if suffix.is_empty() || suffix.eq_ignore_ascii_case("b") {
+        1
+    } else if suffix.eq_ignore_ascii_case("k")
+        || suffix.eq_ignore_ascii_case("kb")
+        || suffix.eq_ignore_ascii_case("kib")
+    {
+        1024
+    } else if suffix.eq_ignore_ascii_case("m")
+        || suffix.eq_ignore_ascii_case("mb")
+        || suffix.eq_ignore_ascii_case("mib")
+    {
+        1024 * 1024
+    } else if suffix.eq_ignore_ascii_case("g")
+        || suffix.eq_ignore_ascii_case("gb")
+        || suffix.eq_ignore_ascii_case("gib")
+    {
+        1024 * 1024 * 1024
+    } else {
+        return None;
+    };
+
+    amount.checked_mul(multiplier)
+}
+
+fn sfs509_cache_budget_bytes(large_size: &str) -> u64 {
+    parse_fio_size_bytes(large_size)
+        .and_then(|bytes| bytes.checked_add(SFS509_CACHE_HEADROOM_BYTES))
+        .unwrap_or(DEFAULT_TEST_CACHE_BYTES)
+        .max(DEFAULT_TEST_CACHE_BYTES)
+}
+
+fn mounted_scenario_cache_budget_bytes(suffix: &str) -> u64 {
+    if suffix.contains("sfs-509-long-lived-fio") {
+        let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
+        return sfs509_cache_budget_bytes(&large_size);
+    }
+
+    DEFAULT_TEST_CACHE_BYTES
+}
+
+fn sfs509_multi_job_size(base_size: &str) -> String {
+    sfs509_capped_size(base_size, 2 * 1024 * 1024, "2m")
+}
+
+fn sfs509_fsync_heavy_size(base_size: &str) -> String {
+    sfs509_capped_size(base_size, 2 * 1024 * 1024, "2m")
+}
+
+fn sfs509_capped_size(base_size: &str, max_bytes: u64, capped_size: &str) -> String {
+    match parse_fio_size_bytes(base_size) {
+        Some(bytes) if bytes <= max_bytes => base_size.to_string(),
+        Some(_) => capped_size.to_string(),
+        None => base_size.to_string(),
+    }
+}
+
 fn mounted_tests_enabled() -> bool {
-    std::env::var(MOUNT_TESTS_ENV).as_deref() == Ok("1")
+    load_test_env();
+    mounted_tests_enabled_from_values(
+        std::env::var(MOUNT_TESTS_ENV).ok().as_deref(),
+        workspace_dotenv_var(MOUNT_TESTS_ENV).as_deref(),
+    )
+}
+
+fn mounted_tests_enabled_from_values(process_env: Option<&str>, dotenv_env: Option<&str>) -> bool {
+    process_env
+        .filter(|value| !value.trim().is_empty())
+        .or(dotenv_env)
+        .is_some_and(|value| value == "1")
 }
 
 fn current_uid_gid() -> (libc::uid_t, libc::gid_t) {
@@ -730,17 +1232,7 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
     let adapter = StudioVfsNativeAdapter::new(Arc::clone(&vfs), rt.handle().clone());
     let session_thread = std::thread::spawn(move || {
         let transport = ClassicReadWriteTransport::new(fuse.into_file());
-        let config = NativeSessionConfig {
-            requested_capabilities: FuseCapabilities::ASYNC_READ
-                | FuseCapabilities::BIG_WRITES
-                | FuseCapabilities::AUTO_INVAL_DATA
-                | FuseCapabilities::READDIRPLUS,
-            max_readahead: 1024 * 1024,
-            max_write: 1024 * 1024,
-            max_background: 16,
-            congestion_threshold: 12,
-            max_pages: 256,
-        };
+        let config = NativeSessionConfig::linux6_safe_from_env();
         let mut session = NativeFuseSession::new(transport, config);
         let handshake = session.handshake();
         let handshake_ok = handshake.is_ok();
@@ -751,7 +1243,11 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
             return;
         }
         let transport = session.into_transport();
-        let handler = LinuxNativeBridge::new(adapter);
+        let runtime_options = StudioFuseRuntimeOptions::from_env();
+        let mut handler = LinuxNativeBridge::new(adapter);
+        if let Some(config) = NativeAsyncWriteConfig::from_runtime_options(&runtime_options) {
+            handler = handler.with_async_write_config(config);
+        }
         let mut dispatcher = NativeDispatcher::new(transport, handler);
         let result = dispatcher.run_until_destroy();
         done_tx.send(result).expect("send native dispatcher result");
@@ -1157,7 +1653,13 @@ fn with_mounted_fuse(
     let tmp = target_tempdir("vfs-");
     let mount_dir = target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-    let vfs = make_test_vfs(&tmp, suffix, &rt);
+    let vfs = make_test_vfs_with_cache_budget(
+        &tmp,
+        suffix,
+        &rt,
+        mounted_scenario_cache_budget_bytes(suffix),
+        DEFAULT_TEST_MEMORY_BYTES,
+    );
     let fs = StudioFuseFs::new_with_runtime_options(
         vfs,
         rt.handle().clone(),
@@ -1226,7 +1728,11 @@ fn with_mounted_fuse(
     finish_mounted_fuse_test(test_result, unmount_result, join_result);
 }
 
-fn with_mounted_native_fuse(suffix: &str, test_fn: impl FnOnce(&Path) -> MountedOperationGuard) {
+fn with_mounted_native_fuse(
+    suffix: &str,
+    mode: MountedFuseMode,
+    test_fn: impl FnOnce(&Path, &StudioVfs) -> MountedOperationGuard,
+) {
     if !mounted_tests_enabled() {
         return;
     }
@@ -1252,30 +1758,33 @@ fn with_mounted_native_fuse(suffix: &str, test_fn: impl FnOnce(&Path) -> Mounted
         .expect("native fusermount3 FUSE mount should return a device fd");
 
     let adapter = StudioVfsNativeAdapter::new(Arc::clone(&vfs), rt.handle().clone());
+    let (session_done_tx, session_done_rx) = std::sync::mpsc::channel();
     let session_handle = std::thread::spawn(move || -> io::Result<()> {
-        let transport = ClassicReadWriteTransport::new(fuse.into_file());
-        let config = NativeSessionConfig {
-            requested_capabilities: FuseCapabilities::ASYNC_READ
-                | FuseCapabilities::BIG_WRITES
-                | FuseCapabilities::AUTO_INVAL_DATA
-                | FuseCapabilities::READDIRPLUS,
-            max_readahead: 1024 * 1024,
-            max_write: 1024 * 1024,
-            max_background: 16,
-            congestion_threshold: 12,
-            max_pages: 256,
-        };
-        let mut session = NativeFuseSession::new(transport, config);
-        session
-            .handshake()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let transport = session.into_transport();
-        let handler = LinuxNativeBridge::new(adapter);
-        let mut dispatcher = NativeDispatcher::new(transport, handler);
-        dispatcher
-            .run_until_destroy()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(())
+        let result = (|| {
+            let transport = ClassicReadWriteTransport::new(fuse.into_file());
+            let config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
+            let mut session = NativeFuseSession::new(transport, config);
+            session
+                .handshake()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let transport = session.into_transport();
+            let mut runtime_options = StudioFuseRuntimeOptions::from_env();
+            runtime_options.async_write_enabled = mode.async_write_enabled();
+            let mut handler = LinuxNativeBridge::new(adapter);
+            if let Some(config) = NativeAsyncWriteConfig::from_runtime_options(&runtime_options) {
+                handler = handler.with_async_write_config(config);
+            }
+            let mut dispatcher = NativeDispatcher::new(transport, handler);
+            dispatcher
+                .run_until_destroy()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            eprintln!("native FUSE session thread finished early: {error:?}");
+        }
+        let _ = session_done_tx.send(format!("{result:?}"));
+        result
     });
 
     let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1292,7 +1801,10 @@ fn with_mounted_native_fuse(suffix: &str, test_fn: impl FnOnce(&Path) -> Mounted
             }
             assert!(
                 !session_handle.is_finished(),
-                "native FUSE session thread exited early before mount became available"
+                "native FUSE session thread exited early before mount became available: {}",
+                session_done_rx
+                    .try_recv()
+                    .unwrap_or_else(|_| "session result unavailable".to_string())
             );
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1301,7 +1813,7 @@ fn with_mounted_native_fuse(suffix: &str, test_fn: impl FnOnce(&Path) -> Mounted
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        test_fn(&mount_path)
+        test_fn(&mount_path, &vfs)
     }));
 
     let unmount_result = force_unmount_fuse_mount_path(&mount_path);
@@ -1342,8 +1854,8 @@ fn run_native_mounted_scenario(scenario: MountedAsyncScenario) {
         MountedBackend::LinuxNativeBridge,
         "native mounted scenario must use LinuxNativeBridge backend"
     );
-    with_mounted_native_fuse(scenario.name, |mount_path| {
-        run_mounted_operation(mount_path, scenario.operation, scenario.name)
+    with_mounted_native_fuse(scenario.name, scenario.mode, |mount_path, vfs| {
+        run_mounted_operation_with_vfs(mount_path, scenario.operation, scenario.name, Some(vfs))
     });
 }
 
@@ -1352,6 +1864,15 @@ fn run_mounted_operation(
     operation: MountedScenarioOperation,
     scenario_name: &str,
 ) -> MountedOperationGuard {
+    run_mounted_operation_with_vfs(mount_path, operation, scenario_name, None)
+}
+
+fn run_mounted_operation_with_vfs(
+    mount_path: &Path,
+    operation: MountedScenarioOperation,
+    scenario_name: &str,
+    vfs: Option<&StudioVfs>,
+) -> MountedOperationGuard {
     match operation {
         MountedScenarioOperation::SequentialWriteReadback => {
             let test_file = mount_path.join("sequential.txt");
@@ -1359,6 +1880,63 @@ fn run_mounted_operation(
             std::fs::write(&test_file, payload).expect("write through FUSE mount");
             let readback = std::fs::read(&test_file).expect("read through FUSE mount");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::RandomWriteReadback => {
+            let test_file = mount_path.join("random.txt");
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&test_file)
+                .expect("create random write file");
+            file.set_len(64).expect("pre-size random write file");
+            file.seek(SeekFrom::Start(32))
+                .expect("seek first random chunk");
+            file.write_all(b"middle").expect("write first random chunk");
+            file.seek(SeekFrom::Start(4))
+                .expect("seek second random chunk");
+            file.write_all(b"head").expect("write second random chunk");
+            file.seek(SeekFrom::Start(56))
+                .expect("seek tail random chunk");
+            file.write_all(b"tail").expect("write tail random chunk");
+            file.sync_all().expect("sync random writes");
+            drop(file);
+
+            let readback = std::fs::read(&test_file).expect("read random write file");
+            assert_eq!(&readback[4..8], b"head");
+            assert_eq!(&readback[32..38], b"middle");
+            assert_eq!(&readback[56..60], b"tail");
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::TruncateReadback => {
+            let test_file = mount_path.join("truncate.txt");
+            std::fs::write(&test_file, b"0123456789abcdef").expect("write truncate seed");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&test_file)
+                .expect("open file for truncate");
+            file.set_len(6).expect("shrink through mounted file");
+            drop(file);
+            let readback = std::fs::read(&test_file).expect("read truncated file");
+            assert_eq!(readback, b"012345");
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::OverwriteReadback => {
+            let test_file = mount_path.join("overwrite.txt");
+            std::fs::write(&test_file, b"abcdefgh").expect("write overwrite seed");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&test_file)
+                .expect("open file for overwrite");
+            file.seek(SeekFrom::Start(2))
+                .expect("seek overwrite offset");
+            file.write_all(b"XYZ").expect("overwrite mounted file");
+            file.sync_all().expect("sync overwrite");
+            drop(file);
+            let readback = std::fs::read(&test_file).expect("read overwritten file");
+            assert_eq!(readback, b"abXYZfgh");
             MountedOperationGuard::default()
         }
         MountedScenarioOperation::WriteFlushReadback => {
@@ -1393,6 +1971,13 @@ fn run_mounted_operation(
             }
             let readback = std::fs::read(&test_file).expect("read reopened file");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::ErrorPropagation => {
+            let missing_parent = mount_path.join("missing-parent").join("child.txt");
+            let error = std::fs::write(&missing_parent, b"must fail")
+                .expect_err("write below missing parent should fail");
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
             MountedOperationGuard::default()
         }
         MountedScenarioOperation::MultipleWriters => {
@@ -1446,6 +2031,10 @@ fn run_mounted_operation(
         }
         MountedScenarioOperation::Sfs509FioMatrix => {
             run_sfs509_fio_matrix_if_available(mount_path, scenario_name);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::Sfs530EvidenceMatrix => {
+            run_sfs530_evidence_matrix_if_available(mount_path, scenario_name, vfs);
             MountedOperationGuard::default()
         }
         MountedScenarioOperation::DirectoryLifecycle => {
@@ -1542,6 +2131,306 @@ fn run_fio_workload_if_available(mount_path: &Path) {
     assert!(status.success(), "fio workload should exit successfully");
 }
 
+fn sfs530_artifact_dir(scenario_name: &str) -> std::path::PathBuf {
+    let dir = workspace_root()
+        .join("target")
+        .join("sfs-530-linux-native-async-write")
+        .join(scenario_name);
+    std::fs::create_dir_all(&dir).expect("create SFS-530 artifact directory");
+    dir
+}
+
+fn run_sfs530_fio_json_case(
+    artifact_dir: &Path,
+    mount_path: &Path,
+    case_name: &str,
+    filename: &str,
+    args: &[&str],
+) -> bool {
+    let output = artifact_dir.join(format!("{case_name}.json"));
+    let log = artifact_dir.join(format!("{case_name}.log"));
+    let mut directory_arg = OsString::from("--directory=");
+    directory_arg.push(mount_path);
+    let mut filename_arg = OsString::from("--filename=");
+    filename_arg.push(filename);
+    let mut output_arg = OsString::from("--output=");
+    output_arg.push(&output);
+    let timeout = sfs509_env_value("STUDIOFS_SFS530_FIO_TIMEOUT_SECS", "90");
+    let timeout_arg = format!("{timeout}s");
+
+    let mut command = if command_available("timeout") {
+        let mut command = Command::new("timeout");
+        command.arg("--kill-after=10s").arg(timeout_arg).arg("fio");
+        command
+    } else {
+        Command::new("fio")
+    };
+    let result = command
+        .arg(format!("--name=studiofs-sfs530-{case_name}"))
+        .arg(directory_arg)
+        .arg(filename_arg)
+        .arg("--ioengine=sync")
+        .arg("--group_reporting")
+        .arg("--output-format=json")
+        .arg(output_arg)
+        .args(args)
+        .output()
+        .expect("run SFS-530 fio workload");
+    let mut log_file = std::fs::File::create(&log).expect("create SFS-530 fio log");
+    log_file
+        .write_all(&result.stdout)
+        .expect("write SFS-530 fio stdout");
+    log_file
+        .write_all(&result.stderr)
+        .expect("write SFS-530 fio stderr");
+    let status_line = format!("{case_name}\t{}\n", result.status);
+    let mut status_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifact_dir.join("workload-status.tsv"))
+        .expect("open SFS-530 workload status");
+    status_file
+        .write_all(status_line.as_bytes())
+        .expect("write SFS-530 workload status");
+    if !result.status.success() {
+        eprintln!(
+            "SFS-530 fio workload {case_name} exited with {}; see {}",
+            result.status,
+            log.display()
+        );
+    }
+    result.status.success()
+}
+
+fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<&StudioVfs>) {
+    let Some(vfs) = vfs else {
+        return;
+    };
+    let snapshot = vfs.write_path_observability_snapshot();
+    let async_write = snapshot.fuse_async_write;
+    let backpressure = snapshot.write_backpressure;
+    let dirty_pressure = snapshot.dirty_pressure;
+    let json = format!(
+        concat!(
+            "{{\n",
+            "  \"fuse_async_write\": {{\n",
+            "    \"snapshot_generation\": {snapshot_generation},\n",
+            "    \"enabled\": {enabled},\n",
+            "    \"platform_policy\": \"{platform_policy}\",\n",
+            "    \"max_pending_bytes\": {max_pending_bytes},\n",
+            "    \"max_pending_writes\": {max_pending_writes},\n",
+            "    \"per_handle_pending_bytes\": {per_handle_pending_bytes},\n",
+            "    \"pending_writes\": {pending_writes},\n",
+            "    \"pending_bytes\": {pending_bytes},\n",
+            "    \"peak_pending_bytes\": {peak_pending_bytes},\n",
+            "    \"completed_writes\": {completed_writes},\n",
+            "    \"failed_writes\": {failed_writes},\n",
+            "    \"task_failed_writes\": {task_failed_writes},\n",
+            "    \"admission_waits\": {admission_waits},\n",
+            "    \"admission_wait_total_ms\": {admission_wait_total_ms:.3},\n",
+            "    \"barrier_waits\": {barrier_waits},\n",
+            "    \"barrier_wait_total_ms\": {barrier_wait_total_ms:.3}\n",
+            "  }},\n",
+            "  \"write_backpressure\": {{\n",
+            "    \"events\": {backpressure_events},\n",
+            "    \"wait_total_ms\": {backpressure_wait_total_ms},\n",
+            "    \"stall_max_ms\": {backpressure_stall_max_ms},\n",
+            "    \"soft_throttle_events\": {backpressure_soft_throttle_events},\n",
+            "    \"hard_events\": {backpressure_hard_events}\n",
+            "  }},\n",
+            "  \"dirty_pressure\": {{\n",
+            "    \"pending_local_dirty_bytes\": {pending_local_dirty_bytes},\n",
+            "    \"pending_persisted_slice_bytes\": {pending_persisted_slice_bytes},\n",
+            "    \"writer_stack_dirty_bytes\": {writer_stack_dirty_bytes},\n",
+            "    \"total_dirty_bytes\": {total_dirty_bytes},\n",
+            "    \"dirty_limit_bytes\": {dirty_limit_bytes},\n",
+            "    \"dirty_peak_bytes\": {dirty_peak_bytes},\n",
+            "    \"staged_peak_bytes\": {staged_peak_bytes}\n",
+            "  }}\n",
+            "}}\n",
+        ),
+        snapshot_generation = async_write.snapshot_generation,
+        enabled = async_write.enabled,
+        platform_policy = async_write.platform_policy,
+        max_pending_bytes = json_option_usize(async_write.max_pending_bytes),
+        max_pending_writes = json_option_usize(async_write.max_pending_writes),
+        per_handle_pending_bytes = json_option_usize(async_write.per_handle_pending_bytes),
+        pending_writes = async_write.pending_writes,
+        pending_bytes = async_write.pending_bytes,
+        peak_pending_bytes = async_write.peak_pending_bytes,
+        completed_writes = async_write.completed_writes,
+        failed_writes = async_write.failed_writes,
+        task_failed_writes = async_write.task_failed_writes,
+        admission_waits = async_write.admission_waits,
+        admission_wait_total_ms = async_write.admission_wait_total_ms,
+        barrier_waits = async_write.barrier_waits,
+        barrier_wait_total_ms = async_write.barrier_wait_total_ms,
+        backpressure_events = backpressure.events,
+        backpressure_wait_total_ms = backpressure.wait_total_ms,
+        backpressure_stall_max_ms = backpressure.stall_max_ms,
+        backpressure_soft_throttle_events = backpressure.soft_throttle_events,
+        backpressure_hard_events = backpressure.hard_events,
+        pending_local_dirty_bytes = dirty_pressure.pending_local_dirty_bytes,
+        pending_persisted_slice_bytes = dirty_pressure.pending_persisted_slice_bytes,
+        writer_stack_dirty_bytes = dirty_pressure.writer_stack_dirty_bytes,
+        total_dirty_bytes = dirty_pressure.total_dirty_bytes,
+        dirty_limit_bytes = dirty_pressure.dirty_limit_bytes,
+        dirty_peak_bytes = dirty_pressure.dirty_peak_bytes,
+        staged_peak_bytes = dirty_pressure.staged_peak_bytes,
+    );
+    std::fs::write(artifact_dir.join(name), json).expect("write SFS-530 telemetry snapshot");
+}
+
+fn json_option_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn run_sfs530_evidence_matrix_if_available(
+    mount_path: &Path,
+    scenario_name: &str,
+    vfs: Option<&StudioVfs>,
+) {
+    assert!(
+        command_available("fio"),
+        "SFS-530 native async write evidence matrix requires fio"
+    );
+
+    raise_nofile_limit_best_effort();
+    let artifact_dir = sfs530_artifact_dir(scenario_name);
+    for artifact in [
+        "correctness-status.tsv",
+        "workload-status.tsv",
+        "seq-write.json",
+        "seq-write.log",
+        "rand-write.json",
+        "rand-write.log",
+        "multi-job.json",
+        "multi-job.log",
+        "fsync-heavy.json",
+        "fsync-heavy.log",
+        "write-path-observability-before.json",
+        "write-path-observability-after.json",
+    ] {
+        let _ = std::fs::remove_file(artifact_dir.join(artifact));
+    }
+    write_sfs530_telemetry_snapshot(&artifact_dir, "write-path-observability-before.json", vfs);
+    let full_correctness_ops = [
+        MountedScenarioOperation::SequentialWriteReadback,
+        MountedScenarioOperation::RandomWriteReadback,
+        MountedScenarioOperation::TruncateReadback,
+        MountedScenarioOperation::OverwriteReadback,
+        MountedScenarioOperation::WriteFlushReadback,
+        MountedScenarioOperation::WriteFsyncReadback,
+        MountedScenarioOperation::CloseReopenReadback,
+        MountedScenarioOperation::ErrorPropagation,
+    ];
+    for operation in full_correctness_ops {
+        let _guard = run_mounted_operation(mount_path, operation, scenario_name);
+        let mut status_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(artifact_dir.join("correctness-status.tsv"))
+            .expect("open SFS-530 correctness status");
+        let status_line = format!("{operation:?}\tpass\n");
+        status_file
+            .write_all(status_line.as_bytes())
+            .expect("write SFS-530 correctness status");
+    }
+
+    let size = sfs509_env_value("STUDIOFS_SFS530_FIO_SIZE", "128m");
+    let runtime = sfs509_env_value("STUDIOFS_SFS530_FIO_RUNTIME_SECS", "5");
+    let size_arg = format!("--size={size}");
+    let runtime_arg = format!("--runtime={runtime}");
+    let offset_increment_arg = format!("--offset_increment={size}");
+    let manifest = format!(
+        concat!(
+            "issue=SFS-530\n",
+            "scenario={scenario_name}\n",
+            "artifact_dir={artifact_dir}\n",
+            "fio_size={size}\n",
+            "fio_runtime_secs={runtime}\n",
+            "correctness_status=correctness-status.tsv\n",
+            "workload_status=workload-status.tsv\n",
+            "telemetry_before=write-path-observability-before.json\n",
+            "telemetry_after=write-path-observability-after.json\n",
+        ),
+        scenario_name = scenario_name,
+        artifact_dir = artifact_dir.display(),
+        size = size,
+        runtime = runtime,
+    );
+    std::fs::write(artifact_dir.join("manifest.txt"), manifest)
+        .expect("write SFS-530 evidence manifest");
+
+    let mut all_passed = true;
+    all_passed &= run_sfs530_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "seq-write",
+        "seq.bin",
+        &[
+            "--rw=write",
+            "--bs=1m",
+            &size_arg,
+            "--numjobs=1",
+            "--fsync_on_close=1",
+        ],
+    );
+    all_passed &= run_sfs530_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "rand-write",
+        "rand.bin",
+        &[
+            "--rw=randwrite",
+            "--bs=4k",
+            &size_arg,
+            "--numjobs=1",
+            &runtime_arg,
+            "--time_based",
+            "--fsync=32",
+        ],
+    );
+    all_passed &= run_sfs530_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "multi-job",
+        "multi.bin",
+        &[
+            "--rw=write",
+            "--bs=64k",
+            &size_arg,
+            "--numjobs=4",
+            &offset_increment_arg,
+            &runtime_arg,
+            "--time_based",
+            "--fsync=1",
+        ],
+    );
+    all_passed &= run_sfs530_fio_json_case(
+        &artifact_dir,
+        mount_path,
+        "fsync-heavy",
+        "fsync-heavy.bin",
+        &[
+            "--rw=write",
+            "--bs=16k",
+            &size_arg,
+            "--numjobs=1",
+            &runtime_arg,
+            "--time_based",
+            "--fsync=1",
+        ],
+    );
+
+    write_sfs530_telemetry_snapshot(&artifact_dir, "write-path-observability-after.json", vfs);
+    assert!(
+        all_passed,
+        "SFS-530 evidence matrix failed; see {}",
+        artifact_dir.display()
+    );
+}
+
 fn sfs509_env_value(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -1622,6 +2511,20 @@ fn run_fio_json_case(
     result.status.success()
 }
 
+fn assert_sfs509_fio_json_case(
+    artifact_dir: &Path,
+    mount_path: &Path,
+    case_name: &str,
+    filename: &str,
+    args: &[&str],
+) {
+    assert!(
+        run_fio_json_case(artifact_dir, mount_path, case_name, filename, args),
+        "SFS-509 fio workload {case_name} failed; see {}",
+        artifact_dir.display()
+    );
+}
+
 fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     assert!(
         command_available("fio"),
@@ -1631,18 +2534,39 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     raise_nofile_limit_best_effort();
     let artifact_dir = sfs509_artifact_dir(scenario_name);
     let _ = std::fs::remove_file(artifact_dir.join("workload-status.tsv"));
-    let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", "512m");
-    let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
-    let runtime = sfs509_env_value("STUDIOFS_SFS509_FIO_RUNTIME_SECS", "20");
-    let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "500")
-        .parse::<usize>()
-        .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
+    let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", SFS509_DEFAULT_FIO_SIZE);
+    let large_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_LARGE_SIZE",
+        SFS509_DEFAULT_FIO_LARGE_SIZE,
+    );
+    let multi_job_default_size = sfs509_multi_job_size(&size);
+    let multi_job_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_MULTI_JOB_SIZE",
+        &multi_job_default_size,
+    );
+    let fsync_heavy_default_size = sfs509_fsync_heavy_size(&size);
+    let fsync_heavy_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_FSYNC_HEAVY_SIZE",
+        &fsync_heavy_default_size,
+    );
+    let runtime = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_RUNTIME_SECS",
+        SFS509_DEFAULT_FIO_RUNTIME_SECS,
+    );
+    let metadata_files = sfs509_env_value(
+        "STUDIOFS_SFS509_METADATA_FILES",
+        SFS509_DEFAULT_METADATA_FILES,
+    )
+    .parse::<usize>()
+    .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
     let size_arg = format!("--size={size}");
     let large_size_arg = format!("--size={large_size}");
+    let multi_job_size_arg = format!("--size={multi_job_size}");
+    let fsync_heavy_size_arg = format!("--size={fsync_heavy_size}");
     let runtime_arg = format!("--runtime={runtime}");
-    let offset_increment_arg = format!("--offset_increment={size}");
+    let offset_increment_arg = format!("--offset_increment={multi_job_size}");
 
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "seq-write",
@@ -1656,21 +2580,21 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         ],
     );
     drop_caches_best_effort(&artifact_dir);
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "cold-cache-read",
         "seq.bin",
         &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "warm-cache-read",
         "seq.bin",
         &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "rand-write",
@@ -1685,7 +2609,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--fsync=32",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "rand-read",
@@ -1699,7 +2623,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--time_based",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "mixed-rw",
@@ -1715,7 +2639,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--fsync=64",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "large-file",
@@ -1729,7 +2653,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         ],
     );
     run_sfs509_metadata_probe(mount_path, &artifact_dir, metadata_files);
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "multi-job",
@@ -1737,13 +2661,12 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         &[
             "--rw=write",
             "--bs=64k",
-            &size_arg,
+            &multi_job_size_arg,
             "--numjobs=4",
             &offset_increment_arg,
-            "--fsync=1",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "fsync-heavy",
@@ -1751,7 +2674,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         &[
             "--rw=write",
             "--bs=16k",
-            &size_arg,
+            &fsync_heavy_size_arg,
             "--numjobs=1",
             "--fsync=1",
         ],

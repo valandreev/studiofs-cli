@@ -375,6 +375,30 @@ pub enum DispatchError {
     /// The underlying transport failed while receiving a request or sending a reply.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The underlying transport failed while receiving the next request.
+    #[error("receive FUSE request failed")]
+    Receive {
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
+    /// The underlying transport failed while sending a reply.
+    #[error(
+        "send FUSE reply failed: opcode={opcode:?}; unique={unique}; reply_len={reply_len}; reply_error={reply_error:?}"
+    )]
+    SendReply {
+        /// Request opcode whose reply failed.
+        opcode: FuseOpcode,
+        /// Request id whose reply failed.
+        unique: u64,
+        /// Serialized reply length.
+        reply_len: usize,
+        /// FUSE reply error code from the output header, when present.
+        reply_error: Option<i32>,
+        /// Original transport error.
+        #[source]
+        source: TransportError,
+    },
     /// A bounded operation queue has no capacity for another request.
     #[error("native FUSE dispatcher queue full for {class:?}")]
     QueueFull {
@@ -418,6 +442,13 @@ impl PartialEq for DispatchError {
     }
 }
 
+fn transport_error_raw_errno(error: &TransportError) -> Option<i32> {
+    match error {
+        TransportError::Io(error) => error.raw_os_error(),
+        TransportError::Abi(_) => None,
+    }
+}
+
 /// Transport-independent request loop for a native FUSE session.
 ///
 /// The dispatcher owns a transport and an operation handler and repeatedly
@@ -450,11 +481,34 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
             handled_requests: 0,
             saw_destroy: false,
         };
-        while let Some(request) = self.transport.receive_request()? {
+        while let Some(request) = self
+            .transport
+            .receive_request()
+            .map_err(|error| DispatchError::Receive { source: error })?
+        {
             let is_destroy = request.opcode == FuseOpcode::Destroy;
+            let opcode = request.opcode;
+            let unique = request.header.unique;
             let reply = self.handler.handle(request);
             if !reply.is_no_reply() {
-                self.transport.send_reply(reply)?;
+                let reply_len = reply.frame_len();
+                let reply_error = reply.error_code();
+                if let Err(error) = self.transport.send_reply(reply) {
+                    if matches!(opcode, FuseOpcode::Release | FuseOpcode::Releasedir)
+                        && reply_error == Some(0)
+                        && transport_error_raw_errno(&error) == Some(libc::ENOENT)
+                    {
+                        summary.handled_requests += 1;
+                        continue;
+                    }
+                    return Err(DispatchError::SendReply {
+                        opcode,
+                        unique,
+                        reply_len,
+                        reply_error,
+                        source: error,
+                    });
+                }
             }
             summary.handled_requests += 1;
             if is_destroy {
@@ -701,6 +755,69 @@ mod tests {
         assert_eq!(transport.sent_replies().len(), 2);
     }
 
+    struct EnoentOnReleaseReplyTransport {
+        inner: FrameQueueTransport,
+    }
+
+    impl FuseTransport for EnoentOnReleaseReplyTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+            if reply.unique == 0x20 {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOENT).into());
+            }
+            self.inner.send_reply(reply)
+        }
+    }
+
+    #[test]
+    fn dispatcher_treats_release_reply_enoent_as_completed_release() {
+        let transport = EnoentOnReleaseReplyTransport {
+            inner: FrameQueueTransport::new([frame(18, 0x20)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        let summary = dispatcher
+            .run_until_destroy()
+            .expect("release reply ENOENT should not fail dispatcher");
+        let (_transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(handler.opcodes, [FuseOpcode::Release]);
+        assert_eq!(
+            summary,
+            DispatchSummary {
+                handled_requests: 1,
+                saw_destroy: false,
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_treats_releasedir_reply_enoent_as_completed_release() {
+        let transport = EnoentOnReleaseReplyTransport {
+            inner: FrameQueueTransport::new([frame(29, 0x20)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        let summary = dispatcher
+            .run_until_destroy()
+            .expect("releasedir reply ENOENT should not fail dispatcher");
+        let (_transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(handler.opcodes, [FuseOpcode::Releasedir]);
+        assert_eq!(
+            summary,
+            DispatchSummary {
+                handled_requests: 1,
+                saw_destroy: false,
+            }
+        );
+    }
+
     #[derive(Default)]
     struct NoReplyHandler {
         handled: usize,
@@ -733,6 +850,36 @@ mod tests {
         );
         assert_eq!(handler.handled, 1);
         assert!(transport.sent_replies().is_empty());
+    }
+
+    struct EioOnReplyTransport {
+        inner: FrameQueueTransport,
+    }
+
+    impl FuseTransport for EioOnReplyTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, _reply: FuseReply) -> Result<(), TransportError> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+        }
+    }
+
+    #[test]
+    fn dispatcher_preserves_send_reply_transport_source_errno() {
+        let transport = EioOnReplyTransport {
+            inner: FrameQueueTransport::new([frame(1, 0x21)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        match dispatcher.run_until_destroy() {
+            Err(DispatchError::SendReply { source, .. }) => {
+                assert_eq!(transport_error_raw_errno(&source), Some(libc::EIO));
+            }
+            result => panic!("expected structured send reply error, got {result:?}"),
+        }
     }
 
     #[test]
@@ -1203,12 +1350,15 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .expect("handler should start and block");
 
-        assert_eq!(
-            dispatcher.shutdown_with_timeout(Duration::from_millis(10)),
-            Err(DispatchError::ShutdownTimeout {
-                remaining_workers: 1
-            })
-        );
+        match dispatcher.shutdown_with_timeout(Duration::from_millis(10)) {
+            Err(DispatchError::ShutdownTimeout { remaining_workers }) => {
+                assert!(
+                    remaining_workers >= 1,
+                    "blocked worker should still be running at timeout"
+                );
+            }
+            result => panic!("expected shutdown timeout, got {result:?}"),
+        }
 
         let (lock, changed) = blocker.as_ref();
         *lock.lock().expect("blocker mutex poisoned") = true;

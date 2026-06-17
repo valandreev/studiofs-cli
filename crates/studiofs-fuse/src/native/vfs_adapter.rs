@@ -1,5 +1,6 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -8,17 +9,24 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
-use studiofs_vfs::{LocalSyncPolicy, OpenFlags, SetattrArgs, StatFs, StudioVfs};
+use studiofs_vfs::{
+    LocalSyncPolicy, OpenFlags, SetattrArgs, StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot,
+};
 use tokio::runtime::Handle;
 use tracing::warn;
 
+use crate::StudioFuseRuntimeOptions;
+use crate::fs::pending_write_tracker::{
+    PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteTracker, PendingWriteTurn,
+    WriteRegistrationError,
+};
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::cache_policy::{
     NativeInodeCacheState, NativeOpenCacheAction, NativeOpenCacheDecision, NativeOpenCacheMetrics,
     NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadPolicy,
     NativeReadAheadState, decide_native_open_cache, decide_native_read_ahead,
 };
-use crate::native::dispatcher::FuseOperationHandler;
+use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
 
 const FUSE_ENTRY_OUT_PAYLOAD_LEN: usize = 128;
@@ -38,9 +46,14 @@ const FUSE_SETATTR_IN_LEN: usize = 88;
 const FUSE_WRITE_IN_LEN: usize = 40;
 const NATIVE_MAX_READ_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const POSIX_STAT_BLOCK_SIZE: u64 = 512;
-const FATTR_FH: u32 = 1 << 0;
+const FATTR_FH: u32 = 1 << 6;
 const FATTR_SIZE: u32 = 1 << 3;
-const SUPPORTED_SETATTR_VALID: u32 = FATTR_FH | FATTR_SIZE;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
+const FATTR_LOCKOWNER: u32 = 1 << 9;
+const FATTR_CTIME: u32 = 1 << 10;
+const SUPPORTED_SETATTR_VALID: u32 =
+    FATTR_FH | FATTR_SIZE | FATTR_MTIME | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
@@ -107,6 +120,27 @@ pub struct NativeStatFs {
     pub frsize: u32,
 }
 
+/// Async write serialization turn for native write executors.
+pub struct NativeAsyncWriteTurn {
+    inner: PendingWriteTurn,
+}
+
+impl NativeAsyncWriteTurn {
+    fn new(inner: PendingWriteTurn) -> Self {
+        Self { inner }
+    }
+
+    /// Wait synchronously until this write may enter the backend.
+    pub fn wait_blocking(self) {
+        self.inner.wait_blocking();
+    }
+
+    /// Wait asynchronously until this write may enter the backend.
+    pub async fn wait(self) {
+        self.inner.wait().await;
+    }
+}
+
 /// VFS operations required by the native Linux bridge operation layer.
 pub trait NativeVfs {
     /// Resolve `name` under `parent`.
@@ -147,6 +181,20 @@ pub trait NativeVfs {
 
     /// Write bytes to an open file handle.
     fn write(&self, fh: u64, ino: u64, offset: u64, data: &[u8], flags: i32) -> Result<u32, i32>;
+
+    /// Record native async write admission and barrier telemetry.
+    fn record_async_write_snapshot(&self, _snapshot: NativeAsyncWriteSnapshot) {}
+
+    /// Run a native async write job without blocking the FUSE callback thread.
+    fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            turn.wait_blocking();
+            job();
+        });
+    }
 
     /// Flush dirty state for a file handle or inode.
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32>;
@@ -242,6 +290,17 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn write(&self, fh: u64, ino: u64, offset: u64, data: &[u8], flags: i32) -> Result<u32, i32> {
         (**self).write(fh, ino, offset, data, flags)
+    }
+
+    fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot) {
+        (**self).record_async_write_snapshot(snapshot);
+    }
+
+    fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        (**self).spawn_native_async_write_job(turn, job);
     }
 
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -446,6 +505,40 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot) {
+        self.vfs
+            .record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+                snapshot_generation: snapshot.snapshot_generation,
+                enabled: snapshot.enabled,
+                platform_policy: snapshot.platform_policy.clone(),
+                max_pending_bytes: snapshot.max_pending_bytes,
+                max_pending_writes: snapshot.max_pending_writes,
+                per_handle_pending_bytes: snapshot.per_handle_pending_bytes,
+                pending_writes: snapshot.pending_writes,
+                pending_bytes: snapshot.pending_bytes,
+                peak_pending_bytes: snapshot.peak_pending_bytes,
+                completed_writes: snapshot.completed_writes,
+                failed_writes: snapshot.failed_writes,
+                task_failed_writes: snapshot.task_failed_writes,
+                admission_waits: snapshot.admission_waits,
+                admission_wait_total_ms: snapshot.admission_wait_total_ms,
+                barrier_waits: snapshot.barrier_waits,
+                barrier_wait_total_ms: snapshot.barrier_wait_total_ms,
+                ..Default::default()
+            });
+    }
+
+    fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
+    where
+        J: FnOnce() + Send + 'static,
+    {
+        let rt = self.rt.clone();
+        drop(self.rt.spawn(async move {
+            turn.wait().await;
+            let _ = rt.spawn_blocking(job).await;
+        }));
+    }
+
     fn flush(&self, ino: u64, fh: u64) -> Result<(), i32> {
         let result = if fh != 0 {
             self.rt.block_on(self.vfs.flush_fh(fh))
@@ -564,12 +657,115 @@ impl NativeVfs for StudioVfsNativeAdapter {
 #[derive(Debug)]
 pub struct LinuxNativeBridge<V> {
     vfs: V,
+    barrier_gates: OperationBarrierGates,
+    async_write: Option<NativeAsyncWriteConfig>,
+    pending_writes: PendingWriteTracker,
     lookup_counts: NativeLookupCountStore,
     open_cache_metrics: NativeOpenCacheMetrics,
     read_metrics: NativeReadMetrics,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     read_ahead_policy: NativeReadAheadPolicy,
     read_ahead_states: Mutex<HashMap<u64, NativeReadAheadState>>,
+}
+
+/// Native Linux async write admission and telemetry profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAsyncWriteConfig {
+    /// Maximum bridge-owned pending write bytes.
+    pub max_pending_bytes: Option<usize>,
+    /// Maximum bridge-owned pending write requests.
+    pub max_pending_writes: Option<usize>,
+    /// Maximum bridge-owned pending bytes for one file handle.
+    pub per_handle_pending_bytes: Option<usize>,
+    /// Human-readable profile name surfaced in diagnostics.
+    pub platform_policy: Cow<'static, str>,
+}
+
+impl NativeAsyncWriteConfig {
+    /// Build native async write config from public FUSE runtime options.
+    pub fn from_runtime_options(options: &StudioFuseRuntimeOptions) -> Option<Self> {
+        if !options.async_write_enabled {
+            return None;
+        }
+        let limits = options
+            .async_write_admission_limits
+            .map(Into::into)
+            .unwrap_or_else(native_async_write_default_limits);
+        Some(Self {
+            max_pending_bytes: limits.max_pending_bytes,
+            max_pending_writes: limits.max_pending_writes,
+            per_handle_pending_bytes: limits.per_handle_pending_bytes,
+            platform_policy: "linux6-safe".into(),
+        })
+    }
+
+    fn admission_limits(&self) -> PendingWriteAdmissionLimits {
+        PendingWriteAdmissionLimits {
+            max_pending_bytes: self.max_pending_bytes,
+            max_pending_writes: self.max_pending_writes,
+            per_handle_pending_bytes: self.per_handle_pending_bytes,
+        }
+    }
+}
+
+/// Point-in-time native async write admission and barrier telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeAsyncWriteSnapshot {
+    /// Tracker mutation generation for stale-snapshot rejection.
+    pub snapshot_generation: u64,
+    /// Whether async native writes are enabled.
+    pub enabled: bool,
+    /// Human-readable profile name.
+    pub platform_policy: Cow<'static, str>,
+    /// Maximum bridge-owned pending write bytes.
+    pub max_pending_bytes: Option<usize>,
+    /// Maximum bridge-owned pending write requests.
+    pub max_pending_writes: Option<usize>,
+    /// Maximum bridge-owned pending bytes for one file handle.
+    pub per_handle_pending_bytes: Option<usize>,
+    /// Currently pending native write requests.
+    pub pending_writes: usize,
+    /// Currently pending bridge-owned native write bytes.
+    pub pending_bytes: usize,
+    /// Peak pending bridge-owned native write bytes.
+    pub peak_pending_bytes: usize,
+    /// Completed async native writes.
+    pub completed_writes: u64,
+    /// Async native writes completed with VFS errors.
+    pub failed_writes: u64,
+    /// Async native write tasks dropped without explicit completion.
+    pub task_failed_writes: u64,
+    /// Number of admission waits recorded by the tracker.
+    pub admission_waits: u64,
+    /// Total admission wait time in milliseconds.
+    pub admission_wait_total_ms: f64,
+    /// Number of barrier waits recorded by the tracker.
+    pub barrier_waits: u64,
+    /// Total barrier wait time in milliseconds.
+    pub barrier_wait_total_ms: f64,
+}
+
+impl Default for NativeAsyncWriteSnapshot {
+    fn default() -> Self {
+        Self {
+            snapshot_generation: 0,
+            enabled: false,
+            platform_policy: Cow::Borrowed(""),
+            max_pending_bytes: None,
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+            pending_writes: 0,
+            pending_bytes: 0,
+            peak_pending_bytes: 0,
+            completed_writes: 0,
+            failed_writes: 0,
+            task_failed_writes: 0,
+            admission_waits: 0,
+            admission_wait_total_ms: 0.0,
+            barrier_waits: 0,
+            barrier_wait_total_ms: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -615,6 +811,9 @@ impl<V> LinuxNativeBridge<V> {
     pub fn new(vfs: V) -> Self {
         Self {
             vfs,
+            barrier_gates: OperationBarrierGates::default(),
+            async_write: None,
+            pending_writes: PendingWriteTracker::default(),
             lookup_counts: NativeLookupCountStore::default(),
             open_cache_metrics: NativeOpenCacheMetrics::default(),
             read_metrics: NativeReadMetrics::default(),
@@ -626,6 +825,17 @@ impl<V> LinuxNativeBridge<V> {
             },
             read_ahead_states: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Enables native async write admission for this bridge.
+    pub fn with_async_write_config(mut self, config: NativeAsyncWriteConfig) -> Self {
+        self.async_write = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_async_write_for_test(self, config: NativeAsyncWriteConfig) -> Self {
+        self.with_async_write_config(config)
     }
 
     /// Returns the kernel lookup reference count currently tracked for `ino`.
@@ -642,9 +852,20 @@ impl<V> LinuxNativeBridge<V> {
     pub fn read_metrics_snapshot(&self) -> NativeReadMetricsSnapshot {
         self.read_metrics.snapshot()
     }
+
+    /// Snapshot native Linux async write admission and barrier metrics.
+    pub fn async_write_snapshot(&self) -> NativeAsyncWriteSnapshot {
+        let Some(config) = &self.async_write else {
+            return NativeAsyncWriteSnapshot::default();
+        };
+        native_async_write_snapshot(&self.pending_writes, config)
+    }
 }
 
-impl<V: NativeVfs> FuseOperationHandler for LinuxNativeBridge<V> {
+impl<V> FuseOperationHandler for LinuxNativeBridge<V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
     fn handle(&mut self, request: FuseRequest) -> FuseReply {
         match request.opcode {
             FuseOpcode::Lookup => self.handle_lookup(request),
@@ -673,7 +894,10 @@ impl<V: NativeVfs> FuseOperationHandler for LinuxNativeBridge<V> {
     }
 }
 
-impl<V: NativeVfs> LinuxNativeBridge<V> {
+impl<V> LinuxNativeBridge<V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
     fn handle_lookup(&self, request: FuseRequest) -> FuseReply {
         let name = match lookup_name(&request.payload) {
             Some(name) => name,
@@ -737,6 +961,21 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        if self.async_write.is_some() {
+            let pending_result = self
+                .pending_writes
+                .drain_and_begin_close(request.header.nodeid, fh);
+            self.publish_async_write_snapshot();
+            if pending_result == Err(libc::EAGAIN) {
+                return errno_reply(request.header.unique, libc::EAGAIN);
+            }
+            let release_result = self.vfs.release(fh);
+            self.pending_writes.finish_close(request.header.nodeid, fh);
+            return empty_barrier_reply(request.header.unique, pending_result, release_result);
+        }
+
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.release(fh) {
             Ok(()) => {
                 lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
@@ -830,6 +1069,18 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        if let Some(config) = &self.async_write {
+            return self.handle_async_write(
+                request.header.unique,
+                request.header.nodeid,
+                write,
+                config,
+            );
+        }
+
+        let _pending_write = self
+            .barrier_gates
+            .begin_write(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.write(
             write.fh,
             request.header.nodeid,
@@ -845,12 +1096,72 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         }
     }
 
+    fn handle_async_write(
+        &self,
+        unique: u64,
+        ino: u64,
+        write: WriteRequest<'_>,
+        config: &NativeAsyncWriteConfig,
+    ) -> FuseReply {
+        let data_len = write.data.len();
+        let registration = match self.pending_writes.register_with_admission(
+            ino,
+            write.fh,
+            data_len,
+            config.admission_limits(),
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.publish_async_write_snapshot();
+                return errno_reply(unique, write_registration_error_to_errno(error));
+            }
+        };
+        self.publish_async_write_snapshot();
+        let mut registration = registration;
+        let turn = NativeAsyncWriteTurn::new(registration.turn_waiter());
+        let data = write.data.to_vec();
+        let vfs = self.vfs.clone();
+        let pending_writes = self.pending_writes.clone();
+        let config = config.clone();
+        let fh = write.fh;
+        let offset = write.offset;
+        let flags = write.flags;
+        self.vfs.spawn_native_async_write_job(turn, move || {
+            let completion = match vfs.write(fh, ino, offset, &data, flags) {
+                Ok(_) => PendingWriteCompletion::Success,
+                Err(errno) => PendingWriteCompletion::Error(errno),
+            };
+            registration.complete(completion);
+            drop(registration);
+            vfs.record_async_write_snapshot(native_async_write_snapshot(&pending_writes, &config));
+        });
+
+        FuseReply::contiguous(unique, ok_reply(unique, &write_payload(data_len as u32)))
+    }
+
     fn handle_flush(&self, request: FuseRequest) -> FuseReply {
         let fh = match flush_fh(&request.payload) {
             Some(fh) => fh,
             None => return invalid_request(request.header.unique),
         };
 
+        if self.async_write.is_some() {
+            let pending_result = if fh != 0 {
+                self.pending_writes
+                    .handle_barrier(request.header.nodeid, fh)
+                    .wait()
+            } else {
+                self.pending_writes
+                    .inode_barrier(request.header.nodeid)
+                    .wait()
+            };
+            self.publish_async_write_snapshot();
+            let flush_result = self.vfs.flush(request.header.nodeid, fh);
+            return empty_barrier_reply(request.header.unique, pending_result, flush_result);
+        }
+
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.flush(request.header.nodeid, fh) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
@@ -865,6 +1176,24 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             None => return invalid_request(request.header.unique),
         };
 
+        if self.async_write.is_some() {
+            let pending_result = self
+                .pending_writes
+                .inode_barrier(request.header.nodeid)
+                .wait();
+            self.publish_async_write_snapshot();
+            let fsync_result = self.vfs.fsync(request.header.nodeid, datasync);
+            if let Err(errno) = fsync_result {
+                warn!(
+                    ino = request.header.nodeid,
+                    datasync, errno, "native FSYNC failed"
+                );
+            }
+            return empty_barrier_reply(request.header.unique, pending_result, fsync_result);
+        }
+
+        self.barrier_gates
+            .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         match self.vfs.fsync(request.header.nodeid, datasync) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
@@ -1065,15 +1394,36 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     }
 
     fn handle_setattr(&self, request: FuseRequest) -> FuseReply {
-        let truncate = match truncate_request(&request.payload) {
-            Some(truncate) => truncate,
+        let setattr = match setattr_request(&request.payload) {
+            Some(setattr) => setattr,
             None => return invalid_request(request.header.unique),
         };
 
-        match self
-            .vfs
-            .truncate(request.header.nodeid, truncate.fh, truncate.size)
-        {
+        let result = match setattr.size {
+            Some(size) => {
+                if self.async_write.is_some() {
+                    let pending_result = self
+                        .pending_writes
+                        .inode_barrier(request.header.nodeid)
+                        .wait();
+                    self.publish_async_write_snapshot();
+                    match (
+                        pending_result,
+                        self.vfs.truncate(request.header.nodeid, setattr.fh, size),
+                    ) {
+                        (Err(errno), _) => return errno_reply(request.header.unique, errno),
+                        (Ok(()), result) => result,
+                    }
+                } else {
+                    self.barrier_gates
+                        .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
+                    self.vfs.truncate(request.header.nodeid, setattr.fh, size)
+                }
+            }
+            None => self.vfs.getattr(request.header.nodeid),
+        };
+
+        match result {
             Ok(attr) => FuseReply::contiguous(
                 request.header.unique,
                 ok_reply(request.header.unique, &attr_out_payload(attr)),
@@ -1194,6 +1544,14 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             );
         }
     }
+
+    fn publish_async_write_snapshot(&self) {
+        let Some(config) = &self.async_write else {
+            return;
+        };
+        self.vfs
+            .record_async_write_snapshot(native_async_write_snapshot(&self.pending_writes, config));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1216,6 +1574,59 @@ fn invalid_request(unique: u64) -> FuseReply {
 
 fn errno_reply(unique: u64, errno: i32) -> FuseReply {
     FuseReply::contiguous(unique, error_reply(unique, errno).to_vec())
+}
+
+fn empty_barrier_reply(
+    unique: u64,
+    pending_result: Result<(), i32>,
+    operation_result: Result<(), i32>,
+) -> FuseReply {
+    match (pending_result, operation_result) {
+        (Err(errno), _) => errno_reply(unique, errno),
+        (Ok(()), Err(errno)) => errno_reply(unique, errno),
+        (Ok(()), Ok(())) => FuseReply::contiguous(unique, ok_reply(unique, &[])),
+    }
+}
+
+fn native_async_write_snapshot(
+    pending_writes: &PendingWriteTracker,
+    config: &NativeAsyncWriteConfig,
+) -> NativeAsyncWriteSnapshot {
+    let tracker = pending_writes.snapshot();
+    NativeAsyncWriteSnapshot {
+        snapshot_generation: tracker.mutation_generation,
+        enabled: true,
+        platform_policy: config.platform_policy.clone(),
+        max_pending_bytes: config.max_pending_bytes,
+        max_pending_writes: config.max_pending_writes,
+        per_handle_pending_bytes: config.per_handle_pending_bytes,
+        pending_writes: tracker.pending_writes,
+        pending_bytes: tracker.pending_bytes,
+        peak_pending_bytes: tracker.peak_pending_bytes,
+        completed_writes: tracker.completed_writes,
+        failed_writes: tracker.failed_writes,
+        task_failed_writes: tracker.task_failed_writes,
+        admission_waits: tracker.admission_waits,
+        admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
+        barrier_waits: tracker.barrier_waits,
+        barrier_wait_total_ms: tracker.barrier_wait_ns as f64 / 1_000_000.0,
+    }
+}
+
+fn native_async_write_default_limits() -> PendingWriteAdmissionLimits {
+    PendingWriteAdmissionLimits {
+        max_pending_bytes: Some(128 * 1024 * 1024),
+        max_pending_writes: Some(256),
+        per_handle_pending_bytes: Some(32 * 1024 * 1024),
+    }
+}
+
+fn write_registration_error_to_errno(error: WriteRegistrationError) -> i32 {
+    match error {
+        WriteRegistrationError::HandleClosing => libc::EAGAIN,
+        WriteRegistrationError::HandleClosed => libc::EIO,
+        WriteRegistrationError::AdmissionLimitExceeded => libc::EAGAIN,
+    }
 }
 
 fn lookup_name(payload: &[u8]) -> Option<&[u8]> {
@@ -1364,15 +1775,22 @@ fn rename_request(payload: &[u8]) -> Option<RenameRequest<'_>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetattrRequest {
+    fh: Option<u64>,
+    size: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TruncateRequest {
     fh: Option<u64>,
     size: u64,
 }
 
-fn truncate_request(payload: &[u8]) -> Option<TruncateRequest> {
+fn setattr_request(payload: &[u8]) -> Option<SetattrRequest> {
     let bytes = payload.get(..FUSE_SETATTR_IN_LEN)?;
     let valid = read_u32(bytes, 0)?;
-    if valid & !SUPPORTED_SETATTR_VALID != 0 || valid & FATTR_SIZE == 0 {
+    if valid & !SUPPORTED_SETATTR_VALID != 0 {
         return None;
     }
     let fh = if valid & FATTR_FH != 0 {
@@ -1380,9 +1798,20 @@ fn truncate_request(payload: &[u8]) -> Option<TruncateRequest> {
     } else {
         None
     };
+    let size = if valid & FATTR_SIZE != 0 {
+        Some(read_u64(bytes, 16)?)
+    } else {
+        None
+    };
+    Some(SetattrRequest { fh, size })
+}
+
+#[cfg(test)]
+fn truncate_request(payload: &[u8]) -> Option<TruncateRequest> {
+    let request = setattr_request(payload)?;
     Some(TruncateRequest {
-        fh,
-        size: read_u64(bytes, 16)?,
+        fh: request.fh,
+        size: request.size?,
     })
 }
 
@@ -1821,6 +2250,7 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseRuntimeOptions};
 
     #[derive(Debug)]
     struct TestNativeVfs {
@@ -2195,6 +2625,960 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingWriteVfs {
+        write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_write: Mutex<std::sync::mpsc::Receiver<()>>,
+        write_error: Option<i32>,
+        snapshots: Mutex<Vec<NativeAsyncWriteSnapshot>>,
+        flushes: AtomicU64,
+        fsyncs: AtomicU64,
+        releases: AtomicU64,
+        truncates: AtomicU64,
+    }
+
+    struct BlockingWriteFixture {
+        vfs: Arc<BlockingWriteVfs>,
+        bridge: Arc<LinuxNativeBridge<Arc<BlockingWriteVfs>>>,
+        write_started: std::sync::mpsc::Receiver<()>,
+        release_write: std::sync::mpsc::Sender<()>,
+    }
+
+    fn blocking_write_fixture() -> BlockingWriteFixture {
+        blocking_write_fixture_with_write_result(None)
+    }
+
+    fn blocking_write_fixture_with_write_error(errno: i32) -> BlockingWriteFixture {
+        blocking_write_fixture_with_write_result(Some(errno))
+    }
+
+    fn blocking_write_fixture_with_write_result(write_error: Option<i32>) -> BlockingWriteFixture {
+        let (write_started_tx, write_started) = std::sync::mpsc::channel();
+        let (release_write, release_write_rx) = std::sync::mpsc::channel();
+        let vfs = Arc::new(BlockingWriteVfs {
+            write_started: Mutex::new(Some(write_started_tx)),
+            release_write: Mutex::new(release_write_rx),
+            write_error,
+            snapshots: Mutex::new(Vec::new()),
+            flushes: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            truncates: AtomicU64::new(0),
+        });
+        let bridge = Arc::new(LinuxNativeBridge::new(Arc::clone(&vfs)));
+
+        BlockingWriteFixture {
+            vfs,
+            bridge,
+            write_started,
+            release_write,
+        }
+    }
+
+    impl NativeVfs for BlockingWriteVfs {
+        fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn getattr(&self, _ino: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn open(&self, _ino: u64, _flags: i32) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn release(&self, _fh: u64) -> Result<(), i32> {
+            self.releases.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn read(&self, _fh: u64, _ino: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn write(
+            &self,
+            _fh: u64,
+            _ino: u64,
+            _offset: u64,
+            data: &[u8],
+            _flags: i32,
+        ) -> Result<u32, i32> {
+            if let Some(started) = self
+                .write_started
+                .lock()
+                .expect("write_started lock should not be poisoned")
+                .take()
+            {
+                started.send(()).expect("test should observe write start");
+            }
+            self.release_write
+                .lock()
+                .expect("release_write lock should not be poisoned")
+                .recv()
+                .expect("test should release blocked write");
+            if let Some(errno) = self.write_error {
+                return Err(errno);
+            }
+            Ok(data.len() as u32)
+        }
+
+        fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot) {
+            self.snapshots
+                .lock()
+                .expect("snapshots lock should not be poisoned")
+                .push(snapshot);
+        }
+
+        fn flush(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn fsync(&self, _ino: u64, _datasync: bool) -> Result<(), i32> {
+            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn opendir(&self, _ino: u64) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn releasedir(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn readdir(&self, _ino: u64, _fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn mkdir(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+        ) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn create(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+            _flags: i32,
+        ) -> Result<(NativeAttr, u64), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn unlink(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rmdir(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rename(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _new_parent: u64,
+            _new_name: &[u8],
+        ) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn truncate(&self, ino: u64, _fh: Option<u64>, size: u64) -> Result<NativeAttr, i32> {
+            self.truncates.fetch_add(1, Ordering::Relaxed);
+            let mut attr = test_attr(ino);
+            attr.size = size;
+            Ok(attr)
+        }
+
+        fn statfs(&self) -> Result<NativeStatFs, i32> {
+            unimplemented!("not used by this test")
+        }
+    }
+
+    #[test]
+    fn handle_flush_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (flush_done_tx, flush_done_rx) = std::sync::mpsc::channel();
+        let flush_bridge = Arc::clone(&fixture.bridge);
+        let flusher = std::thread::spawn(move || {
+            let reply = flush_bridge.handle_flush(flush_request_for_fh(20, 7));
+            flush_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe flush result");
+        });
+
+        assert!(
+            flush_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "flush must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            flush_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("flush should finish after write drains"),
+            0
+        );
+        flusher.join().expect("flush thread should finish");
+        assert_eq!(fixture.vfs.flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_fsync_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (fsync_done_tx, fsync_done_rx) = std::sync::mpsc::channel();
+        let fsync_bridge = Arc::clone(&fixture.bridge);
+        let fsyncer = std::thread::spawn(move || {
+            let reply = fsync_bridge.handle_fsync(fsync_request_for_datasync(20, true));
+            fsync_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe fsync result");
+        });
+
+        assert!(
+            fsync_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "fsync must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            fsync_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("fsync should finish after write drains"),
+            0
+        );
+        fsyncer.join().expect("fsync thread should finish");
+        assert_eq!(fixture.vfs.fsyncs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_release_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before barrier starts");
+
+        let (release_done_tx, release_done_rx) = std::sync::mpsc::channel();
+        let release_bridge = Arc::clone(&fixture.bridge);
+        let releaser = std::thread::spawn(move || {
+            let reply = release_bridge.handle_release(release_request_for_fh(20, 7));
+            release_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe release result");
+        });
+
+        assert!(
+            release_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "release must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            release_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("release should finish after write drains"),
+            0
+        );
+        releaser.join().expect("release thread should finish");
+        assert_eq!(fixture.vfs.releases.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_release_short_circuits_eagain_before_releasing_vfs_handle() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn handle_release(&self, request: FuseRequest)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("fn handle_read(&self, request: FuseRequest)")
+                    .next()
+            })
+            .expect("handle_release body should be present");
+        let eagain_guard = body
+            .find("pending_result == Err(libc::EAGAIN)")
+            .expect("handle_release should check EAGAIN from drain");
+        let vfs_release = body
+            .find("self.vfs.release(fh)")
+            .expect("handle_release should release VFS handle after successful drain");
+        let finish_close = body
+            .find("self.pending_writes.finish_close")
+            .expect("handle_release should finish close after releasing VFS handle");
+
+        assert!(eagain_guard < vfs_release);
+        assert!(eagain_guard < finish_close);
+    }
+
+    #[test]
+    fn handle_setattr_truncate_waits_for_inflight_write_on_same_inode() {
+        let fixture = blocking_write_fixture();
+        let writer_bridge = Arc::clone(&fixture.bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("write should enter backend before truncate starts");
+
+        let (truncate_done_tx, truncate_done_rx) = std::sync::mpsc::channel();
+        let truncate_bridge = Arc::clone(&fixture.bridge);
+        let truncater = std::thread::spawn(move || {
+            let reply = truncate_bridge.handle_setattr(truncate_request_for_size(20, 7, 3));
+            truncate_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe truncate result");
+        });
+
+        assert!(
+            truncate_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "truncate must not cross an inflight write on the same inode"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            truncate_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("truncate should finish after write drains"),
+            0
+        );
+        truncater.join().expect("truncate thread should finish");
+        assert_eq!(fixture.vfs.truncates.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_write_waits_for_async_admission_when_pending_bytes_are_full() {
+        let fixture = blocking_write_fixture();
+        let bridge = Arc::new(
+            LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+                NativeAsyncWriteConfig {
+                    max_pending_bytes: Some(1),
+                    max_pending_writes: None,
+                    per_handle_pending_bytes: None,
+                    platform_policy: "test-native".into(),
+                },
+            ),
+        );
+        let writer_bridge = Arc::clone(&bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("first async write should enter backend and hold admission bytes");
+
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let second_bridge = Arc::clone(&bridge);
+        let second = std::thread::spawn(move || {
+            let reply = second_bridge.handle_write(write_request_for_data(20, 8, 7, b"blocked"));
+            second_done_tx
+                .send(reply_errno(&reply))
+                .expect("test should observe second write reply");
+        });
+
+        assert!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "second blocking write must wait for admission instead of returning EAGAIN"
+        );
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock first write");
+        writer.join().expect("write thread should finish");
+        assert_eq!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("second write should be admitted after first write completes"),
+            0
+        );
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock second write");
+        second.join().expect("second write thread should finish");
+    }
+
+    #[test]
+    fn handle_async_write_uses_shared_executor_instead_of_per_write_threads() {
+        let source = include_str!("vfs_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        let body = source
+            .split("fn handle_async_write(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_flush(").next())
+            .expect("handle_async_write body should be present");
+
+        assert!(!body.contains("std::thread::spawn"));
+        assert!(!body.contains("new_current_thread"));
+        assert!(!production.contains("NativeAsyncWriteExecutor"));
+        assert!(!production.contains("native_async_write_executor"));
+        assert!(body.contains("spawn_native_async_write_job"));
+    }
+
+    #[test]
+    fn studio_vfs_async_write_waits_for_turn_before_entering_blocking_pool() {
+        let source = include_str!("vfs_adapter.rs");
+        let studio_spawn = source
+            .split("impl NativeVfs for StudioVfsNativeAdapter")
+            .nth(1)
+            .and_then(|rest| rest.split("fn flush(").next())
+            .expect("studio native vfs impl should be present");
+        let async_write_body = source
+            .split("fn handle_async_write(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_flush(").next())
+            .expect("handle_async_write body should be present");
+        let wait_pos = studio_spawn
+            .find("turn.wait().await")
+            .expect("studio adapter should wait for turn asynchronously");
+        let spawn_blocking_pos = studio_spawn
+            .find("spawn_blocking")
+            .expect("studio adapter should run backend write in blocking pool after turn");
+
+        assert!(!async_write_body.contains("wait_blocking"));
+        assert!(wait_pos < spawn_blocking_pos);
+    }
+
+    #[test]
+    fn handle_fsync_logs_failures_through_tracing() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn handle_fsync(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_opendir(").next())
+            .expect("handle_fsync body should be present");
+
+        assert!(!body.contains("eprintln!"));
+        assert!(body.contains("warn!"));
+    }
+
+    #[test]
+    fn async_write_snapshot_reports_native_admission_state() {
+        let fixture = blocking_write_fixture();
+        let bridge = Arc::new(
+            LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+                NativeAsyncWriteConfig {
+                    max_pending_bytes: Some(16),
+                    max_pending_writes: Some(2),
+                    per_handle_pending_bytes: Some(8),
+                    platform_policy: "test-native".into(),
+                },
+            ),
+        );
+        let writer_bridge = Arc::clone(&bridge);
+
+        let writer = std::thread::spawn(move || {
+            writer_bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        });
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("async write should enter backend and hold pending bytes");
+
+        let snapshot = bridge.async_write_snapshot();
+
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.platform_policy.as_ref(), "test-native");
+        assert_eq!(snapshot.max_pending_bytes, Some(16));
+        assert_eq!(snapshot.max_pending_writes, Some(2));
+        assert_eq!(snapshot.per_handle_pending_bytes, Some(8));
+        assert_eq!(snapshot.pending_writes, 1);
+        assert_eq!(snapshot.pending_bytes, b"pending".len());
+        assert_eq!(snapshot.peak_pending_bytes, b"pending".len());
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+        writer.join().expect("write thread should finish");
+    }
+
+    #[test]
+    fn native_async_write_snapshot_reports_completion_before_registration_drop() {
+        let pending_writes = PendingWriteTracker::default();
+        let config = NativeAsyncWriteConfig {
+            max_pending_bytes: Some(16),
+            max_pending_writes: Some(2),
+            per_handle_pending_bytes: Some(8),
+            platform_policy: "test-native".into(),
+        };
+        let registration = pending_writes
+            .register_with_admission(20, 7, 4, config.admission_limits())
+            .expect("registration should fit admission limits");
+
+        registration.complete(PendingWriteCompletion::Success);
+        let snapshot = native_async_write_snapshot(&pending_writes, &config);
+
+        assert_eq!(snapshot.pending_writes, 0);
+        assert_eq!(snapshot.pending_bytes, 0);
+        assert_eq!(snapshot.completed_writes, 1);
+    }
+
+    #[test]
+    fn native_async_write_config_uses_runtime_async_write_profile() {
+        let disabled = NativeAsyncWriteConfig::from_runtime_options(&StudioFuseRuntimeOptions {
+            async_write_enabled: false,
+            async_read_enabled: false,
+            async_metadata_enabled: false,
+            linux_async_dio_enabled: false,
+            linux_parallel_dirops_enabled: false,
+            linux_readdirplus_auto_enabled: true,
+            async_write_admission_limits: Some(StudioFuseAsyncWriteAdmissionLimits {
+                max_pending_bytes: Some(4096),
+                max_pending_writes: Some(7),
+                per_handle_pending_bytes: Some(1024),
+            }),
+            async_read_admission_limits: None,
+        });
+        assert_eq!(disabled, None);
+
+        let enabled = NativeAsyncWriteConfig::from_runtime_options(&StudioFuseRuntimeOptions {
+            async_write_enabled: true,
+            async_read_enabled: false,
+            async_metadata_enabled: false,
+            linux_async_dio_enabled: false,
+            linux_parallel_dirops_enabled: false,
+            linux_readdirplus_auto_enabled: true,
+            async_write_admission_limits: Some(StudioFuseAsyncWriteAdmissionLimits {
+                max_pending_bytes: Some(4096),
+                max_pending_writes: Some(7),
+                per_handle_pending_bytes: Some(1024),
+            }),
+            async_read_admission_limits: None,
+        })
+        .expect("enabled runtime async write should produce native config");
+
+        assert_eq!(enabled.max_pending_bytes, Some(4096));
+        assert_eq!(enabled.max_pending_writes, Some(7));
+        assert_eq!(enabled.per_handle_pending_bytes, Some(1024));
+        assert_eq!(enabled.platform_policy.as_ref(), "linux6-safe");
+    }
+
+    #[test]
+    fn native_async_write_default_pending_writes_stays_below_tokio_blocking_pool_limit() {
+        let limits = native_async_write_default_limits();
+
+        assert!(limits.max_pending_writes.is_some_and(|limit| limit < 512));
+    }
+
+    #[test]
+    fn native_async_write_policy_fields_use_cheap_clone_storage() {
+        let source = include_str!("vfs_adapter.rs");
+        let native_async_types = source
+            .split("pub struct NativeAsyncWriteConfig")
+            .nth(1)
+            .and_then(|rest| rest.split("impl NativeAsyncWriteConfig").next())
+            .expect("native async write type definitions should be present");
+
+        assert!(!native_async_types.contains("platform_policy: String"));
+        assert!(!native_async_types.contains("platform_policy: Arc<str>"));
+        assert!(native_async_types.contains("platform_policy: Cow<'static, str>"));
+
+        let studio_record_snapshot = source
+            .split("fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn spawn_native_async_write_job").next())
+            .expect("studio snapshot recording method should be present");
+        assert!(!studio_record_snapshot.contains("to_string()"));
+    }
+
+    #[test]
+    fn handle_write_async_publishes_snapshot_to_backend() {
+        let fixture = blocking_write_fixture();
+        let bridge = LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+            NativeAsyncWriteConfig {
+                max_pending_bytes: Some(16),
+                max_pending_writes: Some(2),
+                per_handle_pending_bytes: Some(8),
+                platform_policy: "test-native".into(),
+            },
+        );
+
+        bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("async write should enter backend and hold pending bytes");
+
+        let snapshots = fixture
+            .vfs
+            .snapshots
+            .lock()
+            .expect("snapshots lock should not be poisoned");
+        let snapshot = snapshots
+            .last()
+            .expect("native bridge should publish async write snapshot");
+
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.pending_writes, 1);
+        assert_eq!(snapshot.pending_bytes, b"pending".len());
+        drop(snapshots);
+
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock write");
+    }
+
+    #[test]
+    fn handle_flush_surfaces_failed_async_write_error() {
+        let fixture = blocking_write_fixture_with_write_error(libc::EIO);
+        let bridge = LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+            NativeAsyncWriteConfig {
+                max_pending_bytes: Some(16),
+                max_pending_writes: Some(2),
+                per_handle_pending_bytes: Some(8),
+                platform_policy: "test-native".into(),
+            },
+        );
+
+        bridge.handle_write(write_request_for_data(20, 7, 0, b"pending"));
+        fixture
+            .write_started
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("async write should enter backend");
+        fixture
+            .release_write
+            .send(())
+            .expect("test should unblock failed write");
+
+        let reply = bridge.handle_flush(flush_request_for_fh(20, 7));
+
+        assert_eq!(reply_errno(&reply), -libc::EIO);
+    }
+
+    #[derive(Debug)]
+    struct SequencedWriteVfs {
+        started: Mutex<std::sync::mpsc::Sender<u64>>,
+        release_first: Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: AtomicU64,
+    }
+
+    impl NativeVfs for SequencedWriteVfs {
+        fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn getattr(&self, _ino: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn open(&self, _ino: u64, _flags: i32) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn release(&self, _fh: u64) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn read(&self, _fh: u64, _ino: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn write(
+            &self,
+            _fh: u64,
+            _ino: u64,
+            offset: u64,
+            data: &[u8],
+            _flags: i32,
+        ) -> Result<u32, i32> {
+            self.started
+                .lock()
+                .expect("started sender lock should not be poisoned")
+                .send(offset)
+                .expect("test should observe write start");
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.release_first
+                    .lock()
+                    .expect("release_first lock should not be poisoned")
+                    .recv()
+                    .expect("test should release first write");
+            }
+            Ok(data.len() as u32)
+        }
+
+        fn flush(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn fsync(&self, _ino: u64, _datasync: bool) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn opendir(&self, _ino: u64) -> Result<u64, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn releasedir(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn readdir(&self, _ino: u64, _fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn mkdir(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+        ) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn create(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+            _flags: i32,
+        ) -> Result<(NativeAttr, u64), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn unlink(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rmdir(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn rename(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _new_parent: u64,
+            _new_name: &[u8],
+        ) -> Result<(), i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn truncate(&self, _ino: u64, _fh: Option<u64>, _size: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by this test")
+        }
+
+        fn statfs(&self) -> Result<NativeStatFs, i32> {
+            unimplemented!("not used by this test")
+        }
+    }
+
+    #[test]
+    fn handle_write_async_serializes_writes_for_same_handle() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let vfs = Arc::new(SequencedWriteVfs {
+            started: Mutex::new(started_tx),
+            release_first: Mutex::new(release_first_rx),
+            calls: AtomicU64::new(0),
+        });
+        let bridge = Arc::new(
+            LinuxNativeBridge::new(Arc::clone(&vfs)).with_async_write_for_test(
+                NativeAsyncWriteConfig {
+                    max_pending_bytes: Some(1024),
+                    max_pending_writes: Some(4),
+                    per_handle_pending_bytes: Some(1024),
+                    platform_policy: "test-native".into(),
+                },
+            ),
+        );
+
+        bridge.handle_write(write_request_for_data(20, 7, 0, b"first"));
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("first write should enter backend"),
+            0
+        );
+        bridge.handle_write(write_request_for_data(20, 7, 5, b"second"));
+
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "second write on same handle must wait for the first write turn"
+        );
+
+        release_first_tx
+            .send(())
+            .expect("test should unblock first write");
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .expect("second write should enter backend after first completes"),
+            5
+        );
+    }
+
+    fn write_request_for_data(ino: u64, fh: u64, offset: u64, data: &[u8]) -> FuseRequest {
+        let mut payload = vec![0; FUSE_WRITE_IN_LEN + data.len()];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        payload[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        payload[FUSE_WRITE_IN_LEN..].copy_from_slice(data);
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + payload.len()) as u32,
+                16,
+                100,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Write,
+            payload,
+        }
+    }
+
+    fn fsync_request_for_datasync(ino: u64, datasync: bool) -> FuseRequest {
+        let mut payload = vec![0; FUSE_FSYNC_IN_LEN];
+        payload[8..12].copy_from_slice(&(u32::from(datasync)).to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_FSYNC_IN_LEN) as u32,
+                20,
+                102,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Fsync,
+            payload,
+        }
+    }
+
+    fn release_request_for_fh(ino: u64, fh: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_RELEASE_IN_LEN];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_RELEASE_IN_LEN) as u32,
+                18,
+                103,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Release,
+            payload,
+        }
+    }
+
+    fn flush_request_for_fh(ino: u64, fh: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_FLUSH_IN_LEN];
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_FLUSH_IN_LEN) as u32,
+                25,
+                101,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Flush,
+            payload,
+        }
+    }
+
+    fn truncate_request_for_size(ino: u64, fh: u64, size: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        payload[0..4].copy_from_slice(&(FATTR_SIZE | FATTR_FH).to_le_bytes());
+        payload[8..16].copy_from_slice(&fh.to_le_bytes());
+        payload[16..24].copy_from_slice(&size.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (40 + FUSE_SETATTR_IN_LEN) as u32,
+                25,
+                104,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Setattr,
+            payload,
+        }
+    }
+
     fn reply_errno(reply: &FuseReply) -> i32 {
         i32::from_le_bytes(reply.to_vec()[4..8].try_into().expect("reply errno"))
     }
@@ -2247,5 +3631,80 @@ mod tests {
     #[test]
     fn read_u64_returns_none_when_range_exceeds_frame() {
         assert_eq!(read_u64(&[1, 2, 3, 4, 5, 6, 7], 0), None);
+    }
+
+    #[test]
+    fn truncate_request_accepts_linux_fattr_fh_bit() {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        payload[0..4].copy_from_slice(&(FATTR_SIZE | (1 << 6)).to_le_bytes());
+        payload[8..16].copy_from_slice(&77_u64.to_le_bytes());
+        payload[16..24].copy_from_slice(&64_u64.to_le_bytes());
+
+        let request = truncate_request(&payload).expect("truncate with fh should parse");
+
+        assert_eq!(
+            request,
+            TruncateRequest {
+                fh: Some(77),
+                size: 64
+            }
+        );
+    }
+
+    #[test]
+    fn truncate_request_ignores_linux_fattr_lockowner_bit() {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        payload[0..4].copy_from_slice(&(FATTR_SIZE | FATTR_FH | (1 << 9)).to_le_bytes());
+        payload[8..16].copy_from_slice(&77_u64.to_le_bytes());
+        payload[16..24].copy_from_slice(&64_u64.to_le_bytes());
+
+        let request = truncate_request(&payload).expect("truncate with lock owner should parse");
+
+        assert_eq!(
+            request,
+            TruncateRequest {
+                fh: Some(77),
+                size: 64
+            }
+        );
+    }
+
+    #[test]
+    fn truncate_request_ignores_writeback_cache_timestamp_bits() {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        payload[0..4].copy_from_slice(
+            &(FATTR_SIZE | FATTR_FH | (1 << 5) | (1 << 9) | (1 << 10)).to_le_bytes(),
+        );
+        payload[8..16].copy_from_slice(&77_u64.to_le_bytes());
+        payload[16..24].copy_from_slice(&64_u64.to_le_bytes());
+
+        let request = truncate_request(&payload)
+            .expect("truncate with writeback timestamp bits should parse");
+
+        assert_eq!(
+            request,
+            TruncateRequest {
+                fh: Some(77),
+                size: 64
+            }
+        );
+    }
+
+    #[test]
+    fn setattr_request_accepts_writeback_cache_timestamp_only_update() {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        payload[0..4].copy_from_slice(&(FATTR_FH | FATTR_MTIME_NOW | FATTR_CTIME).to_le_bytes());
+        payload[8..16].copy_from_slice(&77_u64.to_le_bytes());
+
+        let request =
+            setattr_request(&payload).expect("writeback-cache timestamp-only setattr should parse");
+
+        assert_eq!(
+            request,
+            SetattrRequest {
+                fh: Some(77),
+                size: None
+            }
+        );
     }
 }

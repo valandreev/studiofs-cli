@@ -165,6 +165,7 @@ impl FuseTransport for FrameQueueTransport {
 pub struct ClassicReadWriteTransport<T> {
     io: T,
     read_buffer: Vec<u8>,
+    local_cache_pread_frame: Vec<u8>,
     shutdown_requested: bool,
     local_cache_strategy: LocalCacheReplyStrategy,
     local_cache_output_fd: Option<RawFd>,
@@ -182,6 +183,7 @@ impl<T> ClassicReadWriteTransport<T> {
         Self {
             io,
             read_buffer: vec![0; FUSE_IN_HEADER_LEN + max_write],
+            local_cache_pread_frame: Vec::new(),
             shutdown_requested: false,
             local_cache_strategy: LocalCacheReplyStrategy::PreadBytes,
             local_cache_output_fd: None,
@@ -275,7 +277,6 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             let source_fd = reply
                 .local_cache_source_fd()
                 .expect("local cache range reply should own a source fd");
-            self.io.write_all(header)?;
             let owned_range = FuseLocalCacheReadRange::borrowed(
                 source_fd,
                 range.file_offset,
@@ -284,7 +285,24 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             );
             match self.local_cache_strategy {
                 LocalCacheReplyStrategy::PreadBytes => {
-                    copy_local_cache_range_with_pread(owned_range, &mut self.io)?;
+                    let frame_len =
+                        header
+                            .len()
+                            .checked_add(range.len as usize)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "local cache reply frame length overflows usize",
+                                )
+                            })?;
+                    self.local_cache_pread_frame.clear();
+                    self.local_cache_pread_frame.reserve(frame_len);
+                    self.local_cache_pread_frame.extend_from_slice(header);
+                    copy_local_cache_range_with_pread(
+                        owned_range,
+                        &mut self.local_cache_pread_frame,
+                    )?;
+                    self.io.write_all(&self.local_cache_pread_frame)?;
                 }
                 LocalCacheReplyStrategy::Splice => {
                     let Some(output_fd) = self.local_cache_output_fd else {
@@ -294,6 +312,7 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
                         )
                         .into());
                     };
+                    self.io.write_all(header)?;
                     splice_local_cache_range_to_fd(owned_range, output_fd)?;
                 }
             }
@@ -767,6 +786,30 @@ mod tests {
         frame: Vec<u8>,
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingWriteDevice {
+        output: Vec<u8>,
+        write_lens: Vec<usize>,
+    }
+
+    impl Read for RecordingWriteDevice {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for RecordingWriteDevice {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_lens.push(buf.len());
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Read for ErroringFuseDevice {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if let Some(error) = self.errors.pop_front() {
@@ -861,6 +904,47 @@ mod tests {
         assert_eq!(metrics.payload_bytes, 6);
         let output = transport.into_inner().output;
         assert_eq!(&output[16..], b"456789");
+    }
+
+    #[test]
+    fn classic_read_write_transport_writes_pread_local_cache_range_as_one_frame() {
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"0123456789abcdef")
+            .expect("write cache contents");
+        cache_file.rewind().expect("rewind cache file");
+        let mut transport = ClassicReadWriteTransport::new(RecordingWriteDevice::default());
+
+        let reply = FuseReply::local_cache_range_data(
+            0x89,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 6, 9),
+        )
+        .expect("build local cache range reply");
+        transport
+            .send_reply(reply)
+            .expect("classic send should write local cache range");
+
+        let output = transport.into_inner();
+        assert_eq!(output.write_lens, [22]);
+        assert_eq!(&output.output[16..], b"456789");
+    }
+
+    #[test]
+    fn classic_read_write_transport_reuses_pread_reply_frame_buffer() {
+        let source = include_str!("transport.rs");
+        let transport_struct = source
+            .split("pub struct ClassicReadWriteTransport<T>")
+            .nth(1)
+            .and_then(|rest| rest.split("impl<T> ClassicReadWriteTransport<T>").next())
+            .expect("classic transport struct should be present");
+        let pread_branch = source
+            .split("LocalCacheReplyStrategy::PreadBytes => {")
+            .nth(1)
+            .and_then(|rest| rest.split("LocalCacheReplyStrategy::Splice => {").next())
+            .expect("pread local cache reply branch should be present");
+
+        assert!(transport_struct.contains("local_cache_pread_frame: Vec<u8>"));
+        assert!(!pread_branch.contains("Vec::with_capacity"));
     }
 
     #[test]

@@ -19,14 +19,14 @@ type BarrierTarget = (HandleKey, Sequence, InodeGeneration);
 const TRACKER_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteRegistrationError {
+pub(crate) enum WriteRegistrationError {
     HandleClosing,
     HandleClosed,
     AdmissionLimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PendingWriteCompletion {
+pub(crate) enum PendingWriteCompletion {
     Success,
     Error(i32),
     TaskFailed,
@@ -65,16 +65,16 @@ impl Default for HandleState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct PendingWriteAdmissionLimits {
-    pub(super) max_pending_bytes: Option<usize>,
-    pub(super) max_pending_writes: Option<usize>,
-    pub(super) per_handle_pending_bytes: Option<usize>,
+pub(crate) struct PendingWriteAdmissionLimits {
+    pub(crate) max_pending_bytes: Option<usize>,
+    pub(crate) max_pending_writes: Option<usize>,
+    pub(crate) per_handle_pending_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct PendingWriteAdmissionMetrics {
-    pub(super) waits: u64,
-    pub(super) wait_ns: u64,
+pub(crate) struct PendingWriteAdmissionMetrics {
+    pub(crate) waits: u64,
+    pub(crate) wait_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,18 +84,18 @@ struct PendingWriteBarrierMetrics {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct PendingWriteTrackerSnapshot {
-    pub(super) mutation_generation: u64,
-    pub(super) pending_writes: usize,
-    pub(super) pending_bytes: usize,
-    pub(super) peak_pending_bytes: usize,
-    pub(super) completed_writes: u64,
-    pub(super) failed_writes: u64,
-    pub(super) task_failed_writes: u64,
-    pub(super) admission_waits: u64,
-    pub(super) admission_wait_ns: u64,
-    pub(super) barrier_waits: u64,
-    pub(super) barrier_wait_ns: u64,
+pub(crate) struct PendingWriteTrackerSnapshot {
+    pub(crate) mutation_generation: u64,
+    pub(crate) pending_writes: usize,
+    pub(crate) pending_bytes: usize,
+    pub(crate) peak_pending_bytes: usize,
+    pub(crate) completed_writes: u64,
+    pub(crate) failed_writes: u64,
+    pub(crate) task_failed_writes: u64,
+    pub(crate) admission_waits: u64,
+    pub(crate) admission_wait_ns: u64,
+    pub(crate) barrier_waits: u64,
+    pub(crate) barrier_wait_ns: u64,
 }
 
 #[derive(Debug, Default)]
@@ -108,7 +108,7 @@ struct TrackerState {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct PendingWriteTracker {
+pub(crate) struct PendingWriteTracker {
     shared: Arc<SharedTracker>,
 }
 
@@ -143,7 +143,7 @@ struct TrackerShard {
 }
 
 #[derive(Debug)]
-pub(super) struct PendingWriteRegistration {
+pub(crate) struct PendingWriteRegistration {
     shared: Arc<SharedTracker>,
     shard_index: usize,
     key: HandleKey,
@@ -154,7 +154,7 @@ pub(super) struct PendingWriteRegistration {
 }
 
 #[derive(Debug)]
-pub(super) struct PendingWriteTurn {
+pub(crate) struct PendingWriteTurn {
     shared: Arc<SharedTracker>,
     shard_index: usize,
     key: HandleKey,
@@ -163,7 +163,7 @@ pub(super) struct PendingWriteTurn {
 }
 
 #[derive(Debug)]
-pub(super) struct PendingWriteBarrier {
+pub(crate) struct PendingWriteBarrier {
     shared: Arc<SharedTracker>,
     shard_index: usize,
     targets: SmallVec<[BarrierTarget; 1]>,
@@ -267,7 +267,7 @@ impl GlobalAdmissionState {
 }
 
 impl PendingWriteTracker {
-    pub(super) fn register(
+    pub(crate) fn register(
         &self,
         ino: Ino,
         fh: FileHandle,
@@ -275,7 +275,7 @@ impl PendingWriteTracker {
         self.register_pending_write(ino, fh, 0, PendingWriteAdmissionLimits::default())
     }
 
-    pub(super) fn try_register_with_admission(
+    pub(crate) fn try_register_with_admission(
         &self,
         ino: Ino,
         fh: FileHandle,
@@ -285,7 +285,7 @@ impl PendingWriteTracker {
         self.register_pending_write(ino, fh, bytes, limits)
     }
 
-    pub(super) fn register_with_admission(
+    pub(crate) fn register_with_admission(
         &self,
         ino: Ino,
         fh: FileHandle,
@@ -297,15 +297,21 @@ impl PendingWriteTracker {
             let mut admission = self.shared.lock_admission();
             let shard_index = SharedTracker::shard_index(ino);
             let shard = &self.shared.shards[shard_index];
-            while admission.global_error(bytes, limits)
+            let mut state = shard.lock_state();
+            if let Some(error) = state.handle_lifecycle_error((ino, fh)) {
+                return Err(error);
+            }
+            if admission.global_error(bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
+                drop(state);
                 if wait_started.is_none() {
                     wait_started = Some(Instant::now());
                 }
                 admission = self.shared.wait_admission(admission);
+                drop(admission);
+                continue;
             }
-            let mut state = shard.lock_state();
             if state.per_handle_admission_error((ino, fh), bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
@@ -331,7 +337,7 @@ impl PendingWriteTracker {
         }
     }
 
-    pub(super) fn admission_metrics(&self) -> PendingWriteAdmissionMetrics {
+    pub(crate) fn admission_metrics(&self) -> PendingWriteAdmissionMetrics {
         let admission = self.shared.lock_admission();
         PendingWriteAdmissionMetrics {
             waits: admission.admission_waits,
@@ -339,7 +345,7 @@ impl PendingWriteTracker {
         }
     }
 
-    pub(super) fn snapshot(&self) -> PendingWriteTrackerSnapshot {
+    pub(crate) fn snapshot(&self) -> PendingWriteTrackerSnapshot {
         let admission = self.shared.lock_admission();
         PendingWriteTrackerSnapshot {
             mutation_generation: admission.mutation_generation,
@@ -372,12 +378,15 @@ impl PendingWriteTracker {
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         let mut admission = self.shared.lock_admission();
-        if let Some(error) = admission.global_error(bytes, limits) {
-            return Err(error);
-        }
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.lock_state();
+        if let Some(error) = state.handle_lifecycle_error((ino, fh)) {
+            return Err(error);
+        }
+        if let Some(error) = admission.global_error(bytes, limits) {
+            return Err(error);
+        }
         if let Some(error) = state.per_handle_admission_error((ino, fh), bytes, limits) {
             return Err(error);
         }
@@ -426,7 +435,7 @@ impl PendingWriteTracker {
         })
     }
 
-    pub(super) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
+    pub(crate) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.lock_state();
@@ -447,7 +456,7 @@ impl PendingWriteTracker {
         }
     }
 
-    pub(super) fn inode_barrier(&self, ino: Ino) -> PendingWriteBarrier {
+    pub(crate) fn inode_barrier(&self, ino: Ino) -> PendingWriteBarrier {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.lock_state();
@@ -477,7 +486,7 @@ impl PendingWriteTracker {
         }
     }
 
-    pub(super) fn begin_close(
+    pub(crate) fn begin_close(
         &self,
         ino: Ino,
         fh: FileHandle,
@@ -506,7 +515,39 @@ impl PendingWriteTracker {
         })
     }
 
-    pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
+    pub(crate) fn drain_and_begin_close(&self, ino: Ino, fh: FileHandle) -> Result<(), i32> {
+        let shard = self.shared.shard_for_inode(ino);
+        let mut state = shard.lock_state();
+        let generation = state.inode_generation(ino);
+        let mut waited_since: Option<Instant> = None;
+        loop {
+            let Some(handle) = state
+                .inodes
+                .get_mut(&ino)
+                .and_then(|handles| handles.get_mut(&fh))
+            else {
+                return Ok(());
+            };
+            handle.generation = generation;
+            match handle.lifecycle {
+                HandleLifecycle::Open => {}
+                HandleLifecycle::Closing => return Err(libc::EAGAIN),
+                HandleLifecycle::Closed => return Err(libc::EIO),
+            }
+            if handle.pending.is_empty() {
+                let error = handle.sticky_error;
+                handle.lifecycle = HandleLifecycle::Closed;
+                if let Some(started) = waited_since {
+                    self.shared.record_barrier_wait(started.elapsed());
+                }
+                return error.map_or(Ok(()), Err);
+            }
+            waited_since.get_or_insert_with(Instant::now);
+            state = shard.wait_state(state);
+        }
+    }
+
+    pub(crate) fn finish_close(&self, ino: Ino, fh: FileHandle) {
         let shard = self.shared.shard_for_inode(ino);
         let mut state = shard.lock_state();
         if let Some(handles) = state.inodes.get_mut(&ino) {
@@ -525,11 +566,11 @@ impl PendingWriteTracker {
 }
 
 impl PendingWriteRegistration {
-    pub(super) fn sequence(&self) -> Sequence {
+    pub(crate) fn sequence(&self) -> Sequence {
         self.sequence
     }
 
-    pub(super) fn turn_waiter(&mut self) -> PendingWriteTurn {
+    pub(crate) fn turn_waiter(&mut self) -> PendingWriteTurn {
         let turn_receiver = self.turn_receiver.take();
         PendingWriteTurn {
             shared: Arc::clone(&self.shared),
@@ -542,7 +583,20 @@ impl PendingWriteRegistration {
 }
 
 impl PendingWriteTurn {
-    pub(super) async fn wait(mut self) {
+    pub(crate) fn wait_blocking(mut self) {
+        let shard = &self.shared.shards[self.shard_index];
+        {
+            let state = shard.lock_state();
+            if state.is_registration_turn(self.key, self.sequence) {
+                return;
+            }
+        }
+        if let Some(receiver) = self.turn_receiver.take() {
+            let _ = receiver.blocking_recv();
+        }
+    }
+
+    pub(crate) async fn wait(mut self) {
         let shard = &self.shared.shards[self.shard_index];
         {
             let state = shard.lock_state();
@@ -557,7 +611,7 @@ impl PendingWriteTurn {
 }
 
 impl PendingWriteRegistration {
-    pub(super) fn complete(&self, completion: PendingWriteCompletion) {
+    pub(crate) fn complete(&self, completion: PendingWriteCompletion) {
         if self.completion.set(completion).is_err() {
             return;
         }
@@ -645,13 +699,13 @@ impl Drop for PendingWriteRegistration {
 }
 
 impl PendingWriteBarrier {
-    pub(super) fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         let shard = &self.shared.shards[self.shard_index];
         let state = shard.lock_state();
         barrier_ready(&state, &self.targets)
     }
 
-    pub(super) fn wait(&self) -> Result<(), i32> {
+    pub(crate) fn wait(&self) -> Result<(), i32> {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.lock_state();
         let mut waited_since = None;
@@ -665,7 +719,7 @@ impl PendingWriteBarrier {
         barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err)
     }
 
-    pub(super) async fn wait_async(self) -> Result<(), i32> {
+    pub(crate) async fn wait_async(self) -> Result<(), i32> {
         if self.targets.is_empty() {
             return Ok(());
         }
@@ -776,6 +830,18 @@ fn barrier_error(
 }
 
 impl TrackerState {
+    fn handle_lifecycle_error(&self, key: HandleKey) -> Option<WriteRegistrationError> {
+        let handle = self
+            .inodes
+            .get(&key.0)
+            .and_then(|handles| handles.get(&key.1))?;
+        match handle.lifecycle {
+            HandleLifecycle::Open => None,
+            HandleLifecycle::Closing => Some(WriteRegistrationError::HandleClosing),
+            HandleLifecycle::Closed => Some(WriteRegistrationError::HandleClosed),
+        }
+    }
+
     fn per_handle_admission_error(
         &self,
         key: HandleKey,
@@ -1485,6 +1551,74 @@ mod tests {
             .register(INO, FIRST_FH)
             .expect("closed handle state should be removed before handle reuse");
         assert_eq!(reopened.sequence(), 1);
+    }
+
+    #[test]
+    fn register_with_admission_rejects_closing_handle_before_waiting_for_global_capacity() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(1),
+            max_pending_writes: Some(1),
+            per_handle_pending_bytes: None,
+        };
+        let pending = tracker
+            .register_with_admission(INO, SECOND_FH, 1, limits)
+            .expect("first write fills global admission");
+        let close_barrier = tracker.begin_close(INO, FIRST_FH).expect("begin close");
+        assert!(close_barrier.is_ready());
+
+        let waiting_tracker = tracker.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            result_tx
+                .send(waiting_tracker.register_with_admission(INO, FIRST_FH, 1, limits))
+                .expect("send registration result");
+        });
+
+        match result_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => {
+                assert_eq!(
+                    result.expect_err("closing handle should reject write"),
+                    WriteRegistrationError::HandleClosing
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                pending.complete(PendingWriteCompletion::Success);
+                let result = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("blocked registration should wake after capacity release");
+                waiter.join().expect("waiter should finish");
+                panic!("closing handle waited for global capacity before returning {result:?}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("registration thread exited without sending result");
+            }
+        }
+
+        pending.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
+    }
+
+    #[test]
+    fn draining_close_allows_late_write_until_handle_is_quiescent() {
+        let tracker = PendingWriteTracker::default();
+        let first = tracker.register(INO, FIRST_FH).expect("register write");
+        let waiter_tracker = tracker.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal drain start");
+            waiter_tracker.drain_and_begin_close(INO, FIRST_FH)
+        });
+        ready_rx.recv().expect("drain should start");
+
+        let late = tracker
+            .register(INO, FIRST_FH)
+            .expect("writeback write should register while release drains");
+        first.complete(PendingWriteCompletion::Success);
+        assert!(!drain.is_finished());
+
+        late.complete(PendingWriteCompletion::Success);
+        assert_eq!(drain.join().expect("drain thread should finish"), Ok(()));
     }
 
     #[test]

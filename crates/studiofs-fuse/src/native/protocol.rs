@@ -215,6 +215,32 @@ impl FuseReply {
         }
     }
 
+    /// Returns the `fuse_out_header.error` field when this reply has an output header.
+    pub fn error_code(&self) -> Option<i32> {
+        let header = match &self.frame {
+            FuseReplyFrame::NoReply => return None,
+            FuseReplyFrame::Contiguous(bytes) => bytes.get(..FUSE_OUT_HEADER_LEN)?,
+            FuseReplyFrame::Segmented { header, .. } => header,
+            FuseReplyFrame::LocalCacheRange { header, .. } => header,
+        };
+        let bytes = header.get(4..8)?;
+        let mut raw = [0; 4];
+        raw.copy_from_slice(bytes);
+        Some(i32::from_le_bytes(raw))
+    }
+
+    /// Returns the total serialized frame length.
+    pub fn frame_len(&self) -> usize {
+        match &self.frame {
+            FuseReplyFrame::NoReply => 0,
+            FuseReplyFrame::Contiguous(bytes) => bytes.len(),
+            FuseReplyFrame::Segmented { header, payload } => header.len() + payload.len(),
+            FuseReplyFrame::LocalCacheRange { header, range, .. } => {
+                header.len() + range.len as usize
+            }
+        }
+    }
+
     /// Returns vectored slices for transport writeback without heap allocation.
     pub fn io_slices(&self) -> FuseReplyIoSlices<'_> {
         match &self.frame {
@@ -403,6 +429,10 @@ impl FuseCapabilities {
     pub const AUTO_INVAL_DATA: Self = Self { bits: 1 << 12 };
     /// `FUSE_CAP_READDIRPLUS`: allow directory reads to include entry attributes.
     pub const READDIRPLUS: Self = Self { bits: 1 << 13 };
+    /// `FUSE_CAP_WRITEBACK_CACHE`: allow kernel page-cache writeback.
+    pub const WRITEBACK_CACHE: Self = Self { bits: 1 << 16 };
+    /// `FUSE_MAX_PAGES`: `fuse_init_out.max_pages` contains the max request pages.
+    pub const MAX_PAGES: Self = Self { bits: 1 << 22 };
     /// `FUSE_CAP_SPLICE_WRITE`: allow splice-based writes from the kernel.
     pub const SPLICE_WRITE: Self = Self { bits: 1 << 7 };
     /// `FUSE_CAP_SPLICE_MOVE`: allow moving pages with splice where supported.
@@ -574,6 +604,7 @@ impl FuseOpcode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::abi::error_reply;
 
     fn frame_with_payload(opcode: u32, unique: u64, payload: &[u8]) -> Vec<u8> {
         let len = (FUSE_IN_HEADER_LEN + payload.len()) as u32;
@@ -683,6 +714,26 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuse_reply_error_code_reads_fuse_out_header_errno() {
+        let reply = FuseReply::contiguous(0x55, error_reply(0x55, libc::EIO).to_vec());
+
+        assert_eq!(reply.error_code(), Some(-libc::EIO));
+    }
+
+    #[test]
+    fn fuse_reply_error_code_avoids_panicking_header_slices() {
+        let source = include_str!("protocol.rs");
+        let body = source
+            .split("pub fn error_code(&self)")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn frame_len(&self)").next())
+            .expect("error_code body should be present");
+
+        assert!(!body.contains("expect("));
+        assert!(body.contains(".get(4..8)"));
     }
 
     #[test]
