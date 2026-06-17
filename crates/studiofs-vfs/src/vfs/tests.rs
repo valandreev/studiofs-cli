@@ -6574,6 +6574,37 @@ fn enqueue_native_read_ahead_sends_prefetch_batch_for_touched_blocks() {
 }
 
 #[test]
+fn enqueue_native_read_ahead_rejects_excessive_block_ranges() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "native-read-ahead-block-limit");
+    let mut channels = vfs
+        .startup
+        .lifecycle
+        .lock()
+        .channels
+        .take()
+        .expect("unstarted vfs should retain startup channels");
+    let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+    let excessive_len = block_size
+        .checked_mul(4098)
+        .expect("test read-ahead length should fit");
+
+    let error = vfs
+        .enqueue_native_read_ahead(42, 0, excessive_len)
+        .expect_err("excessive read-ahead block ranges should be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("native read-ahead range exceeds maximum block limit")
+    );
+    assert!(matches!(
+        channels.prefetch_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn active_open_overlay_tracks_only_mutating_handles() {
     assert!(!StudioVfs::active_open_overlay_required(
         OpenFlags::RDONLY,

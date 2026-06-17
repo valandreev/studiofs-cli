@@ -14,6 +14,7 @@ use crate::native::protocol::{FuseLocalCacheReadRange, FuseReply, FuseRequest};
 
 const DEFAULT_CLASSIC_MAX_WRITE: usize = 16 * 1024 * 1024;
 const PREAD_COPY_BUFFER_LEN: usize = 128 * 1024;
+const SPLICE_PIPE_CHUNK_LEN: usize = 64 * 1024;
 
 thread_local! {
     static SPLICE_PIPE: RefCell<Option<SplicePipe>> = const { RefCell::new(None) };
@@ -435,7 +436,13 @@ pub fn splice_local_cache_range_to_fd(
     range: FuseLocalCacheReadRange,
     output_fd: RawFd,
 ) -> io::Result<()> {
-    with_thread_local_splice_pipe(|pipe| splice_local_cache_range_with_pipe(range, output_fd, pipe))
+    let result = with_thread_local_splice_pipe(|pipe| {
+        splice_local_cache_range_with_pipe(range, output_fd, pipe)
+    });
+    if result.is_err() {
+        discard_thread_local_splice_pipe();
+    }
+    result
 }
 
 fn with_thread_local_splice_pipe<R>(f: impl FnOnce(&SplicePipe) -> io::Result<R>) -> io::Result<R> {
@@ -531,11 +538,15 @@ fn splice_local_cache_range_with_pipe(
 
 #[cfg(test)]
 fn reset_splice_pipe_pool_for_test() {
-    SPLICE_PIPE.with(|pipe| {
-        *pipe.borrow_mut() = None;
-    });
+    discard_thread_local_splice_pipe();
     SPLICE_PIPE_CREATE_COUNT.with(|count| {
         *count.borrow_mut() = 0;
+    });
+}
+
+fn discard_thread_local_splice_pipe() {
+    SPLICE_PIPE.with(|pipe| {
+        *pipe.borrow_mut() = None;
     });
 }
 
@@ -557,7 +568,7 @@ fn splice_once(
     let output_offset_ptr = output_offset
         .map(|offset| offset as *mut libc::off_t)
         .unwrap_or(std::ptr::null_mut());
-    let request_len = len.min(128 * 1024);
+    let request_len = len.min(SPLICE_PIPE_CHUNK_LEN);
 
     loop {
         // SAFETY: fds are caller-provided open descriptors, optional offsets
@@ -953,6 +964,50 @@ mod tests {
         .expect("second splice local cache range");
 
         assert_eq!(splice_pipe_create_count_for_test(), 1);
+    }
+
+    #[test]
+    fn splice_local_cache_range_discards_pipe_after_partial_error() {
+        reset_splice_pipe_pool_for_test();
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"AAAABBBB")
+            .expect("write cache contents");
+        let mut output_file = tempfile::tempfile().expect("create output file");
+
+        let error = splice_local_cache_range_to_fd(
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 0, 4, 11),
+            -1,
+        )
+        .expect_err("invalid output fd should fail after filling the pipe");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+
+        splice_local_cache_range_to_fd(
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 4, 11),
+            output_file.as_raw_fd(),
+        )
+        .expect("next splice should not read stale bytes from failed pipe");
+
+        output_file.rewind().expect("rewind output file");
+        let mut output = String::new();
+        output_file
+            .read_to_string(&mut output)
+            .expect("read output");
+        assert_eq!(output, "BBBB");
+        assert_eq!(splice_pipe_create_count_for_test(), 2);
+    }
+
+    #[test]
+    fn splice_once_caps_request_len_to_default_pipe_capacity() {
+        let source = include_str!("transport.rs");
+        let splice_once_fn = source
+            .split("fn splice_once")
+            .nth(1)
+            .expect("splice_once should be present");
+
+        assert!(source.contains("SPLICE_PIPE_CHUNK_LEN: usize = 64 * 1024"));
+        assert!(splice_once_fn.contains("len.min(SPLICE_PIPE_CHUNK_LEN)"));
+        assert!(!splice_once_fn.contains("len.min(128 * 1024)"));
     }
 
     #[test]

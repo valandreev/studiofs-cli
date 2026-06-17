@@ -5175,6 +5175,8 @@ impl StudioVfs {
 
     /// Enqueues a best-effort read-ahead range for Linux native local-cache reads.
     pub fn enqueue_native_read_ahead(&self, ino: Ino, offset: u64, len: u64) -> VfsResult<()> {
+        const MAX_NATIVE_READ_AHEAD_BLOCKS: u64 = 4096;
+
         if len == 0 {
             return Ok(());
         }
@@ -5185,6 +5187,12 @@ impl StudioVfs {
         })?;
         let first_block = block_index_from_offset(offset, self.block_size);
         let last_block = block_index_from_offset(end.saturating_sub(1), self.block_size);
+        let block_count = u64::from(last_block - first_block) + 1;
+        if block_count > MAX_NATIVE_READ_AHEAD_BLOCKS {
+            return Err(VfsError::Other(format!(
+                "native read-ahead range exceeds maximum block limit: ino={ino}, blocks={block_count}"
+            )));
+        }
         let block_indices: Vec<u32> = (first_block..=last_block).collect();
         self.prefetch_tx
             .send(PrefetchWorkItem::Batch(PrefetchBatch::new(
