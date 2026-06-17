@@ -1,7 +1,7 @@
 //! fuser::Filesystem implementation — bridges FUSE kernel calls to StudioVfs.
 
 mod handle_drain;
-mod pending_write_tracker;
+pub(crate) mod pending_write_tracker;
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::ffi::OsStr;
@@ -4271,9 +4271,11 @@ mod tests {
             .expect("async read should reply");
 
         assert_eq!(result, Ok(b"async".to_vec()));
-        let snapshot = vfs.write_path_observability_snapshot();
-        assert_eq!(snapshot.fuse_async_read.pending_reads, 0);
-        assert_eq!(snapshot.fuse_async_read.completed_reads, 1);
+        let snapshot = wait_for_async_read_snapshot(&vfs, |snapshot| {
+            snapshot.pending_reads == 0 && snapshot.completed_reads == 1
+        });
+        assert_eq!(snapshot.pending_reads, 0);
+        assert_eq!(snapshot.completed_reads, 1);
     }
 
     #[test]

@@ -11,6 +11,8 @@ use crate::native::lifecycle::{
 use crate::native::protocol::{FuseCapabilities, FuseInitReply, FuseInitRequest, FuseOpcode};
 use crate::native::transport::{FuseTransport, TransportError};
 
+const STUDIOFS_NATIVE_WRITEBACK_CACHE_ENV: &str = "STUDIOFS_NATIVE_WRITEBACK_CACHE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Local policy for the native FUSE INIT negotiation.
 pub struct NativeSessionConfig {
@@ -26,6 +28,46 @@ pub struct NativeSessionConfig {
     pub congestion_threshold: u16,
     /// Maximum number of memory pages accepted in one request.
     pub max_pages: u16,
+}
+
+impl NativeSessionConfig {
+    /// Linux 6.x native-safe session profile.
+    pub fn linux6_safe(writeback_cache: bool) -> Self {
+        let mut requested_capabilities = FuseCapabilities::ASYNC_READ
+            | FuseCapabilities::BIG_WRITES
+            | FuseCapabilities::MAX_PAGES;
+        if writeback_cache {
+            requested_capabilities = requested_capabilities | FuseCapabilities::WRITEBACK_CACHE;
+        }
+        Self {
+            requested_capabilities,
+            max_readahead: 16 * 1024 * 1024,
+            max_write: 1024 * 1024,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_pages: 256,
+        }
+    }
+
+    /// Linux 6.x native-safe session profile using process environment toggles.
+    pub fn linux6_safe_from_env() -> Self {
+        Self::linux6_safe_from_env_value(
+            std::env::var(STUDIOFS_NATIVE_WRITEBACK_CACHE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn linux6_safe_from_env_value(writeback_cache: Option<&str>) -> Self {
+        Self::linux6_safe(writeback_cache.is_some_and(parse_native_bool_env_value))
+    }
+}
+
+fn parse_native_bool_env_value(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,13 +152,20 @@ impl<T: FuseTransport> NativeFuseSession<T> {
     pub fn handshake(&mut self) -> Result<NegotiatedSession, SessionError> {
         let request = self
             .transport
-            .receive_request()?
+            .receive_request()
+            .map_err(|error| {
+                TransportError::Io(std::io::Error::other(format!("receive INIT: {error}")))
+            })?
             .ok_or(SessionError::MissingInit)?;
         if request.opcode != FuseOpcode::Init {
             return Err(SessionError::ExpectedInit(request.opcode));
         }
 
-        let init = FuseInitRequest::parse(&request.payload).map_err(TransportError::from)?;
+        let init = FuseInitRequest::parse(&request.payload)
+            .map_err(TransportError::from)
+            .map_err(|error| {
+                TransportError::Io(std::io::Error::other(format!("parse INIT: {error}")))
+            })?;
         let capabilities = self
             .config
             .requested_capabilities
@@ -145,7 +194,12 @@ impl<T: FuseTransport> NativeFuseSession<T> {
             max_pages: negotiated.max_pages,
         }
         .into_reply(request.header.unique);
-        self.transport.send_reply(reply)?;
+        self.transport.send_reply(reply).map_err(|error| {
+            TransportError::Io(std::io::Error::other(format!(
+                "send INIT reply: {error}; kernel_caps={:?}; negotiated={negotiated:?}",
+                init.capabilities
+            )))
+        })?;
         self.negotiated = Some(negotiated);
         Ok(negotiated)
     }
@@ -309,6 +363,67 @@ mod tests {
         );
         assert_eq!(session.negotiated(), Some(negotiated));
         assert_eq!(session.transport.sent_replies().len(), 1);
+    }
+
+    #[test]
+    fn linux6_safe_config_does_not_request_writeback_cache_by_default() {
+        let config = NativeSessionConfig::linux6_safe(false);
+
+        assert!(
+            !config
+                .requested_capabilities
+                .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
+    }
+
+    #[test]
+    fn linux6_safe_config_requests_max_pages_when_advertising_max_pages() {
+        let config = NativeSessionConfig::linux6_safe(false);
+
+        assert!(
+            config
+                .requested_capabilities
+                .contains(FuseCapabilities::MAX_PAGES),
+            "init_out.max_pages is only valid when FUSE_MAX_PAGES is negotiated"
+        );
+    }
+
+    #[test]
+    fn linux6_safe_config_bounds_max_write_by_max_pages() {
+        let config = NativeSessionConfig::linux6_safe(false);
+
+        assert!(
+            config.max_write <= u32::from(config.max_pages) * 4096,
+            "Linux rejects INIT replies where max_write exceeds max_pages * page_size"
+        );
+    }
+
+    #[test]
+    fn linux6_safe_config_can_opt_into_writeback_cache_profile() {
+        let config = NativeSessionConfig::linux6_safe(true);
+
+        assert!(
+            config
+                .requested_capabilities
+                .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
+    }
+
+    #[test]
+    fn linux6_safe_env_profile_toggles_writeback_cache() {
+        let disabled = NativeSessionConfig::linux6_safe_from_env_value(None);
+        assert!(
+            !disabled
+                .requested_capabilities
+                .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
+
+        let enabled = NativeSessionConfig::linux6_safe_from_env_value(Some("1"));
+        assert!(
+            enabled
+                .requested_capabilities
+                .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
     }
 
     #[derive(Default)]

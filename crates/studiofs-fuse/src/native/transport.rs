@@ -275,7 +275,6 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             let source_fd = reply
                 .local_cache_source_fd()
                 .expect("local cache range reply should own a source fd");
-            self.io.write_all(header)?;
             let owned_range = FuseLocalCacheReadRange::borrowed(
                 source_fd,
                 range.file_offset,
@@ -284,7 +283,10 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             );
             match self.local_cache_strategy {
                 LocalCacheReplyStrategy::PreadBytes => {
-                    copy_local_cache_range_with_pread(owned_range, &mut self.io)?;
+                    let mut frame = Vec::with_capacity(header.len() + range.len as usize);
+                    frame.extend_from_slice(header);
+                    copy_local_cache_range_with_pread(owned_range, &mut frame)?;
+                    self.io.write_all(&frame)?;
                 }
                 LocalCacheReplyStrategy::Splice => {
                     let Some(output_fd) = self.local_cache_output_fd else {
@@ -294,6 +296,7 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
                         )
                         .into());
                     };
+                    self.io.write_all(header)?;
                     splice_local_cache_range_to_fd(owned_range, output_fd)?;
                 }
             }
@@ -767,6 +770,30 @@ mod tests {
         frame: Vec<u8>,
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingWriteDevice {
+        output: Vec<u8>,
+        write_lens: Vec<usize>,
+    }
+
+    impl Read for RecordingWriteDevice {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for RecordingWriteDevice {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_lens.push(buf.len());
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Read for ErroringFuseDevice {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if let Some(error) = self.errors.pop_front() {
@@ -861,6 +888,29 @@ mod tests {
         assert_eq!(metrics.payload_bytes, 6);
         let output = transport.into_inner().output;
         assert_eq!(&output[16..], b"456789");
+    }
+
+    #[test]
+    fn classic_read_write_transport_writes_pread_local_cache_range_as_one_frame() {
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"0123456789abcdef")
+            .expect("write cache contents");
+        cache_file.rewind().expect("rewind cache file");
+        let mut transport = ClassicReadWriteTransport::new(RecordingWriteDevice::default());
+
+        let reply = FuseReply::local_cache_range_data(
+            0x89,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 4, 6, 9),
+        )
+        .expect("build local cache range reply");
+        transport
+            .send_reply(reply)
+            .expect("classic send should write local cache range");
+
+        let output = transport.into_inner();
+        assert_eq!(output.write_lens, [22]);
+        assert_eq!(&output.output[16..], b"456789");
     }
 
     #[test]

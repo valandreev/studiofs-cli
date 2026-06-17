@@ -550,7 +550,7 @@ mod tests {
     }
 
     fn truncate_request(ino: u64, fh: Option<u64>, size: u64) -> FuseRequest {
-        const FATTR_FH: u32 = 1 << 0;
+        const FATTR_FH: u32 = 1 << 6;
         const FATTR_SIZE: u32 = 1 << 3;
         let valid = FATTR_SIZE | if fh.is_some() { FATTR_FH } else { 0 };
         setattr_request(ino, valid, fh, size)

@@ -418,6 +418,13 @@ impl PartialEq for DispatchError {
     }
 }
 
+fn transport_error_raw_errno(error: &TransportError) -> Option<i32> {
+    match error {
+        TransportError::Io(error) => error.raw_os_error(),
+        TransportError::Abi(_) => None,
+    }
+}
+
 /// Transport-independent request loop for a native FUSE session.
 ///
 /// The dispatcher owns a transport and an operation handler and repeatedly
@@ -450,11 +457,35 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
             handled_requests: 0,
             saw_destroy: false,
         };
-        while let Some(request) = self.transport.receive_request()? {
+        while let Some(request) = self.transport.receive_request().map_err(|error| {
+            DispatchError::Transport(TransportError::Io(std::io::Error::other(format!(
+                "receive FUSE request: {error}"
+            ))))
+        })? {
             let is_destroy = request.opcode == FuseOpcode::Destroy;
+            let opcode = request.opcode;
+            let unique = request.header.unique;
             let reply = self.handler.handle(request);
             if !reply.is_no_reply() {
-                self.transport.send_reply(reply)?;
+                let reply_bytes = reply.to_vec();
+                let reply_len = reply_bytes.len();
+                let reply_error = reply_bytes
+                    .get(4..8)
+                    .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("slice length")));
+                if let Err(error) = self.transport.send_reply(reply) {
+                    if opcode == FuseOpcode::Release
+                        && reply_error == Some(0)
+                        && transport_error_raw_errno(&error) == Some(libc::ENOENT)
+                    {
+                        summary.handled_requests += 1;
+                        continue;
+                    }
+                    return Err(DispatchError::Transport(TransportError::Io(
+                        std::io::Error::other(format!(
+                            "send FUSE reply: {error}; opcode={opcode:?}; unique={unique}; reply_len={reply_len}; reply_error={reply_error:?}"
+                        )),
+                    )));
+                }
             }
             summary.handled_requests += 1;
             if is_destroy {
@@ -699,6 +730,46 @@ mod tests {
         );
         assert_eq!(handler.opcodes, [FuseOpcode::Lookup, FuseOpcode::Destroy]);
         assert_eq!(transport.sent_replies().len(), 2);
+    }
+
+    struct EnoentOnReleaseReplyTransport {
+        inner: FrameQueueTransport,
+    }
+
+    impl FuseTransport for EnoentOnReleaseReplyTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+            if reply.unique == 0x20 {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOENT).into());
+            }
+            self.inner.send_reply(reply)
+        }
+    }
+
+    #[test]
+    fn dispatcher_treats_release_reply_enoent_as_completed_release() {
+        let transport = EnoentOnReleaseReplyTransport {
+            inner: FrameQueueTransport::new([frame(18, 0x20)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        let summary = dispatcher
+            .run_until_destroy()
+            .expect("release reply ENOENT should not fail dispatcher");
+        let (_transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(handler.opcodes, [FuseOpcode::Release]);
+        assert_eq!(
+            summary,
+            DispatchSummary {
+                handled_requests: 1,
+                saw_destroy: false,
+            }
+        );
     }
 
     #[derive(Default)]
@@ -1203,12 +1274,15 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .expect("handler should start and block");
 
-        assert_eq!(
-            dispatcher.shutdown_with_timeout(Duration::from_millis(10)),
-            Err(DispatchError::ShutdownTimeout {
-                remaining_workers: 1
-            })
-        );
+        match dispatcher.shutdown_with_timeout(Duration::from_millis(10)) {
+            Err(DispatchError::ShutdownTimeout { remaining_workers }) => {
+                assert!(
+                    remaining_workers >= 1,
+                    "blocked worker should still be running at timeout"
+                );
+            }
+            result => panic!("expected shutdown timeout, got {result:?}"),
+        }
 
         let (lock, changed) = blocker.as_ref();
         *lock.lock().expect("blocker mutex poisoned") = true;

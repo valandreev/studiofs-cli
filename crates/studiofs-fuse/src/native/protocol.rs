@@ -403,6 +403,10 @@ impl FuseCapabilities {
     pub const AUTO_INVAL_DATA: Self = Self { bits: 1 << 12 };
     /// `FUSE_CAP_READDIRPLUS`: allow directory reads to include entry attributes.
     pub const READDIRPLUS: Self = Self { bits: 1 << 13 };
+    /// `FUSE_CAP_WRITEBACK_CACHE`: allow kernel page-cache writeback.
+    pub const WRITEBACK_CACHE: Self = Self { bits: 1 << 16 };
+    /// `FUSE_MAX_PAGES`: `fuse_init_out.max_pages` contains the max request pages.
+    pub const MAX_PAGES: Self = Self { bits: 1 << 22 };
     /// `FUSE_CAP_SPLICE_WRITE`: allow splice-based writes from the kernel.
     pub const SPLICE_WRITE: Self = Self { bits: 1 << 7 };
     /// `FUSE_CAP_SPLICE_MOVE`: allow moving pages with splice where supported.
