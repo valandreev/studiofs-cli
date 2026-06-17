@@ -1248,6 +1248,45 @@ fn linux_native_bridge_contract_covers_sfs528_page_cache_policy() {
 }
 
 #[test]
+fn linux_native_bridge_contract_covers_sfs529_local_cache_read_path() {
+    let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-529",
+        "NativeLocalCacheReadRange",
+        "safe bytes fallback",
+        "stable local cache file range",
+        "content epoch validation",
+        "pread -> bytes -> writev",
+        "vmsplice/splice",
+        "splice(file_fd -> pipe -> fuse_fd)",
+        "io_uring-backed local-file read",
+        "bounded dynamic readahead",
+        "sparse-random prefetch limits",
+        "singleflight",
+        "read amplification metrics",
+        "posix_fadvise(WILLNEED)",
+        "DONTNEED",
+        "copy count",
+        "local-cache hit/miss",
+        "materialization wait",
+        "io_uring usage/fallback",
+        "p95/p99 latency",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-529 Linux native local-cache read docs are missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn linux_fuse_concurrent_dispatch_audit_covers_sfs514_decision() {
     let doc = read_workspace_file("docs/perf/sfs-514-linux-fuse-concurrent-dispatch-audit.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

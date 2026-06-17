@@ -83,6 +83,19 @@ pub struct FuseReply {
     frame: FuseReplyFrame,
 }
 
+/// Stable local cache file range that a Linux transport may use for optimized read replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseLocalCacheReadRange {
+    /// Source local cache file descriptor.
+    pub fd: i32,
+    /// Byte offset inside the local cache file.
+    pub file_offset: u64,
+    /// Number of bytes available for this reply.
+    pub len: u32,
+    /// StudioFS content epoch validated by the VFS when the range was produced.
+    pub content_epoch: u64,
+}
+
 /// Owned FUSE reply frame storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FuseReplyFrame {
@@ -96,6 +109,13 @@ pub enum FuseReplyFrame {
         header: [u8; FUSE_OUT_HEADER_LEN],
         /// Operation-specific payload.
         payload: Vec<u8>,
+    },
+    /// Optimized read reply backed by a stable local cache file range.
+    LocalCacheRange {
+        /// Fixed `fuse_out_header` bytes.
+        header: [u8; FUSE_OUT_HEADER_LEN],
+        /// Stable local cache range selected for this reply.
+        range: FuseLocalCacheReadRange,
     },
 }
 
@@ -129,6 +149,19 @@ impl FuseReply {
         }
     }
 
+    /// Builds a successful read reply backed by a local cache file range.
+    pub fn local_cache_range_data(unique: u64, range: FuseLocalCacheReadRange) -> Self {
+        let mut header = [0; FUSE_OUT_HEADER_LEN];
+        let len = fuse_out_len_for_payload(range.len as usize);
+        header[0..4].copy_from_slice(&len.to_le_bytes());
+        header[4..8].copy_from_slice(&0_i32.to_le_bytes());
+        header[8..16].copy_from_slice(&unique.to_le_bytes());
+        Self {
+            unique,
+            frame: FuseReplyFrame::LocalCacheRange { header, range },
+        }
+    }
+
     /// Returns a contiguous copy of the reply frame.
     pub fn to_vec(&self) -> Vec<u8> {
         match &self.frame {
@@ -140,6 +173,7 @@ impl FuseReply {
                 bytes.extend_from_slice(payload);
                 bytes
             }
+            FuseReplyFrame::LocalCacheRange { header, .. } => header.to_vec(),
         }
     }
 
@@ -150,6 +184,9 @@ impl FuseReply {
             FuseReplyFrame::Contiguous(bytes) => FuseReplyIoSlices::one(IoSlice::new(bytes)),
             FuseReplyFrame::Segmented { header, payload } => {
                 FuseReplyIoSlices::two(IoSlice::new(header), IoSlice::new(payload))
+            }
+            FuseReplyFrame::LocalCacheRange { header, .. } => {
+                FuseReplyIoSlices::one(IoSlice::new(header))
             }
         }
     }
@@ -165,6 +202,15 @@ impl FuseReply {
             FuseReplyFrame::NoReply => None,
             FuseReplyFrame::Contiguous(bytes) => Some(bytes),
             FuseReplyFrame::Segmented { .. } => None,
+            FuseReplyFrame::LocalCacheRange { .. } => None,
+        }
+    }
+
+    /// Returns the optimized local-cache range selected for this reply, if any.
+    pub fn local_cache_range(&self) -> Option<FuseLocalCacheReadRange> {
+        match &self.frame {
+            FuseReplyFrame::LocalCacheRange { range, .. } => Some(*range),
+            _ => None,
         }
     }
 }
