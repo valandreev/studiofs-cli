@@ -13,13 +13,16 @@ use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseReply, FuseRequest};
 
 const DEFAULT_CLASSIC_MAX_WRITE: usize = 16 * 1024 * 1024;
+const PREAD_COPY_BUFFER_LEN: usize = 128 * 1024;
 
 thread_local! {
     static SPLICE_PIPE: RefCell<Option<SplicePipe>> = const { RefCell::new(None) };
+    static PREAD_COPY_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static SPLICE_PIPE_CREATE_COUNT: RefCell<u64> = const { RefCell::new(0) };
+    #[cfg(test)]
+    static PREAD_COPY_BUFFER_CREATE_COUNT: RefCell<u64> = const { RefCell::new(0) };
 }
-
-#[cfg(test)]
-static SPLICE_PIPE_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct SplicePipe {
@@ -330,8 +333,6 @@ fn copy_local_cache_range_with_pread<W: Write>(
     range: FuseLocalCacheReadRange,
     writer: &mut W,
 ) -> io::Result<()> {
-    const COPY_BUFFER_LEN: usize = 128 * 1024;
-
     let mut remaining = usize::try_from(range.len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -344,51 +345,85 @@ fn copy_local_cache_range_with_pread<W: Write>(
             "local cache read range offset exceeds off_t",
         )
     })?;
-    let mut buffer = vec![0; COPY_BUFFER_LEN];
 
-    while remaining > 0 {
-        let request_len = remaining.min(buffer.len());
-        let read = loop {
-            // SAFETY: `buffer` points to writable memory of `request_len`
-            // bytes, `range.fd` is supplied by the VFS as an open stable local
-            // cache file descriptor, and `pread` does not mutate the shared fd
-            // offset.
-            let result = unsafe {
-                libc::pread(
-                    range.fd,
-                    buffer.as_mut_ptr().cast(),
-                    request_len,
-                    offset as libc::off_t,
-                )
-            };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
+    with_thread_local_pread_copy_buffer(|buffer| {
+        while remaining > 0 {
+            let request_len = remaining.min(buffer.len());
+            let read = loop {
+                // SAFETY: `buffer` points to writable memory of `request_len`
+                // bytes, `range.fd` is supplied by the VFS as an open stable local
+                // cache file descriptor, and `pread` does not mutate the shared fd
+                // offset.
+                let result = unsafe {
+                    libc::pread(
+                        range.fd,
+                        buffer.as_mut_ptr().cast(),
+                        request_len,
+                        offset as libc::off_t,
+                    )
+                };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+                break usize::try_from(result).map_err(|_| {
+                    io::Error::other("local cache read returned an invalid byte count")
+                })?;
+            };
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "local cache range ended before requested reply length",
+                ));
             }
-            break usize::try_from(result).map_err(|_| {
-                io::Error::other("local cache read returned an invalid byte count")
-            })?;
-        };
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "local cache range ended before requested reply length",
-            ));
+            writer.write_all(&buffer[..read])?;
+            remaining -= read;
+            offset =
+                offset
+                    .checked_add(i64::try_from(read).map_err(|_| {
+                        io::Error::other("local cache read length does not fit off_t")
+                    })?)
+                    .ok_or_else(|| io::Error::other("local cache read offset overflowed"))?;
         }
-        writer.write_all(&buffer[..read])?;
-        remaining -= read;
-        offset = offset
-            .checked_add(
-                i64::try_from(read)
-                    .map_err(|_| io::Error::other("local cache read length does not fit off_t"))?,
-            )
-            .ok_or_else(|| io::Error::other("local cache read offset overflowed"))?;
-    }
 
-    Ok(())
+        Ok(())
+    })
+}
+
+fn with_thread_local_pread_copy_buffer<R>(
+    f: impl FnOnce(&mut [u8]) -> io::Result<R>,
+) -> io::Result<R> {
+    PREAD_COPY_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        if buffer.len() != PREAD_COPY_BUFFER_LEN {
+            if buffer.capacity() < PREAD_COPY_BUFFER_LEN {
+                #[cfg(test)]
+                PREAD_COPY_BUFFER_CREATE_COUNT.with(|count| {
+                    *count.borrow_mut() += 1;
+                });
+            }
+            buffer.resize(PREAD_COPY_BUFFER_LEN, 0);
+        }
+        f(buffer.as_mut_slice())
+    })
+}
+
+#[cfg(test)]
+fn reset_pread_copy_buffer_for_test() {
+    PREAD_COPY_BUFFER.with(|buffer| {
+        *buffer.borrow_mut() = Vec::new();
+    });
+    PREAD_COPY_BUFFER_CREATE_COUNT.with(|count| {
+        *count.borrow_mut() = 0;
+    });
+}
+
+#[cfg(test)]
+fn pread_copy_buffer_create_count_for_test() -> u64 {
+    PREAD_COPY_BUFFER_CREATE_COUNT.with(|count| *count.borrow())
 }
 
 /// Splices a stable local cache range into a raw output fd through a pipe.
@@ -429,7 +464,9 @@ fn create_splice_pipe() -> io::Result<SplicePipe> {
     // SAFETY: see `pipe_read`.
     let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
     #[cfg(test)]
-    SPLICE_PIPE_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SPLICE_PIPE_CREATE_COUNT.with(|count| {
+        *count.borrow_mut() += 1;
+    });
     Ok(SplicePipe {
         read: pipe_read,
         write: pipe_write,
@@ -454,6 +491,10 @@ fn splice_local_cache_range_with_pipe(
         )
     })?;
 
+    // FRAMING INVARIANT: `send_reply` has already written a FUSE header whose
+    // payload length is `range.len`. Upstream local-cache range builders must
+    // clamp `range.len` to bytes actually available from this fd; otherwise an
+    // early EOF here means the kernel has received a short framed reply.
     while remaining > 0 {
         let moved_into_pipe = splice_once(
             range.fd,
@@ -493,12 +534,14 @@ fn reset_splice_pipe_pool_for_test() {
     SPLICE_PIPE.with(|pipe| {
         *pipe.borrow_mut() = None;
     });
-    SPLICE_PIPE_CREATE_COUNT.store(0, Ordering::Relaxed);
+    SPLICE_PIPE_CREATE_COUNT.with(|count| {
+        *count.borrow_mut() = 0;
+    });
 }
 
 #[cfg(test)]
 fn splice_pipe_create_count_for_test() -> u64 {
-    SPLICE_PIPE_CREATE_COUNT.load(Ordering::Relaxed)
+    SPLICE_PIPE_CREATE_COUNT.with(|count| *count.borrow())
 }
 
 fn splice_once(
@@ -818,8 +861,31 @@ mod tests {
             .and_then(|rest| rest.split("pub fn splice_local_cache_range_to_fd").next())
             .expect("pread copy function should be present");
 
-        assert!(copy_fn.contains("vec![0; COPY_BUFFER_LEN]"));
+        assert!(copy_fn.contains("with_thread_local_pread_copy_buffer"));
         assert!(!copy_fn.contains("let mut buffer = [0; COPY_BUFFER_LEN]"));
+    }
+
+    #[test]
+    fn pread_local_cache_copy_buffer_is_reused_per_thread() {
+        reset_pread_copy_buffer_for_test();
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"abcdefghijklmnopqrstuvwxyz")
+            .expect("write cache contents");
+        let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(Vec::new()));
+
+        for offset in [0, 8] {
+            let reply = FuseReply::local_cache_range_data(
+                0x88,
+                FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), offset, 4, 9),
+            )
+            .expect("build local cache range reply");
+            transport
+                .send_reply(reply)
+                .expect("classic send should write local cache range");
+        }
+
+        assert_eq!(pread_copy_buffer_create_count_for_test(), 1);
     }
 
     #[test]
@@ -887,6 +953,19 @@ mod tests {
         .expect("second splice local cache range");
 
         assert_eq!(splice_pipe_create_count_for_test(), 1);
+    }
+
+    #[test]
+    fn splice_local_cache_range_documents_fuse_framing_invariant() {
+        let source = include_str!("transport.rs");
+        let splice_fn = source
+            .split("fn splice_local_cache_range_with_pipe")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("splice helper should be present");
+
+        assert!(splice_fn.contains("FRAMING INVARIANT"));
+        assert!(splice_fn.contains("range.len"));
     }
 
     #[test]
