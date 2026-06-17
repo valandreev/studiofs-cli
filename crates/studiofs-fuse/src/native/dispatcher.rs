@@ -494,7 +494,7 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                 let reply_len = reply.frame_len();
                 let reply_error = reply.error_code();
                 if let Err(error) = self.transport.send_reply(reply) {
-                    if opcode == FuseOpcode::Release
+                    if matches!(opcode, FuseOpcode::Release | FuseOpcode::Releasedir)
                         && reply_error == Some(0)
                         && transport_error_raw_errno(&error) == Some(libc::ENOENT)
                     {
@@ -786,6 +786,29 @@ mod tests {
         let (_transport, handler) = dispatcher.into_parts();
 
         assert_eq!(handler.opcodes, [FuseOpcode::Release]);
+        assert_eq!(
+            summary,
+            DispatchSummary {
+                handled_requests: 1,
+                saw_destroy: false,
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_treats_releasedir_reply_enoent_as_completed_release() {
+        let transport = EnoentOnReleaseReplyTransport {
+            inner: FrameQueueTransport::new([frame(29, 0x20)]),
+        };
+        let handler = RecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        let summary = dispatcher
+            .run_until_destroy()
+            .expect("releasedir reply ENOENT should not fail dispatcher");
+        let (_transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(handler.opcodes, [FuseOpcode::Releasedir]);
         assert_eq!(
             summary,
             DispatchSummary {

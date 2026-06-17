@@ -1,5 +1,6 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -509,7 +510,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
                 snapshot_generation: snapshot.snapshot_generation,
                 enabled: snapshot.enabled,
-                platform_policy: snapshot.platform_policy.to_string().into(),
+                platform_policy: snapshot.platform_policy.clone(),
                 max_pending_bytes: snapshot.max_pending_bytes,
                 max_pending_writes: snapshot.max_pending_writes,
                 per_handle_pending_bytes: snapshot.per_handle_pending_bytes,
@@ -677,7 +678,7 @@ pub struct NativeAsyncWriteConfig {
     /// Maximum bridge-owned pending bytes for one file handle.
     pub per_handle_pending_bytes: Option<usize>,
     /// Human-readable profile name surfaced in diagnostics.
-    pub platform_policy: Arc<str>,
+    pub platform_policy: Cow<'static, str>,
 }
 
 impl NativeAsyncWriteConfig {
@@ -715,7 +716,7 @@ pub struct NativeAsyncWriteSnapshot {
     /// Whether async native writes are enabled.
     pub enabled: bool,
     /// Human-readable profile name.
-    pub platform_policy: Arc<str>,
+    pub platform_policy: Cow<'static, str>,
     /// Maximum bridge-owned pending write bytes.
     pub max_pending_bytes: Option<usize>,
     /// Maximum bridge-owned pending write requests.
@@ -749,7 +750,7 @@ impl Default for NativeAsyncWriteSnapshot {
         Self {
             snapshot_generation: 0,
             enabled: false,
-            platform_policy: Arc::from(""),
+            platform_policy: Cow::Borrowed(""),
             max_pending_bytes: None,
             max_pending_writes: None,
             per_handle_pending_bytes: None,
@@ -965,6 +966,9 @@ where
                 .pending_writes
                 .drain_and_begin_close(request.header.nodeid, fh);
             self.publish_async_write_snapshot();
+            if pending_result == Err(libc::EAGAIN) {
+                return errno_reply(request.header.unique, libc::EAGAIN);
+            }
             let release_result = self.vfs.release(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
             return empty_barrier_reply(request.header.unique, pending_result, release_result);
@@ -2934,6 +2938,31 @@ mod tests {
     }
 
     #[test]
+    fn handle_release_short_circuits_eagain_before_releasing_vfs_handle() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn handle_release(&self, request: FuseRequest)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("fn handle_read(&self, request: FuseRequest)")
+                    .next()
+            })
+            .expect("handle_release body should be present");
+        let eagain_guard = body
+            .find("pending_result == Err(libc::EAGAIN)")
+            .expect("handle_release should check EAGAIN from drain");
+        let vfs_release = body
+            .find("self.vfs.release(fh)")
+            .expect("handle_release should release VFS handle after successful drain");
+        let finish_close = body
+            .find("self.pending_writes.finish_close")
+            .expect("handle_release should finish close after releasing VFS handle");
+
+        assert!(eagain_guard < vfs_release);
+        assert!(eagain_guard < finish_close);
+    }
+
+    #[test]
     fn handle_setattr_truncate_waits_for_inflight_write_on_same_inode() {
         let fixture = blocking_write_fixture();
         let writer_bridge = Arc::clone(&fixture.bridge);
@@ -3189,7 +3218,15 @@ mod tests {
             .expect("native async write type definitions should be present");
 
         assert!(!native_async_types.contains("platform_policy: String"));
-        assert!(native_async_types.contains("platform_policy: Arc<str>"));
+        assert!(!native_async_types.contains("platform_policy: Arc<str>"));
+        assert!(native_async_types.contains("platform_policy: Cow<'static, str>"));
+
+        let studio_record_snapshot = source
+            .split("fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn spawn_native_async_write_job").next())
+            .expect("studio snapshot recording method should be present");
+        assert!(!studio_record_snapshot.contains("to_string()"));
     }
 
     #[test]
