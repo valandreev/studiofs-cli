@@ -29,6 +29,7 @@ const FUSE_RENAME_IN_LEN: usize = 8;
 const FUSE_RELEASE_IN_LEN: usize = 24;
 const FUSE_SETATTR_IN_LEN: usize = 88;
 const FUSE_WRITE_IN_LEN: usize = 40;
+const NATIVE_MAX_READ_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const POSIX_STAT_BLOCK_SIZE: u64 = 512;
 const FATTR_FH: u32 = 1 << 0;
 const FATTR_SIZE: u32 = 1 << 3;
@@ -310,8 +311,9 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        let size = checked_native_read_size(size)?;
         // StudioVfs currently reads into initialized slices; avoid unsafe uninit buffers here.
-        let mut out = vec![0; size as usize];
+        let mut out = vec![0; size];
         let read = self
             .rt
             .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out))
@@ -580,6 +582,9 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             Some(read) => read,
             None => return invalid_request(request.header.unique),
         };
+        if let Err(errno) = checked_native_read_size(read.size) {
+            return errno_reply(request.header.unique, errno);
+        }
 
         match self
             .vfs
@@ -919,6 +924,14 @@ fn read_request(payload: &[u8]) -> Option<ReadRequest> {
     })
 }
 
+fn checked_native_read_size(size: u32) -> Result<usize, i32> {
+    let size = size as usize;
+    if size > NATIVE_MAX_READ_SIZE_BYTES {
+        return Err(libc::ENOMEM);
+    }
+    Ok(size)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WriteRequest<'a> {
     fh: u64,
@@ -1114,6 +1127,7 @@ fn readdirplus_payload<V: NativeVfs>(
     let start = usize::try_from(offset).unwrap_or(0);
     let limit = size as usize;
     let mut payload = Vec::new();
+    let mut pending_lookups = Vec::new();
     for (index, entry) in entries.iter().enumerate().skip(start) {
         let next_offset = match u64::try_from(index + 1) {
             Ok(next_offset) => next_offset,
@@ -1130,7 +1144,10 @@ fn readdirplus_payload<V: NativeVfs>(
         };
         payload.extend_from_slice(&entry_payload(attr));
         append_dirent(&mut payload, entry, next_offset);
-        add_lookup(attr.ino);
+        pending_lookups.push(attr.ino);
+    }
+    for ino in pending_lookups {
+        add_lookup(ino);
     }
     Ok(payload)
 }
@@ -1358,6 +1375,182 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct TestNativeVfs {
+        read_calls: AtomicU64,
+    }
+
+    impl NativeVfs for TestNativeVfs {
+        fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
+            if ino == 21 {
+                return Err(libc::EIO);
+            }
+            Ok(test_attr(ino))
+        }
+
+        fn open(&self, _ino: u64, _flags: i32) -> Result<u64, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn release(&self, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn read(&self, _fh: u64, _ino: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, i32> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn write(
+            &self,
+            _fh: u64,
+            _ino: u64,
+            _offset: u64,
+            _data: &[u8],
+            _flags: i32,
+        ) -> Result<u32, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn flush(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn fsync(&self, _ino: u64, _datasync: bool) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn opendir(&self, _ino: u64) -> Result<u64, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn releasedir(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn readdir(&self, _ino: u64, _fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn mkdir(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+        ) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn create(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _uid: u32,
+            _gid: u32,
+            _mode: u16,
+            _flags: i32,
+        ) -> Result<(NativeAttr, u64), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn unlink(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn rmdir(&self, _parent: u64, _name: &[u8]) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn rename(
+            &self,
+            _parent: u64,
+            _name: &[u8],
+            _new_parent: u64,
+            _new_name: &[u8],
+        ) -> Result<(), i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn truncate(&self, _ino: u64, _fh: Option<u64>, _size: u64) -> Result<NativeAttr, i32> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn statfs(&self) -> Result<NativeStatFs, i32> {
+            unimplemented!("not used by these tests")
+        }
+    }
+
+    fn test_attr(ino: u64) -> NativeAttr {
+        NativeAttr {
+            ino,
+            size: 0,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    fn dir_entry(ino: u64, name: &[u8]) -> NativeDirEntry {
+        NativeDirEntry {
+            ino,
+            kind: NativeFileType::RegularFile,
+            name: name.to_vec(),
+        }
+    }
+
+    #[test]
+    fn readdirplus_payload_does_not_record_lookups_when_later_getattr_fails() {
+        let vfs = TestNativeVfs::default();
+        let entries = vec![dir_entry(20, b"ok"), dir_entry(21, b"err")];
+        let mut looked_up = Vec::new();
+
+        let result = readdirplus_payload(&vfs, &entries, 0, 4096, |ino| looked_up.push(ino));
+
+        assert_eq!(result, Err(libc::EIO));
+        assert!(looked_up.is_empty());
+    }
+
+    #[test]
+    fn handle_read_rejects_oversized_requests_without_calling_backend() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        let reply = bridge.handle_read(read_request_for_size(16 * 1024 * 1024 + 1));
+
+        assert_eq!(reply_errno(&reply), -libc::ENOMEM);
+        assert_eq!(vfs.read_calls.load(Ordering::Relaxed), 0);
+    }
+
+    fn read_request_for_size(size: u32) -> FuseRequest {
+        let mut payload = vec![0; FUSE_READ_IN_LEN];
+        payload[0..8].copy_from_slice(&7_u64.to_le_bytes());
+        payload[8..16].copy_from_slice(&13_u64.to_le_bytes());
+        payload[16..20].copy_from_slice(&size.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                40 + FUSE_READ_IN_LEN as u32,
+                15,
+                99,
+                20,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Read,
+            payload,
+        }
+    }
+
+    fn reply_errno(reply: &FuseReply) -> i32 {
+        i32::from_le_bytes(reply.to_vec()[4..8].try_into().expect("reply errno"))
+    }
 
     #[test]
     fn lookup_count_store_uses_multiple_shards_for_distinct_inodes() {
