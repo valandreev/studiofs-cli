@@ -1132,6 +1132,7 @@ where
                 Err(errno) => PendingWriteCompletion::Error(errno),
             };
             registration.complete(completion);
+            drop(registration);
             vfs.record_async_write_snapshot(native_async_write_snapshot(&pending_writes, &config));
         });
 
@@ -3159,6 +3160,27 @@ mod tests {
             .send(())
             .expect("test should unblock write");
         writer.join().expect("write thread should finish");
+    }
+
+    #[test]
+    fn native_async_write_snapshot_reports_completion_before_registration_drop() {
+        let pending_writes = PendingWriteTracker::default();
+        let config = NativeAsyncWriteConfig {
+            max_pending_bytes: Some(16),
+            max_pending_writes: Some(2),
+            per_handle_pending_bytes: Some(8),
+            platform_policy: "test-native".into(),
+        };
+        let registration = pending_writes
+            .register_with_admission(20, 7, 4, config.admission_limits())
+            .expect("registration should fit admission limits");
+
+        registration.complete(PendingWriteCompletion::Success);
+        let snapshot = native_async_write_snapshot(&pending_writes, &config);
+
+        assert_eq!(snapshot.pending_writes, 0);
+        assert_eq!(snapshot.pending_bytes, 0);
+        assert_eq!(snapshot.completed_writes, 1);
     }
 
     #[test]
