@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -64,7 +65,10 @@ pub enum RequestClass {
 }
 
 impl RequestClass {
-    const ALL: [Self; 5] = [
+    /// Number of dispatcher queue classes.
+    pub const CLASS_COUNT: usize = 5;
+
+    const ALL: [Self; Self::CLASS_COUNT] = [
         Self::Metadata,
         Self::Read,
         Self::Write,
@@ -177,10 +181,15 @@ impl BarrierShared {
     const SHARD_COUNT: usize = 64;
 
     fn shard_index(resource: ResourceKey) -> usize {
-        let value = match resource {
+        let mut value = match resource {
             ResourceKey::Inode(inode) => inode,
-            ResourceKey::Handle(handle) => handle.rotate_left(32) ^ 0xa5a5_a5a5_a5a5_a5a5,
+            ResourceKey::Handle(handle) => handle ^ 0xa5a5_a5a5_a5a5_a5a5,
         };
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
 
         (value as usize) & (Self::SHARD_COUNT - 1)
     }
@@ -291,7 +300,7 @@ impl Drop for PendingWriteGuard {
 /// Point-in-time dispatcher telemetry used by tests and future exporters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchTelemetrySnapshot {
-    queue_depths: [usize; 5],
+    queue_depths: [usize; RequestClass::CLASS_COUNT],
     /// Number of submit calls rejected due to bounded queue pressure.
     pub backpressure_events: usize,
 }
@@ -305,7 +314,7 @@ impl DispatchTelemetrySnapshot {
 
 #[derive(Debug, Default)]
 struct DispatchTelemetryState {
-    queue_depths: [AtomicUsize; 5],
+    queue_depths: [AtomicUsize; RequestClass::CLASS_COUNT],
     backpressure_events: AtomicUsize,
 }
 
@@ -353,6 +362,14 @@ pub enum DispatchError {
     /// A worker thread panicked during shutdown.
     #[error("native FUSE dispatcher worker panicked")]
     WorkerPanicked,
+    /// Worker threads did not exit before the shutdown deadline.
+    #[error(
+        "native FUSE dispatcher shutdown timed out with {remaining_workers} workers still running"
+    )]
+    ShutdownTimeout {
+        /// Number of worker threads still running when the timeout elapsed.
+        remaining_workers: usize,
+    },
     /// The dispatcher is no longer accepting work.
     #[error("native FUSE dispatcher is shut down")]
     Shutdown,
@@ -365,6 +382,17 @@ impl PartialEq for DispatchError {
             (Self::QueueFull { class: left }, Self::QueueFull { class: right }) if left == right
         ) || matches!((self, other), (Self::WorkerPanicked, Self::WorkerPanicked))
             || matches!((self, other), (Self::Shutdown, Self::Shutdown))
+            || matches!(
+                (self, other),
+                (
+                    Self::ShutdownTimeout {
+                        remaining_workers: left
+                    },
+                    Self::ShutdownTimeout {
+                        remaining_workers: right
+                    }
+                ) if left == right
+            )
     }
 }
 
@@ -421,8 +449,8 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
 /// Builder for a bounded asynchronous native dispatcher.
 pub struct NativeAsyncDispatcherBuilder<H> {
     handler: H,
-    capacities: [usize; 5],
-    worker_counts: [usize; 5],
+    capacities: [usize; RequestClass::CLASS_COUNT],
+    worker_counts: [usize; RequestClass::CLASS_COUNT],
 }
 
 impl<H> NativeAsyncDispatcherBuilder<H> {
@@ -486,7 +514,7 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 pub struct NativeAsyncDispatcher<S: ReplySink> {
     senders: Vec<SyncSender<OwnedFuseRequest<S>>>,
     workers: Vec<JoinHandle<()>>,
-    capacities: [usize; 5],
+    capacities: [usize; RequestClass::CLASS_COUNT],
     telemetry: Arc<DispatchTelemetryState>,
 }
 
@@ -501,8 +529,8 @@ where
     {
         NativeAsyncDispatcherBuilder {
             handler,
-            capacities: [64; 5],
-            worker_counts: [1; 5],
+            capacities: [64; RequestClass::CLASS_COUNT],
+            worker_counts: [1; RequestClass::CLASS_COUNT],
         }
     }
 
@@ -552,13 +580,45 @@ where
     }
 
     /// Stops intake and waits for worker queues to drain.
-    pub fn shutdown(mut self) -> Result<(), DispatchError> {
+    pub fn shutdown(self) -> Result<(), DispatchError> {
+        self.shutdown_with_timeout(Self::DEFAULT_WORKER_JOIN_TIMEOUT)
+    }
+
+    /// Stops intake and waits up to `timeout` for worker queues to drain.
+    pub fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<(), DispatchError> {
         self.senders.clear();
-        for worker in self.workers {
-            worker.join().map_err(|_| DispatchError::WorkerPanicked)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let mut workers = self.workers;
+
+        while !workers.is_empty() {
+            let mut pending = Vec::with_capacity(workers.len());
+            for worker in workers {
+                if worker.is_finished() {
+                    worker.join().map_err(|_| DispatchError::WorkerPanicked)?;
+                } else {
+                    pending.push(worker);
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(DispatchError::ShutdownTimeout {
+                    remaining_workers: pending.len(),
+                });
+            }
+            workers = pending;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(1)));
         }
         Ok(())
     }
+}
+
+impl<S: ReplySink> NativeAsyncDispatcher<S> {
+    const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 }
 
 #[cfg(test)]
@@ -769,6 +829,28 @@ mod tests {
                 .send(())
                 .expect("test should receive handler start");
             panic!("intentional handler panic");
+        }
+    }
+
+    #[derive(Clone)]
+    struct WaitingAsyncHandler {
+        started: mpsc::Sender<()>,
+        blocker: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl AsyncFuseOperationHandler<RecordedReplySink> for WaitingAsyncHandler {
+        fn handle(&self, envelope: OwnedFuseRequest<RecordedReplySink>) {
+            self.started
+                .send(())
+                .expect("test should receive handler start");
+            let (lock, changed) = self.blocker.as_ref();
+            let mut released = lock.lock().expect("blocker mutex poisoned");
+            while !*released {
+                released = changed
+                    .wait(released)
+                    .expect("blocker condvar wait should recover");
+            }
+            envelope.reply.send_success(&[]);
         }
     }
 
@@ -1008,6 +1090,45 @@ mod tests {
     }
 
     #[test]
+    fn request_class_count_matches_class_table() {
+        assert_eq!(RequestClass::ALL.len(), RequestClass::CLASS_COUNT);
+    }
+
+    #[test]
+    fn async_dispatcher_shutdown_timeout_returns_when_worker_is_stuck() {
+        let sink = RecordedReplySink::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let blocker = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatcher = NativeAsyncDispatcher::<RecordedReplySink>::builder(WaitingAsyncHandler {
+            started: started_tx,
+            blocker: Arc::clone(&blocker),
+        })
+        .queue_capacity(RequestClass::Read, 1)
+        .spawn();
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0xc1),
+                sink.clone(),
+            ))
+            .expect("read should enter bounded queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("handler should start and block");
+
+        assert_eq!(
+            dispatcher.shutdown_with_timeout(Duration::from_millis(10)),
+            Err(DispatchError::ShutdownTimeout {
+                remaining_workers: 1
+            })
+        );
+
+        let (lock, changed) = blocker.as_ref();
+        *lock.lock().expect("blocker mutex poisoned") = true;
+        changed.notify_all();
+    }
+
+    #[test]
     fn barrier_gate_waits_for_pending_writes_on_same_inode() {
         let gates = OperationBarrierGates::default();
         let pending = gates.begin_write(ResourceKey::Inode(10));
@@ -1053,6 +1174,10 @@ mod tests {
         assert_ne!(
             BarrierShared::shard_index(ResourceKey::Inode(20)),
             BarrierShared::shard_index(ResourceKey::Inode(21))
+        );
+        assert_ne!(
+            BarrierShared::shard_index(ResourceKey::Inode(64)),
+            BarrierShared::shard_index(ResourceKey::Inode(128))
         );
         assert_eq!(BarrierShared::SHARD_COUNT, 64);
     }
