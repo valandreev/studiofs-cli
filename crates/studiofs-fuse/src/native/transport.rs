@@ -167,13 +167,68 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     }
 
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
-        self.io.write_all(&reply.bytes)?;
+        let io_slices = reply.io_slices();
+        let slices = io_slices.as_slice();
+        if slices.len() == 1 {
+            self.io.write_all(slices[0].as_ref())?;
+        } else {
+            let mut written = 0;
+            let expected: usize = slices.iter().map(|slice| slice.len()).sum();
+            while written < expected {
+                let pending = pending_reply_slices(slices, written);
+                let bytes = self.io.write_vectored(pending.as_slice())?;
+                if bytes == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "classic FUSE write accepted zero reply bytes",
+                    )
+                    .into());
+                }
+                written += bytes;
+            }
+        }
         Ok(())
     }
 
     fn request_shutdown(&mut self) -> Result<(), TransportError> {
         self.shutdown_requested = true;
         Ok(())
+    }
+}
+
+struct PendingReplySlices<'a> {
+    slices: [io::IoSlice<'a>; 2],
+    len: usize,
+}
+
+impl<'a> PendingReplySlices<'a> {
+    fn as_slice(&self) -> &[io::IoSlice<'a>] {
+        &self.slices[..self.len]
+    }
+}
+
+fn pending_reply_slices<'a>(
+    slices: &'a [io::IoSlice<'a>],
+    mut offset: usize,
+) -> PendingReplySlices<'a> {
+    debug_assert!(
+        slices.len() <= 2,
+        "pending_reply_slices only supports up to 2 slices"
+    );
+    let mut pending = [io::IoSlice::new(&[]), io::IoSlice::new(&[])];
+    let mut len = 0;
+    for slice in slices {
+        if offset >= slice.len() {
+            offset -= slice.len();
+            continue;
+        }
+        pending[len] = io::IoSlice::new(&slice.as_ref()[offset..]);
+        len += 1;
+        offset = 0;
+    }
+    PendingReplySlices {
+        slices: pending,
+        len,
     }
 }
 
@@ -221,10 +276,10 @@ mod tests {
 
         assert_eq!(request.opcode, FuseOpcode::Init);
 
-        let reply = FuseReply {
-            unique: request.header.unique,
-            bytes: error_reply(request.header.unique, libc::ENOSYS).to_vec(),
-        };
+        let reply = FuseReply::contiguous(
+            request.header.unique,
+            error_reply(request.header.unique, libc::ENOSYS).to_vec(),
+        );
         transport
             .send_reply(reply)
             .expect("transport send should accept reply");
@@ -375,10 +430,7 @@ mod tests {
 
         let bytes = error_reply(request.header.unique, libc::EIO).to_vec();
         transport
-            .send_reply(FuseReply {
-                unique: request.header.unique,
-                bytes: bytes.clone(),
-            })
+            .send_reply(FuseReply::contiguous(request.header.unique, bytes.clone()))
             .expect("classic send should write reply");
 
         assert_eq!(transport.into_inner().output, bytes);

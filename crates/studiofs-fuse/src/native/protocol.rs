@@ -1,8 +1,9 @@
 //! Transport-independent FUSE protocol types.
 
 use crate::native::abi::{
-    AbiParseError, FUSE_IN_HEADER_LEN, FuseInHeader, ok_reply, parse_in_header,
+    AbiParseError, FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader, ok_reply, parse_in_header,
 };
+use std::io::IoSlice;
 use std::ops::BitOr;
 
 /// Linux FUSE operation codes understood at the native transport boundary.
@@ -16,10 +17,16 @@ pub enum FuseOpcode {
     Open,
     /// `FUSE_READ`: read file data from an open file handle or node.
     Read,
+    /// `FUSE_WRITE`: write file data to an open file handle or node.
+    Write,
     /// `FUSE_STATFS`: fetch filesystem-level capacity and limit information.
     Statfs,
+    /// `FUSE_FSYNC`: synchronize dirty file data for a handle or inode.
+    Fsync,
     /// `FUSE_RELEASE`: close a previously opened file handle.
     Release,
+    /// `FUSE_FLUSH`: flush dirty file data for a handle or inode.
+    Flush,
     /// `FUSE_INIT`: negotiate protocol version, limits, and capabilities.
     Init,
     /// `FUSE_OPENDIR`: open a directory stream.
@@ -52,8 +59,119 @@ pub struct FuseRequest {
 pub struct FuseReply {
     /// Request id this reply answers.
     pub unique: u64,
+    frame: FuseReplyFrame,
+}
+
+/// Owned FUSE reply frame storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuseReplyFrame {
     /// Complete `fuse_out_header` plus any operation-specific payload.
-    pub bytes: Vec<u8>,
+    Contiguous(Vec<u8>),
+    /// Separate `fuse_out_header` and data payload for vectored transport writes.
+    Segmented {
+        /// Fixed `fuse_out_header` bytes.
+        header: [u8; FUSE_OUT_HEADER_LEN],
+        /// Operation-specific payload.
+        payload: Vec<u8>,
+    },
+}
+
+impl FuseReply {
+    /// Builds a reply from a complete contiguous frame.
+    pub fn contiguous(unique: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            unique,
+            frame: FuseReplyFrame::Contiguous(bytes),
+        }
+    }
+
+    /// Builds a successful data reply with separate header and payload storage.
+    pub fn segmented_data(unique: u64, payload: Vec<u8>) -> Self {
+        let mut header = [0; FUSE_OUT_HEADER_LEN];
+        let len = fuse_out_len_for_payload(payload.len());
+        header[0..4].copy_from_slice(&len.to_le_bytes());
+        header[4..8].copy_from_slice(&0_i32.to_le_bytes());
+        header[8..16].copy_from_slice(&unique.to_le_bytes());
+        Self {
+            unique,
+            frame: FuseReplyFrame::Segmented { header, payload },
+        }
+    }
+
+    /// Returns a contiguous copy of the reply frame.
+    pub fn to_vec(&self) -> Vec<u8> {
+        match &self.frame {
+            FuseReplyFrame::Contiguous(bytes) => bytes.clone(),
+            FuseReplyFrame::Segmented { header, payload } => {
+                let mut bytes = Vec::with_capacity(header.len() + payload.len());
+                bytes.extend_from_slice(header);
+                bytes.extend_from_slice(payload);
+                bytes
+            }
+        }
+    }
+
+    /// Returns vectored slices for transport writeback without heap allocation.
+    pub fn io_slices(&self) -> FuseReplyIoSlices<'_> {
+        match &self.frame {
+            FuseReplyFrame::Contiguous(bytes) => FuseReplyIoSlices::one(IoSlice::new(bytes)),
+            FuseReplyFrame::Segmented { header, payload } => {
+                FuseReplyIoSlices::two(IoSlice::new(header), IoSlice::new(payload))
+            }
+        }
+    }
+
+    /// Returns a view of contiguous reply bytes when this reply owns one frame buffer.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match &self.frame {
+            FuseReplyFrame::Contiguous(bytes) => Some(bytes),
+            FuseReplyFrame::Segmented { .. } => None,
+        }
+    }
+}
+
+fn fuse_out_len_for_payload(payload_len: usize) -> u32 {
+    let len = FUSE_OUT_HEADER_LEN
+        .checked_add(payload_len)
+        .expect("FUSE reply length must fit in u32");
+    u32::try_from(len).expect("FUSE reply length must fit in u32")
+}
+
+/// Fixed-size vectored reply slices.
+pub struct FuseReplyIoSlices<'a> {
+    slices: [IoSlice<'a>; 2],
+    len: usize,
+}
+
+impl<'a> FuseReplyIoSlices<'a> {
+    fn one(first: IoSlice<'a>) -> Self {
+        Self {
+            slices: [first, IoSlice::new(&[])],
+            len: 1,
+        }
+    }
+
+    fn two(first: IoSlice<'a>, second: IoSlice<'a>) -> Self {
+        Self {
+            slices: [first, second],
+            len: 2,
+        }
+    }
+
+    /// Returns active slices.
+    pub fn as_slice(&self) -> &[IoSlice<'a>] {
+        &self.slices[..self.len]
+    }
+
+    /// Returns active slice count.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether there are no active slices.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Parsed `FUSE_INIT` request payload.
@@ -237,10 +355,7 @@ impl FuseInitReply {
         payload.extend_from_slice(&self.capabilities.high_bits().to_le_bytes());
         payload.resize(FUSE_INIT_OUT_PAYLOAD_LEN, 0);
 
-        FuseReply {
-            unique,
-            bytes: ok_reply(unique, &payload),
-        }
+        FuseReply::contiguous(unique, ok_reply(unique, &payload))
     }
 }
 
@@ -279,8 +394,11 @@ impl FuseOpcode {
             3 => Self::Getattr,
             14 => Self::Open,
             15 => Self::Read,
+            16 => Self::Write,
             17 => Self::Statfs,
             18 => Self::Release,
+            20 => Self::Fsync,
+            25 => Self::Flush,
             26 => Self::Init,
             27 => Self::Opendir,
             28 => Self::Readdir,
@@ -334,8 +452,11 @@ mod tests {
             (3, FuseOpcode::Getattr),
             (14, FuseOpcode::Open),
             (15, FuseOpcode::Read),
+            (16, FuseOpcode::Write),
             (17, FuseOpcode::Statfs),
             (18, FuseOpcode::Release),
+            (20, FuseOpcode::Fsync),
+            (25, FuseOpcode::Flush),
             (26, FuseOpcode::Init),
             (27, FuseOpcode::Opendir),
             (28, FuseOpcode::Readdir),
@@ -426,34 +547,41 @@ mod tests {
         };
 
         let reply = init.into_reply(0x99);
+        let bytes = reply.to_vec();
 
-        assert_eq!(&reply.bytes[0..4], &80_u32.to_le_bytes());
-        assert_eq!(&reply.bytes[4..8], &0_i32.to_le_bytes());
-        assert_eq!(&reply.bytes[8..16], &0x99_u64.to_le_bytes());
-        assert_eq!(&reply.bytes[16..20], &7_u32.to_le_bytes());
-        assert_eq!(&reply.bytes[20..24], &38_u32.to_le_bytes());
-        assert_eq!(&reply.bytes[24..28], &(1024 * 1024_u32).to_le_bytes());
+        assert_eq!(&bytes[0..4], &80_u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0_i32.to_le_bytes());
+        assert_eq!(&bytes[8..16], &0x99_u64.to_le_bytes());
+        assert_eq!(&bytes[16..20], &7_u32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &38_u32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &(1024 * 1024_u32).to_le_bytes());
         assert_eq!(
-            &reply.bytes[28..32],
+            &bytes[28..32],
             &(FuseCapabilities::ASYNC_READ
                 | FuseCapabilities::BIG_WRITES
                 | FuseCapabilities::OVER_IO_URING)
                 .low_bits()
                 .to_le_bytes()
         );
-        assert_eq!(&reply.bytes[32..34], &50_u16.to_le_bytes());
-        assert_eq!(&reply.bytes[34..36], &40_u16.to_le_bytes());
-        assert_eq!(&reply.bytes[36..40], &(16 * 1024 * 1024_u32).to_le_bytes());
-        assert_eq!(&reply.bytes[40..44], &1_u32.to_le_bytes());
-        assert_eq!(&reply.bytes[44..46], &256_u16.to_le_bytes());
-        assert_eq!(&reply.bytes[46..48], &0_u16.to_le_bytes());
+        assert_eq!(&bytes[32..34], &50_u16.to_le_bytes());
+        assert_eq!(&bytes[34..36], &40_u16.to_le_bytes());
+        assert_eq!(&bytes[36..40], &(16 * 1024 * 1024_u32).to_le_bytes());
+        assert_eq!(&bytes[40..44], &1_u32.to_le_bytes());
+        assert_eq!(&bytes[44..46], &256_u16.to_le_bytes());
+        assert_eq!(&bytes[46..48], &0_u16.to_le_bytes());
         assert_eq!(
-            &reply.bytes[48..52],
+            &bytes[48..52],
             &(FuseCapabilities::ASYNC_READ
                 | FuseCapabilities::BIG_WRITES
                 | FuseCapabilities::OVER_IO_URING)
                 .high_bits()
                 .to_le_bytes()
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "FUSE reply length must fit in u32")]
+    fn segmented_reply_length_panics_when_payload_exceeds_u32_frame_limit() {
+        let _ = fuse_out_len_for_payload(usize::MAX);
     }
 }

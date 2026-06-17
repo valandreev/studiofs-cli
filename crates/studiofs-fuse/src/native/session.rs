@@ -393,10 +393,7 @@ mod tests {
 
     impl FuseOperationHandler for ReplyingHandler {
         fn handle(&mut self, request: FuseRequest) -> FuseReply {
-            FuseReply {
-                unique: request.header.unique,
-                bytes: ok_reply(request.header.unique, &[]),
-            }
+            FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
         }
     }
 
