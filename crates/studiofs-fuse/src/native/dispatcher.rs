@@ -95,10 +95,8 @@ impl RequestClass {
             | FuseOpcode::Fsync
             | FuseOpcode::Release
             | FuseOpcode::Releasedir
-            | FuseOpcode::Setattr
-            | FuseOpcode::Forget
-            | FuseOpcode::BatchForget => Self::Barrier,
-            FuseOpcode::Other(_) => Self::Background,
+            | FuseOpcode::Setattr => Self::Barrier,
+            FuseOpcode::Forget | FuseOpcode::BatchForget | FuseOpcode::Other(_) => Self::Background,
             FuseOpcode::Lookup
             | FuseOpcode::Getattr
             | FuseOpcode::Mkdir
@@ -1155,6 +1153,14 @@ mod tests {
         assert_eq!(
             RequestClass::for_opcode(FuseOpcode::Release),
             RequestClass::Barrier
+        );
+        assert_eq!(
+            RequestClass::for_opcode(FuseOpcode::Forget),
+            RequestClass::Background
+        );
+        assert_eq!(
+            RequestClass::for_opcode(FuseOpcode::BatchForget),
+            RequestClass::Background
         );
     }
 

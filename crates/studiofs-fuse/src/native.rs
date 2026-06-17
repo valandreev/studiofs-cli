@@ -28,6 +28,7 @@ mod tests {
     #[derive(Debug)]
     struct RecordingNativeVfs {
         lookups: Mutex<Vec<(u64, Vec<u8>)>>,
+        getattrs: Mutex<Vec<u64>>,
         opens: Mutex<Vec<(u64, i32)>>,
         releases: Mutex<Vec<u64>>,
         reads: Mutex<Vec<(u64, u64, u64, u32)>>,
@@ -61,6 +62,10 @@ mod tests {
         }
 
         fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
+            self.getattrs
+                .lock()
+                .expect("getattr calls lock should not be poisoned")
+                .push(ino);
             Ok(NativeAttr { ino, ..self.attr })
         }
 
@@ -135,12 +140,12 @@ mod tests {
             Ok(())
         }
 
-        fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntry>, i32> {
+        fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
             self.readdirs
                 .lock()
                 .expect("readdir calls lock should not be poisoned")
                 .push((ino, fh, offset));
-            Ok(self.dir_entries.clone())
+            Ok(self.dir_entries.clone().into())
         }
 
         fn mkdir(
@@ -680,9 +685,13 @@ mod tests {
         u64::from_le_bytes(raw)
     }
 
-    fn recording_vfs(attr: NativeAttr) -> Arc<RecordingNativeVfs> {
+    fn recording_vfs_with_dir_entries(
+        attr: NativeAttr,
+        dir_entries: Vec<NativeDirEntry>,
+    ) -> Arc<RecordingNativeVfs> {
         Arc::new(RecordingNativeVfs {
             lookups: Mutex::new(Vec::new()),
+            getattrs: Mutex::new(Vec::new()),
             opens: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             reads: Mutex::new(Vec::new()),
@@ -703,12 +712,19 @@ mod tests {
             fh: 7001,
             dir_fh: 8001,
             read_data: b"payload bytes".to_vec(),
-            dir_entries: vec![NativeDirEntry {
+            dir_entries,
+        })
+    }
+
+    fn recording_vfs(attr: NativeAttr) -> Arc<RecordingNativeVfs> {
+        recording_vfs_with_dir_entries(
+            attr,
+            vec![NativeDirEntry {
                 ino: 123,
                 kind: NativeFileType::RegularFile,
                 name: b"child.txt".to_vec(),
             }],
-        })
+        )
     }
 
     #[test]
@@ -1026,6 +1042,39 @@ mod tests {
             reply
                 .windows(b"child.txt".len())
                 .any(|window| window == b"child.txt")
+        );
+    }
+
+    #[test]
+    fn native_bridge_readdirplus_getattrs_only_entries_that_fit_reply() {
+        let attr = NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+        };
+        let entries: Vec<_> = (0..5)
+            .map(|index| NativeDirEntry {
+                ino: 200 + index,
+                kind: NativeFileType::RegularFile,
+                name: format!("file-{index}").into_bytes(),
+            })
+            .collect();
+        let vfs = recording_vfs_with_dir_entries(attr, entries);
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(readdirplus_request(99, 8001, 0, 160));
+        let reply = reply.to_vec();
+
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(
+            vfs.getattrs
+                .lock()
+                .expect("getattr calls lock should not be poisoned")
+                .as_slice(),
+            &[200]
         );
     }
 

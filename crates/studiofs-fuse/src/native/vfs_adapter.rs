@@ -72,15 +72,6 @@ pub struct NativeDirEntry {
     pub name: Vec<u8>,
 }
 
-/// Directory entry plus hydrated attributes used by `READDIRPLUS` replies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeDirEntryPlus {
-    /// Directory entry metadata.
-    pub entry: NativeDirEntry,
-    /// Hydrated child attributes.
-    pub attr: NativeAttr,
-}
-
 /// Filesystem statistics used by native FUSE `STATFS` replies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeStatFs {
@@ -135,18 +126,7 @@ pub trait NativeVfs {
     fn releasedir(&self, ino: u64, fh: u64) -> Result<(), i32>;
 
     /// Read directory entries for an opened directory handle.
-    fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntry>, i32>;
-
-    /// Read directory entries plus attributes for an opened directory handle.
-    fn readdirplus(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntryPlus>, i32> {
-        self.readdir(ino, fh, offset)?
-            .into_iter()
-            .map(|entry| {
-                self.getattr(entry.ino)
-                    .map(|attr| NativeDirEntryPlus { entry, attr })
-            })
-            .collect()
-    }
+    fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Arc<[NativeDirEntry]>, i32>;
 
     /// Create a directory.
     fn mkdir(
@@ -227,12 +207,8 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
         (**self).releasedir(ino, fh)
     }
 
-    fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntry>, i32> {
+    fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
         (**self).readdir(ino, fh, offset)
-    }
-
-    fn readdirplus(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntryPlus>, i32> {
-        (**self).readdirplus(ino, fh, offset)
     }
 
     fn mkdir(
@@ -333,6 +309,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        // StudioVfs currently reads into initialized slices; avoid unsafe uninit buffers here.
         let mut out = vec![0; size as usize];
         let read = self
             .rt
@@ -374,7 +351,13 @@ impl NativeVfs for StudioVfsNativeAdapter {
         let entries = self
             .vfs
             .readdir(ino)
-            .map(|entries| entries.into_iter().map(native_dir_entry).collect())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(native_dir_entry)
+                    .collect::<Vec<_>>()
+                    .into()
+            })
             .map_err(|error| vfs_err_to_errno(&error))?;
         Ok(self.directory_handles.open(ino, entries))
     }
@@ -384,13 +367,19 @@ impl NativeVfs for StudioVfsNativeAdapter {
         Ok(())
     }
 
-    fn readdir(&self, ino: u64, fh: u64, _offset: i64) -> Result<Vec<NativeDirEntry>, i32> {
+    fn readdir(&self, ino: u64, fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
         if let Some(entries) = self.directory_handles.entries(ino, fh) {
             return Ok(entries);
         }
         self.vfs
             .readdir(ino)
-            .map(|entries| entries.into_iter().map(native_dir_entry).collect())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(native_dir_entry)
+                    .collect::<Vec<_>>()
+                    .into()
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -422,6 +411,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .create(parent, name, uid, gid, mode)
             .map_err(|error| vfs_err_to_errno(&error))?;
         let (open_flags, _) = posix_flags_to_open_flags(flags);
+        // StudioVfs has no atomic create+open primitive yet; an open failure leaves the file.
         let fh = self
             .vfs
             .open_file(attr.ino, open_flags, false)
@@ -704,13 +694,13 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             Err(_) => return invalid_request(request.header.unique),
         };
 
-        match self
-            .vfs
-            .readdirplus(request.header.nodeid, readdir.fh, offset)
-        {
+        match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
             Ok(entries) => {
                 let (payload, looked_up_inodes) =
-                    readdirplus_payload(&entries, offset, readdir.size);
+                    match readdirplus_payload(&self.vfs, &entries, offset, readdir.size) {
+                        Ok(payload) => payload,
+                        Err(errno) => return errno_reply(request.header.unique, errno),
+                    };
                 for ino in looked_up_inodes {
                     self.add_lookup(ino, 1);
                 }
@@ -1127,30 +1117,31 @@ fn readdir_payload(entries: &[NativeDirEntry], offset: i64, size: u32) -> Vec<u8
     payload
 }
 
-fn readdirplus_payload(
-    entries: &[NativeDirEntryPlus],
+fn readdirplus_payload<V: NativeVfs>(
+    vfs: &V,
+    entries: &[NativeDirEntry],
     offset: i64,
     size: u32,
-) -> (Vec<u8>, Vec<u64>) {
+) -> Result<(Vec<u8>, Vec<u64>), i32> {
     let start = usize::try_from(offset).unwrap_or(0);
     let limit = size as usize;
     let mut payload = Vec::new();
     let mut looked_up_inodes = Vec::new();
-    for (index, entry_plus) in entries.iter().enumerate().skip(start) {
+    for (index, entry) in entries.iter().enumerate().skip(start) {
         let next_offset = match u64::try_from(index + 1) {
             Ok(next_offset) => next_offset,
             Err(_) => break,
         };
-        let entry = &entry_plus.entry;
         let encoded_len = FUSE_ENTRY_OUT_PAYLOAD_LEN + fuse_dirent_len(entry.name.len());
         if payload.len().saturating_add(encoded_len) > limit {
             break;
         }
-        payload.extend_from_slice(&entry_payload(entry_plus.attr));
+        let attr = vfs.getattr(entry.ino)?;
+        payload.extend_from_slice(&entry_payload(attr));
         append_dirent(&mut payload, entry, next_offset);
-        looked_up_inodes.push(entry_plus.attr.ino);
+        looked_up_inodes.push(attr.ino);
     }
-    (payload, looked_up_inodes)
+    Ok((payload, looked_up_inodes))
 }
 
 fn statfs_payload(statfs: NativeStatFs) -> Vec<u8> {
@@ -1273,22 +1264,22 @@ struct NativeDirectoryHandleStore {
 #[derive(Debug, Clone)]
 struct NativeDirectoryHandle {
     ino: u64,
-    entries: Vec<NativeDirEntry>,
+    entries: Arc<[NativeDirEntry]>,
 }
 
 impl NativeDirectoryHandleStore {
-    fn open(&self, ino: u64, entries: Vec<NativeDirEntry>) -> u64 {
+    fn open(&self, ino: u64, entries: Arc<[NativeDirEntry]>) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
         lock_or_recover(&self.handles).insert(fh, NativeDirectoryHandle { ino, entries });
         fh
     }
 
-    fn entries(&self, ino: u64, fh: u64) -> Option<Vec<NativeDirEntry>> {
+    fn entries(&self, ino: u64, fh: u64) -> Option<Arc<[NativeDirEntry]>> {
         let handles = lock_or_recover(&self.handles);
         handles
             .get(&fh)
             .filter(|handle| handle.ino == ino)
-            .map(|handle| handle.entries.clone())
+            .map(|handle| Arc::clone(&handle.entries))
     }
 
     fn release(&self, ino: u64, fh: u64) -> bool {
