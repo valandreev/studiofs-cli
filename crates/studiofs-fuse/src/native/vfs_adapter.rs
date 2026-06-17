@@ -1611,7 +1611,7 @@ fn native_async_write_snapshot(
 fn native_async_write_default_limits() -> PendingWriteAdmissionLimits {
     PendingWriteAdmissionLimits {
         max_pending_bytes: Some(128 * 1024 * 1024),
-        max_pending_writes: Some(1024),
+        max_pending_writes: Some(256),
         per_handle_pending_bytes: Some(32 * 1024 * 1024),
     }
 }
@@ -3170,6 +3170,13 @@ mod tests {
         assert_eq!(enabled.max_pending_writes, Some(7));
         assert_eq!(enabled.per_handle_pending_bytes, Some(1024));
         assert_eq!(enabled.platform_policy.as_ref(), "linux6-safe");
+    }
+
+    #[test]
+    fn native_async_write_default_pending_writes_stays_below_tokio_blocking_pool_limit() {
+        let limits = native_async_write_default_limits();
+
+        assert!(limits.max_pending_writes.is_some_and(|limit| limit < 512));
     }
 
     #[test]

@@ -165,6 +165,7 @@ impl FuseTransport for FrameQueueTransport {
 pub struct ClassicReadWriteTransport<T> {
     io: T,
     read_buffer: Vec<u8>,
+    local_cache_pread_frame: Vec<u8>,
     shutdown_requested: bool,
     local_cache_strategy: LocalCacheReplyStrategy,
     local_cache_output_fd: Option<RawFd>,
@@ -182,6 +183,7 @@ impl<T> ClassicReadWriteTransport<T> {
         Self {
             io,
             read_buffer: vec![0; FUSE_IN_HEADER_LEN + max_write],
+            local_cache_pread_frame: Vec::new(),
             shutdown_requested: false,
             local_cache_strategy: LocalCacheReplyStrategy::PreadBytes,
             local_cache_output_fd: None,
@@ -283,10 +285,24 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             );
             match self.local_cache_strategy {
                 LocalCacheReplyStrategy::PreadBytes => {
-                    let mut frame = Vec::with_capacity(header.len() + range.len as usize);
-                    frame.extend_from_slice(header);
-                    copy_local_cache_range_with_pread(owned_range, &mut frame)?;
-                    self.io.write_all(&frame)?;
+                    let frame_len =
+                        header
+                            .len()
+                            .checked_add(range.len as usize)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "local cache reply frame length overflows usize",
+                                )
+                            })?;
+                    self.local_cache_pread_frame.clear();
+                    self.local_cache_pread_frame.reserve(frame_len);
+                    self.local_cache_pread_frame.extend_from_slice(header);
+                    copy_local_cache_range_with_pread(
+                        owned_range,
+                        &mut self.local_cache_pread_frame,
+                    )?;
+                    self.io.write_all(&self.local_cache_pread_frame)?;
                 }
                 LocalCacheReplyStrategy::Splice => {
                     let Some(output_fd) = self.local_cache_output_fd else {
@@ -911,6 +927,24 @@ mod tests {
         let output = transport.into_inner();
         assert_eq!(output.write_lens, [22]);
         assert_eq!(&output.output[16..], b"456789");
+    }
+
+    #[test]
+    fn classic_read_write_transport_reuses_pread_reply_frame_buffer() {
+        let source = include_str!("transport.rs");
+        let transport_struct = source
+            .split("pub struct ClassicReadWriteTransport<T>")
+            .nth(1)
+            .and_then(|rest| rest.split("impl<T> ClassicReadWriteTransport<T>").next())
+            .expect("classic transport struct should be present");
+        let pread_branch = source
+            .split("LocalCacheReplyStrategy::PreadBytes => {")
+            .nth(1)
+            .and_then(|rest| rest.split("LocalCacheReplyStrategy::Splice => {").next())
+            .expect("pread local cache reply branch should be present");
+
+        assert!(transport_struct.contains("local_cache_pread_frame: Vec<u8>"));
+        assert!(!pread_branch.contains("Vec::with_capacity"));
     }
 
     #[test]
