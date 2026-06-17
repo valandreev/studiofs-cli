@@ -1423,23 +1423,32 @@ struct NativeTrustedOpenCacheStateStore {
 impl NativeTrustedOpenCacheStateStore {
     const SHARD_COUNT: usize = 64;
 
-    fn shard(ino: u64) -> usize {
-        NativeLookupCountStore::shard_index(ino)
+    fn shard_index(ino: u64) -> usize {
+        let mut value = ino;
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value as usize) & (Self::SHARD_COUNT - 1)
+    }
+
+    fn shard(&self, ino: u64) -> &Mutex<HashMap<u64, NativeInodeCacheState>> {
+        &self.shards[Self::shard_index(ino)]
     }
 
     fn get(&self, ino: u64) -> Option<NativeInodeCacheState> {
-        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states")
+        lock_or_recover(self.shard(ino), "trusted_open_cache_states")
             .get(&ino)
             .cloned()
     }
 
     fn insert(&self, ino: u64, state: NativeInodeCacheState) {
-        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states")
-            .insert(ino, state);
+        lock_or_recover(self.shard(ino), "trusted_open_cache_states").insert(ino, state);
     }
 
     fn remove(&self, ino: u64) {
-        lock_or_recover(&self.shards[Self::shard(ino)], "trusted_open_cache_states").remove(&ino);
+        lock_or_recover(self.shard(ino), "trusted_open_cache_states").remove(&ino);
     }
 }
 
@@ -1672,6 +1681,20 @@ mod tests {
         assert!(state.writer_active);
         assert!(state.dirty);
         assert!(state.local_materialized);
+    }
+
+    #[test]
+    fn trusted_open_cache_state_store_shard_index_is_independent() {
+        let source = include_str!("vfs_adapter.rs");
+        let trusted_store = source
+            .split("struct NativeLookupCountStore")
+            .next()
+            .expect("trusted store should appear before lookup count store");
+
+        assert!(
+            !trusted_store.contains("NativeLookupCountStore::shard_index"),
+            "trusted open cache state sharding must not depend on lookup count sharding"
+        );
     }
 
     #[test]
