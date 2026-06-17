@@ -15,8 +15,11 @@ use crate::native::protocol::{FuseOpcode, FuseReply, FuseRequest};
 
 const FUSE_ENTRY_OUT_PAYLOAD_LEN: usize = 128;
 const FUSE_ATTR_PAYLOAD_LEN: usize = 88;
+const FUSE_BATCH_FORGET_IN_LEN: usize = 8;
+const FUSE_BATCH_FORGET_ONE_LEN: usize = 16;
 const FUSE_FLUSH_IN_LEN: usize = 24;
 const FUSE_FSYNC_IN_LEN: usize = 16;
+const FUSE_FORGET_IN_LEN: usize = 8;
 const FUSE_CREATE_IN_LEN: usize = 16;
 const FUSE_MKDIR_IN_LEN: usize = 8;
 const FUSE_OPEN_IN_LEN: usize = 8;
@@ -67,6 +70,15 @@ pub struct NativeDirEntry {
     pub kind: NativeFileType,
     /// Child name bytes.
     pub name: Vec<u8>,
+}
+
+/// Directory entry plus hydrated attributes used by `READDIRPLUS` replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDirEntryPlus {
+    /// Directory entry metadata.
+    pub entry: NativeDirEntry,
+    /// Hydrated child attributes.
+    pub attr: NativeAttr,
 }
 
 /// Filesystem statistics used by native FUSE `STATFS` replies.
@@ -125,6 +137,17 @@ pub trait NativeVfs {
     /// Read directory entries for an opened directory handle.
     fn readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntry>, i32>;
 
+    /// Read directory entries plus attributes for an opened directory handle.
+    fn readdirplus(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntryPlus>, i32> {
+        self.readdir(ino, fh, offset)?
+            .into_iter()
+            .map(|entry| {
+                self.getattr(entry.ino)
+                    .map(|attr| NativeDirEntryPlus { entry, attr })
+            })
+            .collect()
+    }
+
     /// Create a directory.
     fn mkdir(
         &self,
@@ -148,6 +171,9 @@ pub trait NativeVfs {
 
     /// Remove a regular-file name.
     fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32>;
+
+    /// Remove an empty directory name.
+    fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32>;
 
     /// Rename a namespace entry.
     fn rename(&self, parent: u64, name: &[u8], new_parent: u64, new_name: &[u8])
@@ -205,6 +231,10 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
         (**self).readdir(ino, fh, offset)
     }
 
+    fn readdirplus(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<NativeDirEntryPlus>, i32> {
+        (**self).readdirplus(ino, fh, offset)
+    }
+
     fn mkdir(
         &self,
         parent: u64,
@@ -230,6 +260,10 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
         (**self).unlink(parent, name)
+    }
+
+    fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        (**self).rmdir(parent, name)
     }
 
     fn rename(
@@ -401,6 +435,12 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        self.vfs
+            .rmdir(parent, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     fn rename(
         &self,
         parent: u64,
@@ -432,12 +472,24 @@ impl NativeVfs for StudioVfsNativeAdapter {
 #[derive(Debug)]
 pub struct LinuxNativeBridge<V> {
     vfs: V,
+    lookup_counts: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
 impl<V> LinuxNativeBridge<V> {
     /// Build an operation adapter around a VFS backend.
     pub fn new(vfs: V) -> Self {
-        Self { vfs }
+        Self {
+            vfs,
+            lookup_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Returns the kernel lookup reference count currently tracked for `ino`.
+    pub fn kernel_lookup_count(&self, ino: u64) -> u64 {
+        lock_or_recover(&self.lookup_counts)
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -445,6 +497,7 @@ impl<V: NativeVfs> FuseOperationHandler for LinuxNativeBridge<V> {
     fn handle(&mut self, request: FuseRequest) -> FuseReply {
         match request.opcode {
             FuseOpcode::Lookup => self.handle_lookup(request),
+            FuseOpcode::Forget => self.handle_forget(request),
             FuseOpcode::Getattr => self.handle_getattr(request),
             FuseOpcode::Open => self.handle_open(request),
             FuseOpcode::Read => self.handle_read(request),
@@ -455,9 +508,12 @@ impl<V: NativeVfs> FuseOperationHandler for LinuxNativeBridge<V> {
             FuseOpcode::Opendir => self.handle_opendir(request),
             FuseOpcode::Releasedir => self.handle_releasedir(request),
             FuseOpcode::Readdir => self.handle_readdir(request),
+            FuseOpcode::Readdirplus => self.handle_readdirplus(request),
+            FuseOpcode::BatchForget => self.handle_batch_forget(request),
             FuseOpcode::Mkdir => self.handle_mkdir(request),
             FuseOpcode::Create => self.handle_create(request),
             FuseOpcode::Unlink => self.handle_unlink(request),
+            FuseOpcode::Rmdir => self.handle_rmdir(request),
             FuseOpcode::Rename => self.handle_rename(request),
             FuseOpcode::Statfs => self.handle_statfs(request),
             FuseOpcode::Setattr => self.handle_setattr(request),
@@ -482,15 +538,25 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         };
 
         match self.vfs.lookup(request.header.nodeid, name) {
-            Ok(attr) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(request.header.unique, &entry_payload(attr)),
-            ),
+            Ok(attr) => {
+                self.add_lookup(attr.ino, 1);
+                FuseReply::contiguous(
+                    request.header.unique,
+                    ok_reply(request.header.unique, &entry_payload(attr)),
+                )
+            }
             Err(errno) => FuseReply::contiguous(
                 request.header.unique,
                 error_reply(request.header.unique, errno).to_vec(),
             ),
         }
+    }
+
+    fn handle_forget(&self, request: FuseRequest) -> FuseReply {
+        if let Some(nlookup) = forget_request(&request.payload) {
+            self.forget_lookup(request.header.nodeid, nlookup);
+        }
+        FuseReply::no_reply(request.header.unique)
     }
 
     fn handle_getattr(&self, request: FuseRequest) -> FuseReply {
@@ -714,6 +780,41 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         }
     }
 
+    fn handle_readdirplus(&self, request: FuseRequest) -> FuseReply {
+        let readdir = match read_request(&request.payload) {
+            Some(readdir) => readdir,
+            None => return invalid_request(request.header.unique),
+        };
+        let offset = match i64::try_from(readdir.offset) {
+            Ok(offset) => offset,
+            Err(_) => return invalid_request(request.header.unique),
+        };
+
+        match self
+            .vfs
+            .readdirplus(request.header.nodeid, readdir.fh, offset)
+        {
+            Ok(entries) => {
+                let (payload, looked_up_inodes) =
+                    readdirplus_payload(&entries, offset, readdir.size);
+                for ino in looked_up_inodes {
+                    self.add_lookup(ino, 1);
+                }
+                FuseReply::segmented_data(request.header.unique, payload)
+            }
+            Err(errno) => errno_reply(request.header.unique, errno),
+        }
+    }
+
+    fn handle_batch_forget(&self, request: FuseRequest) -> FuseReply {
+        if let Some(entries) = batch_forget_request(&request.payload) {
+            for (ino, nlookup) in entries {
+                self.forget_lookup(ino, nlookup);
+            }
+        }
+        FuseReply::no_reply(request.header.unique)
+    }
+
     fn handle_mkdir(&self, request: FuseRequest) -> FuseReply {
         let mkdir = match mkdir_request(&request.payload) {
             Some(mkdir) => mkdir,
@@ -727,10 +828,13 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             request.header.gid,
             mkdir.mode,
         ) {
-            Ok(attr) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(request.header.unique, &entry_payload(attr)),
-            ),
+            Ok(attr) => {
+                self.add_lookup(attr.ino, 1);
+                FuseReply::contiguous(
+                    request.header.unique,
+                    ok_reply(request.header.unique, &entry_payload(attr)),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -749,13 +853,16 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             create.mode,
             create.flags,
         ) {
-            Ok((attr, fh)) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(
+            Ok((attr, fh)) => {
+                self.add_lookup(attr.ino, 1);
+                FuseReply::contiguous(
                     request.header.unique,
-                    &create_payload(attr, fh, create.flags),
-                ),
-            ),
+                    ok_reply(
+                        request.header.unique,
+                        &create_payload(attr, fh, create.flags),
+                    ),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -767,6 +874,20 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         };
 
         match self.vfs.unlink(request.header.nodeid, name) {
+            Ok(()) => {
+                FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
+            }
+            Err(errno) => errno_reply(request.header.unique, errno),
+        }
+    }
+
+    fn handle_rmdir(&self, request: FuseRequest) -> FuseReply {
+        let name = match lookup_name(&request.payload) {
+            Some(name) => name,
+            None => return invalid_request(request.header.unique),
+        };
+
+        match self.vfs.rmdir(request.header.nodeid, name) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
@@ -820,6 +941,24 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
+
+    fn add_lookup(&self, ino: u64, nlookup: u64) {
+        let mut lookup_counts = lock_or_recover(&self.lookup_counts);
+        let count = lookup_counts.entry(ino).or_default();
+        *count = count.saturating_add(nlookup);
+    }
+
+    fn forget_lookup(&self, ino: u64, nlookup: u64) {
+        let mut lookup_counts = lock_or_recover(&self.lookup_counts);
+        let Some(count) = lookup_counts.get_mut(&ino) else {
+            return;
+        };
+        if *count <= nlookup {
+            lookup_counts.remove(&ino);
+        } else {
+            *count -= nlookup;
+        }
+    }
 }
 
 fn invalid_request(unique: u64) -> FuseReply {
@@ -853,6 +992,23 @@ fn flush_fh(payload: &[u8]) -> Option<u64> {
 fn fsync_datasync(payload: &[u8]) -> Option<bool> {
     let bytes = payload.get(..FUSE_FSYNC_IN_LEN)?;
     Some(read_u32(bytes, 8) & 1 != 0)
+}
+
+fn forget_request(payload: &[u8]) -> Option<u64> {
+    let bytes = payload.get(..FUSE_FORGET_IN_LEN)?;
+    Some(read_u64(bytes, 0))
+}
+
+fn batch_forget_request(payload: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let header = payload.get(..FUSE_BATCH_FORGET_IN_LEN)?;
+    let count = read_u32(header, 0) as usize;
+    let entries_len = count.checked_mul(FUSE_BATCH_FORGET_ONE_LEN)?;
+    let entries = payload.get(FUSE_BATCH_FORGET_IN_LEN..FUSE_BATCH_FORGET_IN_LEN + entries_len)?;
+    let mut forgets = Vec::with_capacity(count);
+    for entry in entries.chunks_exact(FUSE_BATCH_FORGET_ONE_LEN) {
+        forgets.push((read_u64(entry, 0), read_u64(entry, 8)));
+    }
+    Some(forgets)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1049,6 +1205,32 @@ fn readdir_payload(entries: &[NativeDirEntry], offset: i64, size: u32) -> Vec<u8
         append_dirent(&mut payload, entry, next_offset);
     }
     payload
+}
+
+fn readdirplus_payload(
+    entries: &[NativeDirEntryPlus],
+    offset: i64,
+    size: u32,
+) -> (Vec<u8>, Vec<u64>) {
+    let start = usize::try_from(offset).unwrap_or(0);
+    let limit = size as usize;
+    let mut payload = Vec::new();
+    let mut looked_up_inodes = Vec::new();
+    for (index, entry_plus) in entries.iter().enumerate().skip(start) {
+        let next_offset = match u64::try_from(index + 1) {
+            Ok(next_offset) => next_offset,
+            Err(_) => break,
+        };
+        let entry = &entry_plus.entry;
+        let encoded_len = FUSE_ENTRY_OUT_PAYLOAD_LEN + fuse_dirent_len(entry.name.len());
+        if payload.len().saturating_add(encoded_len) > limit {
+            break;
+        }
+        payload.extend_from_slice(&entry_payload(entry_plus.attr));
+        append_dirent(&mut payload, entry, next_offset);
+        looked_up_inodes.push(entry_plus.attr.ino);
+    }
+    (payload, looked_up_inodes)
 }
 
 fn statfs_payload(statfs: NativeStatFs) -> Vec<u8> {

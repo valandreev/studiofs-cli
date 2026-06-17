@@ -73,6 +73,9 @@ impl FuseTransport for FrameQueueTransport {
     }
 
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+        if reply.is_no_reply() {
+            return Ok(());
+        }
         self.sent_replies.push(reply);
         Ok(())
     }
@@ -167,6 +170,9 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
     }
 
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+        if reply.is_no_reply() {
+            return Ok(());
+        }
         let io_slices = reply.io_slices();
         let slices = io_slices.as_slice();
         if slices.len() == 1 {

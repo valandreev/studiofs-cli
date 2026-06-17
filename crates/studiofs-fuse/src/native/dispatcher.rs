@@ -95,13 +95,16 @@ impl RequestClass {
             | FuseOpcode::Fsync
             | FuseOpcode::Release
             | FuseOpcode::Releasedir
-            | FuseOpcode::Setattr => Self::Barrier,
+            | FuseOpcode::Setattr
+            | FuseOpcode::Forget
+            | FuseOpcode::BatchForget => Self::Barrier,
             FuseOpcode::Other(_) => Self::Background,
             FuseOpcode::Lookup
             | FuseOpcode::Getattr
             | FuseOpcode::Mkdir
             | FuseOpcode::Create
             | FuseOpcode::Unlink
+            | FuseOpcode::Rmdir
             | FuseOpcode::Rename
             | FuseOpcode::Open
             | FuseOpcode::Statfs
@@ -452,7 +455,9 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
         while let Some(request) = self.transport.receive_request()? {
             let is_destroy = request.opcode == FuseOpcode::Destroy;
             let reply = self.handler.handle(request);
-            self.transport.send_reply(reply)?;
+            if !reply.is_no_reply() {
+                self.transport.send_reply(reply)?;
+            }
             summary.handled_requests += 1;
             if is_destroy {
                 summary.saw_destroy = true;
@@ -696,6 +701,40 @@ mod tests {
         );
         assert_eq!(handler.opcodes, [FuseOpcode::Lookup, FuseOpcode::Destroy]);
         assert_eq!(transport.sent_replies().len(), 2);
+    }
+
+    #[derive(Default)]
+    struct NoReplyHandler {
+        handled: usize,
+    }
+
+    impl FuseOperationHandler for NoReplyHandler {
+        fn handle(&mut self, request: FuseRequest) -> FuseReply {
+            self.handled += 1;
+            FuseReply::no_reply(request.header.unique)
+        }
+    }
+
+    #[test]
+    fn dispatcher_does_not_write_no_reply_frames() {
+        let transport = FrameQueueTransport::new([frame(2, 0x10)]);
+        let handler = NoReplyHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        let summary = dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(
+            summary,
+            DispatchSummary {
+                handled_requests: 1,
+                saw_destroy: false,
+            }
+        );
+        assert_eq!(handler.handled, 1);
+        assert!(transport.sent_replies().is_empty());
     }
 
     #[test]

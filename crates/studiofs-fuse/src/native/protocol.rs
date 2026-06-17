@@ -11,6 +11,8 @@ use std::ops::BitOr;
 pub enum FuseOpcode {
     /// `FUSE_LOOKUP`: resolve a child name under a directory node.
     Lookup,
+    /// `FUSE_FORGET`: drop kernel lookup references for an inode.
+    Forget,
     /// `FUSE_GETATTR`: fetch attributes for a node.
     Getattr,
     /// `FUSE_SETATTR`: update attributes for a node.
@@ -39,12 +41,16 @@ pub enum FuseOpcode {
     Releasedir,
     /// `FUSE_READDIRPLUS`: read directory entries with attributes.
     Readdirplus,
+    /// `FUSE_BATCH_FORGET`: drop kernel lookup references for multiple inodes.
+    BatchForget,
     /// `FUSE_MKDIR`: create a directory.
     Mkdir,
     /// `FUSE_CREATE`: create and open a regular file.
     Create,
     /// `FUSE_UNLINK`: remove a regular file name.
     Unlink,
+    /// `FUSE_RMDIR`: remove an empty directory name.
+    Rmdir,
     /// `FUSE_RENAME`: rename a namespace entry.
     Rename,
     /// `FUSE_DESTROY`: terminate the kernel connection.
@@ -79,6 +85,8 @@ pub struct FuseReply {
 /// Owned FUSE reply frame storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FuseReplyFrame {
+    /// No kernel reply should be written for this request.
+    NoReply,
     /// Complete `fuse_out_header` plus any operation-specific payload.
     Contiguous(Vec<u8>),
     /// Separate `fuse_out_header` and data payload for vectored transport writes.
@@ -91,6 +99,14 @@ pub enum FuseReplyFrame {
 }
 
 impl FuseReply {
+    /// Builds a marker for FUSE requests such as `FORGET` that must not be replied to.
+    pub fn no_reply(unique: u64) -> Self {
+        Self {
+            unique,
+            frame: FuseReplyFrame::NoReply,
+        }
+    }
+
     /// Builds a reply from a complete contiguous frame.
     pub fn contiguous(unique: u64, bytes: Vec<u8>) -> Self {
         Self {
@@ -115,6 +131,7 @@ impl FuseReply {
     /// Returns a contiguous copy of the reply frame.
     pub fn to_vec(&self) -> Vec<u8> {
         match &self.frame {
+            FuseReplyFrame::NoReply => Vec::new(),
             FuseReplyFrame::Contiguous(bytes) => bytes.clone(),
             FuseReplyFrame::Segmented { header, payload } => {
                 let mut bytes = Vec::with_capacity(header.len() + payload.len());
@@ -128,6 +145,7 @@ impl FuseReply {
     /// Returns vectored slices for transport writeback without heap allocation.
     pub fn io_slices(&self) -> FuseReplyIoSlices<'_> {
         match &self.frame {
+            FuseReplyFrame::NoReply => FuseReplyIoSlices::empty(),
             FuseReplyFrame::Contiguous(bytes) => FuseReplyIoSlices::one(IoSlice::new(bytes)),
             FuseReplyFrame::Segmented { header, payload } => {
                 FuseReplyIoSlices::two(IoSlice::new(header), IoSlice::new(payload))
@@ -135,9 +153,15 @@ impl FuseReply {
         }
     }
 
+    /// Returns whether this request must be completed without kernel writeback.
+    pub fn is_no_reply(&self) -> bool {
+        matches!(self.frame, FuseReplyFrame::NoReply)
+    }
+
     /// Returns a view of contiguous reply bytes when this reply owns one frame buffer.
     pub fn bytes(&self) -> Option<&[u8]> {
         match &self.frame {
+            FuseReplyFrame::NoReply => None,
             FuseReplyFrame::Contiguous(bytes) => Some(bytes),
             FuseReplyFrame::Segmented { .. } => None,
         }
@@ -158,6 +182,13 @@ pub struct FuseReplyIoSlices<'a> {
 }
 
 impl<'a> FuseReplyIoSlices<'a> {
+    fn empty() -> Self {
+        Self {
+            slices: [IoSlice::new(&[]), IoSlice::new(&[])],
+            len: 0,
+        }
+    }
+
     fn one(first: IoSlice<'a>) -> Self {
         Self {
             slices: [first, IoSlice::new(&[])],
@@ -405,10 +436,12 @@ impl FuseOpcode {
     fn from_raw(opcode: u32) -> Self {
         match opcode {
             1 => Self::Lookup,
+            2 => Self::Forget,
             3 => Self::Getattr,
             4 => Self::Setattr,
             9 => Self::Mkdir,
             10 => Self::Unlink,
+            11 => Self::Rmdir,
             12 => Self::Rename,
             14 => Self::Open,
             15 => Self::Read,
@@ -423,6 +456,7 @@ impl FuseOpcode {
             29 => Self::Releasedir,
             35 => Self::Create,
             38 => Self::Destroy,
+            42 => Self::BatchForget,
             44 => Self::Readdirplus,
             other => Self::Other(other),
         }
@@ -470,10 +504,12 @@ mod tests {
     fn opcode_table_decodes_sfs525_transport_level_request_set() {
         for (raw, expected) in [
             (1, FuseOpcode::Lookup),
+            (2, FuseOpcode::Forget),
             (3, FuseOpcode::Getattr),
             (4, FuseOpcode::Setattr),
             (9, FuseOpcode::Mkdir),
             (10, FuseOpcode::Unlink),
+            (11, FuseOpcode::Rmdir),
             (12, FuseOpcode::Rename),
             (14, FuseOpcode::Open),
             (15, FuseOpcode::Read),
@@ -488,6 +524,7 @@ mod tests {
             (29, FuseOpcode::Releasedir),
             (35, FuseOpcode::Create),
             (38, FuseOpcode::Destroy),
+            (42, FuseOpcode::BatchForget),
             (44, FuseOpcode::Readdirplus),
         ] {
             assert_eq!(FuseOpcode::from_raw(raw), expected);

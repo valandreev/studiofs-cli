@@ -20,22 +20,28 @@ mod tests {
         LinuxNativeBridge, NativeAttr, NativeDirEntry, NativeFileType, NativeStatFs, NativeVfs,
     };
 
+    type WriteCall = (u64, u64, u64, Vec<u8>, i32);
+    type MkdirCall = (u64, Vec<u8>, u32, u32, u16);
+    type CreateCall = (u64, Vec<u8>, u32, u32, u16, i32);
+    type RenameCall = (u64, Vec<u8>, u64, Vec<u8>);
+
     #[derive(Debug)]
     struct RecordingNativeVfs {
         lookups: Mutex<Vec<(u64, Vec<u8>)>>,
         opens: Mutex<Vec<(u64, i32)>>,
         releases: Mutex<Vec<u64>>,
         reads: Mutex<Vec<(u64, u64, u64, u32)>>,
-        writes: Mutex<Vec<(u64, u64, u64, Vec<u8>, i32)>>,
+        writes: Mutex<Vec<WriteCall>>,
         flushes: Mutex<Vec<(u64, u64)>>,
         fsyncs: Mutex<Vec<(u64, bool)>>,
         opendirs: Mutex<Vec<u64>>,
         releasedirs: Mutex<Vec<(u64, u64)>>,
         readdirs: Mutex<Vec<(u64, u64, i64)>>,
-        mkdirs: Mutex<Vec<(u64, Vec<u8>, u32, u32, u16)>>,
-        creates: Mutex<Vec<(u64, Vec<u8>, u32, u32, u16, i32)>>,
+        mkdirs: Mutex<Vec<MkdirCall>>,
+        creates: Mutex<Vec<CreateCall>>,
         unlinks: Mutex<Vec<(u64, Vec<u8>)>>,
-        renames: Mutex<Vec<(u64, Vec<u8>, u64, Vec<u8>)>>,
+        rmdirs: Mutex<Vec<(u64, Vec<u8>)>>,
+        renames: Mutex<Vec<RenameCall>>,
         truncates: Mutex<Vec<(u64, Option<u64>, u64)>>,
         statfs_calls: Mutex<u32>,
         attr: NativeAttr,
@@ -54,8 +60,8 @@ mod tests {
             Ok(self.attr)
         }
 
-        fn getattr(&self, _ino: u64) -> Result<NativeAttr, i32> {
-            Ok(self.attr)
+        fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
+            Ok(NativeAttr { ino, ..self.attr })
         }
 
         fn open(&self, ino: u64, flags: i32) -> Result<u64, i32> {
@@ -172,6 +178,14 @@ mod tests {
             self.unlinks
                 .lock()
                 .expect("unlink calls lock should not be poisoned")
+                .push((parent, name.to_vec()));
+            Ok(())
+        }
+
+        fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+            self.rmdirs
+                .lock()
+                .expect("rmdir calls lock should not be poisoned")
                 .push((parent, name.to_vec()));
             Ok(())
         }
@@ -387,6 +401,13 @@ mod tests {
         request
     }
 
+    fn readdirplus_request(ino: u64, fh: u64, offset: i64, size: u32) -> FuseRequest {
+        let mut request = read_request(ino, fh, offset as u64, size);
+        request.header = FuseInHeader::new(request.header.len, 44, 0xefef, ino, 1000, 1000, 77);
+        request.opcode = FuseOpcode::Readdirplus;
+        request
+    }
+
     fn mkdir_request(parent: u64, name: &[u8], mode: u32) -> FuseRequest {
         let mut payload = Vec::new();
         payload.extend_from_slice(&mode.to_le_bytes());
@@ -449,6 +470,24 @@ mod tests {
         }
     }
 
+    fn rmdir_request(parent: u64, name: &[u8]) -> FuseRequest {
+        let mut payload = Vec::from(name);
+        payload.push(0);
+        FuseRequest {
+            header: FuseInHeader::new(
+                (FUSE_IN_HEADER_LEN + payload.len()) as u32,
+                11,
+                0x1009,
+                parent,
+                1000,
+                1000,
+                77,
+            ),
+            opcode: FuseOpcode::Rmdir,
+            payload,
+        }
+    }
+
     fn rename_request(parent: u64, name: &[u8], new_parent: u64, new_name: &[u8]) -> FuseRequest {
         let mut payload = Vec::new();
         payload.extend_from_slice(&new_parent.to_le_bytes());
@@ -500,6 +539,47 @@ mod tests {
                 77,
             ),
             opcode: FuseOpcode::Setattr,
+            payload,
+        }
+    }
+
+    fn forget_request(ino: u64, nlookup: u64) -> FuseRequest {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&nlookup.to_le_bytes());
+        FuseRequest {
+            header: FuseInHeader::new(
+                (FUSE_IN_HEADER_LEN + payload.len()) as u32,
+                2,
+                0x1007,
+                ino,
+                1000,
+                1000,
+                77,
+            ),
+            opcode: FuseOpcode::Forget,
+            payload,
+        }
+    }
+
+    fn batch_forget_request(entries: &[(u64, u64)]) -> FuseRequest {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        for (ino, nlookup) in entries {
+            payload.extend_from_slice(&ino.to_le_bytes());
+            payload.extend_from_slice(&nlookup.to_le_bytes());
+        }
+        FuseRequest {
+            header: FuseInHeader::new(
+                (FUSE_IN_HEADER_LEN + payload.len()) as u32,
+                42,
+                0x1008,
+                1,
+                1000,
+                1000,
+                77,
+            ),
+            opcode: FuseOpcode::BatchForget,
             payload,
         }
     }
@@ -588,6 +668,12 @@ mod tests {
         u64::from_le_bytes(raw)
     }
 
+    fn direntplus_reply_nodeid(reply: &[u8]) -> u64 {
+        let mut raw = [0; 8];
+        raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN..FUSE_OUT_HEADER_LEN + 8]);
+        u64::from_le_bytes(raw)
+    }
+
     fn statfs_reply_blocks(reply: &[u8]) -> u64 {
         let mut raw = [0; 8];
         raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN..FUSE_OUT_HEADER_LEN + 8]);
@@ -609,6 +695,7 @@ mod tests {
             mkdirs: Mutex::new(Vec::new()),
             creates: Mutex::new(Vec::new()),
             unlinks: Mutex::new(Vec::new()),
+            rmdirs: Mutex::new(Vec::new()),
             renames: Mutex::new(Vec::new()),
             truncates: Mutex::new(Vec::new()),
             statfs_calls: Mutex::new(0),
@@ -912,6 +999,37 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_readdirplus_calls_vfs_and_returns_direntplus_reply() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(readdirplus_request(99, 8001, 0, 4096));
+        let reply = reply.to_vec();
+
+        assert_eq!(
+            vfs.readdirs
+                .lock()
+                .expect("readdir calls lock should not be poisoned")
+                .as_slice(),
+            &[(99, 8001, 0)]
+        );
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(direntplus_reply_nodeid(&reply), 123);
+        assert!(
+            reply
+                .windows(b"child.txt".len())
+                .any(|window| window == b"child.txt")
+        );
+    }
+
+    #[test]
     fn native_bridge_mkdir_calls_vfs_and_returns_entry_reply() {
         let vfs = recording_vfs(NativeAttr {
             ino: 201,
@@ -985,6 +1103,32 @@ mod tests {
                 .expect("unlink calls lock should not be poisoned")
                 .as_slice(),
             &[(1, b"old-file".to_vec())]
+        );
+        assert_eq!(reply_error(reply), 0);
+        assert_eq!(reply.len(), FUSE_OUT_HEADER_LEN);
+    }
+
+    #[test]
+    fn native_bridge_rmdir_calls_vfs_and_returns_empty_success() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 0,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(rmdir_request(1, b"old-dir"));
+        let reply = reply.bytes().expect("rmdir reply should be contiguous");
+
+        assert_eq!(
+            vfs.rmdirs
+                .lock()
+                .expect("rmdir calls lock should not be poisoned")
+                .as_slice(),
+            &[(1, b"old-dir".to_vec())]
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(reply.len(), FUSE_OUT_HEADER_LEN);
@@ -1065,5 +1209,55 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(attr_reply_size(reply), 1234);
+    }
+
+    #[test]
+    fn native_bridge_forget_decrements_lookup_accounting_without_reply() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 42,
+            size: 4096,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let lookup_reply = bridge.handle(lookup_request(1, b"alpha.txt"));
+        assert_eq!(reply_error(&lookup_reply.to_vec()), 0);
+        assert_eq!(bridge.kernel_lookup_count(42), 1);
+
+        let forget_reply = bridge.handle(forget_request(42, 1));
+
+        assert!(forget_reply.is_no_reply());
+        assert_eq!(bridge.kernel_lookup_count(42), 0);
+        assert_eq!(
+            vfs.releases
+                .lock()
+                .expect("release calls lock should not be poisoned")
+                .as_slice(),
+            &[] as &[u64]
+        );
+    }
+
+    #[test]
+    fn native_bridge_batch_forget_saturates_lookup_accounting_without_reply() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 42,
+            size: 4096,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let lookup_reply = bridge.handle(lookup_request(1, b"alpha.txt"));
+        assert_eq!(reply_error(&lookup_reply.to_vec()), 0);
+        let reply = bridge.handle(batch_forget_request(&[(42, 99), (777, 1)]));
+
+        assert!(reply.is_no_reply());
+        assert_eq!(bridge.kernel_lookup_count(42), 0);
+        assert_eq!(bridge.kernel_lookup_count(777), 0);
     }
 }
