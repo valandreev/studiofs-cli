@@ -517,10 +517,7 @@ impl<V: NativeVfs> FuseOperationHandler for LinuxNativeBridge<V> {
             FuseOpcode::Rename => self.handle_rename(request),
             FuseOpcode::Statfs => self.handle_statfs(request),
             FuseOpcode::Setattr => self.handle_setattr(request),
-            _ => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, libc::ENOSYS).to_vec(),
-            ),
+            _ => errno_reply(request.header.unique, libc::ENOSYS),
         }
     }
 }
@@ -529,12 +526,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     fn handle_lookup(&self, request: FuseRequest) -> FuseReply {
         let name = match lookup_name(&request.payload) {
             Some(name) => name,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.lookup(request.header.nodeid, name) {
@@ -545,10 +537,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                     ok_reply(request.header.unique, &entry_payload(attr)),
                 )
             }
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
@@ -565,22 +554,14 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                 request.header.unique,
                 ok_reply(request.header.unique, &attr_out_payload(attr)),
             ),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_open(&self, request: FuseRequest) -> FuseReply {
         let flags = match open_flags(&request.payload) {
             Some(flags) => flags,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.open(request.header.nodeid, flags) {
@@ -588,44 +569,28 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                 request.header.unique,
                 ok_reply(request.header.unique, &open_payload(fh, flags)),
             ),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_release(&self, request: FuseRequest) -> FuseReply {
         let fh = match release_fh(&request.payload) {
             Some(fh) => fh,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.release(fh) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_read(&self, request: FuseRequest) -> FuseReply {
         let read = match read_request(&request.payload) {
             Some(read) => read,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self
@@ -633,22 +598,14 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             .read(read.fh, request.header.nodeid, read.offset, read.size)
         {
             Ok(data) => FuseReply::segmented_data(request.header.unique, data),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_write(&self, request: FuseRequest) -> FuseReply {
         let write = match write_request(&request.payload) {
             Some(write) => write,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.write(
@@ -662,54 +619,35 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                 request.header.unique,
                 ok_reply(request.header.unique, &write_payload(size)),
             ),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_flush(&self, request: FuseRequest) -> FuseReply {
         let fh = match flush_fh(&request.payload) {
             Some(fh) => fh,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.flush(request.header.nodeid, fh) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_fsync(&self, request: FuseRequest) -> FuseReply {
         let datasync = match fsync_datasync(&request.payload) {
             Some(datasync) => datasync,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.fsync(request.header.nodeid, datasync) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
@@ -719,53 +657,32 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                 request.header.unique,
                 ok_reply(request.header.unique, &open_payload(fh, 0)),
             ),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_releasedir(&self, request: FuseRequest) -> FuseReply {
         let fh = match release_fh(&request.payload) {
             Some(fh) => fh,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         match self.vfs.releasedir(request.header.nodeid, fh) {
             Ok(()) => {
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
     fn handle_readdir(&self, request: FuseRequest) -> FuseReply {
         let readdir = match read_request(&request.payload) {
             Some(readdir) => readdir,
-            None => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            None => return invalid_request(request.header.unique),
         };
         let offset = match i64::try_from(readdir.offset) {
             Ok(offset) => offset,
-            Err(_) => {
-                return FuseReply::contiguous(
-                    request.header.unique,
-                    error_reply(request.header.unique, libc::EINVAL).to_vec(),
-                );
-            }
+            Err(_) => return invalid_request(request.header.unique),
         };
 
         match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
@@ -773,10 +690,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                 request.header.unique,
                 readdir_payload(&entries, offset, readdir.size),
             ),
-            Err(errno) => FuseReply::contiguous(
-                request.header.unique,
-                error_reply(request.header.unique, errno).to_vec(),
-            ),
+            Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
 
@@ -976,37 +890,38 @@ fn lookup_name(payload: &[u8]) -> Option<&[u8]> {
 
 fn open_flags(payload: &[u8]) -> Option<i32> {
     let bytes = payload.get(..FUSE_OPEN_IN_LEN)?;
-    Some(read_u32(bytes, 0) as i32)
+    Some(read_u32(bytes, 0)? as i32)
 }
 
 fn release_fh(payload: &[u8]) -> Option<u64> {
     let bytes = payload.get(..FUSE_RELEASE_IN_LEN)?;
-    Some(read_u64(bytes, 0))
+    read_u64(bytes, 0)
 }
 
 fn flush_fh(payload: &[u8]) -> Option<u64> {
     let bytes = payload.get(..FUSE_FLUSH_IN_LEN)?;
-    Some(read_u64(bytes, 0))
+    read_u64(bytes, 0)
 }
 
 fn fsync_datasync(payload: &[u8]) -> Option<bool> {
     let bytes = payload.get(..FUSE_FSYNC_IN_LEN)?;
-    Some(read_u32(bytes, 8) & 1 != 0)
+    Some(read_u32(bytes, 8)? & 1 != 0)
 }
 
 fn forget_request(payload: &[u8]) -> Option<u64> {
     let bytes = payload.get(..FUSE_FORGET_IN_LEN)?;
-    Some(read_u64(bytes, 0))
+    read_u64(bytes, 0)
 }
 
 fn batch_forget_request(payload: &[u8]) -> Option<Vec<(u64, u64)>> {
     let header = payload.get(..FUSE_BATCH_FORGET_IN_LEN)?;
-    let count = read_u32(header, 0) as usize;
+    let count = read_u32(header, 0)? as usize;
     let entries_len = count.checked_mul(FUSE_BATCH_FORGET_ONE_LEN)?;
-    let entries = payload.get(FUSE_BATCH_FORGET_IN_LEN..FUSE_BATCH_FORGET_IN_LEN + entries_len)?;
+    let entries_end = FUSE_BATCH_FORGET_IN_LEN.checked_add(entries_len)?;
+    let entries = payload.get(FUSE_BATCH_FORGET_IN_LEN..entries_end)?;
     let mut forgets = Vec::with_capacity(count);
     for entry in entries.chunks_exact(FUSE_BATCH_FORGET_ONE_LEN) {
-        forgets.push((read_u64(entry, 0), read_u64(entry, 8)));
+        forgets.push((read_u64(entry, 0)?, read_u64(entry, 8)?));
     }
     Some(forgets)
 }
@@ -1021,9 +936,9 @@ struct ReadRequest {
 fn read_request(payload: &[u8]) -> Option<ReadRequest> {
     let bytes = payload.get(..FUSE_READ_IN_LEN)?;
     Some(ReadRequest {
-        fh: read_u64(bytes, 0),
-        offset: read_u64(bytes, 8),
-        size: read_u32(bytes, 16),
+        fh: read_u64(bytes, 0)?,
+        offset: read_u64(bytes, 8)?,
+        size: read_u32(bytes, 16)?,
     })
 }
 
@@ -1037,12 +952,12 @@ struct WriteRequest<'a> {
 
 fn write_request(payload: &[u8]) -> Option<WriteRequest<'_>> {
     let header = payload.get(..FUSE_WRITE_IN_LEN)?;
-    let size = read_u32(header, 16) as usize;
+    let size = read_u32(header, 16)? as usize;
     let data = payload.get(FUSE_WRITE_IN_LEN..FUSE_WRITE_IN_LEN.checked_add(size)?)?;
     Some(WriteRequest {
-        fh: read_u64(header, 0),
-        offset: read_u64(header, 8),
-        flags: read_u32(header, 32) as i32,
+        fh: read_u64(header, 0)?,
+        offset: read_u64(header, 8)?,
+        flags: read_u32(header, 32)? as i32,
         data,
     })
 }
@@ -1057,7 +972,7 @@ fn mkdir_request(payload: &[u8]) -> Option<MkdirRequest<'_>> {
     let header = payload.get(..FUSE_MKDIR_IN_LEN)?;
     let name = lookup_name(payload.get(FUSE_MKDIR_IN_LEN..)?)?;
     Some(MkdirRequest {
-        mode: (read_u32(header, 0) & 0o7777) as u16,
+        mode: (read_u32(header, 0)? & 0o7777) as u16,
         name,
     })
 }
@@ -1073,8 +988,8 @@ fn create_request(payload: &[u8]) -> Option<CreateRequest<'_>> {
     let header = payload.get(..FUSE_CREATE_IN_LEN)?;
     let name = lookup_name(payload.get(FUSE_CREATE_IN_LEN..)?)?;
     Some(CreateRequest {
-        flags: read_u32(header, 0) as i32,
-        mode: (read_u32(header, 4) & 0o7777) as u16,
+        flags: read_u32(header, 0)? as i32,
+        mode: (read_u32(header, 4)? & 0o7777) as u16,
         name,
     })
 }
@@ -1096,7 +1011,7 @@ fn rename_request(payload: &[u8]) -> Option<RenameRequest<'_>> {
         return None;
     }
     Some(RenameRequest {
-        new_parent: read_u64(header, 0),
+        new_parent: read_u64(header, 0)?,
         name,
         new_name,
     })
@@ -1110,13 +1025,18 @@ struct TruncateRequest {
 
 fn truncate_request(payload: &[u8]) -> Option<TruncateRequest> {
     let bytes = payload.get(..FUSE_SETATTR_IN_LEN)?;
-    let valid = read_u32(bytes, 0);
+    let valid = read_u32(bytes, 0)?;
     if valid & FATTR_SIZE == 0 {
         return None;
     }
+    let fh = if valid & FATTR_FH != 0 {
+        Some(read_u64(bytes, 8)?)
+    } else {
+        None
+    };
     Some(TruncateRequest {
-        fh: (valid & FATTR_FH != 0).then(|| read_u64(bytes, 8)),
-        size: read_u64(bytes, 16),
+        fh,
+        size: read_u64(bytes, 16)?,
     })
 }
 
@@ -1332,16 +1252,16 @@ fn linux_mode(attr: NativeAttr) -> u32 {
     file_type | u32::from(attr.perm)
 }
 
-fn read_u32(frame: &[u8], offset: usize) -> u32 {
-    let mut value = [0; 4];
-    value.copy_from_slice(&frame[offset..offset + 4]);
-    u32::from_le_bytes(value)
+fn read_u32(frame: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let value = frame.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
 }
 
-fn read_u64(frame: &[u8], offset: usize) -> u64 {
-    let mut value = [0; 8];
-    value.copy_from_slice(&frame[offset..offset + 8]);
-    u64::from_le_bytes(value)
+fn read_u64(frame: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let value = frame.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(value))
 }
 
 #[derive(Debug, Default)]
@@ -1384,4 +1304,19 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_u32_returns_none_when_range_exceeds_frame() {
+        assert_eq!(read_u32(&[1, 2, 3], 0), None);
+    }
+
+    #[test]
+    fn read_u64_returns_none_when_range_exceeds_frame() {
+        assert_eq!(read_u64(&[1, 2, 3, 4, 5, 6, 7], 0), None);
+    }
 }
