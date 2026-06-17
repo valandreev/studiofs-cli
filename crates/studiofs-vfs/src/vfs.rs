@@ -44,6 +44,8 @@ mod overlay;
 mod prefetch;
 mod read_context;
 mod read_path;
+#[cfg(unix)]
+pub use read_path::VfsLocalCacheReadRange;
 mod startup;
 mod startup_replay;
 mod statfs;

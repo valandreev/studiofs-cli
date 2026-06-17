@@ -6,6 +6,10 @@
 
 use bytes::Bytes;
 use std::any::Any;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Lifecycle state of a single locally persisted payload object.
@@ -84,6 +88,47 @@ pub struct LocalPayloadPut {
     pub evictable: bool,
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+/// Stable file-backed range for a locally persisted payload object.
+pub struct LocalPayloadReadRange {
+    file: Arc<File>,
+    file_offset: u64,
+    len: u64,
+}
+
+#[cfg(unix)]
+impl LocalPayloadReadRange {
+    /// Creates a range backed by a live payload file handle.
+    pub fn new(file: Arc<File>, file_offset: u64, len: u64) -> Self {
+        Self {
+            file,
+            file_offset,
+            len,
+        }
+    }
+
+    /// Returns the live file handle that backs this payload range.
+    pub fn file(&self) -> &File {
+        self.file.as_ref()
+    }
+
+    /// Returns the byte offset in `file` where this range begins.
+    pub fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    /// Returns the available byte length of this range.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns true when the range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Backend-agnostic error surface for local payload operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendError {
@@ -116,6 +161,18 @@ pub trait LocalPayloadBackend: Send + Sync {
     /// Returns the number of bytes written on success, or `None` if the payload
     /// is not present.
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
+
+    /// Returns a stable file-backed range for a local payload, when supported.
+    #[cfg(unix)]
+    fn read_range_handle(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        len: usize,
+    ) -> Option<LocalPayloadReadRange> {
+        let _ = (object_id, data_offset, len);
+        None
+    }
 
     /// Returns bytes suitable for upload for `object_id`, if present.
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;

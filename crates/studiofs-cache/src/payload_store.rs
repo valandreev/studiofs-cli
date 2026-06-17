@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use crate::local::LocalPayloadReadRange;
 use bytes::Bytes;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -302,6 +304,27 @@ impl FilePayloadStore {
                 None
             }
         }
+    }
+
+    /// Returns a stable file-backed range for a local payload.
+    #[cfg(unix)]
+    pub fn read_range_handle(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        len: usize,
+    ) -> Option<LocalPayloadReadRange> {
+        let start = u64::try_from(data_offset).ok()?;
+        let requested = u64::try_from(len).ok()?;
+        let path = self.layout.payload_object_path(object_id);
+        let file = self.cached_read_handle(object_id, &path).ok()?;
+        let payload_len = file.metadata().ok()?.len();
+        let available = payload_len.saturating_sub(start);
+        Some(LocalPayloadReadRange::new(
+            file,
+            start,
+            available.min(requested),
+        ))
     }
 
     /// Hints that the payload for `object_id` will be read soon.
@@ -1719,6 +1742,23 @@ mod tests {
         assert_eq!(store.read_into(7, 2, &mut out), Some(3));
         assert_eq!(&out, b"cde");
         assert_eq!(store.read_into(7, 99, &mut out), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_range_handle_keeps_payload_file_alive_after_store_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(8, b"abcdef").unwrap();
+
+        let range = store.read_range_handle(8, 2, 3).unwrap();
+        drop(store);
+
+        let mut out = [0_u8; 3];
+        platform::pread_exact(range.file(), &mut out, range.file_offset()).unwrap();
+        assert_eq!(&out, b"cde");
+        assert_eq!(range.len(), 3);
     }
 
     #[test]

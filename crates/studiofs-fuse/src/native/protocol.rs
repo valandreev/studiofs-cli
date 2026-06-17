@@ -4,8 +4,10 @@ use crate::native::abi::{
     AbiParseError, FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader, fuse_out_len_for_payload,
     ok_reply, parse_in_header,
 };
-use std::io::IoSlice;
+use std::io::{self, IoSlice};
 use std::ops::BitOr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 /// Linux FUSE operation codes understood at the native transport boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +78,7 @@ pub struct FuseRequest {
 }
 
 /// Fully framed FUSE reply ready for transport writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FuseReply {
     /// Request id this reply answers.
     pub unique: u64,
@@ -84,20 +86,57 @@ pub struct FuseReply {
 }
 
 /// Stable local cache file range that a Linux transport may use for optimized read replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FuseLocalCacheReadRange {
     /// Source local cache file descriptor.
-    pub fd: i32,
+    pub fd: RawFd,
     /// Byte offset inside the local cache file.
     pub file_offset: u64,
     /// Number of bytes available for this reply.
     pub len: u32,
     /// StudioFS content epoch validated by the VFS when the range was produced.
     pub content_epoch: u64,
+    source: Option<Arc<OwnedFd>>,
 }
 
+impl FuseLocalCacheReadRange {
+    /// Builds a range from a borrowed source fd.
+    pub fn borrowed(fd: RawFd, file_offset: u64, len: u32, content_epoch: u64) -> Self {
+        Self {
+            fd,
+            file_offset,
+            len,
+            content_epoch,
+            source: None,
+        }
+    }
+
+    /// Builds a range that owns a duplicated source fd before crossing API boundaries.
+    pub fn try_dup(fd: RawFd, file_offset: u64, len: u32, content_epoch: u64) -> io::Result<Self> {
+        let source = duplicate_fd(fd)?;
+        Ok(Self {
+            fd: source.as_raw_fd(),
+            file_offset,
+            len,
+            content_epoch,
+            source: Some(source),
+        })
+    }
+}
+
+impl PartialEq for FuseLocalCacheReadRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.fd == other.fd
+            && self.file_offset == other.file_offset
+            && self.len == other.len
+            && self.content_epoch == other.content_epoch
+    }
+}
+
+impl Eq for FuseLocalCacheReadRange {}
+
 /// Owned FUSE reply frame storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum FuseReplyFrame {
     /// No kernel reply should be written for this request.
     NoReply,
@@ -116,6 +155,8 @@ pub enum FuseReplyFrame {
         header: [u8; FUSE_OUT_HEADER_LEN],
         /// Stable local cache range selected for this reply.
         range: FuseLocalCacheReadRange,
+        /// Duplicated fd that keeps the local cache file alive until transport send.
+        source: Arc<OwnedFd>,
     },
 }
 
@@ -151,6 +192,11 @@ impl FuseReply {
 
     /// Builds a successful read reply backed by a local cache file range.
     pub fn local_cache_range_data(unique: u64, range: FuseLocalCacheReadRange) -> Self {
+        let source = match &range.source {
+            Some(source) => Arc::clone(source),
+            None => duplicate_fd(range.fd)
+                .expect("local cache read range must contain a valid source file descriptor"),
+        };
         let mut header = [0; FUSE_OUT_HEADER_LEN];
         let len = fuse_out_len_for_payload(range.len as usize);
         header[0..4].copy_from_slice(&len.to_le_bytes());
@@ -158,7 +204,11 @@ impl FuseReply {
         header[8..16].copy_from_slice(&unique.to_le_bytes());
         Self {
             unique,
-            frame: FuseReplyFrame::LocalCacheRange { header, range },
+            frame: FuseReplyFrame::LocalCacheRange {
+                header,
+                range,
+                source,
+            },
         }
     }
 
@@ -191,6 +241,14 @@ impl FuseReply {
         }
     }
 
+    /// Returns the already-framed FUSE reply header for an optimized range reply.
+    pub fn local_cache_range_header(&self) -> Option<&[u8; FUSE_OUT_HEADER_LEN]> {
+        match &self.frame {
+            FuseReplyFrame::LocalCacheRange { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
     /// Returns whether this request must be completed without kernel writeback.
     pub fn is_no_reply(&self) -> bool {
         matches!(self.frame, FuseReplyFrame::NoReply)
@@ -209,9 +267,31 @@ impl FuseReply {
     /// Returns the optimized local-cache range selected for this reply, if any.
     pub fn local_cache_range(&self) -> Option<FuseLocalCacheReadRange> {
         match &self.frame {
-            FuseReplyFrame::LocalCacheRange { range, .. } => Some(*range),
+            FuseReplyFrame::LocalCacheRange { range, .. } => Some(range.clone()),
             _ => None,
         }
+    }
+
+    /// Returns the duplicated local-cache fd owned by this reply, if any.
+    pub fn local_cache_source_fd(&self) -> Option<RawFd> {
+        match &self.frame {
+            FuseReplyFrame::LocalCacheRange { source, .. } => Some(source.as_raw_fd()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn duplicate_fd(fd: RawFd) -> io::Result<Arc<OwnedFd>> {
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` duplicates an open fd without taking
+    // ownership of the caller's descriptor.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `duplicated` is a fresh fd returned by `fcntl` and ownership
+        // moves into `OwnedFd`.
+        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(duplicated) }))
     }
 }
 

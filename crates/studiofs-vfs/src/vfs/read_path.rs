@@ -14,6 +14,8 @@ use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(unix)]
+use studiofs_cache::local::LocalPayloadReadRange;
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, FileType, ResolvedSliceSource, ResolvedSliceSpan,
@@ -23,6 +25,16 @@ use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
 
 type ReadRange = IntervalRange;
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+/// Stable local-cache file range for native Linux read transports.
+pub struct VfsLocalCacheReadRange {
+    /// File-backed payload range.
+    pub payload: LocalPayloadReadRange,
+    /// Content epoch associated with the VFS read plan.
+    pub content_epoch: u64,
+}
 
 #[derive(Debug, Clone)]
 enum ReadSegmentSource {
@@ -1471,6 +1483,85 @@ impl StudioVfs {
             resolved_slices,
             read_len,
         })
+    }
+
+    /// Return a stable local-cache file range when a read maps to one local payload span.
+    #[cfg(unix)]
+    pub async fn local_cache_read_range(
+        &self,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
+        let requested_len = usize::try_from(size).map_err(|_| {
+            VfsError::Other(format!(
+                "native local-cache read size does not fit usize: ino={ino}, size={size}"
+            ))
+        })?;
+        self.enforce_access_async(ino, AccessLevel::ReadOnly)
+            .await?;
+        let prepared = self
+            .prepare_foreground_read(ino, offset, requested_len)
+            .await?;
+        if prepared.context.placeholder_visible(self, ino) || prepared.read_len == 0 {
+            return Ok(None);
+        }
+
+        let writer_stack_claims =
+            self.state
+                .writer_stack
+                .snapshot_read_claims(ino, offset, prepared.read_len as u64);
+        let mut segments = DataReader::build_segments_with(
+            self,
+            ino,
+            offset,
+            prepared.read_len as u64,
+            prepared.context.pending_content_epoch,
+            Some(prepared.resolved_slices.as_ref()),
+            &writer_stack_claims,
+        )
+        .await?;
+        segments.sort_by_key(|segment| segment.range.start());
+        let [segment] = segments.as_slice() else {
+            return Ok(None);
+        };
+        let Some(read_end) = offset.checked_add(prepared.read_len as u64) else {
+            return Ok(None);
+        };
+        if segment.range.start() != offset || segment.range.end() != read_end {
+            return Ok(None);
+        }
+
+        let (object_id, block_offset) = match &segment.source {
+            ReadSegmentSource::PendingExtent {
+                object_id,
+                block_offset,
+            } => (*object_id, u64::from(*block_offset)),
+            ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                (payload.object_id, u64::from(payload.offset))
+            }
+            ReadSegmentSource::Dirty { .. }
+            | ReadSegmentSource::PendingOverlay { .. }
+            | ReadSegmentSource::Zero => return Ok(None),
+        };
+        let data_offset = usize::try_from(block_offset).map_err(|_| {
+            VfsError::Other(format!(
+                "native local-cache read offset does not fit usize: ino={ino}, object_id={object_id}, offset={block_offset}"
+            ))
+        })?;
+        let Some(range) =
+            self.cached_store
+                .read_range_handle(object_id, data_offset, prepared.read_len)
+        else {
+            return Ok(None);
+        };
+        if range.len() != prepared.read_len as u64 {
+            return Ok(None);
+        }
+        Ok(Some(VfsLocalCacheReadRange {
+            payload: range,
+            content_epoch: prepared.context.attr.content_epoch,
+        }))
     }
 
     pub(super) async fn execute_prepared_foreground_read(
@@ -3201,6 +3292,50 @@ mod tests {
                 counting_backend.read_into_calls() > 0,
                 "committed local hits should use direct partial read_into()"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_local_cache_hit_exposes_native_read_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range");
+        rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"native-local-cache-range.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let object_id = 0x529;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 10;
+            staged_attr.committed_size = 10;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            let mut payload = PayloadRef::new_full(object_id, 10);
+            payload.offset = 2;
+            payload.length = 6;
+            meta.stage_payload_slice(attr.ino, 0, &payload)
+                .expect("persist committed payload slice");
+
+            let range = vfs
+                .local_cache_read_range(attr.ino, 1, 4)
+                .await
+                .expect("read range query")
+                .expect("local range");
+
+            let mut out = [0_u8; 4];
+            studiofs_cache::runtime::platform::pread_exact(
+                range.payload.file(),
+                &mut out,
+                range.payload.file_offset(),
+            )
+            .expect("pread");
+            assert_eq!(&out, b"3456");
+            assert_eq!(range.payload.len(), 4);
+            assert_eq!(range.content_epoch, staged_attr.content_epoch);
         });
     }
 

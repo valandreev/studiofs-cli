@@ -1146,6 +1146,43 @@ fn linux_fuse_adapter_benchmark_report_covers_sfs516_decision_gate() {
 }
 
 #[test]
+fn linux_native_local_cache_read_benchmark_report_covers_sfs529_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-529-linux-native-local-cache-read.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-529",
+        "LinuxNativeBridge local-cache read benchmark",
+        "target/sfs-529-local-cache-read-benchmark",
+        "bytes baseline",
+        "pread local-cache range",
+        "splice(file_fd -> pipe -> fuse_fd)",
+        "io_uring usage/fallback",
+        "throughput",
+        "CPU",
+        "p95 latency",
+        "p99 latency",
+        "copy count",
+        "local-cache hit/miss",
+        "materialization wait",
+        "read amplification",
+        "bounded dynamic readahead",
+        "sparse random reads",
+        "cargo test -p studiofs-fuse --test native_local_cache_read_benchmark -- --ignored --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-529 Linux native local-cache read benchmark report is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn linux_native_bridge_contract_covers_sfs524_architecture_gate() {
     let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

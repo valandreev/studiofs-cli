@@ -1,6 +1,8 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -380,6 +382,42 @@ impl NativeVfs for StudioVfsNativeAdapter {
         Ok(out)
     }
 
+    #[cfg(unix)]
+    fn read_local_cache_range(
+        &self,
+        _fh: u64,
+        ino: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<Option<NativeLocalCacheReadRange>, i32> {
+        checked_native_read_size(size)?;
+        let Some(range) = self
+            .rt
+            .block_on(self.vfs.local_cache_read_range(ino, offset, size))
+            .map_err(|error| vfs_err_to_errno(&error))?
+        else {
+            return Ok(None);
+        };
+        let len = u32::try_from(range.payload.len()).map_err(|_| libc::EOVERFLOW)?;
+        NativeLocalCacheReadRange::try_dup(
+            range.payload.file().as_raw_fd(),
+            range.payload.file_offset(),
+            len,
+            range.content_epoch,
+        )
+        .map(Some)
+        .map_err(|error| {
+            warn!(
+                ino,
+                offset,
+                size,
+                error = ?error,
+                "native local cache read range fd duplication failed"
+            );
+            libc::EIO
+        })
+    }
+
     fn write(&self, fh: u64, ino: u64, offset: u64, data: &[u8], flags: i32) -> Result<u32, i32> {
         self.rt
             .block_on(self.vfs.write_fh_with_deferred_materialize(
@@ -512,7 +550,46 @@ pub struct LinuxNativeBridge<V> {
     vfs: V,
     lookup_counts: NativeLookupCountStore,
     open_cache_metrics: NativeOpenCacheMetrics,
+    read_metrics: NativeReadMetrics,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
+}
+
+#[derive(Debug, Default)]
+struct NativeReadMetrics {
+    local_cache_hits: AtomicU64,
+    local_cache_unavailable_fallbacks: AtomicU64,
+    stale_epoch_fallbacks: AtomicU64,
+    bytes_fallbacks: AtomicU64,
+    bytes_returned: AtomicU64,
+}
+
+/// Snapshot of native Linux read path counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeReadMetricsSnapshot {
+    /// Reads served as a stable local-cache range reply.
+    pub local_cache_hits: u64,
+    /// Reads that had no local-cache range available and used bytes fallback.
+    pub local_cache_unavailable_fallbacks: u64,
+    /// Reads that rejected a local-cache range because its epoch was stale.
+    pub stale_epoch_fallbacks: u64,
+    /// Reads served through the safe bytes fallback.
+    pub bytes_fallbacks: u64,
+    /// Total payload bytes returned from reads by this bridge.
+    pub bytes_returned: u64,
+}
+
+impl NativeReadMetrics {
+    fn snapshot(&self) -> NativeReadMetricsSnapshot {
+        NativeReadMetricsSnapshot {
+            local_cache_hits: self.local_cache_hits.load(Ordering::Relaxed),
+            local_cache_unavailable_fallbacks: self
+                .local_cache_unavailable_fallbacks
+                .load(Ordering::Relaxed),
+            stale_epoch_fallbacks: self.stale_epoch_fallbacks.load(Ordering::Relaxed),
+            bytes_fallbacks: self.bytes_fallbacks.load(Ordering::Relaxed),
+            bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl<V> LinuxNativeBridge<V> {
@@ -522,6 +599,7 @@ impl<V> LinuxNativeBridge<V> {
             vfs,
             lookup_counts: NativeLookupCountStore::default(),
             open_cache_metrics: NativeOpenCacheMetrics::default(),
+            read_metrics: NativeReadMetrics::default(),
             trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
         }
     }
@@ -534,6 +612,11 @@ impl<V> LinuxNativeBridge<V> {
     /// Snapshot native Linux open cache policy metrics.
     pub fn open_cache_metrics_snapshot(&self) -> NativeOpenCacheMetricsSnapshot {
         self.open_cache_metrics.snapshot()
+    }
+
+    /// Snapshot native Linux read path metrics.
+    pub fn read_metrics_snapshot(&self) -> NativeReadMetricsSnapshot {
+        self.read_metrics.snapshot()
     }
 }
 
@@ -654,13 +737,29 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             read.size,
         ) {
             Ok(Some(range)) => {
-                if let Some(range) =
-                    self.trusted_local_cache_read_range(request.header.nodeid, read.size, range)
-                {
-                    return FuseReply::local_cache_range_data(request.header.unique, range);
+                match self.trusted_local_cache_read_range(request.header.nodeid, read.size, range) {
+                    LocalCacheReadRangeDecision::Trusted(range) => {
+                        self.read_metrics
+                            .local_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.read_metrics
+                            .bytes_returned
+                            .fetch_add(u64::from(range.len), Ordering::Relaxed);
+                        return FuseReply::local_cache_range_data(request.header.unique, range);
+                    }
+                    LocalCacheReadRangeDecision::StaleEpoch => {
+                        self.read_metrics
+                            .stale_epoch_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    LocalCacheReadRangeDecision::Unsafe => {}
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                self.read_metrics
+                    .local_cache_unavailable_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Err(errno) => return errno_reply(request.header.unique, errno),
         }
 
@@ -668,7 +767,15 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             .vfs
             .read(read.fh, request.header.nodeid, read.offset, read.size)
         {
-            Ok(data) => FuseReply::segmented_data(request.header.unique, data),
+            Ok(data) => {
+                self.read_metrics
+                    .bytes_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                self.read_metrics
+                    .bytes_returned
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                FuseReply::segmented_data(request.header.unique, data)
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -991,21 +1098,28 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         ino: u64,
         requested_size: u32,
         range: NativeLocalCacheReadRange,
-    ) -> Option<NativeLocalCacheReadRange> {
-        let state = self.trusted_open_cache_states.get(ino)?;
+    ) -> LocalCacheReadRangeDecision {
+        let Some(state) = self.trusted_open_cache_states.get(ino) else {
+            return LocalCacheReadRangeDecision::Unsafe;
+        };
         let range_is_current = range.content_epoch == state.content_epoch;
         let range_is_bounded = range.len <= requested_size;
-        if state.local_materialized
-            && !state.writer_active
-            && !state.dirty
-            && range_is_current
-            && range_is_bounded
-        {
-            Some(range)
+        if !range_is_current {
+            return LocalCacheReadRangeDecision::StaleEpoch;
+        }
+        if state.local_materialized && !state.writer_active && !state.dirty && range_is_bounded {
+            LocalCacheReadRangeDecision::Trusted(range)
         } else {
-            None
+            LocalCacheReadRangeDecision::Unsafe
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalCacheReadRangeDecision {
+    Trusted(NativeLocalCacheReadRange),
+    StaleEpoch,
+    Unsafe,
 }
 
 fn cached_open_decision() -> NativeOpenCacheDecision {
@@ -1627,10 +1741,21 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 mod tests {
     use super::*;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct TestNativeVfs {
         read_calls: AtomicU64,
         local_cache_read_calls: AtomicU64,
+        local_cache_file: std::fs::File,
+    }
+
+    impl Default for TestNativeVfs {
+        fn default() -> Self {
+            Self {
+                read_calls: AtomicU64::new(0),
+                local_cache_read_calls: AtomicU64::new(0),
+                local_cache_file: tempfile::tempfile().expect("create local cache fd"),
+            }
+        }
     }
 
     impl NativeVfs for TestNativeVfs {
@@ -1666,12 +1791,12 @@ mod tests {
             _size: u32,
         ) -> Result<Option<NativeLocalCacheReadRange>, i32> {
             self.local_cache_read_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(NativeLocalCacheReadRange {
-                fd: 17,
-                file_offset: 4096,
-                len: 8192,
-                content_epoch: 9,
-            }))
+            Ok(Some(NativeLocalCacheReadRange::borrowed(
+                self.local_cache_file.as_raw_fd(),
+                4096,
+                8192,
+                9,
+            )))
         }
 
         fn write(
@@ -1886,7 +2011,11 @@ mod tests {
 
         let reply = bridge.handle_read(read_request_for_size(8192));
 
-        assert_eq!(reply.local_cache_range().map(|range| range.fd), Some(17));
+        assert_eq!(
+            reply.local_cache_range().map(|range| range.fd),
+            Some(vfs.local_cache_file.as_raw_fd())
+        );
+        assert_eq!(bridge.read_metrics_snapshot().local_cache_hits, 1);
         assert_eq!(vfs.local_cache_read_calls.load(Ordering::Relaxed), 1);
         assert_eq!(vfs.read_calls.load(Ordering::Relaxed), 0);
     }
@@ -1912,6 +2041,9 @@ mod tests {
         let reply = bridge.handle_read(read_request_for_size(8192));
 
         assert!(reply.local_cache_range().is_none());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.stale_epoch_fallbacks, 1);
+        assert_eq!(metrics.bytes_fallbacks, 1);
         assert_eq!(vfs.local_cache_read_calls.load(Ordering::Relaxed), 1);
         assert_eq!(vfs.read_calls.load(Ordering::Relaxed), 1);
     }

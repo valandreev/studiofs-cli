@@ -16,6 +16,8 @@ use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
 use tracing::{debug, warn};
 
+#[cfg(unix)]
+use crate::local::LocalPayloadReadRange;
 use crate::local::{
     LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
     LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut, LocalPayloadStorageStats,
@@ -918,6 +920,29 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         }
         if self.payload_missing(object_id, "read_into") {
             self.remove_orphaned_index_entry(object_id, "read_into");
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn read_range_handle(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        len: usize,
+    ) -> Option<LocalPayloadReadRange> {
+        if !self.has_index_entry(object_id) {
+            return None;
+        }
+        let range = self
+            .payload_store
+            .read_range_handle(object_id, data_offset, len);
+        if let Some(range) = range {
+            self.touch_access_if_read(object_id, range.len() as usize, "read_range_handle");
+            return Some(range);
+        }
+        if self.payload_missing(object_id, "read_range_handle") {
+            self.remove_orphaned_index_entry(object_id, "read_range_handle");
         }
         None
     }
