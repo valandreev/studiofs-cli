@@ -463,7 +463,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
 #[derive(Debug)]
 pub struct LinuxNativeBridge<V> {
     vfs: V,
-    lookup_counts: Mutex<HashMap<u64, u64>>,
+    lookup_counts: NativeLookupCountStore,
 }
 
 impl<V> LinuxNativeBridge<V> {
@@ -471,16 +471,13 @@ impl<V> LinuxNativeBridge<V> {
     pub fn new(vfs: V) -> Self {
         Self {
             vfs,
-            lookup_counts: Mutex::new(HashMap::new()),
+            lookup_counts: NativeLookupCountStore::default(),
         }
     }
 
     /// Returns the kernel lookup reference count currently tracked for `ino`.
     pub fn kernel_lookup_count(&self, ino: u64) -> u64 {
-        lock_or_recover(&self.lookup_counts)
-            .get(&ino)
-            .copied()
-            .unwrap_or(0)
+        self.lookup_counts.count(ino)
     }
 }
 
@@ -697,14 +694,13 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
 
         match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
             Ok(entries) => {
-                let (payload, looked_up_inodes) =
-                    match readdirplus_payload(&self.vfs, &entries, offset, readdir.size) {
+                let payload =
+                    match readdirplus_payload(&self.vfs, &entries, offset, readdir.size, |ino| {
+                        self.add_lookup(ino, 1);
+                    }) {
                         Ok(payload) => payload,
                         Err(errno) => return errno_reply(request.header.unique, errno),
                     };
-                for ino in looked_up_inodes {
-                    self.add_lookup(ino, 1);
-                }
                 FuseReply::segmented_data(request.header.unique, payload)
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -848,21 +844,11 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
     }
 
     fn add_lookup(&self, ino: u64, nlookup: u64) {
-        let mut lookup_counts = lock_or_recover(&self.lookup_counts);
-        let count = lookup_counts.entry(ino).or_default();
-        *count = count.saturating_add(nlookup);
+        self.lookup_counts.add(ino, nlookup);
     }
 
     fn forget_lookup(&self, ino: u64, nlookup: u64) {
-        let mut lookup_counts = lock_or_recover(&self.lookup_counts);
-        let Some(count) = lookup_counts.get_mut(&ino) else {
-            return;
-        };
-        if *count <= nlookup {
-            lookup_counts.remove(&ino);
-        } else {
-            *count -= nlookup;
-        }
+        self.lookup_counts.forget(ino, nlookup);
     }
 }
 
@@ -1123,11 +1109,11 @@ fn readdirplus_payload<V: NativeVfs>(
     entries: &[NativeDirEntry],
     offset: i64,
     size: u32,
-) -> Result<(Vec<u8>, Vec<u64>), i32> {
+    mut add_lookup: impl FnMut(u64),
+) -> Result<Vec<u8>, i32> {
     let start = usize::try_from(offset).unwrap_or(0);
     let limit = size as usize;
     let mut payload = Vec::new();
-    let mut looked_up_inodes = Vec::new();
     for (index, entry) in entries.iter().enumerate().skip(start) {
         let next_offset = match u64::try_from(index + 1) {
             Ok(next_offset) => next_offset,
@@ -1144,9 +1130,9 @@ fn readdirplus_payload<V: NativeVfs>(
         };
         payload.extend_from_slice(&entry_payload(attr));
         append_dirent(&mut payload, entry, next_offset);
-        looked_up_inodes.push(attr.ino);
+        add_lookup(attr.ino);
     }
-    Ok((payload, looked_up_inodes))
+    Ok(payload)
 }
 
 fn statfs_payload(statfs: NativeStatFs) -> Vec<u8> {
@@ -1279,12 +1265,13 @@ struct NativeDirectoryHandle {
 impl NativeDirectoryHandleStore {
     fn open(&self, ino: u64, entries: Arc<[NativeDirEntry]>) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
-        lock_or_recover(&self.handles).insert(fh, NativeDirectoryHandle { ino, entries });
+        lock_or_recover(&self.handles, "directory_handles")
+            .insert(fh, NativeDirectoryHandle { ino, entries });
         fh
     }
 
     fn entries(&self, ino: u64, fh: u64) -> Option<Arc<[NativeDirEntry]>> {
-        let handles = lock_or_recover(&self.handles);
+        let handles = lock_or_recover(&self.handles, "directory_handles");
         handles
             .get(&fh)
             .filter(|handle| handle.ino == ino)
@@ -1292,7 +1279,7 @@ impl NativeDirectoryHandleStore {
     }
 
     fn release(&self, ino: u64, fh: u64) -> bool {
-        let mut handles = lock_or_recover(&self.handles);
+        let mut handles = lock_or_recover(&self.handles, "directory_handles");
         match handles.get(&fh) {
             Some(handle) if handle.ino == ino => handles.remove(&fh).is_some(),
             _ => false,
@@ -1300,11 +1287,69 @@ impl NativeDirectoryHandleStore {
     }
 }
 
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+#[derive(Debug)]
+struct NativeLookupCountStore {
+    shards: [Mutex<HashMap<u64, u64>>; Self::SHARD_COUNT],
+}
+
+impl NativeLookupCountStore {
+    const SHARD_COUNT: usize = 64;
+
+    fn shard_index(ino: u64) -> usize {
+        let mut value = ino;
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value as usize) & (Self::SHARD_COUNT - 1)
+    }
+
+    fn shard(&self, ino: u64) -> &Mutex<HashMap<u64, u64>> {
+        &self.shards[Self::shard_index(ino)]
+    }
+
+    fn add(&self, ino: u64, nlookup: u64) {
+        let mut lookup_counts = lock_or_recover(self.shard(ino), "lookup_counts");
+        let count = lookup_counts.entry(ino).or_default();
+        *count = count.saturating_add(nlookup);
+    }
+
+    fn forget(&self, ino: u64, nlookup: u64) {
+        let mut lookup_counts = lock_or_recover(self.shard(ino), "lookup_counts");
+        let Some(count) = lookup_counts.get_mut(&ino) else {
+            return;
+        };
+        if *count <= nlookup {
+            lookup_counts.remove(&ino);
+        } else {
+            *count -= nlookup;
+        }
+    }
+
+    fn count(&self, ino: u64) -> u64 {
+        lock_or_recover(self.shard(ino), "lookup_counts")
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+const _: () = assert!(NativeLookupCountStore::SHARD_COUNT.is_power_of_two());
+
+impl Default for NativeLookupCountStore {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            warn!("recovering poisoned native bridge mutex");
+            warn!(mutex = name, "recovering poisoned native bridge mutex");
             poisoned.into_inner()
         }
     }
@@ -1313,6 +1358,27 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_count_store_uses_multiple_shards_for_distinct_inodes() {
+        assert_eq!(NativeLookupCountStore::SHARD_COUNT, 64);
+        assert_ne!(
+            NativeLookupCountStore::shard_index(20),
+            NativeLookupCountStore::shard_index(21)
+        );
+    }
+
+    #[test]
+    fn lookup_count_store_tracks_counts_across_shards() {
+        let counts = NativeLookupCountStore::default();
+
+        counts.add(20, 3);
+        counts.add(21, 5);
+        counts.forget(20, 1);
+
+        assert_eq!(counts.count(20), 2);
+        assert_eq!(counts.count(21), 5);
+    }
 
     #[test]
     fn read_u32_returns_none_when_range_exceeds_frame() {

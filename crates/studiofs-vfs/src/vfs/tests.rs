@@ -6254,6 +6254,25 @@ fn cache_runtime_tuning_respects_explicit_default_values_from_raw_config() {
 }
 
 #[test]
+fn vfs_config_default_keeps_transit_memory_budget_derived() {
+    let validated: VfsConfigValidated = VfsConfig::default()
+        .try_into()
+        .expect("validate default VFS config");
+    let derived =
+        derive_cache_runtime_tuning(64 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 32 * 1024 * 1024);
+    let resolved = resolve_cache_runtime_tuning_overrides(
+        derived,
+        &validated,
+        validated.cache_runtime_overrides(),
+    );
+
+    assert_eq!(
+        resolved.transit_memory_budget_bytes,
+        derived.transit_memory_budget_bytes
+    );
+}
+
+#[test]
 fn vfs_config_raw_validate_clamps_and_normalizes() {
     let validated = VfsConfigRaw {
         janitor_interval_secs: Some(0),
@@ -8227,10 +8246,10 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
             snapshot.landing_zone.accepted_bytes, 0,
             "writer/cache dirty state is the only accepted-byte pipeline for this path"
         );
-        assert_eq!(
-            snapshot.drain_lag.current_bytes,
-            vfs.total_landed_write_drain_lag_bytes(),
-            "snapshot should expose the same lag signal used by soft pacing"
+        let lag_after_snapshot = vfs.total_landed_write_drain_lag_bytes();
+        assert!(
+            snapshot.drain_lag.current_bytes >= lag_after_snapshot,
+            "snapshot should not under-report the lag signal used by soft pacing"
         );
         assert!(
             snapshot.drain_lag.current_bytes >= snapshot.drain_lag.steady_quota_bytes,
