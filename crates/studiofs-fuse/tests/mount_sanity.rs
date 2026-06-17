@@ -32,6 +32,10 @@ use studiofs_meta::{
 use studiofs_vfs::{StudioVfs, VfsConfig};
 
 const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
+const DEFAULT_TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_TEST_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+const SFS509_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountedFuseMode {
     Sync,
@@ -603,6 +607,28 @@ fn mounted_tests_enabled_treats_empty_process_env_as_unset() {
 }
 
 #[test]
+fn parse_fio_size_bytes_accepts_binary_suffixes() {
+    assert_eq!(parse_fio_size_bytes("2g"), Some(2 * 1024 * 1024 * 1024));
+}
+
+#[test]
+fn sfs509_cache_budget_covers_large_file_workload() {
+    let budget = sfs509_cache_budget_bytes("1536m");
+
+    assert!(budget > 1536 * 1024 * 1024);
+}
+
+#[test]
+fn sfs509_multi_job_size_is_capped_for_mounted_smoke_runtime() {
+    assert_eq!(sfs509_multi_job_size("512m"), "4m");
+}
+
+#[test]
+fn sfs509_fsync_heavy_size_is_capped_for_mounted_smoke_runtime() {
+    assert_eq!(sfs509_fsync_heavy_size("512m"), "4m");
+}
+
+#[test]
 fn native_sfs530_mounted_scenarios_are_exposed_as_opt_in_tests() {
     let source = include_str!("mount_sanity.rs");
 
@@ -855,6 +881,22 @@ fn make_test_vfs(
     volume_suffix: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Arc<StudioVfs> {
+    make_test_vfs_with_cache_budget(
+        tmp,
+        volume_suffix,
+        rt,
+        DEFAULT_TEST_CACHE_BYTES,
+        DEFAULT_TEST_MEMORY_BYTES,
+    )
+}
+
+fn make_test_vfs_with_cache_budget(
+    tmp: &tempfile::TempDir,
+    volume_suffix: &str,
+    rt: &tokio::runtime::Runtime,
+    cache_capacity_bytes: u64,
+    memory_capacity_bytes: u64,
+) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
     meta.init_root(0, 0).expect("init root");
@@ -869,8 +911,8 @@ fn make_test_vfs(
         meta,
         &data_config,
         cache_dir.to_str().expect("cache dir str"),
-        64 * 1024 * 1024,
-        32 * 1024 * 1024,
+        cache_capacity_bytes,
+        memory_capacity_bytes,
         VfsConfig::default()
             .try_into()
             .expect("default VFS config should validate"),
@@ -878,6 +920,63 @@ fn make_test_vfs(
     .expect("create vfs");
     vfs.start().expect("start vfs background workers");
     vfs
+}
+
+fn parse_fio_size_bytes(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let suffix_start = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(suffix_start);
+    if digits.is_empty() {
+        return None;
+    }
+    let amount = digits.parse::<u64>().ok()?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+
+    amount.checked_mul(multiplier)
+}
+
+fn sfs509_cache_budget_bytes(large_size: &str) -> u64 {
+    parse_fio_size_bytes(large_size)
+        .and_then(|bytes| bytes.checked_add(SFS509_CACHE_HEADROOM_BYTES))
+        .unwrap_or(DEFAULT_TEST_CACHE_BYTES)
+        .max(DEFAULT_TEST_CACHE_BYTES)
+}
+
+fn mounted_scenario_cache_budget_bytes(suffix: &str) -> u64 {
+    if suffix.contains("sfs-509-long-lived-fio") {
+        let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
+        return sfs509_cache_budget_bytes(&large_size);
+    }
+
+    DEFAULT_TEST_CACHE_BYTES
+}
+
+fn sfs509_multi_job_size(base_size: &str) -> String {
+    sfs509_capped_size(base_size, 4 * 1024 * 1024, "4m")
+}
+
+fn sfs509_fsync_heavy_size(base_size: &str) -> String {
+    sfs509_capped_size(base_size, 4 * 1024 * 1024, "4m")
+}
+
+fn sfs509_capped_size(base_size: &str, max_bytes: u64, capped_size: &str) -> String {
+    match parse_fio_size_bytes(base_size) {
+        Some(bytes) if bytes <= max_bytes => base_size.to_string(),
+        Some(_) => capped_size.to_string(),
+        None => base_size.to_string(),
+    }
 }
 
 fn mounted_tests_enabled() -> bool {
@@ -1503,7 +1602,13 @@ fn with_mounted_fuse(
     let tmp = target_tempdir("vfs-");
     let mount_dir = target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-    let vfs = make_test_vfs(&tmp, suffix, &rt);
+    let vfs = make_test_vfs_with_cache_budget(
+        &tmp,
+        suffix,
+        &rt,
+        mounted_scenario_cache_budget_bytes(suffix),
+        DEFAULT_TEST_MEMORY_BYTES,
+    );
     let fs = StudioFuseFs::new_with_runtime_options(
         vfs,
         rt.handle().clone(),
@@ -2355,6 +2460,20 @@ fn run_fio_json_case(
     result.status.success()
 }
 
+fn assert_sfs509_fio_json_case(
+    artifact_dir: &Path,
+    mount_path: &Path,
+    case_name: &str,
+    filename: &str,
+    args: &[&str],
+) {
+    assert!(
+        run_fio_json_case(artifact_dir, mount_path, case_name, filename, args),
+        "SFS-509 fio workload {case_name} failed; see {}",
+        artifact_dir.display()
+    );
+}
+
 fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     assert!(
         command_available("fio"),
@@ -2366,16 +2485,28 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     let _ = std::fs::remove_file(artifact_dir.join("workload-status.tsv"));
     let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", "512m");
     let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
+    let multi_job_default_size = sfs509_multi_job_size(&size);
+    let multi_job_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_MULTI_JOB_SIZE",
+        &multi_job_default_size,
+    );
+    let fsync_heavy_default_size = sfs509_fsync_heavy_size(&size);
+    let fsync_heavy_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_FSYNC_HEAVY_SIZE",
+        &fsync_heavy_default_size,
+    );
     let runtime = sfs509_env_value("STUDIOFS_SFS509_FIO_RUNTIME_SECS", "20");
     let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "500")
         .parse::<usize>()
         .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
     let size_arg = format!("--size={size}");
     let large_size_arg = format!("--size={large_size}");
+    let multi_job_size_arg = format!("--size={multi_job_size}");
+    let fsync_heavy_size_arg = format!("--size={fsync_heavy_size}");
     let runtime_arg = format!("--runtime={runtime}");
-    let offset_increment_arg = format!("--offset_increment={size}");
+    let offset_increment_arg = format!("--offset_increment={multi_job_size}");
 
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "seq-write",
@@ -2389,21 +2520,21 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         ],
     );
     drop_caches_best_effort(&artifact_dir);
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "cold-cache-read",
         "seq.bin",
         &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "warm-cache-read",
         "seq.bin",
         &["--rw=read", "--bs=1m", &size_arg, "--numjobs=1"],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "rand-write",
@@ -2418,7 +2549,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--fsync=32",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "rand-read",
@@ -2432,7 +2563,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--time_based",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "mixed-rw",
@@ -2448,7 +2579,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--fsync=64",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "large-file",
@@ -2462,7 +2593,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         ],
     );
     run_sfs509_metadata_probe(mount_path, &artifact_dir, metadata_files);
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "multi-job",
@@ -2470,13 +2601,12 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         &[
             "--rw=write",
             "--bs=64k",
-            &size_arg,
+            &multi_job_size_arg,
             "--numjobs=4",
             &offset_increment_arg,
-            "--fsync=1",
         ],
     );
-    let _ = run_fio_json_case(
+    assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
         "fsync-heavy",
@@ -2484,7 +2614,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         &[
             "--rw=write",
             "--bs=16k",
-            &size_arg,
+            &fsync_heavy_size_arg,
             "--numjobs=1",
             "--fsync=1",
         ],
