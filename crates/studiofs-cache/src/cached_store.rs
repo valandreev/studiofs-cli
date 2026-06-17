@@ -15,6 +15,8 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
+use crate::local::LocalPayloadReadRange;
 use crate::local::{
     LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadObjectStats, LocalPayloadPut,
     LocalPayloadStorageStats,
@@ -486,6 +488,18 @@ impl CachedStore {
     ) -> Option<usize> {
         self.local_payload_backend
             .read_into(object_id, data_offset, out)
+    }
+
+    /// Returns a stable file-backed range for a local object payload.
+    #[cfg(unix)]
+    pub fn read_range_handle(
+        &self,
+        object_id: ObjectId,
+        data_offset: usize,
+        len: usize,
+    ) -> Option<LocalPayloadReadRange> {
+        self.local_payload_backend
+            .read_range_handle(object_id, data_offset, len)
     }
 
     /// Loads an object payload that is eligible for upload.
@@ -1428,6 +1442,22 @@ mod tests {
             max_buffer_bytes: None,
             submit_upload: true,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_store_exposes_stable_local_payload_read_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        cached_store.put(77, b"abcdef", false).expect("put");
+
+        let range = cached_store.read_range_handle(77, 2, 3).expect("range");
+
+        let mut out = [0_u8; 3];
+        crate::runtime::platform::pread_exact(range.file(), &mut out, range.file_offset())
+            .expect("pread");
+        assert_eq!(&out, b"cde");
+        assert_eq!(range.len(), 3);
     }
 
     #[derive(Clone)]

@@ -44,6 +44,8 @@ mod overlay;
 mod prefetch;
 mod read_context;
 mod read_path;
+#[cfg(unix)]
+pub use read_path::VfsLocalCacheReadRange;
 mod startup;
 mod startup_replay;
 mod statfs;
@@ -5169,6 +5171,36 @@ impl StudioVfs {
         let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         cached
+    }
+
+    /// Enqueues a best-effort read-ahead range for Linux native local-cache reads.
+    pub fn enqueue_native_read_ahead(&self, ino: Ino, offset: u64, len: u64) -> VfsResult<()> {
+        const MAX_NATIVE_READ_AHEAD_BLOCKS: u64 = 4096;
+
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            VfsError::Other(format!(
+                "native read-ahead range overflow: ino={ino}, offset={offset}, len={len}"
+            ))
+        })?;
+        let first_block = block_index_from_offset(offset, self.block_size);
+        let last_block = block_index_from_offset(end.saturating_sub(1), self.block_size);
+        let block_count = u64::from(last_block - first_block) + 1;
+        if block_count > MAX_NATIVE_READ_AHEAD_BLOCKS {
+            return Err(VfsError::Other(format!(
+                "native read-ahead range exceeds maximum block limit: ino={ino}, blocks={block_count}"
+            )));
+        }
+        let block_indices: Vec<u32> = (first_block..=last_block).collect();
+        self.prefetch_tx
+            .send(PrefetchWorkItem::Batch(PrefetchBatch::new(
+                ino,
+                block_indices,
+                None,
+            )))
+            .map_err(|_| VfsError::Other("native read-ahead queue is closed".to_string()))
     }
 
     async fn payload_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {

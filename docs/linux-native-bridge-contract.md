@@ -176,6 +176,43 @@ used direct I/O, or fell back to normal cached I/O. The minimum reason surface i
 Those counters are the benchmark and debugging vocabulary for cache/coherency
 decisions.
 
+### SFS-529 Local-Cache Read Path
+
+SFS-529 makes high-throughput Linux reads a VFS-to-bridge contract instead of a
+side effect of the generic bytes callback. A native read may return a
+`NativeLocalCacheReadRange`, which describes a stable local cache file range and
+the content epoch validation used when that range was selected. The bridge may
+only use that optimized reply when the trusted open-cache state still matches
+the range epoch, the inode has no active writer or dirty local state, local
+materialization is present, and the replied length stays inside the kernel
+request. Otherwise the safe bytes fallback remains mandatory.
+
+The read reply strategy matrix must remain benchmarked on the same host before a
+profile is promoted:
+
+- `pread -> bytes -> writev` is the conservative baseline and the required
+  fallback for encrypted, compressed, sparse, non-contiguous, stale, or
+  not-yet-materialized content.
+- `read/pread -> bytes -> vmsplice/splice` may reduce copies when kernel
+  semantics and buffer ownership make that measurable.
+- `splice(file_fd -> pipe -> fuse_fd)` is allowed only when the local cache file
+  lifetime, immutable range, and FUSE fd semantics are proven safe.
+- `io_uring-backed local-file read` and splice variants are optional execution
+  strategies. Telemetry must record io_uring usage/fallback instead of assuming
+  that io_uring is faster on every kernel and filesystem.
+
+The cache policy for reads must include bounded dynamic readahead, separate
+prefetch work, sparse-random prefetch limits, singleflight cache-miss
+materialization, and read amplification metrics. Sequential local-cache reads
+may use `posix_fadvise(WILLNEED)`. `DONTNEED` is reserved for explicit profiles
+that prefer avoiding host page-cache pollution over warm-read acceleration.
+
+Benchmark reports for this path must include local-cache hit/miss,
+materialization wait, copy count or proxy counters, selected reply strategy,
+throughput, CPU cost, and p95/p99 latency. Warm repeated reads are expected to
+show kernel page-cache acceleration only when the SFS-528 content epoch policy
+says page reuse is safe.
+
 ## References And Clean-Room Use
 
 Curvine is a reference for low-level Rust FUSE transport ideas only. The
