@@ -141,6 +141,41 @@ The kernel cache policy must define:
 - partial-cache controls for sparse files and range reads;
 - direct-I/O and async-DIO opt-in behavior for benchmark profiles.
 
+### SFS-528 Page-Cache Policy
+
+SFS-528 makes the native Linux page-cache decision an explicit `cache_policy`
+boundary instead of an incidental open flag. The decision input is
+`NativeInodeCacheState`, a per-inode snapshot containing the StudioFS content
+epoch, size, mtime, writer state, dirty state, local materialization state, and
+invalidation generation. The output is `NativeOpenCacheDecision`, which carries
+both a kernel action and a metrics reason.
+
+The initial decision table is:
+
+| Condition | Action | Reason |
+|---|---|---|
+| Read-only open, local materialization is present, content epoch/size/mtime match the last trusted kernel-cache state, and invalidation generation is unchanged | `KEEP_CACHE` | `Keep` |
+| Content epoch, size, mtime, or invalidation generation changed after a previously trusted cache generation | `InvalidateThenCached` | `StalePrevented` |
+| Active writer state or dirty state exists for the inode | `FOPEN_DIRECT_IO` | `WriterBarrier` |
+| Local materialization was evicted for the trusted generation | `InvalidateThenCached` | `LocalCacheEvicted` |
+| No trusted kernel-cache generation is available | normal cached I/O | `Cached` |
+
+`AUTO_INVAL_DATA` may be requested when the kernel advertises it, but StudioFS
+does not rely on that capability alone. StudioFS content-epoch knowledge is
+stronger than mtime/size comparison, so overwrite, truncate, remote refresh,
+writer commit, rename/unlink visibility changes, and local cache eviction must
+still drive explicit invalidation before stale kernel pages can be reused.
+
+`writeback_cache` stays a profile gate. It must remain disabled by default
+until separate correctness tests cover read-after-write, fsync, flush, release,
+truncate, and remote-invalidation interactions for that profile.
+
+Metrics must expose why every native Linux open/read path kept, invalidated,
+used direct I/O, or fell back to normal cached I/O. The minimum reason surface is
+`Keep`, `Cached`, `StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted`.
+Those counters are the benchmark and debugging vocabulary for cache/coherency
+decisions.
+
 ## References And Clean-Room Use
 
 Curvine is a reference for low-level Rust FUSE transport ideas only. The

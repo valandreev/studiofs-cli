@@ -1208,6 +1208,46 @@ fn linux_native_bridge_contract_covers_sfs524_architecture_gate() {
 }
 
 #[test]
+fn linux_native_bridge_contract_covers_sfs528_page_cache_policy() {
+    let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
+    let platform_doc = read_workspace_file("docs/platform-bridges.md");
+    let combined = format!("{doc}\n{platform_doc}");
+    let normalized_doc = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "SFS-528",
+        "NativeInodeCacheState",
+        "NativeOpenCacheDecision",
+        "content epoch",
+        "size",
+        "mtime",
+        "writer state",
+        "dirty state",
+        "local materialization",
+        "invalidation generation",
+        "KEEP_CACHE",
+        "AUTO_INVAL_DATA",
+        "FOPEN_DIRECT_IO",
+        "InvalidateThenCached",
+        "WriterBarrier",
+        "StalePrevented",
+        "LocalCacheEvicted",
+        "writeback_cache",
+        "Metrics",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&combined, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-528 Linux native page-cache policy docs are missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn linux_fuse_concurrent_dispatch_audit_covers_sfs514_decision() {
     let doc = read_workspace_file("docs/perf/sfs-514-linux-fuse-concurrent-dispatch-audit.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

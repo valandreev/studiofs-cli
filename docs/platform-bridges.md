@@ -221,16 +221,24 @@ On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 
 ### Linux cache and I/O policy
 
-Linux FUSE keeps buffered I/O as the default. Regular read-only opens return
+Linux FUSE keeps buffered I/O as the default. Regular read-only opens may return
 `FOPEN_KEEP_CACHE` so safe reopen and sequential-read paths can reuse the
-kernel page cache. Write-capable opens do not request `FOPEN_KEEP_CACHE` and do
-not request `FOPEN_DIRECT_IO`, which keeps write coherence explicit without
-globally disabling buffered reads.
+kernel page cache. NativeBridge cache decisions are tracked by SFS-528 through
+`NativeInodeCacheState` and `NativeOpenCacheDecision`: the state includes
+content epoch, size, mtime, writer state, dirty state, local materialization,
+and invalidation generation; the decision records `KEEP_CACHE`,
+`InvalidateThenCached`, `FOPEN_DIRECT_IO`, or normal cached I/O. Write-capable
+opens do not request `FOPEN_KEEP_CACHE` by default and only use
+`FOPEN_DIRECT_IO` when the policy reports a `WriterBarrier` reason.
 
 The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote
 metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `LocalSyncPolicy::WriteThrough`; ordinary writes remain opportunistic.
+`AUTO_INVAL_DATA` is useful when negotiated, but StudioFS still treats content
+epoch and explicit invalidation as the source of truth. Metrics reasons include
+`StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted` so cache behavior can
+be tied back to correctness triggers in benchmark reports.
 
 `STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not

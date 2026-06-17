@@ -1,6 +1,7 @@
 //! Linux-native FUSE bridge building blocks.
 
 pub mod abi;
+pub mod cache_policy;
 pub mod dispatcher;
 pub mod lifecycle;
 pub mod protocol;
@@ -15,6 +16,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::native::abi::{FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader};
+    use crate::native::cache_policy::NativeInodeCacheState;
     use crate::native::dispatcher::FuseOperationHandler;
     use crate::native::protocol::{FuseOpcode, FuseRequest};
     use crate::native::vfs_adapter::{
@@ -32,6 +34,7 @@ mod tests {
         getattrs: Mutex<Vec<u64>>,
         getattr_errors: Mutex<HashMap<u64, i32>>,
         opens: Mutex<Vec<(u64, i32)>>,
+        open_cache_states: Mutex<HashMap<u64, NativeInodeCacheState>>,
         releases: Mutex<Vec<u64>>,
         reads: Mutex<Vec<(u64, u64, u64, u32)>>,
         writes: Mutex<Vec<WriteCall>>,
@@ -86,6 +89,14 @@ mod tests {
                 .expect("open calls lock should not be poisoned")
                 .push((ino, flags));
             Ok(self.fh)
+        }
+
+        fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
+            self.open_cache_states
+                .lock()
+                .expect("open cache states lock should not be poisoned")
+                .get(&ino)
+                .copied()
         }
 
         fn release(&self, fh: u64) -> Result<(), i32> {
@@ -679,6 +690,12 @@ mod tests {
         u64::from_le_bytes(raw)
     }
 
+    fn open_reply_flags(reply: &[u8]) -> u32 {
+        let mut raw = [0; 4];
+        raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN + 8..FUSE_OUT_HEADER_LEN + 12]);
+        u32::from_le_bytes(raw)
+    }
+
     fn write_reply_size(reply: &[u8]) -> u32 {
         let mut raw = [0; 4];
         raw.copy_from_slice(&reply[FUSE_OUT_HEADER_LEN..FUSE_OUT_HEADER_LEN + 4]);
@@ -713,6 +730,7 @@ mod tests {
             getattrs: Mutex::new(Vec::new()),
             getattr_errors: Mutex::new(HashMap::new()),
             opens: Mutex::new(Vec::new()),
+            open_cache_states: Mutex::new(HashMap::new()),
             releases: Mutex::new(Vec::new()),
             reads: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
@@ -866,6 +884,44 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(open_reply_fh(reply), 7001);
+    }
+
+    #[test]
+    fn native_bridge_open_uses_direct_io_when_policy_reports_dirty_writer_state() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::RegularFile,
+            perm: 0o600,
+            uid: 1000,
+            gid: 1000,
+        });
+        vfs.open_cache_states
+            .lock()
+            .expect("open cache states lock should not be poisoned")
+            .insert(
+                99,
+                NativeInodeCacheState {
+                    content_epoch: 7,
+                    cached_content_epoch: Some(7),
+                    size: 8192,
+                    cached_size: Some(8192),
+                    mtime_ns: 123,
+                    cached_mtime_ns: Some(123),
+                    invalidation_generation: 3,
+                    observed_invalidation_generation: 3,
+                    writer_active: false,
+                    dirty: true,
+                    local_materialized: true,
+                },
+            );
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(open_request(99, libc::O_RDONLY));
+        let reply = reply.bytes().expect("open reply should be contiguous");
+
+        assert_eq!(reply_error(reply), 0);
+        assert_eq!(open_reply_flags(reply) & 1, 1);
     }
 
     #[test]

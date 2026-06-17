@@ -11,6 +11,9 @@ use tokio::runtime::Handle;
 use tracing::warn;
 
 use crate::native::abi::{error_reply, ok_reply};
+use crate::native::cache_policy::{
+    NativeInodeCacheState, NativeOpenCacheAction, decide_native_open_cache,
+};
 use crate::native::dispatcher::FuseOperationHandler;
 use crate::native::protocol::{FuseOpcode, FuseReply, FuseRequest};
 
@@ -34,6 +37,7 @@ const POSIX_STAT_BLOCK_SIZE: u64 = 512;
 const FATTR_FH: u32 = 1 << 0;
 const FATTR_SIZE: u32 = 1 << 3;
 const SUPPORTED_SETATTR_VALID: u32 = FATTR_FH | FATTR_SIZE;
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 /// File kind used by the native operation adapter before Linux ABI encoding.
@@ -106,6 +110,11 @@ pub trait NativeVfs {
 
     /// Open a regular file and return a VFS file handle.
     fn open(&self, ino: u64, flags: i32) -> Result<u64, i32>;
+
+    /// Return page-cache policy state for a regular-file open when available.
+    fn open_cache_state(&self, _ino: u64) -> Option<NativeInodeCacheState> {
+        None
+    }
 
     /// Release a previously opened file handle.
     fn release(&self, fh: u64) -> Result<(), i32>;
@@ -180,6 +189,10 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn open(&self, ino: u64, flags: i32) -> Result<u64, i32> {
         (**self).open(ino, flags)
+    }
+
+    fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
+        (**self).open_cache_state(ino)
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
@@ -546,7 +559,10 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         match self.vfs.open(request.header.nodeid, flags) {
             Ok(fh) => FuseReply::contiguous(
                 request.header.unique,
-                ok_reply(request.header.unique, &open_payload(fh, flags)),
+                ok_reply(
+                    request.header.unique,
+                    &open_payload(fh, flags, self.vfs.open_cache_state(request.header.nodeid)),
+                ),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
@@ -637,7 +653,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
         match self.vfs.opendir(request.header.nodeid) {
             Ok(fh) => FuseReply::contiguous(
                 request.header.unique,
-                ok_reply(request.header.unique, &open_payload(fh, 0)),
+                ok_reply(request.header.unique, &open_payload(fh, 0, None)),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
@@ -754,7 +770,7 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
                     request.header.unique,
                     ok_reply(
                         request.header.unique,
-                        &create_payload(attr, fh, create.flags),
+                        &create_payload(attr, fh, create.flags, None),
                     ),
                 )
             }
@@ -1070,17 +1086,22 @@ fn attr_out_payload(attr: NativeAttr) -> Vec<u8> {
     payload
 }
 
-fn open_payload(fh: u64, flags: i32) -> Vec<u8> {
+fn open_payload(fh: u64, flags: i32, cache_state: Option<NativeInodeCacheState>) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16);
     payload.extend_from_slice(&fh.to_le_bytes());
-    payload.extend_from_slice(&open_reply_flags(flags).to_le_bytes());
+    payload.extend_from_slice(&open_reply_flags(flags, cache_state).to_le_bytes());
     payload.extend_from_slice(&0_u32.to_le_bytes());
     payload
 }
 
-fn create_payload(attr: NativeAttr, fh: u64, flags: i32) -> Vec<u8> {
+fn create_payload(
+    attr: NativeAttr,
+    fh: u64,
+    flags: i32,
+    cache_state: Option<NativeInodeCacheState>,
+) -> Vec<u8> {
     let mut payload = entry_payload(attr);
-    payload.extend_from_slice(&open_payload(fh, flags));
+    payload.extend_from_slice(&open_payload(fh, flags, cache_state));
     payload
 }
 
@@ -1209,8 +1230,18 @@ fn write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
     }
 }
 
-fn open_reply_flags(flags: i32) -> u32 {
+fn open_reply_flags(flags: i32, cache_state: Option<NativeInodeCacheState>) -> u32 {
     let (open_flags, _) = posix_flags_to_open_flags(flags);
+    if let Some(state) = cache_state {
+        let read_only =
+            !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR);
+        return match decide_native_open_cache(read_only, state).action {
+            NativeOpenCacheAction::KeepCache => FOPEN_KEEP_CACHE,
+            NativeOpenCacheAction::Cached | NativeOpenCacheAction::InvalidateThenCached => 0,
+            NativeOpenCacheAction::DirectIo => FOPEN_DIRECT_IO,
+        };
+    }
+
     if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
         FOPEN_KEEP_CACHE
     } else {
