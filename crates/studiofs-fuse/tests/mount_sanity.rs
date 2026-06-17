@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -14,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
-use studiofs_fuse::native::dispatcher::{MinimalNativeHandler, NativeDispatcher};
+use studiofs_fuse::native::dispatcher::NativeDispatcher;
 use studiofs_fuse::native::lifecycle::{
     DirectMountOptions, FuseDevice, Fusermount3MountSystem, LibcMountSyscalls, LinuxMountSystem,
     NativeMountLifecycle,
@@ -22,6 +23,7 @@ use studiofs_fuse::native::lifecycle::{
 use studiofs_fuse::native::protocol::FuseCapabilities;
 use studiofs_fuse::native::session::{NativeFuseSession, NativeSessionConfig};
 use studiofs_fuse::native::transport::ClassicReadWriteTransport;
+use studiofs_fuse::native::vfs_adapter::{LinuxNativeBridge, StudioVfsNativeAdapter};
 use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
@@ -54,7 +56,7 @@ impl MountedFuseMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum MountedScenarioOperation {
     SequentialWriteReadback,
     WriteFlushReadback,
@@ -65,11 +67,20 @@ enum MountedScenarioOperation {
     FioMultiJob,
     Sfs509FioMatrix,
     WriteOnlyUntilUnmount,
+    DirectoryLifecycle,
+    NamespaceMutations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountedBackend {
+    Fuser,
+    LinuxNativeBridge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MountedAsyncScenario {
     name: &'static str,
+    backend: MountedBackend,
     mode: MountedFuseMode,
     operation: MountedScenarioOperation,
 }
@@ -94,6 +105,7 @@ macro_rules! declare_mounted_scenarios {
                 $(
                     MountedAsyncScenario {
                         name: $name,
+                        backend: MountedBackend::Fuser,
                         mode: $mode,
                         operation: $operation,
                     },
@@ -107,12 +119,36 @@ macro_rules! declare_mounted_scenarios {
             fn $test_name() {
                 run_mounted_scenario(MountedAsyncScenario {
                     name: $name,
+                    backend: MountedBackend::Fuser,
                     mode: $mode,
                     operation: $operation,
                 });
             }
         )+
     };
+}
+
+fn native_mounted_scenarios() -> &'static [MountedAsyncScenario] {
+    &[
+        MountedAsyncScenario {
+            name: "native-directory-lifecycle",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::Sync,
+            operation: MountedScenarioOperation::DirectoryLifecycle,
+        },
+        MountedAsyncScenario {
+            name: "native-namespace-mutations",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::Sync,
+            operation: MountedScenarioOperation::NamespaceMutations,
+        },
+        MountedAsyncScenario {
+            name: "native-sequential-write-readback",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::Sync,
+            operation: MountedScenarioOperation::SequentialWriteReadback,
+        },
+    ]
 }
 
 declare_mounted_scenarios! {
@@ -191,6 +227,24 @@ declare_mounted_scenarios! {
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::Sfs509FioMatrix
     },
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_mounted_directory_lifecycle() {
+    run_native_mounted_scenario(native_mounted_scenarios()[0]);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_mounted_namespace_mutations() {
+    run_native_mounted_scenario(native_mounted_scenarios()[1]);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_mounted_sequential_write_readback() {
+    run_native_mounted_scenario(native_mounted_scenarios()[2]);
 }
 
 #[test]
@@ -287,6 +341,43 @@ fn native_mount_smoke_is_available_as_sfs525_opt_in_gate() {
         source.contains("native_mount_session_mount_and_unmount_smoke"),
         "SFS-525 native mount smoke must stay available behind the opt-in mounted test gate"
     );
+}
+
+#[test]
+fn native_mounted_matrix_runs_existing_correctness_operations_through_linux_native_bridge() {
+    let scenarios = native_mounted_scenarios();
+    let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+    let operations: BTreeSet<_> = scenarios
+        .iter()
+        .map(|scenario| scenario.operation)
+        .collect();
+
+    assert!(
+        scenarios
+            .iter()
+            .all(|scenario| scenario.backend == MountedBackend::LinuxNativeBridge),
+        "native mounted scenarios must run through LinuxNativeBridge"
+    );
+    for expected in [
+        "native-directory-lifecycle",
+        "native-namespace-mutations",
+        "native-sequential-write-readback",
+    ] {
+        assert!(
+            names.contains(expected),
+            "native mounted matrix is missing {expected}"
+        );
+    }
+    for expected in [
+        MountedScenarioOperation::DirectoryLifecycle,
+        MountedScenarioOperation::NamespaceMutations,
+        MountedScenarioOperation::SequentialWriteReadback,
+    ] {
+        assert!(
+            operations.contains(&expected),
+            "native mounted matrix is missing {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -615,8 +706,11 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
     }
 
     let tmp = target_tempdir("native-fusermount3-session-smoke-");
+    let vfs_tmp = target_tempdir("native-fusermount3-session-vfs-");
     let mount_path = tmp.path().join("mnt");
     std::fs::create_dir(&mount_path).expect("create native fusermount3 session mount point");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&vfs_tmp, "native-session-smoke", &rt);
     let options = native_direct_mount_options();
     let request = options
         .fusermount_request(mount_path.to_str().expect("mount path should be utf-8"))
@@ -633,6 +727,7 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
 
     let (handshake_tx, handshake_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let adapter = StudioVfsNativeAdapter::new(Arc::clone(&vfs), rt.handle().clone());
     let session_thread = std::thread::spawn(move || {
         let transport = ClassicReadWriteTransport::new(fuse.into_file());
         let config = NativeSessionConfig {
@@ -656,7 +751,8 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
             return;
         }
         let transport = session.into_transport();
-        let mut dispatcher = NativeDispatcher::new(transport, MinimalNativeHandler);
+        let handler = LinuxNativeBridge::new(adapter);
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
         let result = dispatcher.run_until_destroy();
         done_tx.send(result).expect("send native dispatcher result");
     });
@@ -1130,8 +1226,123 @@ fn with_mounted_fuse(
     finish_mounted_fuse_test(test_result, unmount_result, join_result);
 }
 
+fn with_mounted_native_fuse(suffix: &str, test_fn: impl FnOnce(&Path) -> MountedOperationGuard) {
+    if !mounted_tests_enabled() {
+        return;
+    }
+    if Command::new("fusermount3").arg("-V").status().is_err() {
+        eprintln!("skipping native mounted scenario because fusermount3 is unavailable");
+        return;
+    }
+
+    let tmp = target_tempdir("native-vfs-");
+    let mount_dir = target_tempdir("native-mount-");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, suffix, &rt);
+
+    let mount_path = mount_dir.path().to_path_buf();
+    let pre_dev = mount_path_device(&mount_path);
+    let options = native_direct_mount_options();
+    let request = options
+        .fusermount_request(mount_path.to_str().expect("mount path should be utf-8"))
+        .expect("build native fusermount3 request");
+    let system = Fusermount3MountSystem::default();
+    let fuse = system
+        .mount(&request)
+        .expect("native fusermount3 FUSE mount should return a device fd");
+
+    let adapter = StudioVfsNativeAdapter::new(Arc::clone(&vfs), rt.handle().clone());
+    let session_handle = std::thread::spawn(move || -> io::Result<()> {
+        let transport = ClassicReadWriteTransport::new(fuse.into_file());
+        let config = NativeSessionConfig {
+            requested_capabilities: FuseCapabilities::ASYNC_READ
+                | FuseCapabilities::BIG_WRITES
+                | FuseCapabilities::AUTO_INVAL_DATA
+                | FuseCapabilities::READDIRPLUS,
+            max_readahead: 1024 * 1024,
+            max_write: 1024 * 1024,
+            max_background: 16,
+            congestion_threshold: 12,
+            max_pages: 256,
+        };
+        let mut session = NativeFuseSession::new(transport, config);
+        session
+            .handshake()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let transport = session.into_transport();
+        let handler = LinuxNativeBridge::new(adapter);
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+        dispatcher
+            .run_until_destroy()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    });
+
+    let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::metadata(&mount_path)
+                .map(|metadata| {
+                    use std::os::unix::fs::MetadataExt;
+                    metadata.dev() != pre_dev
+                })
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                !session_handle.is_finished(),
+                "native FUSE session thread exited early before mount became available"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native FUSE mount did not become available within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        test_fn(&mount_path)
+    }));
+
+    let unmount_result = force_unmount_fuse_mount_path(&mount_path);
+    let test_result = test_result.map(|_guard| MountedOperationGuard::default());
+    let unmount_result =
+        if wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(2)) {
+            unmount_result
+        } else {
+            reconcile_fuse_unmount_result(
+                unmount_result,
+                || force_unmount_fuse_mount_path(&mount_path),
+                || wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(2)),
+            )
+        };
+    let join_result = if should_join_mounted_fuse_session(&test_result, &unmount_result) {
+        join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
+    } else {
+        None
+    };
+
+    finish_mounted_fuse_test(test_result, unmount_result, join_result);
+}
+
 fn run_mounted_scenario(scenario: MountedAsyncScenario) {
-    with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
+    match scenario.backend {
+        MountedBackend::Fuser => {
+            with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
+                run_mounted_operation(mount_path, scenario.operation, scenario.name)
+            });
+        }
+        MountedBackend::LinuxNativeBridge => run_native_mounted_scenario(scenario),
+    }
+}
+
+fn run_native_mounted_scenario(scenario: MountedAsyncScenario) {
+    assert_eq!(
+        scenario.backend,
+        MountedBackend::LinuxNativeBridge,
+        "native mounted scenario must use LinuxNativeBridge backend"
+    );
+    with_mounted_native_fuse(scenario.name, |mount_path| {
         run_mounted_operation(mount_path, scenario.operation, scenario.name)
     });
 }
@@ -1237,6 +1448,61 @@ fn run_mounted_operation(
             run_sfs509_fio_matrix_if_available(mount_path, scenario_name);
             MountedOperationGuard::default()
         }
+        MountedScenarioOperation::DirectoryLifecycle => {
+            let dir = mount_path.join("dir-lifecycle");
+            std::fs::create_dir(&dir).expect("mkdir through native FUSE mount");
+            let file = dir.join("entry.txt");
+            std::fs::write(&file, b"directory lifecycle payload")
+                .expect("create file in opened directory");
+            let entries: BTreeSet<_> = std::fs::read_dir(&dir)
+                .expect("readdir through native FUSE mount")
+                .map(|entry| entry.expect("directory entry").file_name())
+                .collect();
+            assert!(
+                entries.contains(std::ffi::OsStr::new("entry.txt")),
+                "readdir must include file created in directory, got {entries:?}"
+            );
+            std::fs::remove_file(&file).expect("unlink file from directory");
+            std::fs::remove_dir(&dir).expect("released directory should be removable");
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::NamespaceMutations => {
+            let dir = mount_path.join("namespace");
+            std::fs::create_dir(&dir).expect("mkdir through native FUSE mount");
+            let original = dir.join("original.txt");
+            let renamed = dir.join("renamed.txt");
+            std::fs::write(&original, b"0123456789abcdef")
+                .expect("create file through native FUSE mount");
+            std::fs::rename(&original, &renamed).expect("rename through native FUSE mount");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&renamed)
+                .expect("open renamed file for truncate");
+            file.set_len(4).expect("truncate through native FUSE mount");
+            drop(file);
+            let metadata = std::fs::metadata(&renamed).expect("stat renamed file");
+            assert_eq!(metadata.len(), 4);
+            let statfs = statfs_mount_path(mount_path).expect("statfs native mount");
+            assert!(statfs.f_blocks > 0, "statfs should report positive blocks");
+            std::fs::remove_file(&renamed).expect("unlink through native FUSE mount");
+            std::fs::remove_dir(&dir).expect("remove namespace directory");
+            MountedOperationGuard::default()
+        }
+    }
+}
+
+fn statfs_mount_path(path: &Path) -> io::Result<libc::statvfs> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut statfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated C string and `statfs` points to
+    // writable uninitialized storage for libc to fill.
+    let result = unsafe { libc::statvfs(path.as_ptr(), statfs.as_mut_ptr()) };
+    if result == 0 {
+        // SAFETY: libc returned success, so it initialized the output struct.
+        Ok(unsafe { statfs.assume_init() })
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 

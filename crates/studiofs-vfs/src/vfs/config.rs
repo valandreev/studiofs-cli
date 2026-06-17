@@ -614,13 +614,15 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
     type Error = VfsError;
 
     fn try_from(value: VfsConfig) -> Result<Self, Self::Error> {
+        let transit_memory_budget_bytes =
+            value.transit_memory_budget_bytes != DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES;
         normalize_vfs_config(
             value,
             CacheRuntimeTuningOverrides {
                 max_dirty_bytes: true,
                 write_eager_flush_batch_bytes: true,
                 upload_cache_io_slots: true,
-                transit_memory_budget_bytes: true,
+                transit_memory_budget_bytes,
             },
         )
     }

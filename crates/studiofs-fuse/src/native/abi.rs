@@ -117,12 +117,20 @@ pub fn error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_LEN] {
 ///
 /// The returned vector is ready to write to the active FUSE transport.
 pub fn ok_reply(unique: u64, payload: &[u8]) -> Vec<u8> {
-    let mut reply = Vec::with_capacity(FUSE_OUT_HEADER_LEN + payload.len());
-    reply.extend_from_slice(&((FUSE_OUT_HEADER_LEN + payload.len()) as u32).to_le_bytes());
+    let len = fuse_out_len_for_payload(payload.len());
+    let mut reply = Vec::with_capacity(len as usize);
+    reply.extend_from_slice(&len.to_le_bytes());
     reply.extend_from_slice(&0_i32.to_le_bytes());
     reply.extend_from_slice(&unique.to_le_bytes());
     reply.extend_from_slice(payload);
     reply
+}
+
+pub(crate) fn fuse_out_len_for_payload(payload_len: usize) -> u32 {
+    let len = FUSE_OUT_HEADER_LEN
+        .checked_add(payload_len)
+        .expect("FUSE reply length exceeds u32 frame limit");
+    u32::try_from(len).expect("FUSE reply length exceeds u32 frame limit")
 }
 
 fn read_u32(frame: &[u8], offset: usize) -> u32 {
@@ -206,5 +214,11 @@ mod tests {
         let reply = error_reply(0xfeed_beef, i32::MIN);
 
         assert_eq!(&reply[4..8], &i32::MIN.to_le_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "FUSE reply length exceeds u32 frame limit")]
+    fn fuse_out_len_for_payload_panics_when_payload_exceeds_u32_frame_limit() {
+        let _ = fuse_out_len_for_payload(usize::MAX);
     }
 }
