@@ -297,15 +297,21 @@ impl PendingWriteTracker {
             let mut admission = self.shared.lock_admission();
             let shard_index = SharedTracker::shard_index(ino);
             let shard = &self.shared.shards[shard_index];
-            while admission.global_error(bytes, limits)
+            let mut state = shard.lock_state();
+            if let Some(error) = state.handle_lifecycle_error((ino, fh)) {
+                return Err(error);
+            }
+            if admission.global_error(bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
+                drop(state);
                 if wait_started.is_none() {
                     wait_started = Some(Instant::now());
                 }
                 admission = self.shared.wait_admission(admission);
+                drop(admission);
+                continue;
             }
-            let mut state = shard.lock_state();
             if state.per_handle_admission_error((ino, fh), bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
@@ -372,12 +378,15 @@ impl PendingWriteTracker {
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         let mut admission = self.shared.lock_admission();
-        if let Some(error) = admission.global_error(bytes, limits) {
-            return Err(error);
-        }
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.lock_state();
+        if let Some(error) = state.handle_lifecycle_error((ino, fh)) {
+            return Err(error);
+        }
+        if let Some(error) = admission.global_error(bytes, limits) {
+            return Err(error);
+        }
         if let Some(error) = state.per_handle_admission_error((ino, fh), bytes, limits) {
             return Err(error);
         }
@@ -821,6 +830,18 @@ fn barrier_error(
 }
 
 impl TrackerState {
+    fn handle_lifecycle_error(&self, key: HandleKey) -> Option<WriteRegistrationError> {
+        let handle = self
+            .inodes
+            .get(&key.0)
+            .and_then(|handles| handles.get(&key.1))?;
+        match handle.lifecycle {
+            HandleLifecycle::Open => None,
+            HandleLifecycle::Closing => Some(WriteRegistrationError::HandleClosing),
+            HandleLifecycle::Closed => Some(WriteRegistrationError::HandleClosed),
+        }
+    }
+
     fn per_handle_admission_error(
         &self,
         key: HandleKey,
@@ -1530,6 +1551,52 @@ mod tests {
             .register(INO, FIRST_FH)
             .expect("closed handle state should be removed before handle reuse");
         assert_eq!(reopened.sequence(), 1);
+    }
+
+    #[test]
+    fn register_with_admission_rejects_closing_handle_before_waiting_for_global_capacity() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(1),
+            max_pending_writes: Some(1),
+            per_handle_pending_bytes: None,
+        };
+        let pending = tracker
+            .register_with_admission(INO, SECOND_FH, 1, limits)
+            .expect("first write fills global admission");
+        let close_barrier = tracker.begin_close(INO, FIRST_FH).expect("begin close");
+        assert!(close_barrier.is_ready());
+
+        let waiting_tracker = tracker.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            result_tx
+                .send(waiting_tracker.register_with_admission(INO, FIRST_FH, 1, limits))
+                .expect("send registration result");
+        });
+
+        match result_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => {
+                assert_eq!(
+                    result.expect_err("closing handle should reject write"),
+                    WriteRegistrationError::HandleClosing
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                pending.complete(PendingWriteCompletion::Success);
+                let result = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("blocked registration should wake after capacity release");
+                waiter.join().expect("waiter should finish");
+                panic!("closing handle waited for global capacity before returning {result:?}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("registration thread exited without sending result");
+            }
+        }
+
+        pending.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
     }
 
     #[test]
