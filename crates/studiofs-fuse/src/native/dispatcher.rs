@@ -1,6 +1,7 @@
 //! Transport-independent native FUSE dispatcher.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -100,8 +101,8 @@ impl RequestClass {
 }
 
 /// Owned request plus reply capability passed from transport intake to workers.
-#[derive(Debug, Clone)]
-pub struct OwnedFuseRequest<S> {
+#[derive(Debug)]
+pub struct OwnedFuseRequest<S: ReplySink> {
     /// Parsed FUSE request envelope.
     pub request: FuseRequest,
     /// Reply token that must be completed exactly once.
@@ -139,13 +140,29 @@ pub enum ResourceKey {
 
 #[derive(Debug, Default)]
 struct BarrierState {
-    pending_writes: HashMap<ResourceKey, usize>,
+    entries: HashMap<ResourceKey, BarrierEntry>,
+}
+
+#[derive(Debug)]
+struct BarrierEntry {
+    pending_writes: usize,
+    waiters: usize,
+    changed: Arc<Condvar>,
+}
+
+impl Default for BarrierEntry {
+    fn default() -> Self {
+        Self {
+            pending_writes: 0,
+            waiters: 0,
+            changed: Arc::new(Condvar::new()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct BarrierShared {
     state: Mutex<BarrierState>,
-    changed: Condvar,
 }
 
 /// Per-resource gates for write and barrier operation ordering.
@@ -158,7 +175,7 @@ impl OperationBarrierGates {
     /// Records a pending write for `resource` until the returned guard drops.
     pub fn begin_write(&self, resource: ResourceKey) -> PendingWriteGuard {
         let mut state = self.shared.state.lock().expect("barrier state poisoned");
-        *state.pending_writes.entry(resource).or_default() += 1;
+        state.entries.entry(resource).or_default().pending_writes += 1;
         PendingWriteGuard {
             resource,
             shared: Arc::clone(&self.shared),
@@ -168,12 +185,33 @@ impl OperationBarrierGates {
     /// Waits until writes for `resource` drain.
     pub fn wait_for_barrier(&self, resource: ResourceKey) {
         let mut state = self.shared.state.lock().expect("barrier state poisoned");
-        while state.pending_writes.get(&resource).copied().unwrap_or(0) > 0 {
-            state = self
-                .shared
-                .changed
+        while state
+            .entries
+            .get(&resource)
+            .map(|entry| entry.pending_writes)
+            .unwrap_or(0)
+            > 0
+        {
+            let changed = {
+                let entry = state
+                    .entries
+                    .get_mut(&resource)
+                    .expect("barrier entry exists while writes are pending");
+                entry.waiters += 1;
+                Arc::clone(&entry.changed)
+            };
+            state = changed
                 .wait(state)
                 .expect("barrier state poisoned while waiting");
+            let remove_entry = if let Some(entry) = state.entries.get_mut(&resource) {
+                entry.waiters -= 1;
+                entry.pending_writes == 0 && entry.waiters == 0
+            } else {
+                false
+            };
+            if remove_entry {
+                state.entries.remove(&resource);
+            }
         }
     }
 }
@@ -188,12 +226,21 @@ pub struct PendingWriteGuard {
 impl Drop for PendingWriteGuard {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().expect("barrier state poisoned");
-        if let Some(count) = state.pending_writes.get_mut(&self.resource) {
-            *count -= 1;
-            if *count == 0 {
-                state.pending_writes.remove(&self.resource);
-                self.shared.changed.notify_all();
+        let mut changed = None;
+        let mut remove_entry = false;
+        if let Some(entry) = state.entries.get_mut(&self.resource) {
+            entry.pending_writes -= 1;
+            if entry.pending_writes == 0 {
+                changed = Some(Arc::clone(&entry.changed));
+                remove_entry = entry.waiters == 0;
             }
+        }
+        if remove_entry {
+            state.entries.remove(&self.resource);
+        }
+        drop(state);
+        if let Some(changed) = changed {
+            changed.notify_all();
         }
     }
 }
@@ -215,15 +262,18 @@ impl DispatchTelemetrySnapshot {
 
 #[derive(Debug, Default)]
 struct DispatchTelemetryState {
-    queue_depths: [usize; 5],
-    backpressure_events: usize,
+    queue_depths: [AtomicUsize; 5],
+    backpressure_events: AtomicUsize,
 }
 
 impl DispatchTelemetryState {
     fn snapshot(&self) -> DispatchTelemetrySnapshot {
         DispatchTelemetrySnapshot {
-            queue_depths: self.queue_depths,
-            backpressure_events: self.backpressure_events,
+            queue_depths: self
+                .queue_depths
+                .each_ref()
+                .map(|depth| depth.load(Ordering::Relaxed)),
+            backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
         }
     }
 }
@@ -323,7 +373,7 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
         H: AsyncFuseOperationHandler<S>,
         S: ReplySink,
     {
-        let telemetry = Arc::new(Mutex::new(DispatchTelemetryState::default()));
+        let telemetry = Arc::new(DispatchTelemetryState::default());
         let mut senders = Vec::with_capacity(RequestClass::ALL.len());
         let mut workers = Vec::with_capacity(RequestClass::ALL.len());
 
@@ -334,10 +384,7 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
             let worker = thread::spawn(move || {
                 while let Ok(envelope) = receiver.recv() {
                     handler.handle(envelope);
-                    worker_telemetry
-                        .lock()
-                        .expect("dispatcher telemetry state poisoned")
-                        .queue_depths[class.index()] -= 1;
+                    worker_telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
                 }
             });
             senders.push(Some(sender));
@@ -354,11 +401,11 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 }
 
 /// Bounded worker dispatcher for owned native FUSE requests.
-pub struct NativeAsyncDispatcher<S> {
+pub struct NativeAsyncDispatcher<S: ReplySink> {
     senders: Vec<Option<SyncSender<OwnedFuseRequest<S>>>>,
     workers: Vec<JoinHandle<()>>,
     capacities: [usize; 5],
-    telemetry: Arc<Mutex<DispatchTelemetryState>>,
+    telemetry: Arc<DispatchTelemetryState>,
 }
 
 impl<S> NativeAsyncDispatcher<S>
@@ -379,18 +426,23 @@ where
     /// Attempts to enqueue one owned request without waiting for handler work.
     pub fn submit(&self, envelope: OwnedFuseRequest<S>) -> Result<(), DispatchError> {
         let class = envelope.class();
-        {
-            let mut telemetry = self
-                .telemetry
-                .lock()
-                .expect("dispatcher telemetry state poisoned");
-            if telemetry.queue_depths[class.index()] >= self.capacities[class.index()] {
-                telemetry.backpressure_events += 1;
-                drop(telemetry);
-                envelope.reply.send_errno(libc::EAGAIN).ok();
-                return Err(DispatchError::QueueFull { class });
-            }
-            telemetry.queue_depths[class.index()] += 1;
+        let reserved = self.telemetry.queue_depths[class.index()].fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                if current >= self.capacities[class.index()] {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            },
+        );
+        if reserved.is_err() {
+            self.telemetry
+                .backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+            envelope.reply.send_errno(libc::EAGAIN);
+            return Err(DispatchError::QueueFull { class });
         }
 
         match self.senders[class.index()]
@@ -400,21 +452,15 @@ where
         {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(envelope)) => {
-                let mut telemetry = self
-                    .telemetry
-                    .lock()
-                    .expect("dispatcher telemetry state poisoned");
-                telemetry.queue_depths[class.index()] -= 1;
-                telemetry.backpressure_events += 1;
-                drop(telemetry);
-                envelope.reply.send_errno(libc::EAGAIN).ok();
+                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
+                self.telemetry
+                    .backpressure_events
+                    .fetch_add(1, Ordering::Relaxed);
+                envelope.reply.send_errno(libc::EAGAIN);
                 Err(DispatchError::QueueFull { class })
             }
             Err(TrySendError::Disconnected(envelope)) => {
-                self.telemetry
-                    .lock()
-                    .expect("dispatcher telemetry state poisoned")
-                    .queue_depths[class.index()] -= 1;
+                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
                 envelope.reply.drop_without_reply();
                 Err(DispatchError::QueueFull { class })
             }
@@ -423,10 +469,7 @@ where
 
     /// Returns a point-in-time telemetry snapshot.
     pub fn telemetry(&self) -> DispatchTelemetrySnapshot {
-        self.telemetry
-            .lock()
-            .expect("dispatcher telemetry state poisoned")
-            .snapshot()
+        self.telemetry.snapshot()
     }
 
     /// Stops intake and waits for worker queues to drain.
@@ -445,7 +488,7 @@ where
 mod tests {
     use super::*;
     use crate::native::abi::{FUSE_IN_HEADER_LEN, ok_reply};
-    use crate::native::reply::{RecordedReplySink, ReplyCompletionError, ReplyToken};
+    use crate::native::reply::RecordedReplySink;
     use crate::native::transport::FrameQueueTransport;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -541,16 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_token_sends_success_exactly_once() {
+    fn reply_token_consumes_itself_when_sending_success() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_classic(0x71, sink.clone());
 
-        token
-            .send_success(&[0xde, 0xad, 0xbe, 0xef])
-            .expect("first success reply should be accepted");
-        let second = token.send_errno(libc::EIO);
+        token.send_success(&[0xde, 0xad, 0xbe, 0xef]);
 
-        assert_eq!(second, Err(ReplyCompletionError::AlreadyCompleted));
         assert_eq!(sink.completed_unique_ids(), [0x71]);
         assert_eq!(
             sink.completed_replies()[0].bytes[16..],
@@ -559,16 +598,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_token_sends_errno_exactly_once() {
+    fn reply_token_consumes_itself_when_sending_errno() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_io_uring(0x72, sink.clone(), 3, 11);
 
-        token
-            .send_errno(libc::ENOENT)
-            .expect("first errno reply should be accepted");
-        let second = token.send_data(vec![1, 2, 3]);
+        token.send_errno(libc::ENOENT);
 
-        assert_eq!(second, Err(ReplyCompletionError::AlreadyCompleted));
         assert_eq!(sink.completed_unique_ids(), [0x72]);
         assert_eq!(
             &sink.completed_replies()[0].bytes[4..8],
@@ -577,15 +612,18 @@ mod tests {
     }
 
     #[test]
-    fn reply_token_records_drop_without_later_reply() {
+    fn reply_token_drop_without_completion_fails_closed_with_eio() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_classic(0x73, sink.clone());
 
-        token.drop_without_reply();
-        let second = token.send_success(&[]);
+        drop(token);
 
-        assert_eq!(second, Err(ReplyCompletionError::AlreadyCompleted));
         assert_eq!(sink.dropped_unique_ids(), [0x73]);
+        assert_eq!(sink.completed_unique_ids(), [0x73]);
+        assert_eq!(
+            &sink.completed_replies()[0].bytes[4..8],
+            &(-(libc::EIO)).to_le_bytes()
+        );
     }
 
     #[derive(Clone)]
@@ -604,10 +642,7 @@ mod tests {
                 .expect("unblock receiver poisoned")
                 .recv()
                 .expect("test should unblock handler");
-            envelope
-                .reply
-                .send_success(&[])
-                .expect("handler should own first reply completion");
+            envelope.reply.send_success(&[]);
         }
     }
 

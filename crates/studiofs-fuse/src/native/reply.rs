@@ -2,8 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use thiserror::Error;
-
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::protocol::FuseReply;
 
@@ -21,14 +19,6 @@ pub enum ReplyOrigin {
     },
 }
 
-/// Error returned when a reply token is completed after ownership ended.
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub enum ReplyCompletionError {
-    /// The token already sent a reply or was explicitly dropped.
-    #[error("FUSE reply token already completed")]
-    AlreadyCompleted,
-}
-
 /// Reply sink used by concrete transports to commit completed replies.
 pub trait ReplySink: Clone + Send + Sync + 'static {
     /// Commits a fully framed reply for the supplied transport origin.
@@ -37,22 +27,16 @@ pub trait ReplySink: Clone + Send + Sync + 'static {
     fn dropped(&self, origin: ReplyOrigin, unique: u64);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplyState {
-    Pending,
-    Completed,
-}
-
 /// Owned reply capability for one FUSE request.
 ///
 /// The token can be moved to async work and completed from any transport
 /// backend. Completion is fail-closed: exactly one reply or drop event wins.
-#[derive(Debug, Clone)]
-pub struct ReplyToken<S> {
+#[derive(Debug)]
+pub struct ReplyToken<S: ReplySink> {
     unique: u64,
     origin: ReplyOrigin,
     sink: S,
-    state: Arc<Mutex<ReplyState>>,
+    completed: bool,
 }
 
 impl<S: ReplySink> ReplyToken<S> {
@@ -78,54 +62,59 @@ impl<S: ReplySink> ReplyToken<S> {
             unique,
             origin,
             sink,
-            state: Arc::new(Mutex::new(ReplyState::Pending)),
+            completed: false,
         }
     }
 
     /// Sends a successful reply with the supplied payload.
-    pub fn send_success(&self, payload: &[u8]) -> Result<(), ReplyCompletionError> {
+    pub fn send_success(mut self, payload: &[u8]) {
         self.complete(FuseReply {
             unique: self.unique,
             bytes: ok_reply(self.unique, payload),
-        })
+        });
     }
 
     /// Sends an errno reply.
-    pub fn send_errno(&self, errno: i32) -> Result<(), ReplyCompletionError> {
+    pub fn send_errno(mut self, errno: i32) {
         self.complete(FuseReply {
             unique: self.unique,
             bytes: error_reply(self.unique, errno).to_vec(),
-        })
+        });
     }
 
     /// Sends an owned data reply without forcing callers to retain the buffer.
-    pub fn send_data(&self, data: Vec<u8>) -> Result<(), ReplyCompletionError> {
+    pub fn send_data(mut self, data: Vec<u8>) {
         self.complete(FuseReply {
             unique: self.unique,
             bytes: ok_reply(self.unique, &data),
-        })
+        });
     }
 
     /// Marks the token as intentionally dropped without replying to the kernel.
-    pub fn drop_without_reply(&self) {
-        if self.take_completion_slot().is_ok() {
-            self.sink.dropped(self.origin, self.unique);
-        }
+    pub fn drop_without_reply(mut self) {
+        self.completed = true;
+        self.sink.dropped(self.origin, self.unique);
     }
 
-    fn complete(&self, reply: FuseReply) -> Result<(), ReplyCompletionError> {
-        self.take_completion_slot()?;
+    fn complete(&mut self, reply: FuseReply) {
+        self.completed = true;
         self.sink.complete(self.origin, reply);
-        Ok(())
     }
+}
 
-    fn take_completion_slot(&self) -> Result<(), ReplyCompletionError> {
-        let mut state = self.state.lock().expect("reply token state poisoned");
-        if *state == ReplyState::Completed {
-            return Err(ReplyCompletionError::AlreadyCompleted);
+impl<S: ReplySink> Drop for ReplyToken<S> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.sink.dropped(self.origin, self.unique);
+            self.sink.complete(
+                self.origin,
+                FuseReply {
+                    unique: self.unique,
+                    bytes: error_reply(self.unique, libc::EIO).to_vec(),
+                },
+            );
         }
-        *state = ReplyState::Completed;
-        Ok(())
     }
 }
 
