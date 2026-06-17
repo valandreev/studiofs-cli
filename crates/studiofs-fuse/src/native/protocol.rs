@@ -16,10 +16,16 @@ pub enum FuseOpcode {
     Open,
     /// `FUSE_READ`: read file data from an open file handle or node.
     Read,
+    /// `FUSE_WRITE`: write file data to an open file handle or node.
+    Write,
     /// `FUSE_STATFS`: fetch filesystem-level capacity and limit information.
     Statfs,
+    /// `FUSE_FSYNC`: synchronize dirty file data for a handle or inode.
+    Fsync,
     /// `FUSE_RELEASE`: close a previously opened file handle.
     Release,
+    /// `FUSE_FLUSH`: flush dirty file data for a handle or inode.
+    Flush,
     /// `FUSE_INIT`: negotiate protocol version, limits, and capabilities.
     Init,
     /// `FUSE_OPENDIR`: open a directory stream.
@@ -279,8 +285,11 @@ impl FuseOpcode {
             3 => Self::Getattr,
             14 => Self::Open,
             15 => Self::Read,
+            16 => Self::Write,
             17 => Self::Statfs,
             18 => Self::Release,
+            20 => Self::Fsync,
+            25 => Self::Flush,
             26 => Self::Init,
             27 => Self::Opendir,
             28 => Self::Readdir,
@@ -334,8 +343,11 @@ mod tests {
             (3, FuseOpcode::Getattr),
             (14, FuseOpcode::Open),
             (15, FuseOpcode::Read),
+            (16, FuseOpcode::Write),
             (17, FuseOpcode::Statfs),
             (18, FuseOpcode::Release),
+            (20, FuseOpcode::Fsync),
+            (25, FuseOpcode::Flush),
             (26, FuseOpcode::Init),
             (27, FuseOpcode::Opendir),
             (28, FuseOpcode::Readdir),
