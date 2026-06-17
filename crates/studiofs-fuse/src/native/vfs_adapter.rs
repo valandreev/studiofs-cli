@@ -1297,9 +1297,10 @@ impl NativeDirectoryHandleStore {
 
     fn release(&self, ino: u64, fh: u64) -> bool {
         let mut handles = lock_or_recover(&self.handles, "directory_handles");
-        match handles.get(&fh) {
-            Some(handle) if handle.ino == ino => handles.remove(&fh).is_some(),
-            _ => false,
+        if handles.get(&fh).is_some_and(|handle| handle.ino == ino) {
+            handles.remove(&fh).is_some()
+        } else {
+            false
         }
     }
 }
@@ -1571,6 +1572,16 @@ mod tests {
 
         assert_eq!(counts.count(20), 2);
         assert_eq!(counts.count(21), 5);
+    }
+
+    #[test]
+    fn directory_handle_store_release_keeps_mismatched_inode_handle() {
+        let store = NativeDirectoryHandleStore::default();
+        let fh = store.open(20, Arc::from([dir_entry(21, b"child")]));
+
+        assert!(!store.release(21, fh));
+        assert!(store.entries(20, fh).is_some());
+        assert!(store.release(20, fh));
     }
 
     #[test]
