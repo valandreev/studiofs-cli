@@ -8186,10 +8186,16 @@ fn startup_replays_legacy_landed_write_after_restart() {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(
-            vfs.recover_landing_zone_segments().unwrap().is_empty(),
-            "startup recovery should retire replayed landed records"
-        );
+        loop {
+            if vfs.recover_landing_zone_segments().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup recovery should retire replayed landed records"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     });
 }
 

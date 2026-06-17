@@ -4299,7 +4299,13 @@ fn test_pg_reopen_after_claimed_batch_crash_flushes_without_discover() {
     seed_local(&db_a, &info);
     seed_local(&db_b, &info);
 
-    let a = PgMetaEngine::open(&db_a).expect("open a");
+    let a = PgMetaEngine::open_with_options(
+        &db_a,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open a");
     let b = PgMetaEngine::open(&db_b).expect("open b");
 
     a.create_dir(ROOT_INO, b"draft.txt", 0, 0, 0o755)
@@ -4340,7 +4346,13 @@ fn test_pg_reopen_after_claimed_multi_event_batch_preserves_sequence_without_dis
     seed_local(&db_a, &info);
     seed_local(&db_b, &info);
 
-    let a = PgMetaEngine::open(&db_a).expect("open a");
+    let a = PgMetaEngine::open_with_options(
+        &db_a,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open a");
     let b = PgMetaEngine::open(&db_b).expect("open b");
 
     let dir = a
