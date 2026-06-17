@@ -16,7 +16,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::native::abi::{FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader};
-    use crate::native::cache_policy::NativeInodeCacheState;
+    use crate::native::cache_policy::{NativeInodeCacheState, TrustedCacheState};
     use crate::native::dispatcher::FuseOperationHandler;
     use crate::native::protocol::{FuseOpcode, FuseRequest};
     use crate::native::vfs_adapter::{
@@ -928,13 +928,15 @@ mod tests {
                 99,
                 NativeInodeCacheState {
                     content_epoch: 7,
-                    cached_content_epoch: Some(7),
                     size: 8192,
-                    cached_size: Some(8192),
                     mtime_ns: 123,
-                    cached_mtime_ns: Some(123),
                     invalidation_generation: 3,
-                    observed_invalidation_generation: 3,
+                    trusted: Some(TrustedCacheState {
+                        content_epoch: 7,
+                        size: 8192,
+                        mtime_ns: 123,
+                        invalidation_generation: 3,
+                    }),
                     writer_active: false,
                     dirty: true,
                     local_materialized: true,
@@ -966,13 +968,15 @@ mod tests {
                 99,
                 NativeInodeCacheState {
                     content_epoch: 7,
-                    cached_content_epoch: Some(7),
                     size: 8192,
-                    cached_size: Some(8192),
                     mtime_ns: 123,
-                    cached_mtime_ns: Some(123),
                     invalidation_generation: 3,
-                    observed_invalidation_generation: 3,
+                    trusted: Some(TrustedCacheState {
+                        content_epoch: 7,
+                        size: 8192,
+                        mtime_ns: 123,
+                        invalidation_generation: 3,
+                    }),
                     writer_active: false,
                     dirty: false,
                     local_materialized: true,
@@ -1004,13 +1008,10 @@ mod tests {
                 99,
                 NativeInodeCacheState {
                     content_epoch: 7,
-                    cached_content_epoch: None,
                     size: 8192,
-                    cached_size: None,
                     mtime_ns: 123,
-                    cached_mtime_ns: None,
                     invalidation_generation: 3,
-                    observed_invalidation_generation: 3,
+                    trusted: None,
                     writer_active: false,
                     dirty: false,
                     local_materialized: true,
@@ -1048,13 +1049,10 @@ mod tests {
                 99,
                 NativeInodeCacheState {
                     content_epoch: 7,
-                    cached_content_epoch: None,
                     size: 8192,
-                    cached_size: None,
                     mtime_ns: 123,
-                    cached_mtime_ns: None,
                     invalidation_generation: 3,
-                    observed_invalidation_generation: 3,
+                    trusted: None,
                     writer_active: false,
                     dirty: false,
                     local_materialized: true,
@@ -1483,13 +1481,10 @@ mod tests {
                 42,
                 NativeInodeCacheState {
                     content_epoch: 1,
-                    cached_content_epoch: None,
                     size: 0,
-                    cached_size: None,
                     mtime_ns: 123,
-                    cached_mtime_ns: None,
                     invalidation_generation: 0,
-                    observed_invalidation_generation: 0,
+                    trusted: None,
                     writer_active: true,
                     dirty: false,
                     local_materialized: true,

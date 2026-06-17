@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
@@ -908,11 +908,12 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR);
         let decision = decide_native_open_cache(read_only, &state);
         self.open_cache_metrics.record(decision);
+        // Keep the read and write phases separate: this trusted snapshot is only
+        // a cache hint, so a concurrent stale overwrite can at worst cause a
+        // later redundant invalidation rather than stale page reuse.
         if matches!(
             decision.action,
-            NativeOpenCacheAction::KeepCache
-                | NativeOpenCacheAction::Cached
-                | NativeOpenCacheAction::InvalidateThenCached
+            NativeOpenCacheAction::Cached | NativeOpenCacheAction::InvalidateThenCached
         ) {
             self.remember_trusted_open_cache_state(ino, &state);
         }
@@ -925,16 +926,9 @@ impl<V: NativeVfs> LinuxNativeBridge<V> {
             return;
         };
 
-        if state.cached_content_epoch.is_none() {
-            state.cached_content_epoch = Some(trusted.content_epoch);
-        }
-        if state.cached_size.is_none() {
-            state.cached_size = Some(trusted.size);
-        }
-        if state.cached_mtime_ns.is_none() {
-            state.cached_mtime_ns = Some(trusted.mtime_ns);
-        }
-        state.observed_invalidation_generation = trusted.invalidation_generation;
+        state
+            .trusted
+            .get_or_insert_with(|| trusted.current_trusted_snapshot());
     }
 
     fn remember_trusted_open_cache_state(&self, ino: u64, state: &NativeInodeCacheState) {
@@ -1323,13 +1317,10 @@ fn open_reply_flags(decision: NativeOpenCacheDecision) -> u32 {
 fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInodeCacheState {
     NativeInodeCacheState {
         content_epoch: attr.content_epoch,
-        cached_content_epoch: None,
         size: attr.size,
-        cached_size: None,
         mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
-        cached_mtime_ns: None,
         invalidation_generation: 0,
-        observed_invalidation_generation: 0,
+        trusted: None,
         writer_active: dirty,
         dirty,
         local_materialized: true,
@@ -1417,7 +1408,7 @@ impl NativeDirectoryHandleStore {
 
 #[derive(Debug)]
 struct NativeTrustedOpenCacheStateStore {
-    shards: [Mutex<HashMap<u64, NativeInodeCacheState>>; Self::SHARD_COUNT],
+    shards: [RwLock<HashMap<u64, NativeInodeCacheState>>; Self::SHARD_COUNT],
 }
 
 impl NativeTrustedOpenCacheStateStore {
@@ -1433,22 +1424,22 @@ impl NativeTrustedOpenCacheStateStore {
         (value as usize) & (Self::SHARD_COUNT - 1)
     }
 
-    fn shard(&self, ino: u64) -> &Mutex<HashMap<u64, NativeInodeCacheState>> {
+    fn shard(&self, ino: u64) -> &RwLock<HashMap<u64, NativeInodeCacheState>> {
         &self.shards[Self::shard_index(ino)]
     }
 
     fn get(&self, ino: u64) -> Option<NativeInodeCacheState> {
-        lock_or_recover(self.shard(ino), "trusted_open_cache_states")
+        read_or_recover(self.shard(ino), "trusted_open_cache_states")
             .get(&ino)
             .cloned()
     }
 
     fn insert(&self, ino: u64, state: NativeInodeCacheState) {
-        lock_or_recover(self.shard(ino), "trusted_open_cache_states").insert(ino, state);
+        write_or_recover(self.shard(ino), "trusted_open_cache_states").insert(ino, state);
     }
 
     fn remove(&self, ino: u64) {
-        lock_or_recover(self.shard(ino), "trusted_open_cache_states").remove(&ino);
+        write_or_recover(self.shard(ino), "trusted_open_cache_states").remove(&ino);
     }
 }
 
@@ -1457,7 +1448,7 @@ const _: () = assert!(NativeTrustedOpenCacheStateStore::SHARD_COUNT.is_power_of_
 impl Default for NativeTrustedOpenCacheStateStore {
     fn default() -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
         }
     }
 }
@@ -1527,6 +1518,32 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> 
         Ok(guard) => guard,
         Err(poisoned) => {
             warn!(mutex = name, "recovering poisoned native bridge mutex");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn read_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                lock = name,
+                "recovering poisoned native bridge rwlock reader"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                lock = name,
+                "recovering poisoned native bridge rwlock writer"
+            );
             poisoned.into_inner()
         }
     }
@@ -1695,6 +1712,31 @@ mod tests {
             !trusted_store.contains("NativeLookupCountStore::shard_index"),
             "trusted open cache state sharding must not depend on lookup count sharding"
         );
+    }
+
+    #[test]
+    fn trusted_open_cache_state_store_uses_read_write_locks() {
+        let source = include_str!("vfs_adapter.rs");
+        let trusted_store = source
+            .split("struct NativeLookupCountStore")
+            .next()
+            .expect("trusted store should appear before lookup count store");
+
+        assert!(trusted_store.contains("RwLock<HashMap<u64, NativeInodeCacheState>>"));
+        assert!(trusted_store.contains("read_or_recover"));
+        assert!(trusted_store.contains("write_or_recover"));
+    }
+
+    #[test]
+    fn keep_cache_decision_does_not_rewrite_trusted_open_cache_state() {
+        let source = include_str!("vfs_adapter.rs");
+        let open_cache_decision = source
+            .split("fn open_cache_decision")
+            .nth(1)
+            .and_then(|rest| rest.split("fn apply_trusted_open_cache_state").next())
+            .expect("open cache decision body should be present");
+
+        assert!(!open_cache_decision.contains("NativeOpenCacheAction::KeepCache"));
     }
 
     #[test]

@@ -39,25 +39,32 @@ pub struct NativeOpenCacheDecision {
     pub reason: NativeOpenCacheReason,
 }
 
+/// Inode content snapshot last trusted by the kernel page cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedCacheState {
+    /// StudioFS content epoch trusted by the kernel page cache.
+    pub content_epoch: u64,
+    /// Inode size trusted by the kernel page cache.
+    pub size: u64,
+    /// Inode mtime in nanoseconds trusted by the kernel page cache.
+    pub mtime_ns: u64,
+    /// StudioFS invalidation generation observed with this trusted snapshot.
+    pub invalidation_generation: u64,
+}
+
 /// Per-inode state used to decide whether kernel pages are still coherent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeInodeCacheState {
     /// Current StudioFS content epoch.
     pub content_epoch: u64,
-    /// Last epoch trusted by the kernel page cache, if any.
-    pub cached_content_epoch: Option<u64>,
     /// Current inode size.
     pub size: u64,
-    /// Last size trusted by the kernel page cache, if any.
-    pub cached_size: Option<u64>,
     /// Current mtime in nanoseconds.
     pub mtime_ns: u64,
-    /// Last mtime trusted by the kernel page cache, if any.
-    pub cached_mtime_ns: Option<u64>,
     /// Current StudioFS invalidation generation.
     pub invalidation_generation: u64,
-    /// Last invalidation generation observed by the kernel-cache policy.
-    pub observed_invalidation_generation: u64,
+    /// Last content snapshot trusted by the kernel page cache, if any.
+    pub trusted: Option<TrustedCacheState>,
     /// Whether a writer is active for this inode.
     pub writer_active: bool,
     /// Whether local writer/cache state is dirty.
@@ -161,19 +168,15 @@ pub fn decide_native_open_cache(
         };
     }
 
-    if state.cached_content_epoch.is_some()
-        && (state.cached_content_epoch != Some(state.content_epoch)
-            || state.cached_size != Some(state.size)
-            || state.cached_mtime_ns != Some(state.mtime_ns)
-            || state.observed_invalidation_generation != state.invalidation_generation)
-    {
+    let current = state.current_trusted_snapshot();
+    if state.trusted.is_some_and(|trusted| trusted != current) {
         return NativeOpenCacheDecision {
             action: NativeOpenCacheAction::InvalidateThenCached,
             reason: NativeOpenCacheReason::StalePrevented,
         };
     }
 
-    if read_only && state.cached_content_epoch.is_some() {
+    if read_only && state.trusted.is_some() {
         return NativeOpenCacheDecision {
             action: NativeOpenCacheAction::KeepCache,
             reason: NativeOpenCacheReason::Keep,
@@ -186,24 +189,70 @@ pub fn decide_native_open_cache(
     }
 }
 
+impl NativeInodeCacheState {
+    /// Returns the current inode snapshot shape used for trusted-cache comparison.
+    pub fn current_trusted_snapshot(&self) -> TrustedCacheState {
+        TrustedCacheState {
+            content_epoch: self.content_epoch,
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            invalidation_generation: self.invalidation_generation,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     fn clean_trusted_state() -> NativeInodeCacheState {
         NativeInodeCacheState {
             content_epoch: 7,
-            cached_content_epoch: Some(7),
             size: 4096,
-            cached_size: Some(4096),
             mtime_ns: 123,
-            cached_mtime_ns: Some(123),
             invalidation_generation: 3,
-            observed_invalidation_generation: 3,
+            trusted: Some(TrustedCacheState {
+                content_epoch: 7,
+                size: 4096,
+                mtime_ns: 123,
+                invalidation_generation: 3,
+            }),
             writer_active: false,
             dirty: false,
             local_materialized: true,
         }
+    }
+
+    #[test]
+    fn native_inode_cache_state_groups_trusted_snapshot_compactly() {
+        assert!(size_of::<NativeInodeCacheState>() <= 80);
+
+        let state = NativeInodeCacheState {
+            content_epoch: 7,
+            size: 4096,
+            mtime_ns: 123,
+            invalidation_generation: 3,
+            trusted: Some(TrustedCacheState {
+                content_epoch: 7,
+                size: 4096,
+                mtime_ns: 123,
+                invalidation_generation: 3,
+            }),
+            writer_active: false,
+            dirty: false,
+            local_materialized: true,
+        };
+
+        assert_eq!(
+            state.trusted,
+            Some(TrustedCacheState {
+                content_epoch: 7,
+                size: 4096,
+                mtime_ns: 123,
+                invalidation_generation: 3,
+            })
+        );
     }
 
     #[test]
