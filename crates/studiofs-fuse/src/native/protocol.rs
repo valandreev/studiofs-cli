@@ -1,7 +1,8 @@
 //! Transport-independent FUSE protocol types.
 
 use crate::native::abi::{
-    AbiParseError, FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader, ok_reply, parse_in_header,
+    AbiParseError, FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader, fuse_out_len_for_payload,
+    ok_reply, parse_in_header,
 };
 use std::io::IoSlice;
 use std::ops::BitOr;
@@ -166,13 +167,6 @@ impl FuseReply {
             FuseReplyFrame::Segmented { .. } => None,
         }
     }
-}
-
-fn fuse_out_len_for_payload(payload_len: usize) -> u32 {
-    let len = FUSE_OUT_HEADER_LEN
-        .checked_add(payload_len)
-        .expect("FUSE reply length must fit in u32");
-    u32::try_from(len).expect("FUSE reply length must fit in u32")
 }
 
 /// Fixed-size vectored reply slices.
@@ -645,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FUSE reply length must fit in u32")]
+    #[should_panic(expected = "FUSE reply length exceeds u32 frame limit")]
     fn segmented_reply_length_panics_when_payload_exceeds_u32_frame_limit() {
         let _ = fuse_out_len_for_payload(usize::MAX);
     }

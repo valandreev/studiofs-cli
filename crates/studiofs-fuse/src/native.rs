@@ -11,6 +11,7 @@ pub mod vfs_adapter;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use crate::native::abi::{FUSE_IN_HEADER_LEN, FUSE_OUT_HEADER_LEN, FuseInHeader};
@@ -29,6 +30,7 @@ mod tests {
     struct RecordingNativeVfs {
         lookups: Mutex<Vec<(u64, Vec<u8>)>>,
         getattrs: Mutex<Vec<u64>>,
+        getattr_errors: Mutex<HashMap<u64, i32>>,
         opens: Mutex<Vec<(u64, i32)>>,
         releases: Mutex<Vec<u64>>,
         reads: Mutex<Vec<(u64, u64, u64, u32)>>,
@@ -66,6 +68,15 @@ mod tests {
                 .lock()
                 .expect("getattr calls lock should not be poisoned")
                 .push(ino);
+            if let Some(errno) = self
+                .getattr_errors
+                .lock()
+                .expect("getattr errors lock should not be poisoned")
+                .get(&ino)
+                .copied()
+            {
+                return Err(errno);
+            }
             Ok(NativeAttr { ino, ..self.attr })
         }
 
@@ -692,6 +703,7 @@ mod tests {
         Arc::new(RecordingNativeVfs {
             lookups: Mutex::new(Vec::new()),
             getattrs: Mutex::new(Vec::new()),
+            getattr_errors: Mutex::new(HashMap::new()),
             opens: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             reads: Mutex::new(Vec::new()),
@@ -1075,6 +1087,57 @@ mod tests {
                 .expect("getattr calls lock should not be poisoned")
                 .as_slice(),
             &[200]
+        );
+    }
+
+    #[test]
+    fn native_bridge_readdirplus_skips_entries_when_getattr_reports_stale_inode() {
+        let attr = NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+        };
+        let entries = vec![
+            NativeDirEntry {
+                ino: 200,
+                kind: NativeFileType::RegularFile,
+                name: b"present-a".to_vec(),
+            },
+            NativeDirEntry {
+                ino: 201,
+                kind: NativeFileType::RegularFile,
+                name: b"gone".to_vec(),
+            },
+            NativeDirEntry {
+                ino: 202,
+                kind: NativeFileType::RegularFile,
+                name: b"present-b".to_vec(),
+            },
+        ];
+        let vfs = recording_vfs_with_dir_entries(attr, entries);
+        vfs.getattr_errors
+            .lock()
+            .expect("getattr errors lock should not be poisoned")
+            .insert(201, libc::ENOENT);
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(readdirplus_request(99, 8001, 0, 4096));
+        let reply = reply.to_vec();
+
+        assert_eq!(reply_error(&reply), 0);
+        assert!(
+            reply
+                .windows(b"present-a".len())
+                .any(|window| window == b"present-a")
+        );
+        assert!(!reply.windows(b"gone".len()).any(|window| window == b"gone"));
+        assert!(
+            reply
+                .windows(b"present-b".len())
+                .any(|window| window == b"present-b")
         );
     }
 

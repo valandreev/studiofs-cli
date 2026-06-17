@@ -8,6 +8,7 @@ use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
 use studiofs_vfs::{LocalSyncPolicy, OpenFlags, SetattrArgs, StatFs, StudioVfs};
 use tokio::runtime::Handle;
+use tracing::warn;
 
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::dispatcher::FuseOperationHandler;
@@ -462,7 +463,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
 #[derive(Debug)]
 pub struct LinuxNativeBridge<V> {
     vfs: V,
-    lookup_counts: Arc<Mutex<HashMap<u64, u64>>>,
+    lookup_counts: Mutex<HashMap<u64, u64>>,
 }
 
 impl<V> LinuxNativeBridge<V> {
@@ -470,7 +471,7 @@ impl<V> LinuxNativeBridge<V> {
     pub fn new(vfs: V) -> Self {
         Self {
             vfs,
-            lookup_counts: Arc::new(Mutex::new(HashMap::new())),
+            lookup_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1136,7 +1137,11 @@ fn readdirplus_payload<V: NativeVfs>(
         if payload.len().saturating_add(encoded_len) > limit {
             break;
         }
-        let attr = vfs.getattr(entry.ino)?;
+        let attr = match vfs.getattr(entry.ino) {
+            Ok(attr) => attr,
+            Err(errno) if is_stale_dirent_errno(errno) => continue,
+            Err(errno) => return Err(errno),
+        };
         payload.extend_from_slice(&entry_payload(attr));
         append_dirent(&mut payload, entry, next_offset);
         looked_up_inodes.push(attr.ino);
@@ -1195,6 +1200,10 @@ fn dirent_type(kind: NativeFileType) -> u32 {
         NativeFileType::Directory => u32::from(libc::DT_DIR),
         NativeFileType::Symlink => u32::from(libc::DT_LNK),
     }
+}
+
+fn is_stale_dirent_errno(errno: i32) -> bool {
+    matches!(errno, libc::ENOENT | libc::ESTALE)
 }
 
 fn write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
@@ -1292,9 +1301,13 @@ impl NativeDirectoryHandleStore {
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("recovering poisoned native bridge mutex");
+            poisoned.into_inner()
+        }
+    }
 }
 
 #[cfg(test)]
