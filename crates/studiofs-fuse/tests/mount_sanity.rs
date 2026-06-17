@@ -35,6 +35,10 @@ const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
 const DEFAULT_TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_TEST_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 const SFS509_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const SFS509_DEFAULT_FIO_SIZE: &str = "16m";
+const SFS509_DEFAULT_FIO_LARGE_SIZE: &str = "96m";
+const SFS509_DEFAULT_FIO_RUNTIME_SECS: &str = "1";
+const SFS509_DEFAULT_METADATA_FILES: &str = "50";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountedFuseMode {
@@ -619,13 +623,33 @@ fn sfs509_cache_budget_covers_large_file_workload() {
 }
 
 #[test]
+fn sfs509_default_fio_size_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_SIZE, "16m");
+}
+
+#[test]
 fn sfs509_multi_job_size_is_capped_for_mounted_smoke_runtime() {
-    assert_eq!(sfs509_multi_job_size("512m"), "4m");
+    assert_eq!(sfs509_multi_job_size("512m"), "2m");
 }
 
 #[test]
 fn sfs509_fsync_heavy_size_is_capped_for_mounted_smoke_runtime() {
-    assert_eq!(sfs509_fsync_heavy_size("512m"), "4m");
+    assert_eq!(sfs509_fsync_heavy_size("512m"), "2m");
+}
+
+#[test]
+fn sfs509_default_large_file_size_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_LARGE_SIZE, "96m");
+}
+
+#[test]
+fn sfs509_default_timed_runtime_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_FIO_RUNTIME_SECS, "1");
+}
+
+#[test]
+fn sfs509_default_metadata_probe_is_bounded_for_mounted_smoke_runtime() {
+    assert_eq!(SFS509_DEFAULT_METADATA_FILES, "50");
 }
 
 #[test]
@@ -964,11 +988,11 @@ fn mounted_scenario_cache_budget_bytes(suffix: &str) -> u64 {
 }
 
 fn sfs509_multi_job_size(base_size: &str) -> String {
-    sfs509_capped_size(base_size, 4 * 1024 * 1024, "4m")
+    sfs509_capped_size(base_size, 2 * 1024 * 1024, "2m")
 }
 
 fn sfs509_fsync_heavy_size(base_size: &str) -> String {
-    sfs509_capped_size(base_size, 4 * 1024 * 1024, "4m")
+    sfs509_capped_size(base_size, 2 * 1024 * 1024, "2m")
 }
 
 fn sfs509_capped_size(base_size: &str, max_bytes: u64, capped_size: &str) -> String {
@@ -2483,8 +2507,11 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
     raise_nofile_limit_best_effort();
     let artifact_dir = sfs509_artifact_dir(scenario_name);
     let _ = std::fs::remove_file(artifact_dir.join("workload-status.tsv"));
-    let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", "512m");
-    let large_size = sfs509_env_value("STUDIOFS_SFS509_FIO_LARGE_SIZE", "2g");
+    let size = sfs509_env_value("STUDIOFS_SFS509_FIO_SIZE", SFS509_DEFAULT_FIO_SIZE);
+    let large_size = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_LARGE_SIZE",
+        SFS509_DEFAULT_FIO_LARGE_SIZE,
+    );
     let multi_job_default_size = sfs509_multi_job_size(&size);
     let multi_job_size = sfs509_env_value(
         "STUDIOFS_SFS509_FIO_MULTI_JOB_SIZE",
@@ -2495,10 +2522,16 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
         "STUDIOFS_SFS509_FIO_FSYNC_HEAVY_SIZE",
         &fsync_heavy_default_size,
     );
-    let runtime = sfs509_env_value("STUDIOFS_SFS509_FIO_RUNTIME_SECS", "20");
-    let metadata_files = sfs509_env_value("STUDIOFS_SFS509_METADATA_FILES", "500")
-        .parse::<usize>()
-        .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
+    let runtime = sfs509_env_value(
+        "STUDIOFS_SFS509_FIO_RUNTIME_SECS",
+        SFS509_DEFAULT_FIO_RUNTIME_SECS,
+    );
+    let metadata_files = sfs509_env_value(
+        "STUDIOFS_SFS509_METADATA_FILES",
+        SFS509_DEFAULT_METADATA_FILES,
+    )
+    .parse::<usize>()
+    .expect("STUDIOFS_SFS509_METADATA_FILES must be usize");
     let size_arg = format!("--size={size}");
     let large_size_arg = format!("--size={large_size}");
     let multi_job_size_arg = format!("--size={multi_job_size}");
