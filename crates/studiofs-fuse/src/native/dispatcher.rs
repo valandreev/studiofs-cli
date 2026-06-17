@@ -321,20 +321,20 @@ impl DispatchTelemetryState {
     }
 }
 
-struct QueueDepthGuard {
-    telemetry: Arc<DispatchTelemetryState>,
+struct QueueDepthGuard<'a> {
+    telemetry: &'a DispatchTelemetryState,
     class: RequestClass,
 }
 
-impl QueueDepthGuard {
-    fn new(telemetry: Arc<DispatchTelemetryState>, class: RequestClass) -> Self {
+impl<'a> QueueDepthGuard<'a> {
+    fn new(telemetry: &'a DispatchTelemetryState, class: RequestClass) -> Self {
         Self { telemetry, class }
     }
 }
 
-impl Drop for QueueDepthGuard {
+impl Drop for QueueDepthGuard<'_> {
     fn drop(&mut self) {
-        self.telemetry.queue_depths[self.class.index()].fetch_sub(1, Ordering::AcqRel);
+        self.telemetry.queue_depths[self.class.index()].fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -449,28 +449,34 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
         let mut workers = Vec::with_capacity(RequestClass::ALL.len());
 
         for class in RequestClass::ALL {
-            let mut class_senders = Vec::with_capacity(self.worker_counts[class.index()]);
+            let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
+            let receiver = Arc::new(Mutex::new(receiver));
             for _ in 0..self.worker_counts[class.index()] {
-                let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
-                class_senders.push(sender);
                 let handler = self.handler.clone();
                 let worker_telemetry = Arc::clone(&telemetry);
+                let worker_receiver = Arc::clone(&receiver);
                 let worker = thread::spawn(move || {
-                    while let Ok(envelope) = receiver.recv() {
-                        let _depth = QueueDepthGuard::new(Arc::clone(&worker_telemetry), class);
+                    loop {
+                        let envelope = {
+                            let receiver = lock_or_recover(&worker_receiver);
+                            receiver.recv()
+                        };
+                        let Ok(envelope) = envelope else {
+                            break;
+                        };
+                        let _depth = QueueDepthGuard::new(worker_telemetry.as_ref(), class);
                         handler.handle(envelope);
                     }
                 });
                 workers.push(worker);
             }
-            senders.push(class_senders);
+            senders.push(sender);
         }
 
         NativeAsyncDispatcher::<S> {
             senders,
             workers,
             capacities: self.capacities,
-            next_workers: std::array::from_fn(|_| AtomicUsize::new(0)),
             telemetry,
         }
     }
@@ -478,10 +484,9 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 
 /// Bounded worker dispatcher for owned native FUSE requests.
 pub struct NativeAsyncDispatcher<S: ReplySink> {
-    senders: Vec<Vec<SyncSender<OwnedFuseRequest<S>>>>,
+    senders: Vec<SyncSender<OwnedFuseRequest<S>>>,
     workers: Vec<JoinHandle<()>>,
     capacities: [usize; 5],
-    next_workers: [AtomicUsize; 5],
     telemetry: Arc<DispatchTelemetryState>,
 }
 
@@ -505,8 +510,8 @@ where
     pub fn submit(&self, envelope: OwnedFuseRequest<S>) -> Result<(), DispatchError> {
         let class = envelope.class();
         let reserved = self.telemetry.queue_depths[class.index()].fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
             |current| {
                 if current >= self.capacities[class.index()] {
                     None
@@ -523,40 +528,21 @@ where
             return Err(DispatchError::QueueFull { class });
         }
 
-        let class_senders = &self.senders[class.index()];
-        if class_senders.is_empty() {
-            self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
-            envelope.reply.drop_without_reply();
-            return Err(DispatchError::Shutdown);
-        }
-
-        let start = self.next_workers[class.index()].fetch_add(1, Ordering::Relaxed);
-        let mut envelope = envelope;
-        let mut saw_disconnected = false;
-        for offset in 0..class_senders.len() {
-            let index = (start + offset) % class_senders.len();
-            match class_senders[index].try_send(envelope) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) => {
-                    envelope = returned;
-                }
-                Err(TrySendError::Disconnected(returned)) => {
-                    saw_disconnected = true;
-                    envelope = returned;
-                }
+        match self.senders[class.index()].try_send(envelope) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Disconnected(envelope)) => {
+                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::Relaxed);
+                envelope.reply.drop_without_reply();
+                Err(DispatchError::Shutdown)
             }
-        }
-
-        self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
-        if saw_disconnected {
-            envelope.reply.drop_without_reply();
-            Err(DispatchError::Shutdown)
-        } else {
-            self.telemetry
-                .backpressure_events
-                .fetch_add(1, Ordering::Relaxed);
-            envelope.reply.send_errno(libc::EAGAIN);
-            Err(DispatchError::QueueFull { class })
+            Err(TrySendError::Full(envelope)) => {
+                self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::Relaxed);
+                self.telemetry
+                    .backpressure_events
+                    .fetch_add(1, Ordering::Relaxed);
+                envelope.reply.send_errno(libc::EAGAIN);
+                Err(DispatchError::QueueFull { class })
+            }
         }
     }
 
@@ -567,9 +553,7 @@ where
 
     /// Stops intake and waits for worker queues to drain.
     pub fn shutdown(mut self) -> Result<(), DispatchError> {
-        for class_senders in &mut self.senders {
-            class_senders.clear();
-        }
+        self.senders.clear();
         for worker in self.workers {
             worker.join().map_err(|_| DispatchError::WorkerPanicked)?;
         }
@@ -751,6 +735,30 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct BlockingOneAsyncHandler {
+        blocked_unique: u64,
+        started: mpsc::Sender<u64>,
+        unblock: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl AsyncFuseOperationHandler<RecordedReplySink> for BlockingOneAsyncHandler {
+        fn handle(&self, envelope: OwnedFuseRequest<RecordedReplySink>) {
+            let unique = envelope.request.header.unique;
+            self.started
+                .send(unique)
+                .expect("test should receive handler start");
+            if unique == self.blocked_unique {
+                self.unblock
+                    .lock()
+                    .expect("unblock receiver poisoned")
+                    .recv()
+                    .expect("test should unblock handler");
+            }
+            envelope.reply.send_success(&[]);
+        }
+    }
+
+    #[derive(Clone)]
     struct PanickingAsyncHandler {
         started: mpsc::Sender<()>,
     }
@@ -882,6 +890,66 @@ mod tests {
 
         unblock_tx.send(()).expect("first read should unblock");
         unblock_tx.send(()).expect("second read should unblock");
+        dispatcher
+            .shutdown()
+            .expect("dispatcher should join workers");
+    }
+
+    #[test]
+    fn async_dispatcher_idle_worker_takes_request_behind_slow_worker() {
+        let sink = RecordedReplySink::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (unblock_tx, unblock_rx) = mpsc::channel();
+        let dispatcher =
+            NativeAsyncDispatcher::<RecordedReplySink>::builder(BlockingOneAsyncHandler {
+                blocked_unique: 0xb1,
+                started: started_tx,
+                unblock: Arc::new(Mutex::new(unblock_rx)),
+            })
+            .queue_capacity(RequestClass::Read, 3)
+            .worker_count(RequestClass::Read, 2)
+            .spawn();
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0xb1),
+                sink.clone(),
+            ))
+            .expect("first read should enter bounded queue");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("slow worker should start"),
+            0xb1
+        );
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0xb2),
+                sink.clone(),
+            ))
+            .expect("second read should enter bounded queue");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("fast worker should start"),
+            0xb2
+        );
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0xb3),
+                sink.clone(),
+            ))
+            .expect("third read should enter bounded queue");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("idle worker should take queued read"),
+            0xb3
+        );
+
+        unblock_tx.send(()).expect("slow read should unblock");
         dispatcher
             .shutdown()
             .expect("dispatcher should join workers");
