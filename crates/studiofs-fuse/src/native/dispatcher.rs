@@ -1,9 +1,9 @@
 //! Transport-independent native FUSE dispatcher.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
@@ -100,6 +100,12 @@ impl RequestClass {
     }
 }
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Owned request plus reply capability passed from transport intake to workers.
 #[derive(Debug)]
 pub struct OwnedFuseRequest<S: ReplySink> {
@@ -145,7 +151,8 @@ struct BarrierState {
 
 #[derive(Debug)]
 struct BarrierEntry {
-    pending_writes: usize,
+    next_sequence: u64,
+    pending_writes: BTreeSet<u64>,
     waiters: usize,
     changed: Arc<Condvar>,
 }
@@ -153,7 +160,8 @@ struct BarrierEntry {
 impl Default for BarrierEntry {
     fn default() -> Self {
         Self {
-            pending_writes: 0,
+            next_sequence: 0,
+            pending_writes: BTreeSet::new(),
             waiters: 0,
             changed: Arc::new(Condvar::new()),
         }
@@ -174,24 +182,32 @@ pub struct OperationBarrierGates {
 impl OperationBarrierGates {
     /// Records a pending write for `resource` until the returned guard drops.
     pub fn begin_write(&self, resource: ResourceKey) -> PendingWriteGuard {
-        let mut state = self.shared.state.lock().expect("barrier state poisoned");
-        state.entries.entry(resource).or_default().pending_writes += 1;
+        let mut state = lock_or_recover(&self.shared.state);
+        let entry = state.entries.entry(resource).or_default();
+        entry.next_sequence += 1;
+        let sequence = entry.next_sequence;
+        entry.pending_writes.insert(sequence);
         PendingWriteGuard {
             resource,
+            sequence,
             shared: Arc::clone(&self.shared),
         }
     }
 
     /// Waits until writes for `resource` drain.
     pub fn wait_for_barrier(&self, resource: ResourceKey) {
-        let mut state = self.shared.state.lock().expect("barrier state poisoned");
-        while state
+        let mut state = lock_or_recover(&self.shared.state);
+        let barrier_sequence = state
             .entries
             .get(&resource)
-            .map(|entry| entry.pending_writes)
-            .unwrap_or(0)
-            > 0
-        {
+            .map(|entry| entry.next_sequence)
+            .unwrap_or(0);
+        while state.entries.get(&resource).is_some_and(|entry| {
+            entry
+                .pending_writes
+                .iter()
+                .any(|sequence| *sequence <= barrier_sequence)
+        }) {
             let changed = {
                 let entry = state
                     .entries
@@ -202,10 +218,10 @@ impl OperationBarrierGates {
             };
             state = changed
                 .wait(state)
-                .expect("barrier state poisoned while waiting");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let remove_entry = if let Some(entry) = state.entries.get_mut(&resource) {
                 entry.waiters -= 1;
-                entry.pending_writes == 0 && entry.waiters == 0
+                entry.pending_writes.is_empty() && entry.waiters == 0
             } else {
                 false
             };
@@ -220,20 +236,21 @@ impl OperationBarrierGates {
 #[derive(Debug)]
 pub struct PendingWriteGuard {
     resource: ResourceKey,
+    sequence: u64,
     shared: Arc<BarrierShared>,
 }
 
 impl Drop for PendingWriteGuard {
     fn drop(&mut self) {
-        let mut state = self.shared.state.lock().expect("barrier state poisoned");
+        let mut state = lock_or_recover(&self.shared.state);
         let mut changed = None;
         let mut remove_entry = false;
         if let Some(entry) = state.entries.get_mut(&self.resource) {
-            entry.pending_writes -= 1;
-            if entry.pending_writes == 0 {
+            entry.pending_writes.remove(&self.sequence);
+            if entry.waiters > 0 {
                 changed = Some(Arc::clone(&entry.changed));
-                remove_entry = entry.waiters == 0;
             }
+            remove_entry = entry.pending_writes.is_empty() && entry.waiters == 0;
         }
         if remove_entry {
             state.entries.remove(&self.resource);
@@ -293,6 +310,9 @@ pub enum DispatchError {
     /// A worker thread panicked during shutdown.
     #[error("native FUSE dispatcher worker panicked")]
     WorkerPanicked,
+    /// The dispatcher is no longer accepting work.
+    #[error("native FUSE dispatcher is shut down")]
+    Shutdown,
 }
 
 impl PartialEq for DispatchError {
@@ -301,6 +321,7 @@ impl PartialEq for DispatchError {
             (self, other),
             (Self::QueueFull { class: left }, Self::QueueFull { class: right }) if left == right
         ) || matches!((self, other), (Self::WorkerPanicked, Self::WorkerPanicked))
+            || matches!((self, other), (Self::Shutdown, Self::Shutdown))
     }
 }
 
@@ -358,12 +379,19 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
 pub struct NativeAsyncDispatcherBuilder<H> {
     handler: H,
     capacities: [usize; 5],
+    worker_counts: [usize; 5],
 }
 
 impl<H> NativeAsyncDispatcherBuilder<H> {
     /// Overrides the bounded queue capacity for one operation class.
     pub fn queue_capacity(mut self, class: RequestClass, capacity: usize) -> Self {
         self.capacities[class.index()] = capacity;
+        self
+    }
+
+    /// Overrides worker thread count for one operation class.
+    pub fn worker_count(mut self, class: RequestClass, workers: usize) -> Self {
+        self.worker_counts[class.index()] = workers.max(1);
         self
     }
 
@@ -379,16 +407,27 @@ impl<H> NativeAsyncDispatcherBuilder<H> {
 
         for class in RequestClass::ALL {
             let (sender, receiver) = mpsc::sync_channel(self.capacities[class.index()]);
-            let handler = self.handler.clone();
-            let worker_telemetry = Arc::clone(&telemetry);
-            let worker = thread::spawn(move || {
-                while let Ok(envelope) = receiver.recv() {
-                    handler.handle(envelope);
-                    worker_telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
-                }
-            });
+            let receiver = Arc::new(Mutex::new(receiver));
+            for _ in 0..self.worker_counts[class.index()] {
+                let handler = self.handler.clone();
+                let worker_telemetry = Arc::clone(&telemetry);
+                let worker_receiver = Arc::clone(&receiver);
+                let worker = thread::spawn(move || {
+                    loop {
+                        let envelope = {
+                            let receiver = lock_or_recover(&worker_receiver);
+                            receiver.recv()
+                        };
+                        let Ok(envelope) = envelope else {
+                            break;
+                        };
+                        handler.handle(envelope);
+                        worker_telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
+                    }
+                });
+                workers.push(worker);
+            }
             senders.push(Some(sender));
-            workers.push(worker);
         }
 
         NativeAsyncDispatcher::<S> {
@@ -420,6 +459,7 @@ where
         NativeAsyncDispatcherBuilder {
             handler,
             capacities: [64; 5],
+            worker_counts: [1; 5],
         }
     }
 
@@ -445,11 +485,13 @@ where
             return Err(DispatchError::QueueFull { class });
         }
 
-        match self.senders[class.index()]
-            .as_ref()
-            .expect("dispatcher sender missing before shutdown")
-            .try_send(envelope)
-        {
+        let Some(sender) = self.senders[class.index()].as_ref() else {
+            self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
+            envelope.reply.drop_without_reply();
+            return Err(DispatchError::Shutdown);
+        };
+
+        match sender.try_send(envelope) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(envelope)) => {
                 self.telemetry.queue_depths[class.index()].fetch_sub(1, Ordering::AcqRel);
@@ -612,6 +654,18 @@ mod tests {
     }
 
     #[test]
+    fn reply_token_send_data_takes_slice_to_make_payload_copy_explicit() {
+        let sink = RecordedReplySink::default();
+        let token = ReplyToken::new_classic(0x74, sink.clone());
+        let payload = [1, 2, 3, 4];
+
+        token.send_data(&payload);
+
+        assert_eq!(sink.completed_unique_ids(), [0x74]);
+        assert_eq!(sink.completed_replies()[0].bytes[16..], payload);
+    }
+
+    #[test]
     fn reply_token_drop_without_completion_fails_closed_with_eio() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_classic(0x73, sink.clone());
@@ -726,6 +780,48 @@ mod tests {
     }
 
     #[test]
+    fn async_dispatcher_can_run_multiple_workers_for_one_operation_class() {
+        let sink = RecordedReplySink::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (unblock_tx, unblock_rx) = mpsc::channel();
+        let dispatcher =
+            NativeAsyncDispatcher::<RecordedReplySink>::builder(BlockingAsyncHandler {
+                started: started_tx,
+                unblock: Arc::new(Mutex::new(unblock_rx)),
+            })
+            .queue_capacity(RequestClass::Read, 2)
+            .worker_count(RequestClass::Read, 2)
+            .spawn();
+
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0x91),
+                sink.clone(),
+            ))
+            .expect("first read should enter bounded queue");
+        dispatcher
+            .submit(OwnedFuseRequest::classic(
+                request(FuseOpcode::Read, 0x92),
+                sink.clone(),
+            ))
+            .expect("second read should enter bounded queue");
+
+        let first = started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("first worker should start");
+        let second = started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("second worker should start without waiting for first completion");
+        assert_eq!([first, second], [0x91, 0x92]);
+
+        unblock_tx.send(()).expect("first read should unblock");
+        unblock_tx.send(()).expect("second read should unblock");
+        dispatcher
+            .shutdown()
+            .expect("dispatcher should join workers");
+    }
+
+    #[test]
     fn dispatcher_classifies_write_and_barrier_opcodes_explicitly() {
         assert_eq!(
             RequestClass::for_opcode(FuseOpcode::Write),
@@ -784,6 +880,29 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_millis(250))
             .expect("barrier should not wait for other inode writes");
+    }
+
+    #[test]
+    fn barrier_gate_waits_only_for_writes_pending_when_barrier_started() {
+        let gates = OperationBarrierGates::default();
+        let pending_before_barrier = gates.begin_write(ResourceKey::Inode(30));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let waiter_gates = gates.clone();
+
+        std::thread::spawn(move || {
+            waiter_gates.wait_for_barrier(ResourceKey::Inode(30));
+            finished_tx
+                .send(())
+                .expect("test should observe barrier completion");
+        });
+
+        assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let _pending_after_barrier = gates.begin_write(ResourceKey::Inode(30));
+        drop(pending_before_barrier);
+
+        finished_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("barrier should ignore writes that started after it");
     }
 
     fn request(opcode: FuseOpcode, unique: u64) -> FuseRequest {

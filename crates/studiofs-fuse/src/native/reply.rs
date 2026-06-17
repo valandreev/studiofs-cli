@@ -82,11 +82,11 @@ impl<S: ReplySink> ReplyToken<S> {
         });
     }
 
-    /// Sends an owned data reply without forcing callers to retain the buffer.
-    pub fn send_data(mut self, data: Vec<u8>) {
+    /// Sends a data reply, copying the payload behind a FUSE reply header.
+    pub fn send_data(mut self, data: &[u8]) {
         self.complete(FuseReply {
             unique: self.unique,
-            bytes: ok_reply(self.unique, &data),
+            bytes: ok_reply(self.unique, data),
         });
     }
 
