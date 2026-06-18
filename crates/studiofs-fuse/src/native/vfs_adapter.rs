@@ -2722,14 +2722,21 @@ fn open_reply_flags(decision: NativeOpenCacheDecision) -> u32 {
     }
 }
 
+fn native_read_plan_invalidation_generation(attr: &InodeAttr) -> u64 {
+    let mut generation = attr.content_epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    generation ^= attr.size.rotate_left(17);
+    generation ^= (attr.mtime as u64).rotate_left(31);
+    generation ^= (attr.ctime as u64).rotate_left(43);
+    generation.max(1)
+}
+
 fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInodeCacheState {
+    let invalidation_generation = native_read_plan_invalidation_generation(&attr);
     NativeInodeCacheState {
         content_epoch: attr.content_epoch,
         size: attr.size,
         mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
-        // Native Linux does not yet install a kernel invalidator generation source;
-        // content epoch, size, and mtime remain the active production coherency keys.
-        invalidation_generation: 0,
+        invalidation_generation,
         trusted: None,
         writer_active: dirty,
         dirty,
@@ -3348,9 +3355,28 @@ mod tests {
         assert_eq!(state.content_epoch, 9);
         assert_eq!(state.size, 4096);
         assert_eq!(state.mtime_ns, 123_456);
+        assert_ne!(state.invalidation_generation, 0);
         assert!(state.writer_active);
         assert!(state.dirty);
         assert!(state.local_materialized);
+    }
+
+    #[test]
+    fn native_open_cache_state_generation_changes_with_attr_metadata() {
+        let mut first = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
+        first.size = 4096;
+        first.mtime = 123_456;
+        first.content_epoch = 9;
+        let mut second = first.clone();
+        second.mtime = 123_457;
+
+        let first = native_open_cache_state_from_attr(first, false);
+        let second = native_open_cache_state_from_attr(second, false);
+
+        assert_ne!(
+            first.invalidation_generation,
+            second.invalidation_generation
+        );
     }
 
     #[test]

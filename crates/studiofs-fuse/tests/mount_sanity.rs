@@ -596,6 +596,24 @@ fn docs_list_sfs530_native_evidence_command() {
 }
 
 #[test]
+fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
+    let source = include_str!("mount_sanity.rs");
+    let writer = source
+        .rsplit("fn write_sfs530_telemetry_snapshot")
+        .next()
+        .and_then(|rest| {
+            rest.split("fn run_sfs530_evidence_matrix_if_available")
+                .next()
+        })
+        .expect("SFS-530 telemetry writer should be present");
+
+    assert!(writer.contains("local_cache_unavailable_fallbacks"));
+    assert!(writer.contains("stale_epoch_fallbacks"));
+    assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
+    assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
+}
+
+#[test]
 fn mounted_tests_enabled_falls_back_to_workspace_dotenv_value() {
     assert!(mounted_tests_enabled_from_values(None, Some("1")));
 }
@@ -2259,6 +2277,8 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"write_p95_ns\": {native_write_p95_ns},\n",
             "    \"write_p99_ns\": {native_write_p99_ns},\n",
             "    \"local_cache_hits\": {native_local_cache_hits},\n",
+            "    \"local_cache_unavailable_fallbacks\": {native_local_cache_unavailable_fallbacks},\n",
+            "    \"stale_epoch_fallbacks\": {native_stale_epoch_fallbacks},\n",
             "    \"stale_generation_fallbacks\": {native_stale_generation_fallbacks},\n",
             "    \"bytes_fallbacks\": {native_bytes_fallbacks},\n",
             "    \"bytes_returned\": {native_bytes_returned},\n",
@@ -2326,6 +2346,8 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         native_write_p95_ns = native_bridge.write_latency.p95_ns,
         native_write_p99_ns = native_bridge.write_latency.p99_ns,
         native_local_cache_hits = native_bridge.local_cache_hits,
+        native_local_cache_unavailable_fallbacks = native_bridge.local_cache_unavailable_fallbacks,
+        native_stale_epoch_fallbacks = native_bridge.stale_epoch_fallbacks,
         native_stale_generation_fallbacks = native_bridge.stale_generation_fallbacks,
         native_bytes_fallbacks = native_bridge.bytes_fallbacks,
         native_bytes_returned = native_bridge.bytes_returned,
