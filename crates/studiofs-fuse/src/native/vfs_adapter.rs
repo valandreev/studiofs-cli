@@ -1237,6 +1237,37 @@ fn scaled_ratio_micros(numerator: u64, denominator: u64) -> u64 {
     numerator.saturating_mul(1_000_000) / denominator
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NativeFuseMetric {
+    Lookup,
+    Getattr,
+    Readdir,
+    Readdirplus,
+    Open,
+    Release,
+    Read,
+    Write,
+}
+
+struct NativeFuseMetricsGuard<'a, V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
+    bridge: &'a LinuxNativeBridge<V>,
+    metric: NativeFuseMetric,
+    started_at: Instant,
+}
+
+impl<V> Drop for NativeFuseMetricsGuard<'_, V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.bridge
+            .record_native_fuse_metric(self.metric, elapsed_latency_ns(self.started_at));
+    }
+}
+
 /// Snapshot of native Linux read path counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativeReadMetricsSnapshot {
@@ -1382,19 +1413,38 @@ impl<V> LinuxNativeBridge<V>
 where
     V: NativeVfs + Clone + Send + 'static,
 {
+    fn metrics_guard(&self, metric: NativeFuseMetric) -> NativeFuseMetricsGuard<'_, V> {
+        NativeFuseMetricsGuard {
+            bridge: self,
+            metric,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn record_native_fuse_metric(&self, metric: NativeFuseMetric, latency_ns: u64) {
+        match metric {
+            NativeFuseMetric::Lookup => self.amplification_metrics.record_lookup(latency_ns),
+            NativeFuseMetric::Getattr => self.amplification_metrics.record_getattr(latency_ns),
+            NativeFuseMetric::Readdir => self.amplification_metrics.record_readdir(latency_ns),
+            NativeFuseMetric::Readdirplus => {
+                self.amplification_metrics.record_readdirplus(latency_ns);
+            }
+            NativeFuseMetric::Open => self.amplification_metrics.record_open(latency_ns),
+            NativeFuseMetric::Release => self.amplification_metrics.record_release(latency_ns),
+            NativeFuseMetric::Read => self.amplification_metrics.record_read(latency_ns),
+            NativeFuseMetric::Write => self.amplification_metrics.record_write(latency_ns),
+        }
+        self.publish_native_bridge_snapshot_if_due();
+    }
+
     fn handle_lookup(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Lookup);
         let name = match lookup_name(&request.payload) {
             Some(name) => name,
-            None => {
-                self.amplification_metrics
-                    .record_lookup(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
 
-        let reply = match self.vfs.lookup(request.header.nodeid, name) {
+        match self.vfs.lookup(request.header.nodeid, name) {
             Ok(attr) => {
                 self.add_lookup(attr.ino, 1);
                 FuseReply::contiguous(
@@ -1407,11 +1457,7 @@ where
                 ok_reply(request.header.unique, &negative_entry_payload()),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_lookup(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_forget(&self, request: FuseRequest) -> FuseReply {
@@ -1422,33 +1468,24 @@ where
     }
 
     fn handle_getattr(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
-        let reply = match self.vfs.getattr(request.header.nodeid) {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Getattr);
+        match self.vfs.getattr(request.header.nodeid) {
             Ok(attr) => FuseReply::contiguous(
                 request.header.unique,
                 ok_reply(request.header.unique, &attr_out_payload(attr)),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_getattr(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_open(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Open);
         let flags = match open_flags(&request.payload) {
             Some(flags) => flags,
-            None => {
-                self.amplification_metrics
-                    .record_open(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
 
-        let reply = match self.vfs.open(request.header.nodeid, flags) {
+        match self.vfs.open(request.header.nodeid, flags) {
             Ok(fh) => {
                 let decision = self.open_cache_decision(
                     request.header.nodeid,
@@ -1461,23 +1498,14 @@ where
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_open(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_release(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Release);
         let fh = match release_fh(&request.payload) {
             Some(fh) => fh,
-            None => {
-                self.amplification_metrics
-                    .record_release(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         if self.async_write.is_some() {
@@ -1486,9 +1514,6 @@ where
                 .drain_and_begin_close(request.header.nodeid, fh);
             self.publish_async_write_snapshot();
             if pending_result == Err(libc::EAGAIN) {
-                self.amplification_metrics
-                    .record_release(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
                 return errno_reply(request.header.unique, libc::EAGAIN);
             }
             let release_result = self.vfs.release(fh);
@@ -1497,42 +1522,27 @@ where
                 self.forget_read_ahead_handle(request.header.nodeid, fh);
             }
             let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
-            self.amplification_metrics
-                .record_release(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot_if_due();
             return reply;
         }
 
         self.barrier_gates
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
-        let reply = match self.vfs.release(fh) {
+        match self.vfs.release(fh) {
             Ok(()) => {
                 self.forget_read_ahead_handle(request.header.nodeid, fh);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_release(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_read(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Read);
         let read = match read_request(&request.payload) {
             Some(read) => read,
-            None => {
-                self.amplification_metrics
-                    .record_read(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
         if let Err(errno) = checked_native_read_size(read.size) {
-            self.amplification_metrics
-                .record_read(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot_if_due();
             return errno_reply(request.header.unique, errno);
         }
         self.observe_read_ahead(request.header.nodeid, read);
@@ -1555,9 +1565,6 @@ where
                                 self.read_metrics
                                     .bytes_returned
                                     .fetch_add(u64::from(range_len), Ordering::Relaxed);
-                                self.amplification_metrics
-                                    .record_read(elapsed_latency_ns(started_at));
-                                self.publish_native_bridge_snapshot_if_due();
                                 return reply;
                             }
                             Err(error) => {
@@ -1594,14 +1601,11 @@ where
                     .fetch_add(1, Ordering::Relaxed);
             }
             Err(errno) => {
-                self.amplification_metrics
-                    .record_read(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
                 return errno_reply(request.header.unique, errno);
             }
         }
 
-        let reply = match self
+        match self
             .vfs
             .read(read.fh, request.header.nodeid, read.offset, read.size)
         {
@@ -1615,23 +1619,14 @@ where
                 FuseReply::segmented_data(request.header.unique, data)
             }
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_read(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_write(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Write);
         let write = match write_request(&request.payload) {
             Some(write) => write,
-            None => {
-                self.amplification_metrics
-                    .record_write(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
 
         if let Some(config) = &self.async_write {
@@ -1641,16 +1636,13 @@ where
                 write,
                 config,
             );
-            self.amplification_metrics
-                .record_write(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot_if_due();
             return reply;
         }
 
         let _pending_write = self
             .barrier_gates
             .begin_write(ResourceKey::Inode(request.header.nodeid));
-        let reply = match self.vfs.write(
+        match self.vfs.write(
             write.fh,
             request.header.nodeid,
             write.offset,
@@ -1665,11 +1657,7 @@ where
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_write(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_async_write(
@@ -1807,61 +1795,37 @@ where
     }
 
     fn handle_readdir(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Readdir);
         let readdir = match read_request(&request.payload) {
             Some(readdir) => readdir,
-            None => {
-                self.amplification_metrics
-                    .record_readdir(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
         let offset = match i64::try_from(readdir.offset) {
             Ok(offset) => offset,
-            Err(_) => {
-                self.amplification_metrics
-                    .record_readdir(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            Err(_) => return invalid_request(request.header.unique),
         };
 
-        let reply = match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
+        match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
             Ok(entries) => FuseReply::segmented_data(
                 request.header.unique,
                 readdir_payload(&entries, offset, readdir.size),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_readdir(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_readdirplus(&self, request: FuseRequest) -> FuseReply {
-        let started_at = Instant::now();
+        let _metrics = self.metrics_guard(NativeFuseMetric::Readdirplus);
         let readdir = match read_request(&request.payload) {
             Some(readdir) => readdir,
-            None => {
-                self.amplification_metrics
-                    .record_readdirplus(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            None => return invalid_request(request.header.unique),
         };
         let offset = match i64::try_from(readdir.offset) {
             Ok(offset) => offset,
-            Err(_) => {
-                self.amplification_metrics
-                    .record_readdirplus(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot_if_due();
-                return invalid_request(request.header.unique);
-            }
+            Err(_) => return invalid_request(request.header.unique),
         };
 
-        let reply = match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
+        match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
             Ok(entries) => {
                 let payload =
                     match readdirplus_payload(&self.vfs, &entries, offset, readdir.size, |ino| {
@@ -1869,20 +1833,13 @@ where
                     }) {
                         Ok(payload) => payload,
                         Err(errno) => {
-                            self.amplification_metrics
-                                .record_readdirplus(elapsed_latency_ns(started_at));
-                            self.publish_native_bridge_snapshot_if_due();
                             return errno_reply(request.header.unique, errno);
                         }
                     };
                 FuseReply::segmented_data(request.header.unique, payload)
             }
             Err(errno) => errno_reply(request.header.unique, errno),
-        };
-        self.amplification_metrics
-            .record_readdirplus(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot_if_due();
-        reply
+        }
     }
 
     fn handle_batch_forget(&self, request: FuseRequest) -> FuseReply {
@@ -3341,6 +3298,39 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].0.lookup_ops, 1);
         assert_eq!(bridge.amplification_metrics_snapshot().getattr_ops, 1);
+    }
+
+    #[test]
+    fn native_fuse_handlers_use_metrics_guard_for_instrumented_paths() {
+        let source = include_str!("vfs_adapter.rs");
+        for (handler, metric, manual_record) in [
+            ("handle_lookup", "Lookup", ".record_lookup("),
+            ("handle_getattr", "Getattr", ".record_getattr("),
+            ("handle_open", "Open", ".record_open("),
+            ("handle_release", "Release", ".record_release("),
+            ("handle_read", "Read", ".record_read("),
+            ("handle_write", "Write", ".record_write("),
+            ("handle_readdir", "Readdir", ".record_readdir("),
+            ("handle_readdirplus", "Readdirplus", ".record_readdirplus("),
+        ] {
+            let body = source
+                .split(&format!("fn {handler}(&self, request: FuseRequest)"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .expect("handler body should be present");
+            assert!(
+                body.contains(&format!("self.metrics_guard(NativeFuseMetric::{metric})")),
+                "{handler} should create a metrics guard"
+            );
+            assert!(
+                !body.contains(manual_record),
+                "{handler} should not manually record latency on each return path"
+            );
+            assert!(
+                !body.contains("publish_native_bridge_snapshot_if_due"),
+                "{handler} should publish through metrics guard drop"
+            );
+        }
     }
 
     #[test]

@@ -657,10 +657,7 @@ fn wait_for_upload_drain(
     let started = Instant::now();
     let before = sample_metrics(metrics_path)?;
     let mut after = before.clone();
-    let mut samples = vec![UploadDrainSample {
-        elapsed_ms: 0,
-        snapshot: before.clone(),
-    }];
+    let mut samples = vec![upload_drain_sample_observation(0, before.as_ref())];
     let poll = if poll.is_zero() {
         Duration::from_millis(1)
     } else {
@@ -677,10 +674,10 @@ fn wait_for_upload_drain(
         }
         thread::sleep(poll);
         after = sample_metrics(metrics_path)?;
-        samples.push(UploadDrainSample {
-            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            snapshot: after.clone(),
-        });
+        samples.push(upload_drain_sample_observation(
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            after.as_ref(),
+        ));
     }
 
     Ok(UploadDrainResult {
@@ -1019,18 +1016,14 @@ impl From<PerformanceProbeConfig> for PerformanceProbeConfigSummary {
 struct UploadDrainResult {
     before: Option<Value>,
     after: Option<Value>,
-    samples: Vec<UploadDrainSample>,
+    samples: Vec<UploadDrainSampleObservation>,
     elapsed: Duration,
     timed_out: bool,
 }
 
 impl UploadDrainResult {
     fn into_observation(self) -> UploadDrainObservation {
-        let samples: Vec<UploadDrainSampleObservation> = self
-            .samples
-            .iter()
-            .map(UploadDrainSampleObservation::from_sample)
-            .collect();
+        let samples = self.samples;
         let sample_count = samples.len();
         let max_active_uploads = samples
             .iter()
@@ -1106,12 +1099,6 @@ impl UploadDrainResult {
     }
 }
 
-#[derive(Debug, Clone)]
-struct UploadDrainSample {
-    elapsed_ms: u64,
-    snapshot: Option<Value>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UploadDrainSampleObservation {
     elapsed_ms: u64,
@@ -1125,34 +1112,23 @@ struct UploadDrainSampleObservation {
     drain_lag_bytes: u64,
 }
 
-impl UploadDrainSampleObservation {
-    fn from_sample(sample: &UploadDrainSample) -> Self {
-        Self {
-            elapsed_ms: sample.elapsed_ms,
-            metrics_seen: sample.snapshot.is_some(),
-            pending_uploads: metric_value(sample.snapshot.as_ref(), &["upload", "pending_uploads"]),
-            pending_upload_bytes: metric_value(
-                sample.snapshot.as_ref(),
-                &["upload", "pending_upload_bytes"],
-            ),
-            active_uploads: metric_value(sample.snapshot.as_ref(), &["upload", "active_uploads"]),
-            completed_uploads: metric_value(
-                sample.snapshot.as_ref(),
-                &["upload", "completed_uploads"],
-            ),
-            oldest_pending_upload_age_ms: metric_value(
-                sample.snapshot.as_ref(),
-                &["upload", "oldest_pending_upload_age_ms"],
-            ),
-            dirty_total_bytes: metric_value(
-                sample.snapshot.as_ref(),
-                &["dirty_pressure", "total_dirty_bytes"],
-            ),
-            drain_lag_bytes: metric_value(
-                sample.snapshot.as_ref(),
-                &["drain_lag", "current_bytes"],
-            ),
-        }
+fn upload_drain_sample_observation(
+    elapsed_ms: u64,
+    snapshot: Option<&Value>,
+) -> UploadDrainSampleObservation {
+    UploadDrainSampleObservation {
+        elapsed_ms,
+        metrics_seen: snapshot.is_some(),
+        pending_uploads: metric_value(snapshot, &["upload", "pending_uploads"]),
+        pending_upload_bytes: metric_value(snapshot, &["upload", "pending_upload_bytes"]),
+        active_uploads: metric_value(snapshot, &["upload", "active_uploads"]),
+        completed_uploads: metric_value(snapshot, &["upload", "completed_uploads"]),
+        oldest_pending_upload_age_ms: metric_value(
+            snapshot,
+            &["upload", "oldest_pending_upload_age_ms"],
+        ),
+        dirty_total_bytes: metric_value(snapshot, &["dirty_pressure", "total_dirty_bytes"]),
+        drain_lag_bytes: metric_value(snapshot, &["drain_lag", "current_bytes"]),
     }
 }
 
@@ -1734,6 +1710,19 @@ mod tests {
     }
 
     #[test]
+    fn upload_drain_result_samples_store_lightweight_observations() {
+        let source = include_str!("performance_probe.rs");
+        let result_struct = source
+            .split("struct UploadDrainResult")
+            .nth(1)
+            .and_then(|rest| rest.split("impl UploadDrainResult").next())
+            .expect("upload drain result struct should be present");
+
+        assert!(result_struct.contains("samples: Vec<UploadDrainSampleObservation>"));
+        assert!(!source.contains("\nstruct UploadDrainSample {\n"));
+    }
+
+    #[test]
     fn upload_drain_failure_detail_names_stalled_scheduler_state() {
         let observation = UploadDrainObservation {
             timed_out: true,
@@ -1757,11 +1746,8 @@ mod tests {
         assert!(detail.contains("oldest_pending_upload_age_ms_after=165000"));
     }
 
-    fn upload_drain_sample(elapsed_ms: u64, snapshot: Value) -> UploadDrainSample {
-        UploadDrainSample {
-            elapsed_ms,
-            snapshot: Some(snapshot),
-        }
+    fn upload_drain_sample(elapsed_ms: u64, snapshot: Value) -> UploadDrainSampleObservation {
+        upload_drain_sample_observation(elapsed_ms, Some(&snapshot))
     }
 
     fn assert_f64_eq(actual: f64, expected: f64) {
