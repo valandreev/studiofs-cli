@@ -96,29 +96,55 @@ pub struct FuseLocalCacheReadRange {
     pub len: u32,
     /// StudioFS content epoch validated by the VFS when the range was produced.
     pub content_epoch: u64,
+    /// StudioFS invalidation generation validated by the VFS when the range was produced.
+    pub invalidation_generation: u64,
     source: Option<Arc<OwnedFd>>,
 }
 
 impl FuseLocalCacheReadRange {
     /// Builds a range from a borrowed source fd.
     pub fn borrowed(fd: RawFd, file_offset: u64, len: u32, content_epoch: u64) -> Self {
+        Self::borrowed_with_generation(fd, file_offset, len, content_epoch, 0)
+    }
+
+    /// Builds a range from a borrowed source fd and explicit invalidation generation.
+    pub fn borrowed_with_generation(
+        fd: RawFd,
+        file_offset: u64,
+        len: u32,
+        content_epoch: u64,
+        invalidation_generation: u64,
+    ) -> Self {
         Self {
             fd,
             file_offset,
             len,
             content_epoch,
+            invalidation_generation,
             source: None,
         }
     }
 
     /// Builds a range that owns a duplicated source fd before crossing API boundaries.
     pub fn try_dup(fd: RawFd, file_offset: u64, len: u32, content_epoch: u64) -> io::Result<Self> {
+        Self::try_dup_with_generation(fd, file_offset, len, content_epoch, 0)
+    }
+
+    /// Builds a duplicated range with an explicit invalidation generation.
+    pub fn try_dup_with_generation(
+        fd: RawFd,
+        file_offset: u64,
+        len: u32,
+        content_epoch: u64,
+        invalidation_generation: u64,
+    ) -> io::Result<Self> {
         let source = duplicate_fd(fd)?;
         Ok(Self {
             fd: source.as_raw_fd(),
             file_offset,
             len,
             content_epoch,
+            invalidation_generation,
             source: Some(source),
         })
     }

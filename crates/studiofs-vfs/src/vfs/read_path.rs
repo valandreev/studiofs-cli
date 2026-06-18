@@ -34,6 +34,8 @@ pub struct VfsLocalCacheReadRange {
     pub payload: LocalPayloadReadRange,
     /// Content epoch associated with the VFS read plan.
     pub content_epoch: u64,
+    /// Metadata invalidation generation associated with the VFS read plan.
+    pub invalidation_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1561,6 +1563,7 @@ impl StudioVfs {
         Ok(Some(VfsLocalCacheReadRange {
             payload: range,
             content_epoch: prepared.context.attr.content_epoch,
+            invalidation_generation: 0,
         }))
     }
 

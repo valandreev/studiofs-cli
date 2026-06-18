@@ -377,6 +377,92 @@ pub struct VfsFuseAsyncReadSnapshot {
     pub boundary_pool_fallback_allocations: u64,
 }
 
+/// Latency statistics for one native Linux bridge opcode family.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VfsNativeLatencySnapshot {
+    /// Number of sampled operations.
+    pub samples: u64,
+    /// Total observed latency in nanoseconds.
+    pub total_ns: u64,
+    /// Maximum observed latency in nanoseconds.
+    pub max_ns: u64,
+    /// 95th percentile latency in nanoseconds.
+    pub p95_ns: u64,
+    /// 99th percentile latency in nanoseconds.
+    pub p99_ns: u64,
+}
+
+/// Native Linux bridge amplification and sparse-read telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VfsNativeBridgeSnapshot {
+    /// Total FUSE operations included in amplification telemetry.
+    pub fuse_ops: u64,
+    /// Metadata probe operations handled by the native bridge.
+    pub metadata_ops: u64,
+    /// Lookup operations handled by the native bridge.
+    pub lookup_ops: u64,
+    /// Getattr operations handled by the native bridge.
+    pub getattr_ops: u64,
+    /// Readdir operations handled by the native bridge.
+    pub readdir_ops: u64,
+    /// Readdirplus operations handled by the native bridge.
+    pub readdirplus_ops: u64,
+    /// File open operations handled by the native bridge.
+    pub open_ops: u64,
+    /// File release operations handled by the native bridge.
+    pub release_ops: u64,
+    /// Application read operations handled by the native bridge.
+    pub read_ops: u64,
+    /// Application write operations handled by the native bridge.
+    pub write_ops: u64,
+    /// Lookup/getattr ratio scaled by 1,000,000.
+    pub lookup_getattr_ratio_micros: u64,
+    /// Open/release ratio scaled by 1,000,000.
+    pub open_release_ratio_micros: u64,
+    /// Total FUSE operations per application read/write, scaled by 1,000,000.
+    pub fuse_ops_per_read_write_micros: u64,
+    /// Metadata operations per file open, scaled by 1,000,000.
+    pub metadata_ops_per_open_micros: u64,
+    /// Total metadata latency across lookup/getattr/readdir/readdirplus.
+    pub metadata_latency_total_ns: u64,
+    /// Lookup latency statistics.
+    pub lookup_latency: VfsNativeLatencySnapshot,
+    /// Getattr latency statistics.
+    pub getattr_latency: VfsNativeLatencySnapshot,
+    /// Readdir latency statistics.
+    pub readdir_latency: VfsNativeLatencySnapshot,
+    /// Readdirplus latency statistics.
+    pub readdirplus_latency: VfsNativeLatencySnapshot,
+    /// Open latency statistics.
+    pub open_latency: VfsNativeLatencySnapshot,
+    /// Release latency statistics.
+    pub release_latency: VfsNativeLatencySnapshot,
+    /// Read latency statistics.
+    pub read_latency: VfsNativeLatencySnapshot,
+    /// Write latency statistics.
+    pub write_latency: VfsNativeLatencySnapshot,
+    /// Local-cache reads served as stable local-cache range replies.
+    pub local_cache_hits: u64,
+    /// Reads that had no local-cache range available and used bytes fallback.
+    pub local_cache_unavailable_fallbacks: u64,
+    /// Reads that rejected a local-cache range because its epoch was stale.
+    pub stale_epoch_fallbacks: u64,
+    /// Reads that rejected a local-cache range because its invalidation generation was stale.
+    pub stale_generation_fallbacks: u64,
+    /// Reads served through the safe bytes fallback.
+    pub bytes_fallbacks: u64,
+    /// Total payload bytes returned from reads by this bridge.
+    pub bytes_returned: u64,
+    /// Read-ahead decisions that issued a prefetch hint.
+    pub read_ahead_prefetches: u64,
+    /// Read-ahead decisions that intentionally avoided prefetch.
+    pub read_ahead_suppressed: u64,
+    /// Bytes requested beyond application reads by read-ahead decisions.
+    pub read_ahead_amplification_bytes: u64,
+}
+
 /// FUSE I/O callback metrics for one direction.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsFuseIoStats {
@@ -851,6 +937,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Async FUSE read diagnostics.
     #[serde(default)]
     pub fuse_async_read: VfsFuseAsyncReadSnapshot,
+    /// Native Linux bridge amplification and sparse-read diagnostics.
+    #[serde(default)]
+    pub native_bridge: VfsNativeBridgeSnapshot,
     /// Landing-zone metrics.
     #[serde(default)]
     pub landing_zone: VfsWritePathLandingZoneStats,
