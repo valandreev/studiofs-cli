@@ -1183,6 +1183,73 @@ fn linux_native_local_cache_read_benchmark_report_covers_sfs529_gate() {
 }
 
 #[test]
+fn linux_native_bridge_performance_gates_cover_sfs532_rollout_decision() {
+    let doc = read_workspace_file("docs/perf/sfs-532-linux-native-bridge-performance-gates.md");
+    let script = read_workspace_file("tools/perf/sfs532-linux-native-gates.sh");
+    let tests_doc = read_workspace_file("docs/tests.md");
+    let combined = format!("{doc}\n{script}");
+    let normalized_doc = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "SFS-532",
+        "LinuxNativeBridge performance gates",
+        "target/sfs-532-linux-native-bridge-performance-gates",
+        "compact benchmark",
+        "sustained benchmark",
+        "raw ext4 buffered",
+        "raw ext4 direct",
+        "fuser-era baseline",
+        "LinuxNativeBridge classic conservative profile",
+        "LinuxNativeBridge classic high-throughput profile",
+        "LinuxNativeBridge io_uring profile",
+        "JuiceFS reference",
+        "sequential read/write",
+        "warm repeated read",
+        "random read/write",
+        "mixed read/write",
+        "multi-job read/write",
+        "fsync-heavy",
+        "metadata create/stat/readdir",
+        "large-file local-cache read",
+        "throughput",
+        "IOPS",
+        "latency",
+        "CPU",
+        "FUSE op amplification",
+        "queue wait",
+        "cache decisions",
+        "transport mode",
+        "io_uring fallback count",
+        "enabled kernel capabilities",
+        "same-host ratio",
+        "pass/fail/investigate",
+        "rollout decision",
+        "default NativeBridge",
+        "opt-in NativeBridge",
+        "io_uring profile decision",
+        "pause and redesign",
+        "cargo test -p studiofs --test architecture_vocabulary_test linux_native_bridge_performance_gates_cover_sfs532_rollout_decision -- --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&combined, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-532 LinuxNativeBridge performance gates are missing required rollout-decision surfaces:\n{}",
+        missing.join("\n")
+    );
+
+    assert!(
+        tests_doc.contains("SFS-532 LinuxNativeBridge performance gates")
+            && tests_doc.contains("tools/perf/sfs532-linux-native-gates.sh compact")
+            && tests_doc.contains("tools/perf/sfs532-linux-native-gates.sh sustained"),
+        "docs/tests.md should list the SFS-532 compact and sustained benchmark commands"
+    );
+}
+
+#[test]
 fn linux_native_bridge_contract_covers_sfs524_architecture_gate() {
     let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
