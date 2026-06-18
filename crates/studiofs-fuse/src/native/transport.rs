@@ -56,8 +56,11 @@ const _: [(); FUSE_URING_ENT_IN_OUT_SZ] = [(); std::mem::size_of::<FuseUringEntI
 const _: [(); FUSE_URING_REQ_HEADER_SZ] = [(); std::mem::size_of::<FuseUringReqHeader>()];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Linux FUSE-over-io_uring command submitted through `IORING_OP_URING_CMD`.
 pub enum FuseUringCommandOp {
+    /// Register a queue entry buffer with the kernel FUSE connection.
     Register,
+    /// Commit the previous reply for an entry and fetch the next request.
     CommitAndFetch,
 }
 
@@ -71,7 +74,9 @@ impl FuseUringCommandOp {
 }
 
 #[derive(Debug)]
+/// Prepared FUSE-over-io_uring command that borrows a registered queue entry.
 pub struct FuseUringCommand<'a> {
+    /// Kernel command opcode encoded into the io_uring SQE.
     pub op: FuseUringCommandOp,
     fuse_fd: RawFd,
     cmd_req: FuseUringCmdReq,
@@ -96,6 +101,7 @@ impl FuseUringCommand<'_> {
         cmd
     }
 
+    /// Build an SQE128 ready to submit to the io_uring backend.
     pub fn build_sqe(&self, user_data: u64) -> io_uring::squeue::Entry128 {
         let mut sqe = opcode::UringCmd80::new(types::Fd(self.fuse_fd), self.op.as_raw())
             .cmd(self.cmd_bytes())
@@ -129,6 +135,7 @@ fn set_uring_cmd_iovec_count(sqe: &mut io_uring::squeue::Entry128, iovec_count: 
 }
 
 #[derive(Debug)]
+/// Owned FUSE-over-io_uring queue entry with stable request/reply buffers.
 pub struct FuseUringEntry {
     qid: u16,
     user_data: u64,
@@ -144,6 +151,7 @@ pub struct FuseUringEntry {
 unsafe impl Send for FuseUringEntry {}
 
 impl FuseUringEntry {
+    /// Allocate a queue entry for `qid` with a payload buffer sized for the session.
     pub fn new(qid: u16, payload_len: usize) -> Self {
         Self {
             qid,
@@ -171,10 +179,12 @@ impl FuseUringEntry {
         }
     }
 
+    /// Prepare the entry registration command for this queue slot.
     pub fn register_command(&mut self, fuse_fd: RawFd) -> FuseUringCommand<'_> {
         self.command(FuseUringCommandOp::Register, fuse_fd, 0)
     }
 
+    /// Prepare a command that commits `commit_id` and fetches the next request.
     pub fn commit_and_fetch_command(
         &mut self,
         fuse_fd: RawFd,
@@ -326,6 +336,7 @@ fn fuse_uring_op_header_len(opcode: FuseOpcode) -> usize {
     }
 }
 
+/// Return the per-entry payload buffer size required for a negotiated session.
 pub fn io_uring_payload_len_for_session(max_write: u32, max_pages: u16) -> usize {
     FUSE_MIN_READ_BUFFER
         .max(max_write as usize)
@@ -338,6 +349,7 @@ fn page_size_for_io_uring_payload() -> usize {
     usize::try_from(page_size).unwrap_or(4096).max(1)
 }
 
+/// Choose the default number of FUSE-over-io_uring queue entries for Linux.
 pub fn linux_fuse_io_uring_queue_count() -> u16 {
     std::fs::read_to_string("/sys/devices/system/cpu/possible")
         .ok()
@@ -378,12 +390,16 @@ fn parse_linux_possible_cpu_count(raw: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Completion event returned by a FUSE-over-io_uring backend.
 pub struct FuseIoUringCompletion {
+    /// User data copied from the completed SQE.
     pub user_data: u64,
+    /// Kernel completion result; negative values are errno values.
     pub result: i32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Snapshot of FUSE-over-io_uring transport counters and latency totals.
 pub struct FuseIoUringTransportMetricsSnapshot {
     /// Number of registered io_uring queue entries.
     pub queue_depth: u16,
@@ -435,21 +451,29 @@ impl FuseIoUringTransportMetrics {
     }
 }
 
+/// Minimal backend interface used by the FUSE-over-io_uring transport.
 pub trait FuseUringBackend {
+    /// Queue one SQE for submission.
     fn submit(&mut self, entry: io_uring::squeue::Entry128) -> io::Result<()>;
+    /// Flush queued SQEs without waiting for completions.
     fn submit_pending(&mut self) -> io::Result<usize>;
+    /// Submit queued SQEs and wait for at least `wanted` completions.
     fn submit_and_wait(&mut self, wanted: usize) -> io::Result<usize>;
+    /// Drain the next completion if one is immediately available.
     fn next_completion(&mut self) -> io::Result<Option<FuseIoUringCompletion>>;
+    /// Return a pollable file descriptor for the backend when available.
     fn poll_fd(&self) -> Option<RawFd> {
         None
     }
 }
 
+/// Production io_uring backend backed by the `io-uring` crate.
 pub struct IoUringBackend {
     ring: io_uring::IoUring<io_uring::squeue::Entry128, io_uring::cqueue::Entry>,
 }
 
 impl IoUringBackend {
+    /// Create an io_uring backend with the requested queue depth.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
         Ok(Self {
             ring:
@@ -498,6 +522,7 @@ impl FuseUringBackend for IoUringBackend {
 }
 
 #[derive(Debug)]
+/// FUSE transport that exchanges requests and replies through io_uring.
 pub struct FuseIoUringTransport<B> {
     fuse_fd: RawFd,
     entries: Vec<FuseUringEntry>,
@@ -507,6 +532,7 @@ pub struct FuseIoUringTransport<B> {
 }
 
 impl<B> FuseIoUringTransport<B> {
+    /// Build an io_uring transport around an already-open FUSE file descriptor.
     pub fn with_backend(fuse_fd: RawFd, queue_count: u16, payload_len: usize, backend: B) -> Self {
         let entries = (0..queue_count)
             .map(|qid| FuseUringEntry::new(qid, payload_len))
@@ -520,10 +546,12 @@ impl<B> FuseIoUringTransport<B> {
         }
     }
 
+    /// Return whether all queue entries were registered with the kernel.
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 
+    /// Return a copy of current transport metrics.
     pub fn metrics_snapshot(&self) -> FuseIoUringTransportMetricsSnapshot {
         FuseIoUringTransportMetricsSnapshot {
             queue_depth: self.entries.len().min(usize::from(u16::MAX)) as u16,
@@ -560,6 +588,7 @@ impl<B> FuseIoUringTransport<B> {
 }
 
 impl<B: FuseUringBackend> FuseIoUringTransport<B> {
+    /// Register all queue entries with the kernel FUSE connection.
     pub fn register_entries(&mut self) -> Result<(), TransportError> {
         for entry in &mut self.entries {
             let user_data = entry.user_data();
@@ -575,6 +604,7 @@ impl<B: FuseUringBackend> FuseIoUringTransport<B> {
         Ok(())
     }
 
+    /// Receive the next request together with its io_uring reply origin.
     pub fn receive_request_with_origin(
         &mut self,
     ) -> Result<Option<(FuseRequest, ReplyOrigin)>, TransportError> {
@@ -613,6 +643,7 @@ impl<B: FuseUringBackend> FuseIoUringTransport<B> {
             .map_err(TransportError::from)
     }
 
+    /// Send a reply using its recorded io_uring origin when possible.
     pub fn send_reply_from_origin(
         &mut self,
         origin: ReplyOrigin,
@@ -731,12 +762,14 @@ impl<B: FuseUringBackend> FuseTransport for FuseIoUringTransport<B> {
 }
 
 #[derive(Debug)]
+/// Owns the classic FUSE device handle for a registered io_uring transport.
 pub struct RegisteredFuseIoUringTransport<T, B> {
     _io: T,
     inner: FuseIoUringTransport<B>,
 }
 
 impl<T: AsRawFd, B: FuseUringBackend> RegisteredFuseIoUringTransport<T, B> {
+    /// Register a new io_uring transport while retaining ownership of `io`.
     pub fn new(
         io: T,
         queue_count: u16,
@@ -778,6 +811,7 @@ impl<T, B: FuseUringBackend> FuseTransport for RegisteredFuseIoUringTransport<T,
 }
 
 #[derive(Debug)]
+/// Hybrid transport that prefers io_uring and falls back to classic FUSE I/O.
 pub struct HybridFuseTransport<C, B> {
     classic: C,
     io_uring: FuseIoUringTransport<B>,
@@ -788,6 +822,7 @@ pub struct HybridFuseTransport<C, B> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Snapshot of hybrid FUSE transport mode and fallback counters.
 pub struct HybridFuseTransportMetricsSnapshot {
     /// Effective transport mode for this hybrid surface.
     pub mode: LinuxNativeTransportMode,
@@ -804,6 +839,7 @@ pub struct HybridFuseTransportMetricsSnapshot {
 }
 
 impl<C, B> HybridFuseTransport<C, B> {
+    /// Combine an existing classic transport with an io_uring transport.
     pub fn new(classic: C, io_uring: FuseIoUringTransport<B>) -> Self {
         Self {
             classic,
@@ -815,6 +851,7 @@ impl<C, B> HybridFuseTransport<C, B> {
         }
     }
 
+    /// Return current hybrid transport metrics.
     pub fn metrics_snapshot(&self) -> HybridFuseTransportMetricsSnapshot {
         HybridFuseTransportMetricsSnapshot {
             mode: LinuxNativeTransportMode::IoUring,
@@ -833,6 +870,7 @@ impl<C, B> HybridFuseTransport<C, B> {
 }
 
 impl<C, B: FuseUringBackend> HybridFuseTransport<C, B> {
+    /// Register an io_uring backend and return a hybrid transport on success.
     pub fn register_io_uring(
         classic: C,
         fuse_fd: RawFd,
@@ -848,6 +886,7 @@ impl<C, B: FuseUringBackend> HybridFuseTransport<C, B> {
 }
 
 impl<C> HybridFuseTransport<C, IoUringBackend> {
+    /// Register the kernel io_uring backend, returning only the registration error on failure.
     pub fn register_kernel_io_uring(
         classic: C,
         fuse_fd: RawFd,
@@ -858,6 +897,7 @@ impl<C> HybridFuseTransport<C, IoUringBackend> {
             .map_err(|(_classic, error)| error)
     }
 
+    /// Try to register kernel io_uring while returning `classic` if setup fails.
     pub fn try_register_kernel_io_uring(
         classic: C,
         fuse_fd: RawFd,
@@ -888,6 +928,7 @@ impl<C: FuseTransport, B: FuseUringBackend> HybridFuseTransport<C, B> {
             .map(|request| request.map(|request| (request, ReplyOrigin::Classic)))
     }
 
+    /// Receive the next request and record whether its reply should use classic or io_uring.
     pub fn receive_request_with_origin(
         &mut self,
     ) -> Result<Option<(FuseRequest, ReplyOrigin)>, TransportError> {
@@ -1028,6 +1069,7 @@ fn wait_for_hybrid_readiness(
 }
 
 #[derive(Debug)]
+/// Linux-native FUSE transport selected for a mounted session.
 pub enum LinuxNativeFuseTransport<C, B> {
     /// Classic `/dev/fuse` read/write transport.
     Classic(C),
@@ -1036,6 +1078,7 @@ pub enum LinuxNativeFuseTransport<C, B> {
 }
 
 impl<C, B> LinuxNativeFuseTransport<C, B> {
+    /// Return transport metrics, using an empty io_uring snapshot for classic mode.
     pub fn metrics_snapshot(&self) -> HybridFuseTransportMetricsSnapshot {
         match self {
             Self::Classic(_) => HybridFuseTransportMetricsSnapshot {
