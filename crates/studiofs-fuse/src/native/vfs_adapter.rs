@@ -820,6 +820,7 @@ struct NativeReadMetrics {
     read_ahead_amplification_bytes: AtomicU64,
 }
 
+#[repr(align(64))]
 #[derive(Debug, Default)]
 struct NativeAmplificationMetrics {
     lookup_ops: AtomicU64,
@@ -863,6 +864,7 @@ const NATIVE_LATENCY_BUCKET_BOUNDS_NS: [u64; 18] = [
     u64::MAX,
 ];
 
+#[repr(align(64))]
 #[derive(Debug)]
 struct NativeLatencyMetrics {
     samples: AtomicU64,
@@ -907,8 +909,8 @@ struct NativeReadAheadStateShard {
 impl NativeReadAheadStateStore {
     const SHARD_COUNT: usize = 64;
 
-    fn shard_index(fh: u64) -> usize {
-        (fh as usize) % Self::SHARD_COUNT
+    fn shard_index(ino: u64) -> usize {
+        (ino as usize) % Self::SHARD_COUNT
     }
 
     fn observe(
@@ -920,49 +922,47 @@ impl NativeReadAheadStateStore {
         size: u64,
         file_size: u64,
     ) -> NativeReadAheadDecision {
-        let mut shard = lock_or_recover(self.shard(fh), "native_read_ahead_state_shard");
+        let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
         shard.track_handle_inode(fh, ino);
         let state = shard.states.entry(fh).or_default();
         decide_native_read_ahead(policy, state, offset, size, file_size)
     }
 
     fn invalidate_inodes(&self, inodes: &[u64]) {
-        for shard in &self.shards {
-            let mut shard = lock_or_recover(shard, "native_read_ahead_state_shard");
-            for &ino in inodes {
-                let Some(fhs) = shard.fhs_by_inode.remove(&ino) else {
-                    continue;
-                };
-                for fh in fhs {
-                    shard.states.remove(&fh);
-                    shard.inode_by_fh.remove(&fh);
-                }
+        for &ino in inodes {
+            let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
+            let Some(fhs) = shard.fhs_by_inode.remove(&ino) else {
+                continue;
+            };
+            for fh in fhs {
+                shard.states.remove(&fh);
+                shard.inode_by_fh.remove(&fh);
             }
         }
     }
 
-    fn remove_handle(&self, fh: u64) {
-        let mut shard = lock_or_recover(self.shard(fh), "native_read_ahead_state_shard");
+    fn remove_handle(&self, ino: u64, fh: u64) {
+        let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
         shard.remove_handle(fh);
     }
 
     #[cfg(test)]
-    fn contains_handle(&self, fh: u64) -> bool {
-        lock_or_recover(self.shard(fh), "native_read_ahead_state_shard")
+    fn contains_handle(&self, ino: u64, fh: u64) -> bool {
+        lock_or_recover(self.shard(ino), "native_read_ahead_state_shard")
             .states
             .contains_key(&fh)
     }
 
     #[cfg(test)]
-    fn inode_for_handle(&self, fh: u64) -> Option<u64> {
-        lock_or_recover(self.shard(fh), "native_read_ahead_state_shard")
+    fn inode_for_handle(&self, ino: u64, fh: u64) -> Option<u64> {
+        lock_or_recover(self.shard(ino), "native_read_ahead_state_shard")
             .inode_by_fh
             .get(&fh)
             .copied()
     }
 
-    fn shard(&self, fh: u64) -> &Mutex<NativeReadAheadStateShard> {
-        &self.shards[Self::shard_index(fh)]
+    fn shard(&self, ino: u64) -> &Mutex<NativeReadAheadStateShard> {
+        &self.shards[Self::shard_index(ino)]
     }
 }
 
@@ -1026,7 +1026,7 @@ pub struct NativeLatencyMetricsSnapshot {
 }
 
 /// Snapshot of Linux native metadata and application I/O amplification counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeAmplificationMetricsSnapshot {
     /// Total FUSE operations included in amplification telemetry.
     pub fuse_ops: u64,
@@ -1494,7 +1494,7 @@ where
             let release_result = self.vfs.release(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
             if release_result.is_ok() {
-                self.forget_read_ahead_handle(fh);
+                self.forget_read_ahead_handle(request.header.nodeid, fh);
             }
             let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
             self.amplification_metrics
@@ -1507,7 +1507,7 @@ where
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         let reply = match self.vfs.release(fh) {
             Ok(()) => {
-                self.forget_read_ahead_handle(fh);
+                self.forget_read_ahead_handle(request.header.nodeid, fh);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2119,8 +2119,8 @@ where
         self.read_ahead_states.invalidate_inodes(inodes);
     }
 
-    fn forget_read_ahead_handle(&self, fh: u64) {
-        self.read_ahead_states.remove_handle(fh);
+    fn forget_read_ahead_handle(&self, ino: u64, fh: u64) {
+        self.read_ahead_states.remove_handle(ino, fh);
     }
 
     fn trusted_local_cache_read_range(
@@ -3010,6 +3010,7 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 mod tests {
     use super::*;
     use crate::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseRuntimeOptions};
+    use std::mem::align_of;
 
     #[derive(Debug)]
     struct TestNativeVfs {
@@ -3291,6 +3292,12 @@ mod tests {
     }
 
     #[test]
+    fn native_metrics_are_cache_line_aligned_to_reduce_false_sharing() {
+        assert_eq!(align_of::<NativeLatencyMetrics>(), 64);
+        assert_eq!(align_of::<NativeAmplificationMetrics>(), 64);
+    }
+
+    #[test]
     fn lookup_missing_name_returns_negative_entry_with_conservative_ttl() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
@@ -3386,12 +3393,24 @@ mod tests {
     }
 
     #[test]
-    fn native_read_ahead_state_store_uses_multiple_shards_for_handles() {
+    fn native_read_ahead_state_store_uses_multiple_shards_for_inodes() {
         assert_eq!(NativeReadAheadStateStore::SHARD_COUNT, 64);
         assert_ne!(
-            NativeReadAheadStateStore::shard_index(7),
-            NativeReadAheadStateStore::shard_index(8)
+            NativeReadAheadStateStore::shard_index(20),
+            NativeReadAheadStateStore::shard_index(21)
         );
+    }
+
+    #[test]
+    fn native_read_ahead_state_store_invalidates_only_target_inode_shards() {
+        let source = include_str!("vfs_adapter.rs");
+        let invalidate_inodes = source
+            .split("fn invalidate_inodes(&self, inodes: &[u64])")
+            .nth(1)
+            .and_then(|rest| rest.split("fn remove_handle").next())
+            .expect("read-ahead invalidate_inodes body should be present");
+
+        assert!(!invalidate_inodes.contains("for shard in &self.shards"));
     }
 
     #[test]
@@ -3577,10 +3596,10 @@ mod tests {
 
         bridge.invalidate_metadata_cache_for_mutation(&[20]);
 
-        assert!(!bridge.read_ahead_states.contains_handle(7));
-        assert!(bridge.read_ahead_states.contains_handle(8));
-        assert_eq!(bridge.read_ahead_states.inode_for_handle(7), None);
-        assert_eq!(bridge.read_ahead_states.inode_for_handle(8), Some(21));
+        assert!(!bridge.read_ahead_states.contains_handle(20, 7));
+        assert!(bridge.read_ahead_states.contains_handle(21, 8));
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(20, 7), None);
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(21, 8), Some(21));
     }
 
     #[test]
