@@ -162,6 +162,11 @@ fn validate_mounted_performance_probe(
             ),
         });
     }
+    if let Some(upload_drain) = &summary.upload_drain
+        && let Some(detail) = upload_drain_failure_detail(upload_drain)
+    {
+        return Err(ScenarioError::PerformanceProbeValidationFailed { detail });
+    }
 
     let read_phases = summary
         .phases
@@ -599,6 +604,10 @@ fn wait_for_upload_drain(
     let started = Instant::now();
     let before = sample_metrics(metrics_path)?;
     let mut after = before.clone();
+    let mut samples = vec![UploadDrainSample {
+        elapsed_ms: 0,
+        snapshot: before.clone(),
+    }];
     let poll = if poll.is_zero() {
         Duration::from_millis(1)
     } else {
@@ -615,14 +624,55 @@ fn wait_for_upload_drain(
         }
         thread::sleep(poll);
         after = sample_metrics(metrics_path)?;
+        samples.push(UploadDrainSample {
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            snapshot: after.clone(),
+        });
     }
 
     Ok(UploadDrainResult {
         before,
         after,
+        samples,
         elapsed: started.elapsed(),
         timed_out,
     })
+}
+
+fn classify_upload_drain(
+    timed_out: bool,
+    pending_uploads_after: u64,
+    pending_upload_bytes_after: u64,
+    max_active_uploads: u64,
+    completed_uploads_delta: u64,
+) -> String {
+    if !timed_out {
+        return "drained".to_string();
+    }
+    if pending_upload_bytes_after > 0 && max_active_uploads == 0 && completed_uploads_delta == 0 {
+        return "pending-without-active-uploads".to_string();
+    }
+    if pending_uploads_after > 0 && completed_uploads_delta == 0 {
+        return "pending-without-completions".to_string();
+    }
+    "drain-timeout".to_string()
+}
+
+fn upload_drain_failure_detail(observation: &UploadDrainObservation) -> Option<String> {
+    if !observation.timed_out {
+        return None;
+    }
+    Some(format!(
+        "upload drain timed out; classification={}; pending_uploads_after={}; pending_upload_bytes_after={}; active_uploads_after={}; max_active_uploads={}; completed_uploads_delta={}; oldest_pending_upload_age_ms_after={}; samples={}",
+        observation.classification,
+        observation.pending_uploads_after,
+        observation.pending_upload_bytes_after,
+        observation.active_uploads_after,
+        observation.max_active_uploads,
+        observation.completed_uploads_delta,
+        observation.oldest_pending_upload_age_ms_after,
+        observation.sample_count,
+    ))
 }
 
 fn upload_path_is_drained(snapshot: &Value) -> bool {
@@ -873,12 +923,50 @@ impl From<PerformanceProbeConfig> for PerformanceProbeConfigSummary {
 struct UploadDrainResult {
     before: Option<Value>,
     after: Option<Value>,
+    samples: Vec<UploadDrainSample>,
     elapsed: Duration,
     timed_out: bool,
 }
 
 impl UploadDrainResult {
     fn into_observation(self) -> UploadDrainObservation {
+        let samples: Vec<UploadDrainSampleObservation> = self
+            .samples
+            .iter()
+            .map(UploadDrainSampleObservation::from_sample)
+            .collect();
+        let sample_count = samples.len();
+        let max_active_uploads = samples
+            .iter()
+            .map(|sample| sample.active_uploads)
+            .max()
+            .unwrap_or(0);
+        let completed_uploads_before =
+            metric_value(self.before.as_ref(), &["upload", "completed_uploads"]);
+        let completed_uploads_after =
+            metric_value(self.after.as_ref(), &["upload", "completed_uploads"]);
+        let completed_uploads_delta =
+            completed_uploads_after.saturating_sub(completed_uploads_before);
+        let pending_uploads_after =
+            metric_value(self.after.as_ref(), &["upload", "pending_uploads"]);
+        let pending_upload_bytes_after =
+            metric_value(self.after.as_ref(), &["upload", "pending_upload_bytes"]);
+        let oldest_pending_upload_age_ms_after = metric_value(
+            self.after.as_ref(),
+            &["upload", "oldest_pending_upload_age_ms"],
+        );
+        let stalled_pending_without_active_uploads = self.timed_out
+            && pending_upload_bytes_after > 0
+            && max_active_uploads == 0
+            && completed_uploads_delta == 0;
+        let classification = classify_upload_drain(
+            self.timed_out,
+            pending_uploads_after,
+            pending_upload_bytes_after,
+            max_active_uploads,
+            completed_uploads_delta,
+        );
+
         UploadDrainObservation {
             waited_ms: self.elapsed.as_millis().min(u64::MAX as u128) as u64,
             timed_out: self.timed_out,
@@ -886,18 +974,12 @@ impl UploadDrainResult {
                 self.before.as_ref(),
                 &["upload", "pending_uploads"],
             ),
-            pending_uploads_after: metric_value(
-                self.after.as_ref(),
-                &["upload", "pending_uploads"],
-            ),
+            pending_uploads_after,
             pending_upload_bytes_before: metric_value(
                 self.before.as_ref(),
                 &["upload", "pending_upload_bytes"],
             ),
-            pending_upload_bytes_after: metric_value(
-                self.after.as_ref(),
-                &["upload", "pending_upload_bytes"],
-            ),
+            pending_upload_bytes_after,
             dirty_total_bytes_before: metric_value(
                 self.before.as_ref(),
                 &["dirty_pressure", "total_dirty_bytes"],
@@ -912,6 +994,66 @@ impl UploadDrainResult {
             ),
             drain_lag_bytes_after: metric_value(
                 self.after.as_ref(),
+                &["drain_lag", "current_bytes"],
+            ),
+            active_uploads_after: metric_value(self.after.as_ref(), &["upload", "active_uploads"]),
+            max_active_uploads,
+            completed_uploads_before,
+            completed_uploads_after,
+            completed_uploads_delta,
+            oldest_pending_upload_age_ms_after,
+            stalled_pending_without_active_uploads,
+            classification,
+            sample_count,
+            samples,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UploadDrainSample {
+    elapsed_ms: u64,
+    snapshot: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct UploadDrainSampleObservation {
+    elapsed_ms: u64,
+    metrics_seen: bool,
+    pending_uploads: u64,
+    pending_upload_bytes: u64,
+    active_uploads: u64,
+    completed_uploads: u64,
+    oldest_pending_upload_age_ms: u64,
+    dirty_total_bytes: u64,
+    drain_lag_bytes: u64,
+}
+
+impl UploadDrainSampleObservation {
+    fn from_sample(sample: &UploadDrainSample) -> Self {
+        Self {
+            elapsed_ms: sample.elapsed_ms,
+            metrics_seen: sample.snapshot.is_some(),
+            pending_uploads: metric_value(sample.snapshot.as_ref(), &["upload", "pending_uploads"]),
+            pending_upload_bytes: metric_value(
+                sample.snapshot.as_ref(),
+                &["upload", "pending_upload_bytes"],
+            ),
+            active_uploads: metric_value(sample.snapshot.as_ref(), &["upload", "active_uploads"]),
+            completed_uploads: metric_value(
+                sample.snapshot.as_ref(),
+                &["upload", "completed_uploads"],
+            ),
+            oldest_pending_upload_age_ms: metric_value(
+                sample.snapshot.as_ref(),
+                &["upload", "oldest_pending_upload_age_ms"],
+            ),
+            dirty_total_bytes: metric_value(
+                sample.snapshot.as_ref(),
+                &["dirty_pressure", "total_dirty_bytes"],
+            ),
+            drain_lag_bytes: metric_value(
+                sample.snapshot.as_ref(),
                 &["drain_lag", "current_bytes"],
             ),
         }
@@ -930,6 +1072,16 @@ struct UploadDrainObservation {
     dirty_total_bytes_after: u64,
     drain_lag_bytes_before: u64,
     drain_lag_bytes_after: u64,
+    active_uploads_after: u64,
+    max_active_uploads: u64,
+    completed_uploads_before: u64,
+    completed_uploads_after: u64,
+    completed_uploads_delta: u64,
+    oldest_pending_upload_age_ms_after: u64,
+    stalled_pending_without_active_uploads: bool,
+    classification: String,
+    sample_count: usize,
+    samples: Vec<UploadDrainSampleObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1406,6 +1558,114 @@ mod tests {
             observations.post_drain_foreground_local_payload_read_bytes,
             Some(2 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn upload_drain_observation_flags_pending_uploads_without_active_uploads() {
+        let result = UploadDrainResult {
+            before: Some(json!({
+                "upload": {
+                    "pending_uploads": 64,
+                    "pending_upload_bytes": 255 * 1024 * 1024u64,
+                    "active_uploads": 0,
+                    "completed_uploads": 17,
+                    "oldest_pending_upload_age_ms": 45_000
+                },
+                "dirty_pressure": { "total_dirty_bytes": 0 },
+                "drain_lag": { "current_bytes": 255 * 1024 * 1024u64 }
+            })),
+            after: Some(json!({
+                "upload": {
+                    "pending_uploads": 64,
+                    "pending_upload_bytes": 253 * 1024 * 1024u64,
+                    "active_uploads": 0,
+                    "completed_uploads": 17,
+                    "oldest_pending_upload_age_ms": 165_000
+                },
+                "dirty_pressure": { "total_dirty_bytes": 0 },
+                "drain_lag": { "current_bytes": 253 * 1024 * 1024u64 }
+            })),
+            samples: vec![
+                upload_drain_sample(
+                    0,
+                    json!({
+                        "upload": {
+                            "pending_uploads": 64,
+                            "pending_upload_bytes": 255 * 1024 * 1024u64,
+                            "active_uploads": 0,
+                            "completed_uploads": 17,
+                            "oldest_pending_upload_age_ms": 45_000
+                        }
+                    }),
+                ),
+                upload_drain_sample(
+                    60_000,
+                    json!({
+                        "upload": {
+                            "pending_uploads": 64,
+                            "pending_upload_bytes": 254 * 1024 * 1024u64,
+                            "active_uploads": 0,
+                            "completed_uploads": 17,
+                            "oldest_pending_upload_age_ms": 105_000
+                        }
+                    }),
+                ),
+                upload_drain_sample(
+                    120_000,
+                    json!({
+                        "upload": {
+                            "pending_uploads": 64,
+                            "pending_upload_bytes": 253 * 1024 * 1024u64,
+                            "active_uploads": 0,
+                            "completed_uploads": 17,
+                            "oldest_pending_upload_age_ms": 165_000
+                        }
+                    }),
+                ),
+            ],
+            elapsed: Duration::from_secs(120),
+            timed_out: true,
+        };
+
+        let observation = result.into_observation();
+
+        assert!(observation.stalled_pending_without_active_uploads);
+        assert_eq!(observation.classification, "pending-without-active-uploads");
+        assert_eq!(observation.sample_count, 3);
+        assert_eq!(observation.max_active_uploads, 0);
+        assert_eq!(observation.completed_uploads_delta, 0);
+        assert_eq!(observation.oldest_pending_upload_age_ms_after, 165_000);
+    }
+
+    #[test]
+    fn upload_drain_failure_detail_names_stalled_scheduler_state() {
+        let observation = UploadDrainObservation {
+            timed_out: true,
+            pending_uploads_after: 64,
+            pending_upload_bytes_after: 253 * 1024 * 1024,
+            active_uploads_after: 0,
+            max_active_uploads: 0,
+            completed_uploads_delta: 0,
+            oldest_pending_upload_age_ms_after: 165_000,
+            stalled_pending_without_active_uploads: true,
+            classification: "pending-without-active-uploads".to_string(),
+            ..UploadDrainObservation::default()
+        };
+
+        let detail = upload_drain_failure_detail(&observation).expect("stalled drain should fail");
+
+        assert!(detail.contains("pending-without-active-uploads"));
+        assert!(detail.contains("pending_upload_bytes_after=265289728"));
+        assert!(detail.contains("max_active_uploads=0"));
+        assert!(detail.contains("completed_uploads_delta=0"));
+        assert!(detail.contains("oldest_pending_upload_age_ms_after=165000"));
+    }
+
+    fn upload_drain_sample(elapsed_ms: u64, snapshot: Value) -> UploadDrainSample {
+        UploadDrainSample {
+            elapsed_ms,
+            snapshot: Some(snapshot),
+        }
     }
 
     fn assert_f64_eq(actual: f64, expected: f64) {
