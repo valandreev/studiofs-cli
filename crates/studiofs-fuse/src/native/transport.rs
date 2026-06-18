@@ -1596,6 +1596,7 @@ impl<T> ClassicReadWriteTransport<T> {
     pub fn with_output_fd(io: T, output_fd: RawFd) -> Self {
         let mut transport = Self::new(io);
         transport.local_cache_output_fd = Some(output_fd);
+        transport.local_cache_strategy = LocalCacheReplyStrategy::Splice;
         transport
     }
 
@@ -3592,6 +3593,36 @@ mod tests {
         let mut output = Vec::new();
         output_file.read_to_end(&mut output).expect("read output");
         assert_eq!(&output[16..], b"89ab");
+    }
+
+    #[test]
+    fn classic_output_fd_transport_splices_local_cache_range_by_default() {
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"0123456789abcdef")
+            .expect("write cache contents");
+        let output_file = tempfile::tempfile().expect("create output file");
+        let output_fd = output_file.as_raw_fd();
+        let mut transport = ClassicReadWriteTransport::with_output_fd(output_file, output_fd);
+        let reply = FuseReply::local_cache_range_data(
+            0x91,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 2, 5, 13),
+        )
+        .expect("build local cache range reply");
+
+        transport
+            .send_reply(reply)
+            .expect("classic output-fd transport should splice by default");
+
+        let metrics = transport.local_cache_reply_metrics_snapshot();
+        assert_eq!(metrics.splice_replies, 1);
+        assert_eq!(metrics.pread_bytes_replies, 0);
+        assert_eq!(metrics.payload_bytes, 5);
+        let mut output_file = transport.into_inner();
+        output_file.rewind().expect("rewind output file");
+        let mut output = Vec::new();
+        output_file.read_to_end(&mut output).expect("read output");
+        assert_eq!(&output[16..], b"23456");
     }
 
     #[test]
