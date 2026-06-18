@@ -23,6 +23,9 @@ use studiofs_vfs::{StudioVfs, VfsConfigRaw};
 pub const MOUNTED_PERFORMANCE_PROBE: &str = "mounted-performance-probe";
 /// Mounted FUSE write baseline scenario identifier for SFS-469.
 pub const MOUNTED_FUSE_WRITE_BASELINE: &str = "mounted-fuse-write-baseline";
+/// Mounted FUSE read-after-write regression probe for SFS-531.
+pub const MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION: &str =
+    "mounted-fuse-upload-backlog-read-regression";
 
 const PERFORMANCE_PROBE_CLIENT: &str = "client-a";
 const PERFORMANCE_PROBE_FILE: &str = "performance-probe/probe-data.bin";
@@ -40,6 +43,12 @@ const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_UPLOAD_DRAIN_POLL_MS: u64 = 1_000;
 const METRICS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const METRICS_WAIT_POLL: Duration = Duration::from_millis(100);
+
+const SFS531_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const SFS531_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const SFS531_READ_PASSES: u32 = 1;
+const SFS531_SAMPLE_DELAY_MS: u64 = 250;
+const SFS531_UPLOAD_DRAIN_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::scenario) struct MountedPerformanceProbe;
@@ -59,7 +68,11 @@ impl Scenario for MountedPerformanceProbe {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        run_mounted_performance_probe_scenario(context, MOUNTED_PERFORMANCE_PROBE)
+        run_mounted_performance_probe_scenario(
+            context,
+            MOUNTED_PERFORMANCE_PROBE,
+            PerformanceProbeConfigDefaults::standard(),
+        )
     }
 
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
@@ -90,7 +103,11 @@ impl Scenario for MountedFuseWriteBaseline {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        run_mounted_performance_probe_scenario(context, MOUNTED_FUSE_WRITE_BASELINE)
+        run_mounted_performance_probe_scenario(
+            context,
+            MOUNTED_FUSE_WRITE_BASELINE,
+            PerformanceProbeConfigDefaults::standard(),
+        )
     }
 
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
@@ -102,9 +119,45 @@ impl Scenario for MountedFuseWriteBaseline {
     }
 }
 
+/// SFS-531 mounted FUSE read-after-write regression probe backed by performance probe.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::scenario) struct MountedFuseUploadBacklogReadRegression;
+
+impl Scenario for MountedFuseUploadBacklogReadRegression {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION,
+            description: "SFS-531 mounted-write read-after-upload-backlog regression probe for Linux FUSE",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        run_mounted_performance_probe_scenario(
+            context,
+            MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION,
+            PerformanceProbeConfigDefaults::sfs531_upload_backlog_read_regression(),
+        )
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        validate_mounted_performance_probe(context, MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION)
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
 fn run_mounted_performance_probe_scenario(
     context: &ScenarioContext,
     scenario_name: &'static str,
+    defaults: PerformanceProbeConfigDefaults,
 ) -> Result<(), ScenarioError> {
     let Some(config) = &context.client_controller_config else {
         return Err(ScenarioError::MissingComposeInfrastructure);
@@ -114,7 +167,7 @@ fn run_mounted_performance_probe_scenario(
         client_names: vec![PERFORMANCE_PROBE_CLIENT.to_string()],
         clean_existing_local_metadata: true,
     })?;
-    let config = PerformanceProbeConfig::from_env()?;
+    let config = PerformanceProbeConfig::from_env(defaults)?;
     if config.seed_mode == PerformanceProbeSeedMode::ReadOnlySeeded {
         let client = controller.client_at(0)?;
         seed_performance_probe_payload(client, &config)?;
@@ -729,26 +782,69 @@ pub(crate) struct PerformanceProbeConfig {
     pub(crate) seed_mode: PerformanceProbeSeedMode,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PerformanceProbeConfigDefaults {
+    pub(crate) file_bytes: u64,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) read_passes: u32,
+    pub(crate) sample_delay_ms: u64,
+    pub(crate) wait_for_upload_drain: bool,
+    pub(crate) upload_drain_timeout_secs: u64,
+    pub(crate) upload_drain_poll_ms: u64,
+    pub(crate) seed_mode: Option<PerformanceProbeSeedMode>,
+}
+
+impl PerformanceProbeConfigDefaults {
+    pub(crate) fn standard() -> Self {
+        Self {
+            file_bytes: DEFAULT_FILE_BYTES,
+            chunk_bytes: DEFAULT_CHUNK_BYTES,
+            read_passes: DEFAULT_READ_PASSES,
+            sample_delay_ms: DEFAULT_SAMPLE_DELAY_MS,
+            wait_for_upload_drain: true,
+            upload_drain_timeout_secs: DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECS,
+            upload_drain_poll_ms: DEFAULT_UPLOAD_DRAIN_POLL_MS,
+            seed_mode: None,
+        }
+    }
+
+    pub(crate) fn sfs531_upload_backlog_read_regression() -> Self {
+        Self {
+            file_bytes: SFS531_FILE_BYTES,
+            chunk_bytes: SFS531_CHUNK_BYTES,
+            read_passes: SFS531_READ_PASSES,
+            sample_delay_ms: SFS531_SAMPLE_DELAY_MS,
+            wait_for_upload_drain: true,
+            upload_drain_timeout_secs: SFS531_UPLOAD_DRAIN_TIMEOUT_SECS,
+            upload_drain_poll_ms: DEFAULT_UPLOAD_DRAIN_POLL_MS,
+            seed_mode: Some(PerformanceProbeSeedMode::MountedWrite),
+        }
+    }
+}
+
 impl PerformanceProbeConfig {
-    fn from_env() -> Result<Self, ScenarioError> {
+    fn from_env(defaults: PerformanceProbeConfigDefaults) -> Result<Self, ScenarioError> {
         Ok(Self {
-            file_bytes: env_u64("STUDIOFS_E2E_PERF_FILE_BYTES", DEFAULT_FILE_BYTES)?,
-            chunk_bytes: env_usize("STUDIOFS_E2E_PERF_CHUNK_BYTES", DEFAULT_CHUNK_BYTES)?,
-            read_passes: env_u32("STUDIOFS_E2E_PERF_READ_PASSES", DEFAULT_READ_PASSES)?,
+            file_bytes: env_u64("STUDIOFS_E2E_PERF_FILE_BYTES", defaults.file_bytes)?,
+            chunk_bytes: env_usize("STUDIOFS_E2E_PERF_CHUNK_BYTES", defaults.chunk_bytes)?,
+            read_passes: env_u32("STUDIOFS_E2E_PERF_READ_PASSES", defaults.read_passes)?,
             sample_delay: Duration::from_millis(env_u64(
                 "STUDIOFS_E2E_PERF_SAMPLE_AFTER_PHASE_MS",
-                DEFAULT_SAMPLE_DELAY_MS,
+                defaults.sample_delay_ms,
             )?),
-            wait_for_upload_drain: env_bool("STUDIOFS_E2E_PERF_WAIT_FOR_UPLOAD_DRAIN", true)?,
+            wait_for_upload_drain: env_bool(
+                "STUDIOFS_E2E_PERF_WAIT_FOR_UPLOAD_DRAIN",
+                defaults.wait_for_upload_drain,
+            )?,
             upload_drain_timeout: Duration::from_secs(env_u64(
                 "STUDIOFS_E2E_PERF_UPLOAD_DRAIN_TIMEOUT_SECS",
-                DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECS,
+                defaults.upload_drain_timeout_secs,
             )?),
             upload_drain_poll: Duration::from_millis(env_u64(
                 "STUDIOFS_E2E_PERF_UPLOAD_DRAIN_POLL_MS",
-                DEFAULT_UPLOAD_DRAIN_POLL_MS,
+                defaults.upload_drain_poll_ms,
             )?),
-            seed_mode: PerformanceProbeSeedMode::from_env()?,
+            seed_mode: PerformanceProbeSeedMode::from_env(defaults.seed_mode)?,
         })
     }
 }
@@ -760,10 +856,10 @@ pub(crate) enum PerformanceProbeSeedMode {
 }
 
 impl PerformanceProbeSeedMode {
-    fn from_env() -> Result<Self, ScenarioError> {
+    fn from_env(default: Option<Self>) -> Result<Self, ScenarioError> {
         match env::var("STUDIOFS_E2E_PERF_SEED_MODE") {
             Ok(value) if !value.trim().is_empty() => Self::parse(&value),
-            _ => Ok(Self::platform_default()),
+            _ => Ok(default.unwrap_or_else(Self::platform_default)),
         }
     }
 
