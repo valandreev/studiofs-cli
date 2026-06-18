@@ -32,6 +32,7 @@ use crate::native::cache_policy::{
 };
 use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
+use crate::native::transport::LocalCacheReplyMetricsSnapshot;
 
 const FUSE_ENTRY_OUT_PAYLOAD_LEN: usize = 128;
 const FUSE_ATTR_PAYLOAD_LEN: usize = 88;
@@ -818,6 +819,9 @@ struct NativeReadMetrics {
     stale_generation_fallbacks: AtomicU64,
     unsafe_local_cache_fallbacks: AtomicU64,
     bytes_fallbacks: AtomicU64,
+    pread_local_cache_replies: AtomicU64,
+    splice_local_cache_replies: AtomicU64,
+    local_cache_reply_bytes: AtomicU64,
     bytes_returned: AtomicU64,
     read_ahead_prefetches: AtomicU64,
     read_ahead_suppressed: AtomicU64,
@@ -1287,6 +1291,12 @@ pub struct NativeReadMetricsSnapshot {
     pub unsafe_local_cache_fallbacks: u64,
     /// Reads served through the safe bytes fallback.
     pub bytes_fallbacks: u64,
+    /// Local-cache replies served with `pread -> bytes -> write`.
+    pub pread_local_cache_replies: u64,
+    /// Local-cache replies served with `splice(file_fd -> pipe -> fuse_fd)`.
+    pub splice_local_cache_replies: u64,
+    /// Payload bytes returned through local-cache reply strategies.
+    pub local_cache_reply_bytes: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
     /// Read-ahead decisions that issued a prefetch hint.
@@ -1308,6 +1318,9 @@ impl NativeReadMetrics {
             stale_generation_fallbacks: self.stale_generation_fallbacks.load(Ordering::Relaxed),
             unsafe_local_cache_fallbacks: self.unsafe_local_cache_fallbacks.load(Ordering::Relaxed),
             bytes_fallbacks: self.bytes_fallbacks.load(Ordering::Relaxed),
+            pread_local_cache_replies: self.pread_local_cache_replies.load(Ordering::Relaxed),
+            splice_local_cache_replies: self.splice_local_cache_replies.load(Ordering::Relaxed),
+            local_cache_reply_bytes: self.local_cache_reply_bytes.load(Ordering::Relaxed),
             bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
             read_ahead_prefetches: self.read_ahead_prefetches.load(Ordering::Relaxed),
             read_ahead_suppressed: self.read_ahead_suppressed.load(Ordering::Relaxed),
@@ -1413,6 +1426,18 @@ where
             FuseOpcode::Setattr => self.handle_setattr(request),
             _ => errno_reply(request.header.unique, libc::ENOSYS),
         }
+    }
+
+    fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
+        self.read_metrics
+            .pread_local_cache_replies
+            .store(metrics.pread_bytes_replies, Ordering::Relaxed);
+        self.read_metrics
+            .splice_local_cache_replies
+            .store(metrics.splice_replies, Ordering::Relaxed);
+        self.read_metrics
+            .local_cache_reply_bytes
+            .store(metrics.payload_bytes, Ordering::Relaxed);
     }
 }
 
@@ -2301,6 +2326,9 @@ fn vfs_native_bridge_snapshot(
         stale_generation_fallbacks: read.stale_generation_fallbacks,
         unsafe_local_cache_fallbacks: read.unsafe_local_cache_fallbacks,
         bytes_fallbacks: read.bytes_fallbacks,
+        pread_local_cache_replies: read.pread_local_cache_replies,
+        splice_local_cache_replies: read.splice_local_cache_replies,
+        local_cache_reply_bytes: read.local_cache_reply_bytes,
         bytes_returned: read.bytes_returned,
         read_ahead_prefetches: read.read_ahead_prefetches,
         read_ahead_suppressed: read.read_ahead_suppressed,
@@ -3793,6 +3821,23 @@ mod tests {
         let metrics = bridge.read_metrics_snapshot();
         assert_eq!(metrics.unsafe_local_cache_fallbacks, 1);
         assert_eq!(metrics.bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn bridge_read_metrics_include_transport_local_cache_reply_strategy_counts() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_bytes_replies: 2,
+            splice_replies: 5,
+            payload_bytes: 12 * 1024,
+        });
+
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.pread_local_cache_replies, 2);
+        assert_eq!(metrics.splice_local_cache_replies, 5);
+        assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
     }
 
     #[test]

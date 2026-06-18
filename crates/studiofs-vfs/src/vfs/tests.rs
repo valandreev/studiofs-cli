@@ -12074,6 +12074,9 @@ fn write_path_observability_reports_native_bridge_snapshot() {
         read_ahead_prefetches: 2,
         read_ahead_suppressed: 9,
         stale_generation_fallbacks: 4,
+        pread_local_cache_replies: 6,
+        splice_local_cache_replies: 8,
+        local_cache_reply_bytes: 32 * 1024,
         read_ahead_amplification_bytes: 64 * 1024,
         ..VfsNativeBridgeSnapshot::default()
     });
@@ -12084,6 +12087,9 @@ fn write_path_observability_reports_native_bridge_snapshot() {
     assert_eq!(snapshot.native_bridge.lookup_latency.p95_ns, 150);
     assert_eq!(snapshot.native_bridge.stale_generation_fallbacks, 4);
     assert_eq!(snapshot.native_bridge.read_ahead_suppressed, 9);
+    assert_eq!(snapshot.native_bridge.pread_local_cache_replies, 6);
+    assert_eq!(snapshot.native_bridge.splice_local_cache_replies, 8);
+    assert_eq!(snapshot.native_bridge.local_cache_reply_bytes, 32 * 1024);
     assert_eq!(
         snapshot.native_bridge.read_ahead_amplification_bytes,
         64 * 1024

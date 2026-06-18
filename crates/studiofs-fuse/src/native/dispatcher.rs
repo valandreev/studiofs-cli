@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::native::abi::error_reply;
 use crate::native::protocol::{FuseOpcode, FuseReply, FuseRequest};
 use crate::native::reply::{ReplySink, ReplyToken};
-use crate::native::transport::{FuseTransport, TransportError};
+use crate::native::transport::{FuseTransport, LocalCacheReplyMetricsSnapshot, TransportError};
 
 /// Operation layer invoked by the transport-independent dispatcher.
 ///
@@ -23,6 +23,9 @@ use crate::native::transport::{FuseTransport, TransportError};
 pub trait FuseOperationHandler {
     /// Handles one decoded request and returns bytes ready for the transport.
     fn handle(&mut self, request: FuseRequest) -> FuseReply;
+
+    /// Records transport-local local-cache read reply counters after a reply send.
+    fn record_local_cache_reply_metrics(&mut self, _metrics: LocalCacheReplyMetricsSnapshot) {}
 }
 
 /// Minimal handler used while wiring the native transport foundation.
@@ -516,6 +519,9 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                     source: error,
                 });
             }
+            self.handler.record_local_cache_reply_metrics(
+                self.transport.local_cache_reply_metrics_snapshot(),
+            );
             summary.handled_requests += 1;
             if is_destroy {
                 summary.saw_destroy = true;
@@ -728,7 +734,7 @@ mod tests {
     use super::*;
     use crate::native::abi::{FUSE_IN_HEADER_LEN, ok_reply};
     use crate::native::reply::RecordedReplySink;
-    use crate::native::transport::FrameQueueTransport;
+    use crate::native::transport::{FrameQueueTransport, LocalCacheReplyMetricsSnapshot};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -757,6 +763,68 @@ mod tests {
             self.opcodes.push(request.opcode);
             FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
         }
+    }
+
+    struct ReplyMetricsTransport {
+        inner: FrameQueueTransport,
+        metrics: LocalCacheReplyMetricsSnapshot,
+    }
+
+    impl FuseTransport for ReplyMetricsTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+            self.inner.send_reply(reply)
+        }
+
+        fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+            self.metrics
+        }
+    }
+
+    #[derive(Default)]
+    struct ReplyMetricsRecordingHandler {
+        snapshots: Vec<LocalCacheReplyMetricsSnapshot>,
+    }
+
+    impl FuseOperationHandler for ReplyMetricsRecordingHandler {
+        fn handle(&mut self, request: FuseRequest) -> FuseReply {
+            FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
+        }
+
+        fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
+            self.snapshots.push(metrics);
+        }
+    }
+
+    #[test]
+    fn dispatcher_publishes_transport_local_cache_reply_metrics_after_send() {
+        let transport = ReplyMetricsTransport {
+            inner: FrameQueueTransport::new([frame(1, 0x10)]),
+            metrics: LocalCacheReplyMetricsSnapshot {
+                pread_bytes_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            },
+        };
+        let handler = ReplyMetricsRecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (_transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(
+            handler.snapshots,
+            [LocalCacheReplyMetricsSnapshot {
+                pread_bytes_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            }]
+        );
     }
 
     #[test]

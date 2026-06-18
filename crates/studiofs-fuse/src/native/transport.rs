@@ -1386,6 +1386,10 @@ pub trait FuseTransport {
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError>;
     /// Sends one reply frame back to the kernel.
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError>;
+    /// Snapshot transport-local local-cache read reply counters.
+    fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+        LocalCacheReplyMetricsSnapshot::default()
+    }
     /// Sends one reply frame back to the transport origin that produced it.
     fn send_reply_from_origin(
         &mut self,
@@ -1749,6 +1753,10 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             }
         }
         Ok(())
+    }
+
+    fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+        self.local_cache_metrics.snapshot()
     }
 
     fn request_shutdown(&mut self) -> Result<(), TransportError> {
