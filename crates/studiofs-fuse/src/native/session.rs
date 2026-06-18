@@ -61,6 +61,12 @@ impl NativeSessionConfig {
     fn linux6_safe_from_env_value(writeback_cache: Option<&str>) -> Self {
         Self::linux6_safe(writeback_cache.is_some_and(parse_native_bool_env_value))
     }
+
+    /// Opts into advertising FUSE-over-io_uring support during INIT.
+    pub fn with_io_uring_transport(mut self) -> Self {
+        self.requested_capabilities = self.requested_capabilities | FuseCapabilities::OVER_IO_URING;
+        self
+    }
 }
 
 fn parse_native_bool_env_value(raw: &str) -> bool {
@@ -226,6 +232,12 @@ impl<T: FuseTransport> NativeFuseSession<T> {
         self.negotiated = Some(negotiated);
         Ok(negotiated)
     }
+
+    /// Performs INIT negotiation and returns the transport for post-INIT backend upgrades.
+    pub fn handshake_into_transport(mut self) -> Result<(NegotiatedSession, T), SessionError> {
+        let negotiated = self.handshake()?;
+        Ok((negotiated, self.transport))
+    }
 }
 
 /// Direct-mounted native FUSE session with its lifecycle and dispatcher inputs.
@@ -388,6 +400,33 @@ mod tests {
         assert_eq!(session.transport.sent_replies().len(), 1);
     }
 
+    #[test]
+    fn handshake_into_transport_returns_negotiated_state_and_classic_transport_for_upgrade() {
+        let kernel_caps = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
+        let requested_caps = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
+        let transport = FrameQueueTransport::new([init_frame(0x46, 4 * 1024 * 1024, kernel_caps)]);
+        let config = NativeSessionConfig {
+            requested_capabilities: requested_caps,
+            max_readahead: 1024 * 1024,
+            max_write: 16 * 1024 * 1024,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_pages: 256,
+        };
+        let session = NativeFuseSession::new(transport, config);
+
+        let (negotiated, transport) = session
+            .handshake_into_transport()
+            .expect("INIT handshake should return transport for backend upgrade");
+
+        assert!(
+            negotiated
+                .capabilities
+                .contains(FuseCapabilities::OVER_IO_URING)
+        );
+        assert_eq!(transport.sent_replies().len(), 1);
+    }
+
     struct EioReceiveTransport;
 
     impl FuseTransport for EioReceiveTransport {
@@ -470,6 +509,17 @@ mod tests {
             config
                 .requested_capabilities
                 .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
+    }
+
+    #[test]
+    fn linux6_safe_config_can_opt_into_fuse_over_io_uring_transport() {
+        let config = NativeSessionConfig::linux6_safe(false).with_io_uring_transport();
+
+        assert!(
+            config
+                .requested_capabilities
+                .contains(FuseCapabilities::OVER_IO_URING)
         );
     }
 

@@ -4538,6 +4538,7 @@ mod tests {
             linux_async_dio_enabled: false,
             linux_parallel_dirops_enabled: false,
             linux_readdirplus_auto_enabled: true,
+            linux_native_transport: crate::native::transport::LinuxNativeTransportSelection::Auto,
             async_write_admission_limits: Some(StudioFuseAsyncWriteAdmissionLimits {
                 max_pending_bytes: Some(4096),
                 max_pending_writes: Some(7),
@@ -4554,6 +4555,7 @@ mod tests {
             linux_async_dio_enabled: false,
             linux_parallel_dirops_enabled: false,
             linux_readdirplus_auto_enabled: true,
+            linux_native_transport: crate::native::transport::LinuxNativeTransportSelection::Auto,
             async_write_admission_limits: Some(StudioFuseAsyncWriteAdmissionLimits {
                 max_pending_bytes: Some(4096),
                 max_pending_writes: Some(7),

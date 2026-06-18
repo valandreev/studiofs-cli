@@ -74,6 +74,7 @@ anyhow = "1"
 # newer distros. macOS still requires libfuse via macFUSE/osxfuse.
 fuser = "0.16"
 libc = "0.2"
+io-uring = "0.7.12"
 
 # Platform - WinFSP (Windows)
 winfsp = "0.12"

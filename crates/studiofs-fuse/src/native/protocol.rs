@@ -597,7 +597,7 @@ impl FuseRequest {
 }
 
 impl FuseOpcode {
-    fn from_raw(opcode: u32) -> Self {
+    pub(crate) fn from_raw(opcode: u32) -> Self {
         match opcode {
             1 => Self::Lookup,
             2 => Self::Forget,

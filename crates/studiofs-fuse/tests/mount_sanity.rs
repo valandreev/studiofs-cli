@@ -21,7 +21,11 @@ use studiofs_fuse::native::lifecycle::{
 };
 use studiofs_fuse::native::protocol::FuseCapabilities;
 use studiofs_fuse::native::session::{NativeFuseSession, NativeSessionConfig};
-use studiofs_fuse::native::transport::ClassicReadWriteTransport;
+use studiofs_fuse::native::transport::{
+    ClassicReadWriteTransport, HybridFuseTransport, IoUringBackend, LinuxNativeFuseTransport,
+    LinuxNativeTransportSelection, io_uring_payload_len_for_session,
+    linux_fuse_io_uring_queue_count,
+};
 use studiofs_fuse::native::vfs_adapter::{
     LinuxNativeBridge, NativeAsyncWriteConfig, StudioVfsNativeAdapter,
 };
@@ -596,6 +600,16 @@ fn docs_list_sfs530_native_evidence_command() {
 }
 
 #[test]
+fn docs_list_sfs533_native_io_uring_smoke_command() {
+    let docs = include_str!("../../../docs/tests.md");
+
+    assert!(
+        docs.contains("native_fusermount3_io_uring_session_init_and_unmount_smoke"),
+        "docs/tests.md must list the SFS-533 native io_uring smoke command"
+    );
+}
+
+#[test]
 fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     let source = include_str!("mount_sanity.rs");
     let writer = source
@@ -763,6 +777,48 @@ fn native_mount_smoke_is_available_as_sfs525_opt_in_gate() {
         source.contains("native_mount_session_mount_and_unmount_smoke"),
         "SFS-525 native mount smoke must stay available behind the opt-in mounted test gate"
     );
+}
+
+#[test]
+fn native_io_uring_mount_smoke_is_available_as_sfs533_opt_in_gate() {
+    let source = include_str!("mount_sanity.rs");
+
+    assert!(
+        source.contains("native_fusermount3_io_uring_session_init_and_unmount_smoke"),
+        "SFS-533 native io_uring mount smoke must stay available behind the opt-in mounted test gate"
+    );
+}
+
+#[test]
+fn native_io_uring_mount_smoke_uses_drop_guard_for_panic_cleanup() {
+    let source = include_str!("mount_sanity.rs");
+    let smoke = source
+        .rsplit("fn native_fusermount3_io_uring_session_init_and_unmount_smoke")
+        .next()
+        .and_then(|rest| rest.split("fn finish_mounted_fuse_test").next())
+        .expect("SFS-533 native io_uring smoke should be present");
+
+    assert!(smoke.contains("struct MountGuard"));
+    assert!(smoke.contains("impl Drop for MountGuard"));
+    assert!(smoke.contains("force_unmount_fuse_mount_path(mount_path)"));
+    assert!(smoke.contains("mount_guard.disarm()"));
+}
+
+#[test]
+fn native_mounted_session_uses_runtime_linux_native_transport_selection() {
+    let source = include_str!("mount_sanity.rs");
+    let native_mount_runner = source
+        .split("fn with_mounted_native_fuse")
+        .last()
+        .and_then(|rest| rest.split("fn run_mounted_scenario").next())
+        .expect("native mounted runner should be present");
+
+    assert!(native_mount_runner.contains("runtime_options.linux_native_transport"));
+    assert!(native_mount_runner.contains("LinuxNativeFuseTransport::Hybrid"));
+    assert!(native_mount_runner.contains("LinuxNativeTransportSelection::IoUring"));
+    assert!(native_mount_runner.contains("with_io_uring_transport"));
+    assert!(native_mount_runner.contains("linux_fuse_io_uring_queue_count()"));
+    assert!(native_mount_runner.contains("io_uring_payload_len_for_session"));
 }
 
 #[test]
@@ -1295,6 +1351,145 @@ fn native_fusermount3_classic_session_init_and_unmount_smoke() {
     );
 }
 
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, kernel FUSE-over-io_uring, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
+    if !mounted_tests_enabled() {
+        eprintln!(
+            "skipping native fusermount3 io_uring smoke because {MOUNT_TESTS_ENV}=1 is not set"
+        );
+        return;
+    }
+    if Command::new("fusermount3").arg("-V").status().is_err() {
+        eprintln!("skipping native fusermount3 io_uring smoke because fusermount3 is unavailable");
+        return;
+    }
+
+    let tmp = target_tempdir("native-fusermount3-uring-session-smoke-");
+    let vfs_tmp = target_tempdir("native-fusermount3-uring-session-vfs-");
+    let mount_path = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_path).expect("create native io_uring session mount point");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&vfs_tmp, "native-uring-session-smoke", &rt);
+    let options = native_direct_mount_options();
+    let request = options
+        .fusermount_request(mount_path.to_str().expect("mount path should be utf-8"))
+        .expect("build native io_uring session request");
+    let system = Fusermount3MountSystem::default();
+
+    let fuse = system
+        .mount(&request)
+        .expect("native fusermount3 FUSE mount should return a device fd");
+    struct MountGuard(Option<std::path::PathBuf>);
+    impl MountGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Some(mount_path) = &self.0 {
+                let _ = force_unmount_fuse_mount_path(mount_path);
+            }
+        }
+    }
+    let mut mount_guard = MountGuard(Some(mount_path.clone()));
+    assert!(
+        mountinfo_contains_path(&mount_path),
+        "native fusermount3 io_uring session mount should appear in mountinfo"
+    );
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let adapter = StudioVfsNativeAdapter::new(Arc::clone(&vfs), rt.handle().clone());
+    let session_thread = std::thread::spawn(move || {
+        let fuse_file = fuse.into_file();
+        let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
+        let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
+        let config = NativeSessionConfig::linux6_safe_from_env().with_io_uring_transport();
+        let session = NativeFuseSession::new(transport, config);
+        let (negotiated, transport) = match session.handshake_into_transport() {
+            Ok(result) => result,
+            Err(error) => {
+                ready_tx
+                    .send(Err(format!("INIT handshake failed: {error}")))
+                    .expect("send native io_uring handshake failure");
+                return;
+            }
+        };
+        if !negotiated
+            .capabilities
+            .contains(FuseCapabilities::OVER_IO_URING)
+        {
+            ready_tx
+                .send(Ok(false))
+                .expect("send native io_uring unsupported status");
+            return;
+        }
+        let transport = match HybridFuseTransport::<_, IoUringBackend>::register_kernel_io_uring(
+            transport,
+            fuse_fd,
+            linux_fuse_io_uring_queue_count(),
+            io_uring_payload_len_for_session(negotiated.max_write, negotiated.max_pages),
+        ) {
+            Ok(transport) => transport,
+            Err(error) => {
+                ready_tx
+                    .send(Err(format!("io_uring registration failed: {error}")))
+                    .expect("send native io_uring registration failure");
+                return;
+            }
+        };
+        ready_tx
+            .send(Ok(true))
+            .expect("send native io_uring registration status");
+
+        let runtime_options = StudioFuseRuntimeOptions::from_env();
+        let mut handler = LinuxNativeBridge::new(adapter);
+        if let Some(config) = NativeAsyncWriteConfig::from_runtime_options(&runtime_options) {
+            handler = handler.with_async_write_config(config);
+        }
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+        let result = dispatcher.run_until_destroy();
+        done_tx
+            .send(result)
+            .expect("send native io_uring dispatcher result");
+    });
+
+    match ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("native io_uring session should report readiness")
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("skipping native io_uring smoke because FUSE_CAP_OVER_IO_URING is missing");
+            force_unmount_fuse_mount_path(&mount_path)
+                .expect("native io_uring skip unmount should succeed");
+            mount_guard.disarm();
+            session_thread
+                .join()
+                .expect("native io_uring skipped session thread should not panic");
+            return;
+        }
+        Err(error) => panic!("{error}"),
+    }
+
+    force_unmount_fuse_mount_path(&mount_path)
+        .expect("native io_uring session unmount should succeed");
+    mount_guard.disarm();
+    let dispatch_result = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("native io_uring dispatcher should finish after unmount");
+    dispatch_result.expect("native io_uring dispatcher should shut down cleanly");
+    session_thread
+        .join()
+        .expect("native io_uring session thread should not panic");
+    assert!(
+        wait_for_mountinfo_path_to_clear(&mount_path, Duration::from_secs(2)),
+        "native io_uring session mount path should clear from mountinfo after unmount"
+    );
+}
+
 fn finish_mounted_fuse_test(
     test_result: std::thread::Result<MountedOperationGuard>,
     unmount_result: io::Result<()>,
@@ -1779,15 +1974,72 @@ fn with_mounted_native_fuse(
     let (session_done_tx, session_done_rx) = std::sync::mpsc::channel();
     let session_handle = std::thread::spawn(move || -> io::Result<()> {
         let result = (|| {
-            let transport = ClassicReadWriteTransport::new(fuse.into_file());
-            let config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
-            let mut session = NativeFuseSession::new(transport, config);
-            session
-                .handshake()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let transport = session.into_transport();
+            let fuse_file = fuse.into_file();
+            let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
+            let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
             let mut runtime_options = StudioFuseRuntimeOptions::from_env();
             runtime_options.async_write_enabled = mode.async_write_enabled();
+            let mut config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
+            if runtime_options.linux_native_transport != LinuxNativeTransportSelection::Classic {
+                config = config.with_io_uring_transport();
+            }
+            let session = NativeFuseSession::new(transport, config);
+            let (negotiated, transport) = session
+                .handshake_into_transport()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let transport = match runtime_options.linux_native_transport {
+                LinuxNativeTransportSelection::Classic => {
+                    LinuxNativeFuseTransport::Classic(transport)
+                }
+                LinuxNativeTransportSelection::IoUring => {
+                    if !negotiated
+                        .capabilities
+                        .contains(FuseCapabilities::OVER_IO_URING)
+                    {
+                        return Err(io::Error::other(
+                            "FUSE-over-io_uring requested but FUSE_CAP_OVER_IO_URING was not negotiated",
+                        ));
+                    }
+                    LinuxNativeFuseTransport::Hybrid(
+                        HybridFuseTransport::<_, IoUringBackend>::register_kernel_io_uring(
+                            transport,
+                            fuse_fd,
+                            linux_fuse_io_uring_queue_count(),
+                            io_uring_payload_len_for_session(
+                                negotiated.max_write,
+                                negotiated.max_pages,
+                            ),
+                        )
+                        .map_err(|error| io::Error::other(error.to_string()))?,
+                    )
+                }
+                LinuxNativeTransportSelection::Auto => {
+                    if negotiated
+                        .capabilities
+                        .contains(FuseCapabilities::OVER_IO_URING)
+                    {
+                        match HybridFuseTransport::<_, IoUringBackend>::try_register_kernel_io_uring(
+                            transport,
+                            fuse_fd,
+                            linux_fuse_io_uring_queue_count(),
+                            io_uring_payload_len_for_session(
+                                negotiated.max_write,
+                                negotiated.max_pages,
+                            ),
+                        ) {
+                            Ok(transport) => LinuxNativeFuseTransport::Hybrid(transport),
+                            Err((transport, error)) => {
+                                eprintln!(
+                                    "falling back to classic native FUSE transport after io_uring registration failed: {error}"
+                                );
+                                LinuxNativeFuseTransport::Classic(transport)
+                            }
+                        }
+                    } else {
+                        LinuxNativeFuseTransport::Classic(transport)
+                    }
+                }
+            };
             let mut handler = LinuxNativeBridge::new(adapter);
             if let Some(config) = NativeAsyncWriteConfig::from_runtime_options(&runtime_options) {
                 handler = handler.with_async_write_config(config);
