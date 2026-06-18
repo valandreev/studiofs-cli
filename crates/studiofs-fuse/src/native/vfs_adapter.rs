@@ -1438,6 +1438,7 @@ where
         self.read_metrics
             .local_cache_reply_bytes
             .store(metrics.payload_bytes, Ordering::Relaxed);
+        self.publish_native_bridge_snapshot();
     }
 }
 
@@ -3017,7 +3018,10 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 mod tests {
     use super::*;
     use crate::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseRuntimeOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::mem::align_of;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
 
     #[derive(Debug)]
     struct TestNativeVfs {
@@ -3840,6 +3844,68 @@ mod tests {
         assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_bridge_snapshot_reports_splice_reply_strategy_after_mounted_read() {
+        let test_vfs = TestNativeVfs::default();
+        test_vfs
+            .local_cache_file
+            .write_all_at(&vec![b'x'; 8192], 4096)
+            .expect("seed local cache file range");
+        let vfs = Arc::new(test_vfs);
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let mut fuse_file = tempfile::tempfile().expect("create fuse test file");
+        let mut frames = read_request_frame(20, 7, 13, 8192);
+        frames.extend_from_slice(&lookup_request_frame(b"file"));
+        fuse_file.write_all(&frames).expect("write request frames");
+        fuse_file.rewind().expect("rewind request frames");
+        let output_fd = fuse_file.as_raw_fd();
+        let transport = crate::native::transport::ClassicReadWriteTransport::with_output_fd(
+            fuse_file, output_fd,
+        );
+        let mut dispatcher = crate::native::dispatcher::NativeDispatcher::new(transport, bridge);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run read and follow-up lookup");
+
+        let (transport, _bridge) = dispatcher.into_parts();
+        let snapshots = vfs
+            .native_bridge_snapshots
+            .lock()
+            .expect("native bridge snapshots lock should not be poisoned");
+        let (_amplification, read) = snapshots.last().expect("snapshot should be published");
+        assert_eq!(read.local_cache_hits, 1);
+        assert_eq!(read.splice_local_cache_replies, 1);
+        assert_eq!(read.pread_local_cache_replies, 0);
+        assert_eq!(read.local_cache_reply_bytes, 8192);
+
+        let mut output = Vec::new();
+        let mut output_file = transport.into_inner();
+        output_file
+            .seek(SeekFrom::Start(frames.len() as u64))
+            .expect("seek to replies");
+        output_file.read_to_end(&mut output).expect("read replies");
+        assert!(
+            output.len() >= 16 + 8192,
+            "read reply should include FUSE header and spliced payload"
+        );
+    }
+
     #[test]
     fn setattr_truncate_invalidates_trusted_open_cache_state_before_followup_read() {
         let vfs = Arc::new(TestNativeVfs::default());
@@ -3923,6 +3989,16 @@ mod tests {
         }
     }
 
+    fn read_request_frame(ino: u64, fh: u64, offset: u64, size: u32) -> Vec<u8> {
+        let request = read_request_for_ino_fh_offset_and_size(ino, fh, offset, size);
+        fuse_frame(
+            15,
+            request.header.unique,
+            request.header.nodeid,
+            &request.payload,
+        )
+    }
+
     fn lookup_request_for_name(name: &[u8]) -> FuseRequest {
         let mut payload = name.to_vec();
         payload.push(0);
@@ -3939,6 +4015,31 @@ mod tests {
             opcode: FuseOpcode::Lookup,
             payload,
         }
+    }
+
+    fn lookup_request_frame(name: &[u8]) -> Vec<u8> {
+        let request = lookup_request_for_name(name);
+        fuse_frame(
+            1,
+            request.header.unique,
+            request.header.nodeid,
+            &request.payload,
+        )
+    }
+
+    fn fuse_frame(opcode: u32, unique: u64, nodeid: u64, payload: &[u8]) -> Vec<u8> {
+        let len = (crate::native::abi::FUSE_IN_HEADER_LEN + payload.len()) as u32;
+        let mut frame = Vec::with_capacity(len as usize);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&opcode.to_le_bytes());
+        frame.extend_from_slice(&unique.to_le_bytes());
+        frame.extend_from_slice(&nodeid.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
     }
 
     fn getattr_request_for_ino(ino: u64) -> FuseRequest {
