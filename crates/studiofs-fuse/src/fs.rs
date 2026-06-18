@@ -451,26 +451,68 @@ fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
+#[cfg(test)]
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.is_none_or(should_enable_async_fuse_write_from_env_value)
+    match raw {
+        Some(raw) => should_enable_async_fuse_write_from_env_value(raw),
+        None => true,
+    }
+}
+
+fn resolve_async_fuse_write_enabled_from_os(raw: Option<&OsStr>) -> bool {
+    resolve_async_fuse_bool_env_value(
+        STUDIOFS_FUSE_ASYNC_WRITE_ENV,
+        raw,
+        should_enable_async_fuse_write_from_env_value,
+    )
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
-    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
-    resolve_async_fuse_write_enabled(raw.as_deref())
+    let raw = std::env::var_os(STUDIOFS_FUSE_ASYNC_WRITE_ENV);
+    resolve_async_fuse_write_enabled_from_os(raw.as_deref())
 }
 
 fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
+#[cfg(test)]
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
-    raw.is_none_or(should_enable_async_fuse_read_from_env_value)
+    match raw {
+        Some(raw) => should_enable_async_fuse_read_from_env_value(raw),
+        None => true,
+    }
+}
+
+fn resolve_async_fuse_read_enabled_from_os(raw: Option<&OsStr>) -> bool {
+    resolve_async_fuse_bool_env_value(
+        STUDIOFS_FUSE_ASYNC_READ_ENV,
+        raw,
+        should_enable_async_fuse_read_from_env_value,
+    )
 }
 
 fn should_enable_async_fuse_read_from_env() -> bool {
-    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok();
-    resolve_async_fuse_read_enabled(raw.as_deref())
+    let raw = std::env::var_os(STUDIOFS_FUSE_ASYNC_READ_ENV);
+    resolve_async_fuse_read_enabled_from_os(raw.as_deref())
+}
+
+fn resolve_async_fuse_bool_env_value(
+    env_key: &'static str,
+    raw: Option<&OsStr>,
+    parse: fn(&str) -> bool,
+) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let Some(raw) = raw.to_str() else {
+        warn!(
+            env_key,
+            "non-UTF8 Linux FUSE async profile environment value; disabling the async path"
+        );
+        return false;
+    };
+    parse(raw)
 }
 
 fn should_enable_async_fuse_metadata_from_env_value(raw: &str) -> bool {
@@ -3670,11 +3712,13 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
         FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseCapabilityPolicy, PendingFuseCloseGuard,
-        StudioFuseFs, TTL, async_write_platform_policy_label, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, parse_linux_native_transport_selection, posix_flags_to_open_flags,
+        STUDIOFS_FUSE_ASYNC_READ_ENV, STUDIOFS_FUSE_ASYNC_WRITE_ENV, StudioFuseFs, TTL,
+        async_write_platform_policy_label, complete_fuse_write_reply, fuse_write_local_sync_policy,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        parse_linux_native_transport_selection, posix_flags_to_open_flags,
         resolve_async_fuse_read_enabled, resolve_async_fuse_write_enabled,
         retry_optional_fuse_queue_tuning, should_enable_async_fuse_metadata_from_env_value,
+        should_enable_async_fuse_read_from_env, should_enable_async_fuse_write_from_env,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
@@ -3684,8 +3728,9 @@ mod tests {
     use std::cell::Cell;
 
     use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::time::Duration;
     use studiofs_data::store::DataStoreConfig;
@@ -3702,6 +3747,8 @@ mod tests {
     type TestDataReplyResult = Result<Vec<u8>, i32>;
 
     type TestAttrReplyResult = Result<fuser::FileAttr, i32>;
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestAttrReply {
         sender: mpsc::Sender<TestAttrReplyResult>,
@@ -4907,6 +4954,58 @@ mod tests {
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(resolve_async_fuse_read_enabled(Some(true_value)));
         }
+    }
+
+    #[test]
+    fn async_fuse_write_env_non_utf8_value_does_not_fall_back_to_enabled_default() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let previous = std::env::var_os(STUDIOFS_FUSE_ASYNC_WRITE_ENV);
+        // SAFETY: this test serializes process environment mutation with
+        // `ENV_TEST_LOCK` and restores the previous value before returning.
+        unsafe {
+            std::env::set_var(
+                STUDIOFS_FUSE_ASYNC_WRITE_ENV,
+                std::ffi::OsString::from_vec(vec![0xff, b'1']),
+            );
+        }
+
+        let enabled = should_enable_async_fuse_write_from_env();
+
+        // SAFETY: protected by the same process-wide test lock as above.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(STUDIOFS_FUSE_ASYNC_WRITE_ENV, previous);
+            } else {
+                std::env::remove_var(STUDIOFS_FUSE_ASYNC_WRITE_ENV);
+            }
+        }
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn async_fuse_read_env_non_utf8_value_does_not_fall_back_to_enabled_default() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let previous = std::env::var_os(STUDIOFS_FUSE_ASYNC_READ_ENV);
+        // SAFETY: this test serializes process environment mutation with
+        // `ENV_TEST_LOCK` and restores the previous value before returning.
+        unsafe {
+            std::env::set_var(
+                STUDIOFS_FUSE_ASYNC_READ_ENV,
+                std::ffi::OsString::from_vec(vec![0xff, b'1']),
+            );
+        }
+
+        let enabled = should_enable_async_fuse_read_from_env();
+
+        // SAFETY: protected by the same process-wide test lock as above.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(STUDIOFS_FUSE_ASYNC_READ_ENV, previous);
+            } else {
+                std::env::remove_var(STUDIOFS_FUSE_ASYNC_READ_ENV);
+            }
+        }
+        assert!(!enabled);
     }
 
     #[test]

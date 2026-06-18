@@ -55,8 +55,8 @@ struct FuseUringCmdReq {
 const _: [(); FUSE_URING_ENT_IN_OUT_SZ] = [(); std::mem::size_of::<FuseUringEntInOut>()];
 const _: [(); FUSE_URING_REQ_HEADER_SZ] = [(); std::mem::size_of::<FuseUringReqHeader>()];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Linux FUSE-over-io_uring command submitted through `IORING_OP_URING_CMD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuseUringCommandOp {
     /// Register a queue entry buffer with the kernel FUSE connection.
     Register,
@@ -73,8 +73,8 @@ impl FuseUringCommandOp {
     }
 }
 
-#[derive(Debug)]
 /// Prepared FUSE-over-io_uring command that borrows a registered queue entry.
+#[derive(Debug)]
 pub struct FuseUringCommand<'a> {
     /// Kernel command opcode encoded into the io_uring SQE.
     pub op: FuseUringCommandOp,
@@ -134,8 +134,8 @@ fn set_uring_cmd_iovec_count(sqe: &mut io_uring::squeue::Entry128, iovec_count: 
     }
 }
 
-#[derive(Debug)]
 /// Owned FUSE-over-io_uring queue entry with stable request/reply buffers.
+#[derive(Debug)]
 pub struct FuseUringEntry {
     qid: u16,
     user_data: u64,
@@ -389,8 +389,8 @@ fn parse_linux_possible_cpu_count(raw: &str) -> Option<usize> {
     Some(total)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Completion event returned by a FUSE-over-io_uring backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuseIoUringCompletion {
     /// User data copied from the completed SQE.
     pub user_data: u64,
@@ -398,8 +398,8 @@ pub struct FuseIoUringCompletion {
     pub result: i32,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Snapshot of FUSE-over-io_uring transport counters and latency totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FuseIoUringTransportMetricsSnapshot {
     /// Number of registered io_uring queue entries.
     pub queue_depth: u16,
@@ -521,8 +521,8 @@ impl FuseUringBackend for IoUringBackend {
     }
 }
 
-#[derive(Debug)]
 /// FUSE transport that exchanges requests and replies through io_uring.
+#[derive(Debug)]
 pub struct FuseIoUringTransport<B> {
     fuse_fd: RawFd,
     entries: Vec<FuseUringEntry>,
@@ -761,8 +761,8 @@ impl<B: FuseUringBackend> FuseTransport for FuseIoUringTransport<B> {
     }
 }
 
-#[derive(Debug)]
 /// Owns the classic FUSE device handle for a registered io_uring transport.
+#[derive(Debug)]
 pub struct RegisteredFuseIoUringTransport<T, B> {
     _io: T,
     inner: FuseIoUringTransport<B>,
@@ -810,8 +810,8 @@ impl<T, B: FuseUringBackend> FuseTransport for RegisteredFuseIoUringTransport<T,
     }
 }
 
-#[derive(Debug)]
 /// Hybrid transport that prefers io_uring and falls back to classic FUSE I/O.
+#[derive(Debug)]
 pub struct HybridFuseTransport<C, B> {
     classic: C,
     io_uring: FuseIoUringTransport<B>,
@@ -821,8 +821,8 @@ pub struct HybridFuseTransport<C, B> {
     io_uring_runtime_error_fallbacks: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Snapshot of hybrid FUSE transport mode and fallback counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HybridFuseTransportMetricsSnapshot {
     /// Effective transport mode for this hybrid surface.
     pub mode: LinuxNativeTransportMode,
@@ -1068,8 +1068,8 @@ fn wait_for_hybrid_readiness(
     }
 }
 
-#[derive(Debug)]
 /// Linux-native FUSE transport selected for a mounted session.
+#[derive(Debug)]
 pub enum LinuxNativeFuseTransport<C, B> {
     /// Classic `/dev/fuse` read/write transport.
     Classic(C),
@@ -1365,8 +1365,8 @@ impl LocalCacheReplyMetrics {
     }
 }
 
-#[derive(Debug, Error)]
 /// Errors returned by FUSE transport implementations.
+#[derive(Debug, Error)]
 pub enum TransportError {
     /// A raw frame could not be decoded according to the FUSE ABI.
     #[error(transparent)]
@@ -1501,8 +1501,8 @@ where
     }
 }
 
-#[derive(Debug, Default)]
 /// In-memory transport used by protocol and dispatcher tests.
+#[derive(Debug, Default)]
 pub struct FrameQueueTransport {
     inbound: VecDeque<Vec<u8>>,
     sent_replies: Vec<FuseReply>,
@@ -1550,11 +1550,11 @@ impl FuseTransport for FrameQueueTransport {
     }
 }
 
-#[derive(Debug)]
 /// Classic blocking read/write transport for a FUSE device descriptor.
 ///
 /// The kernel expects request reads to use a sufficiently large buffer. This
 /// transport owns and reuses that buffer so sessions do not allocate per frame.
+#[derive(Debug)]
 pub struct ClassicReadWriteTransport<T> {
     io: T,
     read_buffer: Vec<u8>,
