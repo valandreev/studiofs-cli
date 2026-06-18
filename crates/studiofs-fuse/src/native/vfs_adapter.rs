@@ -1,12 +1,12 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
@@ -692,9 +692,12 @@ pub struct LinuxNativeBridge<V> {
     open_cache_metrics: NativeOpenCacheMetrics,
     amplification_metrics: NativeAmplificationMetrics,
     read_metrics: NativeReadMetrics,
+    native_bridge_snapshot_started_at: Instant,
+    native_bridge_snapshot_last_elapsed_ms: AtomicU64,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     read_ahead_policy: NativeReadAheadPolicy,
     read_ahead_states: Mutex<HashMap<u64, NativeReadAheadState>>,
+    read_ahead_inode_by_fh: Mutex<HashMap<u64, u64>>,
 }
 
 /// Native Linux async write admission and telemetry profile.
@@ -831,12 +834,14 @@ struct NativeAmplificationMetrics {
 }
 
 const NATIVE_LATENCY_SAMPLE_CAP: usize = 2048;
+const NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
 
 #[derive(Debug, Default)]
 struct NativeLatencyMetrics {
     total_ns: AtomicU64,
     max_ns: AtomicU64,
-    samples: Mutex<Vec<u64>>,
+    samples: Mutex<VecDeque<u64>>,
 }
 
 /// Point-in-time latency statistics for one native Linux opcode family.
@@ -1017,13 +1022,16 @@ impl NativeLatencyMetrics {
 
         let mut samples = lock_or_recover(&self.samples, "native_latency_samples");
         if samples.len() == NATIVE_LATENCY_SAMPLE_CAP {
-            samples.remove(0);
+            samples.pop_front();
         }
-        samples.push(latency_ns);
+        samples.push_back(latency_ns);
     }
 
     fn snapshot(&self) -> NativeLatencyMetricsSnapshot {
-        let mut samples = lock_or_recover(&self.samples, "native_latency_samples").clone();
+        let mut samples: Vec<u64> = lock_or_recover(&self.samples, "native_latency_samples")
+            .iter()
+            .copied()
+            .collect();
         samples.sort_unstable();
         NativeLatencyMetricsSnapshot {
             samples: samples.len() as u64,
@@ -1112,6 +1120,10 @@ impl<V> LinuxNativeBridge<V> {
             open_cache_metrics: NativeOpenCacheMetrics::default(),
             amplification_metrics: NativeAmplificationMetrics::default(),
             read_metrics: NativeReadMetrics::default(),
+            native_bridge_snapshot_started_at: Instant::now(),
+            native_bridge_snapshot_last_elapsed_ms: AtomicU64::new(
+                NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED,
+            ),
             trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
             read_ahead_policy: NativeReadAheadPolicy {
                 max_prefetch_bytes: 1024 * 1024,
@@ -1119,6 +1131,7 @@ impl<V> LinuxNativeBridge<V> {
                 min_sequential_reads: 2,
             },
             read_ahead_states: Mutex::new(HashMap::new()),
+            read_ahead_inode_by_fh: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1205,7 +1218,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_lookup(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1226,7 +1239,7 @@ where
         };
         self.amplification_metrics
             .record_lookup(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1248,7 +1261,7 @@ where
         };
         self.amplification_metrics
             .record_getattr(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1259,7 +1272,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_open(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1280,7 +1293,7 @@ where
         };
         self.amplification_metrics
             .record_open(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1291,7 +1304,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_release(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1304,15 +1317,18 @@ where
             if pending_result == Err(libc::EAGAIN) {
                 self.amplification_metrics
                     .record_release(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return errno_reply(request.header.unique, libc::EAGAIN);
             }
             let release_result = self.vfs.release(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
+            if release_result.is_ok() {
+                self.forget_read_ahead_handle(fh);
+            }
             let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
             self.amplification_metrics
                 .record_release(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot();
+            self.publish_native_bridge_snapshot_if_due();
             return reply;
         }
 
@@ -1320,14 +1336,14 @@ where
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
         let reply = match self.vfs.release(fh) {
             Ok(()) => {
-                lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
+                self.forget_read_ahead_handle(fh);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
         };
         self.amplification_metrics
             .record_release(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1338,14 +1354,14 @@ where
             None => {
                 self.amplification_metrics
                     .record_read(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
         if let Err(errno) = checked_native_read_size(read.size) {
             self.amplification_metrics
                 .record_read(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot();
+            self.publish_native_bridge_snapshot_if_due();
             return errno_reply(request.header.unique, errno);
         }
         self.observe_read_ahead(request.header.nodeid, read);
@@ -1370,7 +1386,7 @@ where
                                     .fetch_add(u64::from(range_len), Ordering::Relaxed);
                                 self.amplification_metrics
                                     .record_read(elapsed_latency_ns(started_at));
-                                self.publish_native_bridge_snapshot();
+                                self.publish_native_bridge_snapshot_if_due();
                                 return reply;
                             }
                             Err(error) => {
@@ -1409,7 +1425,7 @@ where
             Err(errno) => {
                 self.amplification_metrics
                     .record_read(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return errno_reply(request.header.unique, errno);
             }
         }
@@ -1431,7 +1447,7 @@ where
         };
         self.amplification_metrics
             .record_read(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1442,7 +1458,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_write(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1456,7 +1472,7 @@ where
             );
             self.amplification_metrics
                 .record_write(elapsed_latency_ns(started_at));
-            self.publish_native_bridge_snapshot();
+            self.publish_native_bridge_snapshot_if_due();
             return reply;
         }
 
@@ -1481,7 +1497,7 @@ where
         };
         self.amplification_metrics
             .record_write(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1626,7 +1642,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_readdir(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1635,7 +1651,7 @@ where
             Err(_) => {
                 self.amplification_metrics
                     .record_readdir(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1649,7 +1665,7 @@ where
         };
         self.amplification_metrics
             .record_readdir(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1660,7 +1676,7 @@ where
             None => {
                 self.amplification_metrics
                     .record_readdirplus(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1669,7 +1685,7 @@ where
             Err(_) => {
                 self.amplification_metrics
                     .record_readdirplus(elapsed_latency_ns(started_at));
-                self.publish_native_bridge_snapshot();
+                self.publish_native_bridge_snapshot_if_due();
                 return invalid_request(request.header.unique);
             }
         };
@@ -1684,7 +1700,7 @@ where
                         Err(errno) => {
                             self.amplification_metrics
                                 .record_readdirplus(elapsed_latency_ns(started_at));
-                            self.publish_native_bridge_snapshot();
+                            self.publish_native_bridge_snapshot_if_due();
                             return errno_reply(request.header.unique, errno);
                         }
                     };
@@ -1694,7 +1710,7 @@ where
         };
         self.amplification_metrics
             .record_readdirplus(elapsed_latency_ns(started_at));
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
         reply
     }
 
@@ -1929,7 +1945,27 @@ where
         for &ino in inodes {
             self.trusted_open_cache_states.remove(ino);
         }
-        lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").clear();
+        let mut states = lock_or_recover(&self.read_ahead_states, "native_read_ahead_states");
+        let mut inode_by_fh = lock_or_recover(
+            &self.read_ahead_inode_by_fh,
+            "native_read_ahead_inode_by_fh",
+        );
+        inode_by_fh.retain(|fh, ino| {
+            let keep = !inodes.contains(ino);
+            if !keep {
+                states.remove(fh);
+            }
+            keep
+        });
+    }
+
+    fn forget_read_ahead_handle(&self, fh: u64) {
+        lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
+        lock_or_recover(
+            &self.read_ahead_inode_by_fh,
+            "native_read_ahead_inode_by_fh",
+        )
+        .remove(&fh);
     }
 
     fn trusted_local_cache_read_range(
@@ -1969,6 +2005,11 @@ where
         let decision = {
             let mut states = lock_or_recover(&self.read_ahead_states, "native_read_ahead_states");
             let state = states.entry(read.fh).or_default();
+            lock_or_recover(
+                &self.read_ahead_inode_by_fh,
+                "native_read_ahead_inode_by_fh",
+            )
+            .insert(read.fh, ino);
             decide_native_read_ahead(
                 &self.read_ahead_policy,
                 state,
@@ -2010,6 +2051,38 @@ where
         };
         self.vfs
             .record_async_write_snapshot(native_async_write_snapshot(&self.pending_writes, config));
+    }
+
+    fn publish_native_bridge_snapshot_if_due(&self) {
+        let elapsed_ms = self
+            .native_bridge_snapshot_started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let interval_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+
+        let mut last = self
+            .native_bridge_snapshot_last_elapsed_ms
+            .load(Ordering::Relaxed);
+        loop {
+            let due = last == NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED
+                || elapsed_ms.saturating_sub(last) >= interval_ms;
+            if !due {
+                return;
+            }
+            match self
+                .native_bridge_snapshot_last_elapsed_ms
+                .compare_exchange_weak(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.publish_native_bridge_snapshot();
+                    return;
+                }
+                Err(next) => last = next,
+            }
+        }
     }
 
     fn publish_native_bridge_snapshot(&self) {
@@ -3072,6 +3145,23 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_snapshot_publish_is_rate_limited_on_hot_path() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+
+        let snapshots = vfs
+            .native_bridge_snapshots
+            .lock()
+            .expect("native bridge snapshots lock should not be poisoned");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0.lookup_ops, 1);
+        assert_eq!(bridge.amplification_metrics_snapshot().getattr_ops, 1);
+    }
+
+    #[test]
     fn native_open_cache_state_from_attr_maps_epoch_size_mtime_and_dirty_state() {
         let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
         attr.size = 4096;
@@ -3222,6 +3312,43 @@ mod tests {
     }
 
     #[test]
+    fn mutation_invalidation_keeps_readahead_state_for_unrelated_inode() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(vfs);
+        for ino in [20, 21] {
+            bridge.remember_trusted_open_cache_state(
+                ino,
+                &NativeInodeCacheState {
+                    content_epoch: 9,
+                    size: 64 * 1024,
+                    mtime_ns: 100,
+                    invalidation_generation: 0,
+                    trusted: None,
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        }
+
+        let _ = bridge.handle_read(read_request_for_ino_fh_offset_and_size(20, 7, 0, 8192));
+        let _ = bridge.handle_read(read_request_for_ino_fh_offset_and_size(21, 8, 0, 8192));
+
+        bridge.invalidate_metadata_cache_for_mutation(&[20]);
+
+        let states = lock_or_recover(&bridge.read_ahead_states, "native_read_ahead_states");
+        assert!(!states.contains_key(&7));
+        assert!(states.contains_key(&8));
+        drop(states);
+        let inode_by_fh = lock_or_recover(
+            &bridge.read_ahead_inode_by_fh,
+            "native_read_ahead_inode_by_fh",
+        );
+        assert!(!inode_by_fh.contains_key(&7));
+        assert_eq!(inode_by_fh.get(&8), Some(&21));
+    }
+
+    #[test]
     fn read_metrics_snapshot_reports_sparse_random_readahead_suppression() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(vfs.clone());
@@ -3359,8 +3486,17 @@ mod tests {
     }
 
     fn read_request_for_offset_and_size(offset: u64, size: u32) -> FuseRequest {
+        read_request_for_ino_fh_offset_and_size(20, 7, offset, size)
+    }
+
+    fn read_request_for_ino_fh_offset_and_size(
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> FuseRequest {
         let mut payload = vec![0; FUSE_READ_IN_LEN];
-        payload[0..8].copy_from_slice(&7_u64.to_le_bytes());
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
         payload[8..16].copy_from_slice(&offset.to_le_bytes());
         payload[16..20].copy_from_slice(&size.to_le_bytes());
         FuseRequest {
@@ -3368,7 +3504,7 @@ mod tests {
                 40 + FUSE_READ_IN_LEN as u32,
                 15,
                 99,
-                20,
+                ino,
                 0,
                 0,
                 0,
