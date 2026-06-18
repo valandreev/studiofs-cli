@@ -970,7 +970,6 @@ impl NativeReadAheadStateShard {
     fn track_handle_inode(&mut self, fh: u64, ino: u64) {
         let previous_ino = self.inode_by_fh.insert(fh, ino);
         if previous_ino == Some(ino) {
-            insert_read_ahead_handle(self.fhs_by_inode.entry(ino).or_default(), fh);
             return;
         }
         if let Some(previous_ino) = previous_ino
@@ -1454,7 +1453,7 @@ where
             }
             Err(libc::ENOENT) => FuseReply::contiguous(
                 request.header.unique,
-                ok_reply(request.header.unique, &negative_entry_payload()),
+                ok_reply(request.header.unique, negative_entry_payload()),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
@@ -2551,16 +2550,20 @@ fn entry_payload(attr: NativeAttr) -> Vec<u8> {
     payload
 }
 
-fn negative_entry_payload() -> Vec<u8> {
-    let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.resize(FUSE_ENTRY_OUT_PAYLOAD_LEN, 0);
-    payload
+fn negative_entry_payload() -> &'static [u8] {
+    static PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+    PAYLOAD.get_or_init(|| {
+        let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.resize(FUSE_ENTRY_OUT_PAYLOAD_LEN, 0);
+        payload
+    })
 }
 
 fn attr_out_payload(attr: NativeAttr) -> Vec<u8> {
@@ -3426,6 +3429,32 @@ mod tests {
             shard.fhs_by_inode.get(&21).map(|fhs| fhs.as_slice()),
             Some(&[7][..])
         );
+    }
+
+    #[test]
+    fn native_read_ahead_state_shard_repeated_tracking_returns_before_inode_index_update() {
+        let source = include_str!("vfs_adapter.rs");
+        let track_handle_inode = source
+            .split("fn track_handle_inode(&mut self, fh: u64, ino: u64)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn remove_handle(&mut self, fh: u64)").next())
+            .expect("track_handle_inode body should be present");
+        let repeated_inode_branch = track_handle_inode
+            .split("if previous_ino == Some(ino) {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("repeated inode branch should be present");
+
+        assert!(!repeated_inode_branch.contains("insert_read_ahead_handle"));
+    }
+
+    #[test]
+    fn negative_entry_payload_reuses_static_payload_buffer() {
+        let first = negative_entry_payload();
+        let second = negative_entry_payload();
+
+        assert_eq!(first.len(), FUSE_ENTRY_OUT_PAYLOAD_LEN);
+        assert_eq!(first.as_ptr(), second.as_ptr());
     }
 
     #[test]
