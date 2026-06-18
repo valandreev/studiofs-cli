@@ -816,6 +816,7 @@ struct NativeReadMetrics {
     local_cache_unavailable_fallbacks: AtomicU64,
     stale_epoch_fallbacks: AtomicU64,
     stale_generation_fallbacks: AtomicU64,
+    unsafe_local_cache_fallbacks: AtomicU64,
     bytes_fallbacks: AtomicU64,
     bytes_returned: AtomicU64,
     read_ahead_prefetches: AtomicU64,
@@ -1282,6 +1283,8 @@ pub struct NativeReadMetricsSnapshot {
     pub stale_epoch_fallbacks: u64,
     /// Reads that rejected a local-cache range because its invalidation generation was stale.
     pub stale_generation_fallbacks: u64,
+    /// Reads that rejected a current local-cache range because trust preconditions were unsafe.
+    pub unsafe_local_cache_fallbacks: u64,
     /// Reads served through the safe bytes fallback.
     pub bytes_fallbacks: u64,
     /// Total payload bytes returned from reads by this bridge.
@@ -1303,6 +1306,7 @@ impl NativeReadMetrics {
                 .load(Ordering::Relaxed),
             stale_epoch_fallbacks: self.stale_epoch_fallbacks.load(Ordering::Relaxed),
             stale_generation_fallbacks: self.stale_generation_fallbacks.load(Ordering::Relaxed),
+            unsafe_local_cache_fallbacks: self.unsafe_local_cache_fallbacks.load(Ordering::Relaxed),
             bytes_fallbacks: self.bytes_fallbacks.load(Ordering::Relaxed),
             bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
             read_ahead_prefetches: self.read_ahead_prefetches.load(Ordering::Relaxed),
@@ -1594,7 +1598,11 @@ where
                             .stale_generation_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    LocalCacheReadRangeDecision::Unsafe => {}
+                    LocalCacheReadRangeDecision::Unsafe => {
+                        self.read_metrics
+                            .unsafe_local_cache_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Ok(None) => {
@@ -2291,6 +2299,7 @@ fn vfs_native_bridge_snapshot(
         local_cache_unavailable_fallbacks: read.local_cache_unavailable_fallbacks,
         stale_epoch_fallbacks: read.stale_epoch_fallbacks,
         stale_generation_fallbacks: read.stale_generation_fallbacks,
+        unsafe_local_cache_fallbacks: read.unsafe_local_cache_fallbacks,
         bytes_fallbacks: read.bytes_fallbacks,
         bytes_returned: read.bytes_returned,
         read_ahead_prefetches: read.read_ahead_prefetches,
@@ -3758,6 +3767,32 @@ mod tests {
         assert!(reply.local_cache_range().is_none());
         assert_eq!(bridge.read_metrics_snapshot().stale_generation_fallbacks, 1);
         assert_eq!(bridge.read_metrics_snapshot().bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn handle_read_reports_unsafe_local_cache_fallback_reason() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: true,
+                local_materialized: true,
+            },
+        );
+
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_none());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.unsafe_local_cache_fallbacks, 1);
+        assert_eq!(metrics.bytes_fallbacks, 1);
     }
 
     #[test]

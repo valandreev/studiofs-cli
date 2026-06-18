@@ -451,6 +451,8 @@ pub struct VfsNativeBridgeSnapshot {
     pub stale_epoch_fallbacks: u64,
     /// Reads that rejected a local-cache range because its invalidation generation was stale.
     pub stale_generation_fallbacks: u64,
+    /// Reads that rejected a current local-cache range because trust preconditions were unsafe.
+    pub unsafe_local_cache_fallbacks: u64,
     /// Reads served through the safe bytes fallback.
     pub bytes_fallbacks: u64,
     /// Total payload bytes returned from reads by this bridge.

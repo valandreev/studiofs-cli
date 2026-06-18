@@ -1523,6 +1523,7 @@ impl StudioVfs {
         if open_file.ino != ino
             || open_file.flags.contains(OpenFlags::WRONLY)
             || open_file.flags.contains(OpenFlags::RDWR)
+            || self.inode_has_local_dirty_state(ino)
         {
             return Ok(None);
         }
@@ -3422,6 +3423,56 @@ mod tests {
             assert!(
                 range.is_none(),
                 "write-capable handles must use the bytes path so dirty writer state cannot be bypassed"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_handle_does_not_expose_native_local_cache_range_while_inode_is_dirty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-dirty-inode");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"native-local-cache-range-dirty-inode.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let object_id = 0x536;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+
+            let read_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open read-only handle");
+            let write_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open write-capable handle");
+            vfs.write_fh(write_fh, attr.ino, 4, b"XY")
+                .await
+                .expect("stage dirty writer bytes");
+
+            let range = vfs
+                .local_cache_read_range_for_fh(read_fh, attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "dirty inode state must force mounted reads through the bytes path even when the requested range is clean"
             );
         });
     }
