@@ -1,7 +1,7 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,8 +25,9 @@ use crate::fs::pending_write_tracker::{
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::cache_policy::{
     NativeInodeCacheState, NativeOpenCacheAction, NativeOpenCacheDecision, NativeOpenCacheMetrics,
-    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadPolicy,
-    NativeReadAheadState, decide_native_open_cache, decide_native_read_ahead,
+    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadDecision,
+    NativeReadAheadPolicy, NativeReadAheadState, decide_native_open_cache,
+    decide_native_read_ahead,
 };
 use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
@@ -88,6 +89,12 @@ pub struct NativeAttr {
     pub uid: u32,
     /// Owner group ID.
     pub gid: u32,
+    /// Access time in nanoseconds since Unix epoch.
+    pub atime_ns: u64,
+    /// Modification time in nanoseconds since Unix epoch.
+    pub mtime_ns: u64,
+    /// Change time in nanoseconds since Unix epoch.
+    pub ctime_ns: u64,
 }
 
 /// Directory entry used by the native bridge before FUSE dirent encoding.
@@ -696,8 +703,7 @@ pub struct LinuxNativeBridge<V> {
     native_bridge_snapshot_last_elapsed_ms: AtomicU64,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     read_ahead_policy: NativeReadAheadPolicy,
-    read_ahead_states: Mutex<HashMap<u64, NativeReadAheadState>>,
-    read_ahead_inode_by_fh: Mutex<HashMap<u64, u64>>,
+    read_ahead_states: NativeReadAheadStateStore,
 }
 
 /// Native Linux async write admission and telemetry profile.
@@ -833,15 +839,160 @@ struct NativeAmplificationMetrics {
     write_latency: NativeLatencyMetrics,
 }
 
-const NATIVE_LATENCY_SAMPLE_CAP: usize = 2048;
 const NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
+const NATIVE_LATENCY_BUCKET_BOUNDS_NS: [u64; 18] = [
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    u64::MAX,
+];
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct NativeLatencyMetrics {
+    samples: AtomicU64,
     total_ns: AtomicU64,
     max_ns: AtomicU64,
-    samples: Mutex<VecDeque<u64>>,
+    buckets: [AtomicU64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()],
+}
+
+impl Default for NativeLatencyMetrics {
+    fn default() -> Self {
+        Self {
+            samples: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeReadAheadStateStore {
+    shards: [Mutex<NativeReadAheadStateShard>; Self::SHARD_COUNT],
+}
+
+impl Default for NativeReadAheadStateStore {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(NativeReadAheadStateShard::default())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeReadAheadStateShard {
+    states: HashMap<u64, NativeReadAheadState>,
+    inode_by_fh: HashMap<u64, u64>,
+    fhs_by_inode: HashMap<u64, HashSet<u64>>,
+}
+
+impl NativeReadAheadStateStore {
+    const SHARD_COUNT: usize = 64;
+
+    fn shard_index(fh: u64) -> usize {
+        (fh as usize) % Self::SHARD_COUNT
+    }
+
+    fn observe(
+        &self,
+        policy: &NativeReadAheadPolicy,
+        fh: u64,
+        ino: u64,
+        offset: u64,
+        size: u64,
+        file_size: u64,
+    ) -> NativeReadAheadDecision {
+        let mut shard = lock_or_recover(self.shard(fh), "native_read_ahead_state_shard");
+        shard.track_handle_inode(fh, ino);
+        let state = shard.states.entry(fh).or_default();
+        decide_native_read_ahead(policy, state, offset, size, file_size)
+    }
+
+    fn invalidate_inodes(&self, inodes: &[u64]) {
+        for shard in &self.shards {
+            let mut shard = lock_or_recover(shard, "native_read_ahead_state_shard");
+            for &ino in inodes {
+                let Some(fhs) = shard.fhs_by_inode.remove(&ino) else {
+                    continue;
+                };
+                for fh in fhs {
+                    shard.states.remove(&fh);
+                    shard.inode_by_fh.remove(&fh);
+                }
+            }
+        }
+    }
+
+    fn remove_handle(&self, fh: u64) {
+        let mut shard = lock_or_recover(self.shard(fh), "native_read_ahead_state_shard");
+        shard.remove_handle(fh);
+    }
+
+    #[cfg(test)]
+    fn contains_handle(&self, fh: u64) -> bool {
+        lock_or_recover(self.shard(fh), "native_read_ahead_state_shard")
+            .states
+            .contains_key(&fh)
+    }
+
+    #[cfg(test)]
+    fn inode_for_handle(&self, fh: u64) -> Option<u64> {
+        lock_or_recover(self.shard(fh), "native_read_ahead_state_shard")
+            .inode_by_fh
+            .get(&fh)
+            .copied()
+    }
+
+    fn shard(&self, fh: u64) -> &Mutex<NativeReadAheadStateShard> {
+        &self.shards[Self::shard_index(fh)]
+    }
+}
+
+impl NativeReadAheadStateShard {
+    fn track_handle_inode(&mut self, fh: u64, ino: u64) {
+        let previous_ino = self.inode_by_fh.insert(fh, ino);
+        if previous_ino == Some(ino) {
+            self.fhs_by_inode.entry(ino).or_default().insert(fh);
+            return;
+        }
+        if let Some(previous_ino) = previous_ino
+            && let Some(fhs) = self.fhs_by_inode.get_mut(&previous_ino)
+        {
+            fhs.remove(&fh);
+            if fhs.is_empty() {
+                self.fhs_by_inode.remove(&previous_ino);
+            }
+        }
+        self.fhs_by_inode.entry(ino).or_default().insert(fh);
+    }
+
+    fn remove_handle(&mut self, fh: u64) {
+        self.states.remove(&fh);
+        let Some(ino) = self.inode_by_fh.remove(&fh) else {
+            return;
+        };
+        if let Some(fhs) = self.fhs_by_inode.get_mut(&ino) {
+            fhs.remove(&fh);
+            if fhs.is_empty() {
+                self.fhs_by_inode.remove(&ino);
+            }
+        }
+    }
 }
 
 /// Point-in-time latency statistics for one native Linux opcode family.
@@ -1006,6 +1157,7 @@ impl NativeAmplificationMetrics {
 impl NativeLatencyMetrics {
     fn record(&self, latency_ns: u64) {
         let latency_ns = latency_ns.max(1);
+        self.samples.fetch_add(1, Ordering::Relaxed);
         self.total_ns.fetch_add(latency_ns, Ordering::Relaxed);
         let mut current = self.max_ns.load(Ordering::Relaxed);
         while latency_ns > current {
@@ -1020,38 +1172,53 @@ impl NativeLatencyMetrics {
             }
         }
 
-        let mut samples = lock_or_recover(&self.samples, "native_latency_samples");
-        if samples.len() == NATIVE_LATENCY_SAMPLE_CAP {
-            samples.pop_front();
-        }
-        samples.push_back(latency_ns);
+        self.buckets[native_latency_bucket_index(latency_ns)].fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> NativeLatencyMetricsSnapshot {
-        let mut samples: Vec<u64> = lock_or_recover(&self.samples, "native_latency_samples")
-            .iter()
-            .copied()
-            .collect();
-        samples.sort_unstable();
+        let buckets = self.bucket_counts();
+        let samples = self.samples.load(Ordering::Relaxed);
         NativeLatencyMetricsSnapshot {
-            samples: samples.len() as u64,
+            samples,
             total_ns: self.total_ns.load(Ordering::Relaxed),
             max_ns: self.max_ns.load(Ordering::Relaxed),
-            p95_ns: percentile_from_sorted(&samples, 95),
-            p99_ns: percentile_from_sorted(&samples, 99),
+            p95_ns: percentile_from_buckets(&buckets, samples, 95),
+            p99_ns: percentile_from_buckets(&buckets, samples, 99),
         }
+    }
+
+    fn bucket_counts(&self) -> [u64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()] {
+        std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed))
     }
 }
 
-fn percentile_from_sorted(samples: &[u64], percentile: u64) -> u64 {
-    if samples.is_empty() {
+fn native_latency_bucket_index(latency_ns: u64) -> usize {
+    NATIVE_LATENCY_BUCKET_BOUNDS_NS
+        .iter()
+        .position(|bound| latency_ns <= *bound)
+        .unwrap_or(NATIVE_LATENCY_BUCKET_BOUNDS_NS.len() - 1)
+}
+
+fn percentile_from_buckets(
+    buckets: &[u64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()],
+    samples: u64,
+    percentile: u64,
+) -> u64 {
+    if samples == 0 {
         return 0;
     }
-    let rank = (samples.len() as u64)
+    let rank = samples
         .saturating_mul(percentile)
         .div_ceil(100)
         .saturating_sub(1);
-    samples[rank as usize]
+    let mut seen = 0_u64;
+    for (index, count) in buckets.iter().enumerate() {
+        seen = seen.saturating_add(*count);
+        if seen > rank {
+            return NATIVE_LATENCY_BUCKET_BOUNDS_NS[index];
+        }
+    }
+    NATIVE_LATENCY_BUCKET_BOUNDS_NS[NATIVE_LATENCY_BUCKET_BOUNDS_NS.len() - 1]
 }
 
 fn elapsed_latency_ns(started_at: Instant) -> u64 {
@@ -1130,8 +1297,7 @@ impl<V> LinuxNativeBridge<V> {
                 sequential_window_bytes: 128 * 1024,
                 min_sequential_reads: 2,
             },
-            read_ahead_states: Mutex::new(HashMap::new()),
-            read_ahead_inode_by_fh: Mutex::new(HashMap::new()),
+            read_ahead_states: NativeReadAheadStateStore::default(),
         }
     }
 
@@ -1945,27 +2111,11 @@ where
         for &ino in inodes {
             self.trusted_open_cache_states.remove(ino);
         }
-        let mut states = lock_or_recover(&self.read_ahead_states, "native_read_ahead_states");
-        let mut inode_by_fh = lock_or_recover(
-            &self.read_ahead_inode_by_fh,
-            "native_read_ahead_inode_by_fh",
-        );
-        inode_by_fh.retain(|fh, ino| {
-            let keep = !inodes.contains(ino);
-            if !keep {
-                states.remove(fh);
-            }
-            keep
-        });
+        self.read_ahead_states.invalidate_inodes(inodes);
     }
 
     fn forget_read_ahead_handle(&self, fh: u64) {
-        lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
-        lock_or_recover(
-            &self.read_ahead_inode_by_fh,
-            "native_read_ahead_inode_by_fh",
-        )
-        .remove(&fh);
+        self.read_ahead_states.remove_handle(fh);
     }
 
     fn trusted_local_cache_read_range(
@@ -2002,22 +2152,14 @@ where
             return;
         }
 
-        let decision = {
-            let mut states = lock_or_recover(&self.read_ahead_states, "native_read_ahead_states");
-            let state = states.entry(read.fh).or_default();
-            lock_or_recover(
-                &self.read_ahead_inode_by_fh,
-                "native_read_ahead_inode_by_fh",
-            )
-            .insert(read.fh, ino);
-            decide_native_read_ahead(
-                &self.read_ahead_policy,
-                state,
-                read.offset,
-                u64::from(read.size),
-                cache_state.size,
-            )
-        };
+        let decision = self.read_ahead_states.observe(
+            &self.read_ahead_policy,
+            read.fh,
+            ino,
+            read.offset,
+            u64::from(read.size),
+            cache_state.size,
+        );
         let Some(prefetch) = decision.prefetch else {
             self.read_metrics
                 .read_ahead_suppressed
@@ -2417,6 +2559,9 @@ fn native_attr_from_inode_attr(attr: InodeAttr) -> NativeAttr {
         perm: attr.mode & 0o7777,
         uid: attr.uid,
         gid: attr.gid,
+        atime_ns: u64::try_from(attr.atime).unwrap_or_default(),
+        mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
+        ctime_ns: u64::try_from(attr.ctime).unwrap_or_default(),
     }
 }
 
@@ -2628,16 +2773,19 @@ fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInod
 }
 
 fn append_attr_payload(payload: &mut Vec<u8>, attr: NativeAttr) {
+    let (atime_sec, atime_nsec) = split_unix_nanos(attr.atime_ns);
+    let (mtime_sec, mtime_nsec) = split_unix_nanos(attr.mtime_ns);
+    let (ctime_sec, ctime_nsec) = split_unix_nanos(attr.ctime_ns);
     payload.reserve(FUSE_ATTR_PAYLOAD_LEN);
     payload.extend_from_slice(&attr.ino.to_le_bytes());
     payload.extend_from_slice(&attr.size.to_le_bytes());
     payload.extend_from_slice(&attr.size.div_ceil(POSIX_STAT_BLOCK_SIZE).to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&atime_sec.to_le_bytes());
+    payload.extend_from_slice(&mtime_sec.to_le_bytes());
+    payload.extend_from_slice(&ctime_sec.to_le_bytes());
+    payload.extend_from_slice(&atime_nsec.to_le_bytes());
+    payload.extend_from_slice(&mtime_nsec.to_le_bytes());
+    payload.extend_from_slice(&ctime_nsec.to_le_bytes());
     payload.extend_from_slice(&linux_mode(attr).to_le_bytes());
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.extend_from_slice(&attr.uid.to_le_bytes());
@@ -2645,6 +2793,10 @@ fn append_attr_payload(payload: &mut Vec<u8>, attr: NativeAttr) {
     payload.extend_from_slice(&0_u32.to_le_bytes());
     payload.extend_from_slice(&4096_u32.to_le_bytes());
     payload.extend_from_slice(&0_u32.to_le_bytes());
+}
+
+fn split_unix_nanos(nanos: u64) -> (u64, u32) {
+    (nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
 }
 
 fn linux_mode(attr: NativeAttr) -> u32 {
@@ -3046,6 +3198,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         }
     }
 
@@ -3116,6 +3271,21 @@ mod tests {
     }
 
     #[test]
+    fn native_latency_metrics_reports_bucketed_percentiles_without_sample_lock() {
+        let metrics = NativeLatencyMetrics::default();
+
+        metrics.record(1_500);
+        metrics.record(30_000);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.samples, 2);
+        assert_eq!(snapshot.total_ns, 31_500);
+        assert_eq!(snapshot.max_ns, 30_000);
+        assert_eq!(snapshot.p95_ns, 50_000);
+        assert_eq!(snapshot.p99_ns, 50_000);
+    }
+
+    #[test]
     fn lookup_missing_name_returns_negative_entry_with_conservative_ttl() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
@@ -3176,6 +3346,47 @@ mod tests {
         assert!(state.writer_active);
         assert!(state.dirty);
         assert!(state.local_materialized);
+    }
+
+    #[test]
+    fn native_attr_from_inode_attr_preserves_unix_timestamps() {
+        let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
+        attr.atime = 1_234_567_890;
+        attr.mtime = 2_345_678_901;
+        attr.ctime = 3_456_789_012;
+
+        let native_attr = native_attr_from_inode_attr(attr);
+
+        assert_eq!(native_attr.atime_ns, 1_234_567_890);
+        assert_eq!(native_attr.mtime_ns, 2_345_678_901);
+        assert_eq!(native_attr.ctime_ns, 3_456_789_012);
+    }
+
+    #[test]
+    fn append_attr_payload_writes_timestamp_seconds_and_nanoseconds() {
+        let mut attr = test_attr(55);
+        attr.atime_ns = 1_234_567_890;
+        attr.mtime_ns = 2_345_678_901;
+        attr.ctime_ns = 3_456_789_012;
+
+        let mut payload = Vec::new();
+        append_attr_payload(&mut payload, attr);
+
+        assert_eq!(read_u64(&payload, 24), Some(1));
+        assert_eq!(read_u64(&payload, 32), Some(2));
+        assert_eq!(read_u64(&payload, 40), Some(3));
+        assert_eq!(read_u32(&payload, 48), Some(234_567_890));
+        assert_eq!(read_u32(&payload, 52), Some(345_678_901));
+        assert_eq!(read_u32(&payload, 56), Some(456_789_012));
+    }
+
+    #[test]
+    fn native_read_ahead_state_store_uses_multiple_shards_for_handles() {
+        assert_eq!(NativeReadAheadStateStore::SHARD_COUNT, 64);
+        assert_ne!(
+            NativeReadAheadStateStore::shard_index(7),
+            NativeReadAheadStateStore::shard_index(8)
+        );
     }
 
     #[test]
@@ -3336,16 +3547,10 @@ mod tests {
 
         bridge.invalidate_metadata_cache_for_mutation(&[20]);
 
-        let states = lock_or_recover(&bridge.read_ahead_states, "native_read_ahead_states");
-        assert!(!states.contains_key(&7));
-        assert!(states.contains_key(&8));
-        drop(states);
-        let inode_by_fh = lock_or_recover(
-            &bridge.read_ahead_inode_by_fh,
-            "native_read_ahead_inode_by_fh",
-        );
-        assert!(!inode_by_fh.contains_key(&7));
-        assert_eq!(inode_by_fh.get(&8), Some(&21));
+        assert!(!bridge.read_ahead_states.contains_handle(7));
+        assert!(bridge.read_ahead_states.contains_handle(8));
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(7), None);
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(8), Some(21));
     }
 
     #[test]
