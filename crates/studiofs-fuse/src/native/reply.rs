@@ -87,6 +87,11 @@ impl<S: ReplySink> ReplyToken<S> {
         self.complete(FuseReply::segmented_data(self.unique, data));
     }
 
+    /// Completes a no-reply FUSE request such as `FORGET`.
+    pub fn send_no_reply(mut self) {
+        self.complete(FuseReply::no_reply(self.unique));
+    }
+
     /// Marks the token as intentionally dropped without replying to the kernel.
     pub fn drop_without_reply(mut self) {
         self.completed = true;
@@ -144,6 +149,17 @@ impl RecordedReplySink {
             .completed
             .iter()
             .map(|(_, reply)| reply.unique)
+            .collect()
+    }
+
+    /// Returns reply origins in commit order.
+    pub fn completed_origins(&self) -> Vec<ReplyOrigin> {
+        self.state
+            .lock()
+            .expect("recorded reply sink state poisoned")
+            .completed
+            .iter()
+            .map(|(origin, _)| *origin)
             .collect()
     }
 

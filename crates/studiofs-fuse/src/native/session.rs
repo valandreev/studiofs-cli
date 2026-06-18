@@ -226,6 +226,12 @@ impl<T: FuseTransport> NativeFuseSession<T> {
         self.negotiated = Some(negotiated);
         Ok(negotiated)
     }
+
+    /// Performs INIT negotiation and returns the transport for post-INIT backend upgrades.
+    pub fn handshake_into_transport(mut self) -> Result<(NegotiatedSession, T), SessionError> {
+        let negotiated = self.handshake()?;
+        Ok((negotiated, self.transport))
+    }
 }
 
 /// Direct-mounted native FUSE session with its lifecycle and dispatcher inputs.
@@ -386,6 +392,33 @@ mod tests {
         );
         assert_eq!(session.negotiated(), Some(negotiated));
         assert_eq!(session.transport.sent_replies().len(), 1);
+    }
+
+    #[test]
+    fn handshake_into_transport_returns_negotiated_state_and_classic_transport_for_upgrade() {
+        let kernel_caps = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
+        let requested_caps = FuseCapabilities::ASYNC_READ | FuseCapabilities::OVER_IO_URING;
+        let transport = FrameQueueTransport::new([init_frame(0x46, 4 * 1024 * 1024, kernel_caps)]);
+        let config = NativeSessionConfig {
+            requested_capabilities: requested_caps,
+            max_readahead: 1024 * 1024,
+            max_write: 16 * 1024 * 1024,
+            max_background: 50,
+            congestion_threshold: 40,
+            max_pages: 256,
+        };
+        let session = NativeFuseSession::new(transport, config);
+
+        let (negotiated, transport) = session
+            .handshake_into_transport()
+            .expect("INIT handshake should return transport for backend upgrade");
+
+        assert!(
+            negotiated
+                .capabilities
+                .contains(FuseCapabilities::OVER_IO_URING)
+        );
+        assert_eq!(transport.sent_replies().len(), 1);
     }
 
     struct EioReceiveTransport;

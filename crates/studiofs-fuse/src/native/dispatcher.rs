@@ -139,6 +139,14 @@ impl<S: ReplySink> OwnedFuseRequest<S> {
         }
     }
 
+    /// Builds an owned request from a FUSE-over-io_uring queue entry.
+    pub fn io_uring(request: FuseRequest, sink: S, queue_id: u16, generation: u64) -> Self {
+        Self {
+            reply: ReplyToken::new_io_uring(request.header.unique, sink, queue_id, generation),
+            request,
+        }
+    }
+
     fn class(&self) -> RequestClass {
         RequestClass::for_opcode(self.request.opcode)
     }
@@ -490,25 +498,23 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
             let opcode = request.opcode;
             let unique = request.header.unique;
             let reply = self.handler.handle(request);
-            if !reply.is_no_reply() {
-                let reply_len = reply.frame_len();
-                let reply_error = reply.error_code();
-                if let Err(error) = self.transport.send_reply(reply) {
-                    if matches!(opcode, FuseOpcode::Release | FuseOpcode::Releasedir)
-                        && reply_error == Some(0)
-                        && transport_error_raw_errno(&error) == Some(libc::ENOENT)
-                    {
-                        summary.handled_requests += 1;
-                        continue;
-                    }
-                    return Err(DispatchError::SendReply {
-                        opcode,
-                        unique,
-                        reply_len,
-                        reply_error,
-                        source: error,
-                    });
+            let reply_len = reply.frame_len();
+            let reply_error = reply.error_code();
+            if let Err(error) = self.transport.send_reply(reply) {
+                if matches!(opcode, FuseOpcode::Release | FuseOpcode::Releasedir)
+                    && reply_error == Some(0)
+                    && transport_error_raw_errno(&error) == Some(libc::ENOENT)
+                {
+                    summary.handled_requests += 1;
+                    continue;
                 }
+                return Err(DispatchError::SendReply {
+                    opcode,
+                    unique,
+                    reply_len,
+                    reply_error,
+                    source: error,
+                });
             }
             summary.handled_requests += 1;
             if is_destroy {
@@ -691,6 +697,26 @@ where
     }
 }
 
+/// Submits a transport-originated request to an async dispatcher.
+pub fn submit_transport_request_with_origin<S>(
+    dispatcher: &NativeAsyncDispatcher<S>,
+    request: FuseRequest,
+    origin: crate::native::reply::ReplyOrigin,
+    sink: S,
+) -> Result<(), DispatchError>
+where
+    S: ReplySink,
+{
+    let envelope = match origin {
+        crate::native::reply::ReplyOrigin::Classic => OwnedFuseRequest::classic(request, sink),
+        crate::native::reply::ReplyOrigin::IoUring {
+            queue_id,
+            generation,
+        } => OwnedFuseRequest::io_uring(request, sink, queue_id, generation),
+    };
+    dispatcher.submit(envelope)
+}
+
 impl<S: ReplySink> NativeAsyncDispatcher<S> {
     const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
     /// Whether worker receivers use an MPMC queue rather than a mutex-wrapped MPSC receiver.
@@ -852,6 +878,43 @@ mod tests {
         assert!(transport.sent_replies().is_empty());
     }
 
+    struct NoReplyRecordingTransport {
+        inner: FrameQueueTransport,
+        no_reply_completions: usize,
+    }
+
+    impl FuseTransport for NoReplyRecordingTransport {
+        fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError> {
+            self.inner.receive_request()
+        }
+
+        fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError> {
+            if reply.is_no_reply() {
+                self.no_reply_completions += 1;
+            }
+            self.inner.send_reply(reply)
+        }
+    }
+
+    #[test]
+    fn dispatcher_completes_no_reply_requests_through_transport() {
+        let transport = NoReplyRecordingTransport {
+            inner: FrameQueueTransport::new([frame(2, 0x11)]),
+            no_reply_completions: 0,
+        };
+        let handler = NoReplyHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(handler.handled, 1);
+        assert_eq!(transport.no_reply_completions, 1);
+        assert!(transport.inner.sent_replies().is_empty());
+    }
+
     struct EioOnReplyTransport {
         inner: FrameQueueTransport,
     }
@@ -963,6 +1026,36 @@ mod tests {
     }
 
     #[test]
+    fn reply_token_send_no_reply_completes_without_kernel_writeback_payload() {
+        let sink = RecordedReplySink::default();
+        let token = ReplyToken::new_io_uring(0x75, sink.clone(), 2, 13);
+
+        token.send_no_reply();
+
+        assert_eq!(sink.completed_unique_ids(), [0x75]);
+        assert!(sink.completed_replies()[0].is_no_reply());
+        assert!(sink.dropped_unique_ids().is_empty());
+    }
+
+    #[test]
+    fn owned_request_can_preserve_io_uring_origin_for_async_completion() {
+        let sink = RecordedReplySink::default();
+        let envelope =
+            OwnedFuseRequest::io_uring(request(FuseOpcode::Forget, 0x76), sink.clone(), 4, 19);
+
+        envelope.reply.send_no_reply();
+
+        assert_eq!(sink.completed_unique_ids(), [0x76]);
+        assert_eq!(
+            sink.completed_origins(),
+            [crate::native::reply::ReplyOrigin::IoUring {
+                queue_id: 4,
+                generation: 19,
+            }]
+        );
+    }
+
+    #[test]
     fn reply_token_drop_without_completion_fails_closed_with_eio() {
         let sink = RecordedReplySink::default();
         let token = ReplyToken::new_classic(0x73, sink.clone());
@@ -1055,6 +1148,61 @@ mod tests {
             }
             envelope.reply.send_success(&[]);
         }
+    }
+
+    #[derive(Clone)]
+    struct NoReplyAsyncHandler {
+        started: mpsc::Sender<u64>,
+    }
+
+    impl AsyncFuseOperationHandler<RecordedReplySink> for NoReplyAsyncHandler {
+        fn handle(&self, envelope: OwnedFuseRequest<RecordedReplySink>) {
+            self.started
+                .send(envelope.request.header.unique)
+                .expect("test should receive handler start");
+            envelope.reply.send_no_reply();
+        }
+    }
+
+    #[test]
+    fn async_dispatcher_submit_transport_request_preserves_io_uring_origin() {
+        let sink = RecordedReplySink::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let dispatcher = NativeAsyncDispatcher::<RecordedReplySink>::builder(NoReplyAsyncHandler {
+            started: started_tx,
+        })
+        .spawn();
+
+        submit_transport_request_with_origin(
+            &dispatcher,
+            request(FuseOpcode::Forget, 0xb0),
+            crate::native::reply::ReplyOrigin::IoUring {
+                queue_id: 5,
+                generation: 23,
+            },
+            sink.clone(),
+        )
+        .expect("origin-aware submit should enqueue request");
+
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("worker should handle request"),
+            0xb0
+        );
+        dispatcher
+            .shutdown()
+            .expect("dispatcher should join no-reply worker");
+
+        assert_eq!(sink.completed_unique_ids(), [0xb0]);
+        assert_eq!(
+            sink.completed_origins(),
+            [crate::native::reply::ReplyOrigin::IoUring {
+                queue_id: 5,
+                generation: 23,
+            }]
+        );
+        assert!(sink.completed_replies()[0].is_no_reply());
     }
 
     #[test]
