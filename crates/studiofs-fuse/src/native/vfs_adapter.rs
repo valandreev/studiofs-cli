@@ -480,7 +480,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     #[cfg(unix)]
     fn read_local_cache_range(
         &self,
-        _fh: u64,
+        fh: u64,
         ino: u64,
         offset: u64,
         size: u32,
@@ -488,7 +488,10 @@ impl NativeVfs for StudioVfsNativeAdapter {
         checked_native_read_size(size)?;
         let Some(range) = self
             .rt
-            .block_on(self.vfs.local_cache_read_range(ino, offset, size))
+            .block_on(
+                self.vfs
+                    .local_cache_read_range_for_fh(fh, ino, offset, size),
+            )
             .map_err(|error| vfs_err_to_errno(&error))?
         else {
             return Ok(None);
@@ -3545,6 +3548,22 @@ mod tests {
         assert!(!open_cache_state.contains(".ok()?"));
         assert!(open_cache_state.contains("warn!"));
         assert!(open_cache_state.contains("native open cache state unavailable"));
+    }
+
+    #[test]
+    fn studio_vfs_native_adapter_passes_fh_to_local_cache_read_range() {
+        let source = include_str!("vfs_adapter.rs");
+        let read_local_cache_range = source
+            .split("impl NativeVfs for StudioVfsNativeAdapter")
+            .nth(1)
+            .and_then(|rest| rest.split("fn advise_read_ahead").next())
+            .expect("studio vfs native adapter read_local_cache_range should be present");
+
+        assert!(read_local_cache_range.contains("local_cache_read_range_for_fh"));
+        assert!(
+            read_local_cache_range.contains("fh, ino, offset, size"),
+            "native mounted reads must pass the FUSE fh into the VFS local-cache fast path"
+        );
     }
 
     #[test]
