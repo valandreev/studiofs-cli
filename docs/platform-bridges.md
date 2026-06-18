@@ -191,7 +191,8 @@ defines `LinuxNativeBridge` as an owned Linux platform boundary with classic
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | `50` by default on macOS and Linux 6.x. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | `40` by default on macOS and Linux 6.x. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
-| FUSE async write replies | macOS: enabled by default. Linux: disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
+| FUSE async write replies | macOS and Linux: enabled by default. Linux rollback: `STUDIOFS_FUSE_ASYNC_WRITE=0` / `false` / `off` |
+| Linux: FUSE async read replies | Enabled by default with bounded admission. Roll back with `STUDIOFS_FUSE_ASYNC_READ=0` / `false` / `off` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | Linux: `parallel_dirops` capability | Disabled by default. `STUDIOFS_FUSE_PARALLEL_DIROPS=1` records an opt-in request, but the current `fuser` build does not expose the ABI flag, so StudioFS continues without requesting it |
 | Linux: `readdirplus_auto` capability | Enabled by default and requested only when the kernel advertises `FUSE_READDIRPLUS_AUTO`. Roll back with `STUDIOFS_FUSE_READDIRPLUS_AUTO=0` |
@@ -207,11 +208,14 @@ defines `LinuxNativeBridge` as an owned Linux platform boundary with classic
 the primary FUSE bridge throughput controls for local payload I/O. The Linux
 6.x profile is named `linux6-safe` in mounted status diagnostics. It uses
 `max_write=16777216`, `max_readahead=16777216`, `max_background=50`, and
-`congestion_threshold=40`. The background queue values match the candidate
-profile exercised in the SFS-509 native Linux 6.x ext4 matrix and stay close to
-the conservative macOS bridge profile while avoiding the larger JuiceFS-style
-queue expansion until StudioFS has stronger local-first evidence. Set either
-background queue env var to an empty string to leave that value at the
+`congestion_threshold=40`, enables bounded async raw read/write replies, keeps
+`readdirplus_auto` on when the kernel advertises it, and leaves
+`writeback_cache`, `async_dio`, and `parallel_dirops` off unless explicitly
+requested. The background queue values match the candidate profile exercised in
+the SFS-509 native Linux 6.x ext4 matrix and stay close to the conservative
+macOS bridge profile while avoiding the larger JuiceFS-style queue expansion
+until StudioFS has stronger local-first evidence. Set either background queue
+env var to an empty string to leave that value at the
 kernel/fuser default; `0` has the same opt-out meaning for these two background
 queue controls. StudioFS clamps congestion thresholds above an explicitly
 configured `max_background`; when only `STUDIOFS_FUSE_CONGESTION_THRESHOLD` is

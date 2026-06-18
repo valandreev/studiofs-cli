@@ -451,22 +451,65 @@ fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
+#[cfg(test)]
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(should_enable_async_fuse_write_from_env_value)
+    raw.is_none_or(should_enable_async_fuse_write_from_env_value)
+}
+
+fn resolve_async_fuse_write_enabled_from_os(raw: Option<&OsStr>) -> bool {
+    resolve_async_fuse_bool_env_value(
+        STUDIOFS_FUSE_ASYNC_WRITE_ENV,
+        raw,
+        should_enable_async_fuse_write_from_env_value,
+    )
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
-    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
-    resolve_async_fuse_write_enabled(raw.as_deref())
+    let raw = std::env::var_os(STUDIOFS_FUSE_ASYNC_WRITE_ENV);
+    resolve_async_fuse_write_enabled_from_os(raw.as_deref())
 }
 
 fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
+#[cfg(test)]
+fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
+    raw.is_none_or(should_enable_async_fuse_read_from_env_value)
+}
+
+fn resolve_async_fuse_read_enabled_from_os(raw: Option<&OsStr>) -> bool {
+    resolve_async_fuse_bool_env_value(
+        STUDIOFS_FUSE_ASYNC_READ_ENV,
+        raw,
+        should_enable_async_fuse_read_from_env_value,
+    )
+}
+
 fn should_enable_async_fuse_read_from_env() -> bool {
-    std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV)
-        .is_ok_and(|raw| should_enable_async_fuse_read_from_env_value(&raw))
+    let raw = std::env::var_os(STUDIOFS_FUSE_ASYNC_READ_ENV);
+    resolve_async_fuse_read_enabled_from_os(raw.as_deref())
+}
+
+fn resolve_async_fuse_bool_env_value<F>(
+    env_key: &'static str,
+    raw: Option<&OsStr>,
+    parse: F,
+) -> bool
+where
+    F: FnOnce(&str) -> bool,
+{
+    let Some(raw) = raw else {
+        return true;
+    };
+    let Some(raw) = raw.to_str() else {
+        warn!(
+            env_key,
+            "non-UTF8 Linux FUSE async profile environment value; disabling the async path"
+        );
+        return false;
+    };
+    parse(raw)
 }
 
 fn should_enable_async_fuse_metadata_from_env_value(raw: &str) -> bool {
@@ -1598,8 +1641,8 @@ pub struct StudioFuseAsyncReadAdmissionLimits {
 impl Default for StudioFuseRuntimeOptions {
     fn default() -> Self {
         Self {
-            async_write_enabled: false,
-            async_read_enabled: false,
+            async_write_enabled: true,
+            async_read_enabled: true,
             async_metadata_enabled: false,
             linux_async_dio_enabled: false,
             linux_parallel_dirops_enabled: false,
@@ -3669,8 +3712,9 @@ mod tests {
         StudioFuseFs, TTL, async_write_platform_policy_label, complete_fuse_write_reply,
         fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
         normalize_unix_mode, parse_linux_native_transport_selection, posix_flags_to_open_flags,
-        resolve_async_fuse_write_enabled, retry_optional_fuse_queue_tuning,
-        should_enable_async_fuse_metadata_from_env_value,
+        resolve_async_fuse_read_enabled, resolve_async_fuse_read_enabled_from_os,
+        resolve_async_fuse_write_enabled, resolve_async_fuse_write_enabled_from_os,
+        retry_optional_fuse_queue_tuning, should_enable_async_fuse_metadata_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
@@ -4813,6 +4857,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_options_default_use_automatic_linux_fuse_profile() {
+        let options = super::StudioFuseRuntimeOptions::default();
+
+        assert!(options.async_write_enabled);
+        assert!(options.async_read_enabled);
+        assert!(!options.async_metadata_enabled);
+        assert!(!options.linux_async_dio_enabled);
+        assert!(!options.linux_parallel_dirops_enabled);
+        assert!(options.linux_readdirplus_auto_enabled);
+        assert_eq!(
+            options.linux_native_transport,
+            LinuxNativeTransportSelection::Auto
+        );
+    }
+
+    #[test]
     fn runtime_options_default_use_auto_linux_native_transport() {
         assert_eq!(
             super::StudioFuseRuntimeOptions::default().linux_native_transport,
@@ -4858,8 +4918,13 @@ mod tests {
     }
 
     #[test]
-    fn async_fuse_write_default_profile_is_disabled_when_env_unset() {
-        assert!(!resolve_async_fuse_write_enabled(None));
+    fn async_fuse_write_default_profile_is_enabled_when_env_unset() {
+        assert!(resolve_async_fuse_write_enabled(None));
+    }
+
+    #[test]
+    fn async_fuse_read_default_profile_is_enabled_when_env_unset() {
+        assert!(resolve_async_fuse_read_enabled(None));
     }
 
     #[test]
@@ -4871,6 +4936,35 @@ mod tests {
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(resolve_async_fuse_write_enabled(Some(true_value)));
         }
+    }
+
+    #[test]
+    fn async_fuse_read_env_overrides_default_profile() {
+        for false_value in ["0", "false", "off", ""] {
+            assert!(!resolve_async_fuse_read_enabled(Some(false_value)));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            assert!(resolve_async_fuse_read_enabled(Some(true_value)));
+        }
+    }
+
+    #[test]
+    fn async_fuse_write_env_non_utf8_value_does_not_fall_back_to_enabled_default() {
+        let raw = OsStr::from_bytes(&[0xff, b'1']);
+
+        let enabled = resolve_async_fuse_write_enabled_from_os(Some(raw));
+
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn async_fuse_read_env_non_utf8_value_does_not_fall_back_to_enabled_default() {
+        let raw = OsStr::from_bytes(&[0xff, b'1']);
+
+        let enabled = resolve_async_fuse_read_enabled_from_os(Some(raw));
+
+        assert!(!enabled);
     }
 
     #[test]
