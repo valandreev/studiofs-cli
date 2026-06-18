@@ -48,9 +48,9 @@ write_manifest() {
     echo "raw_ext4_buffered=raw-ext4-buffered.json"
     echo "raw_ext4_direct=raw-ext4-direct.json"
     echo "fuser-era baseline=SFS-509/SFS-516 existing artifacts or rerun current fuser mounted matrix"
-    echo "LinuxNativeBridge classic conservative profile=native-sfs530-async-evidence"
-    echo "LinuxNativeBridge classic high-throughput profile=native-sfs530-writeback-cache-evidence"
-    echo "LinuxNativeBridge io_uring profile=native_fusermount3_io_uring_session_init_and_unmount_smoke plus mounted matrix when supported"
+    echo "LinuxNativeBridge classic conservative profile=native-sfs532-classic-conservative-fio"
+    echo "LinuxNativeBridge classic high-throughput profile=native-sfs532-classic-high-throughput-fio"
+    echo "LinuxNativeBridge io_uring profile=native-sfs532-io-uring-fio plus native_fusermount3_io_uring_session_init_and_unmount_smoke when supported"
     echo "JuiceFS reference=operator-provided optional row"
     echo "workloads=sequential read/write,warm repeated read,random read/write,mixed read/write,multi-job read/write,fsync-heavy,metadata create/stat/readdir,large-file local-cache read"
     echo "metrics=throughput,IOPS,latency,CPU,FUSE op amplification,queue wait,cache decisions,transport mode,io_uring fallback count,enabled kernel capabilities"
@@ -149,10 +149,13 @@ if [[ "${SFS532_RUN_MOUNTED:-0}" == "1" ]]; then
   export STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1
   run_cargo_gate "mounted native evidence matrix" \
     cargo test -p studiofs-fuse --test mount_sanity native_sfs530_mounted_evidence -- --ignored --nocapture --test-threads=1
+  run_cargo_gate "mounted native performance matrix" \
+    cargo test -p studiofs-fuse --test mount_sanity native_sfs532_mounted_fio -- --ignored --nocapture --test-threads=1
   run_cargo_gate "mounted io_uring smoke" \
     cargo test -p studiofs-fuse --test mount_sanity native_fusermount3_io_uring_session_init_and_unmount_smoke -- --ignored --nocapture --test-threads=1
 else
   record_row "mounted native evidence matrix" investigate "set SFS532_RUN_MOUNTED=1 to run /dev/fuse mounted workloads"
+  record_row "mounted native performance matrix" investigate "set SFS532_RUN_MOUNTED=1 to run SFS-532 mounted FIO workloads"
   record_row "mounted io_uring smoke" investigate "set SFS532_RUN_MOUNTED=1 on a host with FUSE-over-io_uring support"
 fi
 
