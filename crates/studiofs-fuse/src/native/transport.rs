@@ -3268,6 +3268,17 @@ mod tests {
     }
 
     #[test]
+    fn classic_read_write_transport_ignores_no_reply_frames() {
+        let mut transport = ClassicReadWriteTransport::new(MemoryFuseDevice::new(Vec::new()));
+
+        transport
+            .send_reply(FuseReply::no_reply(0x87))
+            .expect("classic no-reply send should be a no-op");
+
+        assert!(transport.into_inner().output.is_empty());
+    }
+
+    #[test]
     fn classic_read_write_transport_writes_local_cache_range_from_fd() {
         let mut cache_file = tempfile::tempfile().expect("create local cache file");
         cache_file
