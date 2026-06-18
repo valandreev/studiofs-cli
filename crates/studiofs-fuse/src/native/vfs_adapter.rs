@@ -972,12 +972,13 @@ impl NativeReadAheadStateShard {
         if previous_ino == Some(ino) {
             return;
         }
-        if let Some(previous_ino) = previous_ino
-            && let Some(fhs) = self.fhs_by_inode.get_mut(&previous_ino)
-        {
-            remove_read_ahead_handle(fhs, fh);
-            if fhs.is_empty() {
-                self.fhs_by_inode.remove(&previous_ino);
+        if let Some(previous_ino) = previous_ino {
+            self.states.remove(&fh);
+            if let Some(fhs) = self.fhs_by_inode.get_mut(&previous_ino) {
+                remove_read_ahead_handle(fhs, fh);
+                if fhs.is_empty() {
+                    self.fhs_by_inode.remove(&previous_ino);
+                }
             }
         }
         insert_read_ahead_handle(self.fhs_by_inode.entry(ino).or_default(), fh);
@@ -1517,18 +1518,17 @@ where
             }
             let release_result = self.vfs.release(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
-            if release_result.is_ok() {
-                self.forget_read_ahead_handle(request.header.nodeid, fh);
-            }
+            self.forget_read_ahead_handle(request.header.nodeid, fh);
             let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
             return reply;
         }
 
         self.barrier_gates
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
-        match self.vfs.release(fh) {
+        let release_result = self.vfs.release(fh);
+        self.forget_read_ahead_handle(request.header.nodeid, fh);
+        match release_result {
             Ok(()) => {
-                self.forget_read_ahead_handle(request.header.nodeid, fh);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -3432,6 +3432,17 @@ mod tests {
     }
 
     #[test]
+    fn native_read_ahead_state_shard_reassignment_drops_stale_handle_state() {
+        let mut shard = NativeReadAheadStateShard::default();
+
+        shard.track_handle_inode(7, 20);
+        shard.states.entry(7).or_default();
+        shard.track_handle_inode(7, 21);
+
+        assert!(!shard.states.contains_key(&7));
+    }
+
+    #[test]
     fn native_read_ahead_state_shard_repeated_tracking_returns_before_inode_index_update() {
         let source = include_str!("vfs_adapter.rs");
         let track_handle_inode = source
@@ -3884,6 +3895,7 @@ mod tests {
         write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         release_write: Mutex<std::sync::mpsc::Receiver<()>>,
         write_error: Option<i32>,
+        release_error: Option<i32>,
         snapshots: Mutex<Vec<NativeAsyncWriteSnapshot>>,
         flushes: AtomicU64,
         fsyncs: AtomicU64,
@@ -3907,12 +3919,24 @@ mod tests {
     }
 
     fn blocking_write_fixture_with_write_result(write_error: Option<i32>) -> BlockingWriteFixture {
+        blocking_write_fixture_with_results(write_error, None)
+    }
+
+    fn blocking_write_fixture_with_release_error(errno: i32) -> BlockingWriteFixture {
+        blocking_write_fixture_with_results(None, Some(errno))
+    }
+
+    fn blocking_write_fixture_with_results(
+        write_error: Option<i32>,
+        release_error: Option<i32>,
+    ) -> BlockingWriteFixture {
         let (write_started_tx, write_started) = std::sync::mpsc::channel();
         let (release_write, release_write_rx) = std::sync::mpsc::channel();
         let vfs = Arc::new(BlockingWriteVfs {
             write_started: Mutex::new(Some(write_started_tx)),
             release_write: Mutex::new(release_write_rx),
             write_error,
+            release_error,
             snapshots: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
             fsyncs: AtomicU64::new(0),
@@ -3944,6 +3968,9 @@ mod tests {
 
         fn release(&self, _fh: u64) -> Result<(), i32> {
             self.releases.fetch_add(1, Ordering::Relaxed);
+            if let Some(errno) = self.release_error {
+                return Err(errno);
+            }
             Ok(())
         }
 
@@ -4215,6 +4242,45 @@ mod tests {
 
         assert!(eagain_guard < vfs_release);
         assert!(eagain_guard < finish_close);
+    }
+
+    #[test]
+    fn handle_release_forgets_read_ahead_handle_after_release_error() {
+        let fixture = blocking_write_fixture_with_release_error(libc::EIO);
+
+        fixture.bridge.read_ahead_states.observe(
+            &fixture.bridge.read_ahead_policy,
+            7,
+            20,
+            0,
+            8192,
+            16 * 1024,
+        );
+        let reply = fixture.bridge.handle_release(release_request_for_fh(20, 7));
+
+        assert_eq!(reply_errno(&reply), -libc::EIO);
+        assert!(!fixture.bridge.read_ahead_states.contains_handle(20, 7));
+    }
+
+    #[test]
+    fn handle_release_with_async_write_forgets_read_ahead_handle_after_release_error() {
+        let fixture = blocking_write_fixture_with_release_error(libc::EIO);
+        let bridge = LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+            NativeAsyncWriteConfig {
+                max_pending_bytes: Some(16),
+                max_pending_writes: Some(2),
+                per_handle_pending_bytes: Some(8),
+                platform_policy: "test-native".into(),
+            },
+        );
+
+        bridge
+            .read_ahead_states
+            .observe(&bridge.read_ahead_policy, 7, 20, 0, 8192, 16 * 1024);
+        let reply = bridge.handle_release(release_request_for_fh(20, 7));
+
+        assert_eq!(reply_errno(&reply), -libc::EIO);
+        assert!(!bridge.read_ahead_states.contains_handle(20, 7));
     }
 
     #[test]

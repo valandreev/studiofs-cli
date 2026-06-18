@@ -215,8 +215,10 @@ fn validate_mounted_performance_probe(
             ),
         });
     }
-    if let Some(upload_drain) = &summary.upload_drain
-        && let Some(detail) = upload_drain_failure_detail(upload_drain)
+    if let Some(detail) = summary
+        .upload_drain
+        .as_ref()
+        .and_then(upload_drain_failure_detail)
     {
         return Err(ScenarioError::PerformanceProbeValidationFailed { detail });
     }
