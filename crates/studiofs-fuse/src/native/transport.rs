@@ -1629,12 +1629,18 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             return Ok(());
         }
         if let Some(range) = reply.local_cache_range() {
-            let header = reply
-                .local_cache_range_header()
-                .expect("local cache range reply should carry a header");
-            let source_fd = reply
-                .local_cache_source_fd()
-                .expect("local cache range reply should own a source fd");
+            let header = reply.local_cache_range_header().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local cache range reply is missing its output header",
+                )
+            })?;
+            let source_fd = reply.local_cache_source_fd().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local cache range reply is missing its source fd",
+                )
+            })?;
             let owned_range = FuseLocalCacheReadRange::borrowed(
                 source_fd,
                 range.file_offset,
@@ -3307,6 +3313,23 @@ mod tests {
         let output = transport.into_inner();
         assert_eq!(output.write_lens, [22]);
         assert_eq!(&output.output[16..], b"456789");
+    }
+
+    #[test]
+    fn classic_local_cache_reply_path_returns_errors_instead_of_panicking_on_invariants() {
+        let source = include_str!("transport.rs");
+        let send_reply = source
+            .split("impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T>")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("fn send_reply(&mut self, reply: FuseReply)")
+                    .nth(1)
+            })
+            .and_then(|rest| rest.split("fn request_shutdown").next())
+            .expect("classic send_reply body should be present");
+
+        assert!(!send_reply.contains("local cache range reply should carry a header"));
+        assert!(!send_reply.contains("local cache range reply should own a source fd"));
     }
 
     #[test]
