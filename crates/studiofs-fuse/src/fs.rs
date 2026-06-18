@@ -485,7 +485,10 @@ fn parse_linux_native_transport_selection(raw: Option<&str>) -> LinuxNativeTrans
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("classic") {
         LinuxNativeTransportSelection::Classic
-    } else if trimmed.eq_ignore_ascii_case("io_uring") || trimmed.eq_ignore_ascii_case("iouring") {
+    } else if trimmed.eq_ignore_ascii_case("io_uring")
+        || trimmed.eq_ignore_ascii_case("io-uring")
+        || trimmed.eq_ignore_ascii_case("iouring")
+    {
         LinuxNativeTransportSelection::IoUring
     } else if trimmed.eq_ignore_ascii_case("auto") || trimmed.is_empty() {
         LinuxNativeTransportSelection::Auto
@@ -4820,6 +4823,13 @@ mod tests {
     #[test]
     fn linux_native_transport_runtime_option_parses_io_uring_value() {
         let transport = parse_linux_native_transport_selection(Some("io_uring"));
+
+        assert_eq!(transport, LinuxNativeTransportSelection::IoUring);
+    }
+
+    #[test]
+    fn linux_native_transport_runtime_option_parses_hyphenated_io_uring_value() {
+        let transport = parse_linux_native_transport_selection(Some("io-uring"));
 
         assert_eq!(transport, LinuxNativeTransportSelection::IoUring);
     }

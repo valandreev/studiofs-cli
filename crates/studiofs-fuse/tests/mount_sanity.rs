@@ -790,6 +790,21 @@ fn native_io_uring_mount_smoke_is_available_as_sfs533_opt_in_gate() {
 }
 
 #[test]
+fn native_io_uring_mount_smoke_uses_drop_guard_for_panic_cleanup() {
+    let source = include_str!("mount_sanity.rs");
+    let smoke = source
+        .rsplit("fn native_fusermount3_io_uring_session_init_and_unmount_smoke")
+        .next()
+        .and_then(|rest| rest.split("fn finish_mounted_fuse_test").next())
+        .expect("SFS-533 native io_uring smoke should be present");
+
+    assert!(smoke.contains("struct MountGuard"));
+    assert!(smoke.contains("impl Drop for MountGuard"));
+    assert!(smoke.contains("force_unmount_fuse_mount_path(mount_path)"));
+    assert!(smoke.contains("mount_guard.disarm()"));
+}
+
+#[test]
 fn native_mounted_session_uses_runtime_linux_native_transport_selection() {
     let source = include_str!("mount_sanity.rs");
     let native_mount_runner = source
@@ -1365,6 +1380,20 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
     let fuse = system
         .mount(&request)
         .expect("native fusermount3 FUSE mount should return a device fd");
+    struct MountGuard(Option<std::path::PathBuf>);
+    impl MountGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Some(mount_path) = &self.0 {
+                let _ = force_unmount_fuse_mount_path(mount_path);
+            }
+        }
+    }
+    let mut mount_guard = MountGuard(Some(mount_path.clone()));
     assert!(
         mountinfo_contains_path(&mount_path),
         "native fusermount3 io_uring session mount should appear in mountinfo"
@@ -1436,6 +1465,7 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
             eprintln!("skipping native io_uring smoke because FUSE_CAP_OVER_IO_URING is missing");
             force_unmount_fuse_mount_path(&mount_path)
                 .expect("native io_uring skip unmount should succeed");
+            mount_guard.disarm();
             session_thread
                 .join()
                 .expect("native io_uring skipped session thread should not panic");
@@ -1446,6 +1476,7 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
 
     force_unmount_fuse_mount_path(&mount_path)
         .expect("native io_uring session unmount should succeed");
+    mount_guard.disarm();
     let dispatch_result = done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("native io_uring dispatcher should finish after unmount");
