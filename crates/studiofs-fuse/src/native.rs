@@ -1569,7 +1569,8 @@ mod tests {
         let reply = bridge.handle(create_request(1, b"created.txt", 0o644, libc::O_RDWR));
         let reply = reply.bytes().expect("create reply should be contiguous");
 
-        assert_eq!(create_reply_flags(reply) & 1, 1);
+        assert_eq!(create_reply_flags(reply), 0);
+        assert_eq!(bridge.open_cache_metrics_snapshot().writer_barrier, 1);
     }
 
     #[test]
