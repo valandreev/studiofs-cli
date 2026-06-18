@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::native::abi::{AbiParseError, FUSE_IN_HEADER_LEN};
-use crate::native::protocol::{FuseLocalCacheReadRange, FuseReply, FuseRequest};
+use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
 
 const DEFAULT_CLASSIC_MAX_WRITE: usize = 16 * 1024 * 1024;
 const PREAD_COPY_BUFFER_LEN: usize = 128 * 1024;
@@ -45,6 +45,174 @@ struct LocalCacheReplyMetrics {
     pread_bytes_replies: AtomicU64,
     splice_replies: AtomicU64,
     payload_bytes: AtomicU64,
+}
+
+/// Requested Linux-native FUSE transport backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxNativeTransportSelection {
+    /// Always use classic blocking `/dev/fuse` read/write transport.
+    Classic,
+    /// Prefer FUSE-over-io_uring when capability probing says it is safe.
+    IoUring,
+    /// Try FUSE-over-io_uring, then fall back to classic transport.
+    Auto,
+}
+
+/// Effective Linux-native FUSE transport backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxNativeTransportMode {
+    /// Classic blocking `/dev/fuse` read/write transport.
+    Classic,
+    /// FUSE-over-io_uring transport.
+    IoUring,
+}
+
+/// Capability probe inputs for FUSE-over-io_uring transport selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringTransportProbe {
+    /// The running kernel exposes the evolving FUSE-over-io_uring ABI.
+    pub kernel_supported: bool,
+    /// The FUSE module has io_uring transport enabled.
+    pub fuse_module_enabled: bool,
+    /// FUSE init capability negotiation advertised `FUSE_CAP_OVER_IO_URING`.
+    pub fuse_cap_over_io_uring: bool,
+    /// Configured submission/completion queue depth for the io_uring backend.
+    pub queue_depth: Option<usize>,
+    /// System security policy permits this process to use io_uring.
+    pub restricted_by_policy: bool,
+}
+
+/// Reason an io_uring transport request resolved to the classic backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoUringFallbackReason {
+    /// Caller explicitly selected classic transport.
+    ClassicRequested,
+    /// The running kernel does not expose the FUSE-over-io_uring ABI.
+    KernelUnsupported,
+    /// The FUSE module has io_uring transport disabled.
+    FuseModuleDisabled,
+    /// FUSE capability negotiation did not advertise io_uring transport.
+    CapabilityMissing,
+    /// No valid io_uring queue depth was configured.
+    QueueDepthUnavailable,
+    /// System security policy prevents io_uring use by this process.
+    RestrictedByPolicy,
+    /// The request class is not supported by the current FUSE-over-io_uring ABI.
+    UnsupportedRequestClass,
+}
+
+/// Effective transport decision exposed to mount diagnostics and telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxNativeTransportDecision {
+    /// The requested transport selection.
+    pub requested: LinuxNativeTransportSelection,
+    /// The backend StudioFS should use for this session.
+    pub mode: LinuxNativeTransportMode,
+    /// Queue depth used by the io_uring backend when active.
+    pub io_uring_queue_depth: Option<usize>,
+    /// Reason an io_uring-capable selection fell back to classic transport.
+    pub fallback_reason: Option<IoUringFallbackReason>,
+}
+
+impl LinuxNativeTransportDecision {
+    /// Builds a classic decision with a fallback reason for tests and probes.
+    pub fn classic_with_fallback(reason: IoUringFallbackReason) -> Self {
+        Self {
+            requested: LinuxNativeTransportSelection::Auto,
+            mode: LinuxNativeTransportMode::Classic,
+            io_uring_queue_depth: None,
+            fallback_reason: Some(reason),
+        }
+    }
+}
+
+/// Resolves requested Linux-native transport selection against io_uring support.
+pub fn resolve_linux_native_transport(
+    selection: LinuxNativeTransportSelection,
+    probe: IoUringTransportProbe,
+) -> LinuxNativeTransportDecision {
+    if selection == LinuxNativeTransportSelection::Classic {
+        return LinuxNativeTransportDecision {
+            requested: selection,
+            mode: LinuxNativeTransportMode::Classic,
+            io_uring_queue_depth: None,
+            fallback_reason: Some(IoUringFallbackReason::ClassicRequested),
+        };
+    }
+
+    let fallback_reason = if !probe.kernel_supported {
+        Some(IoUringFallbackReason::KernelUnsupported)
+    } else if !probe.fuse_module_enabled {
+        Some(IoUringFallbackReason::FuseModuleDisabled)
+    } else if !probe.fuse_cap_over_io_uring {
+        Some(IoUringFallbackReason::CapabilityMissing)
+    } else if probe.restricted_by_policy {
+        Some(IoUringFallbackReason::RestrictedByPolicy)
+    } else if probe.queue_depth.is_none_or(|queue_depth| queue_depth == 0) {
+        Some(IoUringFallbackReason::QueueDepthUnavailable)
+    } else {
+        None
+    };
+
+    if let Some(fallback_reason) = fallback_reason {
+        return LinuxNativeTransportDecision {
+            requested: selection,
+            mode: LinuxNativeTransportMode::Classic,
+            io_uring_queue_depth: None,
+            fallback_reason: Some(fallback_reason),
+        };
+    }
+
+    LinuxNativeTransportDecision {
+        requested: selection,
+        mode: LinuxNativeTransportMode::IoUring,
+        io_uring_queue_depth: probe.queue_depth,
+        fallback_reason: None,
+    }
+}
+
+/// Per-request backend route selected after session-level transport resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxNativeRequestRoute {
+    /// Backend that should handle this request.
+    pub mode: LinuxNativeTransportMode,
+    /// Reason this request fell back from io_uring to classic transport.
+    pub fallback_reason: Option<IoUringFallbackReason>,
+    /// Number of fallback events represented by this route.
+    pub fallback_count: u64,
+}
+
+impl LinuxNativeRequestRoute {
+    /// Builds a classic fallback route for unsupported io_uring request classes.
+    pub fn classic_fallback(reason: IoUringFallbackReason) -> Self {
+        Self {
+            mode: LinuxNativeTransportMode::Classic,
+            fallback_reason: Some(reason),
+            fallback_count: 1,
+        }
+    }
+}
+
+/// Routes one FUSE request through the active Linux-native transport backend.
+pub fn route_linux_native_request(
+    active_mode: LinuxNativeTransportMode,
+    opcode: FuseOpcode,
+) -> LinuxNativeRequestRoute {
+    if active_mode == LinuxNativeTransportMode::IoUring && io_uring_unsupported_opcode(opcode) {
+        return LinuxNativeRequestRoute::classic_fallback(
+            IoUringFallbackReason::UnsupportedRequestClass,
+        );
+    }
+
+    LinuxNativeRequestRoute {
+        mode: active_mode,
+        fallback_reason: None,
+        fallback_count: 0,
+    }
+}
+
+fn io_uring_unsupported_opcode(opcode: FuseOpcode) -> bool {
+    matches!(opcode, FuseOpcode::Other(_))
 }
 
 /// Snapshot of native transport local-cache read reply counters.
@@ -706,6 +874,40 @@ mod tests {
             .expect("transport send should accept reply");
 
         assert_eq!(transport.sent_replies().len(), 1);
+    }
+
+    #[test]
+    fn auto_io_uring_transport_falls_back_to_classic_when_kernel_capability_is_missing() {
+        let decision = resolve_linux_native_transport(
+            LinuxNativeTransportSelection::Auto,
+            IoUringTransportProbe {
+                kernel_supported: false,
+                fuse_module_enabled: true,
+                fuse_cap_over_io_uring: true,
+                queue_depth: Some(64),
+                restricted_by_policy: false,
+            },
+        );
+
+        assert_eq!(
+            decision,
+            LinuxNativeTransportDecision::classic_with_fallback(
+                IoUringFallbackReason::KernelUnsupported
+            )
+        );
+    }
+
+    #[test]
+    fn io_uring_transport_routes_interrupt_requests_through_classic_fallback() {
+        let route =
+            route_linux_native_request(LinuxNativeTransportMode::IoUring, FuseOpcode::Other(36));
+
+        assert_eq!(
+            route,
+            LinuxNativeRequestRoute::classic_fallback(
+                IoUringFallbackReason::UnsupportedRequestClass
+            )
+        );
     }
 
     #[derive(Debug)]

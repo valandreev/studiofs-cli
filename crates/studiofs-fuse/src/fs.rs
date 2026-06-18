@@ -36,6 +36,8 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 
+use crate::native::transport::LinuxNativeTransportSelection;
+
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
@@ -58,6 +60,7 @@ const STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_READ_MAX_PENDING_READS";
 const STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_READ_PER_HANDLE_PENDING_BYTES";
+const STUDIOFS_FUSE_LINUX_NATIVE_TRANSPORT_ENV: &str = "STUDIOFS_FUSE_LINUX_NATIVE_TRANSPORT";
 const FUSE_BOUNDARY_POOL_BUFFER_BYTES: usize = DEFAULT_FUSE_MAX_READAHEAD_BYTES as usize;
 const FUSE_BOUNDARY_POOL_MAX_BUFFERS: usize = 64;
 const FUSE_BOUNDARY_POOL_MAX_POOLED_BUFFER_BYTES: usize = DEFAULT_FUSE_MAX_READAHEAD_BYTES as usize;
@@ -473,6 +476,27 @@ fn should_enable_async_fuse_metadata_from_env_value(raw: &str) -> bool {
 fn should_enable_async_fuse_metadata_from_env() -> bool {
     std::env::var(STUDIOFS_FUSE_ASYNC_METADATA_ENV)
         .is_ok_and(|raw| should_enable_async_fuse_metadata_from_env_value(&raw))
+}
+
+fn parse_linux_native_transport_selection(raw: Option<&str>) -> LinuxNativeTransportSelection {
+    let Some(raw) = raw else {
+        return LinuxNativeTransportSelection::Auto;
+    };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("classic") {
+        LinuxNativeTransportSelection::Classic
+    } else if trimmed.eq_ignore_ascii_case("io_uring") || trimmed.eq_ignore_ascii_case("iouring") {
+        LinuxNativeTransportSelection::IoUring
+    } else if trimmed.eq_ignore_ascii_case("auto") || trimmed.is_empty() {
+        LinuxNativeTransportSelection::Auto
+    } else {
+        warn!(
+            env_key = STUDIOFS_FUSE_LINUX_NATIVE_TRANSPORT_ENV,
+            env_value = trimmed,
+            "invalid Linux native transport selection; using auto"
+        );
+        LinuxNativeTransportSelection::Auto
+    }
 }
 
 /// Abstracts attribute replies so async metadata paths can use real fuser
@@ -1536,6 +1560,8 @@ pub struct StudioFuseRuntimeOptions {
     pub linux_parallel_dirops_enabled: bool,
     /// Request Linux `FUSE_READDIRPLUS_AUTO` during FUSE init when supported.
     pub linux_readdirplus_auto_enabled: bool,
+    /// Select LinuxNativeBridge transport backend: classic, io_uring, or auto.
+    pub linux_native_transport: LinuxNativeTransportSelection,
     /// Optional custom limits for async write admission control. When omitted,
     /// explicit-runtime construction uses the safe platform defaults.
     pub async_write_admission_limits: Option<StudioFuseAsyncWriteAdmissionLimits>,
@@ -1575,6 +1601,7 @@ impl Default for StudioFuseRuntimeOptions {
             linux_async_dio_enabled: false,
             linux_parallel_dirops_enabled: false,
             linux_readdirplus_auto_enabled: true,
+            linux_native_transport: LinuxNativeTransportSelection::Auto,
             async_write_admission_limits: None,
             async_read_admission_limits: None,
         }
@@ -1614,6 +1641,11 @@ impl StudioFuseRuntimeOptions {
             linux_readdirplus_auto_enabled: std::env::var(STUDIOFS_FUSE_READDIRPLUS_AUTO_ENV)
                 .ok()
                 .is_none_or(|raw| parse_bridge_bool_env_value(&raw)),
+            linux_native_transport: parse_linux_native_transport_selection(
+                std::env::var(STUDIOFS_FUSE_LINUX_NATIVE_TRANSPORT_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
@@ -3633,13 +3665,15 @@ mod tests {
         FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseCapabilityPolicy, PendingFuseCloseGuard,
         StudioFuseFs, TTL, async_write_platform_policy_label, complete_fuse_write_reply,
         fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
-        retry_optional_fuse_queue_tuning, should_enable_async_fuse_metadata_from_env_value,
+        normalize_unix_mode, parse_linux_native_transport_selection, posix_flags_to_open_flags,
+        resolve_async_fuse_write_enabled, retry_optional_fuse_queue_tuning,
+        should_enable_async_fuse_metadata_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use super::{FuseOpenCacheMode, fuse_open_reply_flags};
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
+    use crate::native::transport::LinuxNativeTransportSelection;
     use std::cell::Cell;
 
     use std::ffi::OsStr;
@@ -4003,6 +4037,7 @@ mod tests {
                 linux_async_dio_enabled: true,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -4036,6 +4071,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -4090,6 +4126,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: None,
             },
@@ -4117,6 +4154,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_enabled: true,
                 async_metadata_enabled: false,
@@ -4278,6 +4316,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -4324,6 +4363,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -4417,6 +4457,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -4465,6 +4506,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4096),
@@ -4507,6 +4549,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_admission_limits: Some(super::StudioFuseAsyncReadAdmissionLimits {
                     max_pending_bytes: Some(4),
@@ -4545,6 +4588,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_enabled: false,
                 async_metadata_enabled: false,
@@ -4763,6 +4807,21 @@ mod tests {
     #[test]
     fn runtime_options_default_keep_readdirplus_auto_enabled() {
         assert!(super::StudioFuseRuntimeOptions::default().linux_readdirplus_auto_enabled);
+    }
+
+    #[test]
+    fn runtime_options_default_use_auto_linux_native_transport() {
+        assert_eq!(
+            super::StudioFuseRuntimeOptions::default().linux_native_transport,
+            LinuxNativeTransportSelection::Auto
+        );
+    }
+
+    #[test]
+    fn linux_native_transport_runtime_option_parses_io_uring_value() {
+        let transport = parse_linux_native_transport_selection(Some("io_uring"));
+
+        assert_eq!(transport, LinuxNativeTransportSelection::IoUring);
     }
 
     #[test]
@@ -4989,6 +5048,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -5072,6 +5132,7 @@ mod tests {
                 linux_async_dio_enabled: false,
                 linux_parallel_dirops_enabled: false,
                 linux_readdirplus_auto_enabled: true,
+                linux_native_transport: LinuxNativeTransportSelection::Auto,
                 async_write_admission_limits: None,
                 async_read_enabled: false,
                 async_metadata_enabled: false,

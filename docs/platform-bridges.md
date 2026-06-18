@@ -195,6 +195,7 @@ defines `LinuxNativeBridge` as an owned Linux platform boundary with classic
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | Linux: `parallel_dirops` capability | Disabled by default. `STUDIOFS_FUSE_PARALLEL_DIROPS=1` records an opt-in request, but the current `fuser` build does not expose the ABI flag, so StudioFS continues without requesting it |
 | Linux: `readdirplus_auto` capability | Enabled by default and requested only when the kernel advertises `FUSE_READDIRPLUS_AUTO`. Roll back with `STUDIOFS_FUSE_READDIRPLUS_AUTO=0` |
+| LinuxNativeBridge transport | `auto` by default. Set `STUDIOFS_FUSE_LINUX_NATIVE_TRANSPORT=classic`, `io_uring`, or `auto` to force classic `/dev/fuse`, request FUSE-over-io_uring, or allow safe fallback |
 | Linux: `writeback_cache` capability | Disabled; StudioFS does not request `FUSE_WRITEBACK_CACHE` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
