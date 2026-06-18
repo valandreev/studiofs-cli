@@ -61,6 +61,12 @@ impl NativeSessionConfig {
     fn linux6_safe_from_env_value(writeback_cache: Option<&str>) -> Self {
         Self::linux6_safe(writeback_cache.is_some_and(parse_native_bool_env_value))
     }
+
+    /// Opts into advertising FUSE-over-io_uring support during INIT.
+    pub fn with_io_uring_transport(mut self) -> Self {
+        self.requested_capabilities = self.requested_capabilities | FuseCapabilities::OVER_IO_URING;
+        self
+    }
 }
 
 fn parse_native_bool_env_value(raw: &str) -> bool {
@@ -503,6 +509,17 @@ mod tests {
             config
                 .requested_capabilities
                 .contains(FuseCapabilities::WRITEBACK_CACHE)
+        );
+    }
+
+    #[test]
+    fn linux6_safe_config_can_opt_into_fuse_over_io_uring_transport() {
+        let config = NativeSessionConfig::linux6_safe(false).with_io_uring_transport();
+
+        assert!(
+            config
+                .requested_capabilities
+                .contains(FuseCapabilities::OVER_IO_URING)
         );
     }
 

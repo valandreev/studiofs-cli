@@ -801,6 +801,7 @@ fn native_mounted_session_uses_runtime_linux_native_transport_selection() {
     assert!(native_mount_runner.contains("runtime_options.linux_native_transport"));
     assert!(native_mount_runner.contains("LinuxNativeFuseTransport::Hybrid"));
     assert!(native_mount_runner.contains("LinuxNativeTransportSelection::IoUring"));
+    assert!(native_mount_runner.contains("with_io_uring_transport"));
     assert!(native_mount_runner.contains("linux_fuse_io_uring_queue_count()"));
     assert!(native_mount_runner.contains("io_uring_payload_len_for_session"));
 }
@@ -1376,7 +1377,7 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
         let fuse_file = fuse.into_file();
         let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
         let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
-        let config = NativeSessionConfig::linux6_safe_from_env();
+        let config = NativeSessionConfig::linux6_safe_from_env().with_io_uring_transport();
         let session = NativeFuseSession::new(transport, config);
         let (negotiated, transport) = match session.handshake_into_transport() {
             Ok(result) => result,
@@ -1945,13 +1946,16 @@ fn with_mounted_native_fuse(
             let fuse_file = fuse.into_file();
             let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
             let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
-            let config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
+            let mut runtime_options = StudioFuseRuntimeOptions::from_env();
+            runtime_options.async_write_enabled = mode.async_write_enabled();
+            let mut config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
+            if runtime_options.linux_native_transport != LinuxNativeTransportSelection::Classic {
+                config = config.with_io_uring_transport();
+            }
             let session = NativeFuseSession::new(transport, config);
             let (negotiated, transport) = session
                 .handshake_into_transport()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            let mut runtime_options = StudioFuseRuntimeOptions::from_env();
-            runtime_options.async_write_enabled = mode.async_write_enabled();
             let transport = match runtime_options.linux_native_transport {
                 LinuxNativeTransportSelection::Classic => {
                     LinuxNativeFuseTransport::Classic(transport)
