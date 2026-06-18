@@ -258,7 +258,7 @@ pub fn decide_native_open_cache(
 ) -> NativeOpenCacheDecision {
     if state.writer_active || state.dirty {
         return NativeOpenCacheDecision {
-            action: NativeOpenCacheAction::DirectIo,
+            action: NativeOpenCacheAction::InvalidateThenCached,
             reason: NativeOpenCacheReason::WriterBarrier,
         };
     }
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_open_uses_direct_io_when_writer_state_is_dirty() {
+    fn read_only_open_invalidates_before_cached_io_when_writer_state_is_dirty() {
         let decision = decide_native_open_cache(
             true,
             &NativeInodeCacheState {
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(
             decision,
             NativeOpenCacheDecision {
-                action: NativeOpenCacheAction::DirectIo,
+                action: NativeOpenCacheAction::InvalidateThenCached,
                 reason: NativeOpenCacheReason::WriterBarrier,
             }
         );

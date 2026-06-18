@@ -1,13 +1,14 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
 use studiofs_vfs::{
@@ -886,6 +887,8 @@ struct NativeReadAheadStateStore {
     shards: [Mutex<NativeReadAheadStateShard>; Self::SHARD_COUNT],
 }
 
+type NativeReadAheadHandles = SmallVec<[u64; 4]>;
+
 impl Default for NativeReadAheadStateStore {
     fn default() -> Self {
         Self {
@@ -898,7 +901,7 @@ impl Default for NativeReadAheadStateStore {
 struct NativeReadAheadStateShard {
     states: HashMap<u64, NativeReadAheadState>,
     inode_by_fh: HashMap<u64, u64>,
-    fhs_by_inode: HashMap<u64, HashSet<u64>>,
+    fhs_by_inode: HashMap<u64, NativeReadAheadHandles>,
 }
 
 impl NativeReadAheadStateStore {
@@ -967,18 +970,18 @@ impl NativeReadAheadStateShard {
     fn track_handle_inode(&mut self, fh: u64, ino: u64) {
         let previous_ino = self.inode_by_fh.insert(fh, ino);
         if previous_ino == Some(ino) {
-            self.fhs_by_inode.entry(ino).or_default().insert(fh);
+            insert_read_ahead_handle(self.fhs_by_inode.entry(ino).or_default(), fh);
             return;
         }
         if let Some(previous_ino) = previous_ino
             && let Some(fhs) = self.fhs_by_inode.get_mut(&previous_ino)
         {
-            fhs.remove(&fh);
+            remove_read_ahead_handle(fhs, fh);
             if fhs.is_empty() {
                 self.fhs_by_inode.remove(&previous_ino);
             }
         }
-        self.fhs_by_inode.entry(ino).or_default().insert(fh);
+        insert_read_ahead_handle(self.fhs_by_inode.entry(ino).or_default(), fh);
     }
 
     fn remove_handle(&mut self, fh: u64) {
@@ -987,11 +990,23 @@ impl NativeReadAheadStateShard {
             return;
         };
         if let Some(fhs) = self.fhs_by_inode.get_mut(&ino) {
-            fhs.remove(&fh);
+            remove_read_ahead_handle(fhs, fh);
             if fhs.is_empty() {
                 self.fhs_by_inode.remove(&ino);
             }
         }
+    }
+}
+
+fn insert_read_ahead_handle(handles: &mut NativeReadAheadHandles, fh: u64) {
+    if !handles.contains(&fh) {
+        handles.push(fh);
+    }
+}
+
+fn remove_read_ahead_handle(handles: &mut NativeReadAheadHandles, fh: u64) {
+    if let Some(index) = handles.iter().position(|stored_fh| *stored_fh == fh) {
+        handles.swap_remove(index);
     }
 }
 
@@ -1159,19 +1174,7 @@ impl NativeLatencyMetrics {
         let latency_ns = latency_ns.max(1);
         self.samples.fetch_add(1, Ordering::Relaxed);
         self.total_ns.fetch_add(latency_ns, Ordering::Relaxed);
-        let mut current = self.max_ns.load(Ordering::Relaxed);
-        while latency_ns > current {
-            match self.max_ns.compare_exchange_weak(
-                current,
-                latency_ns,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
-
+        self.max_ns.fetch_max(latency_ns, Ordering::Relaxed);
         self.buckets[native_latency_bucket_index(latency_ns)].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1193,6 +1196,8 @@ impl NativeLatencyMetrics {
 }
 
 fn native_latency_bucket_index(latency_ns: u64) -> usize {
+    // The bucket table is intentionally tiny; linear search avoids extra branchy
+    // machinery and keeps the hot-path choice obvious.
     NATIVE_LATENCY_BUCKET_BOUNDS_NS
         .iter()
         .position(|bound| latency_ns <= *bound)
@@ -3386,6 +3391,31 @@ mod tests {
         assert_ne!(
             NativeReadAheadStateStore::shard_index(7),
             NativeReadAheadStateStore::shard_index(8)
+        );
+    }
+
+    #[test]
+    fn native_read_ahead_handles_keep_common_case_inline() {
+        let mut handles = NativeReadAheadHandles::new();
+
+        for fh in 1..=4 {
+            insert_read_ahead_handle(&mut handles, fh);
+        }
+
+        assert!(!handles.spilled());
+    }
+
+    #[test]
+    fn native_read_ahead_state_shard_reassigns_handle_between_inodes() {
+        let mut shard = NativeReadAheadStateShard::default();
+
+        shard.track_handle_inode(7, 20);
+        shard.track_handle_inode(7, 21);
+
+        assert!(!shard.fhs_by_inode.contains_key(&20));
+        assert_eq!(
+            shard.fhs_by_inode.get(&21).map(|fhs| fhs.as_slice()),
+            Some(&[7][..])
         );
     }
 

@@ -174,7 +174,7 @@ The initial decision table is:
 |---|---|---|
 | Read-only open, local materialization is present, content epoch/size/mtime match the last trusted kernel-cache state, and invalidation generation is unchanged | `KEEP_CACHE` | `Keep` |
 | Content epoch, size, mtime, or invalidation generation changed after a previously trusted cache generation | `InvalidateThenCached` | `StalePrevented` |
-| Active writer state or dirty state exists for the inode | `FOPEN_DIRECT_IO` | `WriterBarrier` |
+| Active writer state or dirty state exists for the inode | `InvalidateThenCached` | `WriterBarrier` |
 | Local materialization was evicted for the trusted generation | `InvalidateThenCached` | `LocalCacheEvicted` |
 | No trusted kernel-cache generation is available | normal cached I/O | `Cached` |
 
@@ -188,11 +188,13 @@ still drive explicit invalidation before stale kernel pages can be reused.
 until separate correctness tests cover read-after-write, fsync, flush, release,
 truncate, and remote-invalidation interactions for that profile.
 
-Metrics must expose why every native Linux open/read path kept, invalidated,
-used direct I/O, or fell back to normal cached I/O. The minimum reason surface is
-`Keep`, `Cached`, `StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted`.
-Those counters are the benchmark and debugging vocabulary for cache/coherency
-decisions.
+Metrics must expose why every native Linux open/read path kept, invalidated, or
+fell back to normal cached I/O. The minimum reason surface is `Keep`, `Cached`,
+`StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted`. Those counters are
+the benchmark and debugging vocabulary for cache/coherency decisions. The
+writer-barrier path is performance-first: it drops potentially stale pages and
+returns to buffered cached I/O instead of making dirty or upload-backlog reads
+use per-handle direct I/O.
 
 ### SFS-529 Local-Cache Read Path
 

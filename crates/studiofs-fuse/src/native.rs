@@ -930,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn native_bridge_open_uses_direct_io_when_policy_reports_dirty_writer_state() {
+    fn native_bridge_open_invalidates_and_uses_cached_io_when_policy_reports_dirty_writer_state() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,
             size: 8192,
@@ -969,7 +969,9 @@ mod tests {
         let reply = reply.bytes().expect("open reply should be contiguous");
 
         assert_eq!(reply_error(reply), 0);
-        assert_eq!(open_reply_flags(reply) & 1, 1);
+        assert_eq!(open_reply_flags(reply), 0);
+        assert_eq!(bridge.open_cache_metrics_snapshot().invalidated, 1);
+        assert_eq!(bridge.open_cache_metrics_snapshot().writer_barrier, 1);
     }
 
     #[test]
