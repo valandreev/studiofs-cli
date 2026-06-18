@@ -34,6 +34,17 @@ pub struct VfsLocalCacheReadRange {
     pub payload: LocalPayloadReadRange,
     /// Content epoch associated with the VFS read plan.
     pub content_epoch: u64,
+    /// Metadata invalidation generation associated with the VFS read plan.
+    pub invalidation_generation: u64,
+}
+
+#[cfg(unix)]
+fn native_read_plan_invalidation_generation(attr: &InodeAttr) -> u64 {
+    let mut generation = attr.content_epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    generation ^= attr.size.rotate_left(17);
+    generation ^= (attr.mtime as u64).rotate_left(31);
+    generation ^= (attr.ctime as u64).rotate_left(43);
+    generation.max(1)
 }
 
 #[derive(Debug, Clone)]
@@ -1561,6 +1572,9 @@ impl StudioVfs {
         Ok(Some(VfsLocalCacheReadRange {
             payload: range,
             content_epoch: prepared.context.attr.content_epoch,
+            invalidation_generation: native_read_plan_invalidation_generation(
+                &prepared.context.attr,
+            ),
         }))
     }
 
@@ -3336,6 +3350,7 @@ mod tests {
             assert_eq!(&out, b"3456");
             assert_eq!(range.payload.len(), 4);
             assert_eq!(range.content_epoch, staged_attr.content_epoch);
+            assert_ne!(range.invalidation_generation, 0);
         });
     }
 

@@ -596,6 +596,24 @@ fn docs_list_sfs530_native_evidence_command() {
 }
 
 #[test]
+fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
+    let source = include_str!("mount_sanity.rs");
+    let writer = source
+        .rsplit("fn write_sfs530_telemetry_snapshot")
+        .next()
+        .and_then(|rest| {
+            rest.split("fn run_sfs530_evidence_matrix_if_available")
+                .next()
+        })
+        .expect("SFS-530 telemetry writer should be present");
+
+    assert!(writer.contains("local_cache_unavailable_fallbacks"));
+    assert!(writer.contains("stale_epoch_fallbacks"));
+    assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
+    assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
+}
+
+#[test]
 fn mounted_tests_enabled_falls_back_to_workspace_dotenv_value() {
     assert!(mounted_tests_enabled_from_values(None, Some("1")));
 }
@@ -2208,6 +2226,7 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
     };
     let snapshot = vfs.write_path_observability_snapshot();
     let async_write = snapshot.fuse_async_write;
+    let native_bridge = snapshot.native_bridge;
     let backpressure = snapshot.write_backpressure;
     let dirty_pressure = snapshot.dirty_pressure;
     let json = format!(
@@ -2230,6 +2249,42 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"admission_wait_total_ms\": {admission_wait_total_ms:.3},\n",
             "    \"barrier_waits\": {barrier_waits},\n",
             "    \"barrier_wait_total_ms\": {barrier_wait_total_ms:.3}\n",
+            "  }},\n",
+            "  \"native_bridge\": {{\n",
+            "    \"fuse_ops\": {native_fuse_ops},\n",
+            "    \"metadata_ops\": {native_metadata_ops},\n",
+            "    \"lookup_ops\": {native_lookup_ops},\n",
+            "    \"getattr_ops\": {native_getattr_ops},\n",
+            "    \"readdir_ops\": {native_readdir_ops},\n",
+            "    \"readdirplus_ops\": {native_readdirplus_ops},\n",
+            "    \"open_ops\": {native_open_ops},\n",
+            "    \"release_ops\": {native_release_ops},\n",
+            "    \"read_ops\": {native_read_ops},\n",
+            "    \"write_ops\": {native_write_ops},\n",
+            "    \"lookup_getattr_ratio_micros\": {native_lookup_getattr_ratio_micros},\n",
+            "    \"open_release_ratio_micros\": {native_open_release_ratio_micros},\n",
+            "    \"fuse_ops_per_read_write_micros\": {native_fuse_ops_per_read_write_micros},\n",
+            "    \"metadata_ops_per_open_micros\": {native_metadata_ops_per_open_micros},\n",
+            "    \"metadata_latency_total_ns\": {native_metadata_latency_total_ns},\n",
+            "    \"lookup_p95_ns\": {native_lookup_p95_ns},\n",
+            "    \"lookup_p99_ns\": {native_lookup_p99_ns},\n",
+            "    \"getattr_p95_ns\": {native_getattr_p95_ns},\n",
+            "    \"getattr_p99_ns\": {native_getattr_p99_ns},\n",
+            "    \"readdir_p95_ns\": {native_readdir_p95_ns},\n",
+            "    \"readdir_p99_ns\": {native_readdir_p99_ns},\n",
+            "    \"read_p95_ns\": {native_read_p95_ns},\n",
+            "    \"read_p99_ns\": {native_read_p99_ns},\n",
+            "    \"write_p95_ns\": {native_write_p95_ns},\n",
+            "    \"write_p99_ns\": {native_write_p99_ns},\n",
+            "    \"local_cache_hits\": {native_local_cache_hits},\n",
+            "    \"local_cache_unavailable_fallbacks\": {native_local_cache_unavailable_fallbacks},\n",
+            "    \"stale_epoch_fallbacks\": {native_stale_epoch_fallbacks},\n",
+            "    \"stale_generation_fallbacks\": {native_stale_generation_fallbacks},\n",
+            "    \"bytes_fallbacks\": {native_bytes_fallbacks},\n",
+            "    \"bytes_returned\": {native_bytes_returned},\n",
+            "    \"read_ahead_prefetches\": {native_read_ahead_prefetches},\n",
+            "    \"read_ahead_suppressed\": {native_read_ahead_suppressed},\n",
+            "    \"read_ahead_amplification_bytes\": {native_read_ahead_amplification_bytes}\n",
             "  }},\n",
             "  \"write_backpressure\": {{\n",
             "    \"events\": {backpressure_events},\n",
@@ -2265,6 +2320,40 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         admission_wait_total_ms = async_write.admission_wait_total_ms,
         barrier_waits = async_write.barrier_waits,
         barrier_wait_total_ms = async_write.barrier_wait_total_ms,
+        native_fuse_ops = native_bridge.fuse_ops,
+        native_metadata_ops = native_bridge.metadata_ops,
+        native_lookup_ops = native_bridge.lookup_ops,
+        native_getattr_ops = native_bridge.getattr_ops,
+        native_readdir_ops = native_bridge.readdir_ops,
+        native_readdirplus_ops = native_bridge.readdirplus_ops,
+        native_open_ops = native_bridge.open_ops,
+        native_release_ops = native_bridge.release_ops,
+        native_read_ops = native_bridge.read_ops,
+        native_write_ops = native_bridge.write_ops,
+        native_lookup_getattr_ratio_micros = native_bridge.lookup_getattr_ratio_micros,
+        native_open_release_ratio_micros = native_bridge.open_release_ratio_micros,
+        native_fuse_ops_per_read_write_micros = native_bridge.fuse_ops_per_read_write_micros,
+        native_metadata_ops_per_open_micros = native_bridge.metadata_ops_per_open_micros,
+        native_metadata_latency_total_ns = native_bridge.metadata_latency_total_ns,
+        native_lookup_p95_ns = native_bridge.lookup_latency.p95_ns,
+        native_lookup_p99_ns = native_bridge.lookup_latency.p99_ns,
+        native_getattr_p95_ns = native_bridge.getattr_latency.p95_ns,
+        native_getattr_p99_ns = native_bridge.getattr_latency.p99_ns,
+        native_readdir_p95_ns = native_bridge.readdir_latency.p95_ns,
+        native_readdir_p99_ns = native_bridge.readdir_latency.p99_ns,
+        native_read_p95_ns = native_bridge.read_latency.p95_ns,
+        native_read_p99_ns = native_bridge.read_latency.p99_ns,
+        native_write_p95_ns = native_bridge.write_latency.p95_ns,
+        native_write_p99_ns = native_bridge.write_latency.p99_ns,
+        native_local_cache_hits = native_bridge.local_cache_hits,
+        native_local_cache_unavailable_fallbacks = native_bridge.local_cache_unavailable_fallbacks,
+        native_stale_epoch_fallbacks = native_bridge.stale_epoch_fallbacks,
+        native_stale_generation_fallbacks = native_bridge.stale_generation_fallbacks,
+        native_bytes_fallbacks = native_bridge.bytes_fallbacks,
+        native_bytes_returned = native_bridge.bytes_returned,
+        native_read_ahead_prefetches = native_bridge.read_ahead_prefetches,
+        native_read_ahead_suppressed = native_bridge.read_ahead_suppressed,
+        native_read_ahead_amplification_bytes = native_bridge.read_ahead_amplification_bytes,
         backpressure_events = backpressure.events,
         backpressure_wait_total_ms = backpressure.wait_total_ms,
         backpressure_stall_max_ms = backpressure.stall_max_ms,

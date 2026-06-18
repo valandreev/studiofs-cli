@@ -77,6 +77,39 @@ fn registry_exposes_mounted_fuse_write_baseline_sfs469_scenario() {
 }
 
 #[test]
+fn registry_exposes_mounted_fuse_upload_backlog_read_sfs531_scenario() {
+    let scenarios = available_scenarios();
+    let scenario = scenarios
+        .iter()
+        .find(|scenario| scenario.name == MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION)
+        .expect("SFS-531 FUSE upload-backlog read regression scenario should be registered");
+
+    assert!(scenario.requires_studiofs_bin);
+    assert!(scenario.description.contains("SFS-531"));
+    assert!(scenario.description.contains("mounted-write"));
+    assert!(resolve_scenario(MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION).is_some());
+    assert!(resolve_scenario("fuse-upload-backlog-read-regression").is_some());
+    assert!(resolve_scenario("sfs-531").is_some());
+    assert!(resolve_scenario("531").is_some());
+}
+
+#[test]
+fn sfs531_probe_defaults_reproduce_mounted_upload_backlog_read_shape() {
+    let defaults = PerformanceProbeConfigDefaults::sfs531_upload_backlog_read_regression();
+
+    assert_eq!(defaults.file_bytes, 256 * 1024 * 1024);
+    assert_eq!(defaults.chunk_bytes, 4 * 1024 * 1024);
+    assert_eq!(defaults.read_passes, 1);
+    assert_eq!(defaults.sample_delay_ms, 250);
+    assert!(defaults.wait_for_upload_drain);
+    assert_eq!(defaults.upload_drain_timeout_secs, 180);
+    assert_eq!(
+        defaults.seed_mode,
+        Some(PerformanceProbeSeedMode::MountedWrite)
+    );
+}
+
+#[test]
 fn performance_probe_seed_mode_summary_records_read_only_seeded_backend() {
     let config = PerformanceProbeConfig {
         file_bytes: 1024,

@@ -228,8 +228,12 @@ kernel page cache. NativeBridge cache decisions are tracked by SFS-528 through
 content epoch, size, mtime, writer state, dirty state, local materialization,
 and invalidation generation; the decision records `KEEP_CACHE`,
 `InvalidateThenCached`, `FOPEN_DIRECT_IO`, or normal cached I/O. Write-capable
-opens do not request `FOPEN_KEEP_CACHE` by default and only use
-`FOPEN_DIRECT_IO` when the policy reports a `WriterBarrier` reason.
+opens do not request `FOPEN_KEEP_CACHE` by default. Writer-barrier decisions are
+performance-first: StudioFS invalidates potentially stale kernel pages, then
+returns to buffered cached I/O so Linux keeps the same high-throughput local
+read posture expected from the Windows and macOS bridges. Direct I/O remains a
+separate explicit policy action, not the default dirty or upload-backlog read
+path.
 
 The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote

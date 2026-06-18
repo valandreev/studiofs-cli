@@ -781,6 +781,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -809,6 +812,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -833,6 +839,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -857,6 +866,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -876,6 +888,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -902,6 +917,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -912,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn native_bridge_open_uses_direct_io_when_policy_reports_dirty_writer_state() {
+    fn native_bridge_open_invalidates_and_uses_cached_io_when_policy_reports_dirty_writer_state() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,
             size: 8192,
@@ -920,6 +938,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         vfs.open_cache_states
             .lock()
@@ -948,7 +969,9 @@ mod tests {
         let reply = reply.bytes().expect("open reply should be contiguous");
 
         assert_eq!(reply_error(reply), 0);
-        assert_eq!(open_reply_flags(reply) & 1, 1);
+        assert_eq!(open_reply_flags(reply), 0);
+        assert_eq!(bridge.open_cache_metrics_snapshot().invalidated, 1);
+        assert_eq!(bridge.open_cache_metrics_snapshot().writer_barrier, 1);
     }
 
     #[test]
@@ -960,6 +983,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         vfs.open_cache_states
             .lock()
@@ -1000,6 +1026,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         vfs.open_cache_states
             .lock()
@@ -1041,6 +1070,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         vfs.open_cache_states
             .lock()
@@ -1091,6 +1123,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1117,6 +1152,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1143,6 +1181,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1169,6 +1210,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1195,6 +1239,9 @@ mod tests {
             perm: 0o600,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1221,6 +1268,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1247,6 +1297,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1275,6 +1328,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1305,6 +1361,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1336,6 +1395,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         };
         let entries: Vec<_> = (0..5)
             .map(|index| NativeDirEntry {
@@ -1369,6 +1431,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         };
         let entries = vec![
             NativeDirEntry {
@@ -1420,6 +1485,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1001,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1446,6 +1514,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1001,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1473,6 +1544,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         vfs.open_cache_states
             .lock()
@@ -1495,7 +1569,8 @@ mod tests {
         let reply = bridge.handle(create_request(1, b"created.txt", 0o644, libc::O_RDWR));
         let reply = reply.bytes().expect("create reply should be contiguous");
 
-        assert_eq!(create_reply_flags(reply) & 1, 1);
+        assert_eq!(create_reply_flags(reply), 0);
+        assert_eq!(bridge.open_cache_metrics_snapshot().writer_barrier, 1);
     }
 
     #[test]
@@ -1507,6 +1582,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1533,6 +1611,9 @@ mod tests {
             perm: 0o755,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1559,6 +1640,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1585,6 +1669,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1609,6 +1696,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1634,6 +1724,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1662,6 +1755,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1686,6 +1782,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -1715,6 +1814,9 @@ mod tests {
             perm: 0o644,
             uid: 1000,
             gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         });
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 

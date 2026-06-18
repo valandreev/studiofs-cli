@@ -293,8 +293,29 @@ fn fuse_attr_blksize() -> u32 {
     512
 }
 
-fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuseOpenCacheMode {
+    Normal,
+    WriterBarrier,
+}
+
+fn fuse_open_cache_mode(vfs: &StudioVfs, ino: u64, open_flags: OpenFlags) -> FuseOpenCacheMode {
+    if open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR) {
+        return FuseOpenCacheMode::Normal;
+    }
+
+    if vfs.inode_has_local_dirty_state(ino) || !vfs.pending_uploads_for_inode(ino).is_empty() {
+        FuseOpenCacheMode::WriterBarrier
+    } else {
+        FuseOpenCacheMode::Normal
+    }
+}
+
+fn fuse_open_reply_flags(open_flags: OpenFlags, cache_mode: FuseOpenCacheMode) -> u32 {
     if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
+        if cache_mode == FuseOpenCacheMode::WriterBarrier {
+            return 0;
+        }
         fuser::consts::FOPEN_KEEP_CACHE
     } else {
         0
@@ -2527,12 +2548,13 @@ impl Filesystem for StudioFuseFs {
                 let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
                 match self.vfs.open_file(attr.ino, open_flags, false) {
                     Ok(fh) => {
+                        let cache_mode = fuse_open_cache_mode(&self.vfs, attr.ino, open_flags);
                         reply.created(
                             &TTL,
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags),
+                            fuse_open_reply_flags(open_flags, cache_mode),
                         );
                     }
                     Err(e) => {
@@ -2712,13 +2734,15 @@ impl Filesystem for StudioFuseFs {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags(open_flags);
+                let cache_mode = fuse_open_cache_mode(&self.vfs, ino, open_flags);
+                let reply_flags = fuse_open_reply_flags(open_flags, cache_mode);
                 debug!(
                     ino,
                     fh,
                     posix_flags = flags,
                     ?open_flags,
                     trunc,
+                    ?cache_mode,
                     reply_flags,
                     direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
                     keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
@@ -3603,7 +3627,6 @@ impl FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    use super::fuse_open_reply_flags;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, DirectoryHandleStore,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseDataReply,
@@ -3615,6 +3638,7 @@ mod tests {
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
+    use super::{FuseOpenCacheMode, fuse_open_reply_flags};
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
 
@@ -4656,15 +4680,28 @@ mod tests {
     fn fuse_open_reply_flags_match_platform_cache_policy() {
         {
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY),
+                fuse_open_reply_flags(OpenFlags::RDONLY, FuseOpenCacheMode::Normal),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
+                fuse_open_reply_flags(
+                    OpenFlags::RDONLY | OpenFlags::APPEND,
+                    FuseOpenCacheMode::Normal
+                ),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::RDONLY, FuseOpenCacheMode::WriterBarrier),
+                0
+            );
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::WRONLY, FuseOpenCacheMode::WriterBarrier),
+                0
+            );
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::RDWR, FuseOpenCacheMode::WriterBarrier),
+                0
+            );
         }
     }
 

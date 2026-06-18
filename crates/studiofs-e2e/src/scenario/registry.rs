@@ -43,6 +43,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
             MountedPerformanceProbe.definition(),
             MountedFuseWriteBaseline.definition(),
+            MountedFuseUploadBacklogReadRegression.definition(),
         ]
     })
 }
@@ -140,6 +141,10 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_FUSE_WRITE_BASELINE | "fuse-write-baseline" | "sfs-469" | "98" => {
             Some(Box::new(MountedFuseWriteBaseline))
         }
+        MOUNTED_FUSE_UPLOAD_BACKLOG_READ_REGRESSION
+        | "fuse-upload-backlog-read-regression"
+        | "sfs-531"
+        | "531" => Some(Box::new(MountedFuseUploadBacklogReadRegression)),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,

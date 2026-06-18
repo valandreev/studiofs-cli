@@ -141,6 +141,24 @@ The kernel cache policy must define:
 - partial-cache controls for sparse files and range reads;
 - direct-I/O and async-DIO opt-in behavior for benchmark profiles.
 
+Bridge-owned metadata and local-cache state must be invalidated explicitly when
+the bridge observes mutations that can change namespace visibility, file size,
+or content identity. Successful `create` and `mkdir` invalidate both the parent
+directory state and the new inode state before the reply is returned.
+Successful `unlink`, `rmdir`, and `rename` invalidate the affected parent
+directory state; `rename` invalidates both source and destination parents.
+Successful write/overwrite and size-changing `setattr`/truncate invalidate the
+inode state before later reads can use a previously trusted local-cache range.
+Remote refresh is represented by the VFS invalidation generation attached to
+local-cache read ranges; if that generation differs from the bridge-owned
+trusted open state, the native bridge must reject the optimized range and fall
+back to a bytes read. These invalidations are bridge hints layered on top of
+StudioFS VFS authority: missing a hint must degrade to conservative cached/bytes
+fallback, never stale kernel page reuse.
+Negative lookup replies should use a conservative negative-entry TTL so repeated
+misses do not require a userspace round trip while create/rename invalidation
+can still make a new child visible promptly.
+
 ### SFS-528 Page-Cache Policy
 
 SFS-528 makes the native Linux page-cache decision an explicit `cache_policy`
@@ -156,7 +174,7 @@ The initial decision table is:
 |---|---|---|
 | Read-only open, local materialization is present, content epoch/size/mtime match the last trusted kernel-cache state, and invalidation generation is unchanged | `KEEP_CACHE` | `Keep` |
 | Content epoch, size, mtime, or invalidation generation changed after a previously trusted cache generation | `InvalidateThenCached` | `StalePrevented` |
-| Active writer state or dirty state exists for the inode | `FOPEN_DIRECT_IO` | `WriterBarrier` |
+| Active writer state or dirty state exists for the inode | `InvalidateThenCached` | `WriterBarrier` |
 | Local materialization was evicted for the trusted generation | `InvalidateThenCached` | `LocalCacheEvicted` |
 | No trusted kernel-cache generation is available | normal cached I/O | `Cached` |
 
@@ -170,11 +188,13 @@ still drive explicit invalidation before stale kernel pages can be reused.
 until separate correctness tests cover read-after-write, fsync, flush, release,
 truncate, and remote-invalidation interactions for that profile.
 
-Metrics must expose why every native Linux open/read path kept, invalidated,
-used direct I/O, or fell back to normal cached I/O. The minimum reason surface is
-`Keep`, `Cached`, `StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted`.
-Those counters are the benchmark and debugging vocabulary for cache/coherency
-decisions.
+Metrics must expose why every native Linux open/read path kept, invalidated, or
+fell back to normal cached I/O. The minimum reason surface is `Keep`, `Cached`,
+`StalePrevented`, `WriterBarrier`, and `LocalCacheEvicted`. Those counters are
+the benchmark and debugging vocabulary for cache/coherency decisions. The
+writer-barrier path is performance-first: it drops potentially stale pages and
+returns to buffered cached I/O instead of making dirty or upload-backlog reads
+use per-handle direct I/O.
 
 ### SFS-529 Local-Cache Read Path
 
@@ -232,6 +252,40 @@ The first native Linux rollout must be performance-led. Every transport profile
 should emit enough telemetry to explain throughput, latency distribution, CPU
 cost, context switching, queue saturation, cache hit rate, copy count, fallback
 rate, and shutdown behavior with pending work.
+
+The native bridge telemetry surface for SFS-531 includes:
+
+- lookup/getattr/readdir/readdirplus metadata operation counts and aggregate
+  metadata-op count;
+- read/write/open/release operation counts;
+- lookup/getattr and open/release ratios, scaled as integer micro-ratios for
+  stable diagnostics export;
+- total FUSE operations, FUSE operations per application read/write, and
+  metadata operations per opened file, scaled as integer micro-ratios so random
+  read/write and metadata-probe amplification can be compared across benchmark
+  phases;
+- per-opcode bounded latency snapshots with total, max, p95, and p99
+  nanoseconds for lookup, getattr, readdir, readdirplus, open, release, read,
+  and write;
+- local-cache read hit/fallback counters and bytes returned;
+- stale content-epoch and stale invalidation-generation fallback counters for
+  explaining remote refresh or mutation-driven local-cache range rejection;
+- read-ahead prefetch count, suppressed/no-prefetch count, and prefetch
+  amplification bytes so sparse-random reads can prove they avoided readahead
+  amplification.
+
+Mounted benchmark reports should consume those counters rather than infer
+causes from throughput alone. Unit tests can verify the counter semantics and
+cache-invalidation rules locally; same-host fio/material performance acceptance
+remains an operator-run gate because raw disk baseline and mount privileges vary
+by host.
+
+The native dispatcher separates operation classes into dedicated metadata,
+read, write, barrier, and background queues with independently configurable
+worker counts and queue capacities. This keeps small/random metadata and data
+operations from sharing one FIFO with long sequential operations or release
+barriers, while still preserving per-handle write ordering inside the VFS
+adapter where coherence requires it.
 
 Minimum benchmark gates:
 

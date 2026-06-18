@@ -75,14 +75,15 @@ pub use metrics::{
     VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
     VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
     VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
-    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsNamespaceCacheSnapshot, VfsNativeBridgeSnapshot, VfsNativeLatencySnapshot,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2533,6 +2534,7 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            native_bridge_snapshot: Mutex::new(VfsNativeBridgeSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2566,6 +2568,7 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    native_bridge_snapshot: Mutex<VfsNativeBridgeSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -7025,6 +7028,11 @@ impl StudioVfs {
         *self.state.fuse_async_read_snapshot.lock() = snapshot;
     }
 
+    /// Replace the latest native Linux bridge diagnostics snapshot.
+    pub fn record_native_bridge_snapshot(&self, snapshot: VfsNativeBridgeSnapshot) {
+        *self.state.native_bridge_snapshot.lock() = snapshot;
+    }
+
     fn apply_fuse_async_write_reset_baseline(
         mut snapshot: VfsFuseAsyncWriteSnapshot,
         baseline: &VfsFuseAsyncWriteSnapshot,
@@ -7831,6 +7839,7 @@ impl StudioVfs {
             },
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
+            native_bridge: self.state.native_bridge_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,

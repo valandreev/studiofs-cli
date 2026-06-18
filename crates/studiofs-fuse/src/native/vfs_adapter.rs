@@ -6,11 +6,14 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, vfs_err_to_errno};
 use studiofs_meta::{DirEntry, FileType, InodeAttr};
 use studiofs_vfs::{
     LocalSyncPolicy, OpenFlags, SetattrArgs, StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot,
+    VfsNativeBridgeSnapshot, VfsNativeLatencySnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::warn;
@@ -23,8 +26,9 @@ use crate::fs::pending_write_tracker::{
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::cache_policy::{
     NativeInodeCacheState, NativeOpenCacheAction, NativeOpenCacheDecision, NativeOpenCacheMetrics,
-    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadPolicy,
-    NativeReadAheadState, decide_native_open_cache, decide_native_read_ahead,
+    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadDecision,
+    NativeReadAheadPolicy, NativeReadAheadState, decide_native_open_cache,
+    decide_native_read_ahead,
 };
 use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
@@ -86,6 +90,12 @@ pub struct NativeAttr {
     pub uid: u32,
     /// Owner group ID.
     pub gid: u32,
+    /// Access time in nanoseconds since Unix epoch.
+    pub atime_ns: u64,
+    /// Modification time in nanoseconds since Unix epoch.
+    pub mtime_ns: u64,
+    /// Change time in nanoseconds since Unix epoch.
+    pub ctime_ns: u64,
 }
 
 /// Directory entry used by the native bridge before FUSE dirent encoding.
@@ -184,6 +194,14 @@ pub trait NativeVfs {
 
     /// Record native async write admission and barrier telemetry.
     fn record_async_write_snapshot(&self, _snapshot: NativeAsyncWriteSnapshot) {}
+
+    /// Record native Linux bridge amplification and sparse-read telemetry.
+    fn record_native_bridge_snapshot(
+        &self,
+        _amplification: NativeAmplificationMetricsSnapshot,
+        _read: NativeReadMetricsSnapshot,
+    ) {
+    }
 
     /// Run a native async write job without blocking the FUSE callback thread.
     fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
@@ -294,6 +312,14 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn record_async_write_snapshot(&self, snapshot: NativeAsyncWriteSnapshot) {
         (**self).record_async_write_snapshot(snapshot);
+    }
+
+    fn record_native_bridge_snapshot(
+        &self,
+        amplification: NativeAmplificationMetricsSnapshot,
+        read: NativeReadMetricsSnapshot,
+    ) {
+        (**self).record_native_bridge_snapshot(amplification, read);
     }
 
     fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
@@ -468,11 +494,12 @@ impl NativeVfs for StudioVfsNativeAdapter {
             return Ok(None);
         };
         let len = u32::try_from(range.payload.len()).map_err(|_| libc::EOVERFLOW)?;
-        NativeLocalCacheReadRange::try_dup(
+        NativeLocalCacheReadRange::try_dup_with_generation(
             range.payload.file().as_raw_fd(),
             range.payload.file_offset(),
             len,
             range.content_epoch,
+            range.invalidation_generation,
         )
         .map(Some)
         .map_err(|error| {
@@ -526,6 +553,15 @@ impl NativeVfs for StudioVfsNativeAdapter {
                 barrier_wait_total_ms: snapshot.barrier_wait_total_ms,
                 ..Default::default()
             });
+    }
+
+    fn record_native_bridge_snapshot(
+        &self,
+        amplification: NativeAmplificationMetricsSnapshot,
+        read: NativeReadMetricsSnapshot,
+    ) {
+        self.vfs
+            .record_native_bridge_snapshot(vfs_native_bridge_snapshot(amplification, read));
     }
 
     fn spawn_native_async_write_job<J>(&self, turn: NativeAsyncWriteTurn, job: J)
@@ -662,10 +698,13 @@ pub struct LinuxNativeBridge<V> {
     pending_writes: PendingWriteTracker,
     lookup_counts: NativeLookupCountStore,
     open_cache_metrics: NativeOpenCacheMetrics,
+    amplification_metrics: NativeAmplificationMetrics,
     read_metrics: NativeReadMetrics,
+    native_bridge_snapshot_started_at: Instant,
+    native_bridge_snapshot_last_elapsed_ms: AtomicU64,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     read_ahead_policy: NativeReadAheadPolicy,
-    read_ahead_states: Mutex<HashMap<u64, NativeReadAheadState>>,
+    read_ahead_states: NativeReadAheadStateStore,
 }
 
 /// Native Linux async write admission and telemetry profile.
@@ -773,8 +812,460 @@ struct NativeReadMetrics {
     local_cache_hits: AtomicU64,
     local_cache_unavailable_fallbacks: AtomicU64,
     stale_epoch_fallbacks: AtomicU64,
+    stale_generation_fallbacks: AtomicU64,
     bytes_fallbacks: AtomicU64,
     bytes_returned: AtomicU64,
+    read_ahead_prefetches: AtomicU64,
+    read_ahead_suppressed: AtomicU64,
+    read_ahead_amplification_bytes: AtomicU64,
+}
+
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct NativeAmplificationMetrics {
+    lookup_ops: AtomicU64,
+    getattr_ops: AtomicU64,
+    readdir_ops: AtomicU64,
+    readdirplus_ops: AtomicU64,
+    open_ops: AtomicU64,
+    release_ops: AtomicU64,
+    read_ops: AtomicU64,
+    write_ops: AtomicU64,
+    lookup_latency: NativeLatencyMetrics,
+    getattr_latency: NativeLatencyMetrics,
+    readdir_latency: NativeLatencyMetrics,
+    readdirplus_latency: NativeLatencyMetrics,
+    open_latency: NativeLatencyMetrics,
+    release_latency: NativeLatencyMetrics,
+    read_latency: NativeLatencyMetrics,
+    write_latency: NativeLatencyMetrics,
+}
+
+const NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
+const NATIVE_LATENCY_BUCKET_BOUNDS_NS: [u64; 18] = [
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    u64::MAX,
+];
+
+#[repr(align(64))]
+#[derive(Debug)]
+struct NativeLatencyMetrics {
+    samples: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()],
+}
+
+impl Default for NativeLatencyMetrics {
+    fn default() -> Self {
+        Self {
+            samples: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeReadAheadStateStore {
+    shards: [Mutex<NativeReadAheadStateShard>; Self::SHARD_COUNT],
+}
+
+type NativeReadAheadHandles = SmallVec<[u64; 4]>;
+
+impl Default for NativeReadAheadStateStore {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(NativeReadAheadStateShard::default())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeReadAheadStateShard {
+    states: HashMap<u64, NativeReadAheadState>,
+    inode_by_fh: HashMap<u64, u64>,
+    fhs_by_inode: HashMap<u64, NativeReadAheadHandles>,
+}
+
+impl NativeReadAheadStateStore {
+    const SHARD_COUNT: usize = 64;
+
+    fn shard_index(ino: u64) -> usize {
+        (ino as usize) % Self::SHARD_COUNT
+    }
+
+    fn observe(
+        &self,
+        policy: &NativeReadAheadPolicy,
+        fh: u64,
+        ino: u64,
+        offset: u64,
+        size: u64,
+        file_size: u64,
+    ) -> NativeReadAheadDecision {
+        let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
+        shard.track_handle_inode(fh, ino);
+        let state = shard.states.entry(fh).or_default();
+        decide_native_read_ahead(policy, state, offset, size, file_size)
+    }
+
+    fn invalidate_inodes(&self, inodes: &[u64]) {
+        for &ino in inodes {
+            let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
+            let Some(fhs) = shard.fhs_by_inode.remove(&ino) else {
+                continue;
+            };
+            for fh in fhs {
+                shard.states.remove(&fh);
+                shard.inode_by_fh.remove(&fh);
+            }
+        }
+    }
+
+    fn remove_handle(&self, ino: u64, fh: u64) {
+        let mut shard = lock_or_recover(self.shard(ino), "native_read_ahead_state_shard");
+        shard.remove_handle(fh);
+    }
+
+    #[cfg(test)]
+    fn contains_handle(&self, ino: u64, fh: u64) -> bool {
+        lock_or_recover(self.shard(ino), "native_read_ahead_state_shard")
+            .states
+            .contains_key(&fh)
+    }
+
+    #[cfg(test)]
+    fn inode_for_handle(&self, ino: u64, fh: u64) -> Option<u64> {
+        lock_or_recover(self.shard(ino), "native_read_ahead_state_shard")
+            .inode_by_fh
+            .get(&fh)
+            .copied()
+    }
+
+    fn shard(&self, ino: u64) -> &Mutex<NativeReadAheadStateShard> {
+        &self.shards[Self::shard_index(ino)]
+    }
+}
+
+impl NativeReadAheadStateShard {
+    fn track_handle_inode(&mut self, fh: u64, ino: u64) {
+        let previous_ino = self.inode_by_fh.insert(fh, ino);
+        if previous_ino == Some(ino) {
+            return;
+        }
+        if let Some(previous_ino) = previous_ino {
+            self.states.remove(&fh);
+            if let Some(fhs) = self.fhs_by_inode.get_mut(&previous_ino) {
+                remove_read_ahead_handle(fhs, fh);
+                if fhs.is_empty() {
+                    self.fhs_by_inode.remove(&previous_ino);
+                }
+            }
+        }
+        insert_read_ahead_handle(self.fhs_by_inode.entry(ino).or_default(), fh);
+    }
+
+    fn remove_handle(&mut self, fh: u64) {
+        self.states.remove(&fh);
+        let Some(ino) = self.inode_by_fh.remove(&fh) else {
+            return;
+        };
+        if let Some(fhs) = self.fhs_by_inode.get_mut(&ino) {
+            remove_read_ahead_handle(fhs, fh);
+            if fhs.is_empty() {
+                self.fhs_by_inode.remove(&ino);
+            }
+        }
+    }
+}
+
+fn insert_read_ahead_handle(handles: &mut NativeReadAheadHandles, fh: u64) {
+    if !handles.contains(&fh) {
+        handles.push(fh);
+    }
+}
+
+fn remove_read_ahead_handle(handles: &mut NativeReadAheadHandles, fh: u64) {
+    if let Some(index) = handles.iter().position(|stored_fh| *stored_fh == fh) {
+        handles.swap_remove(index);
+    }
+}
+
+/// Point-in-time latency statistics for one native Linux opcode family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeLatencyMetricsSnapshot {
+    /// Number of sampled operations.
+    pub samples: u64,
+    /// Total observed latency in nanoseconds.
+    pub total_ns: u64,
+    /// Maximum observed latency in nanoseconds.
+    pub max_ns: u64,
+    /// 95th percentile latency in nanoseconds.
+    pub p95_ns: u64,
+    /// 99th percentile latency in nanoseconds.
+    pub p99_ns: u64,
+}
+
+/// Snapshot of Linux native metadata and application I/O amplification counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeAmplificationMetricsSnapshot {
+    /// Total FUSE operations included in amplification telemetry.
+    pub fuse_ops: u64,
+    /// Metadata probe operations handled by this bridge.
+    pub metadata_ops: u64,
+    /// Lookup operations handled by this bridge.
+    pub lookup_ops: u64,
+    /// Getattr operations handled by this bridge.
+    pub getattr_ops: u64,
+    /// Readdir operations handled by this bridge.
+    pub readdir_ops: u64,
+    /// Readdirplus operations handled by this bridge.
+    pub readdirplus_ops: u64,
+    /// File open operations handled by this bridge.
+    pub open_ops: u64,
+    /// File release operations handled by this bridge.
+    pub release_ops: u64,
+    /// Application read operations handled by this bridge.
+    pub read_ops: u64,
+    /// Application write operations handled by this bridge.
+    pub write_ops: u64,
+    /// Lookup/getattr ratio scaled by 1,000,000 for integer telemetry export.
+    pub lookup_getattr_ratio_micros: u64,
+    /// Open/release ratio scaled by 1,000,000 for integer telemetry export.
+    pub open_release_ratio_micros: u64,
+    /// Total FUSE operations per application read/write, scaled by 1,000,000.
+    pub fuse_ops_per_read_write_micros: u64,
+    /// Metadata operations per file open, scaled by 1,000,000.
+    pub metadata_ops_per_open_micros: u64,
+    /// Lookup latency statistics.
+    pub lookup_latency: NativeLatencyMetricsSnapshot,
+    /// Getattr latency statistics.
+    pub getattr_latency: NativeLatencyMetricsSnapshot,
+    /// Readdir latency statistics.
+    pub readdir_latency: NativeLatencyMetricsSnapshot,
+    /// Readdirplus latency statistics.
+    pub readdirplus_latency: NativeLatencyMetricsSnapshot,
+    /// Open latency statistics.
+    pub open_latency: NativeLatencyMetricsSnapshot,
+    /// Release latency statistics.
+    pub release_latency: NativeLatencyMetricsSnapshot,
+    /// Read latency statistics.
+    pub read_latency: NativeLatencyMetricsSnapshot,
+    /// Write latency statistics.
+    pub write_latency: NativeLatencyMetricsSnapshot,
+    /// Total metadata latency across lookup/getattr/readdir/readdirplus.
+    pub metadata_latency_total_ns: u64,
+}
+
+impl NativeAmplificationMetrics {
+    fn record_lookup(&self, latency_ns: u64) {
+        self.lookup_ops.fetch_add(1, Ordering::Relaxed);
+        self.lookup_latency.record(latency_ns);
+    }
+
+    fn record_getattr(&self, latency_ns: u64) {
+        self.getattr_ops.fetch_add(1, Ordering::Relaxed);
+        self.getattr_latency.record(latency_ns);
+    }
+
+    fn record_readdir(&self, latency_ns: u64) {
+        self.readdir_ops.fetch_add(1, Ordering::Relaxed);
+        self.readdir_latency.record(latency_ns);
+    }
+
+    fn record_readdirplus(&self, latency_ns: u64) {
+        self.readdirplus_ops.fetch_add(1, Ordering::Relaxed);
+        self.readdirplus_latency.record(latency_ns);
+    }
+
+    fn record_open(&self, latency_ns: u64) {
+        self.open_ops.fetch_add(1, Ordering::Relaxed);
+        self.open_latency.record(latency_ns);
+    }
+
+    fn record_release(&self, latency_ns: u64) {
+        self.release_ops.fetch_add(1, Ordering::Relaxed);
+        self.release_latency.record(latency_ns);
+    }
+
+    fn record_read(&self, latency_ns: u64) {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
+        self.read_latency.record(latency_ns);
+    }
+
+    fn record_write(&self, latency_ns: u64) {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.write_latency.record(latency_ns);
+    }
+
+    fn snapshot(&self) -> NativeAmplificationMetricsSnapshot {
+        let lookup_ops = self.lookup_ops.load(Ordering::Relaxed);
+        let getattr_ops = self.getattr_ops.load(Ordering::Relaxed);
+        let readdir_ops = self.readdir_ops.load(Ordering::Relaxed);
+        let readdirplus_ops = self.readdirplus_ops.load(Ordering::Relaxed);
+        let open_ops = self.open_ops.load(Ordering::Relaxed);
+        let release_ops = self.release_ops.load(Ordering::Relaxed);
+        let read_ops = self.read_ops.load(Ordering::Relaxed);
+        let write_ops = self.write_ops.load(Ordering::Relaxed);
+        let metadata_ops = lookup_ops + getattr_ops + readdir_ops + readdirplus_ops;
+        let fuse_ops = metadata_ops + open_ops + release_ops + read_ops + write_ops;
+        let application_io_ops = read_ops + write_ops;
+        let lookup_latency = self.lookup_latency.snapshot();
+        let getattr_latency = self.getattr_latency.snapshot();
+        let readdir_latency = self.readdir_latency.snapshot();
+        let readdirplus_latency = self.readdirplus_latency.snapshot();
+        let open_latency = self.open_latency.snapshot();
+        let release_latency = self.release_latency.snapshot();
+        let read_latency = self.read_latency.snapshot();
+        let write_latency = self.write_latency.snapshot();
+        NativeAmplificationMetricsSnapshot {
+            fuse_ops,
+            metadata_ops,
+            lookup_ops,
+            getattr_ops,
+            readdir_ops,
+            readdirplus_ops,
+            open_ops,
+            release_ops,
+            read_ops,
+            write_ops,
+            lookup_getattr_ratio_micros: scaled_ratio_micros(lookup_ops, getattr_ops),
+            open_release_ratio_micros: scaled_ratio_micros(open_ops, release_ops),
+            fuse_ops_per_read_write_micros: scaled_ratio_micros(fuse_ops, application_io_ops),
+            metadata_ops_per_open_micros: scaled_ratio_micros(metadata_ops, open_ops),
+            lookup_latency,
+            getattr_latency,
+            readdir_latency,
+            readdirplus_latency,
+            open_latency,
+            release_latency,
+            read_latency,
+            write_latency,
+            metadata_latency_total_ns: lookup_latency
+                .total_ns
+                .saturating_add(getattr_latency.total_ns)
+                .saturating_add(readdir_latency.total_ns)
+                .saturating_add(readdirplus_latency.total_ns),
+        }
+    }
+}
+
+impl NativeLatencyMetrics {
+    fn record(&self, latency_ns: u64) {
+        let latency_ns = latency_ns.max(1);
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(latency_ns, Ordering::Relaxed);
+        self.buckets[native_latency_bucket_index(latency_ns)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> NativeLatencyMetricsSnapshot {
+        let buckets = self.bucket_counts();
+        let samples = self.samples.load(Ordering::Relaxed);
+        NativeLatencyMetricsSnapshot {
+            samples,
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+            p95_ns: percentile_from_buckets(&buckets, samples, 95),
+            p99_ns: percentile_from_buckets(&buckets, samples, 99),
+        }
+    }
+
+    fn bucket_counts(&self) -> [u64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()] {
+        std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed))
+    }
+}
+
+fn native_latency_bucket_index(latency_ns: u64) -> usize {
+    // The bucket table is intentionally tiny; linear search avoids extra branchy
+    // machinery and keeps the hot-path choice obvious.
+    NATIVE_LATENCY_BUCKET_BOUNDS_NS
+        .iter()
+        .position(|bound| latency_ns <= *bound)
+        .unwrap_or(NATIVE_LATENCY_BUCKET_BOUNDS_NS.len() - 1)
+}
+
+fn percentile_from_buckets(
+    buckets: &[u64; NATIVE_LATENCY_BUCKET_BOUNDS_NS.len()],
+    samples: u64,
+    percentile: u64,
+) -> u64 {
+    if samples == 0 {
+        return 0;
+    }
+    let rank = samples
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .saturating_sub(1);
+    let mut seen = 0_u64;
+    for (index, count) in buckets.iter().enumerate() {
+        seen = seen.saturating_add(*count);
+        if seen > rank {
+            return NATIVE_LATENCY_BUCKET_BOUNDS_NS[index];
+        }
+    }
+    NATIVE_LATENCY_BUCKET_BOUNDS_NS[NATIVE_LATENCY_BUCKET_BOUNDS_NS.len() - 1]
+}
+
+fn elapsed_latency_ns(started_at: Instant) -> u64 {
+    started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn scaled_ratio_micros(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator.saturating_mul(1_000_000) / denominator
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeFuseMetric {
+    Lookup,
+    Getattr,
+    Readdir,
+    Readdirplus,
+    Open,
+    Release,
+    Read,
+    Write,
+}
+
+struct NativeFuseMetricsGuard<'a, V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
+    bridge: &'a LinuxNativeBridge<V>,
+    metric: NativeFuseMetric,
+    started_at: Instant,
+}
+
+impl<V> Drop for NativeFuseMetricsGuard<'_, V>
+where
+    V: NativeVfs + Clone + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.bridge
+            .record_native_fuse_metric(self.metric, elapsed_latency_ns(self.started_at));
+    }
 }
 
 /// Snapshot of native Linux read path counters.
@@ -786,10 +1277,18 @@ pub struct NativeReadMetricsSnapshot {
     pub local_cache_unavailable_fallbacks: u64,
     /// Reads that rejected a local-cache range because its epoch was stale.
     pub stale_epoch_fallbacks: u64,
+    /// Reads that rejected a local-cache range because its invalidation generation was stale.
+    pub stale_generation_fallbacks: u64,
     /// Reads served through the safe bytes fallback.
     pub bytes_fallbacks: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
+    /// Read-ahead decisions that issued a prefetch hint.
+    pub read_ahead_prefetches: u64,
+    /// Read-ahead decisions that intentionally avoided prefetch.
+    pub read_ahead_suppressed: u64,
+    /// Bytes requested beyond application reads by read-ahead decisions.
+    pub read_ahead_amplification_bytes: u64,
 }
 
 impl NativeReadMetrics {
@@ -800,8 +1299,14 @@ impl NativeReadMetrics {
                 .local_cache_unavailable_fallbacks
                 .load(Ordering::Relaxed),
             stale_epoch_fallbacks: self.stale_epoch_fallbacks.load(Ordering::Relaxed),
+            stale_generation_fallbacks: self.stale_generation_fallbacks.load(Ordering::Relaxed),
             bytes_fallbacks: self.bytes_fallbacks.load(Ordering::Relaxed),
             bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
+            read_ahead_prefetches: self.read_ahead_prefetches.load(Ordering::Relaxed),
+            read_ahead_suppressed: self.read_ahead_suppressed.load(Ordering::Relaxed),
+            read_ahead_amplification_bytes: self
+                .read_ahead_amplification_bytes
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -816,14 +1321,19 @@ impl<V> LinuxNativeBridge<V> {
             pending_writes: PendingWriteTracker::default(),
             lookup_counts: NativeLookupCountStore::default(),
             open_cache_metrics: NativeOpenCacheMetrics::default(),
+            amplification_metrics: NativeAmplificationMetrics::default(),
             read_metrics: NativeReadMetrics::default(),
+            native_bridge_snapshot_started_at: Instant::now(),
+            native_bridge_snapshot_last_elapsed_ms: AtomicU64::new(
+                NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED,
+            ),
             trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
             read_ahead_policy: NativeReadAheadPolicy {
                 max_prefetch_bytes: 1024 * 1024,
                 sequential_window_bytes: 128 * 1024,
                 min_sequential_reads: 2,
             },
-            read_ahead_states: Mutex::new(HashMap::new()),
+            read_ahead_states: NativeReadAheadStateStore::default(),
         }
     }
 
@@ -846,6 +1356,11 @@ impl<V> LinuxNativeBridge<V> {
     /// Snapshot native Linux open cache policy metrics.
     pub fn open_cache_metrics_snapshot(&self) -> NativeOpenCacheMetricsSnapshot {
         self.open_cache_metrics.snapshot()
+    }
+
+    /// Snapshot native Linux metadata and I/O amplification counters.
+    pub fn amplification_metrics_snapshot(&self) -> NativeAmplificationMetricsSnapshot {
+        self.amplification_metrics.snapshot()
     }
 
     /// Snapshot native Linux read path metrics.
@@ -898,7 +1413,32 @@ impl<V> LinuxNativeBridge<V>
 where
     V: NativeVfs + Clone + Send + 'static,
 {
+    fn metrics_guard(&self, metric: NativeFuseMetric) -> NativeFuseMetricsGuard<'_, V> {
+        NativeFuseMetricsGuard {
+            bridge: self,
+            metric,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn record_native_fuse_metric(&self, metric: NativeFuseMetric, latency_ns: u64) {
+        match metric {
+            NativeFuseMetric::Lookup => self.amplification_metrics.record_lookup(latency_ns),
+            NativeFuseMetric::Getattr => self.amplification_metrics.record_getattr(latency_ns),
+            NativeFuseMetric::Readdir => self.amplification_metrics.record_readdir(latency_ns),
+            NativeFuseMetric::Readdirplus => {
+                self.amplification_metrics.record_readdirplus(latency_ns);
+            }
+            NativeFuseMetric::Open => self.amplification_metrics.record_open(latency_ns),
+            NativeFuseMetric::Release => self.amplification_metrics.record_release(latency_ns),
+            NativeFuseMetric::Read => self.amplification_metrics.record_read(latency_ns),
+            NativeFuseMetric::Write => self.amplification_metrics.record_write(latency_ns),
+        }
+        self.publish_native_bridge_snapshot_if_due();
+    }
+
     fn handle_lookup(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Lookup);
         let name = match lookup_name(&request.payload) {
             Some(name) => name,
             None => return invalid_request(request.header.unique),
@@ -912,6 +1452,10 @@ where
                     ok_reply(request.header.unique, &entry_payload(attr)),
                 )
             }
+            Err(libc::ENOENT) => FuseReply::contiguous(
+                request.header.unique,
+                ok_reply(request.header.unique, negative_entry_payload()),
+            ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -924,6 +1468,7 @@ where
     }
 
     fn handle_getattr(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Getattr);
         match self.vfs.getattr(request.header.nodeid) {
             Ok(attr) => FuseReply::contiguous(
                 request.header.unique,
@@ -934,6 +1479,7 @@ where
     }
 
     fn handle_open(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Open);
         let flags = match open_flags(&request.payload) {
             Some(flags) => flags,
             None => return invalid_request(request.header.unique),
@@ -956,6 +1502,7 @@ where
     }
 
     fn handle_release(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Release);
         let fh = match release_fh(&request.payload) {
             Some(fh) => fh,
             None => return invalid_request(request.header.unique),
@@ -971,14 +1518,17 @@ where
             }
             let release_result = self.vfs.release(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
-            return empty_barrier_reply(request.header.unique, pending_result, release_result);
+            self.forget_read_ahead_handle(request.header.nodeid, fh);
+            let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
+            return reply;
         }
 
         self.barrier_gates
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
-        match self.vfs.release(fh) {
+        let release_result = self.vfs.release(fh);
+        self.forget_read_ahead_handle(request.header.nodeid, fh);
+        match release_result {
             Ok(()) => {
-                lock_or_recover(&self.read_ahead_states, "native_read_ahead_states").remove(&fh);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -986,6 +1536,7 @@ where
     }
 
     fn handle_read(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Read);
         let read = match read_request(&request.payload) {
             Some(read) => read,
             None => return invalid_request(request.header.unique),
@@ -1035,6 +1586,11 @@ where
                             .stale_epoch_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    LocalCacheReadRangeDecision::StaleGeneration => {
+                        self.read_metrics
+                            .stale_generation_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     LocalCacheReadRangeDecision::Unsafe => {}
                 }
             }
@@ -1043,7 +1599,9 @@ where
                     .local_cache_unavailable_fallbacks
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Err(errno) => return errno_reply(request.header.unique, errno),
+            Err(errno) => {
+                return errno_reply(request.header.unique, errno);
+            }
         }
 
         match self
@@ -1064,18 +1622,20 @@ where
     }
 
     fn handle_write(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Write);
         let write = match write_request(&request.payload) {
             Some(write) => write,
             None => return invalid_request(request.header.unique),
         };
 
         if let Some(config) = &self.async_write {
-            return self.handle_async_write(
+            let reply = self.handle_async_write(
                 request.header.unique,
                 request.header.nodeid,
                 write,
                 config,
             );
+            return reply;
         }
 
         let _pending_write = self
@@ -1088,10 +1648,13 @@ where
             write.data,
             write.flags,
         ) {
-            Ok(size) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(request.header.unique, &write_payload(size)),
-            ),
+            Ok(size) => {
+                self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid]);
+                FuseReply::contiguous(
+                    request.header.unique,
+                    ok_reply(request.header.unique, &write_payload(size)),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -1117,6 +1680,7 @@ where
             }
         };
         self.publish_async_write_snapshot();
+        self.invalidate_metadata_cache_for_mutation(&[ino]);
         let mut registration = registration;
         let turn = NativeAsyncWriteTurn::new(registration.turn_waiter());
         let data = write.data.to_vec();
@@ -1230,6 +1794,7 @@ where
     }
 
     fn handle_readdir(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Readdir);
         let readdir = match read_request(&request.payload) {
             Some(readdir) => readdir,
             None => return invalid_request(request.header.unique),
@@ -1249,6 +1814,7 @@ where
     }
 
     fn handle_readdirplus(&self, request: FuseRequest) -> FuseReply {
+        let _metrics = self.metrics_guard(NativeFuseMetric::Readdirplus);
         let readdir = match read_request(&request.payload) {
             Some(readdir) => readdir,
             None => return invalid_request(request.header.unique),
@@ -1265,7 +1831,9 @@ where
                         self.add_lookup(ino, 1);
                     }) {
                         Ok(payload) => payload,
-                        Err(errno) => return errno_reply(request.header.unique, errno),
+                        Err(errno) => {
+                            return errno_reply(request.header.unique, errno);
+                        }
                     };
                 FuseReply::segmented_data(request.header.unique, payload)
             }
@@ -1296,6 +1864,7 @@ where
             mkdir.mode,
         ) {
             Ok(attr) => {
+                self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid, attr.ino]);
                 self.add_lookup(attr.ino, 1);
                 FuseReply::contiguous(
                     request.header.unique,
@@ -1321,6 +1890,7 @@ where
             create.flags,
         ) {
             Ok((attr, fh)) => {
+                self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid, attr.ino]);
                 self.add_lookup(attr.ino, 1);
                 let decision = self.open_cache_decision(
                     attr.ino,
@@ -1344,6 +1914,7 @@ where
 
         match self.vfs.unlink(request.header.nodeid, name) {
             Ok(()) => {
+                self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid]);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -1358,6 +1929,7 @@ where
 
         match self.vfs.rmdir(request.header.nodeid, name) {
             Ok(()) => {
+                self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid]);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -1377,6 +1949,10 @@ where
             rename.new_name,
         ) {
             Ok(()) => {
+                self.invalidate_metadata_cache_for_mutation(&[
+                    request.header.nodeid,
+                    rename.new_parent,
+                ]);
                 FuseReply::contiguous(request.header.unique, ok_reply(request.header.unique, &[]))
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -1424,10 +2000,15 @@ where
         };
 
         match result {
-            Ok(attr) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(request.header.unique, &attr_out_payload(attr)),
-            ),
+            Ok(attr) => {
+                if setattr.size.is_some() {
+                    self.invalidate_metadata_cache_for_mutation(&[request.header.nodeid]);
+                }
+                FuseReply::contiguous(
+                    request.header.unique,
+                    ok_reply(request.header.unique, &attr_out_payload(attr)),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -1487,6 +2068,17 @@ where
         self.trusted_open_cache_states.insert(ino, state.clone());
     }
 
+    fn invalidate_metadata_cache_for_mutation(&self, inodes: &[u64]) {
+        for &ino in inodes {
+            self.trusted_open_cache_states.remove(ino);
+        }
+        self.read_ahead_states.invalidate_inodes(inodes);
+    }
+
+    fn forget_read_ahead_handle(&self, ino: u64, fh: u64) {
+        self.read_ahead_states.remove_handle(ino, fh);
+    }
+
     fn trusted_local_cache_read_range(
         &self,
         ino: u64,
@@ -1497,9 +2089,14 @@ where
             return LocalCacheReadRangeDecision::Unsafe;
         };
         let range_is_current = range.content_epoch == state.content_epoch;
+        let range_generation_is_current =
+            range.invalidation_generation == state.invalidation_generation;
         let range_is_bounded = range.len <= requested_size;
         if !range_is_current {
             return LocalCacheReadRangeDecision::StaleEpoch;
+        }
+        if !range_generation_is_current {
+            return LocalCacheReadRangeDecision::StaleGeneration;
         }
         if state.local_materialized && !state.writer_active && !state.dirty && range_is_bounded {
             LocalCacheReadRangeDecision::Trusted(range)
@@ -1516,20 +2113,26 @@ where
             return;
         }
 
-        let decision = {
-            let mut states = lock_or_recover(&self.read_ahead_states, "native_read_ahead_states");
-            let state = states.entry(read.fh).or_default();
-            decide_native_read_ahead(
-                &self.read_ahead_policy,
-                state,
-                read.offset,
-                u64::from(read.size),
-                cache_state.size,
-            )
-        };
+        let decision = self.read_ahead_states.observe(
+            &self.read_ahead_policy,
+            read.fh,
+            ino,
+            read.offset,
+            u64::from(read.size),
+            cache_state.size,
+        );
         let Some(prefetch) = decision.prefetch else {
+            self.read_metrics
+                .read_ahead_suppressed
+                .fetch_add(1, Ordering::Relaxed);
             return;
         };
+        self.read_metrics
+            .read_ahead_prefetches
+            .fetch_add(1, Ordering::Relaxed);
+        self.read_metrics
+            .read_ahead_amplification_bytes
+            .fetch_add(decision.read_amplification_bytes, Ordering::Relaxed);
         if let Err(errno) = self
             .vfs
             .advise_read_ahead(read.fh, ino, prefetch.offset, prefetch.len)
@@ -1552,12 +2155,52 @@ where
         self.vfs
             .record_async_write_snapshot(native_async_write_snapshot(&self.pending_writes, config));
     }
+
+    fn publish_native_bridge_snapshot_if_due(&self) {
+        let elapsed_ms = self
+            .native_bridge_snapshot_started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let interval_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+
+        let mut last = self
+            .native_bridge_snapshot_last_elapsed_ms
+            .load(Ordering::Relaxed);
+        loop {
+            let due = last == NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED
+                || elapsed_ms.saturating_sub(last) >= interval_ms;
+            if !due {
+                return;
+            }
+            match self
+                .native_bridge_snapshot_last_elapsed_ms
+                .compare_exchange_weak(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.publish_native_bridge_snapshot();
+                    return;
+                }
+                Err(next) => last = next,
+            }
+        }
+    }
+
+    fn publish_native_bridge_snapshot(&self) {
+        self.vfs.record_native_bridge_snapshot(
+            self.amplification_metrics.snapshot(),
+            self.read_metrics.snapshot(),
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
 enum LocalCacheReadRangeDecision {
     Trusted(NativeLocalCacheReadRange),
     StaleEpoch,
+    StaleGeneration,
     Unsafe,
 }
 
@@ -1610,6 +2253,56 @@ fn native_async_write_snapshot(
         admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
         barrier_waits: tracker.barrier_waits,
         barrier_wait_total_ms: tracker.barrier_wait_ns as f64 / 1_000_000.0,
+    }
+}
+
+fn vfs_native_bridge_snapshot(
+    amplification: NativeAmplificationMetricsSnapshot,
+    read: NativeReadMetricsSnapshot,
+) -> VfsNativeBridgeSnapshot {
+    VfsNativeBridgeSnapshot {
+        fuse_ops: amplification.fuse_ops,
+        metadata_ops: amplification.metadata_ops,
+        lookup_ops: amplification.lookup_ops,
+        getattr_ops: amplification.getattr_ops,
+        readdir_ops: amplification.readdir_ops,
+        readdirplus_ops: amplification.readdirplus_ops,
+        open_ops: amplification.open_ops,
+        release_ops: amplification.release_ops,
+        read_ops: amplification.read_ops,
+        write_ops: amplification.write_ops,
+        lookup_getattr_ratio_micros: amplification.lookup_getattr_ratio_micros,
+        open_release_ratio_micros: amplification.open_release_ratio_micros,
+        fuse_ops_per_read_write_micros: amplification.fuse_ops_per_read_write_micros,
+        metadata_ops_per_open_micros: amplification.metadata_ops_per_open_micros,
+        metadata_latency_total_ns: amplification.metadata_latency_total_ns,
+        lookup_latency: vfs_native_latency_snapshot(amplification.lookup_latency),
+        getattr_latency: vfs_native_latency_snapshot(amplification.getattr_latency),
+        readdir_latency: vfs_native_latency_snapshot(amplification.readdir_latency),
+        readdirplus_latency: vfs_native_latency_snapshot(amplification.readdirplus_latency),
+        open_latency: vfs_native_latency_snapshot(amplification.open_latency),
+        release_latency: vfs_native_latency_snapshot(amplification.release_latency),
+        read_latency: vfs_native_latency_snapshot(amplification.read_latency),
+        write_latency: vfs_native_latency_snapshot(amplification.write_latency),
+        local_cache_hits: read.local_cache_hits,
+        local_cache_unavailable_fallbacks: read.local_cache_unavailable_fallbacks,
+        stale_epoch_fallbacks: read.stale_epoch_fallbacks,
+        stale_generation_fallbacks: read.stale_generation_fallbacks,
+        bytes_fallbacks: read.bytes_fallbacks,
+        bytes_returned: read.bytes_returned,
+        read_ahead_prefetches: read.read_ahead_prefetches,
+        read_ahead_suppressed: read.read_ahead_suppressed,
+        read_ahead_amplification_bytes: read.read_ahead_amplification_bytes,
+    }
+}
+
+fn vfs_native_latency_snapshot(snapshot: NativeLatencyMetricsSnapshot) -> VfsNativeLatencySnapshot {
+    VfsNativeLatencySnapshot {
+        samples: snapshot.samples,
+        total_ns: snapshot.total_ns,
+        max_ns: snapshot.max_ns,
+        p95_ns: snapshot.p95_ns,
+        p99_ns: snapshot.p99_ns,
     }
 }
 
@@ -1827,6 +2520,9 @@ fn native_attr_from_inode_attr(attr: InodeAttr) -> NativeAttr {
         perm: attr.mode & 0o7777,
         uid: attr.uid,
         gid: attr.gid,
+        atime_ns: u64::try_from(attr.atime).unwrap_or_default(),
+        mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
+        ctime_ns: u64::try_from(attr.ctime).unwrap_or_default(),
     }
 }
 
@@ -1852,6 +2548,22 @@ fn entry_payload(attr: NativeAttr) -> Vec<u8> {
     payload.extend_from_slice(&0_u32.to_le_bytes());
     append_attr_payload(&mut payload, attr);
     payload
+}
+
+fn negative_entry_payload() -> &'static [u8] {
+    static PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+    PAYLOAD.get_or_init(|| {
+        let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.resize(FUSE_ENTRY_OUT_PAYLOAD_LEN, 0);
+        payload
+    })
 }
 
 fn attr_out_payload(attr: NativeAttr) -> Vec<u8> {
@@ -2010,14 +2722,21 @@ fn open_reply_flags(decision: NativeOpenCacheDecision) -> u32 {
     }
 }
 
+fn native_read_plan_invalidation_generation(attr: &InodeAttr) -> u64 {
+    let mut generation = attr.content_epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    generation ^= attr.size.rotate_left(17);
+    generation ^= (attr.mtime as u64).rotate_left(31);
+    generation ^= (attr.ctime as u64).rotate_left(43);
+    generation.max(1)
+}
+
 fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInodeCacheState {
+    let invalidation_generation = native_read_plan_invalidation_generation(&attr);
     NativeInodeCacheState {
         content_epoch: attr.content_epoch,
         size: attr.size,
         mtime_ns: u64::try_from(attr.mtime).unwrap_or_default(),
-        // Native Linux does not yet install a kernel invalidator generation source;
-        // content epoch, size, and mtime remain the active production coherency keys.
-        invalidation_generation: 0,
+        invalidation_generation,
         trusted: None,
         writer_active: dirty,
         dirty,
@@ -2026,16 +2745,19 @@ fn native_open_cache_state_from_attr(attr: InodeAttr, dirty: bool) -> NativeInod
 }
 
 fn append_attr_payload(payload: &mut Vec<u8>, attr: NativeAttr) {
+    let (atime_sec, atime_nsec) = split_unix_nanos(attr.atime_ns);
+    let (mtime_sec, mtime_nsec) = split_unix_nanos(attr.mtime_ns);
+    let (ctime_sec, ctime_nsec) = split_unix_nanos(attr.ctime_ns);
     payload.reserve(FUSE_ATTR_PAYLOAD_LEN);
     payload.extend_from_slice(&attr.ino.to_le_bytes());
     payload.extend_from_slice(&attr.size.to_le_bytes());
     payload.extend_from_slice(&attr.size.div_ceil(POSIX_STAT_BLOCK_SIZE).to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.extend_from_slice(&atime_sec.to_le_bytes());
+    payload.extend_from_slice(&mtime_sec.to_le_bytes());
+    payload.extend_from_slice(&ctime_sec.to_le_bytes());
+    payload.extend_from_slice(&atime_nsec.to_le_bytes());
+    payload.extend_from_slice(&mtime_nsec.to_le_bytes());
+    payload.extend_from_slice(&ctime_nsec.to_le_bytes());
     payload.extend_from_slice(&linux_mode(attr).to_le_bytes());
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.extend_from_slice(&attr.uid.to_le_bytes());
@@ -2043,6 +2765,10 @@ fn append_attr_payload(payload: &mut Vec<u8>, attr: NativeAttr) {
     payload.extend_from_slice(&0_u32.to_le_bytes());
     payload.extend_from_slice(&4096_u32.to_le_bytes());
     payload.extend_from_slice(&0_u32.to_le_bytes());
+}
+
+fn split_unix_nanos(nanos: u64) -> (u64, u32) {
+    (nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
 }
 
 fn linux_mode(attr: NativeAttr) -> u32 {
@@ -2251,36 +2977,55 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 mod tests {
     use super::*;
     use crate::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseRuntimeOptions};
+    use std::mem::align_of;
 
     #[derive(Debug)]
     struct TestNativeVfs {
+        lookup_calls: AtomicU64,
+        getattr_calls: AtomicU64,
+        readdir_calls: AtomicU64,
         read_calls: AtomicU64,
         local_cache_read_calls: AtomicU64,
         advise_read_ahead_calls: AtomicU64,
         last_read_ahead_offset: AtomicU64,
         last_read_ahead_len: AtomicU64,
         local_cache_file: std::fs::File,
+        native_bridge_snapshots: Mutex<
+            Vec<(
+                NativeAmplificationMetricsSnapshot,
+                NativeReadMetricsSnapshot,
+            )>,
+        >,
     }
 
     impl Default for TestNativeVfs {
         fn default() -> Self {
             Self {
+                lookup_calls: AtomicU64::new(0),
+                getattr_calls: AtomicU64::new(0),
+                readdir_calls: AtomicU64::new(0),
                 read_calls: AtomicU64::new(0),
                 local_cache_read_calls: AtomicU64::new(0),
                 advise_read_ahead_calls: AtomicU64::new(0),
                 last_read_ahead_offset: AtomicU64::new(0),
                 last_read_ahead_len: AtomicU64::new(0),
                 local_cache_file: tempfile::tempfile().expect("create local cache fd"),
+                native_bridge_snapshots: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl NativeVfs for TestNativeVfs {
-        fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<NativeAttr, i32> {
-            unimplemented!("not used by these tests")
+        fn lookup(&self, _parent: u64, name: &[u8]) -> Result<NativeAttr, i32> {
+            self.lookup_calls.fetch_add(1, Ordering::Relaxed);
+            if name == b"missing" {
+                return Err(libc::ENOENT);
+            }
+            Ok(test_attr(20))
         }
 
         fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
+            self.getattr_calls.fetch_add(1, Ordering::Relaxed);
             if ino == 21 {
                 return Err(libc::EIO);
             }
@@ -2288,7 +3033,7 @@ mod tests {
         }
 
         fn open(&self, _ino: u64, _flags: i32) -> Result<u64, i32> {
-            unimplemented!("not used by these tests")
+            Ok(7)
         }
 
         fn release(&self, _fh: u64) -> Result<(), i32> {
@@ -2323,15 +3068,26 @@ mod tests {
             Ok(())
         }
 
+        fn record_native_bridge_snapshot(
+            &self,
+            amplification: NativeAmplificationMetricsSnapshot,
+            read: NativeReadMetricsSnapshot,
+        ) {
+            self.native_bridge_snapshots
+                .lock()
+                .expect("native bridge snapshots lock should not be poisoned")
+                .push((amplification, read));
+        }
+
         fn write(
             &self,
             _fh: u64,
             _ino: u64,
             _offset: u64,
-            _data: &[u8],
+            data: &[u8],
             _flags: i32,
         ) -> Result<u32, i32> {
-            unimplemented!("not used by these tests")
+            Ok(data.len() as u32)
         }
 
         fn flush(&self, _ino: u64, _fh: u64) -> Result<(), i32> {
@@ -2351,7 +3107,8 @@ mod tests {
         }
 
         fn readdir(&self, _ino: u64, _fh: u64, _offset: i64) -> Result<Arc<[NativeDirEntry]>, i32> {
-            unimplemented!("not used by these tests")
+            self.readdir_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::from([dir_entry(20, b"file")]))
         }
 
         fn mkdir(
@@ -2395,8 +3152,10 @@ mod tests {
             unimplemented!("not used by these tests")
         }
 
-        fn truncate(&self, _ino: u64, _fh: Option<u64>, _size: u64) -> Result<NativeAttr, i32> {
-            unimplemented!("not used by these tests")
+        fn truncate(&self, ino: u64, _fh: Option<u64>, size: u64) -> Result<NativeAttr, i32> {
+            let mut attr = test_attr(ino);
+            attr.size = size;
+            Ok(attr)
         }
 
         fn statfs(&self) -> Result<NativeStatFs, i32> {
@@ -2412,6 +3171,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
         }
     }
 
@@ -2420,6 +3182,164 @@ mod tests {
             ino,
             kind: NativeFileType::RegularFile,
             name: name.to_vec(),
+        }
+    }
+
+    #[test]
+    fn amplification_metrics_snapshot_counts_metadata_churn() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+        let _ = bridge.handle_readdir(readdir_request_for_offset_and_size(0, 4096));
+
+        let metrics = bridge.amplification_metrics_snapshot();
+        assert_eq!(metrics.metadata_ops, 3);
+        assert_eq!(metrics.lookup_ops, 1);
+        assert_eq!(metrics.getattr_ops, 1);
+        assert_eq!(metrics.readdir_ops, 1);
+        assert_eq!(metrics.fuse_ops, 3);
+        assert_eq!(metrics.lookup_getattr_ratio_micros, 1_000_000);
+        assert_eq!(metrics.fuse_ops_per_read_write_micros, 0);
+        assert_eq!(metrics.metadata_ops_per_open_micros, 0);
+        assert_eq!(vfs.lookup_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(vfs.getattr_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(vfs.readdir_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn amplification_metrics_snapshot_reports_named_amplification_ratios() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+        let _ = bridge.handle_open(open_request_for_flags(0));
+        let _ = bridge.handle_read(read_request_for_size(8192));
+        let _ = bridge.handle_write(write_request_for_data(20, 7, 0, b"abc"));
+
+        let metrics = bridge.amplification_metrics_snapshot();
+        assert_eq!(metrics.fuse_ops, 5);
+        assert_eq!(metrics.fuse_ops_per_read_write_micros, 2_500_000);
+        assert_eq!(metrics.metadata_ops_per_open_micros, 2_000_000);
+    }
+
+    #[test]
+    fn amplification_metrics_snapshot_records_opcode_latency_percentiles() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+        let _ = bridge.handle_readdir(readdir_request_for_offset_and_size(0, 4096));
+
+        let metrics = bridge.amplification_metrics_snapshot();
+        assert_eq!(metrics.lookup_latency.samples, 1);
+        assert_eq!(metrics.getattr_latency.samples, 1);
+        assert_eq!(metrics.readdir_latency.samples, 1);
+        assert!(metrics.lookup_latency.p95_ns >= 1);
+        assert!(metrics.getattr_latency.p99_ns >= 1);
+        assert!(metrics.metadata_latency_total_ns >= 3);
+    }
+
+    #[test]
+    fn native_latency_metrics_reports_bucketed_percentiles_without_sample_lock() {
+        let metrics = NativeLatencyMetrics::default();
+
+        metrics.record(1_500);
+        metrics.record(30_000);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.samples, 2);
+        assert_eq!(snapshot.total_ns, 31_500);
+        assert_eq!(snapshot.max_ns, 30_000);
+        assert_eq!(snapshot.p95_ns, 50_000);
+        assert_eq!(snapshot.p99_ns, 50_000);
+    }
+
+    #[test]
+    fn native_metrics_are_cache_line_aligned_to_reduce_false_sharing() {
+        assert_eq!(align_of::<NativeLatencyMetrics>(), 64);
+        assert_eq!(align_of::<NativeAmplificationMetrics>(), 64);
+    }
+
+    #[test]
+    fn lookup_missing_name_returns_negative_entry_with_conservative_ttl() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle_lookup(lookup_request_for_name(b"missing"));
+        let bytes = reply.to_vec();
+
+        assert_eq!(reply_errno(&reply), 0);
+        assert_eq!(entry_reply_nodeid(&bytes), 0);
+        assert_eq!(entry_reply_valid_seconds(&bytes), 1);
+    }
+
+    #[test]
+    fn handle_lookup_publishes_native_bridge_snapshot_to_backend() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+
+        let snapshots = vfs
+            .native_bridge_snapshots
+            .lock()
+            .expect("native bridge snapshots lock should not be poisoned");
+        let (amplification, read) = snapshots.last().expect("snapshot should be published");
+        assert_eq!(amplification.lookup_ops, 1);
+        assert_eq!(read.local_cache_hits, 0);
+    }
+
+    #[test]
+    fn native_bridge_snapshot_publish_is_rate_limited_on_hot_path() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+
+        let snapshots = vfs
+            .native_bridge_snapshots
+            .lock()
+            .expect("native bridge snapshots lock should not be poisoned");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0.lookup_ops, 1);
+        assert_eq!(bridge.amplification_metrics_snapshot().getattr_ops, 1);
+    }
+
+    #[test]
+    fn native_fuse_handlers_use_metrics_guard_for_instrumented_paths() {
+        let source = include_str!("vfs_adapter.rs");
+        for (handler, metric, manual_record) in [
+            ("handle_lookup", "Lookup", ".record_lookup("),
+            ("handle_getattr", "Getattr", ".record_getattr("),
+            ("handle_open", "Open", ".record_open("),
+            ("handle_release", "Release", ".record_release("),
+            ("handle_read", "Read", ".record_read("),
+            ("handle_write", "Write", ".record_write("),
+            ("handle_readdir", "Readdir", ".record_readdir("),
+            ("handle_readdirplus", "Readdirplus", ".record_readdirplus("),
+        ] {
+            let body = source
+                .split(&format!("fn {handler}(&self, request: FuseRequest)"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .expect("handler body should be present");
+            assert!(
+                body.contains(&format!("self.metrics_guard(NativeFuseMetric::{metric})")),
+                "{handler} should create a metrics guard"
+            );
+            assert!(
+                !body.contains(manual_record),
+                "{handler} should not manually record latency on each return path"
+            );
+            assert!(
+                !body.contains("publish_native_bridge_snapshot_if_due"),
+                "{handler} should publish through metrics guard drop"
+            );
         }
     }
 
@@ -2435,9 +3355,143 @@ mod tests {
         assert_eq!(state.content_epoch, 9);
         assert_eq!(state.size, 4096);
         assert_eq!(state.mtime_ns, 123_456);
+        assert_ne!(state.invalidation_generation, 0);
         assert!(state.writer_active);
         assert!(state.dirty);
         assert!(state.local_materialized);
+    }
+
+    #[test]
+    fn native_open_cache_state_generation_changes_with_attr_metadata() {
+        let mut first = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
+        first.size = 4096;
+        first.mtime = 123_456;
+        first.content_epoch = 9;
+        let mut second = first.clone();
+        second.mtime = 123_457;
+
+        let first = native_open_cache_state_from_attr(first, false);
+        let second = native_open_cache_state_from_attr(second, false);
+
+        assert_ne!(
+            first.invalidation_generation,
+            second.invalidation_generation
+        );
+    }
+
+    #[test]
+    fn native_attr_from_inode_attr_preserves_unix_timestamps() {
+        let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
+        attr.atime = 1_234_567_890;
+        attr.mtime = 2_345_678_901;
+        attr.ctime = 3_456_789_012;
+
+        let native_attr = native_attr_from_inode_attr(attr);
+
+        assert_eq!(native_attr.atime_ns, 1_234_567_890);
+        assert_eq!(native_attr.mtime_ns, 2_345_678_901);
+        assert_eq!(native_attr.ctime_ns, 3_456_789_012);
+    }
+
+    #[test]
+    fn append_attr_payload_writes_timestamp_seconds_and_nanoseconds() {
+        let mut attr = test_attr(55);
+        attr.atime_ns = 1_234_567_890;
+        attr.mtime_ns = 2_345_678_901;
+        attr.ctime_ns = 3_456_789_012;
+
+        let mut payload = Vec::new();
+        append_attr_payload(&mut payload, attr);
+
+        assert_eq!(read_u64(&payload, 24), Some(1));
+        assert_eq!(read_u64(&payload, 32), Some(2));
+        assert_eq!(read_u64(&payload, 40), Some(3));
+        assert_eq!(read_u32(&payload, 48), Some(234_567_890));
+        assert_eq!(read_u32(&payload, 52), Some(345_678_901));
+        assert_eq!(read_u32(&payload, 56), Some(456_789_012));
+    }
+
+    #[test]
+    fn native_read_ahead_state_store_uses_multiple_shards_for_inodes() {
+        assert_eq!(NativeReadAheadStateStore::SHARD_COUNT, 64);
+        assert_ne!(
+            NativeReadAheadStateStore::shard_index(20),
+            NativeReadAheadStateStore::shard_index(21)
+        );
+    }
+
+    #[test]
+    fn native_read_ahead_state_store_invalidates_only_target_inode_shards() {
+        let source = include_str!("vfs_adapter.rs");
+        let invalidate_inodes = source
+            .split("fn invalidate_inodes(&self, inodes: &[u64])")
+            .nth(1)
+            .and_then(|rest| rest.split("fn remove_handle").next())
+            .expect("read-ahead invalidate_inodes body should be present");
+
+        assert!(!invalidate_inodes.contains("for shard in &self.shards"));
+    }
+
+    #[test]
+    fn native_read_ahead_handles_keep_common_case_inline() {
+        let mut handles = NativeReadAheadHandles::new();
+
+        for fh in 1..=4 {
+            insert_read_ahead_handle(&mut handles, fh);
+        }
+
+        assert!(!handles.spilled());
+    }
+
+    #[test]
+    fn native_read_ahead_state_shard_reassigns_handle_between_inodes() {
+        let mut shard = NativeReadAheadStateShard::default();
+
+        shard.track_handle_inode(7, 20);
+        shard.track_handle_inode(7, 21);
+
+        assert!(!shard.fhs_by_inode.contains_key(&20));
+        assert_eq!(
+            shard.fhs_by_inode.get(&21).map(|fhs| fhs.as_slice()),
+            Some(&[7][..])
+        );
+    }
+
+    #[test]
+    fn native_read_ahead_state_shard_reassignment_drops_stale_handle_state() {
+        let mut shard = NativeReadAheadStateShard::default();
+
+        shard.track_handle_inode(7, 20);
+        shard.states.entry(7).or_default();
+        shard.track_handle_inode(7, 21);
+
+        assert!(!shard.states.contains_key(&7));
+    }
+
+    #[test]
+    fn native_read_ahead_state_shard_repeated_tracking_returns_before_inode_index_update() {
+        let source = include_str!("vfs_adapter.rs");
+        let track_handle_inode = source
+            .split("fn track_handle_inode(&mut self, fh: u64, ino: u64)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn remove_handle(&mut self, fh: u64)").next())
+            .expect("track_handle_inode body should be present");
+        let repeated_inode_branch = track_handle_inode
+            .split("if previous_ino == Some(ino) {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("repeated inode branch should be present");
+
+        assert!(!repeated_inode_branch.contains("insert_read_ahead_handle"));
+    }
+
+    #[test]
+    fn negative_entry_payload_reuses_static_payload_buffer() {
+        let first = negative_entry_payload();
+        let second = negative_entry_payload();
+
+        assert_eq!(first.len(), FUSE_ENTRY_OUT_PAYLOAD_LEN);
+        assert_eq!(first.as_ptr(), second.as_ptr());
     }
 
     #[test]
@@ -2574,6 +3628,67 @@ mod tests {
     }
 
     #[test]
+    fn mutation_invalidation_keeps_readahead_state_for_unrelated_inode() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(vfs);
+        for ino in [20, 21] {
+            bridge.remember_trusted_open_cache_state(
+                ino,
+                &NativeInodeCacheState {
+                    content_epoch: 9,
+                    size: 64 * 1024,
+                    mtime_ns: 100,
+                    invalidation_generation: 0,
+                    trusted: None,
+                    writer_active: false,
+                    dirty: false,
+                    local_materialized: true,
+                },
+            );
+        }
+
+        let _ = bridge.handle_read(read_request_for_ino_fh_offset_and_size(20, 7, 0, 8192));
+        let _ = bridge.handle_read(read_request_for_ino_fh_offset_and_size(21, 8, 0, 8192));
+
+        bridge.invalidate_metadata_cache_for_mutation(&[20]);
+
+        assert!(!bridge.read_ahead_states.contains_handle(20, 7));
+        assert!(bridge.read_ahead_states.contains_handle(21, 8));
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(20, 7), None);
+        assert_eq!(bridge.read_ahead_states.inode_for_handle(21, 8), Some(21));
+    }
+
+    #[test]
+    fn read_metrics_snapshot_reports_sparse_random_readahead_suppression() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(vfs.clone());
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 512 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let _ = bridge.handle_read(read_request_for_offset_and_size(0, 8192));
+        let _ = bridge.handle_read(read_request_for_offset_and_size(256 * 1024, 8192));
+        let random_metrics = bridge.read_metrics_snapshot();
+        assert_eq!(random_metrics.read_ahead_prefetches, 0);
+        assert_eq!(random_metrics.read_ahead_suppressed, 2);
+
+        let _ = bridge.handle_read(read_request_for_offset_and_size(264 * 1024, 8192));
+        let sequential_metrics = bridge.read_metrics_snapshot();
+        assert_eq!(sequential_metrics.read_ahead_prefetches, 1);
+        assert!(sequential_metrics.read_ahead_amplification_bytes > 0);
+    }
+
+    #[test]
     fn handle_read_falls_back_to_bytes_when_local_cache_epoch_is_stale() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
@@ -2601,13 +3716,97 @@ mod tests {
         assert_eq!(vfs.read_calls.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn handle_read_falls_back_to_bytes_when_remote_refresh_generation_changed() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 7,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_none());
+        assert_eq!(bridge.read_metrics_snapshot().stale_generation_fallbacks, 1);
+        assert_eq!(bridge.read_metrics_snapshot().bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn setattr_truncate_invalidates_trusted_open_cache_state_before_followup_read() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let _ = bridge.handle_setattr(setattr_size_request(20, 4096));
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_none());
+        assert_eq!(bridge.read_metrics_snapshot().bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn handle_write_overwrite_invalidates_trusted_open_cache_state_before_followup_read() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let _ = bridge.handle_write(write_request_for_data(20, 7, 4096, b"overwrite"));
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_none());
+        assert_eq!(bridge.read_metrics_snapshot().bytes_fallbacks, 1);
+    }
+
     fn read_request_for_size(size: u32) -> FuseRequest {
         read_request_for_offset_and_size(13, size)
     }
 
     fn read_request_for_offset_and_size(offset: u64, size: u32) -> FuseRequest {
+        read_request_for_ino_fh_offset_and_size(20, 7, offset, size)
+    }
+
+    fn read_request_for_ino_fh_offset_and_size(
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> FuseRequest {
         let mut payload = vec![0; FUSE_READ_IN_LEN];
-        payload[0..8].copy_from_slice(&7_u64.to_le_bytes());
+        payload[0..8].copy_from_slice(&fh.to_le_bytes());
         payload[8..16].copy_from_slice(&offset.to_le_bytes());
         payload[16..20].copy_from_slice(&size.to_le_bytes());
         FuseRequest {
@@ -2615,7 +3814,7 @@ mod tests {
                 40 + FUSE_READ_IN_LEN as u32,
                 15,
                 99,
-                20,
+                ino,
                 0,
                 0,
                 0,
@@ -2625,11 +3824,104 @@ mod tests {
         }
     }
 
+    fn lookup_request_for_name(name: &[u8]) -> FuseRequest {
+        let mut payload = name.to_vec();
+        payload.push(0);
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                (crate::native::abi::FUSE_IN_HEADER_LEN + payload.len()) as u32,
+                1,
+                100,
+                1,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Lookup,
+            payload,
+        }
+    }
+
+    fn getattr_request_for_ino(ino: u64) -> FuseRequest {
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                crate::native::abi::FUSE_IN_HEADER_LEN as u32,
+                3,
+                101,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Getattr,
+            payload: Vec::new(),
+        }
+    }
+
+    fn open_request_for_flags(flags: u32) -> FuseRequest {
+        let mut payload = vec![0; FUSE_OPEN_IN_LEN];
+        payload[0..4].copy_from_slice(&flags.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                40 + FUSE_OPEN_IN_LEN as u32,
+                14,
+                104,
+                20,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Open,
+            payload,
+        }
+    }
+
+    fn readdir_request_for_offset_and_size(offset: u64, size: u32) -> FuseRequest {
+        let mut payload = vec![0; FUSE_READ_IN_LEN];
+        payload[0..8].copy_from_slice(&7_u64.to_le_bytes());
+        payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        payload[16..20].copy_from_slice(&size.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                40 + FUSE_READ_IN_LEN as u32,
+                28,
+                102,
+                1,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Readdir,
+            payload,
+        }
+    }
+
+    fn setattr_size_request(ino: u64, size: u64) -> FuseRequest {
+        let mut payload = vec![0; FUSE_SETATTR_IN_LEN];
+        let valid = FATTR_SIZE;
+        payload[0..4].copy_from_slice(&valid.to_le_bytes());
+        payload[8..16].copy_from_slice(&size.to_le_bytes());
+        FuseRequest {
+            header: crate::native::abi::FuseInHeader::new(
+                40 + FUSE_SETATTR_IN_LEN as u32,
+                4,
+                103,
+                ino,
+                0,
+                0,
+                0,
+            ),
+            opcode: FuseOpcode::Setattr,
+            payload,
+        }
+    }
+
     #[derive(Debug)]
     struct BlockingWriteVfs {
         write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         release_write: Mutex<std::sync::mpsc::Receiver<()>>,
         write_error: Option<i32>,
+        release_error: Option<i32>,
         snapshots: Mutex<Vec<NativeAsyncWriteSnapshot>>,
         flushes: AtomicU64,
         fsyncs: AtomicU64,
@@ -2653,12 +3945,24 @@ mod tests {
     }
 
     fn blocking_write_fixture_with_write_result(write_error: Option<i32>) -> BlockingWriteFixture {
+        blocking_write_fixture_with_results(write_error, None)
+    }
+
+    fn blocking_write_fixture_with_release_error(errno: i32) -> BlockingWriteFixture {
+        blocking_write_fixture_with_results(None, Some(errno))
+    }
+
+    fn blocking_write_fixture_with_results(
+        write_error: Option<i32>,
+        release_error: Option<i32>,
+    ) -> BlockingWriteFixture {
         let (write_started_tx, write_started) = std::sync::mpsc::channel();
         let (release_write, release_write_rx) = std::sync::mpsc::channel();
         let vfs = Arc::new(BlockingWriteVfs {
             write_started: Mutex::new(Some(write_started_tx)),
             release_write: Mutex::new(release_write_rx),
             write_error,
+            release_error,
             snapshots: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
             fsyncs: AtomicU64::new(0),
@@ -2690,6 +3994,9 @@ mod tests {
 
         fn release(&self, _fh: u64) -> Result<(), i32> {
             self.releases.fetch_add(1, Ordering::Relaxed);
+            if let Some(errno) = self.release_error {
+                return Err(errno);
+            }
             Ok(())
         }
 
@@ -2961,6 +4268,45 @@ mod tests {
 
         assert!(eagain_guard < vfs_release);
         assert!(eagain_guard < finish_close);
+    }
+
+    #[test]
+    fn handle_release_forgets_read_ahead_handle_after_release_error() {
+        let fixture = blocking_write_fixture_with_release_error(libc::EIO);
+
+        fixture.bridge.read_ahead_states.observe(
+            &fixture.bridge.read_ahead_policy,
+            7,
+            20,
+            0,
+            8192,
+            16 * 1024,
+        );
+        let reply = fixture.bridge.handle_release(release_request_for_fh(20, 7));
+
+        assert_eq!(reply_errno(&reply), -libc::EIO);
+        assert!(!fixture.bridge.read_ahead_states.contains_handle(20, 7));
+    }
+
+    #[test]
+    fn handle_release_with_async_write_forgets_read_ahead_handle_after_release_error() {
+        let fixture = blocking_write_fixture_with_release_error(libc::EIO);
+        let bridge = LinuxNativeBridge::new(Arc::clone(&fixture.vfs)).with_async_write_for_test(
+            NativeAsyncWriteConfig {
+                max_pending_bytes: Some(16),
+                max_pending_writes: Some(2),
+                per_handle_pending_bytes: Some(8),
+                platform_policy: "test-native".into(),
+            },
+        );
+
+        bridge
+            .read_ahead_states
+            .observe(&bridge.read_ahead_policy, 7, 20, 0, 8192, 16 * 1024);
+        let reply = bridge.handle_release(release_request_for_fh(20, 7));
+
+        assert_eq!(reply_errno(&reply), -libc::EIO);
+        assert!(!bridge.read_ahead_states.contains_handle(20, 7));
     }
 
     #[test]
@@ -3581,6 +4927,24 @@ mod tests {
 
     fn reply_errno(reply: &FuseReply) -> i32 {
         i32::from_le_bytes(reply.to_vec()[4..8].try_into().expect("reply errno"))
+    }
+
+    fn entry_reply_nodeid(reply: &[u8]) -> u64 {
+        u64::from_le_bytes(
+            reply[crate::native::abi::FUSE_OUT_HEADER_LEN
+                ..crate::native::abi::FUSE_OUT_HEADER_LEN + 8]
+                .try_into()
+                .expect("entry nodeid"),
+        )
+    }
+
+    fn entry_reply_valid_seconds(reply: &[u8]) -> u64 {
+        u64::from_le_bytes(
+            reply[crate::native::abi::FUSE_OUT_HEADER_LEN + 16
+                ..crate::native::abi::FUSE_OUT_HEADER_LEN + 24]
+                .try_into()
+                .expect("entry valid"),
+        )
     }
 
     #[test]

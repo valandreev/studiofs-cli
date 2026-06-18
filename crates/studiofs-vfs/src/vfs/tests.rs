@@ -12047,6 +12047,50 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
 }
 
 #[test]
+fn write_path_observability_reports_native_bridge_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-native-bridge");
+
+    vfs.record_native_bridge_snapshot(VfsNativeBridgeSnapshot {
+        metadata_ops: 7,
+        lookup_ops: 3,
+        getattr_ops: 2,
+        readdir_ops: 1,
+        readdirplus_ops: 1,
+        open_ops: 5,
+        release_ops: 4,
+        read_ops: 11,
+        write_ops: 13,
+        lookup_getattr_ratio_micros: 1_500_000,
+        open_release_ratio_micros: 1_250_000,
+        metadata_latency_total_ns: 700,
+        lookup_latency: VfsNativeLatencySnapshot {
+            samples: 3,
+            total_ns: 300,
+            max_ns: 150,
+            p95_ns: 150,
+            p99_ns: 150,
+        },
+        read_ahead_prefetches: 2,
+        read_ahead_suppressed: 9,
+        stale_generation_fallbacks: 4,
+        read_ahead_amplification_bytes: 64 * 1024,
+        ..VfsNativeBridgeSnapshot::default()
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.native_bridge.metadata_ops, 7);
+    assert_eq!(snapshot.native_bridge.lookup_latency.p95_ns, 150);
+    assert_eq!(snapshot.native_bridge.stale_generation_fallbacks, 4);
+    assert_eq!(snapshot.native_bridge.read_ahead_suppressed, 9);
+    assert_eq!(
+        snapshot.native_bridge.read_ahead_amplification_bytes,
+        64 * 1024
+    );
+}
+
+#[test]
 fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-async-write-stale-snapshot");
