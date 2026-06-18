@@ -314,7 +314,7 @@ fn fuse_open_cache_mode(vfs: &StudioVfs, ino: u64, open_flags: OpenFlags) -> Fus
 fn fuse_open_reply_flags(open_flags: OpenFlags, cache_mode: FuseOpenCacheMode) -> u32 {
     if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
         if cache_mode == FuseOpenCacheMode::WriterBarrier {
-            return fuser::consts::FOPEN_DIRECT_IO;
+            return 0;
         }
         fuser::consts::FOPEN_KEEP_CACHE
     } else {
@@ -4692,7 +4692,7 @@ mod tests {
             );
             assert_eq!(
                 fuse_open_reply_flags(OpenFlags::RDONLY, FuseOpenCacheMode::WriterBarrier),
-                fuser::consts::FOPEN_DIRECT_IO
+                0
             );
             assert_eq!(
                 fuse_open_reply_flags(OpenFlags::WRONLY, FuseOpenCacheMode::WriterBarrier),
