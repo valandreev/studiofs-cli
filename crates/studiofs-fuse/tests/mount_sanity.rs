@@ -247,6 +247,24 @@ fn native_mounted_scenarios() -> &'static [MountedAsyncScenario] {
             mode: MountedFuseMode::AsyncWritebackCache,
             operation: MountedScenarioOperation::Sfs530EvidenceMatrix,
         },
+        MountedAsyncScenario {
+            name: "native-sfs532-classic-conservative-fio",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::Sync,
+            operation: MountedScenarioOperation::Sfs509FioMatrix,
+        },
+        MountedAsyncScenario {
+            name: "native-sfs532-classic-high-throughput-fio",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWritebackCache,
+            operation: MountedScenarioOperation::Sfs509FioMatrix,
+        },
+        MountedAsyncScenario {
+            name: "native-sfs532-io-uring-fio",
+            backend: MountedBackend::LinuxNativeBridge,
+            mode: MountedFuseMode::AsyncWritebackCache,
+            operation: MountedScenarioOperation::Sfs509FioMatrix,
+        },
     ]
 }
 
@@ -459,6 +477,28 @@ fn native_sfs530_mounted_evidence_writeback_cache_profile() {
 }
 
 #[test]
+#[ignore = "requires /dev/fuse, fusermount3, fio, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_sfs532_mounted_fio_classic_conservative_profile() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-sfs532-classic-conservative-fio",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, fio, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_sfs532_mounted_fio_classic_high_throughput_profile() {
+    run_native_mounted_scenario(native_mounted_scenario(
+        "native-sfs532-classic-high-throughput-fio",
+    ));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, fusermount3, fio, kernel FUSE-over-io_uring, and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn native_sfs532_mounted_fio_io_uring_profile() {
+    run_native_mounted_scenario(native_mounted_scenario("native-sfs532-io-uring-fio"));
+}
+
+#[test]
 fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() {
     let scenarios = mounted_async_scenarios();
     let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
@@ -581,6 +621,23 @@ fn native_mounted_matrix_includes_sfs530_evidence_profiles() {
         assert!(
             evidence_profiles.contains(expected),
             "native SFS-530 evidence matrix is missing profile {expected}"
+        );
+    }
+}
+
+#[test]
+fn native_mounted_matrix_includes_sfs532_performance_gate_profiles() {
+    let scenarios = native_mounted_scenarios();
+    let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+
+    for expected in [
+        "native-sfs532-classic-conservative-fio",
+        "native-sfs532-classic-high-throughput-fio",
+        "native-sfs532-io-uring-fio",
+    ] {
+        assert!(
+            names.contains(expected),
+            "native SFS-532 performance matrix is missing {expected}"
         );
     }
 }
