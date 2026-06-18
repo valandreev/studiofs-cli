@@ -453,10 +453,7 @@ fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
 
 #[cfg(test)]
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    match raw {
-        Some(raw) => should_enable_async_fuse_write_from_env_value(raw),
-        None => true,
-    }
+    raw.is_none_or(should_enable_async_fuse_write_from_env_value)
 }
 
 fn resolve_async_fuse_write_enabled_from_os(raw: Option<&OsStr>) -> bool {
@@ -478,10 +475,7 @@ fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
 
 #[cfg(test)]
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
-    match raw {
-        Some(raw) => should_enable_async_fuse_read_from_env_value(raw),
-        None => true,
-    }
+    raw.is_none_or(should_enable_async_fuse_read_from_env_value)
 }
 
 fn resolve_async_fuse_read_enabled_from_os(raw: Option<&OsStr>) -> bool {
