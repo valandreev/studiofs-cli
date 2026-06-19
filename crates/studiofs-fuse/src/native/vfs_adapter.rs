@@ -1307,6 +1307,26 @@ pub struct NativeReadMetricsSnapshot {
     pub read_ahead_amplification_bytes: u64,
 }
 
+impl NativeReadMetricsSnapshot {
+    /// Return stable artifact labels for observed local-cache read fallback reasons.
+    pub fn local_cache_fallback_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::with_capacity(4);
+        if self.local_cache_unavailable_fallbacks > 0 {
+            reasons.push("local_cache_unavailable");
+        }
+        if self.stale_epoch_fallbacks > 0 {
+            reasons.push("stale_epoch");
+        }
+        if self.stale_generation_fallbacks > 0 {
+            reasons.push("stale_generation");
+        }
+        if self.unsafe_local_cache_fallbacks > 0 {
+            reasons.push("unsafe_local_cache");
+        }
+        reasons
+    }
+}
+
 impl NativeReadMetrics {
     fn snapshot(&self) -> NativeReadMetricsSnapshot {
         NativeReadMetricsSnapshot {
@@ -3825,6 +3845,27 @@ mod tests {
         let metrics = bridge.read_metrics_snapshot();
         assert_eq!(metrics.unsafe_local_cache_fallbacks, 1);
         assert_eq!(metrics.bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn read_metrics_snapshot_lists_observed_local_cache_fallback_reasons() {
+        let metrics = NativeReadMetricsSnapshot {
+            local_cache_unavailable_fallbacks: 1,
+            stale_epoch_fallbacks: 2,
+            stale_generation_fallbacks: 3,
+            unsafe_local_cache_fallbacks: 4,
+            ..NativeReadMetricsSnapshot::default()
+        };
+
+        assert_eq!(
+            metrics.local_cache_fallback_reasons(),
+            [
+                "local_cache_unavailable",
+                "stale_epoch",
+                "stale_generation",
+                "unsafe_local_cache",
+            ]
+        );
     }
 
     #[test]

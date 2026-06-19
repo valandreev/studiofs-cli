@@ -33,7 +33,7 @@ use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
-use studiofs_vfs::{StudioVfs, VfsConfig};
+use studiofs_vfs::{StudioVfs, VfsConfig, VfsNativeBridgeSnapshot};
 
 const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
 const DEFAULT_TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -680,8 +680,26 @@ fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
 
     assert!(writer.contains("local_cache_unavailable_fallbacks"));
     assert!(writer.contains("stale_epoch_fallbacks"));
+    assert!(writer.contains("unsafe_local_cache_fallbacks"));
+    assert!(writer.contains("fallback_reasons"));
     assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
     assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
+    assert!(writer.contains("native_bridge.unsafe_local_cache_fallbacks"));
+}
+
+#[test]
+fn native_local_cache_fallback_reasons_json_lists_observed_reasons() {
+    let native_bridge = VfsNativeBridgeSnapshot {
+        local_cache_unavailable_fallbacks: 1,
+        stale_generation_fallbacks: 2,
+        unsafe_local_cache_fallbacks: 3,
+        ..VfsNativeBridgeSnapshot::default()
+    };
+
+    assert_eq!(
+        native_local_cache_fallback_reasons_json(&native_bridge),
+        "[\"local_cache_unavailable\",\"stale_generation\",\"unsafe_local_cache\"]"
+    );
 }
 
 #[test]
@@ -2603,6 +2621,8 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"local_cache_unavailable_fallbacks\": {native_local_cache_unavailable_fallbacks},\n",
             "    \"stale_epoch_fallbacks\": {native_stale_epoch_fallbacks},\n",
             "    \"stale_generation_fallbacks\": {native_stale_generation_fallbacks},\n",
+            "    \"unsafe_local_cache_fallbacks\": {native_unsafe_local_cache_fallbacks},\n",
+            "    \"fallback_reasons\": {native_local_cache_fallback_reasons},\n",
             "    \"bytes_fallbacks\": {native_bytes_fallbacks},\n",
             "    \"bytes_returned\": {native_bytes_returned},\n",
             "    \"read_ahead_prefetches\": {native_read_ahead_prefetches},\n",
@@ -2672,6 +2692,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         native_local_cache_unavailable_fallbacks = native_bridge.local_cache_unavailable_fallbacks,
         native_stale_epoch_fallbacks = native_bridge.stale_epoch_fallbacks,
         native_stale_generation_fallbacks = native_bridge.stale_generation_fallbacks,
+        native_unsafe_local_cache_fallbacks = native_bridge.unsafe_local_cache_fallbacks,
+        native_local_cache_fallback_reasons =
+            native_local_cache_fallback_reasons_json(&native_bridge),
         native_bytes_fallbacks = native_bridge.bytes_fallbacks,
         native_bytes_returned = native_bridge.bytes_returned,
         native_read_ahead_prefetches = native_bridge.read_ahead_prefetches,
@@ -2695,6 +2718,23 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
 
 fn json_option_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn native_local_cache_fallback_reasons_json(native_bridge: &VfsNativeBridgeSnapshot) -> String {
+    let mut reasons = Vec::with_capacity(4);
+    if native_bridge.local_cache_unavailable_fallbacks > 0 {
+        reasons.push("\"local_cache_unavailable\"");
+    }
+    if native_bridge.stale_epoch_fallbacks > 0 {
+        reasons.push("\"stale_epoch\"");
+    }
+    if native_bridge.stale_generation_fallbacks > 0 {
+        reasons.push("\"stale_generation\"");
+    }
+    if native_bridge.unsafe_local_cache_fallbacks > 0 {
+        reasons.push("\"unsafe_local_cache\"");
+    }
+    format!("[{}]", reasons.join(","))
 }
 
 fn run_sfs530_evidence_matrix_if_available(
