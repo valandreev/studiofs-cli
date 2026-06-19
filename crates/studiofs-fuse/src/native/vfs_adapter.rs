@@ -26,10 +26,10 @@ use crate::fs::pending_write_tracker::{
 };
 use crate::native::abi::{error_reply, ok_reply};
 use crate::native::cache_policy::{
-    NativeInodeCacheState, NativeOpenCacheAction, NativeOpenCacheDecision, NativeOpenCacheMetrics,
-    NativeOpenCacheMetricsSnapshot, NativeOpenCacheReason, NativeReadAheadDecision,
-    NativeReadAheadPolicy, NativeReadAheadState, decide_native_open_cache,
-    decide_native_read_ahead,
+    NativeInodeCacheState, NativeMetadataCachePolicy, NativeOpenCacheAction,
+    NativeOpenCacheDecision, NativeOpenCacheMetrics, NativeOpenCacheMetricsSnapshot,
+    NativeOpenCacheReason, NativeReadAheadDecision, NativeReadAheadPolicy, NativeReadAheadState,
+    decide_native_open_cache, decide_native_read_ahead,
 };
 use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
@@ -62,6 +62,7 @@ const SUPPORTED_SETATTR_VALID: u32 =
     FATTR_FH | FATTR_SIZE | FATTR_MTIME | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const FOPEN_CACHE_DIR: u32 = 1 << 3;
 
 /// Stable local cache file range that a native Linux read transport may use.
 pub type NativeLocalCacheReadRange = FuseLocalCacheReadRange;
@@ -708,6 +709,7 @@ pub struct LinuxNativeBridge<V> {
     native_bridge_snapshot_started_at: Instant,
     native_bridge_snapshot_last_elapsed_ms: AtomicU64,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
+    metadata_cache_policy: NativeMetadataCachePolicy,
     read_ahead_policy: NativeReadAheadPolicy,
     read_ahead_states: NativeReadAheadStateStore,
     willneed_hint_states: NativeWillneedHintStateStore,
@@ -843,6 +845,9 @@ struct NativeAmplificationMetrics {
     release_ops: AtomicU64,
     read_ops: AtomicU64,
     write_ops: AtomicU64,
+    negative_lookup_replies: AtomicU64,
+    metadata_invalidation_events: AtomicU64,
+    metadata_invalidated_inodes: AtomicU64,
     lookup_latency: NativeLatencyMetrics,
     getattr_latency: NativeLatencyMetrics,
     readdir_latency: NativeLatencyMetrics,
@@ -1144,6 +1149,12 @@ pub struct NativeAmplificationMetricsSnapshot {
     pub read_ops: u64,
     /// Application write operations handled by this bridge.
     pub write_ops: u64,
+    /// Negative lookup replies returned to the kernel.
+    pub negative_lookup_replies: u64,
+    /// Metadata invalidation batches triggered by namespace/content changes.
+    pub metadata_invalidation_events: u64,
+    /// Total inode entries included in metadata invalidation batches.
+    pub metadata_invalidated_inodes: u64,
     /// Lookup/getattr ratio scaled by 1,000,000 for integer telemetry export.
     pub lookup_getattr_ratio_micros: u64,
     /// Open/release ratio scaled by 1,000,000 for integer telemetry export.
@@ -1213,6 +1224,17 @@ impl NativeAmplificationMetrics {
         self.write_latency.record(latency_ns);
     }
 
+    fn record_negative_lookup_reply(&self) {
+        self.negative_lookup_replies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_metadata_invalidation(&self, inode_count: u64) {
+        self.metadata_invalidation_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.metadata_invalidated_inodes
+            .fetch_add(inode_count, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> NativeAmplificationMetricsSnapshot {
         let lookup_ops = self.lookup_ops.load(Ordering::Relaxed);
         let getattr_ops = self.getattr_ops.load(Ordering::Relaxed);
@@ -1222,6 +1244,10 @@ impl NativeAmplificationMetrics {
         let release_ops = self.release_ops.load(Ordering::Relaxed);
         let read_ops = self.read_ops.load(Ordering::Relaxed);
         let write_ops = self.write_ops.load(Ordering::Relaxed);
+        let negative_lookup_replies = self.negative_lookup_replies.load(Ordering::Relaxed);
+        let metadata_invalidation_events =
+            self.metadata_invalidation_events.load(Ordering::Relaxed);
+        let metadata_invalidated_inodes = self.metadata_invalidated_inodes.load(Ordering::Relaxed);
         let metadata_ops = lookup_ops + getattr_ops + readdir_ops + readdirplus_ops;
         let fuse_ops = metadata_ops + open_ops + release_ops + read_ops + write_ops;
         let application_io_ops = read_ops + write_ops;
@@ -1244,6 +1270,9 @@ impl NativeAmplificationMetrics {
             release_ops,
             read_ops,
             write_ops,
+            negative_lookup_replies,
+            metadata_invalidation_events,
+            metadata_invalidated_inodes,
             lookup_getattr_ratio_micros: scaled_ratio_micros(lookup_ops, getattr_ops),
             open_release_ratio_micros: scaled_ratio_micros(open_ops, release_ops),
             fuse_ops_per_read_write_micros: scaled_ratio_micros(fuse_ops, application_io_ops),
@@ -1496,6 +1525,7 @@ impl<V> LinuxNativeBridge<V> {
                 NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED,
             ),
             trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
+            metadata_cache_policy: NativeMetadataCachePolicy::linux_automatic(),
             read_ahead_policy: NativeReadAheadPolicy {
                 max_prefetch_bytes: 1024 * 1024,
                 sequential_window_bytes: 128 * 1024,
@@ -1634,13 +1664,22 @@ where
                 self.add_lookup(attr.ino, 1);
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(request.header.unique, &entry_payload(attr)),
+                    ok_reply(
+                        request.header.unique,
+                        &entry_payload(attr, self.metadata_cache_policy),
+                    ),
                 )
             }
-            Err(libc::ENOENT) => FuseReply::contiguous(
-                request.header.unique,
-                ok_reply(request.header.unique, negative_entry_payload()),
-            ),
+            Err(libc::ENOENT) => {
+                self.amplification_metrics.record_negative_lookup_reply();
+                FuseReply::contiguous(
+                    request.header.unique,
+                    ok_reply(
+                        request.header.unique,
+                        &negative_entry_payload(self.metadata_cache_policy.negative_entry_ttl),
+                    ),
+                )
+            }
             Err(errno) => errno_reply(request.header.unique, errno),
         }
     }
@@ -1657,7 +1696,10 @@ where
         match self.vfs.getattr(request.header.nodeid) {
             Ok(attr) => FuseReply::contiguous(
                 request.header.unique,
-                ok_reply(request.header.unique, &attr_out_payload(attr)),
+                ok_reply(
+                    request.header.unique,
+                    &attr_out_payload(attr, self.metadata_cache_policy.attr_ttl),
+                ),
             ),
             Err(errno) => errno_reply(request.header.unique, errno),
         }
@@ -1958,6 +2000,13 @@ where
 
     fn handle_opendir(&self, request: FuseRequest) -> FuseReply {
         match self.vfs.opendir(request.header.nodeid) {
+            Ok(fh) if self.metadata_cache_policy.cache_directory_streams => FuseReply::contiguous(
+                request.header.unique,
+                ok_reply(
+                    request.header.unique,
+                    &open_payload_with_flags(fh, FOPEN_CACHE_DIR),
+                ),
+            ),
             Ok(fh) => FuseReply::contiguous(
                 request.header.unique,
                 ok_reply(
@@ -2016,15 +2065,21 @@ where
 
         match self.vfs.readdir(request.header.nodeid, readdir.fh, offset) {
             Ok(entries) => {
-                let payload =
-                    match readdirplus_payload(&self.vfs, &entries, offset, readdir.size, |ino| {
+                let payload = match readdirplus_payload(
+                    &self.vfs,
+                    &entries,
+                    offset,
+                    readdir.size,
+                    self.metadata_cache_policy,
+                    |ino| {
                         self.add_lookup(ino, 1);
-                    }) {
-                        Ok(payload) => payload,
-                        Err(errno) => {
-                            return errno_reply(request.header.unique, errno);
-                        }
-                    };
+                    },
+                ) {
+                    Ok(payload) => payload,
+                    Err(errno) => {
+                        return errno_reply(request.header.unique, errno);
+                    }
+                };
                 FuseReply::segmented_data(request.header.unique, payload)
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2058,7 +2113,10 @@ where
                 self.add_lookup(attr.ino, 1);
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(request.header.unique, &entry_payload(attr)),
+                    ok_reply(
+                        request.header.unique,
+                        &entry_payload(attr, self.metadata_cache_policy),
+                    ),
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2089,7 +2147,10 @@ where
                 );
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(request.header.unique, &create_payload(attr, fh, decision)),
+                    ok_reply(
+                        request.header.unique,
+                        &create_payload(attr, fh, decision, self.metadata_cache_policy),
+                    ),
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2196,7 +2257,10 @@ where
                 }
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(request.header.unique, &attr_out_payload(attr)),
+                    ok_reply(
+                        request.header.unique,
+                        &attr_out_payload(attr, self.metadata_cache_policy.attr_ttl),
+                    ),
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2259,6 +2323,8 @@ where
     }
 
     fn invalidate_metadata_cache_for_mutation(&self, inodes: &[u64]) {
+        self.amplification_metrics
+            .record_metadata_invalidation(inodes.len() as u64);
         for &ino in inodes {
             self.trusted_open_cache_states.remove(ino);
         }
@@ -2765,38 +2831,42 @@ fn native_dir_entry(entry: DirEntry) -> NativeDirEntry {
     }
 }
 
-fn entry_payload(attr: NativeAttr) -> Vec<u8> {
+fn append_timeout_payload(payload: &mut Vec<u8>, duration: Duration) {
+    payload.extend_from_slice(&duration.as_secs().to_le_bytes());
+}
+
+fn append_timeout_nanos_payload(payload: &mut Vec<u8>, duration: Duration) {
+    payload.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
+}
+
+fn entry_payload(attr: NativeAttr, metadata_cache_policy: NativeMetadataCachePolicy) -> Vec<u8> {
     let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
     payload.extend_from_slice(&attr.ino.to_le_bytes());
     payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
+    append_timeout_payload(&mut payload, metadata_cache_policy.entry_ttl);
+    append_timeout_payload(&mut payload, metadata_cache_policy.attr_ttl);
+    append_timeout_nanos_payload(&mut payload, metadata_cache_policy.entry_ttl);
+    append_timeout_nanos_payload(&mut payload, metadata_cache_policy.attr_ttl);
     append_attr_payload(&mut payload, attr);
     payload
 }
 
-fn negative_entry_payload() -> &'static [u8] {
-    static PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-
-    PAYLOAD.get_or_init(|| {
-        let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&1_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.resize(FUSE_ENTRY_OUT_PAYLOAD_LEN, 0);
-        payload
-    })
+fn negative_entry_payload(entry_ttl: Duration) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
+    payload.extend_from_slice(&0_u64.to_le_bytes());
+    payload.extend_from_slice(&0_u64.to_le_bytes());
+    append_timeout_payload(&mut payload, entry_ttl);
+    payload.extend_from_slice(&0_u64.to_le_bytes());
+    append_timeout_nanos_payload(&mut payload, entry_ttl);
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.resize(FUSE_ENTRY_OUT_PAYLOAD_LEN, 0);
+    payload
 }
 
-fn attr_out_payload(attr: NativeAttr) -> Vec<u8> {
+fn attr_out_payload(attr: NativeAttr, attr_ttl: Duration) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16 + FUSE_ATTR_PAYLOAD_LEN);
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u32.to_le_bytes());
+    append_timeout_payload(&mut payload, attr_ttl);
+    append_timeout_nanos_payload(&mut payload, attr_ttl);
     payload.extend_from_slice(&0_u32.to_le_bytes());
     append_attr_payload(&mut payload, attr);
     payload
@@ -2810,8 +2880,21 @@ fn open_payload(fh: u64, decision: NativeOpenCacheDecision) -> Vec<u8> {
     payload
 }
 
-fn create_payload(attr: NativeAttr, fh: u64, decision: NativeOpenCacheDecision) -> Vec<u8> {
-    let mut payload = entry_payload(attr);
+fn open_payload_with_flags(fh: u64, flags: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16);
+    payload.extend_from_slice(&fh.to_le_bytes());
+    payload.extend_from_slice(&flags.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload
+}
+
+fn create_payload(
+    attr: NativeAttr,
+    fh: u64,
+    decision: NativeOpenCacheDecision,
+    metadata_cache_policy: NativeMetadataCachePolicy,
+) -> Vec<u8> {
+    let mut payload = entry_payload(attr, metadata_cache_policy);
     payload.extend_from_slice(&open_payload(fh, decision));
     payload
 }
@@ -2846,6 +2929,7 @@ fn readdirplus_payload<V: NativeVfs>(
     entries: &[NativeDirEntry],
     offset: i64,
     size: u32,
+    metadata_cache_policy: NativeMetadataCachePolicy,
     mut add_lookup: impl FnMut(u64),
 ) -> Result<Vec<u8>, i32> {
     let start = usize::try_from(offset).unwrap_or(0);
@@ -2866,7 +2950,13 @@ fn readdirplus_payload<V: NativeVfs>(
             Err(errno) if is_stale_dirent_errno(errno) => continue,
             Err(errno) => return Err(errno),
         };
-        payload.extend_from_slice(&entry_payload(attr));
+        payload.extend_from_slice(&entry_payload(
+            attr,
+            NativeMetadataCachePolicy {
+                entry_ttl: metadata_cache_policy.dir_entry_ttl,
+                ..metadata_cache_policy
+            },
+        ));
         append_dirent(&mut payload, entry, next_offset);
         pending_lookups.push(attr.ino);
     }
@@ -3504,7 +3594,8 @@ mod tests {
 
         assert_eq!(reply_errno(&reply), 0);
         assert_eq!(entry_reply_nodeid(&bytes), 0);
-        assert_eq!(entry_reply_valid_seconds(&bytes), 1);
+        assert_eq!(entry_reply_valid_seconds(&bytes), 0);
+        assert_eq!(entry_reply_valid_nanos(&bytes), 250_000_000);
     }
 
     #[test]
@@ -3755,12 +3846,12 @@ mod tests {
     }
 
     #[test]
-    fn negative_entry_payload_reuses_static_payload_buffer() {
-        let first = negative_entry_payload();
-        let second = negative_entry_payload();
+    fn negative_entry_payload_encodes_supplied_ttl() {
+        let payload = negative_entry_payload(Duration::from_millis(250));
 
-        assert_eq!(first.len(), FUSE_ENTRY_OUT_PAYLOAD_LEN);
-        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(payload.len(), FUSE_ENTRY_OUT_PAYLOAD_LEN);
+        assert_eq!(&payload[16..24], &0_u64.to_le_bytes());
+        assert_eq!(&payload[32..36], &250_000_000_u32.to_le_bytes());
     }
 
     #[test]
@@ -3838,7 +3929,14 @@ mod tests {
         let entries = vec![dir_entry(20, b"ok"), dir_entry(21, b"err")];
         let mut looked_up = Vec::new();
 
-        let result = readdirplus_payload(&vfs, &entries, 0, 4096, |ino| looked_up.push(ino));
+        let result = readdirplus_payload(
+            &vfs,
+            &entries,
+            0,
+            4096,
+            NativeMetadataCachePolicy::linux_automatic(),
+            |ino| looked_up.push(ino),
+        );
 
         assert_eq!(result, Err(libc::EIO));
         assert!(looked_up.is_empty());
@@ -5517,6 +5615,15 @@ mod tests {
                 ..crate::native::abi::FUSE_OUT_HEADER_LEN + 24]
                 .try_into()
                 .expect("entry valid"),
+        )
+    }
+
+    fn entry_reply_valid_nanos(reply: &[u8]) -> u32 {
+        u32::from_le_bytes(
+            reply[crate::native::abi::FUSE_OUT_HEADER_LEN + 32
+                ..crate::native::abi::FUSE_OUT_HEADER_LEN + 36]
+                .try_into()
+                .expect("entry valid nanos"),
         )
     }
 

@@ -27,6 +27,7 @@ mod tests {
     type MkdirCall = (u64, Vec<u8>, u32, u32, u16);
     type CreateCall = (u64, Vec<u8>, u32, u32, u16, i32);
     type RenameCall = (u64, Vec<u8>, u64, Vec<u8>);
+    const FOPEN_CACHE_DIR: u32 = 1 << 3;
 
     #[derive(Debug)]
     struct RecordingNativeVfs {
@@ -63,6 +64,9 @@ mod tests {
                 .lock()
                 .expect("lookup calls lock should not be poisoned")
                 .push((parent, name.to_vec()));
+            if name == b"missing" {
+                return Err(libc::ENOENT);
+            }
             Ok(self.attr)
         }
 
@@ -677,6 +681,20 @@ mod tests {
         u64::from_le_bytes(raw)
     }
 
+    fn entry_reply_valid_seconds(reply: &[u8]) -> u64 {
+        let mut raw = [0; 8];
+        let offset = FUSE_OUT_HEADER_LEN + 16;
+        raw.copy_from_slice(&reply[offset..offset + 8]);
+        u64::from_le_bytes(raw)
+    }
+
+    fn entry_reply_valid_nanos(reply: &[u8]) -> u32 {
+        let mut raw = [0; 4];
+        let offset = FUSE_OUT_HEADER_LEN + 32;
+        raw.copy_from_slice(&reply[offset..offset + 4]);
+        u32::from_le_bytes(raw)
+    }
+
     fn attr_reply_size(reply: &[u8]) -> u64 {
         let attr_payload_offset = FUSE_OUT_HEADER_LEN + 16;
         let mut raw = [0; 8];
@@ -1289,6 +1307,56 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_opendir_enables_linux_directory_stream_cache_policy() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(opendir_request(99));
+        let reply = reply.bytes().expect("opendir reply should be contiguous");
+
+        assert_eq!(open_reply_flags(reply), FOPEN_CACHE_DIR);
+    }
+
+    #[test]
+    fn native_bridge_missing_lookup_uses_conservative_negative_entry_ttl() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 8192,
+            kind: NativeFileType::Directory,
+            perm: 0o755,
+            uid: 1000,
+            gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(lookup_request(1, b"missing"));
+        let reply = reply.bytes().expect("lookup reply should be contiguous");
+
+        assert_eq!(entry_reply_nodeid(reply), 0);
+        assert_eq!(entry_reply_valid_seconds(reply), 0);
+        assert_eq!(entry_reply_valid_nanos(reply), 250_000_000);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .negative_lookup_replies,
+            1
+        );
+    }
+
+    #[test]
     fn native_bridge_releasedir_calls_vfs_and_returns_empty_success() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,
@@ -1533,6 +1601,39 @@ mod tests {
         assert_eq!(reply_error(reply), 0);
         assert_eq!(entry_reply_nodeid(reply), 202);
         assert_eq!(create_reply_fh(reply), 7001);
+    }
+
+    #[test]
+    fn native_bridge_create_records_metadata_invalidation_telemetry() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 202,
+            size: 0,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1001,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(create_request(1, b"new-file", 0o100644, libc::O_RDWR));
+        let reply = reply.bytes().expect("create reply should be contiguous");
+
+        assert_eq!(reply_error(reply), 0);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            2
+        );
     }
 
     #[test]

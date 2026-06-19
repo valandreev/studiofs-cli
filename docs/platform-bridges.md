@@ -257,6 +257,16 @@ reads, so Linux page-cache readahead cannot carry sequential reads in the same
 way it does for buffered opens. StudioFS keeps direct I/O out of defaults for
 that reason.
 
+Linux metadata caching uses the automatic native metadata profile. Positive
+lookup entries, inode attributes, and readdirplus directory entries use a
+1-second TTL; negative lookup replies use a conservative 250 ms TTL. Native
+`opendir` replies request `FOPEN_CACHE_DIR` so Linux may cache directory stream
+state, while create, mkdir, unlink, rmdir, rename, write, and size-changing
+setattr paths explicitly invalidate the affected parent or inode state before
+later cached reads can be trusted. The native telemetry snapshot includes
+negative lookup replies plus metadata invalidation event and inode counts, in
+addition to lookup/getattr/readdir/readdirplus operation counts and ratios.
+
 `FUSE_WRITEBACK_CACHE` remains disabled because the kernel may acknowledge and
 merge dirty cached writes before userspace has committed StudioFS local-first
 metadata and payload state. Enabling it needs a separate correctness proof for

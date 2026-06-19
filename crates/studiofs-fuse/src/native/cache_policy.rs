@@ -1,6 +1,41 @@
 //! Linux native page-cache and coherency policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// Linux native metadata-cache policy used by automatic mounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeMetadataCachePolicy {
+    /// TTL for inode attributes returned by `getattr`, `lookup`, and `readdirplus`.
+    pub attr_ttl: Duration,
+    /// TTL for positive directory entries returned by `lookup`.
+    pub entry_ttl: Duration,
+    /// TTL for directory entries returned by `readdirplus`.
+    pub dir_entry_ttl: Duration,
+    /// TTL for negative lookup entries.
+    pub negative_entry_ttl: Duration,
+    /// Whether `opendir` should request Linux directory stream caching.
+    pub cache_directory_streams: bool,
+}
+
+impl NativeMetadataCachePolicy {
+    /// Returns the automatic Linux metadata profile.
+    pub const fn linux_automatic() -> Self {
+        Self {
+            attr_ttl: Duration::from_secs(1),
+            entry_ttl: Duration::from_secs(1),
+            dir_entry_ttl: Duration::from_secs(1),
+            negative_entry_ttl: Duration::from_millis(250),
+            cache_directory_streams: true,
+        }
+    }
+}
+
+impl Default for NativeMetadataCachePolicy {
+    fn default() -> Self {
+        Self::linux_automatic()
+    }
+}
 
 /// Kernel page-cache action selected for an open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +372,20 @@ mod tests {
             dirty: false,
             local_materialized: true,
         }
+    }
+
+    #[test]
+    fn linux_metadata_cache_policy_matches_juicefs_style_defaults() {
+        let policy = NativeMetadataCachePolicy::linux_automatic();
+
+        assert_eq!(policy.attr_ttl, std::time::Duration::from_secs(1));
+        assert_eq!(policy.entry_ttl, std::time::Duration::from_secs(1));
+        assert_eq!(policy.dir_entry_ttl, std::time::Duration::from_secs(1));
+        assert_eq!(
+            policy.negative_entry_ttl,
+            std::time::Duration::from_millis(250)
+        );
+        assert!(policy.cache_directory_streams);
     }
 
     #[test]
