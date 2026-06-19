@@ -135,6 +135,11 @@ impl StudioVfs {
         self.state.deferred_release_inflight.wait(ino).await;
     }
 
+    /// Return whether a deferred last-handle release barrier is currently registered for `ino`.
+    pub fn has_deferred_release_barrier(&self, ino: Ino) -> bool {
+        self.state.deferred_release_inflight.contains(ino)
+    }
+
     /// Wait until any deferred last-handle release barrier for `ino` drains.
     pub async fn wait_for_deferred_release_barrier(&self, ino: Ino) {
         self.wait_for_deferred_release_inflight(ino).await;

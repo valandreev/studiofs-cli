@@ -156,6 +156,11 @@ impl NativeAsyncWriteTurn {
 
 /// VFS operations required by the native Linux bridge operation layer.
 pub trait NativeVfs {
+    /// Return whether an already-scheduled deferred release barrier exists for `ino`.
+    fn has_deferred_release_barrier(&self, _ino: u64) -> bool {
+        false
+    }
+
     /// Resolve `name` under `parent`.
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<NativeAttr, i32>;
 
@@ -282,6 +287,10 @@ pub trait NativeVfs {
 }
 
 impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
+    fn has_deferred_release_barrier(&self, ino: u64) -> bool {
+        (**self).has_deferred_release_barrier(ino)
+    }
+
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<NativeAttr, i32> {
         (**self).lookup(parent, name)
     }
@@ -438,9 +447,20 @@ impl StudioVfsNativeAdapter {
             directory_handles: Arc::new(NativeDirectoryHandleStore::default()),
         }
     }
+
+    fn wait_for_deferred_release_barrier_if_inflight(&self, ino: u64) {
+        if self.vfs.has_deferred_release_barrier(ino) {
+            self.rt
+                .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        }
+    }
 }
 
 impl NativeVfs for StudioVfsNativeAdapter {
+    fn has_deferred_release_barrier(&self, ino: u64) -> bool {
+        self.vfs.has_deferred_release_barrier(ino)
+    }
+
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<NativeAttr, i32> {
         self.vfs
             .lookup(parent, name)
@@ -449,8 +469,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
-        self.rt
-            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        self.wait_for_deferred_release_barrier_if_inflight(ino);
         self.vfs
             .getattr(ino)
             .map(native_attr_from_inode_attr)
@@ -458,8 +477,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn open(&self, ino: u64, flags: i32) -> Result<u64, i32> {
-        self.rt
-            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        self.wait_for_deferred_release_barrier_if_inflight(ino);
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         self.vfs
             .open_file(ino, open_flags, trunc)
@@ -467,8 +485,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
-        self.rt
-            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        self.wait_for_deferred_release_barrier_if_inflight(ino);
         let attr = match self.vfs.getattr(ino) {
             Ok(attr) => attr,
             Err(error) => {
@@ -506,8 +523,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        self.rt
-            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        self.wait_for_deferred_release_barrier_if_inflight(ino);
         let size = checked_native_read_size(size)?;
         // StudioVfs currently reads into initialized slices; avoid unsafe uninit buffers here.
         let mut out = vec![0; size];
@@ -901,12 +917,12 @@ struct NativeAmplificationMetrics {
 const NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS: u64 = 1_000;
 static NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS: AtomicU64 =
     AtomicU64::new(NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS);
-#[cfg(test)]
 static NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[doc(hidden)]
 pub struct NativeBridgeSnapshotIntervalGuard {
     previous_ms: u64,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl Drop for NativeBridgeSnapshotIntervalGuard {
@@ -919,9 +935,15 @@ impl Drop for NativeBridgeSnapshotIntervalGuard {
 pub fn set_native_bridge_snapshot_min_interval_for_test(
     interval: Duration,
 ) -> NativeBridgeSnapshotIntervalGuard {
+    let lock = NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK
+        .lock()
+        .expect("native bridge snapshot interval test lock should not be poisoned");
     let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
     let previous_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.swap(interval_ms, Ordering::Relaxed);
-    NativeBridgeSnapshotIntervalGuard { previous_ms }
+    NativeBridgeSnapshotIntervalGuard {
+        previous_ms,
+        _lock: lock,
+    }
 }
 
 #[cfg(test)]
@@ -1746,7 +1768,7 @@ where
                     request.header.unique,
                     ok_reply(
                         request.header.unique,
-                        &entry_payload(attr, self.metadata_cache_policy),
+                        &entry_payload(attr, &self.metadata_cache_policy),
                     ),
                 )
             }
@@ -2150,7 +2172,7 @@ where
                     &entries,
                     offset,
                     readdir.size,
-                    self.metadata_cache_policy,
+                    &self.metadata_cache_policy,
                     |ino| {
                         self.add_lookup(ino, 1);
                     },
@@ -2195,7 +2217,7 @@ where
                     request.header.unique,
                     ok_reply(
                         request.header.unique,
-                        &entry_payload(attr, self.metadata_cache_policy),
+                        &entry_payload(attr, &self.metadata_cache_policy),
                     ),
                 )
             }
@@ -2229,7 +2251,7 @@ where
                     request.header.unique,
                     ok_reply(
                         request.header.unique,
-                        &create_payload(attr, fh, decision, self.metadata_cache_policy),
+                        &create_payload(attr, fh, decision, &self.metadata_cache_policy),
                     ),
                 )
             }
@@ -2929,14 +2951,22 @@ fn append_timeout_nanos_payload(payload: &mut Vec<u8>, duration: Duration) {
     payload.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
 }
 
-fn entry_payload(attr: NativeAttr, metadata_cache_policy: NativeMetadataCachePolicy) -> Vec<u8> {
+fn entry_payload(attr: NativeAttr, metadata_cache_policy: &NativeMetadataCachePolicy) -> Vec<u8> {
+    entry_payload_with_ttls(
+        attr,
+        metadata_cache_policy.entry_ttl,
+        metadata_cache_policy.attr_ttl,
+    )
+}
+
+fn entry_payload_with_ttls(attr: NativeAttr, entry_ttl: Duration, attr_ttl: Duration) -> Vec<u8> {
     let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
     payload.extend_from_slice(&attr.ino.to_le_bytes());
     payload.extend_from_slice(&0_u64.to_le_bytes());
-    append_timeout_payload(&mut payload, metadata_cache_policy.entry_ttl);
-    append_timeout_payload(&mut payload, metadata_cache_policy.attr_ttl);
-    append_timeout_nanos_payload(&mut payload, metadata_cache_policy.entry_ttl);
-    append_timeout_nanos_payload(&mut payload, metadata_cache_policy.attr_ttl);
+    append_timeout_payload(&mut payload, entry_ttl);
+    append_timeout_payload(&mut payload, attr_ttl);
+    append_timeout_nanos_payload(&mut payload, entry_ttl);
+    append_timeout_nanos_payload(&mut payload, attr_ttl);
     append_attr_payload(&mut payload, attr);
     payload
 }
@@ -2982,7 +3012,7 @@ fn create_payload(
     attr: NativeAttr,
     fh: u64,
     decision: NativeOpenCacheDecision,
-    metadata_cache_policy: NativeMetadataCachePolicy,
+    metadata_cache_policy: &NativeMetadataCachePolicy,
 ) -> Vec<u8> {
     let mut payload = entry_payload(attr, metadata_cache_policy);
     payload.extend_from_slice(&open_payload(fh, decision));
@@ -3019,7 +3049,7 @@ fn readdirplus_payload<V: NativeVfs>(
     entries: &[NativeDirEntry],
     offset: i64,
     size: u32,
-    metadata_cache_policy: NativeMetadataCachePolicy,
+    metadata_cache_policy: &NativeMetadataCachePolicy,
     mut add_lookup: impl FnMut(u64),
 ) -> Result<Vec<u8>, i32> {
     let start = usize::try_from(offset).unwrap_or(0);
@@ -3040,12 +3070,10 @@ fn readdirplus_payload<V: NativeVfs>(
             Err(errno) if is_stale_dirent_errno(errno) => continue,
             Err(errno) => return Err(errno),
         };
-        payload.extend_from_slice(&entry_payload(
+        payload.extend_from_slice(&entry_payload_with_ttls(
             attr,
-            NativeMetadataCachePolicy {
-                entry_ttl: metadata_cache_policy.dir_entry_ttl,
-                ..metadata_cache_policy
-            },
+            metadata_cache_policy.dir_entry_ttl,
+            metadata_cache_policy.attr_ttl,
         ));
         append_dirent(&mut payload, entry, next_offset);
         pending_lookups.push(attr.ino);
@@ -3729,7 +3757,6 @@ mod tests {
 
     #[test]
     fn native_bridge_snapshot_interval_test_guard_allows_immediate_publish() {
-        let _lock = native_bridge_snapshot_interval_test_lock();
         let _guard = set_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
@@ -4048,7 +4075,7 @@ mod tests {
             &entries,
             0,
             4096,
-            NativeMetadataCachePolicy::linux_automatic(),
+            &NativeMetadataCachePolicy::linux_automatic(),
             |ino| looked_up.push(ino),
         );
 
@@ -5081,10 +5108,32 @@ mod tests {
                 .and_then(|rest| rest.split(next_marker).next())
                 .unwrap_or_else(|| panic!("{operation} body should be present"));
             assert!(
-                body.contains("self.vfs.wait_for_deferred_release_barrier(ino)"),
+                body.contains("self.wait_for_deferred_release_barrier_if_inflight(ino)"),
                 "{operation} should wait for a deferred last-handle release before observing inode state"
             );
         }
+    }
+
+    #[test]
+    fn studio_vfs_native_adapter_uses_deferred_release_fast_path() {
+        let source = include_str!("vfs_adapter.rs");
+        let helper_body = source
+            .split("fn wait_for_deferred_release_barrier_if_inflight(&self, ino: u64)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("impl NativeVfs for StudioVfsNativeAdapter")
+                    .next()
+            })
+            .expect("deferred release fast-path helper should be present");
+
+        assert!(
+            helper_body.contains("if self.vfs.has_deferred_release_barrier(ino)"),
+            "deferred release wait should avoid Tokio block_on when no release barrier is registered"
+        );
+        assert!(
+            helper_body.contains("self.vfs.wait_for_deferred_release_barrier(ino)"),
+            "deferred release fast path should still wait when a barrier is registered"
+        );
     }
 
     #[test]

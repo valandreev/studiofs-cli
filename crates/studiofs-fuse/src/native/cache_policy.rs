@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Linux native metadata-cache policy used by automatic mounts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeMetadataCachePolicy {
     /// TTL for inode attributes returned by `getattr`, `lookup`, and `readdirplus`.
     pub attr_ttl: Duration,
