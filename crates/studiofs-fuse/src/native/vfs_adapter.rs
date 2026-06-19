@@ -1,7 +1,7 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -905,21 +905,21 @@ type NativeReadAheadHandles = SmallVec<[u64; 4]>;
 
 #[derive(Debug)]
 struct NativeWillneedHintStateStore {
-    slots: [NativeWillneedHintStateSlot; Self::SLOT_COUNT],
+    slots: [Mutex<NativeWillneedHintStateSlot>; Self::SLOT_COUNT],
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct NativeWillneedHintStateSlot {
-    ino: AtomicU64,
-    fh: AtomicU64,
-    start: AtomicU64,
-    end: AtomicU64,
+    ino: u64,
+    fh: u64,
+    start: u64,
+    end: u64,
 }
 
 impl Default for NativeWillneedHintStateStore {
     fn default() -> Self {
         Self {
-            slots: std::array::from_fn(|_| NativeWillneedHintStateSlot::default()),
+            slots: std::array::from_fn(|_| Mutex::new(NativeWillneedHintStateSlot::default())),
         }
     }
 }
@@ -939,39 +939,48 @@ impl NativeWillneedHintStateStore {
 
     fn should_hint(&self, ino: u64, fh: u64, offset: u64, len: u32) -> bool {
         let hint_end = offset.saturating_add(u64::from(len));
-        let slot = &self.slots[Self::slot_index(ino, fh)];
-        if slot.ino.load(Ordering::Relaxed) != ino || slot.fh.load(Ordering::Relaxed) != fh {
-            slot.start.store(offset, Ordering::Relaxed);
-            slot.end.store(hint_end, Ordering::Relaxed);
-            slot.fh.store(fh, Ordering::Relaxed);
-            slot.ino.store(ino, Ordering::Relaxed);
+        let mut slot = lock_or_recover(
+            &self.slots[Self::slot_index(ino, fh)],
+            "native_willneed_hint_state_slot",
+        );
+        if slot.ino != ino || slot.fh != fh {
+            *slot = NativeWillneedHintStateSlot {
+                ino,
+                fh,
+                start: offset,
+                end: hint_end,
+            };
             return true;
         }
 
-        let last_start = slot.start.load(Ordering::Relaxed);
-        let last_end = slot.end.load(Ordering::Relaxed);
-        if offset >= last_start && hint_end <= last_end {
+        if offset >= slot.start && hint_end <= slot.end {
             return false;
         }
-        slot.start.store(offset, Ordering::Relaxed);
-        slot.end.store(hint_end, Ordering::Relaxed);
+        slot.start = offset;
+        slot.end = hint_end;
         true
     }
 
     fn invalidate_inodes(&self, inodes: &[u64]) {
-        for &ino in inodes {
-            for slot in &self.slots {
-                if slot.ino.load(Ordering::Relaxed) == ino {
-                    slot.ino.store(0, Ordering::Relaxed);
-                }
+        if inodes.is_empty() {
+            return;
+        }
+        let inodes: HashSet<u64> = inodes.iter().copied().collect();
+        for slot in &self.slots {
+            let mut slot = lock_or_recover(slot, "native_willneed_hint_state_slot");
+            if inodes.contains(&slot.ino) {
+                slot.ino = 0;
             }
         }
     }
 
     fn remove_handle(&self, ino: u64, fh: u64) {
-        let slot = &self.slots[Self::slot_index(ino, fh)];
-        if slot.ino.load(Ordering::Relaxed) == ino && slot.fh.load(Ordering::Relaxed) == fh {
-            slot.ino.store(0, Ordering::Relaxed);
+        let mut slot = lock_or_recover(
+            &self.slots[Self::slot_index(ino, fh)],
+            "native_willneed_hint_state_slot",
+        );
+        if slot.ino == ino && slot.fh == fh {
+            slot.ino = 0;
         }
     }
 }
