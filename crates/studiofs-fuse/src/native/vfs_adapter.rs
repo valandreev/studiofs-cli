@@ -1,7 +1,8 @@
 //! Native Linux FUSE operation adapter backed by StudioFS VFS contracts.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use studiofs_vfs::{
     VfsNativeBridgeSnapshot, VfsNativeLatencySnapshot,
 };
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::StudioFuseRuntimeOptions;
 use crate::fs::pending_write_tracker::{
@@ -709,6 +710,7 @@ pub struct LinuxNativeBridge<V> {
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     read_ahead_policy: NativeReadAheadPolicy,
     read_ahead_states: NativeReadAheadStateStore,
+    willneed_hint_states: NativeWillneedHintStateStore,
 }
 
 /// Native Linux async write admission and telemetry profile.
@@ -822,6 +824,8 @@ struct NativeReadMetrics {
     pread_local_cache_replies: AtomicU64,
     splice_local_cache_replies: AtomicU64,
     local_cache_reply_bytes: AtomicU64,
+    local_cache_willneed_hints: AtomicU64,
+    local_cache_willneed_errors: AtomicU64,
     bytes_returned: AtomicU64,
     read_ahead_prefetches: AtomicU64,
     read_ahead_suppressed: AtomicU64,
@@ -898,6 +902,90 @@ struct NativeReadAheadStateStore {
 }
 
 type NativeReadAheadHandles = SmallVec<[u64; 4]>;
+
+#[derive(Debug)]
+struct NativeWillneedHintStateStore {
+    slots: [Mutex<NativeWillneedHintStateSlot>; Self::SLOT_COUNT],
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct NativeWillneedHintStateSlot {
+    ino: u64,
+    fh: u64,
+    start: u64,
+    end: u64,
+}
+
+impl Default for NativeWillneedHintStateStore {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Mutex::new(NativeWillneedHintStateSlot::default())),
+        }
+    }
+}
+
+impl NativeWillneedHintStateStore {
+    const SLOT_COUNT: usize = 1024;
+
+    fn slot_index(ino: u64, fh: u64) -> usize {
+        let mut value = ino ^ fh.rotate_left(32);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value as usize) & (Self::SLOT_COUNT - 1)
+    }
+
+    fn should_hint(&self, ino: u64, fh: u64, offset: u64, len: u32) -> bool {
+        let hint_end = offset.saturating_add(u64::from(len));
+        let mut slot = lock_or_recover(
+            &self.slots[Self::slot_index(ino, fh)],
+            "native_willneed_hint_state_slot",
+        );
+        if slot.ino != ino || slot.fh != fh {
+            *slot = NativeWillneedHintStateSlot {
+                ino,
+                fh,
+                start: offset,
+                end: hint_end,
+            };
+            return true;
+        }
+
+        if offset >= slot.start && hint_end <= slot.end {
+            return false;
+        }
+        slot.start = offset;
+        slot.end = hint_end;
+        true
+    }
+
+    fn invalidate_inodes(&self, inodes: &[u64]) {
+        if inodes.is_empty() {
+            return;
+        }
+        let inodes: HashSet<u64> = inodes.iter().copied().collect();
+        for slot in &self.slots {
+            let mut slot = lock_or_recover(slot, "native_willneed_hint_state_slot");
+            if inodes.contains(&slot.ino) {
+                slot.ino = 0;
+            }
+        }
+    }
+
+    fn remove_handle(&self, ino: u64, fh: u64) {
+        let mut slot = lock_or_recover(
+            &self.slots[Self::slot_index(ino, fh)],
+            "native_willneed_hint_state_slot",
+        );
+        if slot.ino == ino && slot.fh == fh {
+            slot.ino = 0;
+        }
+    }
+}
+
+const _: () = assert!(NativeWillneedHintStateStore::SLOT_COUNT.is_power_of_two());
 
 impl Default for NativeReadAheadStateStore {
     fn default() -> Self {
@@ -1297,6 +1385,10 @@ pub struct NativeReadMetricsSnapshot {
     pub splice_local_cache_replies: u64,
     /// Payload bytes returned through local-cache reply strategies.
     pub local_cache_reply_bytes: u64,
+    /// Trusted local-cache replies that issued a `POSIX_FADV_WILLNEED` hint.
+    pub local_cache_willneed_hints: u64,
+    /// Trusted local-cache replies whose `POSIX_FADV_WILLNEED` hint failed.
+    pub local_cache_willneed_errors: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
     /// Read-ahead decisions that issued a prefetch hint.
@@ -1330,6 +1422,37 @@ fn fetch_add_if_nonzero(metric: &AtomicU64, delta: u64) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn native_local_cache_willneed(range: &NativeLocalCacheReadRange) -> io::Result<()> {
+    let offset = libc::off_t::try_from(range.file_offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local cache range offset exceeds off_t",
+        )
+    })?;
+    let len = libc::off_t::try_from(u64::from(range.len)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local cache range length exceeds off_t",
+        )
+    })?;
+    let rc = unsafe {
+        // SAFETY: `range.fd` is owned or borrowed from a live local-cache range for
+        // the duration of this call, and POSIX_FADV_WILLNEED is advisory only.
+        libc::posix_fadvise(range.fd, offset, len, libc::POSIX_FADV_WILLNEED)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_local_cache_willneed(_range: &NativeLocalCacheReadRange) -> io::Result<()> {
+    Ok(())
+}
+
 impl NativeReadMetrics {
     fn snapshot(&self) -> NativeReadMetricsSnapshot {
         NativeReadMetricsSnapshot {
@@ -1344,6 +1467,8 @@ impl NativeReadMetrics {
             pread_local_cache_replies: self.pread_local_cache_replies.load(Ordering::Relaxed),
             splice_local_cache_replies: self.splice_local_cache_replies.load(Ordering::Relaxed),
             local_cache_reply_bytes: self.local_cache_reply_bytes.load(Ordering::Relaxed),
+            local_cache_willneed_hints: self.local_cache_willneed_hints.load(Ordering::Relaxed),
+            local_cache_willneed_errors: self.local_cache_willneed_errors.load(Ordering::Relaxed),
             bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
             read_ahead_prefetches: self.read_ahead_prefetches.load(Ordering::Relaxed),
             read_ahead_suppressed: self.read_ahead_suppressed.load(Ordering::Relaxed),
@@ -1377,6 +1502,7 @@ impl<V> LinuxNativeBridge<V> {
                 min_sequential_reads: 2,
             },
             read_ahead_states: NativeReadAheadStateStore::default(),
+            willneed_hint_states: NativeWillneedHintStateStore::default(),
         }
     }
 
@@ -1614,6 +1740,7 @@ where
             Ok(Some(range)) => {
                 match self.trusted_local_cache_read_range(request.header.nodeid, read.size, range) {
                     LocalCacheReadRangeDecision::Trusted(range) => {
+                        self.record_local_cache_willneed(request.header.nodeid, read.fh, &range);
                         let range_len = range.len;
                         match FuseReply::local_cache_range_data(request.header.unique, range) {
                             Ok(reply) => {
@@ -2136,10 +2263,12 @@ where
             self.trusted_open_cache_states.remove(ino);
         }
         self.read_ahead_states.invalidate_inodes(inodes);
+        self.willneed_hint_states.invalidate_inodes(inodes);
     }
 
     fn forget_read_ahead_handle(&self, ino: u64, fh: u64) {
         self.read_ahead_states.remove_handle(ino, fh);
+        self.willneed_hint_states.remove_handle(ino, fh);
     }
 
     fn trusted_local_cache_read_range(
@@ -2165,6 +2294,35 @@ where
             LocalCacheReadRangeDecision::Trusted(range)
         } else {
             LocalCacheReadRangeDecision::Unsafe
+        }
+    }
+
+    fn record_local_cache_willneed(&self, ino: u64, fh: u64, range: &NativeLocalCacheReadRange) {
+        if !self
+            .willneed_hint_states
+            .should_hint(ino, fh, range.file_offset, range.len)
+        {
+            return;
+        }
+        match native_local_cache_willneed(range) {
+            Ok(()) => {
+                self.read_metrics
+                    .local_cache_willneed_hints
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.read_metrics
+                    .local_cache_willneed_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    ino,
+                    fh,
+                    offset = range.file_offset,
+                    len = range.len,
+                    error = ?error,
+                    "native local cache willneed hint failed"
+                );
+            }
         }
     }
 
@@ -2356,6 +2514,8 @@ fn vfs_native_bridge_snapshot(
         pread_local_cache_replies: read.pread_local_cache_replies,
         splice_local_cache_replies: read.splice_local_cache_replies,
         local_cache_reply_bytes: read.local_cache_reply_bytes,
+        local_cache_willneed_hints: read.local_cache_willneed_hints,
+        local_cache_willneed_errors: read.local_cache_willneed_errors,
         bytes_returned: read.bytes_returned,
         read_ahead_prefetches: read.read_ahead_prefetches,
         read_ahead_suppressed: read.read_ahead_suppressed,
@@ -3119,13 +3279,13 @@ mod tests {
             &self,
             _fh: u64,
             _ino: u64,
-            _offset: u64,
+            offset: u64,
             _size: u32,
         ) -> Result<Option<NativeLocalCacheReadRange>, i32> {
             self.local_cache_read_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Some(NativeLocalCacheReadRange::borrowed(
                 self.local_cache_file.as_raw_fd(),
-                4096,
+                offset,
                 8192,
                 9,
             )))
@@ -3724,6 +3884,86 @@ mod tests {
     }
 
     #[test]
+    fn handle_read_advises_willneed_for_trusted_local_cache_range() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_some());
+        assert_eq!(bridge.read_metrics_snapshot().local_cache_willneed_hints, 1);
+    }
+
+    #[test]
+    fn handle_read_coalesces_repeated_willneed_hints_for_trusted_local_cache_range() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let first = bridge.handle_read(read_request_for_size(8192));
+        let second = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(first.local_cache_range().is_some());
+        assert!(second.local_cache_range().is_some());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.local_cache_hits, 2);
+        assert_eq!(metrics.local_cache_willneed_hints, 1);
+    }
+
+    #[test]
+    fn handle_read_reissues_willneed_hint_after_rewind_on_same_handle() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 32 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let _ = bridge.handle_read(read_request_for_offset_and_size(0, 8192));
+        let _ = bridge.handle_read(read_request_for_offset_and_size(8192, 8192));
+        let rewind = bridge.handle_read(read_request_for_offset_and_size(0, 8192));
+
+        assert!(rewind.local_cache_range().is_some());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.local_cache_hits, 3);
+        assert_eq!(metrics.local_cache_willneed_hints, 3);
+    }
+
+    #[test]
     fn handle_read_triggers_bounded_readahead_for_sequential_trusted_reads() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(vfs.clone());
@@ -3746,10 +3986,7 @@ mod tests {
 
         assert_eq!(vfs.advise_read_ahead_calls.load(Ordering::Relaxed), 1);
         assert_eq!(vfs.last_read_ahead_offset.load(Ordering::Relaxed), 16_384);
-        assert_eq!(
-            vfs.last_read_ahead_len.load(Ordering::Relaxed),
-            64 * 1024 - 16_384
-        );
+        assert_eq!(vfs.last_read_ahead_len.load(Ordering::Relaxed), 8192);
     }
 
     #[test]
@@ -3811,6 +4048,36 @@ mod tests {
         let sequential_metrics = bridge.read_metrics_snapshot();
         assert_eq!(sequential_metrics.read_ahead_prefetches, 1);
         assert!(sequential_metrics.read_ahead_amplification_bytes > 0);
+    }
+
+    #[test]
+    fn read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(vfs.clone());
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 2 * 1024 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        for block in 0..8u64 {
+            let _ = bridge.handle_read(read_request_for_offset_and_size(block * 8192, 8192));
+        }
+        let sequential = bridge.read_metrics_snapshot();
+        assert!(sequential.read_ahead_prefetches > 1);
+        assert!(sequential.read_ahead_amplification_bytes > 0);
+
+        let _ = bridge.handle_read(read_request_for_offset_and_size(1024 * 1024, 8192));
+        let sparse = bridge.read_metrics_snapshot();
+        assert!(sparse.read_ahead_suppressed > sequential.read_ahead_suppressed);
     }
 
     #[test]

@@ -698,6 +698,28 @@ pub(super) fn derive_hotspots(
         push_hotspot(
             &mut hotspots,
             scope,
+            SUBSYSTEM_CACHE,
+            OPERATION_PREFETCH_QUEUE,
+            "read_ahead_deduped_prefetch_blocks",
+            snapshot.cache.state.read_ahead_deduped_prefetch_blocks as f64,
+            vec![runtime_snapshot_reference(
+                "cache.state.read_ahead_deduped_prefetch_blocks",
+            )],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_CACHE,
+            OPERATION_PREFETCH_QUEUE,
+            "fetch.singleflight_wait_max_ms",
+            snapshot.write_path.fetch.singleflight_wait_max_ms,
+            vec![runtime_snapshot_reference(
+                "write_path.fetch.singleflight_wait_max_ms",
+            )],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
             SUBSYSTEM_SYNCHRONIZATION,
             OPERATION_METADATA_BACKLOG,
             "pending_metadata_ops",
@@ -1712,4 +1734,54 @@ pub(super) fn capture_bundle_artifact(
         path: path.to_string_lossy().into_owned(),
         bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_hotspots_reports_readahead_prefetch_deduplication() {
+        let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+        snapshot.cache.state.read_ahead_deduped_prefetch_blocks = 7;
+
+        let (hotspots, truncated) = derive_hotspots(
+            &DiagnosticsEvidenceScope::default(),
+            Some(&snapshot),
+            &[],
+            16,
+        );
+
+        assert!(!truncated);
+        assert!(hotspots.iter().any(|hotspot| {
+            hotspot.subsystem == SUBSYSTEM_CACHE
+                && hotspot.operation_type == OPERATION_PREFETCH_QUEUE
+                && hotspot.metric == "read_ahead_deduped_prefetch_blocks"
+                && hotspot.score == 7.0
+        }));
+    }
+
+    #[test]
+    fn derive_hotspots_reports_singleflight_wait_latency() {
+        let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+        snapshot.write_path.fetch.singleflight_wait_max_ms = 12.5;
+
+        let (hotspots, truncated) = derive_hotspots(
+            &DiagnosticsEvidenceScope::default(),
+            Some(&snapshot),
+            &[],
+            16,
+        );
+
+        assert!(!truncated);
+        assert!(hotspots.iter().any(|hotspot| {
+            hotspot.subsystem == SUBSYSTEM_CACHE
+                && hotspot.operation_type == OPERATION_PREFETCH_QUEUE
+                && hotspot.metric == "fetch.singleflight_wait_max_ms"
+                && hotspot.score == 12.5
+                && hotspot.supporting_evidence.iter().any(|reference| {
+                    reference.field.as_deref() == Some("write_path.fetch.singleflight_wait_max_ms")
+                })
+        }));
+    }
 }

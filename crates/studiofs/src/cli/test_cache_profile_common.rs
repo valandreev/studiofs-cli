@@ -9,6 +9,10 @@ use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 
 const WINFSP_CLEANUP_REGRESSION_ISSUE: &str = "SFS-192";
 
+fn format_duration_ms(ms: f64) -> String {
+    format!("{ms:.1}ms")
+}
+
 pub(crate) fn collect_write_path_artifacts(
     output_dir: &Path,
     run_id: &str,
@@ -212,11 +216,13 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(snapshot.upload.canceled_stale_after_put_bytes)
     ));
     out.push_str(&format!(
-        "fetch: cache_hits={} s3_fetches={} s3_errors={} singleflight={} retries={} bytes_downloaded={} prefetch_skips={}\n",
+        "fetch: cache_hits={} s3_fetches={} s3_errors={} singleflight={} singleflight_waits={} singleflight_wait_max={} retries={} bytes_downloaded={} prefetch_skips={}\n",
         snapshot.fetch.cache_hits,
         snapshot.fetch.s3_fetches,
         snapshot.fetch.s3_errors,
         snapshot.fetch.singleflight_joins,
+        snapshot.fetch.singleflight_waits,
+        format_duration_ms(snapshot.fetch.singleflight_wait_max_ms),
         snapshot.fetch.retries,
         format_bytes(snapshot.fetch.bytes_downloaded),
         snapshot.fetch.prefetch_skips
@@ -380,6 +386,8 @@ mod tests {
                 s3_fetches: 5,
                 s3_errors: 1,
                 singleflight_joins: 2,
+                singleflight_waits: 2,
+                singleflight_wait_max_ms: 4.5,
                 retries: 1,
                 bytes_downloaded: 20 * 1024 * 1024,
                 prefetch_skips: 9,
@@ -400,7 +408,7 @@ mod tests {
                 .contains("upload_stale: total=7 before_put=4 after_put=3 after_put_bytes=12.0MiB")
         );
         assert!(summary.contains(
-            "fetch: cache_hits=11 s3_fetches=5 s3_errors=1 singleflight=2 retries=1 bytes_downloaded=20.0MiB prefetch_skips=9"
+            "fetch: cache_hits=11 s3_fetches=5 s3_errors=1 singleflight=2 singleflight_waits=2 singleflight_wait_max=4.5ms retries=1 bytes_downloaded=20.0MiB prefetch_skips=9"
         ));
         assert!(summary.contains(
             "fetch_crypto: encrypted_objects=4 encrypted_bytes=1.5KiB crypto_failures=3 malformed=1"

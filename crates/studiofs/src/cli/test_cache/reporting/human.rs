@@ -136,11 +136,12 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
     if let Some(fetch) = &observability.fetch {
         let _ = writeln!(
             out,
-            "Fetch: cache hits {}, S3 GETs {}, downloaded {}, singleflight {}, prefetch skips {}",
+            "Fetch: cache hits {}, S3 GETs {}, downloaded {}, singleflight {}, wait max {}, prefetch skips {}",
             fetch.cache_hits,
             fetch.s3_fetches,
             format_bytes(fetch.bytes_downloaded),
             fetch.singleflight_joins,
+            format_duration_ms(fetch.raw.singleflight_wait_max_ms),
             fetch.prefetch_skips,
         );
         let _ = writeln!(

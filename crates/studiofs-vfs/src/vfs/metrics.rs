@@ -461,6 +461,10 @@ pub struct VfsNativeBridgeSnapshot {
     pub splice_local_cache_replies: u64,
     /// Payload bytes returned through local-cache reply strategies.
     pub local_cache_reply_bytes: u64,
+    /// Trusted local-cache replies that issued a kernel `WILLNEED` hint.
+    pub local_cache_willneed_hints: u64,
+    /// Trusted local-cache replies whose kernel `WILLNEED` hint failed.
+    pub local_cache_willneed_errors: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
     /// Read-ahead decisions that issued a prefetch hint.
@@ -789,6 +793,18 @@ pub struct VfsFetchStats {
     pub s3_errors: u64,
     /// Singleflight join count.
     pub singleflight_joins: u64,
+    /// Singleflight wait count.
+    #[serde(default)]
+    pub singleflight_waits: u64,
+    /// Total singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_total_ms: f64,
+    /// Average singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_avg_ms: f64,
+    /// Maximum singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_max_ms: f64,
     /// Retry attempt count.
     pub retries: u64,
     /// Total bytes downloaded.
@@ -1406,6 +1422,9 @@ pub struct VfsCacheStateSnapshot {
     pub local_backend_dirty_objects: usize,
     /// Current prefetch queue depth.
     pub prefetch_queue_depth: u64,
+    /// Prefetch block candidates suppressed because an equivalent prefetch was already in-flight.
+    #[serde(default)]
+    pub read_ahead_deduped_prefetch_blocks: u64,
     /// Transit memory snapshot.
     pub transit_memory: VfsTransitMemorySnapshot,
 }

@@ -6167,6 +6167,23 @@ fn default_readahead_tracks_the_juicefs_sized_buffer_budget() {
 }
 
 #[test]
+fn cache_state_snapshot_reports_readahead_prefetch_deduplication() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "readahead-dedupe-snapshot");
+
+    let _ = vfs.readahead.record_read(77, 0, 0);
+    let blocks = vfs.readahead.record_read(77, 1, 1);
+    for block in blocks {
+        let _ = vfs.readahead.start_prefetch(77, block);
+    }
+    let _ = vfs.readahead.record_read(77, 2, 2);
+
+    let snapshot = vfs.cache_state_snapshot();
+
+    assert!(snapshot.read_ahead_deduped_prefetch_blocks > 0);
+}
+
+#[test]
 fn upload_aimd_uses_independent_idle_reset_policy() {
     let upload_aimd = build_upload_aimd_config(&VfsConfig {
         upload_idle_reset_secs: 120,
@@ -11936,6 +11953,18 @@ fn write_path_observability_reports_fetch_counters() {
         .store(3, Ordering::Relaxed);
     vfs.fetch_scheduler
         .metrics
+        .singleflight_waits
+        .store(3, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .singleflight_wait_total_ns
+        .store(6_000_000, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .singleflight_wait_max_ns
+        .store(4_000_000, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
         .bytes_downloaded
         .store(20 * 1024 * 1024, Ordering::Relaxed);
 
@@ -11944,6 +11973,10 @@ fn write_path_observability_reports_fetch_counters() {
     assert_eq!(snapshot.fetch.cache_hits, 13);
     assert_eq!(snapshot.fetch.s3_fetches, 5);
     assert_eq!(snapshot.fetch.singleflight_joins, 3);
+    assert_eq!(snapshot.fetch.singleflight_waits, 3);
+    assert_eq!(snapshot.fetch.singleflight_wait_total_ms, 6.0);
+    assert_eq!(snapshot.fetch.singleflight_wait_avg_ms, 2.0);
+    assert_eq!(snapshot.fetch.singleflight_wait_max_ms, 4.0);
     assert_eq!(snapshot.fetch.bytes_downloaded, 20 * 1024 * 1024);
 }
 
@@ -12077,6 +12110,8 @@ fn write_path_observability_reports_native_bridge_snapshot() {
         pread_local_cache_replies: 6,
         splice_local_cache_replies: 8,
         local_cache_reply_bytes: 32 * 1024,
+        local_cache_willneed_hints: 10,
+        local_cache_willneed_errors: 1,
         read_ahead_amplification_bytes: 64 * 1024,
         ..VfsNativeBridgeSnapshot::default()
     });
@@ -12090,6 +12125,8 @@ fn write_path_observability_reports_native_bridge_snapshot() {
     assert_eq!(snapshot.native_bridge.pread_local_cache_replies, 6);
     assert_eq!(snapshot.native_bridge.splice_local_cache_replies, 8);
     assert_eq!(snapshot.native_bridge.local_cache_reply_bytes, 32 * 1024);
+    assert_eq!(snapshot.native_bridge.local_cache_willneed_hints, 10);
+    assert_eq!(snapshot.native_bridge.local_cache_willneed_errors, 1);
     assert_eq!(
         snapshot.native_bridge.read_ahead_amplification_bytes,
         64 * 1024

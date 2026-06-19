@@ -46,9 +46,22 @@ pub struct ReadAheadPolicy {
     pub prefetch_enabled: bool,
 }
 
+/// Snapshot of read-ahead planner counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadAheadMetricsSnapshot {
+    /// Prefetch block candidates suppressed because the block was already in-flight.
+    pub deduped_prefetch_blocks: u64,
+}
+
 /// Maximum idle gap before the read state resets back to cold, in microseconds.
 const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
+
+fn fetch_add_if_nonzero(metric: &AtomicU64, delta: u64) {
+    if delta != 0 {
+        metric.fetch_add(delta, Ordering::Relaxed);
+    }
+}
 
 // =============================================================================
 // Internal state
@@ -59,6 +72,8 @@ struct ReadState {
     last_block: u32,
     /// Whether recent reads established sequential forward progress.
     sequential_ready: bool,
+    /// Contiguous forward reads observed since the stream became sequential.
+    sequential_streak: u32,
     /// Fixed prefetch width once the sequential window opens.
     current_width: u32,
     /// Monotonic timestamp (microseconds) when this inode was last read.
@@ -75,6 +90,8 @@ pub struct ReadAheadTracker {
     states: DashMap<ReadStreamKey, ReadState>,
     /// Blocks that are already being prefetched — avoids duplicate work.
     inflight: DashMap<(Ino, u32), ()>,
+    /// Prefetch candidates suppressed by in-flight deduplication.
+    deduped_prefetch_blocks: AtomicU64,
     /// Maximum blocks ahead to fetch when fully ramped-up.
     pub width: u32,
     /// Baseline prefetch width before ramp-up.
@@ -121,6 +138,7 @@ impl ReadAheadTracker {
         let mut state = self.states.entry(key).or_insert(ReadState {
             last_block: u32::MAX,
             sequential_ready: false,
+            sequential_streak: 0,
             current_width: base_width,
             last_read_at_micros: 0,
         });
@@ -129,6 +147,7 @@ impl ReadAheadTracker {
             && now_micros.saturating_sub(state.last_read_at_micros) > READ_STATE_IDLE_RESET_US
         {
             state.sequential_ready = false;
+            state.sequential_streak = 0;
             state.current_width = base_width;
             state.last_block = u32::MAX;
         }
@@ -146,13 +165,23 @@ impl ReadAheadTracker {
         let was_ready = state.sequential_ready;
         if is_sequential {
             state.sequential_ready = true;
-            state.current_width = fixed_width;
+            state.sequential_streak = state.sequential_streak.saturating_add(1);
+            state.current_width = if was_ready {
+                state
+                    .current_width
+                    .saturating_mul(2)
+                    .clamp(fixed_width, max_width)
+            } else {
+                fixed_width
+            };
         } else if is_same_block {
             if !state.sequential_ready {
+                state.sequential_streak = 0;
                 state.current_width = base_width;
             }
         } else {
             state.sequential_ready = false;
+            state.sequential_streak = 0;
             state.current_width = base_width;
         }
 
@@ -169,16 +198,20 @@ impl ReadAheadTracker {
         if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
             return Vec::new();
         }
-        (1..=current_width)
+        let mut deduped_blocks = 0_u64;
+        let prefetch = (1..=current_width)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
                 if self.inflight.contains_key(&(key.ino, block)) {
+                    deduped_blocks += 1;
                     None // Already in-flight
                 } else {
                     Some(block)
                 }
             })
-            .collect()
+            .collect();
+        fetch_add_if_nonzero(&self.deduped_prefetch_blocks, deduped_blocks);
+        prefetch
     }
 
     /// Create a new tracker.
@@ -202,9 +235,17 @@ impl ReadAheadTracker {
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
             inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
+            deduped_prefetch_blocks: AtomicU64::new(0),
             width,
             base_width,
             min_prefetch_on_seq,
+        }
+    }
+
+    /// Return read-ahead planner counters for observability.
+    pub fn metrics_snapshot(&self) -> ReadAheadMetricsSnapshot {
+        ReadAheadMetricsSnapshot {
+            deduped_prefetch_blocks: self.deduped_prefetch_blocks.load(Ordering::Relaxed),
         }
     }
 
@@ -354,72 +395,54 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_ramp_up() {
-        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
+    fn test_sequential_reads_grow_window_toward_max_width() {
+        let tracker = ReadAheadTracker::new_with_bounds(2, 16, 2);
         let mut t = 1_000_000u64;
 
         // First read: block 0 establishes baseline state only.
         let p = tracker.record_read_at_micros(1, 0, 0, t);
         assert!(p.is_empty());
 
-        // Second read: block 1 opens the fixed sequential window.
+        // Second read: block 1 opens the sequential window at the base width.
         t = t.saturating_add(500_000);
         let p = tracker.record_read_at_micros(1, 1, 1, t);
         assert_eq!(
             p.len(),
-            8,
-            "sequential reads should use the configured window"
+            2,
+            "sequential reads should start from the configured base window"
         );
         assert_eq!(p[0], 2, "prefetch should start immediately after read head");
+        assert_eq!(tracker.debug_width(1), Some(2));
 
-        // Continued sequential reads keep the same stable width.
-        t = t.saturating_add(500_000);
-        let p = tracker.record_read_at_micros(1, 2, 2, t);
-        assert_eq!(
-            p.len(),
-            8,
-            "the simplified model should avoid widening surprises"
-        );
-        assert_eq!(tracker.debug_width(1), Some(8));
-
-        let mut last = 2u32;
-        for _ in 0..20 {
-            last += 1;
+        for block in 2..=8 {
             t = t.saturating_add(500_000);
-            let _ = tracker.record_read_at_micros(1, last, last, t);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
         }
-        assert_eq!(tracker.debug_width(1), Some(8));
-        t = t.saturating_add(500_000);
-        let blocks = tracker.record_read_at_micros(1, last + 1, last + 1, t);
-        assert!(
-            blocks.len() <= 8,
-            "prefetch depth should stay on the configured fixed window"
-        );
+
+        assert_eq!(tracker.debug_width(1), Some(16));
     }
 
     #[test]
-    fn test_random_seek_scales_back_to_base_width() {
-        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
+    fn test_random_seek_shrinks_adaptive_window_to_base_width() {
+        let tracker = ReadAheadTracker::new_with_bounds(2, 16, 2);
         let mut t = 1_000_000u64;
 
-        let _ = tracker.record_read_at_micros(1, 0, 0, t);
-        t = t.saturating_add(500_000);
-        let _ = tracker.record_read_at_micros(1, 1, 1, t);
-        t = t.saturating_add(500_000);
-        let _ = tracker.record_read_at_micros(1, 2, 2, t);
-        assert_eq!(tracker.debug_width(1), Some(8));
+        for block in 0..=8 {
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+            t = t.saturating_add(500_000);
+        }
+        assert_eq!(tracker.debug_width(1), Some(16));
 
-        t = t.saturating_add(500_000);
         let random = tracker.record_read_at_micros(1, 1000, 1000, t);
         assert!(
             random.is_empty(),
             "random jump should suppress immediate prefetch"
         );
-        assert_eq!(tracker.debug_width(1), Some(8));
+        assert_eq!(tracker.debug_width(1), Some(2));
     }
 
     #[test]
-    fn test_large_span_opens_the_same_fixed_window() {
+    fn test_large_span_opens_base_window_before_growth() {
         let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1);
         let mut t = 1_000_000u64;
 
@@ -476,6 +499,10 @@ mod tests {
                 b
             );
         }
+        assert!(
+            tracker.metrics_snapshot().deduped_prefetch_blocks > 0,
+            "in-flight prefetch candidates should be counted as deduped"
+        );
     }
 
     #[test]
@@ -638,7 +665,7 @@ mod tests {
             t = t.saturating_add(1_000_000);
             let _ = tracker.record_read_at_micros(1, block, block, t);
         }
-        assert_eq!(tracker.debug_width(1), Some(16));
+        assert_eq!(tracker.debug_width(1), Some(256));
 
         // A far non-sequential jump should clear the current sequential state.
         t = t.saturating_add(1_000);
@@ -659,7 +686,7 @@ mod tests {
             t = t.saturating_add(1_000_000);
             let _ = tracker.record_read_at_micros(1, block, block, t);
         }
-        assert_eq!(tracker.debug_width(1), Some(16));
+        assert_eq!(tracker.debug_width(1), Some(256));
 
         t = t.saturating_add(15_000_000);
         let reset = tracker.record_read_at_micros(1, 9, 9, t);
@@ -673,12 +700,12 @@ mod tests {
         let resumed = tracker.record_read_at_micros(1, 10, 10, t);
         assert!(
             !resumed.is_empty(),
-            "the next contiguous read should re-open the fixed sequential prefetch window"
+            "the next contiguous read should re-open the adaptive sequential prefetch window"
         );
     }
 
     #[test]
-    fn test_predictable_window_stays_stable_across_sequential_reads() {
+    fn test_predictable_window_grows_across_sequential_reads() {
         let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
@@ -693,9 +720,9 @@ mod tests {
         t = t.saturating_add(1_000_000);
         let third = tracker.record_read_at_micros(1, 2, 2, t);
         assert_eq!(
-            second.len(),
+            second.len() * 2,
             third.len(),
-            "steady sequential reads should keep a predictable window instead of velocity-driven swings"
+            "steady sequential reads should grow the adaptive window predictably"
         );
     }
 }

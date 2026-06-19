@@ -46,6 +46,13 @@ Every machine-readable row must preserve:
 - pread_local_cache_replies;
 - splice_local_cache_replies;
 - local_cache_reply_bytes;
+- read_ahead_prefetches;
+- read_ahead_suppressed;
+- read_ahead_amplification_bytes;
+- local_cache_willneed_hints;
+- local_cache_willneed_errors;
+- singleflight_waits;
+- singleflight_wait_max_ms;
 - local-cache hit and miss counts;
 - fallback_reasons;
 - unsafe_local_cache_fallbacks;
@@ -59,7 +66,18 @@ The SFS-529 local strategy harness already records `selected_reply_strategy`,
 mounted telemetry writer records `fallback_reasons` from
 `VfsNativeBridgeSnapshot` counters on the live bridge:
 `pread_local_cache_replies`, `splice_local_cache_replies`,
-`local_cache_reply_bytes`, and `unsafe_local_cache_fallbacks`.
+`local_cache_reply_bytes`, `read_ahead_prefetches`, `read_ahead_suppressed`,
+`read_ahead_amplification_bytes`, `local_cache_willneed_hints`,
+`local_cache_willneed_errors`, and `unsafe_local_cache_fallbacks`. The VFS
+fetch telemetry records `singleflight_waits` and `singleflight_wait_max_ms` so
+concurrent cache-miss materialization can be checked from the same mounted
+evidence bundle.
+
+The SFS-535 wrapper also copies mounted SFS-530 telemetry from
+`target/sfs-530-linux-native-async-write/*/write-path-observability-before.json`
+and `target/sfs-530-linux-native-async-write/*/write-path-observability-after.json`
+into the SFS-535 artifact directory, using profile-prefixed filenames, so the
+SFS-536 fields can be reviewed beside the SFS-535 summary.
 
 ## Reproducible commands
 
@@ -93,9 +111,10 @@ reasons.
 
 Focused correctness tests cover stale epoch, stale invalidation generation,
 local cache eviction, dirty writer, dirty inode, truncate, overwrite, remote
-refresh fallback, selected reply strategy, and bridge reply counters. The final
-report still needs mounted throughput, p95/p99 latency, CPU, raw disk baseline,
-and bottleneck evidence from the reference FUSE-capable host.
+refresh fallback, selected reply strategy, bridge reply counters, adaptive
+read-ahead prefetch/suppression, WILLNEED hint counters, and singleflight wait
+metrics. The final report still needs mounted throughput, p95/p99 latency, CPU,
+raw disk baseline, and bottleneck evidence from the reference FUSE-capable host.
 
 ## Closure rule
 
@@ -103,7 +122,7 @@ Do not mark SFS-535 complete until the final summary contains either:
 
 - warm trusted local-cache read throughput at 60-75% of raw warm disk speed with
   matching p95 latency, p99 latency, CPU, selected reply strategy, and
-  local-cache reply counters; or
+  local-cache reply counters plus SFS-536 read-ahead/singleflight counters; or
 - an explicit bottleneck analysis explaining why the mounted path missed the
   target, with the same raw disk baseline, latency, CPU, fallback reason, and
   bridge telemetry evidence.
