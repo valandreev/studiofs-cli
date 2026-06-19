@@ -879,6 +879,18 @@ fn native_mounted_session_uses_runtime_linux_native_transport_selection() {
 }
 
 #[test]
+fn native_mounted_classic_transport_uses_output_fd_for_splice_replies() {
+    let source = include_str!("mount_sanity.rs");
+    let native_mount_runner = source
+        .split("fn with_mounted_native_fuse")
+        .last()
+        .and_then(|rest| rest.split("fn run_mounted_scenario").next())
+        .expect("native mounted runner should be present");
+
+    assert!(native_mount_runner.contains("ClassicReadWriteTransport::with_output_fd"));
+}
+
+#[test]
 fn native_mounted_matrix_runs_existing_correctness_operations_through_linux_native_bridge() {
     let scenarios = native_mounted_scenarios();
     let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
@@ -1462,7 +1474,8 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
     let session_thread = std::thread::spawn(move || {
         let fuse_file = fuse.into_file();
         let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
-        let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
+        let transport = ClassicReadWriteTransport::with_output_fd(fuse_file, fuse_fd)
+            .with_transport_fd(fuse_fd);
         let config = NativeSessionConfig::linux6_safe_from_env().with_io_uring_transport();
         let session = NativeFuseSession::new(transport, config);
         let (negotiated, transport) = match session.handshake_into_transport() {
@@ -2033,7 +2046,8 @@ fn with_mounted_native_fuse(
         let result = (|| {
             let fuse_file = fuse.into_file();
             let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
-            let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
+            let transport = ClassicReadWriteTransport::with_output_fd(fuse_file, fuse_fd)
+                .with_transport_fd(fuse_fd);
             let mut runtime_options = StudioFuseRuntimeOptions::from_env();
             runtime_options.async_write_enabled = mode.async_write_enabled();
             let mut config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
