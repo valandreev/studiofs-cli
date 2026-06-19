@@ -1762,6 +1762,39 @@ mod tests {
     }
 
     #[test]
+    fn native_bridge_same_parent_rename_invalidates_parent_once() {
+        let vfs = recording_vfs(NativeAttr {
+            ino: 99,
+            size: 0,
+            kind: NativeFileType::RegularFile,
+            perm: 0o644,
+            uid: 1000,
+            gid: 1000,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        });
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let reply = bridge.handle(rename_request(1, b"old", 1, b"new"));
+        let reply = reply.bytes().expect("rename reply should be contiguous");
+
+        assert_eq!(reply_error(reply), 0);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            1
+        );
+    }
+
+    #[test]
     fn native_bridge_rename_rejects_embedded_nul_in_new_name_without_calling_vfs() {
         let vfs = recording_vfs(NativeAttr {
             ino: 99,

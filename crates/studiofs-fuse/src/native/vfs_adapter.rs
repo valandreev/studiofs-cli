@@ -2323,13 +2323,19 @@ where
     }
 
     fn invalidate_metadata_cache_for_mutation(&self, inodes: &[u64]) {
-        self.amplification_metrics
-            .record_metadata_invalidation(inodes.len() as u64);
+        let mut unique_inodes = SmallVec::<[u64; 4]>::new();
         for &ino in inodes {
+            if !unique_inodes.contains(&ino) {
+                unique_inodes.push(ino);
+            }
+        }
+        self.amplification_metrics
+            .record_metadata_invalidation(unique_inodes.len() as u64);
+        for &ino in &unique_inodes {
             self.trusted_open_cache_states.remove(ino);
         }
-        self.read_ahead_states.invalidate_inodes(inodes);
-        self.willneed_hint_states.invalidate_inodes(inodes);
+        self.read_ahead_states.invalidate_inodes(&unique_inodes);
+        self.willneed_hint_states.invalidate_inodes(&unique_inodes);
     }
 
     fn forget_read_ahead_handle(&self, ino: u64, fh: u64) {
