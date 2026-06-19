@@ -7988,8 +7988,8 @@ impl StudioVfs {
                 singleflight_wait_avg_ms: if fetch_singleflight_waits == 0 {
                     0.0
                 } else {
-                    (fetch_singleflight_wait_total_ns as f64 / fetch_singleflight_waits as f64)
-                        / 1_000_000.0
+                    (fetch_singleflight_wait_total_ns as f64 / 1_000_000.0)
+                        / fetch_singleflight_waits as f64
                 },
                 singleflight_wait_max_ms: fetch_singleflight_wait_max_ns as f64 / 1_000_000.0,
                 retries: fetch_retries,

@@ -253,7 +253,7 @@ pub fn decide_native_read_ahead(
         }
     } else {
         state.last_prefetch_end = Some(prefetch_start + len);
-        state.current_prefetch_bytes = len;
+        state.current_prefetch_bytes = next_window;
         NativeReadAheadDecision {
             prefetch: Some(NativePrefetchRange {
                 offset: prefetch_start,
@@ -500,6 +500,44 @@ mod tests {
             Some(NativePrefetchRange {
                 offset: 12_288,
                 len: 8192,
+            })
+        );
+    }
+
+    #[test]
+    fn growing_files_preserve_adaptive_window_momentum_across_eof_caps() {
+        let policy = NativeReadAheadPolicy {
+            max_prefetch_bytes: 16 * 1024,
+            sequential_window_bytes: 4096,
+            min_sequential_reads: 2,
+        };
+        let mut history = NativeReadAheadState::default();
+
+        let first = decide_native_read_ahead(&policy, &mut history, 0, 4096, 8192);
+        let second = decide_native_read_ahead(&policy, &mut history, 4096, 4096, 12_288);
+        let third = decide_native_read_ahead(&policy, &mut history, 8192, 4096, 16_384);
+        let fourth = decide_native_read_ahead(&policy, &mut history, 12_288, 4096, 32_768);
+
+        assert_eq!(first.prefetch, None);
+        assert_eq!(
+            second.prefetch,
+            Some(NativePrefetchRange {
+                offset: 8192,
+                len: 4096,
+            })
+        );
+        assert_eq!(
+            third.prefetch,
+            Some(NativePrefetchRange {
+                offset: 12_288,
+                len: 4096,
+            })
+        );
+        assert_eq!(
+            fourth.prefetch,
+            Some(NativePrefetchRange {
+                offset: 16_384,
+                len: 16 * 1024,
             })
         );
     }
