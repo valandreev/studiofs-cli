@@ -503,6 +503,8 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
             let reply = self.handler.handle(request);
             let reply_len = reply.frame_len();
             let reply_error = reply.error_code();
+            let records_local_cache_reply_metrics =
+                opcode == FuseOpcode::Read && reply.has_local_cache_range();
             if let Err(error) = self.transport.send_reply(reply) {
                 if matches!(opcode, FuseOpcode::Release | FuseOpcode::Releasedir)
                     && reply_error == Some(0)
@@ -519,7 +521,7 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                     source: error,
                 });
             }
-            if opcode == FuseOpcode::Read {
+            if records_local_cache_reply_metrics {
                 self.handler.record_local_cache_reply_metrics(
                     self.transport.local_cache_reply_metrics_snapshot(),
                 );
@@ -735,8 +737,10 @@ impl<S: ReplySink> NativeAsyncDispatcher<S> {
 mod tests {
     use super::*;
     use crate::native::abi::{FUSE_IN_HEADER_LEN, ok_reply};
+    use crate::native::protocol::FuseLocalCacheReadRange;
     use crate::native::reply::RecordedReplySink;
     use crate::native::transport::{FrameQueueTransport, LocalCacheReplyMetricsSnapshot};
+    use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -805,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_publishes_transport_local_cache_reply_metrics_after_send() {
+    fn dispatcher_skips_local_cache_reply_metrics_snapshot_for_bytes_read_reply() {
         let transport = ReplyMetricsTransport {
             inner: FrameQueueTransport::new([frame(15, 0x10)]),
             metrics: LocalCacheReplyMetricsSnapshot {
@@ -816,6 +820,51 @@ mod tests {
             snapshot_calls: AtomicUsize::new(0),
         };
         let handler = ReplyMetricsRecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(transport.snapshot_calls.load(Ordering::Relaxed), 0);
+        assert!(handler.snapshots.is_empty());
+    }
+
+    struct LocalCacheReplyMetricsRecordingHandler {
+        snapshots: Vec<LocalCacheReplyMetricsSnapshot>,
+        local_cache_file: std::fs::File,
+    }
+
+    impl FuseOperationHandler for LocalCacheReplyMetricsRecordingHandler {
+        fn handle(&mut self, request: FuseRequest) -> FuseReply {
+            FuseReply::local_cache_range_data(
+                request.header.unique,
+                FuseLocalCacheReadRange::borrowed(self.local_cache_file.as_raw_fd(), 0, 4096, 1),
+            )
+            .expect("local cache range reply")
+        }
+
+        fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
+            self.snapshots.push(metrics);
+        }
+    }
+
+    #[test]
+    fn dispatcher_publishes_transport_local_cache_reply_metrics_after_local_cache_send() {
+        let transport = ReplyMetricsTransport {
+            inner: FrameQueueTransport::new([frame(15, 0x10)]),
+            metrics: LocalCacheReplyMetricsSnapshot {
+                pread_local_cache_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            },
+            snapshot_calls: AtomicUsize::new(0),
+        };
+        let handler = LocalCacheReplyMetricsRecordingHandler {
+            snapshots: Vec::new(),
+            local_cache_file: tempfile::tempfile().expect("create local cache source"),
+        };
         let mut dispatcher = NativeDispatcher::new(transport, handler);
 
         dispatcher
@@ -855,6 +904,20 @@ mod tests {
 
         assert_eq!(transport.snapshot_calls.load(Ordering::Relaxed), 0);
         assert!(handler.snapshots.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_samples_reply_metrics_only_for_local_cache_range_replies() {
+        let source = include_str!("dispatcher.rs");
+        let run_loop = source
+            .split("pub fn run_until_destroy")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("dispatcher run loop should be present");
+
+        assert!(run_loop.contains("reply.has_local_cache_range()"));
+        assert!(run_loop.contains("if records_local_cache_reply_metrics"));
+        assert!(!run_loop.contains("if opcode == FuseOpcode::Read {\n                self.handler.record_local_cache_reply_metrics"));
     }
 
     #[test]
