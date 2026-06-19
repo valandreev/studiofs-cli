@@ -28,7 +28,6 @@ use studiofs_fuse::native::transport::{
 };
 use studiofs_fuse::native::vfs_adapter::{
     LinuxNativeBridge, NativeAsyncWriteConfig, StudioVfsNativeAdapter,
-    set_native_bridge_snapshot_min_interval_for_test,
 };
 use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
@@ -2115,6 +2114,7 @@ fn with_mounted_fuse(
 fn with_mounted_native_fuse(
     suffix: &str,
     mode: MountedFuseMode,
+    native_bridge_snapshot_min_interval: Option<Duration>,
     test_fn: impl FnOnce(&Path, &StudioVfs) -> MountedOperationGuard,
 ) {
     if !mounted_tests_enabled() {
@@ -2213,6 +2213,9 @@ fn with_mounted_native_fuse(
                 }
             };
             let mut handler = LinuxNativeBridge::new(adapter);
+            if let Some(interval) = native_bridge_snapshot_min_interval {
+                handler = handler.with_native_bridge_snapshot_min_interval_for_test(interval);
+            }
             if let Some(config) = NativeAsyncWriteConfig::from_runtime_options(&runtime_options) {
                 handler = handler.with_async_write_config(config);
             }
@@ -2296,9 +2299,16 @@ fn run_native_mounted_scenario(scenario: MountedAsyncScenario) {
         MountedBackend::LinuxNativeBridge,
         "native mounted scenario must use LinuxNativeBridge backend"
     );
-    with_mounted_native_fuse(scenario.name, scenario.mode, |mount_path, vfs| {
-        run_mounted_operation_with_vfs(mount_path, scenario.operation, scenario.name, Some(vfs))
-    });
+    let native_bridge_snapshot_min_interval =
+        (scenario.operation == MountedScenarioOperation::Sfs509FioMatrix).then_some(Duration::ZERO);
+    with_mounted_native_fuse(
+        scenario.name,
+        scenario.mode,
+        native_bridge_snapshot_min_interval,
+        |mount_path, vfs| {
+            run_mounted_operation_with_vfs(mount_path, scenario.operation, scenario.name, Some(vfs))
+        },
+    );
 }
 
 fn run_mounted_operation(
@@ -3342,7 +3352,6 @@ fn write_sfs509_metadata_amplification_probe(
     let Some(vfs) = vfs else {
         return;
     };
-    let _snapshot_interval_guard = set_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
     let probe_count = file_count.min(128);
     std::thread::sleep(Duration::from_millis(1_100));
 

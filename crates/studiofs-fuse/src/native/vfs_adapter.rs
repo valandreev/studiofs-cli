@@ -764,8 +764,10 @@ pub struct LinuxNativeBridge<V> {
     read_metrics: NativeReadMetrics,
     native_bridge_snapshot_started_at: Instant,
     native_bridge_snapshot_last_elapsed_ms: AtomicU64,
+    native_bridge_snapshot_min_interval_ms: u64,
     trusted_open_cache_states: NativeTrustedOpenCacheStateStore,
     metadata_cache_policy: NativeMetadataCachePolicy,
+    negative_entry_payload: Vec<u8>,
     read_ahead_policy: NativeReadAheadPolicy,
     read_ahead_states: NativeReadAheadStateStore,
     willneed_hint_states: NativeWillneedHintStateStore,
@@ -915,43 +917,6 @@ struct NativeAmplificationMetrics {
 }
 
 const NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS: u64 = 1_000;
-static NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS: AtomicU64 =
-    AtomicU64::new(NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS);
-static NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[doc(hidden)]
-pub struct NativeBridgeSnapshotIntervalGuard {
-    previous_ms: u64,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl Drop for NativeBridgeSnapshotIntervalGuard {
-    fn drop(&mut self) {
-        NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.store(self.previous_ms, Ordering::Relaxed);
-    }
-}
-
-#[doc(hidden)]
-pub fn set_native_bridge_snapshot_min_interval_for_test(
-    interval: Duration,
-) -> NativeBridgeSnapshotIntervalGuard {
-    let lock = NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK
-        .lock()
-        .expect("native bridge snapshot interval test lock should not be poisoned");
-    let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
-    let previous_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.swap(interval_ms, Ordering::Relaxed);
-    NativeBridgeSnapshotIntervalGuard {
-        previous_ms,
-        _lock: lock,
-    }
-}
-
-#[cfg(test)]
-fn native_bridge_snapshot_interval_test_lock() -> MutexGuard<'static, ()> {
-    NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK
-        .lock()
-        .expect("native bridge snapshot interval test lock should not be poisoned")
-}
 const NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
 const NATIVE_LATENCY_BUCKET_BOUNDS_NS: [u64; 18] = [
     1_000,
@@ -1613,6 +1578,9 @@ impl NativeReadMetrics {
 impl<V> LinuxNativeBridge<V> {
     /// Build an operation adapter around a VFS backend.
     pub fn new(vfs: V) -> Self {
+        let metadata_cache_policy = NativeMetadataCachePolicy::linux_automatic();
+        let negative_entry_payload =
+            negative_entry_payload(metadata_cache_policy.negative_entry_ttl);
         Self {
             vfs,
             barrier_gates: OperationBarrierGates::default(),
@@ -1626,8 +1594,10 @@ impl<V> LinuxNativeBridge<V> {
             native_bridge_snapshot_last_elapsed_ms: AtomicU64::new(
                 NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED,
             ),
+            native_bridge_snapshot_min_interval_ms: NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS,
             trusted_open_cache_states: NativeTrustedOpenCacheStateStore::default(),
-            metadata_cache_policy: NativeMetadataCachePolicy::linux_automatic(),
+            metadata_cache_policy,
+            negative_entry_payload,
             read_ahead_policy: NativeReadAheadPolicy {
                 max_prefetch_bytes: 1024 * 1024,
                 sequential_window_bytes: 128 * 1024,
@@ -1647,6 +1617,13 @@ impl<V> LinuxNativeBridge<V> {
     #[cfg(test)]
     fn with_async_write_for_test(self, config: NativeAsyncWriteConfig) -> Self {
         self.with_async_write_config(config)
+    }
+
+    #[doc(hidden)]
+    pub fn with_native_bridge_snapshot_min_interval_for_test(mut self, interval: Duration) -> Self {
+        self.native_bridge_snapshot_min_interval_ms =
+            interval.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
     }
 
     /// Returns the kernel lookup reference count currently tracked for `ino`.
@@ -1776,10 +1753,7 @@ where
                 self.amplification_metrics.record_negative_lookup_reply();
                 FuseReply::contiguous(
                     request.header.unique,
-                    ok_reply(
-                        request.header.unique,
-                        &negative_entry_payload(self.metadata_cache_policy.negative_entry_ttl),
-                    ),
+                    ok_reply(request.header.unique, &self.negative_entry_payload),
                 )
             }
             Err(errno) => errno_reply(request.header.unique, errno),
@@ -2557,7 +2531,7 @@ where
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let interval_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.load(Ordering::Relaxed);
+        let interval_ms = self.native_bridge_snapshot_min_interval_ms;
 
         let mut last = self
             .native_bridge_snapshot_last_elapsed_ms
@@ -2952,23 +2926,29 @@ fn append_timeout_nanos_payload(payload: &mut Vec<u8>, duration: Duration) {
 }
 
 fn entry_payload(attr: NativeAttr, metadata_cache_policy: &NativeMetadataCachePolicy) -> Vec<u8> {
-    entry_payload_with_ttls(
+    let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
+    append_entry_payload_with_ttls(
+        &mut payload,
         attr,
         metadata_cache_policy.entry_ttl,
         metadata_cache_policy.attr_ttl,
-    )
+    );
+    payload
 }
 
-fn entry_payload_with_ttls(attr: NativeAttr, entry_ttl: Duration, attr_ttl: Duration) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(FUSE_ENTRY_OUT_PAYLOAD_LEN);
+fn append_entry_payload_with_ttls(
+    payload: &mut Vec<u8>,
+    attr: NativeAttr,
+    entry_ttl: Duration,
+    attr_ttl: Duration,
+) {
     payload.extend_from_slice(&attr.ino.to_le_bytes());
     payload.extend_from_slice(&0_u64.to_le_bytes());
-    append_timeout_payload(&mut payload, entry_ttl);
-    append_timeout_payload(&mut payload, attr_ttl);
-    append_timeout_nanos_payload(&mut payload, entry_ttl);
-    append_timeout_nanos_payload(&mut payload, attr_ttl);
-    append_attr_payload(&mut payload, attr);
-    payload
+    append_timeout_payload(payload, entry_ttl);
+    append_timeout_payload(payload, attr_ttl);
+    append_timeout_nanos_payload(payload, entry_ttl);
+    append_timeout_nanos_payload(payload, attr_ttl);
+    append_attr_payload(payload, attr);
 }
 
 fn negative_entry_payload(entry_ttl: Duration) -> Vec<u8> {
@@ -3070,11 +3050,12 @@ fn readdirplus_payload<V: NativeVfs>(
             Err(errno) if is_stale_dirent_errno(errno) => continue,
             Err(errno) => return Err(errno),
         };
-        payload.extend_from_slice(&entry_payload_with_ttls(
+        append_entry_payload_with_ttls(
+            &mut payload,
             attr,
             metadata_cache_policy.dir_entry_ttl,
             metadata_cache_policy.attr_ttl,
-        ));
+        );
         append_dirent(&mut payload, entry, next_offset);
         pending_lookups.push(attr.ino);
     }
@@ -3739,7 +3720,6 @@ mod tests {
 
     #[test]
     fn native_bridge_snapshot_publish_is_rate_limited_on_hot_path() {
-        let _lock = native_bridge_snapshot_interval_test_lock();
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -3756,10 +3736,10 @@ mod tests {
     }
 
     #[test]
-    fn native_bridge_snapshot_interval_test_guard_allows_immediate_publish() {
-        let _guard = set_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
+    fn native_bridge_snapshot_interval_override_allows_immediate_publish() {
         let vfs = Arc::new(TestNativeVfs::default());
-        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs))
+            .with_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
 
         let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
         let _ = bridge.handle_getattr(getattr_request_for_ino(20));
@@ -3770,6 +3750,37 @@ mod tests {
             .expect("native bridge snapshots lock should not be poisoned");
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[1].0.getattr_ops, 1);
+    }
+
+    #[test]
+    fn native_bridge_snapshot_interval_override_is_bridge_scoped() {
+        let default_vfs = Arc::new(TestNativeVfs::default());
+        let immediate_vfs = Arc::new(TestNativeVfs::default());
+        let default_bridge = LinuxNativeBridge::new(Arc::clone(&default_vfs));
+        let immediate_bridge = LinuxNativeBridge::new(Arc::clone(&immediate_vfs))
+            .with_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
+
+        let _ = immediate_bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = immediate_bridge.handle_getattr(getattr_request_for_ino(20));
+        let _ = default_bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = default_bridge.handle_getattr(getattr_request_for_ino(20));
+
+        assert_eq!(
+            immediate_vfs
+                .native_bridge_snapshots
+                .lock()
+                .expect("native bridge snapshots lock should not be poisoned")
+                .len(),
+            2
+        );
+        assert_eq!(
+            default_vfs
+                .native_bridge_snapshots
+                .lock()
+                .expect("native bridge snapshots lock should not be poisoned")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3993,6 +4004,32 @@ mod tests {
         assert_eq!(payload.len(), FUSE_ENTRY_OUT_PAYLOAD_LEN);
         assert_eq!(&payload[16..24], &0_u64.to_le_bytes());
         assert_eq!(&payload[32..36], &250_000_000_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn handle_lookup_reuses_cached_negative_entry_payload() {
+        let source = include_str!("vfs_adapter.rs");
+        let handle_lookup = source
+            .split("fn handle_lookup(&self, request: FuseRequest)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_forget").next())
+            .expect("handle_lookup body should be present");
+
+        assert!(handle_lookup.contains("&self.negative_entry_payload"));
+        assert!(!handle_lookup.contains("negative_entry_payload("));
+    }
+
+    #[test]
+    fn readdirplus_payload_appends_entry_payload_without_per_entry_allocation() {
+        let source = include_str!("vfs_adapter.rs");
+        let readdirplus_payload = source
+            .split("fn readdirplus_payload<V: NativeVfs>")
+            .nth(1)
+            .and_then(|rest| rest.split("fn statfs_payload").next())
+            .expect("readdirplus_payload body should be present");
+
+        assert!(readdirplus_payload.contains("append_entry_payload_with_ttls("));
+        assert!(!readdirplus_payload.contains("entry_payload("));
     }
 
     #[test]
