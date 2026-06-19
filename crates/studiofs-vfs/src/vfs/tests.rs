@@ -12094,6 +12094,9 @@ fn write_path_observability_reports_native_bridge_snapshot() {
         release_ops: 4,
         read_ops: 11,
         write_ops: 13,
+        negative_lookup_replies: 2,
+        metadata_invalidation_events: 3,
+        metadata_invalidated_inodes: 5,
         lookup_getattr_ratio_micros: 1_500_000,
         open_release_ratio_micros: 1_250_000,
         lookup_ops_per_open_micros: 600_000,
@@ -12122,6 +12125,9 @@ fn write_path_observability_reports_native_bridge_snapshot() {
     let snapshot = vfs.write_path_observability_snapshot();
 
     assert_eq!(snapshot.native_bridge.metadata_ops, 7);
+    assert_eq!(snapshot.native_bridge.negative_lookup_replies, 2);
+    assert_eq!(snapshot.native_bridge.metadata_invalidation_events, 3);
+    assert_eq!(snapshot.native_bridge.metadata_invalidated_inodes, 5);
     assert_eq!(snapshot.native_bridge.lookup_ops_per_open_micros, 600_000);
     assert_eq!(snapshot.native_bridge.getattr_ops_per_open_micros, 400_000);
     assert_eq!(

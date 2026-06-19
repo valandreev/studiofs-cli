@@ -707,6 +707,9 @@ fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
     assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
     assert!(writer.contains("native_bridge.unsafe_local_cache_fallbacks"));
+    assert!(writer.contains("native_bridge.negative_lookup_replies"));
+    assert!(writer.contains("native_bridge.metadata_invalidation_events"));
+    assert!(writer.contains("native_bridge.metadata_invalidated_inodes"));
     assert!(writer.contains("native_bridge.lookup_ops_per_open_micros"));
     assert!(writer.contains("native_bridge.getattr_ops_per_open_micros"));
     assert!(writer.contains("native_bridge.readdirplus_readdir_ratio_micros"));
@@ -2632,6 +2635,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"release_ops\": {native_release_ops},\n",
             "    \"read_ops\": {native_read_ops},\n",
             "    \"write_ops\": {native_write_ops},\n",
+            "    \"negative_lookup_replies\": {native_negative_lookup_replies},\n",
+            "    \"metadata_invalidation_events\": {native_metadata_invalidation_events},\n",
+            "    \"metadata_invalidated_inodes\": {native_metadata_invalidated_inodes},\n",
             "    \"lookup_getattr_ratio_micros\": {native_lookup_getattr_ratio_micros},\n",
             "    \"open_release_ratio_micros\": {native_open_release_ratio_micros},\n",
             "    \"fuse_ops_per_read_write_micros\": {native_fuse_ops_per_read_write_micros},\n",
@@ -2715,6 +2721,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         native_release_ops = native_bridge.release_ops,
         native_read_ops = native_bridge.read_ops,
         native_write_ops = native_bridge.write_ops,
+        native_negative_lookup_replies = native_bridge.negative_lookup_replies,
+        native_metadata_invalidation_events = native_bridge.metadata_invalidation_events,
+        native_metadata_invalidated_inodes = native_bridge.metadata_invalidated_inodes,
         native_lookup_getattr_ratio_micros = native_bridge.lookup_getattr_ratio_micros,
         native_open_release_ratio_micros = native_bridge.open_release_ratio_micros,
         native_fuse_ops_per_read_write_micros = native_bridge.fuse_ops_per_read_write_micros,

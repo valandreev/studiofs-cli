@@ -417,6 +417,12 @@ pub struct VfsNativeBridgeSnapshot {
     pub read_ops: u64,
     /// Application write operations handled by the native bridge.
     pub write_ops: u64,
+    /// Negative lookup replies emitted by the native bridge.
+    pub negative_lookup_replies: u64,
+    /// Metadata cache invalidation events emitted by the native bridge.
+    pub metadata_invalidation_events: u64,
+    /// Total unique inode targets included in native metadata invalidation events.
+    pub metadata_invalidated_inodes: u64,
     /// Lookup/getattr ratio scaled by 1,000,000.
     pub lookup_getattr_ratio_micros: u64,
     /// Open/release ratio scaled by 1,000,000.
