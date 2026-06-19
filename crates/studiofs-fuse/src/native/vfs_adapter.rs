@@ -905,58 +905,78 @@ type NativeReadAheadHandles = SmallVec<[u64; 4]>;
 
 #[derive(Debug)]
 struct NativeWillneedHintStateStore {
-    shards: [Mutex<NativeWillneedHintStateShard>; Self::SHARD_COUNT],
+    slots: [NativeWillneedHintStateSlot; Self::SLOT_COUNT],
 }
 
 #[derive(Debug, Default)]
-struct NativeWillneedHintStateShard {
-    hinted_end_by_handle: HashMap<(u64, u64), u64>,
+struct NativeWillneedHintStateSlot {
+    ino: AtomicU64,
+    fh: AtomicU64,
+    start: AtomicU64,
+    end: AtomicU64,
 }
 
 impl Default for NativeWillneedHintStateStore {
     fn default() -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(NativeWillneedHintStateShard::default())),
+            slots: std::array::from_fn(|_| NativeWillneedHintStateSlot::default()),
         }
     }
 }
 
 impl NativeWillneedHintStateStore {
-    const SHARD_COUNT: usize = 64;
+    const SLOT_COUNT: usize = 1024;
 
-    fn shard_index(ino: u64) -> usize {
-        (ino as usize) % Self::SHARD_COUNT
+    fn slot_index(ino: u64, fh: u64) -> usize {
+        let mut value = ino ^ fh.rotate_left(32);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value as usize) & (Self::SLOT_COUNT - 1)
     }
 
     fn should_hint(&self, ino: u64, fh: u64, offset: u64, len: u32) -> bool {
         let hint_end = offset.saturating_add(u64::from(len));
-        let mut shard = lock_or_recover(self.shard(ino), "native_willneed_hint_state_shard");
-        let hinted_end = shard.hinted_end_by_handle.entry((ino, fh)).or_default();
-        if hint_end <= *hinted_end {
+        let slot = &self.slots[Self::slot_index(ino, fh)];
+        if slot.ino.load(Ordering::Relaxed) != ino || slot.fh.load(Ordering::Relaxed) != fh {
+            slot.start.store(offset, Ordering::Relaxed);
+            slot.end.store(hint_end, Ordering::Relaxed);
+            slot.fh.store(fh, Ordering::Relaxed);
+            slot.ino.store(ino, Ordering::Relaxed);
+            return true;
+        }
+
+        let last_start = slot.start.load(Ordering::Relaxed);
+        let last_end = slot.end.load(Ordering::Relaxed);
+        if offset >= last_start && hint_end <= last_end {
             return false;
         }
-        *hinted_end = hint_end;
+        slot.start.store(offset, Ordering::Relaxed);
+        slot.end.store(hint_end, Ordering::Relaxed);
         true
     }
 
     fn invalidate_inodes(&self, inodes: &[u64]) {
         for &ino in inodes {
-            lock_or_recover(self.shard(ino), "native_willneed_hint_state_shard")
-                .hinted_end_by_handle
-                .retain(|(hint_ino, _), _| *hint_ino != ino);
+            for slot in &self.slots {
+                if slot.ino.load(Ordering::Relaxed) == ino {
+                    slot.ino.store(0, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     fn remove_handle(&self, ino: u64, fh: u64) {
-        lock_or_recover(self.shard(ino), "native_willneed_hint_state_shard")
-            .hinted_end_by_handle
-            .remove(&(ino, fh));
-    }
-
-    fn shard(&self, ino: u64) -> &Mutex<NativeWillneedHintStateShard> {
-        &self.shards[Self::shard_index(ino)]
+        let slot = &self.slots[Self::slot_index(ino, fh)];
+        if slot.ino.load(Ordering::Relaxed) == ino && slot.fh.load(Ordering::Relaxed) == fh {
+            slot.ino.store(0, Ordering::Relaxed);
+        }
     }
 }
+
+const _: () = assert!(NativeWillneedHintStateStore::SLOT_COUNT.is_power_of_two());
 
 impl Default for NativeReadAheadStateStore {
     fn default() -> Self {
@@ -3250,13 +3270,13 @@ mod tests {
             &self,
             _fh: u64,
             _ino: u64,
-            _offset: u64,
+            offset: u64,
             _size: u32,
         ) -> Result<Option<NativeLocalCacheReadRange>, i32> {
             self.local_cache_read_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Some(NativeLocalCacheReadRange::borrowed(
                 self.local_cache_file.as_raw_fd(),
-                4096,
+                offset,
                 8192,
                 9,
             )))
@@ -3904,6 +3924,34 @@ mod tests {
         let metrics = bridge.read_metrics_snapshot();
         assert_eq!(metrics.local_cache_hits, 2);
         assert_eq!(metrics.local_cache_willneed_hints, 1);
+    }
+
+    #[test]
+    fn handle_read_reissues_willneed_hint_after_rewind_on_same_handle() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 32 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let _ = bridge.handle_read(read_request_for_offset_and_size(0, 8192));
+        let _ = bridge.handle_read(read_request_for_offset_and_size(8192, 8192));
+        let rewind = bridge.handle_read(read_request_for_offset_and_size(0, 8192));
+
+        assert!(rewind.local_cache_range().is_some());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.local_cache_hits, 3);
+        assert_eq!(metrics.local_cache_willneed_hints, 3);
     }
 
     #[test]
