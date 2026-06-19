@@ -57,6 +57,12 @@ pub struct ReadAheadMetricsSnapshot {
 const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
+fn fetch_add_if_nonzero(metric: &AtomicU64, delta: u64) {
+    if delta != 0 {
+        metric.fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
 // =============================================================================
 // Internal state
 // =============================================================================
@@ -192,17 +198,20 @@ impl ReadAheadTracker {
         if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
             return Vec::new();
         }
-        (1..=current_width)
+        let mut deduped_blocks = 0_u64;
+        let prefetch = (1..=current_width)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
                 if self.inflight.contains_key(&(key.ino, block)) {
-                    self.deduped_prefetch_blocks.fetch_add(1, Ordering::Relaxed);
+                    deduped_blocks += 1;
                     None // Already in-flight
                 } else {
                     Some(block)
                 }
             })
-            .collect()
+            .collect();
+        fetch_add_if_nonzero(&self.deduped_prefetch_blocks, deduped_blocks);
+        prefetch
     }
 
     /// Create a new tracker.
