@@ -467,12 +467,17 @@ fn transport_error_raw_errno(error: &TransportError) -> Option<i32> {
 pub struct NativeDispatcher<T, H> {
     transport: T,
     handler: H,
+    last_local_cache_reply_metrics: LocalCacheReplyMetricsSnapshot,
 }
 
 impl<T, H> NativeDispatcher<T, H> {
     /// Creates a dispatcher from a transport backend and operation handler.
     pub fn new(transport: T, handler: H) -> Self {
-        Self { transport, handler }
+        Self {
+            transport,
+            handler,
+            last_local_cache_reply_metrics: LocalCacheReplyMetricsSnapshot::default(),
+        }
     }
 
     /// Returns the owned transport and handler after the loop is no longer needed.
@@ -522,9 +527,12 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                 });
             }
             if records_local_cache_reply_metrics {
-                self.handler.record_local_cache_reply_metrics(
-                    self.transport.local_cache_reply_metrics_snapshot(),
-                );
+                let current = self.transport.local_cache_reply_metrics_snapshot();
+                let delta = current.saturating_sub(self.last_local_cache_reply_metrics);
+                self.last_local_cache_reply_metrics = current;
+                if !delta.is_zero() {
+                    self.handler.record_local_cache_reply_metrics(delta);
+                }
             }
             summary.handled_requests += 1;
             if is_destroy {
@@ -916,8 +924,42 @@ mod tests {
             .expect("dispatcher run loop should be present");
 
         assert!(run_loop.contains("reply.has_local_cache_range()"));
+        assert!(run_loop.contains("saturating_sub(self.last_local_cache_reply_metrics)"));
         assert!(run_loop.contains("if records_local_cache_reply_metrics"));
         assert!(!run_loop.contains("if opcode == FuseOpcode::Read {\n                self.handler.record_local_cache_reply_metrics"));
+    }
+
+    #[test]
+    fn dispatcher_skips_zero_local_cache_reply_metric_deltas() {
+        let transport = ReplyMetricsTransport {
+            inner: FrameQueueTransport::new([frame(15, 0x10), frame(15, 0x11)]),
+            metrics: LocalCacheReplyMetricsSnapshot {
+                pread_local_cache_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            },
+            snapshot_calls: AtomicUsize::new(0),
+        };
+        let handler = LocalCacheReplyMetricsRecordingHandler {
+            snapshots: Vec::new(),
+            local_cache_file: tempfile::tempfile().expect("create local cache source"),
+        };
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(transport.snapshot_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            handler.snapshots,
+            [LocalCacheReplyMetricsSnapshot {
+                pread_local_cache_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            }]
+        );
     }
 
     #[test]

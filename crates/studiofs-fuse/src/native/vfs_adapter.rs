@@ -1324,9 +1324,9 @@ impl NativeReadMetricsSnapshot {
     }
 }
 
-fn store_if_changed(metric: &AtomicU64, next: u64) {
-    if metric.load(Ordering::Relaxed) != next {
-        metric.store(next, Ordering::Relaxed);
+fn fetch_add_if_nonzero(metric: &AtomicU64, delta: u64) {
+    if delta != 0 {
+        metric.fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -1452,15 +1452,15 @@ where
     }
 
     fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
-        store_if_changed(
+        fetch_add_if_nonzero(
             &self.read_metrics.pread_local_cache_replies,
             metrics.pread_local_cache_replies,
         );
-        store_if_changed(
+        fetch_add_if_nonzero(
             &self.read_metrics.splice_local_cache_replies,
             metrics.splice_replies,
         );
-        store_if_changed(
+        fetch_add_if_nonzero(
             &self.read_metrics.local_cache_reply_bytes,
             metrics.payload_bytes,
         );
@@ -3427,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cache_reply_metrics_skip_unchanged_atomic_stores() {
+    fn local_cache_reply_metrics_accumulate_transport_deltas() {
         let source = include_str!("vfs_adapter.rs");
         let body = source
             .split("fn record_local_cache_reply_metrics")
@@ -3435,7 +3435,7 @@ mod tests {
             .and_then(|rest| rest.split("\n    }\n}").next())
             .expect("record_local_cache_reply_metrics body should be present");
 
-        assert!(body.contains("store_if_changed"));
+        assert!(body.contains("fetch_add_if_nonzero"));
         assert!(!body.contains(".store(metrics."));
     }
 
@@ -3926,6 +3926,28 @@ mod tests {
 
         let metrics = bridge.read_metrics_snapshot();
         assert_eq!(metrics.pread_local_cache_replies, 2);
+        assert_eq!(metrics.splice_local_cache_replies, 5);
+        assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
+    }
+
+    #[test]
+    fn bridge_read_metrics_accumulate_multiple_transport_deltas() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_local_cache_replies: 2,
+            splice_replies: 1,
+            payload_bytes: 4096,
+        });
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_local_cache_replies: 3,
+            splice_replies: 4,
+            payload_bytes: 8192,
+        });
+
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.pread_local_cache_replies, 5);
         assert_eq!(metrics.splice_local_cache_replies, 5);
         assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
     }

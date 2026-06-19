@@ -1342,6 +1342,24 @@ pub struct LocalCacheReplyMetricsSnapshot {
     pub payload_bytes: u64,
 }
 
+impl LocalCacheReplyMetricsSnapshot {
+    /// Return counters added since `previous`.
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            pread_local_cache_replies: self
+                .pread_local_cache_replies
+                .saturating_sub(previous.pread_local_cache_replies),
+            splice_replies: self.splice_replies.saturating_sub(previous.splice_replies),
+            payload_bytes: self.payload_bytes.saturating_sub(previous.payload_bytes),
+        }
+    }
+
+    /// Returns true when no local-cache replies or bytes were recorded.
+    pub fn is_zero(self) -> bool {
+        self.pread_local_cache_replies == 0 && self.splice_replies == 0 && self.payload_bytes == 0
+    }
+}
+
 impl LocalCacheReplyMetrics {
     fn record(&self, strategy: LocalCacheReplyStrategy, payload_bytes: u32) {
         match strategy {
