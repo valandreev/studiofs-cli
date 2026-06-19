@@ -74,6 +74,11 @@ impl OpenFlags {
         (self.0 & other.0) == other.0
     }
 
+    /// Returns true when any bit from `other` is present.
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
     /// Returns the union of this and another flag set.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)

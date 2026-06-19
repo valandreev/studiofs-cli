@@ -22,7 +22,7 @@ use studiofs_meta::schema::{
     UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 type ReadRange = IntervalRange;
 
@@ -1518,14 +1518,14 @@ impl StudioVfs {
         size: u32,
     ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
         let Some(open_file) = self.handle_table.get(fh) else {
-            debug!(
+            trace!(
                 fh,
                 ino, "native local-cache read range rejected: unknown file handle"
             );
             return Ok(None);
         };
         if open_file.ino != ino {
-            debug!(
+            trace!(
                 fh,
                 ino,
                 open_ino = open_file.ino,
@@ -1533,26 +1533,20 @@ impl StudioVfs {
             );
             return Ok(None);
         }
-        if open_file.flags.contains(OpenFlags::WRONLY) {
-            debug!(
+        if open_file
+            .flags
+            .intersects(OpenFlags::WRONLY | OpenFlags::RDWR)
+        {
+            trace!(
                 fh,
                 ino,
                 flags = ?open_file.flags,
-                "native local-cache read range rejected: write-only file handle"
-            );
-            return Ok(None);
-        }
-        if open_file.flags.contains(OpenFlags::RDWR) {
-            debug!(
-                fh,
-                ino,
-                flags = ?open_file.flags,
-                "native local-cache read range rejected: read-write file handle"
+                "native local-cache read range rejected: write-capable file handle"
             );
             return Ok(None);
         }
         if self.inode_has_local_dirty_state(ino) {
-            debug!(
+            trace!(
                 fh,
                 ino, "native local-cache read range rejected: inode has local dirty state"
             );
@@ -3464,6 +3458,21 @@ mod tests {
                 "evicted local-cache payloads must fall back to the bytes path"
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_local_cache_fh_rejections_are_trace_level_and_combined_flags() {
+        let source = include_str!("read_path.rs");
+        let body = source
+            .split("pub async fn local_cache_read_range_for_fh")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    #[cfg(unix)]\n    async fn ").next())
+            .expect("local_cache_read_range_for_fh body should be present");
+
+        assert!(body.contains("trace!("));
+        assert!(!body.contains("debug!("));
+        assert!(body.contains(".intersects(OpenFlags::WRONLY | OpenFlags::RDWR)"));
     }
 
     #[cfg(unix)]
