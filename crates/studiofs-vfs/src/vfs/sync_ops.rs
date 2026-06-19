@@ -135,6 +135,11 @@ impl StudioVfs {
         self.state.deferred_release_inflight.wait(ino).await;
     }
 
+    /// Wait until any deferred last-handle release barrier for `ino` drains.
+    pub async fn wait_for_deferred_release_barrier(&self, ino: Ino) {
+        self.wait_for_deferred_release_inflight(ino).await;
+    }
+
     pub(super) fn register_deferred_release_barrier(
         &self,
         ino: Ino,
@@ -1121,6 +1126,7 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
+        self.wait_for_deferred_release_inflight(ino).await;
         let debug_path = self.debug_pending_target_path(ino);
         if let Some(path) = &debug_path {
             let session = self.state.file_session.debug_snapshot(ino);

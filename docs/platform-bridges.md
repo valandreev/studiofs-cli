@@ -431,7 +431,7 @@ background local-I/O pool.
 FUSE callback barrier semantics:
 - `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
 - `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty writer-stack state, but does not force remote publication.
-- `release` becomes the fallback strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, but it must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
+- `release` becomes the fallback strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, but it must not force synchronous PG/S3 replication or upload completion. On Linux native, the callback may schedule that last-handle barrier as deferred VFS work; later same-inode `getattr`, `open`, and `read` paths wait for it before observing inode state. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
 
 FUSE data-buffer behavior:

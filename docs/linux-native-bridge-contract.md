@@ -118,8 +118,11 @@ The bridge must preserve these rules:
   remote upload or PostgreSQL replication.
 - `flush` freezes and finishes dirty slices owned by the handle or inode.
 - `fsync` remains the strict caller-requested local sync API.
-- `release` drains remaining local writer state when required without moving
-  remote publication into the foreground path.
+- `release` closes the handle in the foreground path and may defer the
+  last-handle local durability barrier to VFS background work; later same-inode
+  `getattr`, `open`, and `read` observations must wait for that deferred
+  barrier before using inode state. It must not move remote publication into
+  the foreground path.
 - EOF-changing paths persist local EOF and attributes before returning.
 - Remote invalidation and local writes trigger VFS invalidation before Linux
   kernel page-cache reuse can expose stale bytes.

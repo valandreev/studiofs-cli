@@ -11676,6 +11676,45 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 }
 
 #[test]
+fn read_into_fh_waits_for_deferred_last_handle_release_barrier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-waits-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"read-waits-release.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+
+        let (entry, guard) = vfs
+            .state
+            .deferred_release_inflight
+            .try_register(ino)
+            .expect("test should reserve the deferred release gate");
+
+        let reading_vfs = Arc::clone(&vfs);
+        let read = tokio::spawn(async move {
+            let mut buffer = [];
+            reading_vfs.read_into_fh(fh, ino, 0, &mut buffer).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !read.is_finished(),
+            "read_into_fh must wait for an in-flight deferred last-handle release barrier before observing inode state"
+        );
+
+        drop(entry);
+        drop(guard);
+        read.await
+            .expect("read task should not panic")
+            .expect("read should complete after deferred release barrier drains");
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_release_barrier_replaces_older_inflight_marker() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");

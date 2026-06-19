@@ -173,6 +173,17 @@ pub trait NativeVfs {
     /// Release a previously opened file handle.
     fn release(&self, fh: u64) -> Result<(), i32>;
 
+    /// Release a file handle while allowing the last-handle local durability barrier to drain
+    /// outside the FUSE callback foreground path when the backend supports it.
+    fn release_with_deferred_last_handle_barrier(&self, fh: u64) -> Result<(), i32> {
+        self.release(fh)
+    }
+
+    /// Wait for an already-scheduled deferred release barrier before observing inode state.
+    fn wait_for_deferred_release_barrier(&self, _ino: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Read bytes from an open file handle.
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32>;
 
@@ -289,6 +300,14 @@ impl<T: NativeVfs + ?Sized> NativeVfs for Arc<T> {
 
     fn release(&self, fh: u64) -> Result<(), i32> {
         (**self).release(fh)
+    }
+
+    fn release_with_deferred_last_handle_barrier(&self, fh: u64) -> Result<(), i32> {
+        (**self).release_with_deferred_last_handle_barrier(fh)
+    }
+
+    fn wait_for_deferred_release_barrier(&self, ino: u64) -> Result<(), i32> {
+        (**self).wait_for_deferred_release_barrier(ino)
     }
 
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
@@ -430,6 +449,8 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn getattr(&self, ino: u64) -> Result<NativeAttr, i32> {
+        self.rt
+            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
         self.vfs
             .getattr(ino)
             .map(native_attr_from_inode_attr)
@@ -437,6 +458,8 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn open(&self, ino: u64, flags: i32) -> Result<u64, i32> {
+        self.rt
+            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         self.vfs
             .open_file(ino, open_flags, trunc)
@@ -444,6 +467,8 @@ impl NativeVfs for StudioVfsNativeAdapter {
     }
 
     fn open_cache_state(&self, ino: u64) -> Option<NativeInodeCacheState> {
+        self.rt
+            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
         let attr = match self.vfs.getattr(ino) {
             Ok(attr) => attr,
             Err(error) => {
@@ -467,7 +492,22 @@ impl NativeVfs for StudioVfsNativeAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn release_with_deferred_last_handle_barrier(&self, fh: u64) -> Result<(), i32> {
+        let _outcome = self
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.rt);
+        Ok(())
+    }
+
+    fn wait_for_deferred_release_barrier(&self, ino: u64) -> Result<(), i32> {
+        self.rt
+            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
+        Ok(())
+    }
+
     fn read(&self, fh: u64, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        self.rt
+            .block_on(self.vfs.wait_for_deferred_release_barrier(ino));
         let size = checked_native_read_size(size)?;
         // StudioVfs currently reads into initialized slices; avoid unsafe uninit buffers here.
         let mut out = vec![0; size];
@@ -1752,7 +1792,7 @@ where
             if pending_result == Err(libc::EAGAIN) {
                 return errno_reply(request.header.unique, libc::EAGAIN);
             }
-            let release_result = self.vfs.release(fh);
+            let release_result = self.vfs.release_with_deferred_last_handle_barrier(fh);
             self.pending_writes.finish_close(request.header.nodeid, fh);
             self.forget_read_ahead_handle(request.header.nodeid, fh);
             let reply = empty_barrier_reply(request.header.unique, pending_result, release_result);
@@ -1761,7 +1801,7 @@ where
 
         self.barrier_gates
             .wait_for_barrier(ResourceKey::Inode(request.header.nodeid));
-        let release_result = self.vfs.release(fh);
+        let release_result = self.vfs.release_with_deferred_last_handle_barrier(fh);
         self.forget_read_ahead_handle(request.header.nodeid, fh);
         match release_result {
             Ok(()) => {
@@ -4955,14 +4995,48 @@ mod tests {
             .find("pending_result == Err(libc::EAGAIN)")
             .expect("handle_release should check EAGAIN from drain");
         let vfs_release = body
-            .find("self.vfs.release(fh)")
-            .expect("handle_release should release VFS handle after successful drain");
+            .find("self.vfs.release_with_deferred_last_handle_barrier(fh)")
+            .expect("handle_release should release VFS handle with the deferred last-handle barrier after successful drain");
         let finish_close = body
             .find("self.pending_writes.finish_close")
             .expect("handle_release should finish close after releasing VFS handle");
 
         assert!(eagain_guard < vfs_release);
         assert!(eagain_guard < finish_close);
+    }
+
+    #[test]
+    fn native_bridge_inode_operations_wait_for_deferred_release_barrier() {
+        let source = include_str!("vfs_adapter.rs");
+        let adapter_impl = source
+            .split("impl NativeVfs for StudioVfsNativeAdapter")
+            .nth(1)
+            .and_then(|rest| rest.split("struct NativeFuseMetricGuard").next())
+            .expect("StudioVfsNativeAdapter NativeVfs impl should be present");
+        for (operation, next_marker) in [
+            (
+                "fn getattr(&self, ino: u64)",
+                "fn open(&self, ino: u64, flags: i32)",
+            ),
+            (
+                "fn open(&self, ino: u64, flags: i32)",
+                "fn open_cache_state(&self, ino: u64)",
+            ),
+            (
+                "fn read(&self, fh: u64, ino: u64, offset: u64, size: u32)",
+                "#[cfg(unix)]",
+            ),
+        ] {
+            let body = adapter_impl
+                .split(operation)
+                .nth(1)
+                .and_then(|rest| rest.split(next_marker).next())
+                .unwrap_or_else(|| panic!("{operation} body should be present"));
+            assert!(
+                body.contains("self.vfs.wait_for_deferred_release_barrier(ino)"),
+                "{operation} should wait for a deferred last-handle release before observing inode state"
+            );
+        }
     }
 
     #[test]
