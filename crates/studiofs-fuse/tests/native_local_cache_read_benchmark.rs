@@ -254,8 +254,8 @@ fn measurement_from_transport(
         name,
         elapsed,
         latencies,
-        metrics.pread_bytes_replies,
-        metrics.pread_bytes_replies + metrics.splice_replies,
+        metrics.pread_local_cache_replies,
+        metrics.pread_local_cache_replies + metrics.splice_replies,
         0,
     );
     measurement.read_amplification_bytes = metrics

@@ -1335,7 +1335,7 @@ fn elapsed_transport_latency_ns(started_at: Instant) -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalCacheReplyMetricsSnapshot {
     /// Replies served by `pread -> bytes -> write`.
-    pub pread_bytes_replies: u64,
+    pub pread_local_cache_replies: u64,
     /// Replies served by `splice(file_fd -> pipe -> fuse_fd)`.
     pub splice_replies: u64,
     /// Payload bytes copied or spliced from a local cache fd.
@@ -1358,7 +1358,7 @@ impl LocalCacheReplyMetrics {
 
     fn snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
         LocalCacheReplyMetricsSnapshot {
-            pread_bytes_replies: self.pread_bytes_replies.load(Ordering::Relaxed),
+            pread_local_cache_replies: self.pread_bytes_replies.load(Ordering::Relaxed),
             splice_replies: self.splice_replies.load(Ordering::Relaxed),
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
         }
@@ -3349,7 +3349,7 @@ mod tests {
             .expect("classic send should write local cache range");
 
         let metrics = transport.local_cache_reply_metrics_snapshot();
-        assert_eq!(metrics.pread_bytes_replies, 1);
+        assert_eq!(metrics.pread_local_cache_replies, 1);
         assert_eq!(metrics.payload_bytes, 6);
         let output = transport.into_inner().output;
         assert_eq!(&output[16..], b"456789");
@@ -3624,7 +3624,7 @@ mod tests {
 
         let metrics = transport.local_cache_reply_metrics_snapshot();
         assert_eq!(metrics.splice_replies, 1);
-        assert_eq!(metrics.pread_bytes_replies, 0);
+        assert_eq!(metrics.pread_local_cache_replies, 0);
         assert_eq!(metrics.payload_bytes, 5);
         let mut output_file = transport.into_inner();
         output_file.rewind().expect("rewind output file");

@@ -809,7 +809,7 @@ mod tests {
         let transport = ReplyMetricsTransport {
             inner: FrameQueueTransport::new([frame(15, 0x10)]),
             metrics: LocalCacheReplyMetricsSnapshot {
-                pread_bytes_replies: 2,
+                pread_local_cache_replies: 2,
                 splice_replies: 3,
                 payload_bytes: 4096,
             },
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(
             handler.snapshots,
             [LocalCacheReplyMetricsSnapshot {
-                pread_bytes_replies: 2,
+                pread_local_cache_replies: 2,
                 splice_replies: 3,
                 payload_bytes: 4096,
             }]
@@ -839,7 +839,7 @@ mod tests {
         let transport = ReplyMetricsTransport {
             inner: FrameQueueTransport::new([frame(1, 0x10)]),
             metrics: LocalCacheReplyMetricsSnapshot {
-                pread_bytes_replies: 2,
+                pread_local_cache_replies: 2,
                 splice_replies: 3,
                 payload_bytes: 4096,
             },

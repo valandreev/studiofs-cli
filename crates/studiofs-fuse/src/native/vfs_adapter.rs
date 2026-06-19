@@ -1309,21 +1309,24 @@ pub struct NativeReadMetricsSnapshot {
 
 impl NativeReadMetricsSnapshot {
     /// Return stable artifact labels for observed local-cache read fallback reasons.
-    pub fn local_cache_fallback_reasons(&self) -> Vec<&'static str> {
-        let mut reasons = Vec::with_capacity(4);
-        if self.local_cache_unavailable_fallbacks > 0 {
-            reasons.push("local_cache_unavailable");
-        }
-        if self.stale_epoch_fallbacks > 0 {
-            reasons.push("stale_epoch");
-        }
-        if self.stale_generation_fallbacks > 0 {
-            reasons.push("stale_generation");
-        }
-        if self.unsafe_local_cache_fallbacks > 0 {
-            reasons.push("unsafe_local_cache");
-        }
-        reasons
+    pub fn local_cache_fallback_reasons(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (
+                self.local_cache_unavailable_fallbacks > 0,
+                "local_cache_unavailable",
+            ),
+            (self.stale_epoch_fallbacks > 0, "stale_epoch"),
+            (self.stale_generation_fallbacks > 0, "stale_generation"),
+            (self.unsafe_local_cache_fallbacks > 0, "unsafe_local_cache"),
+        ]
+        .into_iter()
+        .filter_map(|(observed, reason)| observed.then_some(reason))
+    }
+}
+
+fn store_if_changed(metric: &AtomicU64, next: u64) {
+    if metric.load(Ordering::Relaxed) != next {
+        metric.store(next, Ordering::Relaxed);
     }
 }
 
@@ -1449,15 +1452,18 @@ where
     }
 
     fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
-        self.read_metrics
-            .pread_local_cache_replies
-            .store(metrics.pread_bytes_replies, Ordering::Relaxed);
-        self.read_metrics
-            .splice_local_cache_replies
-            .store(metrics.splice_replies, Ordering::Relaxed);
-        self.read_metrics
-            .local_cache_reply_bytes
-            .store(metrics.payload_bytes, Ordering::Relaxed);
+        store_if_changed(
+            &self.read_metrics.pread_local_cache_replies,
+            metrics.pread_local_cache_replies,
+        );
+        store_if_changed(
+            &self.read_metrics.splice_local_cache_replies,
+            metrics.splice_replies,
+        );
+        store_if_changed(
+            &self.read_metrics.local_cache_reply_bytes,
+            metrics.payload_bytes,
+        );
         self.publish_native_bridge_snapshot_if_due();
     }
 }
@@ -3421,6 +3427,32 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_reply_metrics_skip_unchanged_atomic_stores() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn record_local_cache_reply_metrics")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("record_local_cache_reply_metrics body should be present");
+
+        assert!(body.contains("store_if_changed"));
+        assert!(!body.contains(".store(metrics."));
+    }
+
+    #[test]
+    fn local_cache_fallback_reasons_use_stack_iterator() {
+        let source = include_str!("vfs_adapter.rs");
+        let signature = source
+            .split("pub fn local_cache_fallback_reasons")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .expect("local_cache_fallback_reasons signature should be present");
+
+        assert!(signature.contains("impl Iterator<Item = &'static str>"));
+        assert!(!signature.contains("Vec"));
+    }
+
+    #[test]
     fn native_open_cache_state_from_attr_maps_epoch_size_mtime_and_dirty_state() {
         let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
         attr.size = 4096;
@@ -3871,7 +3903,7 @@ mod tests {
         };
 
         assert_eq!(
-            metrics.local_cache_fallback_reasons(),
+            metrics.local_cache_fallback_reasons().collect::<Vec<_>>(),
             [
                 "local_cache_unavailable",
                 "stale_epoch",
@@ -3887,7 +3919,7 @@ mod tests {
         let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
         bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
-            pread_bytes_replies: 2,
+            pread_local_cache_replies: 2,
             splice_replies: 5,
             payload_bytes: 12 * 1024,
         });

@@ -1518,13 +1518,44 @@ impl StudioVfs {
         size: u32,
     ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
         let Some(open_file) = self.handle_table.get(fh) else {
+            debug!(
+                fh,
+                ino, "native local-cache read range rejected: unknown file handle"
+            );
             return Ok(None);
         };
-        if open_file.ino != ino
-            || open_file.flags.contains(OpenFlags::WRONLY)
-            || open_file.flags.contains(OpenFlags::RDWR)
-            || self.inode_has_local_dirty_state(ino)
-        {
+        if open_file.ino != ino {
+            debug!(
+                fh,
+                ino,
+                open_ino = open_file.ino,
+                "native local-cache read range rejected: file handle inode mismatch"
+            );
+            return Ok(None);
+        }
+        if open_file.flags.contains(OpenFlags::WRONLY) {
+            debug!(
+                fh,
+                ino,
+                flags = ?open_file.flags,
+                "native local-cache read range rejected: write-only file handle"
+            );
+            return Ok(None);
+        }
+        if open_file.flags.contains(OpenFlags::RDWR) {
+            debug!(
+                fh,
+                ino,
+                flags = ?open_file.flags,
+                "native local-cache read range rejected: read-write file handle"
+            );
+            return Ok(None);
+        }
+        if self.inode_has_local_dirty_state(ino) {
+            debug!(
+                fh,
+                ino, "native local-cache read range rejected: inode has local dirty state"
+            );
             return Ok(None);
         }
         self.local_cache_read_range_impl(Some(fh), ino, offset, size)
