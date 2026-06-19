@@ -28,6 +28,7 @@ use studiofs_fuse::native::transport::{
 };
 use studiofs_fuse::native::vfs_adapter::{
     LinuxNativeBridge, NativeAsyncWriteConfig, StudioVfsNativeAdapter,
+    set_native_bridge_snapshot_min_interval_for_test,
 };
 use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
@@ -700,6 +701,38 @@ fn docs_list_sfs537_metadata_cache_regression_gate() {
         docs.contains("metadata_invalidation_events"),
         "docs/tests.md must list the native metadata invalidation telemetry counter"
     );
+    assert!(
+        docs.contains("metadata-amplification.tsv"),
+        "docs/tests.md must list the mounted repeated metadata amplification artifact"
+    );
+}
+
+#[test]
+fn sfs509_metadata_probe_records_repeated_metadata_amplification_artifact() {
+    let source = include_str!("mount_sanity.rs");
+    let probe = source
+        .rsplit("fn run_sfs509_metadata_probe")
+        .next()
+        .and_then(|rest| rest.split("/// Verifies that creating").next())
+        .expect("SFS-509 metadata probe should be present");
+
+    for expected in [
+        "metadata-amplification.tsv",
+        "repeated_stat",
+        "repeated_list",
+        "repeated_missing",
+        "list-cache-probe",
+        "missing-cache-probe-dir",
+        "lookup_ops_delta",
+        "getattr_ops_delta",
+        "readdir_ops_delta",
+        "negative_lookup_replies_delta",
+    ] {
+        assert!(
+            probe.contains(expected),
+            "SFS-509 metadata probe should record {expected}"
+        );
+    }
 }
 
 #[test]
@@ -2439,7 +2472,7 @@ fn run_mounted_operation_with_vfs(
             MountedOperationGuard::default()
         }
         MountedScenarioOperation::Sfs509FioMatrix => {
-            run_sfs509_fio_matrix_if_available(mount_path, scenario_name);
+            run_sfs509_fio_matrix_if_available(mount_path, scenario_name, vfs);
             MountedOperationGuard::default()
         }
         MountedScenarioOperation::Sfs530EvidenceMatrix => {
@@ -3056,7 +3089,11 @@ fn assert_sfs509_fio_json_case(
     );
 }
 
-fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
+fn run_sfs509_fio_matrix_if_available(
+    mount_path: &Path,
+    scenario_name: &str,
+    vfs: Option<&StudioVfs>,
+) {
     assert!(
         command_available("fio"),
         "SFS-509 long-lived fio matrix requires fio"
@@ -3183,7 +3220,7 @@ fn run_sfs509_fio_matrix_if_available(mount_path: &Path, scenario_name: &str) {
             "--fsync_on_close=1",
         ],
     );
-    run_sfs509_metadata_probe(mount_path, &artifact_dir, metadata_files);
+    run_sfs509_metadata_probe(mount_path, &artifact_dir, metadata_files, vfs);
     assert_sfs509_fio_json_case(
         &artifact_dir,
         mount_path,
@@ -3255,7 +3292,12 @@ fn drop_caches_best_effort(artifact_dir: &Path) {
     }
 }
 
-fn run_sfs509_metadata_probe(mount_path: &Path, artifact_dir: &Path, file_count: usize) {
+fn run_sfs509_metadata_probe(
+    mount_path: &Path,
+    artifact_dir: &Path,
+    file_count: usize,
+    vfs: Option<&StudioVfs>,
+) {
     let metadata_dir = mount_path.join("sfs509-metadata-heavy");
     let _ = std::fs::remove_dir_all(&metadata_dir);
     std::fs::create_dir_all(&metadata_dir).expect("create SFS-509 metadata directory");
@@ -3288,6 +3330,148 @@ fn run_sfs509_metadata_probe(mount_path: &Path, artifact_dir: &Path, file_count:
     );
     std::fs::write(artifact_dir.join("metadata-readdir-stat.tsv"), summary)
         .expect("write SFS-509 metadata summary");
+    write_sfs509_metadata_amplification_probe(&metadata_dir, artifact_dir, file_count, vfs);
+}
+
+fn write_sfs509_metadata_amplification_probe(
+    metadata_dir: &Path,
+    artifact_dir: &Path,
+    file_count: usize,
+    vfs: Option<&StudioVfs>,
+) {
+    let Some(vfs) = vfs else {
+        return;
+    };
+    let _snapshot_interval_guard = set_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
+    let probe_count = file_count.min(128);
+    std::thread::sleep(Duration::from_millis(1_100));
+
+    let mut rows = String::from(
+        "phase\tapp_ops\tfuse_ops_delta\tmetadata_ops_delta\tlookup_ops_delta\tgetattr_ops_delta\treaddir_ops_delta\treaddirplus_ops_delta\tnegative_lookup_replies_delta\n",
+    );
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_stat_first",
+        probe_count,
+        &measure_native_metadata_delta(vfs, || {
+            for index in 0..probe_count {
+                let path = metadata_dir.join(format!("file-{index:06}.txt"));
+                let _ = std::fs::metadata(path).expect("stat SFS-509 metadata file");
+            }
+        }),
+    );
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_stat_cached",
+        probe_count,
+        &measure_native_metadata_delta(vfs, || {
+            for index in 0..probe_count {
+                let path = metadata_dir.join(format!("file-{index:06}.txt"));
+                let _ = std::fs::metadata(path).expect("stat cached SFS-509 metadata file");
+            }
+        }),
+    );
+    let list_dir = metadata_dir.join("list-cache-probe");
+    std::fs::create_dir_all(&list_dir).expect("create SFS-509 list cache probe directory");
+    for index in 0..16 {
+        let path = list_dir.join(format!("entry-{index:02}.txt"));
+        std::fs::write(path, b"list-cache-probe\n").expect("write SFS-509 list cache probe file");
+    }
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_list_first",
+        1,
+        &measure_native_metadata_delta(vfs, || {
+            let count = std::fs::read_dir(&list_dir)
+                .expect("read SFS-509 metadata directory")
+                .count();
+            assert_eq!(count, 16);
+        }),
+    );
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_list_cached",
+        1,
+        &measure_native_metadata_delta(vfs, || {
+            let count = std::fs::read_dir(&list_dir)
+                .expect("read cached SFS-509 metadata directory")
+                .count();
+            assert_eq!(count, 16);
+        }),
+    );
+    let missing_dir = metadata_dir.join("missing-cache-probe-dir");
+    std::fs::create_dir_all(&missing_dir).expect("create SFS-509 missing cache probe directory");
+    let missing_path = missing_dir.join("missing-negative-cache-probe");
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_missing_first",
+        1,
+        &measure_native_metadata_delta(vfs, || {
+            assert!(
+                std::fs::metadata(&missing_path).is_err(),
+                "missing metadata probe should not resolve"
+            );
+        }),
+    );
+    append_sfs509_metadata_amplification_row(
+        &mut rows,
+        "repeated_missing_cached",
+        1,
+        &measure_native_metadata_delta(vfs, || {
+            assert!(
+                std::fs::metadata(&missing_path).is_err(),
+                "cached missing metadata probe should not resolve"
+            );
+        }),
+    );
+    std::fs::write(artifact_dir.join("metadata-amplification.tsv"), rows)
+        .expect("write SFS-509 metadata amplification summary");
+}
+
+fn measure_native_metadata_delta(
+    vfs: &StudioVfs,
+    operation: impl FnOnce(),
+) -> VfsNativeBridgeSnapshot {
+    let before = vfs.write_path_observability_snapshot().native_bridge;
+    operation();
+    let after = vfs.write_path_observability_snapshot().native_bridge;
+    native_bridge_snapshot_delta(&before, &after)
+}
+
+fn native_bridge_snapshot_delta(
+    before: &VfsNativeBridgeSnapshot,
+    after: &VfsNativeBridgeSnapshot,
+) -> VfsNativeBridgeSnapshot {
+    VfsNativeBridgeSnapshot {
+        fuse_ops: after.fuse_ops.saturating_sub(before.fuse_ops),
+        metadata_ops: after.metadata_ops.saturating_sub(before.metadata_ops),
+        lookup_ops: after.lookup_ops.saturating_sub(before.lookup_ops),
+        getattr_ops: after.getattr_ops.saturating_sub(before.getattr_ops),
+        readdir_ops: after.readdir_ops.saturating_sub(before.readdir_ops),
+        readdirplus_ops: after.readdirplus_ops.saturating_sub(before.readdirplus_ops),
+        negative_lookup_replies: after
+            .negative_lookup_replies
+            .saturating_sub(before.negative_lookup_replies),
+        ..VfsNativeBridgeSnapshot::default()
+    }
+}
+
+fn append_sfs509_metadata_amplification_row(
+    rows: &mut String,
+    phase: &str,
+    app_ops: usize,
+    delta: &VfsNativeBridgeSnapshot,
+) {
+    rows.push_str(&format!(
+        "{phase}\t{app_ops}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        delta.fuse_ops,
+        delta.metadata_ops,
+        delta.lookup_ops,
+        delta.getattr_ops,
+        delta.readdir_ops,
+        delta.readdirplus_ops,
+        delta.negative_lookup_replies
+    ));
 }
 
 /// Verifies that creating and dropping a FUSE session does not panic or leak.

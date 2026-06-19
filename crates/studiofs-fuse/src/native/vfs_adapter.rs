@@ -898,7 +898,38 @@ struct NativeAmplificationMetrics {
     write_latency: NativeLatencyMetrics,
 }
 
-const NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS: u64 = 1_000;
+static NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS: AtomicU64 =
+    AtomicU64::new(NATIVE_BRIDGE_SNAPSHOT_DEFAULT_MIN_INTERVAL_MS);
+#[cfg(test)]
+static NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[doc(hidden)]
+pub struct NativeBridgeSnapshotIntervalGuard {
+    previous_ms: u64,
+}
+
+impl Drop for NativeBridgeSnapshotIntervalGuard {
+    fn drop(&mut self) {
+        NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.store(self.previous_ms, Ordering::Relaxed);
+    }
+}
+
+#[doc(hidden)]
+pub fn set_native_bridge_snapshot_min_interval_for_test(
+    interval: Duration,
+) -> NativeBridgeSnapshotIntervalGuard {
+    let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
+    let previous_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.swap(interval_ms, Ordering::Relaxed);
+    NativeBridgeSnapshotIntervalGuard { previous_ms }
+}
+
+#[cfg(test)]
+fn native_bridge_snapshot_interval_test_lock() -> MutexGuard<'static, ()> {
+    NATIVE_BRIDGE_SNAPSHOT_INTERVAL_TEST_LOCK
+        .lock()
+        .expect("native bridge snapshot interval test lock should not be poisoned")
+}
 const NATIVE_BRIDGE_SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
 const NATIVE_LATENCY_BUCKET_BOUNDS_NS: [u64; 18] = [
     1_000,
@@ -2504,9 +2535,7 @@ where
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let interval_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let interval_ms = NATIVE_BRIDGE_SNAPSHOT_MIN_INTERVAL_MS.load(Ordering::Relaxed);
 
         let mut last = self
             .native_bridge_snapshot_last_elapsed_ms
@@ -3682,6 +3711,7 @@ mod tests {
 
     #[test]
     fn native_bridge_snapshot_publish_is_rate_limited_on_hot_path() {
+        let _lock = native_bridge_snapshot_interval_test_lock();
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
 
@@ -3695,6 +3725,24 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].0.lookup_ops, 1);
         assert_eq!(bridge.amplification_metrics_snapshot().getattr_ops, 1);
+    }
+
+    #[test]
+    fn native_bridge_snapshot_interval_test_guard_allows_immediate_publish() {
+        let _lock = native_bridge_snapshot_interval_test_lock();
+        let _guard = set_native_bridge_snapshot_min_interval_for_test(Duration::ZERO);
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
+        let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+
+        let snapshots = vfs
+            .native_bridge_snapshots
+            .lock()
+            .expect("native bridge snapshots lock should not be poisoned");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].0.getattr_ops, 1);
     }
 
     #[test]
