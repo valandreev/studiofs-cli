@@ -1163,6 +1163,12 @@ pub struct NativeAmplificationMetricsSnapshot {
     pub fuse_ops_per_read_write_micros: u64,
     /// Metadata operations per file open, scaled by 1,000,000.
     pub metadata_ops_per_open_micros: u64,
+    /// Lookup operations per file open, scaled by 1,000,000.
+    pub lookup_ops_per_open_micros: u64,
+    /// Getattr operations per file open, scaled by 1,000,000.
+    pub getattr_ops_per_open_micros: u64,
+    /// Readdirplus operations per readdir operation, scaled by 1,000,000.
+    pub readdirplus_readdir_ratio_micros: u64,
     /// Lookup latency statistics.
     pub lookup_latency: NativeLatencyMetricsSnapshot,
     /// Getattr latency statistics.
@@ -1277,6 +1283,9 @@ impl NativeAmplificationMetrics {
             open_release_ratio_micros: scaled_ratio_micros(open_ops, release_ops),
             fuse_ops_per_read_write_micros: scaled_ratio_micros(fuse_ops, application_io_ops),
             metadata_ops_per_open_micros: scaled_ratio_micros(metadata_ops, open_ops),
+            lookup_ops_per_open_micros: scaled_ratio_micros(lookup_ops, open_ops),
+            getattr_ops_per_open_micros: scaled_ratio_micros(getattr_ops, open_ops),
+            readdirplus_readdir_ratio_micros: scaled_ratio_micros(readdirplus_ops, readdir_ops),
             lookup_latency,
             getattr_latency,
             readdir_latency,
@@ -3541,14 +3550,19 @@ mod tests {
 
         let _ = bridge.handle_lookup(lookup_request_for_name(b"file"));
         let _ = bridge.handle_getattr(getattr_request_for_ino(20));
+        let _ = bridge.handle_readdir(readdir_request_for_offset_and_size(0, 4096));
+        let _ = bridge.handle_readdirplus(readdir_request_for_offset_and_size(0, 4096));
         let _ = bridge.handle_open(open_request_for_flags(0));
         let _ = bridge.handle_read(read_request_for_size(8192));
         let _ = bridge.handle_write(write_request_for_data(20, 7, 0, b"abc"));
 
         let metrics = bridge.amplification_metrics_snapshot();
-        assert_eq!(metrics.fuse_ops, 5);
-        assert_eq!(metrics.fuse_ops_per_read_write_micros, 2_500_000);
-        assert_eq!(metrics.metadata_ops_per_open_micros, 2_000_000);
+        assert_eq!(metrics.fuse_ops, 7);
+        assert_eq!(metrics.fuse_ops_per_read_write_micros, 3_500_000);
+        assert_eq!(metrics.metadata_ops_per_open_micros, 4_000_000);
+        assert_eq!(metrics.lookup_ops_per_open_micros, 1_000_000);
+        assert_eq!(metrics.getattr_ops_per_open_micros, 1_000_000);
+        assert_eq!(metrics.readdirplus_readdir_ratio_micros, 1_000_000);
     }
 
     #[test]
