@@ -3746,10 +3746,7 @@ mod tests {
 
         assert_eq!(vfs.advise_read_ahead_calls.load(Ordering::Relaxed), 1);
         assert_eq!(vfs.last_read_ahead_offset.load(Ordering::Relaxed), 16_384);
-        assert_eq!(
-            vfs.last_read_ahead_len.load(Ordering::Relaxed),
-            64 * 1024 - 16_384
-        );
+        assert_eq!(vfs.last_read_ahead_len.load(Ordering::Relaxed), 8192);
     }
 
     #[test]
