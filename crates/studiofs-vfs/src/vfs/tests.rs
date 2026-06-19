@@ -12096,6 +12096,9 @@ fn write_path_observability_reports_native_bridge_snapshot() {
         write_ops: 13,
         lookup_getattr_ratio_micros: 1_500_000,
         open_release_ratio_micros: 1_250_000,
+        lookup_ops_per_open_micros: 600_000,
+        getattr_ops_per_open_micros: 400_000,
+        readdirplus_readdir_ratio_micros: 1_000_000,
         metadata_latency_total_ns: 700,
         lookup_latency: VfsNativeLatencySnapshot {
             samples: 3,
@@ -12119,6 +12122,12 @@ fn write_path_observability_reports_native_bridge_snapshot() {
     let snapshot = vfs.write_path_observability_snapshot();
 
     assert_eq!(snapshot.native_bridge.metadata_ops, 7);
+    assert_eq!(snapshot.native_bridge.lookup_ops_per_open_micros, 600_000);
+    assert_eq!(snapshot.native_bridge.getattr_ops_per_open_micros, 400_000);
+    assert_eq!(
+        snapshot.native_bridge.readdirplus_readdir_ratio_micros,
+        1_000_000
+    );
     assert_eq!(snapshot.native_bridge.lookup_latency.p95_ns, 150);
     assert_eq!(snapshot.native_bridge.stale_generation_fallbacks, 4);
     assert_eq!(snapshot.native_bridge.read_ahead_suppressed, 9);

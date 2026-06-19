@@ -425,6 +425,12 @@ pub struct VfsNativeBridgeSnapshot {
     pub fuse_ops_per_read_write_micros: u64,
     /// Metadata operations per file open, scaled by 1,000,000.
     pub metadata_ops_per_open_micros: u64,
+    /// Lookup operations per file open, scaled by 1,000,000.
+    pub lookup_ops_per_open_micros: u64,
+    /// Getattr operations per file open, scaled by 1,000,000.
+    pub getattr_ops_per_open_micros: u64,
+    /// Readdirplus/readdir ratio scaled by 1,000,000.
+    pub readdirplus_readdir_ratio_micros: u64,
     /// Total metadata latency across lookup/getattr/readdir/readdirplus.
     pub metadata_latency_total_ns: u64,
     /// Lookup latency statistics.

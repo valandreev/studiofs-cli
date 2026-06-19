@@ -707,6 +707,9 @@ fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
     assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
     assert!(writer.contains("native_bridge.unsafe_local_cache_fallbacks"));
+    assert!(writer.contains("native_bridge.lookup_ops_per_open_micros"));
+    assert!(writer.contains("native_bridge.getattr_ops_per_open_micros"));
+    assert!(writer.contains("native_bridge.readdirplus_readdir_ratio_micros"));
     assert!(writer.contains("native_bridge.local_cache_willneed_hints"));
     assert!(writer.contains("native_bridge.local_cache_willneed_errors"));
     assert!(writer.contains("fetch.singleflight_waits"));
@@ -2633,6 +2636,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"open_release_ratio_micros\": {native_open_release_ratio_micros},\n",
             "    \"fuse_ops_per_read_write_micros\": {native_fuse_ops_per_read_write_micros},\n",
             "    \"metadata_ops_per_open_micros\": {native_metadata_ops_per_open_micros},\n",
+            "    \"lookup_ops_per_open_micros\": {native_lookup_ops_per_open_micros},\n",
+            "    \"getattr_ops_per_open_micros\": {native_getattr_ops_per_open_micros},\n",
+            "    \"readdirplus_readdir_ratio_micros\": {native_readdirplus_readdir_ratio_micros},\n",
             "    \"metadata_latency_total_ns\": {native_metadata_latency_total_ns},\n",
             "    \"lookup_p95_ns\": {native_lookup_p95_ns},\n",
             "    \"lookup_p99_ns\": {native_lookup_p99_ns},\n",
@@ -2713,6 +2719,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         native_open_release_ratio_micros = native_bridge.open_release_ratio_micros,
         native_fuse_ops_per_read_write_micros = native_bridge.fuse_ops_per_read_write_micros,
         native_metadata_ops_per_open_micros = native_bridge.metadata_ops_per_open_micros,
+        native_lookup_ops_per_open_micros = native_bridge.lookup_ops_per_open_micros,
+        native_getattr_ops_per_open_micros = native_bridge.getattr_ops_per_open_micros,
+        native_readdirplus_readdir_ratio_micros = native_bridge.readdirplus_readdir_ratio_micros,
         native_metadata_latency_total_ns = native_bridge.metadata_latency_total_ns,
         native_lookup_p95_ns = native_bridge.lookup_latency.p95_ns,
         native_lookup_p99_ns = native_bridge.lookup_latency.p99_ns,
