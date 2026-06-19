@@ -836,11 +836,13 @@ pub fn run(
                 format_ms(snapshot.local_cache_io.backend_io_max_ms)
             );
             println!(
-                "  fetch cache_hits/s3/s3_errors/singleflight/bytes/prefetch_skips: {}/{}/{}/{}/{}/{}",
+                "  fetch cache_hits/s3/s3_errors/singleflight/waits/wait_max/bytes/prefetch_skips: {}/{}/{}/{}/{}/{}/{}/{}",
                 snapshot.fetch.cache_hits,
                 snapshot.fetch.s3_fetches,
                 snapshot.fetch.s3_errors,
                 snapshot.fetch.singleflight_joins,
+                snapshot.fetch.singleflight_waits,
+                format_ms(snapshot.fetch.singleflight_wait_max_ms),
                 format_bytes(snapshot.fetch.bytes_downloaded),
                 snapshot.fetch.prefetch_skips
             );

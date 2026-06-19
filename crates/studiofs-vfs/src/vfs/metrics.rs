@@ -789,6 +789,18 @@ pub struct VfsFetchStats {
     pub s3_errors: u64,
     /// Singleflight join count.
     pub singleflight_joins: u64,
+    /// Singleflight wait count.
+    #[serde(default)]
+    pub singleflight_waits: u64,
+    /// Total singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_total_ms: f64,
+    /// Average singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_avg_ms: f64,
+    /// Maximum singleflight wait time in milliseconds.
+    #[serde(default)]
+    pub singleflight_wait_max_ms: f64,
     /// Retry attempt count.
     pub retries: u64,
     /// Total bytes downloaded.
@@ -1406,6 +1418,9 @@ pub struct VfsCacheStateSnapshot {
     pub local_backend_dirty_objects: usize,
     /// Current prefetch queue depth.
     pub prefetch_queue_depth: u64,
+    /// Prefetch block candidates suppressed because an equivalent prefetch was already in-flight.
+    #[serde(default)]
+    pub read_ahead_deduped_prefetch_blocks: u64,
     /// Transit memory snapshot.
     pub transit_memory: VfsTransitMemorySnapshot,
 }

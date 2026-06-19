@@ -46,6 +46,13 @@ pub struct ReadAheadPolicy {
     pub prefetch_enabled: bool,
 }
 
+/// Snapshot of read-ahead planner counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadAheadMetricsSnapshot {
+    /// Prefetch block candidates suppressed because the block was already in-flight.
+    pub deduped_prefetch_blocks: u64,
+}
+
 /// Maximum idle gap before the read state resets back to cold, in microseconds.
 const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
@@ -77,6 +84,8 @@ pub struct ReadAheadTracker {
     states: DashMap<ReadStreamKey, ReadState>,
     /// Blocks that are already being prefetched — avoids duplicate work.
     inflight: DashMap<(Ino, u32), ()>,
+    /// Prefetch candidates suppressed by in-flight deduplication.
+    deduped_prefetch_blocks: AtomicU64,
     /// Maximum blocks ahead to fetch when fully ramped-up.
     pub width: u32,
     /// Baseline prefetch width before ramp-up.
@@ -187,6 +196,7 @@ impl ReadAheadTracker {
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
                 if self.inflight.contains_key(&(key.ino, block)) {
+                    self.deduped_prefetch_blocks.fetch_add(1, Ordering::Relaxed);
                     None // Already in-flight
                 } else {
                     Some(block)
@@ -216,9 +226,17 @@ impl ReadAheadTracker {
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
             inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
+            deduped_prefetch_blocks: AtomicU64::new(0),
             width,
             base_width,
             min_prefetch_on_seq,
+        }
+    }
+
+    /// Return read-ahead planner counters for observability.
+    pub fn metrics_snapshot(&self) -> ReadAheadMetricsSnapshot {
+        ReadAheadMetricsSnapshot {
+            deduped_prefetch_blocks: self.deduped_prefetch_blocks.load(Ordering::Relaxed),
         }
     }
 
@@ -472,6 +490,10 @@ mod tests {
                 b
             );
         }
+        assert!(
+            tracker.metrics_snapshot().deduped_prefetch_blocks > 0,
+            "in-flight prefetch candidates should be counted as deduped"
+        );
     }
 
     #[test]

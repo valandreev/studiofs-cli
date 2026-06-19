@@ -109,6 +109,12 @@ pub struct FetchMetrics {
     pub s3_errors: AtomicU64,
     /// Singleflight join count (non-owner readers for in-flight objects).
     pub singleflight_joins: AtomicU64,
+    /// Singleflight waits that observed an in-flight owner.
+    pub singleflight_waits: AtomicU64,
+    /// Total singleflight waiter time in nanoseconds.
+    pub singleflight_wait_total_ns: AtomicU64,
+    /// Peak singleflight waiter time in nanoseconds.
+    pub singleflight_wait_max_ns: AtomicU64,
     /// Retry count across fetch stages.
     pub retries: AtomicU64,
     /// Total bytes downloaded from remote and validated payloads.
@@ -172,6 +178,9 @@ impl FetchMetrics {
             s3_fetches: AtomicU64::new(0),
             s3_errors: AtomicU64::new(0),
             singleflight_joins: AtomicU64::new(0),
+            singleflight_waits: AtomicU64::new(0),
+            singleflight_wait_total_ns: AtomicU64::new(0),
+            singleflight_wait_max_ns: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
             encrypted_objects_read: AtomicU64::new(0),
@@ -207,11 +216,13 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} encrypted_objects={} encrypted_bytes={} crypto_read_failures={} malformed_encrypted_objects={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3} s3_get_max_ms={:.3} decode_max_ms={:.3} assemble_copy_max_ms={:.3} local_cache_put_max_ms={:.3} fetch_total_max_ms={:.3}",
+            "cache_hits={} s3={} errors={} singleflight={} singleflight_waits={} singleflight_wait_max_ms={:.3} retries={} bytes={} encrypted_objects={} encrypted_bytes={} crypto_read_failures={} malformed_encrypted_objects={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3} s3_get_max_ms={:.3} decode_max_ms={:.3} assemble_copy_max_ms={:.3} local_cache_put_max_ms={:.3} fetch_total_max_ms={:.3}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
             self.singleflight_joins.load(Ordering::Relaxed),
+            self.singleflight_waits.load(Ordering::Relaxed),
+            self.singleflight_wait_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.retries.load(Ordering::Relaxed),
             self.bytes_downloaded.load(Ordering::Relaxed),
             self.encrypted_objects_read.load(Ordering::Relaxed),
@@ -535,7 +546,18 @@ impl FetchScheduler {
                 Action::Wait(mut rx) => {
                     // Wait for the fetcher to finish (with a generous timeout
                     // to avoid infinite hangs).
+                    let wait_started = Instant::now();
                     let recv = tokio::time::timeout(Duration::from_secs(300), rx.recv()).await;
+                    let wait_ns = wait_started.elapsed().to_nanos_u64();
+                    self.metrics
+                        .singleflight_waits
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .singleflight_wait_total_ns
+                        .fetch_add(wait_ns, Ordering::Relaxed);
+                    self.metrics
+                        .singleflight_wait_max_ns
+                        .fetch_max(wait_ns, Ordering::Relaxed);
                     match recv {
                         Ok(Ok(BroadcastResult::Success(payload))) => {
                             return Ok(payload);
@@ -1834,6 +1856,22 @@ mod tests {
                 scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed),
                 io_calls_before,
                 "waiter should not spawn a blocking cache reread after singleflight notification"
+            );
+            assert_eq!(
+                scheduler
+                    .metrics
+                    .singleflight_waits
+                    .load(Ordering::Relaxed),
+                1,
+                "singleflight waiters should record materialization wait count"
+            );
+            assert!(
+                scheduler
+                    .metrics
+                    .singleflight_wait_total_ns
+                    .load(Ordering::Relaxed)
+                    > 0,
+                "singleflight waiters should record materialization wait time"
             );
         });
     }

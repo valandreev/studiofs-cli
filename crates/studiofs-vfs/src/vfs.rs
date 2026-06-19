@@ -3249,6 +3249,10 @@ impl StudioVfs {
                 .metrics
                 .prefetch_queue_depth
                 .load(Ordering::Relaxed),
+            read_ahead_deduped_prefetch_blocks: self
+                .readahead
+                .metrics_snapshot()
+                .deduped_prefetch_blocks,
             transit_memory: VfsTransitMemorySnapshot {
                 budget_bytes: transit.budget_bytes,
                 used_bytes: transit.used_bytes,
@@ -7437,6 +7441,13 @@ impl StudioVfs {
         let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
         let fetch_s3_errors = fetch_metrics.s3_errors.load(Ordering::Relaxed);
         let fetch_singleflight_joins = fetch_metrics.singleflight_joins.load(Ordering::Relaxed);
+        let fetch_singleflight_waits = fetch_metrics.singleflight_waits.load(Ordering::Relaxed);
+        let fetch_singleflight_wait_total_ns = fetch_metrics
+            .singleflight_wait_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_singleflight_wait_max_ns = fetch_metrics
+            .singleflight_wait_max_ns
+            .load(Ordering::Relaxed);
         let fetch_retries = fetch_metrics.retries.load(Ordering::Relaxed);
         let fetch_bytes_downloaded = fetch_metrics.bytes_downloaded.load(Ordering::Relaxed);
         let fetch_encrypted_objects_read =
@@ -7972,6 +7983,15 @@ impl StudioVfs {
                 s3_fetches: fetch_s3_fetches,
                 s3_errors: fetch_s3_errors,
                 singleflight_joins: fetch_singleflight_joins,
+                singleflight_waits: fetch_singleflight_waits,
+                singleflight_wait_total_ms: fetch_singleflight_wait_total_ns as f64 / 1_000_000.0,
+                singleflight_wait_avg_ms: if fetch_singleflight_waits == 0 {
+                    0.0
+                } else {
+                    (fetch_singleflight_wait_total_ns as f64 / fetch_singleflight_waits as f64)
+                        / 1_000_000.0
+                },
+                singleflight_wait_max_ms: fetch_singleflight_wait_max_ns as f64 / 1_000_000.0,
                 retries: fetch_retries,
                 bytes_downloaded: fetch_bytes_downloaded,
                 encrypted_objects_read: fetch_encrypted_objects_read,
