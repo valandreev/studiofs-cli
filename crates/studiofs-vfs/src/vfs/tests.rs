@@ -11715,6 +11715,22 @@ fn read_into_fh_waits_for_deferred_last_handle_release_barrier() {
 }
 
 #[test]
+fn read_into_fh_checks_deferred_release_barrier_before_waiting() {
+    let source = include_str!("sync_ops.rs");
+    let read_into_fh = source
+        .split("pub async fn read_into_fh")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("let debug_path = self.debug_pending_target_path(ino);")
+                .next()
+        })
+        .expect("read_into_fh prelude should be present");
+
+    assert!(read_into_fh.contains("if self.has_deferred_release_barrier(ino)"));
+    assert!(read_into_fh.contains("self.wait_for_deferred_release_inflight(ino).await"));
+}
+
+#[test]
 fn deferred_release_barrier_replaces_older_inflight_marker() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");

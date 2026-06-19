@@ -1131,7 +1131,9 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
-        self.wait_for_deferred_release_inflight(ino).await;
+        if self.has_deferred_release_barrier(ino) {
+            self.wait_for_deferred_release_inflight(ino).await;
+        }
         let debug_path = self.debug_pending_target_path(ino);
         if let Some(path) = &debug_path {
             let session = self.state.file_session.debug_snapshot(ino);

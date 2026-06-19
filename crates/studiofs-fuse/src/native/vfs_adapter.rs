@@ -3034,7 +3034,11 @@ fn readdirplus_payload<V: NativeVfs>(
 ) -> Result<Vec<u8>, i32> {
     let start = usize::try_from(offset).unwrap_or(0);
     let limit = size as usize;
-    let mut payload = Vec::with_capacity(limit);
+    let estimated_size = entries
+        .len()
+        .saturating_sub(start)
+        .saturating_mul(FUSE_ENTRY_OUT_PAYLOAD_LEN + 128);
+    let mut payload = Vec::with_capacity(limit.min(estimated_size));
     let mut pending_lookups = Vec::new();
     for (index, entry) in entries.iter().enumerate().skip(start) {
         let next_offset = match u64::try_from(index + 1) {
@@ -4041,7 +4045,10 @@ mod tests {
             .and_then(|rest| rest.split("fn statfs_payload").next())
             .expect("readdirplus_payload body should be present");
 
-        assert!(readdirplus_payload.contains("let mut payload = Vec::with_capacity(limit);"));
+        assert!(readdirplus_payload.contains("let estimated_size = entries"));
+        assert!(readdirplus_payload.contains("saturating_sub(start)"));
+        assert!(readdirplus_payload.contains("FUSE_ENTRY_OUT_PAYLOAD_LEN + 128"));
+        assert!(readdirplus_payload.contains("Vec::with_capacity(limit.min(estimated_size))"));
     }
 
     #[test]
