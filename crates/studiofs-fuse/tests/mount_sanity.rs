@@ -685,6 +685,24 @@ fn docs_list_sfs536_adaptive_readahead_regression_gate() {
 }
 
 #[test]
+fn docs_list_sfs537_metadata_cache_regression_gate() {
+    let docs = include_str!("../../../docs/tests.md");
+
+    assert!(
+        docs.contains("SFS-537 Linux metadata cache policy"),
+        "docs/tests.md must list the SFS-537 metadata cache regression gate"
+    );
+    assert!(
+        docs.contains("linux_metadata_cache_policy_matches_juicefs_style_defaults"),
+        "docs/tests.md must list the focused native metadata-cache policy test"
+    );
+    assert!(
+        docs.contains("metadata_invalidation_events"),
+        "docs/tests.md must list the native metadata invalidation telemetry counter"
+    );
+}
+
+#[test]
 fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     let source = include_str!("mount_sanity.rs");
     let writer = source
