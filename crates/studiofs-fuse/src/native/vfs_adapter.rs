@@ -1458,7 +1458,7 @@ where
         self.read_metrics
             .local_cache_reply_bytes
             .store(metrics.payload_bytes, Ordering::Relaxed);
-        self.publish_native_bridge_snapshot();
+        self.publish_native_bridge_snapshot_if_due();
     }
 }
 
@@ -3408,6 +3408,19 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_reply_metrics_publish_native_bridge_snapshot_through_throttled_path() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn record_local_cache_reply_metrics")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("record_local_cache_reply_metrics body should be present");
+
+        assert!(body.contains("publish_native_bridge_snapshot_if_due"));
+        assert!(!body.contains("publish_native_bridge_snapshot();"));
+    }
+
+    #[test]
     fn native_open_cache_state_from_attr_maps_epoch_size_mtime_and_dirty_state() {
         let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
         attr.size = 4096;
@@ -3887,7 +3900,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dispatcher_bridge_snapshot_reports_splice_reply_strategy_after_mounted_read() {
+    fn dispatcher_bridge_metrics_report_splice_reply_strategy_after_mounted_read() {
         let test_vfs = TestNativeVfs::default();
         test_vfs
             .local_cache_file
@@ -3924,12 +3937,8 @@ mod tests {
             .run_until_destroy()
             .expect("dispatcher should run read and follow-up lookup");
 
-        let (transport, _bridge) = dispatcher.into_parts();
-        let snapshots = vfs
-            .native_bridge_snapshots
-            .lock()
-            .expect("native bridge snapshots lock should not be poisoned");
-        let (_amplification, read) = snapshots.last().expect("snapshot should be published");
+        let (transport, bridge) = dispatcher.into_parts();
+        let read = bridge.read_metrics_snapshot();
         assert_eq!(read.local_cache_hits, 1);
         assert_eq!(read.splice_local_cache_replies, 1);
         assert_eq!(read.pread_local_cache_replies, 0);

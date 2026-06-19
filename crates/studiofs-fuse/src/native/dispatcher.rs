@@ -519,9 +519,11 @@ impl<T: FuseTransport, H: FuseOperationHandler> NativeDispatcher<T, H> {
                     source: error,
                 });
             }
-            self.handler.record_local_cache_reply_metrics(
-                self.transport.local_cache_reply_metrics_snapshot(),
-            );
+            if opcode == FuseOpcode::Read {
+                self.handler.record_local_cache_reply_metrics(
+                    self.transport.local_cache_reply_metrics_snapshot(),
+                );
+            }
             summary.handled_requests += 1;
             if is_destroy {
                 summary.saw_destroy = true;
@@ -735,6 +737,7 @@ mod tests {
     use crate::native::abi::{FUSE_IN_HEADER_LEN, ok_reply};
     use crate::native::reply::RecordedReplySink;
     use crate::native::transport::{FrameQueueTransport, LocalCacheReplyMetricsSnapshot};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -768,6 +771,7 @@ mod tests {
     struct ReplyMetricsTransport {
         inner: FrameQueueTransport,
         metrics: LocalCacheReplyMetricsSnapshot,
+        snapshot_calls: AtomicUsize,
     }
 
     impl FuseTransport for ReplyMetricsTransport {
@@ -780,6 +784,7 @@ mod tests {
         }
 
         fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+            self.snapshot_calls.fetch_add(1, Ordering::Relaxed);
             self.metrics
         }
     }
@@ -802,12 +807,13 @@ mod tests {
     #[test]
     fn dispatcher_publishes_transport_local_cache_reply_metrics_after_send() {
         let transport = ReplyMetricsTransport {
-            inner: FrameQueueTransport::new([frame(1, 0x10)]),
+            inner: FrameQueueTransport::new([frame(15, 0x10)]),
             metrics: LocalCacheReplyMetricsSnapshot {
                 pread_bytes_replies: 2,
                 splice_replies: 3,
                 payload_bytes: 4096,
             },
+            snapshot_calls: AtomicUsize::new(0),
         };
         let handler = ReplyMetricsRecordingHandler::default();
         let mut dispatcher = NativeDispatcher::new(transport, handler);
@@ -815,7 +821,7 @@ mod tests {
         dispatcher
             .run_until_destroy()
             .expect("dispatcher should run request loop");
-        let (_transport, handler) = dispatcher.into_parts();
+        let (transport, handler) = dispatcher.into_parts();
 
         assert_eq!(
             handler.snapshots,
@@ -825,6 +831,30 @@ mod tests {
                 payload_bytes: 4096,
             }]
         );
+        assert_eq!(transport.snapshot_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dispatcher_skips_local_cache_reply_metrics_snapshot_for_non_read_requests() {
+        let transport = ReplyMetricsTransport {
+            inner: FrameQueueTransport::new([frame(1, 0x10)]),
+            metrics: LocalCacheReplyMetricsSnapshot {
+                pread_bytes_replies: 2,
+                splice_replies: 3,
+                payload_bytes: 4096,
+            },
+            snapshot_calls: AtomicUsize::new(0),
+        };
+        let handler = ReplyMetricsRecordingHandler::default();
+        let mut dispatcher = NativeDispatcher::new(transport, handler);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run request loop");
+        let (transport, handler) = dispatcher.into_parts();
+
+        assert_eq!(transport.snapshot_calls.load(Ordering::Relaxed), 0);
+        assert!(handler.snapshots.is_empty());
     }
 
     #[test]
