@@ -80,11 +80,14 @@ impl StrategyMeasurement {
                 "\"name\":\"{}\",",
                 "\"throughput_mib_s\":{:.2},",
                 "\"cpu\":\"not captured by harness; use perf stat command from docs\",",
+                "\"selected_reply_strategy\":\"{}\",",
                 "\"p95_latency_us\":{},",
                 "\"p99_latency_us\":{},",
                 "\"copy_count\":{},",
                 "\"local_cache_hits\":{},",
                 "\"local_cache_misses\":{},",
+                "\"local_cache_reply_bytes\":{},",
+                "\"fallback_reasons\":[],",
                 "\"materialization_wait_us\":{},",
                 "\"read_amplification_bytes\":{},",
                 "\"io_uring_used\":{},",
@@ -93,17 +96,57 @@ impl StrategyMeasurement {
             ),
             self.name,
             self.throughput_mib_s,
+            self.selected_reply_strategy(),
             self.p95_latency_us,
             self.p99_latency_us,
             self.copy_count,
             self.local_cache_hits,
             self.local_cache_misses,
+            self.local_cache_reply_bytes(),
             self.materialization_wait_us,
             self.read_amplification_bytes,
             self.io_uring_used,
             self.io_uring_fallback
         )
     }
+
+    fn selected_reply_strategy(&self) -> &'static str {
+        if self.name.starts_with("splice(") {
+            "splice"
+        } else if self.name.starts_with("pread ") {
+            "pread"
+        } else {
+            "bytes"
+        }
+    }
+
+    fn local_cache_reply_bytes(&self) -> u64 {
+        self.local_cache_hits.saturating_mul(CHUNK_LEN as u64)
+    }
+}
+
+#[test]
+fn strategy_measurement_json_preserves_sfs535_local_cache_reply_evidence() {
+    let measurement = StrategyMeasurement {
+        name: "splice(file_fd -> pipe -> fuse_fd)",
+        throughput_mib_s: 1234.5,
+        p95_latency_us: 95,
+        p99_latency_us: 99,
+        copy_count: 0,
+        local_cache_hits: 16,
+        local_cache_misses: 0,
+        materialization_wait_us: 0,
+        read_amplification_bytes: 0,
+        io_uring_used: false,
+        io_uring_fallback: "classic transport selected",
+    };
+
+    let json = measurement.to_json();
+
+    assert!(json.contains("\"selected_reply_strategy\":\"splice\""));
+    assert!(json.contains("\"local_cache_reply_bytes\":16777216"));
+    assert!(json.contains("\"fallback_reasons\":[]"));
+    assert!(json.contains("\"cpu\":\"not captured by harness; use perf stat command from docs\""));
 }
 
 fn run_bytes_baseline(data: &[u8]) -> StrategyMeasurement {
@@ -211,8 +254,8 @@ fn measurement_from_transport(
         name,
         elapsed,
         latencies,
-        metrics.pread_bytes_replies,
-        metrics.pread_bytes_replies + metrics.splice_replies,
+        metrics.pread_local_cache_replies,
+        metrics.pread_local_cache_replies + metrics.splice_replies,
         0,
     );
     measurement.read_amplification_bytes = metrics

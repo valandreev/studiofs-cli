@@ -33,7 +33,7 @@ use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
-use studiofs_vfs::{StudioVfs, VfsConfig};
+use studiofs_vfs::{StudioVfs, VfsConfig, VfsNativeBridgeSnapshot};
 
 const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
 const DEFAULT_TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -680,8 +680,26 @@ fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
 
     assert!(writer.contains("local_cache_unavailable_fallbacks"));
     assert!(writer.contains("stale_epoch_fallbacks"));
+    assert!(writer.contains("unsafe_local_cache_fallbacks"));
+    assert!(writer.contains("fallback_reasons"));
     assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
     assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
+    assert!(writer.contains("native_bridge.unsafe_local_cache_fallbacks"));
+}
+
+#[test]
+fn native_local_cache_fallback_reasons_json_lists_observed_reasons() {
+    let native_bridge = VfsNativeBridgeSnapshot {
+        local_cache_unavailable_fallbacks: 1,
+        stale_generation_fallbacks: 2,
+        unsafe_local_cache_fallbacks: 3,
+        ..VfsNativeBridgeSnapshot::default()
+    };
+
+    assert_eq!(
+        native_local_cache_fallback_reasons_json(&native_bridge),
+        "[\"local_cache_unavailable\",\"stale_generation\",\"unsafe_local_cache\"]"
+    );
 }
 
 #[test]
@@ -876,6 +894,18 @@ fn native_mounted_session_uses_runtime_linux_native_transport_selection() {
     assert!(native_mount_runner.contains("with_io_uring_transport"));
     assert!(native_mount_runner.contains("linux_fuse_io_uring_queue_count()"));
     assert!(native_mount_runner.contains("io_uring_payload_len_for_session"));
+}
+
+#[test]
+fn native_mounted_classic_transport_uses_output_fd_for_splice_replies() {
+    let source = include_str!("mount_sanity.rs");
+    let native_mount_runner = source
+        .split("fn with_mounted_native_fuse")
+        .last()
+        .and_then(|rest| rest.split("fn run_mounted_scenario").next())
+        .expect("native mounted runner should be present");
+
+    assert!(native_mount_runner.contains("ClassicReadWriteTransport::with_output_fd"));
 }
 
 #[test]
@@ -1462,7 +1492,8 @@ fn native_fusermount3_io_uring_session_init_and_unmount_smoke() {
     let session_thread = std::thread::spawn(move || {
         let fuse_file = fuse.into_file();
         let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
-        let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
+        let transport = ClassicReadWriteTransport::with_output_fd(fuse_file, fuse_fd)
+            .with_transport_fd(fuse_fd);
         let config = NativeSessionConfig::linux6_safe_from_env().with_io_uring_transport();
         let session = NativeFuseSession::new(transport, config);
         let (negotiated, transport) = match session.handshake_into_transport() {
@@ -2033,7 +2064,8 @@ fn with_mounted_native_fuse(
         let result = (|| {
             let fuse_file = fuse.into_file();
             let fuse_fd = std::os::fd::AsRawFd::as_raw_fd(&fuse_file);
-            let transport = ClassicReadWriteTransport::new(fuse_file).with_transport_fd(fuse_fd);
+            let transport = ClassicReadWriteTransport::with_output_fd(fuse_file, fuse_fd)
+                .with_transport_fd(fuse_fd);
             let mut runtime_options = StudioFuseRuntimeOptions::from_env();
             runtime_options.async_write_enabled = mode.async_write_enabled();
             let mut config = NativeSessionConfig::linux6_safe(mode.writeback_cache_enabled());
@@ -2589,6 +2621,8 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"local_cache_unavailable_fallbacks\": {native_local_cache_unavailable_fallbacks},\n",
             "    \"stale_epoch_fallbacks\": {native_stale_epoch_fallbacks},\n",
             "    \"stale_generation_fallbacks\": {native_stale_generation_fallbacks},\n",
+            "    \"unsafe_local_cache_fallbacks\": {native_unsafe_local_cache_fallbacks},\n",
+            "    \"fallback_reasons\": {native_local_cache_fallback_reasons},\n",
             "    \"bytes_fallbacks\": {native_bytes_fallbacks},\n",
             "    \"bytes_returned\": {native_bytes_returned},\n",
             "    \"read_ahead_prefetches\": {native_read_ahead_prefetches},\n",
@@ -2658,6 +2692,9 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
         native_local_cache_unavailable_fallbacks = native_bridge.local_cache_unavailable_fallbacks,
         native_stale_epoch_fallbacks = native_bridge.stale_epoch_fallbacks,
         native_stale_generation_fallbacks = native_bridge.stale_generation_fallbacks,
+        native_unsafe_local_cache_fallbacks = native_bridge.unsafe_local_cache_fallbacks,
+        native_local_cache_fallback_reasons =
+            native_local_cache_fallback_reasons_json(&native_bridge),
         native_bytes_fallbacks = native_bridge.bytes_fallbacks,
         native_bytes_returned = native_bridge.bytes_returned,
         native_read_ahead_prefetches = native_bridge.read_ahead_prefetches,
@@ -2681,6 +2718,23 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
 
 fn json_option_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn native_local_cache_fallback_reasons_json(native_bridge: &VfsNativeBridgeSnapshot) -> String {
+    let mut reasons = Vec::with_capacity(4);
+    if native_bridge.local_cache_unavailable_fallbacks > 0 {
+        reasons.push("\"local_cache_unavailable\"");
+    }
+    if native_bridge.stale_epoch_fallbacks > 0 {
+        reasons.push("\"stale_epoch\"");
+    }
+    if native_bridge.stale_generation_fallbacks > 0 {
+        reasons.push("\"stale_generation\"");
+    }
+    if native_bridge.unsafe_local_cache_fallbacks > 0 {
+        reasons.push("\"unsafe_local_cache\"");
+    }
+    format!("[{}]", reasons.join(","))
 }
 
 fn run_sfs530_evidence_matrix_if_available(

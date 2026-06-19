@@ -1,9 +1,9 @@
 use super::overlay::PendingOverlayBlockSource;
 use super::writer_stack::WriterStackReadClaim;
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
-    PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
-    VfsError, VfsResult,
+    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, OpenFlags,
+    PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS, PrefetchBatch, PrefetchReadContext,
+    PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs, VfsError, VfsResult,
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
@@ -22,7 +22,7 @@ use studiofs_meta::schema::{
     UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 type ReadRange = IntervalRange;
 
@@ -1504,6 +1504,66 @@ impl StudioVfs {
         offset: u64,
         size: u32,
     ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
+        self.local_cache_read_range_impl(None, ino, offset, size)
+            .await
+    }
+
+    /// Return a stable local-cache file range for a specific read handle.
+    #[cfg(unix)]
+    pub async fn local_cache_read_range_for_fh(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            trace!(
+                fh,
+                ino, "native local-cache read range rejected: unknown file handle"
+            );
+            return Ok(None);
+        };
+        if open_file.ino != ino {
+            trace!(
+                fh,
+                ino,
+                open_ino = open_file.ino,
+                "native local-cache read range rejected: file handle inode mismatch"
+            );
+            return Ok(None);
+        }
+        if open_file
+            .flags
+            .intersects(OpenFlags::WRONLY | OpenFlags::RDWR)
+        {
+            trace!(
+                fh,
+                ino,
+                flags = ?open_file.flags,
+                "native local-cache read range rejected: write-capable file handle"
+            );
+            return Ok(None);
+        }
+        if self.inode_has_local_dirty_state(ino) {
+            trace!(
+                fh,
+                ino, "native local-cache read range rejected: inode has local dirty state"
+            );
+            return Ok(None);
+        }
+        self.local_cache_read_range_impl(Some(fh), ino, offset, size)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn local_cache_read_range_impl(
+        &self,
+        _fh: Option<u64>,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> VfsResult<Option<VfsLocalCacheReadRange>> {
         let requested_len = usize::try_from(size).map_err(|_| {
             VfsError::Other(format!(
                 "native local-cache read size does not fit usize: ino={ino}, size={size}"
@@ -1515,6 +1575,11 @@ impl StudioVfs {
             .prepare_foreground_read(ino, offset, requested_len)
             .await?;
         if prepared.context.placeholder_visible(self, ino) || prepared.read_len == 0 {
+            return Ok(None);
+        }
+        if prepared.context.attr.upload_state != MetaUploadState::Ready
+            || prepared.context.attr.content_epoch != prepared.context.attr.committed_content_epoch
+        {
             return Ok(None);
         }
 
@@ -3351,6 +3416,249 @@ mod tests {
             assert_eq!(range.payload.len(), 4);
             assert_eq!(range.content_epoch, staged_attr.content_epoch);
             assert_ne!(range.invalidation_generation, 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evicted_local_cache_payload_does_not_expose_native_read_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-evicted");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"native-local-cache-range-evicted.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let object_id = 0x537;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), true)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+            vfs.cached_store.remove(object_id);
+
+            let range = vfs
+                .local_cache_read_range(attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "evicted local-cache payloads must fall back to the bytes path"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_local_cache_fh_rejections_are_trace_level_and_combined_flags() {
+        let source = include_str!("read_path.rs");
+        let body = source
+            .split("pub async fn local_cache_read_range_for_fh")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    #[cfg(unix)]\n    async fn ").next())
+            .expect("local_cache_read_range_for_fh body should be present");
+
+        assert!(body.contains("trace!("));
+        assert!(!body.contains("debug!("));
+        assert!(body.contains(".intersects(OpenFlags::WRONLY | OpenFlags::RDWR)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_capable_handle_does_not_expose_native_local_cache_read_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-rdwr");
+        rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"native-local-cache-range-rdwr.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let object_id = 0x535;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open write-capable handle");
+
+            let range = vfs
+                .local_cache_read_range_for_fh(fh, attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "write-capable handles must use the bytes path so dirty writer state cannot be bypassed"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_handle_does_not_expose_native_local_cache_range_while_inode_is_dirty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-dirty-inode");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"native-local-cache-range-dirty-inode.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let object_id = 0x536;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+
+            let read_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open read-only handle");
+            let write_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open write-capable handle");
+            vfs.write_fh(write_fh, attr.ino, 4, b"XY")
+                .await
+                .expect("stage dirty writer bytes");
+
+            let range = vfs
+                .local_cache_read_range_for_fh(read_fh, attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "dirty inode state must force mounted reads through the bytes path even when the requested range is clean"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncate_does_not_expose_stale_native_local_cache_read_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-truncate");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"native-local-cache-range-truncate.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let object_id = 0x538;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+
+            let read_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open read-only handle");
+            let truncate_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open truncate handle");
+            vfs.setattr_with_handle(Some(truncate_fh), attr.ino, SetattrArgs::size_only(4))
+                .expect("truncate file");
+
+            let range = vfs
+                .local_cache_read_range_for_fh(read_fh, attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "truncate must force mounted reads through bytes fallback until the new epoch is safe"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_does_not_expose_stale_native_local_cache_read_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "native-local-cache-range-overwrite");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"native-local-cache-range-overwrite.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let object_id = 0x539;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed payload object");
+
+            let mut staged_attr = meta.get_attr(attr.ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_full(object_id, 8))
+                .expect("persist committed payload slice");
+
+            let read_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open read-only handle");
+            let write_fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open overwrite handle");
+            vfs.write_fh(write_fh, attr.ino, 0, b"ZZ")
+                .await
+                .expect("overwrite committed bytes");
+
+            let range = vfs
+                .local_cache_read_range_for_fh(read_fh, attr.ino, 0, 4)
+                .await
+                .expect("read range query");
+
+            assert!(
+                range.is_none(),
+                "overwrite must force mounted reads through bytes fallback until the new epoch is safe"
+            );
         });
     }
 

@@ -289,6 +289,11 @@ impl FuseReply {
         }
     }
 
+    /// Returns true when this reply is backed by a stable local-cache range.
+    pub fn has_local_cache_range(&self) -> bool {
+        matches!(self.frame, FuseReplyFrame::LocalCacheRange { .. })
+    }
+
     /// Returns whether this request must be completed without kernel writeback.
     pub fn is_no_reply(&self) -> bool {
         matches!(self.frame, FuseReplyFrame::NoReply)

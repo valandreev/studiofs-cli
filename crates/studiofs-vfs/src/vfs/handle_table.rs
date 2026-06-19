@@ -1,5 +1,6 @@
 use crate::access::AccessClass;
-use parking_lot::{Mutex, RwLock};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::types::{Ino, InodeAttr};
@@ -11,7 +12,7 @@ pub(super) struct HandleTable {
     /// Monotonically increasing file handle counter.
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
-    handles: RwLock<HashMap<u64, OpenFile>>,
+    handles: DashMap<u64, OpenFile>,
     /// Inode -> number of currently open file descriptors.
     open_counts: Mutex<HashMap<Ino, u32>>,
     /// Inodes that were unlinked while still open (deferred deletion).
@@ -22,7 +23,7 @@ impl HandleTable {
     pub(super) fn new() -> Self {
         Self {
             next_fh: AtomicU64::new(1),
-            handles: RwLock::new(HashMap::new()),
+            handles: DashMap::new(),
             open_counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
@@ -38,19 +39,21 @@ impl HandleTable {
     ) -> OpenFile {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
-        self.handles.write().insert(fh, open_file.clone());
+        self.handles.insert(fh, open_file.clone());
         *self.open_counts.lock().entry(ino).or_insert(0) += 1;
         open_file
     }
 
     /// Look up an open file handle.
     pub(super) fn get(&self, fh: u64) -> Option<OpenFile> {
-        self.handles.read().get(&fh).cloned()
+        self.handles
+            .get(&fh)
+            .map(|open_file| open_file.value().clone())
     }
 
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
-        let open_file = self.handles.write().remove(&fh)?;
+        let (_, open_file) = self.handles.remove(&fh)?;
         let mut counts = self.open_counts.lock();
         let count = counts.get_mut(&open_file.ino)?;
         *count = count.saturating_sub(1);
@@ -70,8 +73,7 @@ impl HandleTable {
     /// must survive namespace removal until the handle is released.
     pub(super) fn has_active_open_overlay(&self, ino: Ino) -> bool {
         self.handles
-            .read()
-            .values()
+            .iter()
             .any(|open_file| open_file.ino == ino && open_file.active_open_overlay)
     }
 
@@ -92,8 +94,7 @@ impl HandleTable {
     /// kernel unmounted the filesystem without flushing all file descriptors).
     pub(super) fn collect_open_access_classes(&self) -> Vec<AccessClass> {
         self.handles
-            .read()
-            .values()
+            .iter()
             .map(|f| f.current_access_class())
             .collect()
     }
@@ -105,6 +106,14 @@ mod tests {
 
     #[test]
     fn test_handle_table_open_close() {
+        let source = include_str!("handle_table.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("handle table implementation should be present");
+        assert!(implementation.contains("handles: DashMap<u64, OpenFile>"));
+        assert!(!implementation.contains("RwLock"));
+
         let ht = HandleTable::new();
         let fh1 = ht.open(10, OpenFlags::RDONLY, None, false);
         let fh2 = ht.open(10, OpenFlags::RDWR, None, true);

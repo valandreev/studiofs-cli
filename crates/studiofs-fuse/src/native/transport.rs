@@ -1335,11 +1335,29 @@ fn elapsed_transport_latency_ns(started_at: Instant) -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalCacheReplyMetricsSnapshot {
     /// Replies served by `pread -> bytes -> write`.
-    pub pread_bytes_replies: u64,
+    pub pread_local_cache_replies: u64,
     /// Replies served by `splice(file_fd -> pipe -> fuse_fd)`.
     pub splice_replies: u64,
     /// Payload bytes copied or spliced from a local cache fd.
     pub payload_bytes: u64,
+}
+
+impl LocalCacheReplyMetricsSnapshot {
+    /// Return counters added since `previous`.
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            pread_local_cache_replies: self
+                .pread_local_cache_replies
+                .saturating_sub(previous.pread_local_cache_replies),
+            splice_replies: self.splice_replies.saturating_sub(previous.splice_replies),
+            payload_bytes: self.payload_bytes.saturating_sub(previous.payload_bytes),
+        }
+    }
+
+    /// Returns true when no local-cache replies or bytes were recorded.
+    pub fn is_zero(self) -> bool {
+        self.pread_local_cache_replies == 0 && self.splice_replies == 0 && self.payload_bytes == 0
+    }
 }
 
 impl LocalCacheReplyMetrics {
@@ -1358,7 +1376,7 @@ impl LocalCacheReplyMetrics {
 
     fn snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
         LocalCacheReplyMetricsSnapshot {
-            pread_bytes_replies: self.pread_bytes_replies.load(Ordering::Relaxed),
+            pread_local_cache_replies: self.pread_bytes_replies.load(Ordering::Relaxed),
             splice_replies: self.splice_replies.load(Ordering::Relaxed),
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
         }
@@ -1386,6 +1404,10 @@ pub trait FuseTransport {
     fn receive_request(&mut self) -> Result<Option<FuseRequest>, TransportError>;
     /// Sends one reply frame back to the kernel.
     fn send_reply(&mut self, reply: FuseReply) -> Result<(), TransportError>;
+    /// Snapshot transport-local local-cache read reply counters.
+    fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+        LocalCacheReplyMetricsSnapshot::default()
+    }
     /// Sends one reply frame back to the transport origin that produced it.
     fn send_reply_from_origin(
         &mut self,
@@ -1596,6 +1618,7 @@ impl<T> ClassicReadWriteTransport<T> {
     pub fn with_output_fd(io: T, output_fd: RawFd) -> Self {
         let mut transport = Self::new(io);
         transport.local_cache_output_fd = Some(output_fd);
+        transport.local_cache_strategy = LocalCacheReplyStrategy::Splice;
         transport
     }
 
@@ -1748,6 +1771,10 @@ impl<T: Read + Write> FuseTransport for ClassicReadWriteTransport<T> {
             }
         }
         Ok(())
+    }
+
+    fn local_cache_reply_metrics_snapshot(&self) -> LocalCacheReplyMetricsSnapshot {
+        self.local_cache_metrics.snapshot()
     }
 
     fn request_shutdown(&mut self) -> Result<(), TransportError> {
@@ -3340,7 +3367,7 @@ mod tests {
             .expect("classic send should write local cache range");
 
         let metrics = transport.local_cache_reply_metrics_snapshot();
-        assert_eq!(metrics.pread_bytes_replies, 1);
+        assert_eq!(metrics.pread_local_cache_replies, 1);
         assert_eq!(metrics.payload_bytes, 6);
         let output = transport.into_inner().output;
         assert_eq!(&output[16..], b"456789");
@@ -3592,6 +3619,36 @@ mod tests {
         let mut output = Vec::new();
         output_file.read_to_end(&mut output).expect("read output");
         assert_eq!(&output[16..], b"89ab");
+    }
+
+    #[test]
+    fn classic_output_fd_transport_splices_local_cache_range_by_default() {
+        let mut cache_file = tempfile::tempfile().expect("create local cache file");
+        cache_file
+            .write_all(b"0123456789abcdef")
+            .expect("write cache contents");
+        let output_file = tempfile::tempfile().expect("create output file");
+        let output_fd = output_file.as_raw_fd();
+        let mut transport = ClassicReadWriteTransport::with_output_fd(output_file, output_fd);
+        let reply = FuseReply::local_cache_range_data(
+            0x91,
+            FuseLocalCacheReadRange::borrowed(cache_file.as_raw_fd(), 2, 5, 13),
+        )
+        .expect("build local cache range reply");
+
+        transport
+            .send_reply(reply)
+            .expect("classic output-fd transport should splice by default");
+
+        let metrics = transport.local_cache_reply_metrics_snapshot();
+        assert_eq!(metrics.splice_replies, 1);
+        assert_eq!(metrics.pread_local_cache_replies, 0);
+        assert_eq!(metrics.payload_bytes, 5);
+        let mut output_file = transport.into_inner();
+        output_file.rewind().expect("rewind output file");
+        let mut output = Vec::new();
+        output_file.read_to_end(&mut output).expect("read output");
+        assert_eq!(&output[16..], b"23456");
     }
 
     #[test]

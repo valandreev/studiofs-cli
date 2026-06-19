@@ -32,6 +32,7 @@ use crate::native::cache_policy::{
 };
 use crate::native::dispatcher::{FuseOperationHandler, OperationBarrierGates, ResourceKey};
 use crate::native::protocol::{FuseLocalCacheReadRange, FuseOpcode, FuseReply, FuseRequest};
+use crate::native::transport::LocalCacheReplyMetricsSnapshot;
 
 const FUSE_ENTRY_OUT_PAYLOAD_LEN: usize = 128;
 const FUSE_ATTR_PAYLOAD_LEN: usize = 88;
@@ -480,7 +481,7 @@ impl NativeVfs for StudioVfsNativeAdapter {
     #[cfg(unix)]
     fn read_local_cache_range(
         &self,
-        _fh: u64,
+        fh: u64,
         ino: u64,
         offset: u64,
         size: u32,
@@ -488,7 +489,10 @@ impl NativeVfs for StudioVfsNativeAdapter {
         checked_native_read_size(size)?;
         let Some(range) = self
             .rt
-            .block_on(self.vfs.local_cache_read_range(ino, offset, size))
+            .block_on(
+                self.vfs
+                    .local_cache_read_range_for_fh(fh, ino, offset, size),
+            )
             .map_err(|error| vfs_err_to_errno(&error))?
         else {
             return Ok(None);
@@ -813,7 +817,11 @@ struct NativeReadMetrics {
     local_cache_unavailable_fallbacks: AtomicU64,
     stale_epoch_fallbacks: AtomicU64,
     stale_generation_fallbacks: AtomicU64,
+    unsafe_local_cache_fallbacks: AtomicU64,
     bytes_fallbacks: AtomicU64,
+    pread_local_cache_replies: AtomicU64,
+    splice_local_cache_replies: AtomicU64,
+    local_cache_reply_bytes: AtomicU64,
     bytes_returned: AtomicU64,
     read_ahead_prefetches: AtomicU64,
     read_ahead_suppressed: AtomicU64,
@@ -1279,8 +1287,16 @@ pub struct NativeReadMetricsSnapshot {
     pub stale_epoch_fallbacks: u64,
     /// Reads that rejected a local-cache range because its invalidation generation was stale.
     pub stale_generation_fallbacks: u64,
+    /// Reads that rejected a current local-cache range because trust preconditions were unsafe.
+    pub unsafe_local_cache_fallbacks: u64,
     /// Reads served through the safe bytes fallback.
     pub bytes_fallbacks: u64,
+    /// Local-cache replies served with `pread -> bytes -> write`.
+    pub pread_local_cache_replies: u64,
+    /// Local-cache replies served with `splice(file_fd -> pipe -> fuse_fd)`.
+    pub splice_local_cache_replies: u64,
+    /// Payload bytes returned through local-cache reply strategies.
+    pub local_cache_reply_bytes: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
     /// Read-ahead decisions that issued a prefetch hint.
@@ -1289,6 +1305,29 @@ pub struct NativeReadMetricsSnapshot {
     pub read_ahead_suppressed: u64,
     /// Bytes requested beyond application reads by read-ahead decisions.
     pub read_ahead_amplification_bytes: u64,
+}
+
+impl NativeReadMetricsSnapshot {
+    /// Return stable artifact labels for observed local-cache read fallback reasons.
+    pub fn local_cache_fallback_reasons(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (
+                self.local_cache_unavailable_fallbacks > 0,
+                "local_cache_unavailable",
+            ),
+            (self.stale_epoch_fallbacks > 0, "stale_epoch"),
+            (self.stale_generation_fallbacks > 0, "stale_generation"),
+            (self.unsafe_local_cache_fallbacks > 0, "unsafe_local_cache"),
+        ]
+        .into_iter()
+        .filter_map(|(observed, reason)| observed.then_some(reason))
+    }
+}
+
+fn fetch_add_if_nonzero(metric: &AtomicU64, delta: u64) {
+    if delta != 0 {
+        metric.fetch_add(delta, Ordering::Relaxed);
+    }
 }
 
 impl NativeReadMetrics {
@@ -1300,7 +1339,11 @@ impl NativeReadMetrics {
                 .load(Ordering::Relaxed),
             stale_epoch_fallbacks: self.stale_epoch_fallbacks.load(Ordering::Relaxed),
             stale_generation_fallbacks: self.stale_generation_fallbacks.load(Ordering::Relaxed),
+            unsafe_local_cache_fallbacks: self.unsafe_local_cache_fallbacks.load(Ordering::Relaxed),
             bytes_fallbacks: self.bytes_fallbacks.load(Ordering::Relaxed),
+            pread_local_cache_replies: self.pread_local_cache_replies.load(Ordering::Relaxed),
+            splice_local_cache_replies: self.splice_local_cache_replies.load(Ordering::Relaxed),
+            local_cache_reply_bytes: self.local_cache_reply_bytes.load(Ordering::Relaxed),
             bytes_returned: self.bytes_returned.load(Ordering::Relaxed),
             read_ahead_prefetches: self.read_ahead_prefetches.load(Ordering::Relaxed),
             read_ahead_suppressed: self.read_ahead_suppressed.load(Ordering::Relaxed),
@@ -1406,6 +1449,22 @@ where
             FuseOpcode::Setattr => self.handle_setattr(request),
             _ => errno_reply(request.header.unique, libc::ENOSYS),
         }
+    }
+
+    fn record_local_cache_reply_metrics(&mut self, metrics: LocalCacheReplyMetricsSnapshot) {
+        fetch_add_if_nonzero(
+            &self.read_metrics.pread_local_cache_replies,
+            metrics.pread_local_cache_replies,
+        );
+        fetch_add_if_nonzero(
+            &self.read_metrics.splice_local_cache_replies,
+            metrics.splice_replies,
+        );
+        fetch_add_if_nonzero(
+            &self.read_metrics.local_cache_reply_bytes,
+            metrics.payload_bytes,
+        );
+        self.publish_native_bridge_snapshot_if_due();
     }
 }
 
@@ -1591,7 +1650,11 @@ where
                             .stale_generation_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    LocalCacheReadRangeDecision::Unsafe => {}
+                    LocalCacheReadRangeDecision::Unsafe => {
+                        self.read_metrics
+                            .unsafe_local_cache_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Ok(None) => {
@@ -2288,7 +2351,11 @@ fn vfs_native_bridge_snapshot(
         local_cache_unavailable_fallbacks: read.local_cache_unavailable_fallbacks,
         stale_epoch_fallbacks: read.stale_epoch_fallbacks,
         stale_generation_fallbacks: read.stale_generation_fallbacks,
+        unsafe_local_cache_fallbacks: read.unsafe_local_cache_fallbacks,
         bytes_fallbacks: read.bytes_fallbacks,
+        pread_local_cache_replies: read.pread_local_cache_replies,
+        splice_local_cache_replies: read.splice_local_cache_replies,
+        local_cache_reply_bytes: read.local_cache_reply_bytes,
         bytes_returned: read.bytes_returned,
         read_ahead_prefetches: read.read_ahead_prefetches,
         read_ahead_suppressed: read.read_ahead_suppressed,
@@ -2977,7 +3044,10 @@ fn write_or_recover<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<
 mod tests {
     use super::*;
     use crate::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseRuntimeOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::mem::align_of;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
 
     #[derive(Debug)]
     struct TestNativeVfs {
@@ -3344,6 +3414,45 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_reply_metrics_publish_native_bridge_snapshot_through_throttled_path() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn record_local_cache_reply_metrics")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("record_local_cache_reply_metrics body should be present");
+
+        assert!(body.contains("publish_native_bridge_snapshot_if_due"));
+        assert!(!body.contains("publish_native_bridge_snapshot();"));
+    }
+
+    #[test]
+    fn local_cache_reply_metrics_accumulate_transport_deltas() {
+        let source = include_str!("vfs_adapter.rs");
+        let body = source
+            .split("fn record_local_cache_reply_metrics")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("record_local_cache_reply_metrics body should be present");
+
+        assert!(body.contains("fetch_add_if_nonzero"));
+        assert!(!body.contains(".store(metrics."));
+    }
+
+    #[test]
+    fn local_cache_fallback_reasons_use_stack_iterator() {
+        let source = include_str!("vfs_adapter.rs");
+        let signature = source
+            .split("pub fn local_cache_fallback_reasons")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .expect("local_cache_fallback_reasons signature should be present");
+
+        assert!(signature.contains("impl Iterator<Item = &'static str>"));
+        assert!(!signature.contains("Vec"));
+    }
+
+    #[test]
     fn native_open_cache_state_from_attr_maps_epoch_size_mtime_and_dirty_state() {
         let mut attr = InodeAttr::new_file(55, 1, 1000, 1001, 0o644);
         attr.size = 4096;
@@ -3548,6 +3657,22 @@ mod tests {
     }
 
     #[test]
+    fn studio_vfs_native_adapter_passes_fh_to_local_cache_read_range() {
+        let source = include_str!("vfs_adapter.rs");
+        let read_local_cache_range = source
+            .split("impl NativeVfs for StudioVfsNativeAdapter")
+            .nth(1)
+            .and_then(|rest| rest.split("fn advise_read_ahead").next())
+            .expect("studio vfs native adapter read_local_cache_range should be present");
+
+        assert!(read_local_cache_range.contains("local_cache_read_range_for_fh"));
+        assert!(
+            read_local_cache_range.contains("fh, ino, offset, size"),
+            "native mounted reads must pass the FUSE fh into the VFS local-cache fast path"
+        );
+    }
+
+    #[test]
     fn readdirplus_payload_does_not_record_lookups_when_later_getattr_fails() {
         let vfs = TestNativeVfs::default();
         let entries = vec![dir_entry(20, b"ok"), dir_entry(21, b"err")];
@@ -3742,6 +3867,150 @@ mod tests {
     }
 
     #[test]
+    fn handle_read_reports_unsafe_local_cache_fallback_reason() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: true,
+                local_materialized: true,
+            },
+        );
+
+        let reply = bridge.handle_read(read_request_for_size(8192));
+
+        assert!(reply.local_cache_range().is_none());
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.unsafe_local_cache_fallbacks, 1);
+        assert_eq!(metrics.bytes_fallbacks, 1);
+    }
+
+    #[test]
+    fn read_metrics_snapshot_lists_observed_local_cache_fallback_reasons() {
+        let metrics = NativeReadMetricsSnapshot {
+            local_cache_unavailable_fallbacks: 1,
+            stale_epoch_fallbacks: 2,
+            stale_generation_fallbacks: 3,
+            unsafe_local_cache_fallbacks: 4,
+            ..NativeReadMetricsSnapshot::default()
+        };
+
+        assert_eq!(
+            metrics.local_cache_fallback_reasons().collect::<Vec<_>>(),
+            [
+                "local_cache_unavailable",
+                "stale_epoch",
+                "stale_generation",
+                "unsafe_local_cache",
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_read_metrics_include_transport_local_cache_reply_strategy_counts() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_local_cache_replies: 2,
+            splice_replies: 5,
+            payload_bytes: 12 * 1024,
+        });
+
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.pread_local_cache_replies, 2);
+        assert_eq!(metrics.splice_local_cache_replies, 5);
+        assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
+    }
+
+    #[test]
+    fn bridge_read_metrics_accumulate_multiple_transport_deltas() {
+        let vfs = Arc::new(TestNativeVfs::default());
+        let mut bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_local_cache_replies: 2,
+            splice_replies: 1,
+            payload_bytes: 4096,
+        });
+        bridge.record_local_cache_reply_metrics(LocalCacheReplyMetricsSnapshot {
+            pread_local_cache_replies: 3,
+            splice_replies: 4,
+            payload_bytes: 8192,
+        });
+
+        let metrics = bridge.read_metrics_snapshot();
+        assert_eq!(metrics.pread_local_cache_replies, 5);
+        assert_eq!(metrics.splice_local_cache_replies, 5);
+        assert_eq!(metrics.local_cache_reply_bytes, 12 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_bridge_metrics_report_splice_reply_strategy_after_mounted_read() {
+        let test_vfs = TestNativeVfs::default();
+        test_vfs
+            .local_cache_file
+            .write_all_at(&vec![b'x'; 8192], 4096)
+            .expect("seed local cache file range");
+        let vfs = Arc::new(test_vfs);
+        let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
+        bridge.remember_trusted_open_cache_state(
+            20,
+            &NativeInodeCacheState {
+                content_epoch: 9,
+                size: 16 * 1024,
+                mtime_ns: 100,
+                invalidation_generation: 0,
+                trusted: None,
+                writer_active: false,
+                dirty: false,
+                local_materialized: true,
+            },
+        );
+
+        let mut fuse_file = tempfile::tempfile().expect("create fuse test file");
+        let mut frames = read_request_frame(20, 7, 13, 8192);
+        frames.extend_from_slice(&lookup_request_frame(b"file"));
+        fuse_file.write_all(&frames).expect("write request frames");
+        fuse_file.rewind().expect("rewind request frames");
+        let output_fd = fuse_file.as_raw_fd();
+        let transport = crate::native::transport::ClassicReadWriteTransport::with_output_fd(
+            fuse_file, output_fd,
+        );
+        let mut dispatcher = crate::native::dispatcher::NativeDispatcher::new(transport, bridge);
+
+        dispatcher
+            .run_until_destroy()
+            .expect("dispatcher should run read and follow-up lookup");
+
+        let (transport, bridge) = dispatcher.into_parts();
+        let read = bridge.read_metrics_snapshot();
+        assert_eq!(read.local_cache_hits, 1);
+        assert_eq!(read.splice_local_cache_replies, 1);
+        assert_eq!(read.pread_local_cache_replies, 0);
+        assert_eq!(read.local_cache_reply_bytes, 8192);
+
+        let mut output = Vec::new();
+        let mut output_file = transport.into_inner();
+        output_file
+            .seek(SeekFrom::Start(frames.len() as u64))
+            .expect("seek to replies");
+        output_file.read_to_end(&mut output).expect("read replies");
+        assert!(
+            output.len() >= 16 + 8192,
+            "read reply should include FUSE header and spliced payload"
+        );
+    }
+
+    #[test]
     fn setattr_truncate_invalidates_trusted_open_cache_state_before_followup_read() {
         let vfs = Arc::new(TestNativeVfs::default());
         let bridge = LinuxNativeBridge::new(Arc::clone(&vfs));
@@ -3824,6 +4093,16 @@ mod tests {
         }
     }
 
+    fn read_request_frame(ino: u64, fh: u64, offset: u64, size: u32) -> Vec<u8> {
+        let request = read_request_for_ino_fh_offset_and_size(ino, fh, offset, size);
+        fuse_frame(
+            15,
+            request.header.unique,
+            request.header.nodeid,
+            &request.payload,
+        )
+    }
+
     fn lookup_request_for_name(name: &[u8]) -> FuseRequest {
         let mut payload = name.to_vec();
         payload.push(0);
@@ -3840,6 +4119,31 @@ mod tests {
             opcode: FuseOpcode::Lookup,
             payload,
         }
+    }
+
+    fn lookup_request_frame(name: &[u8]) -> Vec<u8> {
+        let request = lookup_request_for_name(name);
+        fuse_frame(
+            1,
+            request.header.unique,
+            request.header.nodeid,
+            &request.payload,
+        )
+    }
+
+    fn fuse_frame(opcode: u32, unique: u64, nodeid: u64, payload: &[u8]) -> Vec<u8> {
+        let len = (crate::native::abi::FUSE_IN_HEADER_LEN + payload.len()) as u32;
+        let mut frame = Vec::with_capacity(len as usize);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&opcode.to_le_bytes());
+        frame.extend_from_slice(&unique.to_le_bytes());
+        frame.extend_from_slice(&nodeid.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
     }
 
     fn getattr_request_for_ino(ino: u64) -> FuseRequest {

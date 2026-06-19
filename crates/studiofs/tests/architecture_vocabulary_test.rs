@@ -1250,6 +1250,64 @@ fn linux_native_bridge_performance_gates_cover_sfs532_rollout_decision() {
 }
 
 #[test]
+fn linux_mounted_local_cache_disk_speed_report_covers_sfs535_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-535-linux-mounted-local-cache-disk-speed.md");
+    let script = read_workspace_file("tools/perf/sfs535-linux-mounted-local-cache-disk-speed.sh");
+    let tests_doc = read_workspace_file("docs/tests.md");
+    let combined = format!("{doc}\n{script}");
+    let normalized_doc = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "SFS-535",
+        "Linux mounted local-cache disk speed",
+        "target/sfs-535-linux-mounted-local-cache-disk-speed",
+        "tools/perf/sfs535-linux-mounted-local-cache-disk-speed.sh",
+        "SFS535_RUN_MOUNTED=1",
+        "warm trusted local-cache read",
+        "60-75% of raw warm disk speed",
+        "cold local-cache read",
+        "same-host raw disk baseline",
+        "selected_reply_strategy",
+        "pread_local_cache_replies",
+        "splice_local_cache_replies",
+        "local_cache_reply_bytes",
+        "fallback_reasons",
+        "unsafe_local_cache_fallbacks",
+        "stale epoch",
+        "stale invalidation generation",
+        "dirty writer",
+        "dirty inode",
+        "eviction",
+        "truncate",
+        "overwrite",
+        "remote refresh fallback",
+        "throughput",
+        "p95 latency",
+        "p99 latency",
+        "CPU",
+        "bottleneck",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&combined, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-535 Linux mounted local-cache disk-speed report is missing required acceptance surfaces:\n{}",
+        missing.join("\n")
+    );
+
+    assert!(
+        tests_doc.contains("SFS-535 Linux mounted local-cache disk speed")
+            && tests_doc.contains("tools/perf/sfs535-linux-mounted-local-cache-disk-speed.sh")
+            && tests_doc.contains("target/sfs-535-linux-mounted-local-cache-disk-speed")
+            && tests_doc.contains("SFS535_RUN_MOUNTED=1"),
+        "docs/tests.md should list the SFS-535 mounted disk-speed benchmark commands"
+    );
+}
+
+#[test]
 fn linux_native_bridge_contract_covers_sfs524_architecture_gate() {
     let doc = read_workspace_file("docs/linux-native-bridge-contract.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
