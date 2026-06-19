@@ -517,20 +517,38 @@ mod tests {
         let second = decide_native_read_ahead(&policy, &mut history, 4096, 4096, 1024 * 1024);
         let third = decide_native_read_ahead(&policy, &mut history, 8192, 4096, 1024 * 1024);
         let fourth = decide_native_read_ahead(&policy, &mut history, 12_288, 4096, 1024 * 1024);
+        let fifth = decide_native_read_ahead(&policy, &mut history, 16_384, 4096, 1024 * 1024);
+        let sixth = decide_native_read_ahead(&policy, &mut history, 20_480, 4096, 1024 * 1024);
+        let seventh = decide_native_read_ahead(&policy, &mut history, 24_576, 4096, 1024 * 1024);
 
         assert_eq!(first.prefetch, None);
         assert_eq!(
             second.prefetch,
             Some(NativePrefetchRange {
                 offset: 8192,
-                len: 16 * 1024,
+                len: 4096,
             })
         );
-        assert_eq!(third.prefetch, None);
+        assert_eq!(
+            third.prefetch,
+            Some(NativePrefetchRange {
+                offset: 12_288,
+                len: 8192,
+            })
+        );
         assert_eq!(
             fourth.prefetch,
             Some(NativePrefetchRange {
-                offset: 24_576,
+                offset: 20_480,
+                len: 16 * 1024,
+            })
+        );
+        assert_eq!(fifth.prefetch, None);
+        assert_eq!(sixth.prefetch, None);
+        assert_eq!(
+            seventh.prefetch,
+            Some(NativePrefetchRange {
+                offset: 36_864,
                 len: 16 * 1024,
             })
         );
