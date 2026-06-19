@@ -1217,6 +1217,18 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(write_reply_size(reply), 7);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            1
+        );
     }
 
     #[test]
@@ -1701,6 +1713,18 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(reply.len(), FUSE_OUT_HEADER_LEN);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            1
+        );
     }
 
     #[test]
@@ -1730,6 +1754,18 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(reply.len(), FUSE_OUT_HEADER_LEN);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            1
+        );
     }
 
     #[test]
@@ -1759,6 +1795,18 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(reply.len(), FUSE_OUT_HEADER_LEN);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            2
+        );
     }
 
     #[test]
@@ -1876,6 +1924,18 @@ mod tests {
         );
         assert_eq!(reply_error(reply), 0);
         assert_eq!(attr_reply_size(reply), 1234);
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidation_events,
+            1
+        );
+        assert_eq!(
+            bridge
+                .amplification_metrics_snapshot()
+                .metadata_invalidated_inodes,
+            1
+        );
     }
 
     #[test]
