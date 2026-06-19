@@ -46,7 +46,9 @@ impl HandleTable {
 
     /// Look up an open file handle.
     pub(super) fn get(&self, fh: u64) -> Option<OpenFile> {
-        self.handles.get(&fh).map(|open_file| open_file.clone())
+        self.handles
+            .get(&fh)
+            .map(|open_file| open_file.value().clone())
     }
 
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
