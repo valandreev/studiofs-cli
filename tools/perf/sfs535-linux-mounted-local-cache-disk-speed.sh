@@ -14,6 +14,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 artifact_root="$repo_root/target/sfs-535-linux-mounted-local-cache-disk-speed"
 run_dir="$artifact_root/$mode"
 sfs532_root="$repo_root/target/sfs-532-linux-native-bridge-performance-gates/$mode"
+sfs530_root="$repo_root/target/sfs-530-linux-native-async-write"
 
 mkdir -p "$run_dir"
 
@@ -33,9 +34,10 @@ write_manifest() {
     echo "artifact_root=$artifact_root"
     echo "run_dir=$run_dir"
     echo "sfs532_run_dir=$sfs532_root"
+    echo "sfs530_telemetry_root=$sfs530_root"
     echo "target=warm trusted local-cache read at 60-75% of raw warm disk speed"
     echo "mounted_env=SFS535_RUN_MOUNTED=1"
-    echo "required_fields=throughput,p95 latency,p99 latency,CPU,selected_reply_strategy,pread_local_cache_replies,splice_local_cache_replies,local_cache_reply_bytes,fallback_reasons,unsafe_local_cache_fallbacks,bottleneck"
+    echo "required_fields=throughput,p95 latency,p99 latency,CPU,selected_reply_strategy,pread_local_cache_replies,splice_local_cache_replies,local_cache_reply_bytes,read_ahead_prefetches,read_ahead_suppressed,read_ahead_amplification_bytes,local_cache_willneed_hints,local_cache_willneed_errors,singleflight_waits,singleflight_wait_max_ms,fallback_reasons,unsafe_local_cache_fallbacks,bottleneck"
   } > "$run_dir/manifest.txt"
 }
 
@@ -81,6 +83,14 @@ copy_if_present() {
   fi
 }
 
+copy_sfs530_telemetry_if_present() {
+  local profile="$1"
+  local file="$2"
+  copy_if_present \
+    "$sfs530_root/$profile/$file" \
+    "$run_dir/$profile-$file"
+}
+
 rm -f "$run_dir/status.tsv"
 write_manifest
 write_summary_header
@@ -98,6 +108,10 @@ if [[ "${SFS535_RUN_MOUNTED:-0}" == "1" ]]; then
   copy_if_present "$sfs532_root/summary.md" "$run_dir/sfs-532-summary.md"
   copy_if_present "$sfs532_root/status.tsv" "$run_dir/sfs-532-status.tsv"
   copy_if_present "$sfs532_root/manifest.txt" "$run_dir/sfs-532-manifest.txt"
+  copy_sfs530_telemetry_if_present "native-sfs530-async-evidence" "write-path-observability-before.json"
+  copy_sfs530_telemetry_if_present "native-sfs530-async-evidence" "write-path-observability-after.json"
+  copy_sfs530_telemetry_if_present "native-sfs530-writeback-cache-evidence" "write-path-observability-before.json"
+  copy_sfs530_telemetry_if_present "native-sfs530-writeback-cache-evidence" "write-path-observability-after.json"
 else
   record_row "warm trusted local-cache read" investigate "set SFS535_RUN_MOUNTED=1 to collect mounted FUSE evidence through SFS-532"
   record_row "cold local-cache read" investigate "set SFS535_RUN_MOUNTED=1 to collect mounted FUSE evidence through SFS-532"
@@ -107,7 +121,7 @@ fi
   echo
   echo "## Closure Gate"
   echo
-  echo "SFS-535 remains pending until mounted rows show warm trusted local-cache read throughput at 60-75% of raw warm disk speed, or record the measured bottleneck with p95 latency, p99 latency, CPU, selected reply strategy, local-cache reply counters, fallback_reasons, and raw disk baseline."
+  echo "SFS-535 remains pending until mounted rows show warm trusted local-cache read throughput at 60-75% of raw warm disk speed, or record the measured bottleneck with p95 latency, p99 latency, CPU, selected reply strategy, local-cache reply counters, read_ahead_prefetches, read_ahead_suppressed, read_ahead_amplification_bytes, local_cache_willneed_hints, local_cache_willneed_errors, singleflight_waits, singleflight_wait_max_ms, fallback_reasons, and raw disk baseline."
 } >> "$run_dir/summary.md"
 
 echo "SFS-535 $mode summary: ${run_dir#$repo_root/}/summary.md"

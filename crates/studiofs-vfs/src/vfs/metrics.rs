@@ -461,6 +461,10 @@ pub struct VfsNativeBridgeSnapshot {
     pub splice_local_cache_replies: u64,
     /// Payload bytes returned through local-cache reply strategies.
     pub local_cache_reply_bytes: u64,
+    /// Trusted local-cache replies that issued a kernel `WILLNEED` hint.
+    pub local_cache_willneed_hints: u64,
+    /// Trusted local-cache replies whose kernel `WILLNEED` hint failed.
+    pub local_cache_willneed_errors: u64,
     /// Total payload bytes returned from reads by this bridge.
     pub bytes_returned: u64,
     /// Read-ahead decisions that issued a prefetch hint.

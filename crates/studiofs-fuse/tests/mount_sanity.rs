@@ -667,6 +667,24 @@ fn docs_list_sfs533_native_io_uring_smoke_command() {
 }
 
 #[test]
+fn docs_list_sfs536_adaptive_readahead_regression_gate() {
+    let docs = include_str!("../../../docs/tests.md");
+
+    assert!(
+        docs.contains("SFS-536 adaptive Linux readahead"),
+        "docs/tests.md must list the SFS-536 adaptive readahead regression gate"
+    );
+    assert!(
+        docs.contains("read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression"),
+        "docs/tests.md must list the focused native adaptive prefetch regression test"
+    );
+    assert!(
+        docs.contains("local_cache_willneed_hints"),
+        "docs/tests.md must list the native WILLNEED telemetry counter"
+    );
+}
+
+#[test]
 fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     let source = include_str!("mount_sanity.rs");
     let writer = source
@@ -682,9 +700,17 @@ fn sfs530_telemetry_snapshot_exports_native_local_cache_fallback_counters() {
     assert!(writer.contains("stale_epoch_fallbacks"));
     assert!(writer.contains("unsafe_local_cache_fallbacks"));
     assert!(writer.contains("fallback_reasons"));
+    assert!(writer.contains("local_cache_willneed_hints"));
+    assert!(writer.contains("local_cache_willneed_errors"));
+    assert!(writer.contains("singleflight_waits"));
+    assert!(writer.contains("singleflight_wait_max_ms"));
     assert!(writer.contains("native_bridge.local_cache_unavailable_fallbacks"));
     assert!(writer.contains("native_bridge.stale_epoch_fallbacks"));
     assert!(writer.contains("native_bridge.unsafe_local_cache_fallbacks"));
+    assert!(writer.contains("native_bridge.local_cache_willneed_hints"));
+    assert!(writer.contains("native_bridge.local_cache_willneed_errors"));
+    assert!(writer.contains("fetch.singleflight_waits"));
+    assert!(writer.contains("fetch.singleflight_wait_max_ms"));
 }
 
 #[test]
@@ -2568,6 +2594,7 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
     let snapshot = vfs.write_path_observability_snapshot();
     let async_write = snapshot.fuse_async_write;
     let native_bridge = snapshot.native_bridge;
+    let fetch = snapshot.fetch;
     let backpressure = snapshot.write_backpressure;
     let dirty_pressure = snapshot.dirty_pressure;
     let json = format!(
@@ -2625,9 +2652,18 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             "    \"fallback_reasons\": {native_local_cache_fallback_reasons},\n",
             "    \"bytes_fallbacks\": {native_bytes_fallbacks},\n",
             "    \"bytes_returned\": {native_bytes_returned},\n",
+            "    \"local_cache_willneed_hints\": {native_local_cache_willneed_hints},\n",
+            "    \"local_cache_willneed_errors\": {native_local_cache_willneed_errors},\n",
             "    \"read_ahead_prefetches\": {native_read_ahead_prefetches},\n",
             "    \"read_ahead_suppressed\": {native_read_ahead_suppressed},\n",
             "    \"read_ahead_amplification_bytes\": {native_read_ahead_amplification_bytes}\n",
+            "  }},\n",
+            "  \"fetch\": {{\n",
+            "    \"singleflight_joins\": {fetch_singleflight_joins},\n",
+            "    \"singleflight_waits\": {fetch_singleflight_waits},\n",
+            "    \"singleflight_wait_total_ms\": {fetch_singleflight_wait_total_ms:.3},\n",
+            "    \"singleflight_wait_avg_ms\": {fetch_singleflight_wait_avg_ms:.3},\n",
+            "    \"singleflight_wait_max_ms\": {fetch_singleflight_wait_max_ms:.3}\n",
             "  }},\n",
             "  \"write_backpressure\": {{\n",
             "    \"events\": {backpressure_events},\n",
@@ -2697,9 +2733,16 @@ fn write_sfs530_telemetry_snapshot(artifact_dir: &Path, name: &str, vfs: Option<
             native_local_cache_fallback_reasons_json(&native_bridge),
         native_bytes_fallbacks = native_bridge.bytes_fallbacks,
         native_bytes_returned = native_bridge.bytes_returned,
+        native_local_cache_willneed_hints = native_bridge.local_cache_willneed_hints,
+        native_local_cache_willneed_errors = native_bridge.local_cache_willneed_errors,
         native_read_ahead_prefetches = native_bridge.read_ahead_prefetches,
         native_read_ahead_suppressed = native_bridge.read_ahead_suppressed,
         native_read_ahead_amplification_bytes = native_bridge.read_ahead_amplification_bytes,
+        fetch_singleflight_joins = fetch.singleflight_joins,
+        fetch_singleflight_waits = fetch.singleflight_waits,
+        fetch_singleflight_wait_total_ms = fetch.singleflight_wait_total_ms,
+        fetch_singleflight_wait_avg_ms = fetch.singleflight_wait_avg_ms,
+        fetch_singleflight_wait_max_ms = fetch.singleflight_wait_max_ms,
         backpressure_events = backpressure.events,
         backpressure_wait_total_ms = backpressure.wait_total_ms,
         backpressure_stall_max_ms = backpressure.stall_max_ms,

@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `crates/studiofs-vfs/src/readahead.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add tests that require the VFS tracker to widen sequential streams and shrink after a random jump:
 
@@ -56,17 +56,17 @@ fn test_random_seek_shrinks_adaptive_window_to_base_width() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify RED**
+- [x] **Step 2: Run tests to verify RED**
 
 Run: `cargo test -p studiofs-vfs test_sequential_reads_grow_window_toward_max_width test_random_seek_shrinks_adaptive_window_to_base_width -- --nocapture`
 
 Expected: FAIL because the current tracker keeps a fixed configured window.
 
-- [ ] **Step 3: Implement minimal adaptive growth/shrink**
+- [x] **Step 3: Implement minimal adaptive growth/shrink**
 
 Update `ReadState` with a small sequential streak counter. On contiguous forward reads, grow `current_width` by doubling until `max_width`, starting at `fixed_width`. On random/sparse reads or idle reset, shrink to `base_width` and suppress immediate prefetch.
 
-- [ ] **Step 4: Run tests to verify GREEN**
+- [x] **Step 4: Run tests to verify GREEN**
 
 Run: `cargo test -p studiofs-vfs test_sequential_reads_grow_window_toward_max_width test_random_seek_shrinks_adaptive_window_to_base_width -- --nocapture`
 
@@ -78,7 +78,7 @@ Expected: PASS.
 - Modify: `crates/studiofs-fuse/src/native/cache_policy.rs`
 - Modify: `crates/studiofs-fuse/src/native/vfs_adapter.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add a Linux native bridge test proving a long trusted sequential read stream records prefetches and nonzero amplification while a later sparse seek records suppression:
 
@@ -114,17 +114,17 @@ fn read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify RED**
+- [x] **Step 2: Run test to verify RED**
 
 Run: `cargo test -p studiofs-fuse read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression -- --nocapture`
 
 Expected: FAIL until native metrics expose the needed adaptive-session behavior.
 
-- [ ] **Step 3: Implement minimal metric wiring**
+- [x] **Step 3: Implement minimal metric wiring**
 
 If needed, extend `NativeReadMetricsSnapshot` and `observe_read_ahead` with counters for adaptive prefetch observations. Keep native range calculation bounded by `NativeReadAheadPolicy` and preserve existing suppression behavior for untrusted or dirty cache state.
 
-- [ ] **Step 4: Run test to verify GREEN**
+- [x] **Step 4: Run test to verify GREEN**
 
 Run: `cargo test -p studiofs-fuse read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression -- --nocapture`
 
@@ -135,20 +135,27 @@ Expected: PASS.
 **Files:**
 - No new files.
 
-- [ ] **Step 1: Run focused VFS tests**
+- [x] **Step 1: Run focused VFS tests**
 
 Run: `cargo test -p studiofs-vfs readahead -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 2: Run focused native bridge tests**
+- [x] **Step 2: Run focused native bridge tests**
 
 Run: `cargo test -p studiofs-fuse read_ahead -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Inspect diff**
+- [x] **Step 3: Inspect diff**
 
 Run: `git diff -- crates/studiofs-vfs/src/readahead.rs crates/studiofs-fuse/src/native/cache_policy.rs crates/studiofs-fuse/src/native/vfs_adapter.rs docs/superpowers/plans/2026-06-19-sfs-536-adaptive-linux-readahead.md`
 
 Expected: Only the adaptive readahead plan, tests, implementation, and metrics wiring changed.
+
+Focused validation run on 2026-06-19:
+- `cargo test -p studiofs-vfs readahead -- --nocapture`
+- `cargo test -p studiofs-fuse readahead -- --nocapture`
+- `cargo test -p studiofs-fuse read_metrics_snapshot_reports_adaptive_prefetch_and_sparse_suppression -- --nocapture`
+- `cargo test -p studiofs-fuse local_cache -- --nocapture`
+- `cargo test -p studiofs-vfs write_path_observability_reports_native_bridge_snapshot -- --nocapture`
