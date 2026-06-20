@@ -522,75 +522,15 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
-    const RUNTIME_STATS_BACKSLASH_PATH: &[u16] = &[
-        b'\\' as u16,
-        b'.' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        b'f' as u16,
-        b's' as u16,
-        b'-' as u16,
-        b'r' as u16,
-        b'u' as u16,
-        b'n' as u16,
-        b't' as u16,
-        b'i' as u16,
-        b'm' as u16,
-        b'e' as u16,
-        b'-' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'a' as u16,
-        b't' as u16,
-        b's' as u16,
-    ];
-    const RUNTIME_STATS_SLASH_PATH: &[u16] = &[
-        b'/' as u16,
-        b'.' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        b'f' as u16,
-        b's' as u16,
-        b'-' as u16,
-        b'r' as u16,
-        b'u' as u16,
-        b'n' as u16,
-        b't' as u16,
-        b'i' as u16,
-        b'm' as u16,
-        b'e' as u16,
-        b'-' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'a' as u16,
-        b't' as u16,
-        b's' as u16,
-    ];
-    let slice = path.as_slice();
-    utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_BACKSLASH_PATH)
-        || utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_SLASH_PATH)
-}
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_start_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.contains(['\\', '/']) {
+        return false;
+    };
 
-fn utf16_ascii_eq_ignore_case(actual: &[u16], expected_lower_ascii: &[u16]) -> bool {
-    actual.len() == expected_lower_ascii.len()
-        && actual
-            .iter()
-            .zip(expected_lower_ascii)
-            .all(|(&actual, &expected)| {
-                if actual <= 0x7f && expected <= 0x7f {
-                    (actual as u8).to_ascii_lowercase() as u16 == expected
-                } else {
-                    actual == expected
-                }
-            })
+    trimmed
+        .trim_end_matches([' ', '.'])
+        .eq_ignore_ascii_case(".studiofs-runtime-stats")
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -2126,11 +2066,11 @@ mod tests {
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
-        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
-        write_local_sync_policy_from_create_options,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
+        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
+        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -2615,6 +2555,40 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_runtime_stats_path_accepts_windows_root_component_forms() {
+        for path in [
+            r"\.studiofs-runtime-stats",
+            r"/.studiofs-runtime-stats",
+            r"\.STUDIOFS-RUNTIME-STATS",
+            r"\.studiofs-runtime-stats.",
+            r"\.studiofs-runtime-stats ",
+        ] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to resolve to the runtime stats surface"
+            );
+        }
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_path_rejects_nested_components() {
+        for path in [
+            r"\child\.studiofs-runtime-stats",
+            r"\.studiofs-runtime-stats\child",
+            r"\.studiofs-runtime-stats\",
+        ] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                !is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to remain a normal namespace path"
+            );
+        }
+    }
+
+    #[test]
     fn winfsp_runtime_stats_open_disables_os_cache() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-cache-policy");
         let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
@@ -2628,6 +2602,24 @@ mod tests {
             &mut file_info,
         )
         .expect("runtime stats open path");
+
+        assert!(handle.disable_os_cache);
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_open_accepts_windows_normalized_component() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-normalized");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats.").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("runtime stats normalized open path");
 
         assert!(handle.disable_os_cache);
     }
