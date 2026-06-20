@@ -25,6 +25,7 @@ pub mod benchmark_profile;
 #[cfg(not(unix))]
 pub mod benchmark_profile_stub;
 pub mod mount_profile_types;
+pub mod perf;
 pub mod runtime_tuning;
 pub mod settings;
 pub mod snapshot;
@@ -127,6 +128,7 @@ enum Commands {
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
     Umount(umount::UmountArgs),
+    Perf(perf::PerfArgs),
     Status(status::StatusArgs),
     Settings(settings::SettingsArgs),
     Janitor(janitor::JanitorArgs),
@@ -148,6 +150,7 @@ impl Commands {
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
             Self::Umount(args) => args.dispatch(),
+            Self::Perf(args) => args.dispatch(),
             Self::Status(args) => args.dispatch(),
             Self::Settings(args) => args.dispatch(),
             Self::Janitor(args) => args.dispatch(),
@@ -215,6 +218,49 @@ mod tests {
                 );
             }
             other => panic!("expected Test command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn perf_command_parses_sampling_and_output_flags() {
+        let cli = parse_for_test(&[
+            "perf",
+            "Z:",
+            "--interval",
+            "250",
+            "--count",
+            "2",
+            "--section",
+            "bridge",
+            "--section",
+            "vfs-read",
+            "--verbosity",
+            "verbose",
+            "--json-lines",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Perf(perf::PerfArgs {
+                mountpoint,
+                interval,
+                count,
+                schema,
+                sections,
+                verbosity,
+                json,
+                json_lines,
+            }) => {
+                assert_eq!(mountpoint, std::path::PathBuf::from("Z:"));
+                assert_eq!(interval, 250);
+                assert_eq!(count, Some(2));
+                assert!(!schema);
+                assert_eq!(sections, vec!["bridge", "vfs-read"]);
+                assert_eq!(verbosity, perf::PerfVerbosity::Verbose);
+                assert!(!json);
+                assert!(json_lines);
+            }
+            other => panic!("expected Perf command, got {other:?}"),
         }
     }
 

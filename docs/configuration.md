@@ -255,6 +255,19 @@ studiofs umount <mount-point>
 studiofs status <name>
 ```
 
+### `perf`
+
+```bash
+studiofs perf <mountpoint>
+studiofs perf <mountpoint> --interval 500 --count 10
+studiofs perf <mountpoint> --json-lines --count 5
+```
+
+Reads the mounted `.studiofs-runtime-stats` surface and prints live interval
+rates, gauges, and optional verbose latency averages. See
+[studiofs perf command](./perf/studiofs-perf-command.md) and
+[runtime stats schema](./perf/runtime-stats-schema.md).
+
 ### `janitor`
 
 ```bash
