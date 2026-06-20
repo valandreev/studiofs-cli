@@ -121,6 +121,58 @@ fn make_test_vfs_with_config(
 }
 
 #[test]
+fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
+    let tmp = TempDir::new().unwrap();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");
+
+    let attr = vfs
+        .lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME)
+        .expect("lookup runtime stats surface");
+    assert_eq!(attr.ino, RUNTIME_STATS_FILE_INO);
+    assert_eq!(attr.kind, FileType::RegularFile);
+    assert_eq!(attr.mode, 0o444);
+    assert!(
+        meta.lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME).is_err(),
+        "runtime stats surface must not persist into volume metadata"
+    );
+
+    let entries = vfs.readdir(ROOT_INO).expect("readdir root");
+    assert!(entries.iter().any(|entry| {
+        entry.ino == RUNTIME_STATS_FILE_INO && entry.name == RUNTIME_STATS_FILE_NAME
+    }));
+
+    let mut out = vec![0u8; attr.size as usize];
+    let read = vfs.read_runtime_stats_file(0, &mut out);
+    out.truncate(read as usize);
+    let text = String::from_utf8(out).expect("runtime stats text is utf-8");
+    assert!(text.starts_with("# studiofs_runtime_stats schema_version=1\n"));
+
+    let parsed = RuntimeStatsSnapshot::parse_text(&text).expect("parse runtime stats text");
+    assert_eq!(parsed.schema_version, RUNTIME_STATS_SCHEMA_VERSION);
+    assert!(parsed.generated_unix_ms > 0);
+    assert!(parsed.bridge.counters.contains_key("read_callbacks"));
+    assert!(parsed.vfs_read.counters.contains_key("calls"));
+    assert!(parsed.upload_queue.gauges.contains_key("pending_depth"));
+}
+
+#[test]
+fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
+    let tmp = TempDir::new().unwrap();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-offset");
+    let text = vfs.runtime_stats_file_text();
+    assert!(text.len() > 16);
+
+    let mut out = [0u8; 8];
+    let read = vfs.read_runtime_stats_file(2, &mut out);
+    assert_eq!(read, 8);
+    assert_eq!(&out, &text.as_bytes()[2..10]);
+
+    let mut eof = [0u8; 4];
+    let read = vfs.read_runtime_stats_file(u64::MAX, &mut eof);
+    assert_eq!(read, 0);
+}
+
+#[test]
 fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
     let mut fixture =
         ContractVfsFixture::new("vfs-contract-harness").expect("create vfs contract fixture");

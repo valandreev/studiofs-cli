@@ -503,10 +503,19 @@ fn unix_nanos_to_filetime(unix_nanos: u64) -> u64 {
 /// Handles `.` (current dir), `..` (parent dir), and strips trailing
 /// dots/spaces from path components (standard Windows path semantics).
 fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
+    if is_runtime_stats_windows_path(path) {
+        return Ok(vfs.runtime_stats_file_attr());
+    }
     let s = path.to_string_lossy();
     vfs.namespace_resolver(NamespacePathStyle::Windows)
         .resolve_path(&s)
         .map_err(vfs_to_winfsp_err)
+}
+
+fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
+    let s = path.to_string_lossy();
+    let name = String::from_utf8_lossy(studiofs_vfs::RUNTIME_STATS_FILE_NAME);
+    s == format!("\\{name}") || s == format!("/{name}")
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -1006,7 +1015,15 @@ impl StudioFsContext {
         write_local_sync_policy: LocalSyncPolicy,
     ) -> winfsp::Result<StudioFileHandle> {
         let is_dir = attr.kind == FileType::Directory;
-        let fh = if is_dir {
+        let fh = if self.vfs.is_runtime_stats_file_ino(attr.ino) {
+            if open_flags.contains(OpenFlags::WRONLY)
+                || open_flags.contains(OpenFlags::RDWR)
+                || trunc
+            {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
+            0
+        } else if is_dir {
             0
         } else {
             self.vfs
@@ -1321,6 +1338,17 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        if is_runtime_stats_windows_path(file_name) {
+            let open_flags = open_flags_from_access(granted_access, create_options);
+            let attr = self.vfs.runtime_stats_file_attr();
+            Self::write_open_file_info(file_info, &attr);
+            return self.open_file_handle_for_attr(
+                &attr,
+                open_flags,
+                false,
+                write_local_sync_policy_from_create_options(create_options),
+            );
+        }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1353,6 +1381,10 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if self.vfs.is_runtime_stats_file_ino(context.ino) {
+            *file_info = attr_to_file_info(&self.vfs.runtime_stats_file_attr());
+            return Ok(());
+        }
         let attr = self
             .vfs
             .peek_dirty_attr(context.ino)
@@ -1370,6 +1402,9 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        if self.vfs.is_runtime_stats_file_ino(context.ino) {
+            return Ok(self.vfs.read_runtime_stats_file(offset, buffer));
+        }
         if let Some(n) = self.try_handle_zero_fill_read(context, buffer, offset) {
             trace!(
                 ino = context.ino,
@@ -1579,6 +1614,9 @@ impl FileSystemContext for StudioFsContext {
 
                 let child_attr = match self.vfs.getattr(entry.ino) {
                     Ok(a) => a,
+                    Err(_) if self.vfs.is_runtime_stats_file_ino(entry.ino) => {
+                        self.vfs.runtime_stats_file_attr()
+                    }
                     Err(e) => {
                         let display_name = String::from_utf8_lossy(&entry.name);
                         warn!(

@@ -8,6 +8,14 @@ platform.
 
 The current schema version is `1`.
 
+## Mounted Access
+
+Mounted StudioFS volumes expose the live text representation through the
+root-local hidden file `.studiofs-runtime-stats`. Windows WinFSP, macFUSE, and
+Linux FUSE bridges all use this same file name and the same parser-compatible
+text format. The file is synthetic: it is not persisted in volume metadata, and
+readers should treat each open/read as a fresh point-in-time snapshot.
+
 ## Snapshot Shape
 
 `RuntimeStatsSnapshot` contains these stable sections:

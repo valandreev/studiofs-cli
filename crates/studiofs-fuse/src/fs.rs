@@ -966,6 +966,11 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let attr = self.vfs.runtime_stats_file_attr();
+            reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid));
+            return;
+        }
         match self.vfs.getattr(ino) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
@@ -1264,6 +1269,17 @@ impl Filesystem for StudioFuseFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            if open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
+                || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
+                || trunc
+            {
+                reply.error(libc::EROFS);
+                return;
+            }
+            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
+            return;
+        }
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
                 let reply_flags = fuse_open_reply_flags(open_flags);
@@ -1309,6 +1325,12 @@ impl Filesystem for StudioFuseFs {
                 return;
             }
         };
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let mut out = vec![0u8; size as usize];
+            let n = self.vfs.read_runtime_stats_file(offset, &mut out) as usize;
+            reply.data(&out[..n]);
+            return;
+        }
         let clamped_size = match self.vfs.getattr(ino) {
             Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
             Err(e) => {

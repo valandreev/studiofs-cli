@@ -983,6 +983,9 @@ impl StudioVfsAdapter {
 
     /// Get inode attributes.
     pub(crate) fn getattr(&self, ino: u64) -> Result<stat, i32> {
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            return Ok(self.attr_to_stat(&self.vfs.runtime_stats_file_attr()));
+        }
         self.vfs
             .getattr(ino)
             .map(|attr| self.attr_to_stat(&attr))
@@ -1060,6 +1063,15 @@ impl StudioVfsAdapter {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         if self.read_only && posix_open_requests_write(flags, trunc) {
             return Err(libc::EROFS);
+        }
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            if posix_open_requests_write(flags, trunc)
+                || open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
+                || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
+            {
+                return Err(libc::EROFS);
+            }
+            return Ok(OpenReply::new(0).with_direct_io(true));
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.vfs
@@ -1300,6 +1312,13 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let mut out = vec![0u8; size_usize];
+            let n = self.vfs.read_runtime_stats_file(offset, &mut out) as usize;
+            out.truncate(n);
+            return Ok(out);
+        }
+
         // Test-only synchronous reads return an owned Vec, so keep them off the
         // queued-read pool; otherwise this helper would consume pooled buffers.
         let mut out = vec![0u8; size_usize];
@@ -1330,6 +1349,19 @@ impl StudioVfsAdapter {
     ) -> Result<PooledReadBuffer, i32> {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
+        }
+        if state.vfs.is_runtime_stats_file_ino(request.ino) {
+            let size = request.size.min(request.max_read_len) as usize;
+            let mut out = state
+                .shared
+                .read_buffers
+                .clone()
+                .acquire_with_capacity(size, size);
+            let n = state
+                .vfs
+                .read_runtime_stats_file(request.offset, out.as_mut_slice());
+            out.truncate(n as usize);
+            return Ok(out);
         }
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
@@ -1943,6 +1975,9 @@ impl StudioVfsAdapter {
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
+        if self.vfs.is_runtime_stats_file_ino(entry.ino) {
+            return self.attr_to_stat(&self.vfs.runtime_stats_file_attr());
+        }
         let mut out = minimal_stat(entry.ino);
         out.st_ino = entry.ino;
         out.st_mode = match entry.kind {

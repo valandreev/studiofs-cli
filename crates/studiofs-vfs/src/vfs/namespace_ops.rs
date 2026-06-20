@@ -926,6 +926,9 @@ impl StudioVfs {
     /// Returns the resolved `InodeAttr` or a metadata error when the entry is
     /// absent or blocked.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_name(parent, name) {
+            return Ok(self.runtime_stats_file_attr());
+        }
         self.namespace_resolver(NamespacePathStyle::Posix)
             .lookup_component(parent, name)
     }
@@ -952,6 +955,12 @@ impl StudioVfs {
                 !super::is_blocked_root_macos_metadata(&entry.name)
                     && !super::is_probable_trash_component(&entry.name)
             });
+            if !entries
+                .iter()
+                .any(|entry| entry.name == super::runtime_stats_surface::RUNTIME_STATS_FILE_NAME)
+            {
+                entries.push(self.runtime_stats_dir_entry());
+            }
         }
 
         let mut confirmed_entry_inos = HashSet::new();
