@@ -522,6 +522,18 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
+    let slice = path.as_slice();
+    let Some(&first) = slice.first() else {
+        return false;
+    };
+    if first == b'\\' as u16 || first == b'/' as u16 {
+        if slice.get(1).copied() != Some(b'.' as u16) {
+            return false;
+        }
+    } else if first != b'.' as u16 {
+        return false;
+    }
+
     let s = path.to_string_lossy();
     let trimmed = s.trim_start_matches(['\\', '/']);
     if trimmed.is_empty() || trimmed.contains(['\\', '/']) {
@@ -2616,6 +2628,18 @@ mod tests {
             r"\.studiofs-runtime-stats\child",
             r"\.studiofs-runtime-stats\",
         ] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                !is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to remain a normal namespace path"
+            );
+        }
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_path_rejects_normal_paths_before_string_allocation() {
+        for path in [r"\child", r"/child", r"child", r"runtime-stats"] {
             let file_name = U16CString::from_str(path).expect("u16 path");
 
             assert!(

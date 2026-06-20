@@ -274,8 +274,10 @@ fn sleep_until_next_deadline(
     let now = Instant::now();
     if *next_deadline > now {
         sleep(*next_deadline - now);
+        *next_deadline += interval;
+    } else {
+        *next_deadline = now + interval;
     }
-    *next_deadline += interval;
 }
 
 fn stats_path(mountpoint: &Path) -> PathBuf {
@@ -284,14 +286,15 @@ fn stats_path(mountpoint: &Path) -> PathBuf {
         use std::path::{Component, Prefix};
 
         let mut components = mountpoint.components();
-        if let (Some(Component::Prefix(prefix)), None) = (components.next(), components.next())
-            && matches!(prefix.kind(), Prefix::Disk(_))
-        {
-            return PathBuf::from(format!(
-                "{}\\{}",
-                mountpoint.display(),
-                runtime_stats_file_name()
-            ));
+        match (components.next(), components.next()) {
+            (Some(Component::Prefix(prefix)), None) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+                return PathBuf::from(format!(
+                    "{}\\{}",
+                    mountpoint.display(),
+                    runtime_stats_file_name()
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -361,11 +364,14 @@ fn normalize_perf_mountpoint(raw: &str) -> String {
     {
         let normalized = normalized.replace('/', "\\");
         let mut chars = normalized.chars();
-        if let (Some(drive), Some(':'), rest) = (chars.next(), chars.next(), chars.as_str())
-            && drive.is_ascii_alphabetic()
-            && rest.chars().all(|ch| ch == '\\')
-        {
-            return format!("{}:", drive.to_ascii_uppercase());
+        match (chars.next(), chars.next()) {
+            (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+                let rest = chars.as_str();
+                if rest.chars().all(|ch| ch == '\\') {
+                    return format!("{}:", drive.to_ascii_uppercase());
+                }
+            }
+            _ => {}
         }
         normalized.trim_end_matches('\\').to_string()
     }
@@ -902,8 +908,9 @@ fn write_sample(
         PerfOutput::Table => write_table_sample(out, sample, table_state),
         PerfOutput::Json => bail!("finite JSON output must be written as a sample array"),
         PerfOutput::JsonLines => {
-            serde_json::to_writer(&mut *out, sample)?;
-            writeln!(out)?;
+            let mut buffer = serde_json::to_vec(sample)?;
+            buffer.push(b'\n');
+            out.write_all(&buffer)?;
             Ok(())
         }
     }
@@ -1221,11 +1228,13 @@ mod tests {
     #[derive(Default)]
     struct FlushingBuffer {
         bytes: Vec<u8>,
+        writes: usize,
         flushes: usize,
     }
 
     impl Write for FlushingBuffer {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
             self.bytes.extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -1717,6 +1726,20 @@ mod tests {
     }
 
     #[test]
+    fn sleep_until_next_deadline_resets_when_sampler_falls_behind() {
+        let before = Instant::now();
+        let mut next_deadline = before - Duration::from_millis(250);
+        let mut sleeps = 0;
+
+        sleep_until_next_deadline(&mut next_deadline, Duration::from_secs(1), &mut |_| {
+            sleeps += 1;
+        });
+
+        assert_eq!(sleeps, 0);
+        assert!(next_deadline >= before);
+    }
+
+    #[test]
     fn build_sample_includes_latency_averages_when_verbose() {
         let options = PerfOptions {
             mountpoint: Some(PathBuf::from("Z:")),
@@ -1927,6 +1950,31 @@ mod tests {
         let output = String::from_utf8(out).expect("json lines is utf8");
 
         assert_eq!(output.lines().count(), 1);
+    }
+
+    #[test]
+    fn json_lines_output_writes_record_and_newline_together() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::JsonLines,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+        let mut out = FlushingBuffer::default();
+        let mut table_state = TableOutputState::default();
+
+        write_sample(&mut out, &sample, &options, &mut table_state).expect("write json line");
+
+        assert_eq!(out.writes, 1);
+        assert!(out.bytes.ends_with(b"\n"));
     }
 
     #[test]
