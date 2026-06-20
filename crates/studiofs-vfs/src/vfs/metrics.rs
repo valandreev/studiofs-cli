@@ -309,9 +309,9 @@ impl RuntimeStatsSnapshot {
             self.generated_unix_ms = value;
             return Ok(());
         }
-        let target = self
-            .section_mut(section)
-            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
         let metric = RuntimeScalarMetric {
             value,
             unit: parse_runtime_stats_unit(unit),
@@ -338,9 +338,9 @@ impl RuntimeStatsSnapshot {
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
         Self::validate_not_root_system_histogram(section, key, line)?;
-        let target = self
-            .section_mut(section)
-            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
         let unit = parse_runtime_stats_unit(unit);
         if let Some(histogram) = target.latencies.get_mut(key) {
             set_histogram_unit(histogram, unit, line)?;
@@ -374,9 +374,9 @@ impl RuntimeStatsSnapshot {
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
         Self::validate_not_root_system_histogram(section, key, line)?;
-        let target = self
-            .section_mut(section)
-            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
         // Avoid `entry(key.to_owned())` here: histogram buckets repeat the same
         // key, and the borrowed lookup avoids allocating a discarded `String`.
         if let Some(histogram) = target.latencies.get_mut(key) {
@@ -531,18 +531,23 @@ where
 {
     let mut raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
     raw_buckets.sort_by_key(|bucket| bucket.le_ns);
+    if raw_buckets.len() < 2 {
+        return Ok(raw_buckets);
+    }
 
-    let mut buckets: Vec<RuntimeLatencyBucket> = Vec::with_capacity(raw_buckets.len());
-    for bucket in raw_buckets {
-        if let Some(last) = buckets.last_mut()
-            && last.le_ns == bucket.le_ns
-        {
-            *last = bucket;
+    let mut write_index = 0;
+    for read_index in 1..raw_buckets.len() {
+        if raw_buckets[write_index].le_ns == raw_buckets[read_index].le_ns {
+            raw_buckets[write_index] = raw_buckets[read_index];
         } else {
-            buckets.push(bucket);
+            write_index += 1;
+            if write_index != read_index {
+                raw_buckets[write_index] = raw_buckets[read_index];
+            }
         }
     }
-    Ok(buckets)
+    raw_buckets.truncate(write_index + 1);
+    Ok(raw_buckets)
 }
 
 /// Scalar counter or gauge value with a stable unit.
@@ -2294,6 +2299,36 @@ mod tests {
 
         assert_eq!(error.line(), 1);
         assert_eq!(error.message(), "metric key must not contain dots");
+    }
+
+    #[test]
+    fn runtime_stats_text_ignores_unknown_future_sections() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            counter network.rx_bytes bytes 64\n\
+            gauge network.connected count 1\n\
+            histogram_count network.round_trip ns 2\n\
+            histogram_sum network.round_trip ns 300\n\
+            histogram_bucket network.round_trip 500 2\n\
+            counter vfs_read.calls count 4\n\
+            ",
+        )
+        .expect("unknown future sections should be skipped");
+
+        assert_eq!(parsed.vfs_read.counters["calls"].value, 4);
+        for section in [
+            &parsed.system,
+            &parsed.bridge,
+            &parsed.vfs_write,
+            &parsed.cache,
+            &parsed.upload_queue,
+            &parsed.object_io,
+            &parsed.metadata,
+        ] {
+            assert!(section.counters.is_empty());
+            assert!(section.gauges.is_empty());
+            assert!(section.latencies.is_empty());
+        }
     }
 
     #[test]
