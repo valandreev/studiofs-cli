@@ -522,75 +522,27 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
-    const RUNTIME_STATS_BACKSLASH_PATH: &[u16] = &[
-        b'\\' as u16,
-        b'.' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        b'f' as u16,
-        b's' as u16,
-        b'-' as u16,
-        b'r' as u16,
-        b'u' as u16,
-        b'n' as u16,
-        b't' as u16,
-        b'i' as u16,
-        b'm' as u16,
-        b'e' as u16,
-        b'-' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'a' as u16,
-        b't' as u16,
-        b's' as u16,
-    ];
-    const RUNTIME_STATS_SLASH_PATH: &[u16] = &[
-        b'/' as u16,
-        b'.' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        b'f' as u16,
-        b's' as u16,
-        b'-' as u16,
-        b'r' as u16,
-        b'u' as u16,
-        b'n' as u16,
-        b't' as u16,
-        b'i' as u16,
-        b'm' as u16,
-        b'e' as u16,
-        b'-' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'a' as u16,
-        b't' as u16,
-        b's' as u16,
-    ];
     let slice = path.as_slice();
-    utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_BACKSLASH_PATH)
-        || utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_SLASH_PATH)
-}
+    let Some(&first) = slice.first() else {
+        return false;
+    };
+    if first == b'\\' as u16 || first == b'/' as u16 {
+        if slice.get(1).copied() != Some(b'.' as u16) {
+            return false;
+        }
+    } else if first != b'.' as u16 {
+        return false;
+    }
 
-fn utf16_ascii_eq_ignore_case(actual: &[u16], expected_lower_ascii: &[u16]) -> bool {
-    actual.len() == expected_lower_ascii.len()
-        && actual
-            .iter()
-            .zip(expected_lower_ascii)
-            .all(|(&actual, &expected)| {
-                if actual <= 0x7f && expected <= 0x7f {
-                    (actual as u8).to_ascii_lowercase() as u16 == expected
-                } else {
-                    actual == expected
-                }
-            })
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_start_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.contains(['\\', '/']) {
+        return false;
+    };
+
+    trimmed
+        .trim_end_matches([' ', '.'])
+        .eq_ignore_ascii_case(".studiofs-runtime-stats")
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -1371,6 +1323,7 @@ impl FileSystemContext for StudioFsContext {
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
             || self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
+        self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1445,6 +1398,7 @@ impl FileSystemContext for StudioFsContext {
                 write_local_sync_policy_from_create_options(create_options),
             )?;
             handle.set_disable_os_cache(true);
+            self.vfs.note_winfsp_os_cache_open(true);
             set_current_winfsp_open_disable_cache(true);
             return Ok(handle);
         }
@@ -1461,6 +1415,7 @@ impl FileSystemContext for StudioFsContext {
         let mut handle = self.execute_create_callback_plan(plan, file_info)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
+        self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1526,6 +1481,7 @@ impl FileSystemContext for StudioFsContext {
         let fh = context.fh;
         let out_buf = SendMutBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
+        let callback_start = Instant::now();
 
         let result: Result<u32, _> = self.spawn_wait(async move {
             // SAFETY:
@@ -1540,7 +1496,12 @@ impl FileSystemContext for StudioFsContext {
 
         match result {
             Ok(n) => {
+                self.vfs
+                    .record_winfsp_read_callback_observability(n, callback_start.elapsed());
                 context.record_read_callback(n);
+                if !context.disable_os_cache {
+                    self.vfs.note_winfsp_os_cache_miss_read(n);
+                }
                 trace!(
                     ino,
                     fh,
@@ -2126,16 +2087,17 @@ mod tests {
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
-        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
-        write_local_sync_policy_from_create_options,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
+        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
+        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;
+    use std::time::Duration;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::{
         CURRENT_FORMAT_VERSION, DirEntryValue, FileType, FormatInfo, Ino, InodeAttr, MetaFormat,
@@ -2336,6 +2298,33 @@ mod tests {
         handle.record_read_callback(256);
 
         assert_eq!(handle.read_callback_snapshot(), (2, 384));
+    }
+
+    #[test]
+    fn winfsp_os_cache_observability_tracks_cacheable_open_and_read_miss() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("winfsp-os-cache-observability");
+        let attr = vfs
+            .create(ROOT_INO, b"cacheable-read.txt", 0, 0, 0o644)
+            .expect("create file");
+        let mut handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
+
+        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
+        vfs.note_winfsp_os_cache_open(disable_os_cache);
+        vfs.record_winfsp_read_callback_observability(4096, Duration::from_millis(2));
+        handle.record_read_callback(4096);
+        if !handle.disable_os_cache {
+            vfs.note_winfsp_os_cache_miss_read(4096);
+        }
+
+        let callbacks = vfs.write_path_observability_snapshot().winfsp_callbacks;
+        assert_eq!(callbacks.read, 1);
+        assert_eq!(callbacks.read_bytes, 4096);
+        assert_eq!(callbacks.read_total_ns, 2_000_000);
+        assert_eq!(callbacks.os_cache_enabled_open, 1);
+        assert_eq!(callbacks.os_cache_disabled_open, 0);
+        assert_eq!(callbacks.os_cache_miss_read_callbacks, 1);
+        assert_eq!(callbacks.os_cache_miss_read_bytes, 4096);
     }
 
     #[test]
@@ -2615,6 +2604,52 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_runtime_stats_path_accepts_windows_root_component_forms() {
+        for path in [
+            r"\.studiofs-runtime-stats",
+            r"/.studiofs-runtime-stats",
+            r"\.STUDIOFS-RUNTIME-STATS",
+            r"\.studiofs-runtime-stats.",
+            r"\.studiofs-runtime-stats ",
+        ] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to resolve to the runtime stats surface"
+            );
+        }
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_path_rejects_nested_components() {
+        for path in [
+            r"\child\.studiofs-runtime-stats",
+            r"\.studiofs-runtime-stats\child",
+            r"\.studiofs-runtime-stats\",
+        ] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                !is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to remain a normal namespace path"
+            );
+        }
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_path_rejects_normal_paths_before_string_allocation() {
+        for path in [r"\child", r"/child", r"child", r"runtime-stats"] {
+            let file_name = U16CString::from_str(path).expect("u16 path");
+
+            assert!(
+                !is_runtime_stats_windows_path(file_name.as_ucstr()),
+                "expected {path:?} to remain a normal namespace path"
+            );
+        }
+    }
+
+    #[test]
     fn winfsp_runtime_stats_open_disables_os_cache() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-cache-policy");
         let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
@@ -2628,6 +2663,24 @@ mod tests {
             &mut file_info,
         )
         .expect("runtime stats open path");
+
+        assert!(handle.disable_os_cache);
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_open_accepts_windows_normalized_component() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-normalized");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats.").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("runtime stats normalized open path");
 
         assert!(handle.disable_os_cache);
     }

@@ -103,6 +103,8 @@ pub enum FetchError {
 pub struct FetchMetrics {
     /// Cache hit count.
     pub cache_hits: AtomicU64,
+    /// Bytes served from the local block cache fast path.
+    pub cache_hit_bytes: AtomicU64,
     /// Number of S3 fetch attempts (including retries that progressed to fetch stage).
     pub s3_fetches: AtomicU64,
     /// Number of fetch errors reported by S3.
@@ -169,6 +171,7 @@ impl FetchMetrics {
     fn new() -> Self {
         Self {
             cache_hits: AtomicU64::new(0),
+            cache_hit_bytes: AtomicU64::new(0),
             s3_fetches: AtomicU64::new(0),
             s3_errors: AtomicU64::new(0),
             singleflight_joins: AtomicU64::new(0),
@@ -477,6 +480,9 @@ impl FetchScheduler {
             && let Some(cached) = self.payload_store_get_async(object_id).await?
         {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .cache_hit_bytes
+                .fetch_add(cached.len() as u64, Ordering::Relaxed);
             return Ok(cached);
         }
 
@@ -516,6 +522,9 @@ impl FetchScheduler {
                         match self.payload_store_get_async(object_id).await {
                             Ok(Some(cached)) => {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                self.metrics
+                                    .cache_hit_bytes
+                                    .fetch_add(cached.len() as u64, Ordering::Relaxed);
                                 if let Some((_, tx)) = self.inflight.remove(&object_id) {
                                     let _ = tx.send(BroadcastResult::Success(cached.clone()));
                                 }

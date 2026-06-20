@@ -1,6 +1,9 @@
 use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
 
-use super::{RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot, StudioVfs};
+use super::{
+    RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
+    StudioVfs,
+};
 use crate::utils::now_unix_millis;
 
 /// Root-local hidden file that exposes the cross-platform runtime stats text surface.
@@ -89,7 +92,11 @@ impl StudioVfs {
             &mut snapshot.bridge,
             "read_callbacks",
             "count",
-            write_path.fuse_callbacks.read.calls,
+            write_path
+                .fuse_callbacks
+                .read
+                .calls
+                .saturating_add(write_path.winfsp_callbacks.read),
         );
         insert_counter(
             &mut snapshot.bridge,
@@ -121,6 +128,30 @@ impl StudioVfs {
         );
         insert_counter(
             &mut snapshot.bridge,
+            "os_cache_enabled_open",
+            "count",
+            write_path.winfsp_callbacks.os_cache_enabled_open,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_disabled_open",
+            "count",
+            write_path.winfsp_callbacks.os_cache_disabled_open,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_miss_read_callbacks",
+            "count",
+            write_path.winfsp_callbacks.os_cache_miss_read_callbacks,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_miss_read_bytes",
+            "bytes",
+            write_path.winfsp_callbacks.os_cache_miss_read_bytes,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
             "callback_errors",
             "count",
             write_path
@@ -133,7 +164,11 @@ impl StudioVfs {
             &mut snapshot.bridge,
             "read_callback_bytes",
             "bytes",
-            write_path.fuse_callbacks.read.bytes,
+            write_path
+                .fuse_callbacks
+                .read
+                .bytes
+                .saturating_add(write_path.winfsp_callbacks.read_bytes),
         );
         insert_counter(
             &mut snapshot.bridge,
@@ -144,6 +179,22 @@ impl StudioVfs {
                 .write
                 .bytes
                 .saturating_add(write_path.winfsp_write_path.write_bytes),
+        );
+        insert_latency(
+            &mut snapshot.bridge,
+            "callback",
+            "ns",
+            write_path
+                .fuse_callbacks
+                .read
+                .calls
+                .saturating_add(write_path.fuse_callbacks.write.calls)
+                .saturating_add(write_path.winfsp_callbacks.read)
+                .saturating_add(write_path.winfsp_callbacks.write),
+            ms_sum_to_ns(write_path.fuse_callbacks.read.total_ms)
+                .saturating_add(ms_sum_to_ns(write_path.fuse_callbacks.write.total_ms))
+                .saturating_add(write_path.winfsp_callbacks.read_total_ns)
+                .saturating_add(ms_sum_to_ns(write_path.winfsp_write_path.callback.total_ms)),
         );
 
         insert_counter(
@@ -207,6 +258,30 @@ impl StudioVfs {
             "count",
             cache.local_backend_dirty_objects as u64,
         );
+        insert_counter(
+            &mut snapshot.cache,
+            "hit_calls",
+            "count",
+            write_path.fetch.cache_hits,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "hit_bytes",
+            "bytes",
+            write_path.fetch.cache_hit_bytes,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "read_calls",
+            "count",
+            write_path.fetch.local_cache_io_calls,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "read_bytes",
+            "bytes",
+            write_path.fetch.cache_hit_bytes,
+        );
         insert_gauge(
             &mut snapshot.upload_queue,
             "pending_depth",
@@ -265,6 +340,21 @@ impl StudioVfs {
         );
         insert_counter(
             &mut snapshot.object_io,
+            "get_calls",
+            "count",
+            write_path.fetch.s3_get_calls,
+        );
+        insert_counter(
+            &mut snapshot.object_io,
+            "get_bytes",
+            "bytes",
+            write_path
+                .fetch
+                .encrypted_bytes_read
+                .max(write_path.fetch.bytes_downloaded),
+        );
+        insert_counter(
+            &mut snapshot.object_io,
             "put_calls",
             "count",
             upload.completed_uploads,
@@ -293,6 +383,13 @@ impl StudioVfs {
             "count",
             write_path.metadata_commit.calls,
         );
+        insert_latency(
+            &mut snapshot.metadata,
+            "commit",
+            "ns",
+            write_path.metadata_commit.calls,
+            ms_sum_to_ns(write_path.metadata_commit.total_ms),
+        );
 
         snapshot
     }
@@ -316,4 +413,26 @@ fn insert_gauge(section: &mut RuntimeStatsSection, name: &str, unit: &'static st
             unit: unit.into(),
         },
     );
+}
+
+fn insert_latency(
+    section: &mut RuntimeStatsSection,
+    name: &str,
+    unit: &'static str,
+    count: u64,
+    sum: u64,
+) {
+    section.latencies.insert(
+        name.to_owned(),
+        RuntimeLatencyHistogram {
+            count,
+            sum,
+            unit: unit.into(),
+            buckets: Vec::new(),
+        },
+    );
+}
+
+fn ms_sum_to_ns(value: f64) -> u64 {
+    (value.max(0.0) * 1_000_000.0).round() as u64
 }
