@@ -17,7 +17,7 @@ use studiofs_vfs::{
 };
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
-const RUNTIME_STATS_FILE: &str = ".studiofs-runtime-stats";
+const TABLE_HEADER_REPEAT_SAMPLES: u64 = 30;
 const SECTION_ALIAS_NAMES: &[&str] = &["runtime", "vfs", "upload", "object"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -167,6 +167,12 @@ struct PerfLatencySample {
     unit: Cow<'static, str>,
 }
 
+#[derive(Debug, Default)]
+struct TableOutputState {
+    samples_printed: u64,
+    printed_warnings: BTreeSet<String>,
+}
+
 fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
     if options.schema {
         write_schema(out, options)?;
@@ -197,8 +203,7 @@ fn run_perf_with_sampler(
 
     let mut previous = read_next()?;
     let mut remaining = options.count;
-    let mut printed_header = false;
-    let mut printed_warnings = BTreeSet::new();
+    let mut table_state = TableOutputState::default();
 
     loop {
         if matches!(remaining, Some(0)) {
@@ -208,13 +213,7 @@ fn run_perf_with_sampler(
         sleep(options.interval);
         let current = read_next()?;
         let sample = build_sample(&previous, &current, options);
-        write_sample(
-            out,
-            &sample,
-            options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )?;
+        write_sample(out, &sample, options, &mut table_state)?;
         out.flush()?;
         previous = current;
 
@@ -261,11 +260,20 @@ fn stats_path(mountpoint: &Path) -> PathBuf {
         if let (Some(Component::Prefix(prefix)), None) = (components.next(), components.next())
             && matches!(prefix.kind(), Prefix::Disk(_))
         {
-            return PathBuf::from(format!("{}\\{RUNTIME_STATS_FILE}", mountpoint.display()));
+            return PathBuf::from(format!(
+                "{}\\{}",
+                mountpoint.display(),
+                runtime_stats_file_name()
+            ));
         }
     }
 
-    mountpoint.join(RUNTIME_STATS_FILE)
+    mountpoint.join(runtime_stats_file_name())
+}
+
+fn runtime_stats_file_name() -> &'static str {
+    std::str::from_utf8(RUNTIME_STATS_FILE_NAME)
+        .expect("StudioFS runtime stats file name must be UTF-8")
 }
 
 fn read_snapshot(path: &Path) -> anyhow::Result<RuntimeStatsSnapshot> {
@@ -296,8 +304,18 @@ fn build_sample(
     let mut warnings = Vec::new();
 
     for section_name in &options.sections {
-        let before = section(previous, section_name);
-        let after = section(current, section_name);
+        let Some(before) = section(previous, section_name) else {
+            warnings.push(format!(
+                "unsupported stats section '{section_name}' in this CLI version"
+            ));
+            continue;
+        };
+        let Some(after) = section(current, section_name) else {
+            warnings.push(format!(
+                "unsupported stats section '{section_name}' in this CLI version"
+            ));
+            continue;
+        };
         if section_is_empty(after) {
             warnings.push(format!("missing stats for section '{section_name}'"));
         }
@@ -338,7 +356,7 @@ fn build_section_sample(
 
     for (name, metric) in &current.counters {
         let previous_value = previous.counters.get(name).map_or(0, |metric| metric.value);
-        let delta = metric.value.saturating_sub(previous_value);
+        let delta = reset_aware_delta(previous_value, metric.value);
         sample.counters.insert(
             name.clone(),
             PerfCounterSample {
@@ -379,13 +397,21 @@ fn build_latency_sample(
 ) -> PerfLatencySample {
     let previous_count = previous.map_or(0, |histogram| histogram.count);
     let previous_sum = previous.map_or(0, |histogram| histogram.sum);
-    let count_delta = current.count.saturating_sub(previous_count);
-    let sum_delta = current.sum.saturating_sub(previous_sum);
+    let count_delta = reset_aware_delta(previous_count, current.count);
+    let sum_delta = reset_aware_delta(previous_sum, current.sum);
     PerfLatencySample {
         count_delta,
         sum_delta,
         avg: (count_delta > 0).then_some(sum_delta as f64 / count_delta as f64),
         unit: current.unit.clone(),
+    }
+}
+
+fn reset_aware_delta(previous: u64, current: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
     }
 }
 
@@ -401,11 +427,10 @@ fn write_sample(
     out: &mut impl Write,
     sample: &PerfSample,
     options: &PerfOptions,
-    printed_header: &mut bool,
-    printed_warnings: &mut BTreeSet<String>,
+    table_state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
     match options.output {
-        PerfOutput::Table => write_table_sample(out, sample, printed_header, printed_warnings),
+        PerfOutput::Table => write_table_sample(out, sample, table_state),
         PerfOutput::Json => bail!("finite JSON output must be written as a sample array"),
         PerfOutput::JsonLines => {
             serde_json::to_writer(&mut *out, sample)?;
@@ -424,20 +449,22 @@ fn write_json_samples(out: &mut impl Write, samples: &[PerfSample]) -> anyhow::R
 fn write_table_sample(
     out: &mut impl Write,
     sample: &PerfSample,
-    printed_header: &mut bool,
-    printed_warnings: &mut BTreeSet<String>,
+    state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
-    if !*printed_header {
+    if state
+        .samples_printed
+        .is_multiple_of(TABLE_HEADER_REPEAT_SAMPLES)
+    {
         writeln!(
             out,
             "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
             "time_ms", "section", "kind", "metric", "rate/s", "current", "unit"
         )?;
-        *printed_header = true;
     }
 
     for warning in &sample.warnings {
-        if printed_warnings.insert(warning.clone()) {
+        if !state.printed_warnings.contains(warning) {
+            state.printed_warnings.insert(warning.clone());
             writeln!(out, "warning: {warning}")?;
         }
     }
@@ -488,6 +515,7 @@ fn write_table_sample(
             )?;
         }
     }
+    state.samples_printed = state.samples_printed.saturating_add(1);
     Ok(())
 }
 
@@ -513,7 +541,7 @@ fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<(
     let sections = options.sections.to_vec();
     let payload = serde_json::json!({
         "schema_version": studiofs_vfs::RUNTIME_STATS_SCHEMA_VERSION,
-        "stats_file": String::from_utf8_lossy(RUNTIME_STATS_FILE_NAME),
+        "stats_file": runtime_stats_file_name(),
         "sections": sections,
         "line_kinds": ["counter", "gauge", "histogram_count", "histogram_sum", "histogram_bucket"],
         "units": ["count", "bytes", "ns", "ms", "percent"],
@@ -523,17 +551,20 @@ fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<(
     Ok(())
 }
 
-fn section<'a>(snapshot: &'a RuntimeStatsSnapshot, section_name: &str) -> &'a RuntimeStatsSection {
+fn section<'a>(
+    snapshot: &'a RuntimeStatsSnapshot,
+    section_name: &str,
+) -> Option<&'a RuntimeStatsSection> {
     match section_name {
-        "system" => &snapshot.system,
-        "bridge" => &snapshot.bridge,
-        "vfs_read" => &snapshot.vfs_read,
-        "vfs_write" => &snapshot.vfs_write,
-        "cache" => &snapshot.cache,
-        "upload_queue" => &snapshot.upload_queue,
-        "object_io" => &snapshot.object_io,
-        "metadata" => &snapshot.metadata,
-        _ => unreachable!("sections are validated before sampling"),
+        "system" => Some(&snapshot.system),
+        "bridge" => Some(&snapshot.bridge),
+        "vfs_read" => Some(&snapshot.vfs_read),
+        "vfs_write" => Some(&snapshot.vfs_write),
+        "cache" => Some(&snapshot.cache),
+        "upload_queue" => Some(&snapshot.upload_queue),
+        "object_io" => Some(&snapshot.object_io),
+        "metadata" => Some(&snapshot.metadata),
+        _ => None,
     }
 }
 
@@ -546,21 +577,20 @@ fn parse_sections(raw: &[String]) -> anyhow::Result<Vec<&'static str>> {
         return Ok(RUNTIME_STATS_SECTIONS.to_vec());
     }
 
-    let known = RUNTIME_STATS_SECTIONS
-        .iter()
-        .copied()
-        .collect::<BTreeSet<&'static str>>();
     let mut sections = Vec::new();
     let mut seen = BTreeSet::new();
     for section in raw {
-        let normalized = section.replace('-', "_");
+        let normalized = section.to_lowercase().replace('-', "_");
         let expanded = match normalized.as_str() {
             "runtime" => vec!["system"],
             "vfs" => vec!["vfs_read", "vfs_write"],
             "upload" => vec!["upload_queue"],
             "object" => vec!["object_io"],
             _ => {
-                let Some(&known_section) = known.get(normalized.as_str()) else {
+                let Some(&known_section) = RUNTIME_STATS_SECTIONS
+                    .iter()
+                    .find(|&&name| name == normalized.as_str())
+                else {
                     bail!(
                         "unknown runtime stats section '{}'; expected one of: {}",
                         section,
@@ -672,6 +702,14 @@ mod tests {
         .expect("parse sections");
 
         assert_eq!(sections, vec!["vfs_read", "upload_queue"]);
+    }
+
+    #[test]
+    fn parse_sections_accepts_case_insensitive_names() {
+        let sections = parse_sections(&["VFS".to_string(), "BRIDGE".to_string()])
+            .expect("parse uppercase sections");
+
+        assert_eq!(sections, vec!["vfs_read", "vfs_write", "bridge"]);
     }
 
     #[test]
@@ -809,6 +847,59 @@ mod tests {
     }
 
     #[test]
+    fn build_sample_treats_counter_resets_as_current_interval_activity() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["vfs_read", "object_io"],
+            verbosity: PerfVerbosity::Verbose,
+            output: PerfOutput::Table,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 1_000, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+
+        assert_eq!(
+            sample.sections["vfs_read"].counters["requested_bytes"].delta,
+            300
+        );
+        assert_eq!(sample.sections["object_io"].latencies["get"].count_delta, 3);
+        assert_eq!(
+            sample.sections["object_io"].latencies["get"].sum_delta,
+            3_000
+        );
+    }
+
+    #[test]
+    fn build_sample_warns_for_unsupported_schema_section_without_panicking() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["future_section"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::Table,
+        };
+
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+
+        assert!(sample.sections.is_empty());
+        assert_eq!(
+            sample.warnings,
+            vec!["unsupported stats section 'future_section' in this CLI version"]
+        );
+    }
+
+    #[test]
     fn build_sample_uses_configured_interval_when_snapshot_timestamps_do_not_advance() {
         let options = PerfOptions {
             mountpoint: Some(PathBuf::from("Z:")),
@@ -870,17 +961,9 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
-        let mut printed_header = false;
-        let mut printed_warnings = BTreeSet::new();
+        let mut table_state = TableOutputState::default();
 
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write table");
+        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("warning: missing stats for section 'metadata'"));
@@ -903,25 +986,12 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
-        let mut printed_header = false;
-        let mut printed_warnings = BTreeSet::new();
+        let mut table_state = TableOutputState::default();
 
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write first table sample");
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write second table sample");
+        write_sample(&mut out, &sample, &options, &mut table_state)
+            .expect("write first table sample");
+        write_sample(&mut out, &sample, &options, &mut table_state)
+            .expect("write second table sample");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert_eq!(
@@ -930,6 +1000,34 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn table_output_repeats_header_periodically() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(TABLE_HEADER_REPEAT_SAMPLES + 1),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::Table,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+        let mut out = Vec::new();
+        let mut table_state = TableOutputState::default();
+
+        for _ in 0..=TABLE_HEADER_REPEAT_SAMPLES {
+            write_sample(&mut out, &sample, &options, &mut table_state)
+                .expect("write table sample");
+        }
+        let output = String::from_utf8(out).expect("table is utf8");
+
+        assert_eq!(output.matches("time_ms").count(), 2);
     }
 
     #[test]
@@ -949,17 +1047,9 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
-        let mut printed_header = false;
-        let mut printed_warnings = BTreeSet::new();
+        let mut table_state = TableOutputState::default();
 
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write table");
+        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("time_ms"));
@@ -991,17 +1081,9 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
-        let mut printed_header = false;
-        let mut printed_warnings = BTreeSet::new();
+        let mut table_state = TableOutputState::default();
 
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write table");
+        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("latency"));
@@ -1027,17 +1109,9 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
-        let mut printed_header = false;
-        let mut printed_warnings = BTreeSet::new();
+        let mut table_state = TableOutputState::default();
 
-        write_sample(
-            &mut out,
-            &sample,
-            &options,
-            &mut printed_header,
-            &mut printed_warnings,
-        )
-        .expect("write json lines");
+        write_sample(&mut out, &sample, &options, &mut table_state).expect("write json lines");
         let output = String::from_utf8(out).expect("json lines is utf8");
 
         assert_eq!(output.lines().count(), 1);
