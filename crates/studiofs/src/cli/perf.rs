@@ -369,8 +369,8 @@ fn write_table_sample(
     if !*printed_header {
         writeln!(
             out,
-            "{:<13} {:<13} {:<28} {:>14} {:>14} {:<10}",
-            "time_ms", "section", "metric", "rate/s", "value", "unit"
+            "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
+            "time_ms", "section", "kind", "metric", "rate/s", "current", "unit"
         )?;
         *printed_header = true;
     }
@@ -383,10 +383,11 @@ fn write_table_sample(
         for (name, metric) in &section.counters {
             writeln!(
                 out,
-                "{:<13} {:<13} {:<28} {:>14.2} {:>14} {:<10}",
+                "{:<13} {:<13} {:<9} {:<28} {:>14.2} {:>14} {:<10}",
                 sample.generated_unix_ms,
-                section_name,
-                name,
+                display_section_name(section_name),
+                "counter",
+                display_metric_name(name),
                 metric.rate_per_sec,
                 metric.total,
                 metric.unit
@@ -395,8 +396,14 @@ fn write_table_sample(
         for (name, metric) in &section.gauges {
             writeln!(
                 out,
-                "{:<13} {:<13} {:<28} {:>14} {:>14} {:<10}",
-                sample.generated_unix_ms, section_name, name, "-", metric.value, metric.unit
+                "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
+                sample.generated_unix_ms,
+                display_section_name(section_name),
+                "gauge",
+                display_metric_name(name),
+                "-",
+                metric.value,
+                metric.unit
             )?;
         }
         for (name, latency) in &section.latencies {
@@ -406,10 +413,11 @@ fn write_table_sample(
                 .unwrap_or_else(|| "-".to_string());
             writeln!(
                 out,
-                "{:<13} {:<13} {:<28} {:>14} {:>14} {:<10}",
+                "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
                 sample.generated_unix_ms,
-                section_name,
-                name,
+                display_section_name(section_name),
+                "latency",
+                display_metric_name(name),
                 avg,
                 latency.count_delta,
                 latency.unit
@@ -417,6 +425,24 @@ fn write_table_sample(
         }
     }
     Ok(())
+}
+
+fn display_section_name(section_name: &str) -> &'static str {
+    match section_name {
+        "system" => "runtime",
+        "bridge" => "bridge",
+        "vfs_read" => "VFS read",
+        "vfs_write" => "VFS write",
+        "cache" => "cache",
+        "upload_queue" => "upload",
+        "object_io" => "object",
+        "metadata" => "metadata",
+        _ => "unknown",
+    }
+}
+
+fn display_metric_name(name: &str) -> String {
+    name.replace('_', " ")
 }
 
 fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<()> {
@@ -640,6 +666,40 @@ mod tests {
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("warning: missing stats for section 'metadata'"));
+    }
+
+    #[test]
+    fn table_output_uses_readable_section_metric_and_kind_labels() {
+        let options = PerfOptions {
+            mountpoint: PathBuf::from("Z:"),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["vfs_read", "upload_queue"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::Table,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 1),
+            &snapshot_at(2_000, 600, 3),
+            &options,
+        );
+        let mut out = Vec::new();
+        let mut printed_header = false;
+
+        write_sample(&mut out, &sample, &options, &mut printed_header).expect("write table");
+        let output = String::from_utf8(out).expect("table is utf8");
+
+        assert!(output.contains("time_ms"));
+        assert!(output.contains("section"));
+        assert!(output.contains("kind"));
+        assert!(output.contains("VFS read"));
+        assert!(output.contains("counter"));
+        assert!(output.contains("requested bytes"));
+        assert!(output.contains("500.00"));
+        assert!(output.contains("upload"));
+        assert!(output.contains("gauge"));
+        assert!(output.contains("pending depth"));
     }
 
     #[test]
