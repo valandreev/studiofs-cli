@@ -394,6 +394,9 @@ impl RuntimeStatsSection {
             )?;
         }
         for (name, metric) in &self.gauges {
+            if is_root_runtime_stats_gauge(section_name, name) {
+                continue;
+            }
             writeln!(
                 out,
                 "gauge {section_name}.{name} {} {}",
@@ -421,6 +424,10 @@ impl RuntimeStatsSection {
         }
         Ok(())
     }
+}
+
+fn is_root_runtime_stats_gauge(section_name: &str, name: &str) -> bool {
+    section_name == "system" && matches!(name, "schema_version" | "generated_unix_ms")
 }
 
 fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
@@ -1975,6 +1982,28 @@ mod tests {
         assert!(snapshot.system.counters.is_empty());
         assert!(snapshot.bridge.gauges.is_empty());
         assert!(snapshot.metadata.latencies.is_empty());
+    }
+
+    #[test]
+    fn runtime_stats_text_omits_duplicate_root_system_gauges() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "gauges": {
+                    "schema_version": { "value": 1, "unit": "count" },
+                    "generated_unix_ms": { "value": 1, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with duplicate system gauges");
+
+        let text = snapshot.to_text();
+
+        assert_eq!(text.matches("gauge system.schema_version").count(), 1);
+        assert_eq!(text.matches("gauge system.generated_unix_ms").count(), 1);
+        assert!(text.contains("gauge system.uptime_ms ms 12\n"));
     }
 
     #[test]
