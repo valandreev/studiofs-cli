@@ -1,4 +1,5 @@
 use super::*;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone)]
 pub(crate) struct LiveMountRuntimeFingerprint {
@@ -13,6 +14,36 @@ pub(crate) struct LiveMountDiagnosticsSource {
     identity: DiagnosticsSessionInfo,
     base_fingerprint: EnvironmentFingerprint,
     vfs: Arc<StudioVfs>,
+    process_sampler: Mutex<ProcessMetricsSampler>,
+}
+
+struct ProcessMetricsSampler {
+    pid: Pid,
+    system: System,
+}
+
+impl ProcessMetricsSampler {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid: Pid::from_u32(pid),
+            system: System::new(),
+        }
+    }
+
+    fn sample(&mut self) -> DiagnosticsProcessSnapshot {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+        self.system
+            .process(self.pid)
+            .map(|process| DiagnosticsProcessSnapshot {
+                cpu_percent: process.cpu_usage() as f64,
+                rss_bytes: process.memory(),
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl LiveMountDiagnosticsSource {
@@ -48,6 +79,7 @@ impl LiveMountDiagnosticsSource {
             identity,
             base_fingerprint,
             vfs,
+            process_sampler: Mutex::new(ProcessMetricsSampler::new(pid)),
         }
     }
 }
@@ -74,6 +106,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         DiagnosticsRuntimeSnapshot {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
+            process: self.process_sampler.lock().sample(),
             ingress: health.ingress,
             write_path: health.write_path,
             upload: health.upload,

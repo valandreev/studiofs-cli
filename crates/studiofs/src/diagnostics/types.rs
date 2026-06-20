@@ -73,9 +73,17 @@ pub(crate) struct DiagnosticsSynchronizationSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DiagnosticsProcessSnapshot {
+    pub cpu_percent: f64,
+    pub rss_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub schema_version: u32,
     pub generated_unix_ms: u64,
+    #[serde(default)]
+    pub process: DiagnosticsProcessSnapshot,
     pub ingress: VfsIngressStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
     pub upload: VfsUploadStats,
@@ -91,6 +99,7 @@ impl DiagnosticsRuntimeSnapshot {
         Self {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
+            process: DiagnosticsProcessSnapshot::default(),
             ingress: health.ingress,
             write_path: health.write_path,
             cache: DiagnosticsCacheSnapshot::default(),

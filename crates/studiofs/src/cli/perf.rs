@@ -389,6 +389,18 @@ fn runtime_stats_from_diagnostics(
 
     insert_gauge(
         &mut snapshot.system,
+        "cpu_percent_x10",
+        "percent_x10",
+        (diagnostics.process.cpu_percent * 10.0).round() as u64,
+    );
+    insert_gauge(
+        &mut snapshot.system,
+        "rss_bytes",
+        "bytes",
+        diagnostics.process.rss_bytes,
+    );
+    insert_gauge(
+        &mut snapshot.system,
         "uptime_ms",
         "ms",
         (write_path.uptime_secs * 1000.0) as u64,
@@ -782,17 +794,6 @@ fn write_table_sample(
     sample: &PerfSample,
     state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
-    if state
-        .samples_printed
-        .is_multiple_of(TABLE_HEADER_REPEAT_SAMPLES)
-    {
-        writeln!(
-            out,
-            "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
-            "time_ms", "section", "kind", "metric", "rate/s", "current", "unit"
-        )?;
-    }
-
     for warning in &sample.warnings {
         if !state.printed_warnings.contains(warning) {
             state.printed_warnings.insert(warning.clone());
@@ -800,75 +801,128 @@ fn write_table_sample(
         }
     }
 
-    for (section_name, section) in &sample.sections {
-        for (name, metric) in &section.counters {
-            writeln!(
-                out,
-                "{:<13} {:<13} {:<9} {:<28} {:>14.2} {:>14} {:<10}",
-                sample.generated_unix_ms,
-                display_section_name(section_name),
-                "counter",
-                display_metric_name(name),
-                metric.rate_per_sec,
-                metric.total,
-                metric.unit
-            )?;
-        }
-        for (name, metric) in &section.gauges {
-            writeln!(
-                out,
-                "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
-                sample.generated_unix_ms,
-                display_section_name(section_name),
-                "gauge",
-                display_metric_name(name),
-                "-",
-                metric.value,
-                metric.unit
-            )?;
-        }
-        for (name, latency) in &section.latencies {
-            let latency_rate = rate(latency.count_delta, sample.interval_ms as f64 / 1000.0);
-            let avg = latency
-                .avg
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| "-".to_string());
-            writeln!(
-                out,
-                "{:<13} {:<13} {:<9} {:<28} {:>14.2} {:>14} {:<10}",
-                sample.generated_unix_ms,
-                display_section_name(section_name),
-                "latency",
-                display_metric_name(name),
-                latency_rate,
-                avg,
-                latency.unit
-            )?;
-        }
+    if state
+        .samples_printed
+        .is_multiple_of(TABLE_HEADER_REPEAT_SAMPLES)
+    {
+        writeln!(
+            out,
+            "------usage------ ---------fuse--------- -----meta---- --blockcache-- ---object---"
+        )?;
+        writeln!(
+            out,
+            " cpu    mem   buf |  ops    lat   read  write|  ops    lat |  read  write|  get   put"
+        )?;
     }
+
+    let row = dstat_row(sample);
+    writeln!(
+        out,
+        "{:>5} {:>6} {:>5} |{:>5} {:>6} {:>6} {:>6}|{:>5} {:>6} |{:>6} {:>6}|{:>5} {:>5}",
+        row.cpu,
+        row.mem,
+        row.buf,
+        row.fuse_ops,
+        row.fuse_lat,
+        row.fuse_read,
+        row.fuse_write,
+        row.meta_ops,
+        row.meta_lat,
+        row.cache_read,
+        row.cache_write,
+        row.object_get,
+        row.object_put
+    )?;
     state.samples_printed = state.samples_printed.saturating_add(1);
     Ok(())
 }
 
-fn display_section_name(section_name: &str) -> &'static str {
-    match section_name {
-        "system" => "runtime",
-        "bridge" => "bridge",
-        "vfs_read" => "VFS read",
-        "vfs_write" => "VFS write",
-        "cache" => "cache",
-        "upload_queue" => "upload",
-        "object_io" => "object",
-        "metadata" => "metadata",
-        _ => "unknown",
+struct DstatRow {
+    cpu: String,
+    mem: String,
+    buf: String,
+    fuse_ops: String,
+    fuse_lat: String,
+    fuse_read: String,
+    fuse_write: String,
+    meta_ops: String,
+    meta_lat: String,
+    cache_read: String,
+    cache_write: String,
+    object_get: String,
+    object_put: String,
+}
+
+fn dstat_row(sample: &PerfSample) -> DstatRow {
+    let bridge = sample.sections.get("bridge");
+    let vfs_read = sample.sections.get("vfs_read");
+    let vfs_write = sample.sections.get("vfs_write");
+    let cache = sample.sections.get("cache");
+    let object = sample.sections.get("object_io");
+    let metadata = sample.sections.get("metadata");
+    let system = sample.sections.get("system");
+
+    DstatRow {
+        cpu: format_cpu(gauge_value(system, "cpu_percent_x10")),
+        mem: format_bytes(gauge_value(system, "rss_bytes")),
+        buf: format_bytes(gauge_value(cache, "dirty_bytes")),
+        fuse_ops: format_rate(
+            counter_rate(bridge, "read_callbacks")
+                + counter_rate(bridge, "write_callbacks")
+                + counter_rate(bridge, "flush_callbacks")
+                + counter_rate(bridge, "cleanup_callbacks")
+                + counter_rate(bridge, "close_callbacks"),
+        ),
+        fuse_lat: "0".to_string(),
+        fuse_read: format_bytes_rate(counter_rate(vfs_read, "requested_bytes")),
+        fuse_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
+        meta_ops: format_rate(counter_rate(metadata, "commit_calls")),
+        meta_lat: "0".to_string(),
+        cache_read: "0".to_string(),
+        cache_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
+        object_get: "0".to_string(),
+        object_put: format_bytes_rate(counter_rate(object, "put_bytes")),
     }
 }
 
-fn display_metric_name(name: &str) -> Cow<'_, str> {
-    if name.contains('_') {
-        Cow::Owned(name.replace('_', " "))
+fn counter_rate(section: Option<&PerfSectionSample>, name: &str) -> f64 {
+    section
+        .and_then(|section| section.counters.get(name))
+        .map_or(0.0, |metric| metric.rate_per_sec)
+}
+
+fn gauge_value(section: Option<&PerfSectionSample>, name: &str) -> u64 {
+    section
+        .and_then(|section| section.gauges.get(name))
+        .map_or(0, |metric| metric.value)
+}
+
+fn format_rate(value: f64) -> String {
+    if value < 10.0 {
+        format!("{value:.1}")
     } else {
-        Cow::Borrowed(name)
+        format!("{value:.0}")
+    }
+}
+
+fn format_bytes_rate(value: f64) -> String {
+    format_bytes(value.max(0.0) as u64)
+}
+
+fn format_cpu(value_x10: u64) -> String {
+    format!("{:.1}%", value_x10 as f64 / 10.0)
+}
+
+fn format_bytes(value: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+
+    match value {
+        0..KIB => value.to_string(),
+        KIB..MIB => format!("{}K", value / KIB),
+        MIB..GIB => format!("{}M", value / MIB),
+        _ => format!("{}G", value / GIB),
     }
 }
 
@@ -1026,6 +1080,50 @@ mod tests {
         snapshot
     }
 
+    fn dstat_snapshot_at(generated_unix_ms: u64, multiplier: u64) -> RuntimeStatsSnapshot {
+        let mut snapshot = RuntimeStatsSnapshot {
+            generated_unix_ms,
+            ..RuntimeStatsSnapshot::default()
+        };
+        snapshot.system.gauges.insert(
+            "cpu_percent_x10".to_string(),
+            scalar(12 * multiplier, "percent_x10"),
+        );
+        snapshot
+            .system
+            .gauges
+            .insert("rss_bytes".to_string(), scalar(50 * 1024 * 1024, "bytes"));
+        snapshot
+            .cache
+            .gauges
+            .insert("dirty_bytes".to_string(), scalar(4096 * 1024, "bytes"));
+        snapshot.bridge.counters.insert(
+            "read_callbacks".to_string(),
+            scalar(10 * multiplier, "count"),
+        );
+        snapshot.bridge.counters.insert(
+            "write_callbacks".to_string(),
+            scalar(20 * multiplier, "count"),
+        );
+        snapshot.vfs_read.counters.insert(
+            "requested_bytes".to_string(),
+            scalar(55 * 1024 * 1024 * multiplier, "bytes"),
+        );
+        snapshot.vfs_write.counters.insert(
+            "accepted_bytes".to_string(),
+            scalar(9 * 1024 * 1024 * multiplier, "bytes"),
+        );
+        snapshot
+            .metadata
+            .counters
+            .insert("commit_calls".to_string(), scalar(15 * multiplier, "count"));
+        snapshot.object_io.counters.insert(
+            "put_bytes".to_string(),
+            scalar(7 * 1024 * 1024 * multiplier, "bytes"),
+        );
+        snapshot
+    }
+
     #[cfg(windows)]
     #[test]
     fn mount_points_match_treats_drive_root_forms_as_equivalent() {
@@ -1048,6 +1146,8 @@ mod tests {
         diagnostics.write_path.vfs_write_path.calls = 7;
         diagnostics.write_path.vfs_write_path.write_bytes = 8192;
         diagnostics.write_path.metadata_commit.calls = 11;
+        diagnostics.process.cpu_percent = 12.3;
+        diagnostics.process.rss_bytes = 51 * 1024 * 1024;
         diagnostics.ingress.dirty_mem_bytes = 13;
         diagnostics.ingress.write_backpressure_events = 17;
         diagnostics.cache.state.transit_memory.used_bytes = 19;
@@ -1062,6 +1162,8 @@ mod tests {
         let snapshot = runtime_stats_from_diagnostics(diagnostics);
 
         assert_eq!(snapshot.generated_unix_ms, 42);
+        assert_eq!(snapshot.system.gauges["cpu_percent_x10"].value, 123);
+        assert_eq!(snapshot.system.gauges["rss_bytes"].value, 51 * 1024 * 1024);
         assert_eq!(snapshot.system.gauges["uptime_ms"].value, 3500);
         assert_eq!(snapshot.bridge.counters["read_callbacks"].value, 2);
         assert_eq!(snapshot.bridge.counters["write_callbacks"].value, 3);
@@ -1423,23 +1525,23 @@ mod tests {
         }
         let output = String::from_utf8(out).expect("table is utf8");
 
-        assert_eq!(output.matches("time_ms").count(), 2);
+        assert_eq!(output.matches("------usage------").count(), 2);
     }
 
     #[test]
-    fn table_output_uses_readable_section_metric_and_kind_labels() {
+    fn table_output_uses_juicefs_stats_style_sections() {
         let options = PerfOptions {
             mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
-            sections: vec!["vfs_read", "upload_queue"],
+            sections: RUNTIME_STATS_SECTIONS.to_vec(),
             verbosity: PerfVerbosity::Normal,
             output: PerfOutput::Table,
         };
         let sample = build_sample(
-            &snapshot_at(1_000, 100, 1),
-            &snapshot_at(2_000, 600, 3),
+            &dstat_snapshot_at(1_000, 1),
+            &dstat_snapshot_at(2_000, 2),
             &options,
         );
         let mut out = Vec::new();
@@ -1448,32 +1550,36 @@ mod tests {
         write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
-        assert!(output.contains("time_ms"));
-        assert!(output.contains("section"));
-        assert!(output.contains("kind"));
-        assert!(output.contains("VFS read"));
-        assert!(output.contains("counter"));
-        assert!(output.contains("requested bytes"));
-        assert!(output.contains("500.00"));
-        assert!(output.contains("upload"));
-        assert!(output.contains("gauge"));
-        assert!(output.contains("pending depth"));
+        assert!(output.contains("------usage------"));
+        assert!(output.contains("---------fuse---------"));
+        assert!(output.contains("-----meta----"));
+        assert!(output.contains("--blockcache--"));
+        assert!(output.contains("---object---"));
+        assert!(output.contains(" cpu    mem   buf |"));
+        assert!(output.contains("2.4%"));
+        assert!(output.contains("50M"));
+        assert!(output.contains("4M"));
+        assert!(output.contains("30"));
+        assert!(output.contains("55M"));
+        assert!(output.contains("9M"));
+        assert!(output.contains("15"));
+        assert!(output.contains("7M"));
     }
 
     #[test]
-    fn table_output_labels_latency_rate_and_average_columns() {
+    fn table_output_formats_zeroes_for_unavailable_dstat_columns() {
         let options = PerfOptions {
             mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
-            sections: vec!["object_io"],
-            verbosity: PerfVerbosity::Verbose,
+            sections: RUNTIME_STATS_SECTIONS.to_vec(),
+            verbosity: PerfVerbosity::Normal,
             output: PerfOutput::Table,
         };
         let sample = build_sample(
-            &snapshot_at(1_000, 100, 0),
-            &snapshot_at(2_000, 300, 0),
+            &RuntimeStatsSnapshot::default(),
+            &RuntimeStatsSnapshot::default(),
             &options,
         );
         let mut out = Vec::new();
@@ -1482,19 +1588,8 @@ mod tests {
         write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
-        assert!(output.contains("latency"));
-        assert!(output.contains("2.00"));
-        assert!(output.contains("1000.00"));
-        assert!(output.contains("ns"));
-    }
-
-    #[test]
-    fn display_metric_name_borrows_when_no_rewrite_is_needed() {
-        assert!(matches!(
-            display_metric_name("requests"),
-            Cow::Borrowed("requests")
-        ));
-        assert_eq!(display_metric_name("requested_bytes"), "requested bytes");
+        assert!(output.contains("0.0%"));
+        assert!(output.lines().any(|line| line.starts_with(" 0.0%")));
     }
 
     #[test]
