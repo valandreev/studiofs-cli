@@ -223,7 +223,7 @@ fn runtime_stats_reserved_name_rejects_namespace_mutations() {
     let source = vfs
         .create(ROOT_INO, b"runtime-stats-source", 0, 0, 0o644)
         .expect("create source file");
-    assert_attr_access_denied(vfs.link(source.ino, ROOT_INO, RUNTIME_STATS_FILE_NAME));
+    assert_entry_exists(vfs.link(source.ino, ROOT_INO, RUNTIME_STATS_FILE_NAME));
     assert_attr_access_denied(vfs.link(RUNTIME_STATS_FILE_INO, ROOT_INO, b"runtime-stats-link"));
     assert_access_denied(vfs.unlink(ROOT_INO, RUNTIME_STATS_FILE_NAME));
     assert_access_denied(vfs.rmdir(ROOT_INO, RUNTIME_STATS_FILE_NAME));

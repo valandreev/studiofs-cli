@@ -1368,7 +1368,8 @@ impl FileSystemContext for StudioFsContext {
         Self::write_open_file_info(file_info, &attr);
         let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
-        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
+            || self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
@@ -1437,12 +1438,15 @@ impl FileSystemContext for StudioFsContext {
             let open_flags = open_flags_from_access(granted_access, create_options);
             let attr = self.vfs.runtime_stats_file_attr();
             Self::write_open_file_info(file_info, &attr);
-            return self.open_file_handle_for_attr(
+            let mut handle = self.open_file_handle_for_attr(
                 &attr,
                 open_flags,
                 false,
                 write_local_sync_policy_from_create_options(create_options),
-            );
+            )?;
+            handle.set_disable_os_cache(true);
+            set_current_winfsp_open_disable_cache(true);
+            return Ok(handle);
         }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
@@ -2585,6 +2589,47 @@ mod tests {
             async move { vfs.release_fh(handle.fh).await }
         })
         .expect("release handle");
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_create_disables_os_cache() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-create-cache-policy");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            0x0100_0000,
+            FILE_GENERIC_READ_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut file_info,
+        )
+        .expect("runtime stats create/open path");
+
+        assert!(handle.disable_os_cache);
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_open_disables_os_cache() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-cache-policy");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("runtime stats open path");
+
+        assert!(handle.disable_os_cache);
     }
 
     #[test]

@@ -1221,7 +1221,7 @@ impl StudioVfs {
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         validate_name(new_name)?;
-        self.reject_runtime_stats_entry_mutation(new_parent, new_name)?;
+        self.reject_runtime_stats_entry_creation(new_parent, new_name)?;
         if self.should_ignore_regular_file_path(new_parent, new_name) {
             let source_attr = self.getattr(ino)?;
             let ignored = self.create_ignored_entry(
