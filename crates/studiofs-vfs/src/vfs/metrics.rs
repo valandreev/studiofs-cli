@@ -336,14 +336,14 @@ impl RuntimeStatsSnapshot {
         Ok(())
     }
 
-    fn set_histogram_total(
+    fn set_histogram_total<'a>(
         &mut self,
         kind: &str,
-        name: &str,
+        name: &'a str,
         unit: &str,
         value: u64,
         line: usize,
-        explicit_histogram_units: &mut BTreeMap<String, Cow<'static, str>>,
+        explicit_histogram_units: &mut BTreeMap<(&'a str, &'a str), Cow<'static, str>>,
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
         Self::validate_not_root_system_histogram(section, key, line)?;
@@ -351,7 +351,7 @@ impl RuntimeStatsSnapshot {
             return Ok(());
         };
         let unit = parse_runtime_stats_unit(unit);
-        let explicit_unit_key = format!("{section}.{key}");
+        let explicit_unit_key = (section, key);
         if let Some(existing_unit) = explicit_histogram_units.get(&explicit_unit_key) {
             if existing_unit != &unit {
                 return Err(RuntimeStatsParseError::new(line, "histogram unit mismatch"));
