@@ -37,7 +37,8 @@ Counters are reported as totals plus per-second rates computed from two
 runtime stats snapshots. Gauges are point-in-time values. Verbose mode includes
 latency averages computed from histogram `count` and `sum` deltas.
 
-`--json` prints each sample as pretty JSON. `--json-lines` prints compact
+`--json --count N` prints one pretty JSON array containing `N` interval samples.
+Use `--json-lines` for continuous streaming; it prints compact
 newline-delimited JSON, one sample per line. Both machine-readable modes keep
 the stable schema section keys such as `vfs_read` and `upload_queue`.
 

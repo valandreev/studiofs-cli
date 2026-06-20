@@ -82,6 +82,11 @@ impl PerfArgs {
         if self.json && self.json_lines {
             bail!("--json and --json-lines are mutually exclusive");
         }
+        if self.json && !self.schema && self.count.is_none() {
+            bail!(
+                "--json requires --count for finite output; use --json-lines for continuous streaming"
+            );
+        }
 
         Ok(PerfOptions {
             mountpoint: self.mountpoint,
@@ -173,6 +178,10 @@ fn run_perf_with_sampler(
     mut read_next: impl FnMut() -> anyhow::Result<RuntimeStatsSnapshot>,
     mut sleep: impl FnMut(Duration),
 ) -> anyhow::Result<()> {
+    if matches!(options.output, PerfOutput::Json) {
+        return run_json_perf_with_sampler(options, out, read_next, sleep);
+    }
+
     if matches!(options.count, Some(0)) {
         return Ok(());
     }
@@ -196,6 +205,32 @@ fn run_perf_with_sampler(
             *count = count.saturating_sub(1);
         }
     }
+}
+
+fn run_json_perf_with_sampler(
+    options: &PerfOptions,
+    out: &mut impl Write,
+    mut read_next: impl FnMut() -> anyhow::Result<RuntimeStatsSnapshot>,
+    mut sleep: impl FnMut(Duration),
+) -> anyhow::Result<()> {
+    let Some(count) = options.count else {
+        bail!(
+            "--json requires --count for finite output; use --json-lines for continuous streaming"
+        );
+    };
+    if count == 0 {
+        return write_json_samples(out, &[]);
+    }
+
+    let mut previous = read_next()?;
+    let mut samples = Vec::new();
+    for _ in 0..count {
+        sleep(options.interval);
+        let current = read_next()?;
+        samples.push(build_sample(&previous, &current, options));
+        previous = current;
+    }
+    write_json_samples(out, &samples)
 }
 
 fn stats_path(mountpoint: &Path) -> PathBuf {
@@ -362,6 +397,12 @@ fn write_sample(
             Ok(())
         }
     }
+}
+
+fn write_json_samples(out: &mut impl Write, samples: &[PerfSample]) -> anyhow::Result<()> {
+    serde_json::to_writer_pretty(&mut *out, samples)?;
+    writeln!(out)?;
+    Ok(())
 }
 
 fn write_table_sample(
@@ -667,6 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn into_options_rejects_continuous_json_without_count() {
+        let args = PerfArgs {
+            mountpoint: PathBuf::from("Z:"),
+            interval: 1,
+            count: None,
+            schema: false,
+            sections: Vec::new(),
+            verbosity: PerfVerbosity::Normal,
+            json: true,
+            json_lines: false,
+        };
+
+        let error = args
+            .into_options()
+            .expect_err("continuous pretty json should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "--json requires --count for finite output; use --json-lines for continuous streaming"
+        );
+    }
+
+    #[test]
     fn parse_sections_rejects_unknown_section() {
         let error = parse_sections(&["unknown".to_string()]).expect_err("unknown section");
         let message = error.to_string();
@@ -834,31 +898,73 @@ mod tests {
     }
 
     #[test]
-    fn json_output_is_parseable_pretty_sample() {
+    fn json_output_is_parseable_pretty_sample_array() {
         let options = PerfOptions {
             mountpoint: PathBuf::from("Z:"),
-            interval: Duration::from_secs(1),
-            count: Some(1),
+            interval: Duration::from_millis(250),
+            count: Some(2),
             schema: false,
             sections: vec!["vfs_read"],
             verbosity: PerfVerbosity::Normal,
             output: PerfOutput::Json,
         };
-        let sample = build_sample(
-            &snapshot_at(1_000, 100, 0),
-            &snapshot_at(2_000, 300, 0),
-            &options,
-        );
+        let snapshots = [
+            snapshot_at(1_000, 100, 0),
+            snapshot_at(1_250, 200, 0),
+            snapshot_at(1_500, 450, 0),
+        ];
+        let mut next_snapshot = 0;
         let mut out = Vec::new();
-        let mut printed_header = false;
 
-        write_sample(&mut out, &sample, &options, &mut printed_header).expect("write json");
-        let payload: serde_json::Value = serde_json::from_slice(&out).expect("json sample");
+        run_perf_with_sampler(
+            &options,
+            &mut out,
+            || {
+                let snapshot = snapshots[next_snapshot].clone();
+                next_snapshot += 1;
+                Ok(snapshot)
+            },
+            |_| {},
+        )
+        .expect("write json");
+        let payload: serde_json::Value = serde_json::from_slice(&out).expect("json samples");
 
+        let samples = payload.as_array().expect("json sample array");
+        assert_eq!(samples.len(), 2);
         assert_eq!(
-            payload["sections"]["vfs_read"]["counters"]["requested_bytes"]["delta"],
-            200
+            samples[1]["sections"]["vfs_read"]["counters"]["requested_bytes"]["delta"],
+            250
         );
+    }
+
+    #[test]
+    fn json_output_count_zero_is_empty_array_without_reading_stats() {
+        let options = PerfOptions {
+            mountpoint: PathBuf::from("Z:"),
+            interval: Duration::from_millis(250),
+            count: Some(0),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::Json,
+        };
+        let mut reads = 0;
+        let mut out = Vec::new();
+
+        run_perf_with_sampler(
+            &options,
+            &mut out,
+            || {
+                reads += 1;
+                Ok(snapshot_at(1_000, 100, 0))
+            },
+            |_| {},
+        )
+        .expect("write empty json");
+        let payload: serde_json::Value = serde_json::from_slice(&out).expect("json samples");
+
+        assert_eq!(payload, serde_json::json!([]));
+        assert_eq!(reads, 0);
     }
 
     #[test]
