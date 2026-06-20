@@ -792,6 +792,18 @@ pub struct VfsWritePathWinfspCallbackStats {
     /// Number of cleanup+flush handle pairs.
     #[serde(default)]
     pub cleanup_flush_fh: u64,
+    /// Number of WinFSP opens that allowed the Windows file cache.
+    #[serde(default)]
+    pub os_cache_enabled_open: u64,
+    /// Number of WinFSP opens that bypassed the Windows file cache.
+    #[serde(default)]
+    pub os_cache_disabled_open: u64,
+    /// Read callbacks observed on cacheable handles.
+    #[serde(default)]
+    pub os_cache_miss_read_callbacks: u64,
+    /// Bytes read through callbacks on cacheable handles.
+    #[serde(default)]
+    pub os_cache_miss_read_bytes: u64,
 }
 
 /// WinFSP write-path stage metrics.

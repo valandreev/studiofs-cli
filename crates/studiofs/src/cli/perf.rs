@@ -21,6 +21,7 @@ use crate::diagnostics;
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const TABLE_HEADER_REPEAT_SAMPLES: u64 = 30;
+const TABLE_CELL_WIDTH: usize = 8;
 const SECTION_ALIAS_NAMES: &[&str] = &["runtime", "vfs", "upload", "object"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -441,6 +442,30 @@ fn runtime_stats_from_diagnostics(
     );
     insert_counter(
         &mut snapshot.bridge,
+        "os_cache_enabled_open",
+        "count",
+        write_path.winfsp_callbacks.os_cache_enabled_open,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "os_cache_disabled_open",
+        "count",
+        write_path.winfsp_callbacks.os_cache_disabled_open,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "os_cache_miss_read_callbacks",
+        "count",
+        write_path.winfsp_callbacks.os_cache_miss_read_callbacks,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "os_cache_miss_read_bytes",
+        "bytes",
+        write_path.winfsp_callbacks.os_cache_miss_read_bytes,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
         "callback_errors",
         "count",
         write_path
@@ -805,36 +830,83 @@ fn write_table_sample(
         .samples_printed
         .is_multiple_of(TABLE_HEADER_REPEAT_SAMPLES)
     {
-        writeln!(
-            out,
-            "------usage------ ---------fuse--------- -----meta---- --blockcache-- ---object---"
-        )?;
-        writeln!(
-            out,
-            " cpu    mem   buf |  ops    lat   read  write|  ops    lat |  read  write|  get   put"
-        )?;
+        write_table_header(out)?;
     }
 
     let row = dstat_row(sample);
     writeln!(
         out,
-        "{:>5} {:>6} {:>5} |{:>5} {:>6} {:>6} {:>6}|{:>5} {:>6} |{:>6} {:>6}|{:>5} {:>5}",
-        row.cpu,
-        row.mem,
-        row.buf,
-        row.fuse_ops,
-        row.fuse_lat,
-        row.fuse_read,
-        row.fuse_write,
-        row.meta_ops,
-        row.meta_lat,
-        row.cache_read,
-        row.cache_write,
-        row.object_get,
-        row.object_put
+        "{} {} {} | {} {} {} {} | {} {} | {} {} | {} {}",
+        table_cell(&row.cpu),
+        table_cell(&row.mem),
+        table_cell(&row.buf),
+        table_cell(&row.fuse_ops),
+        table_cell(&row.fuse_lat),
+        table_cell(&row.fuse_read),
+        table_cell(&row.fuse_write),
+        table_cell(&row.meta_ops),
+        table_cell(&row.meta_lat),
+        table_cell(&row.cache_read),
+        table_cell(&row.cache_write),
+        table_cell(&row.object_get),
+        table_cell(&row.object_put)
     )?;
     state.samples_printed = state.samples_printed.saturating_add(1);
     Ok(())
+}
+
+fn write_table_header(out: &mut impl Write) -> anyhow::Result<()> {
+    writeln!(
+        out,
+        "{} | {} | {} | {} | {}",
+        table_group("usage", 3),
+        table_group("fuse", 4),
+        table_group("meta", 2),
+        table_group("blockcache", 2),
+        table_group("object", 2),
+    )?;
+    writeln!(
+        out,
+        "{} {} {} | {} {} {} {} | {} {} | {} {} | {} {}",
+        table_label("cpu"),
+        table_label("mem"),
+        table_label("buf"),
+        table_label("ops"),
+        table_label("lat"),
+        table_label("read"),
+        table_label("write"),
+        table_label("ops"),
+        table_label("lat"),
+        table_label("read"),
+        table_label("write"),
+        table_label("get"),
+        table_label("put"),
+    )?;
+    Ok(())
+}
+
+fn table_group(label: &str, columns: usize) -> String {
+    let width = columns * TABLE_CELL_WIDTH + columns.saturating_sub(1);
+    if label.len() >= width {
+        return label[..width].to_string();
+    }
+    let padding = width - label.len();
+    let left = padding / 2;
+    let right = padding - left;
+    format!("{}{}{}", "-".repeat(left), label, "-".repeat(right))
+}
+
+fn table_label(label: &str) -> String {
+    format!("{label:>width$}", width = TABLE_CELL_WIDTH)
+}
+
+fn table_cell(value: &str) -> String {
+    let value = if value.len() > TABLE_CELL_WIDTH {
+        &value[value.len() - TABLE_CELL_WIDTH..]
+    } else {
+        value
+    };
+    format!("{value:>width$}", width = TABLE_CELL_WIDTH)
 }
 
 struct DstatRow {
@@ -878,7 +950,7 @@ fn dstat_row(sample: &PerfSample) -> DstatRow {
         fuse_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
         meta_ops: format_rate(counter_rate(metadata, "commit_calls")),
         meta_lat: "0".to_string(),
-        cache_read: "0".to_string(),
+        cache_read: format_bytes_rate(counter_rate(bridge, "os_cache_miss_read_bytes")),
         cache_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
         object_get: "0".to_string(),
         object_put: format_bytes_rate(counter_rate(object, "put_bytes")),
@@ -898,7 +970,9 @@ fn gauge_value(section: Option<&PerfSectionSample>, name: &str) -> u64 {
 }
 
 fn format_rate(value: f64) -> String {
-    if value < 10.0 {
+    if value == 0.0 {
+        "0".to_string()
+    } else if value < 10.0 {
         format!("{value:.1}")
     } else {
         format!("{value:.0}")
@@ -910,7 +984,11 @@ fn format_bytes_rate(value: f64) -> String {
 }
 
 fn format_cpu(value_x10: u64) -> String {
-    format!("{:.1}%", value_x10 as f64 / 10.0)
+    if value_x10 < 10_000 {
+        format!("{:.1}%", value_x10 as f64 / 10.0)
+    } else {
+        format!("{}%", value_x10 / 10)
+    }
 }
 
 fn format_bytes(value: u64) -> String {
@@ -1121,6 +1199,10 @@ mod tests {
             "put_bytes".to_string(),
             scalar(7 * 1024 * 1024 * multiplier, "bytes"),
         );
+        snapshot.bridge.counters.insert(
+            "os_cache_miss_read_bytes".to_string(),
+            scalar(3 * 1024 * 1024 * multiplier, "bytes"),
+        );
         snapshot
     }
 
@@ -1140,6 +1222,22 @@ mod tests {
         diagnostics.write_path.uptime_secs = 3.5;
         diagnostics.write_path.fuse_callbacks.read.calls = 2;
         diagnostics.write_path.winfsp_callbacks.write = 3;
+        diagnostics
+            .write_path
+            .winfsp_callbacks
+            .os_cache_enabled_open = 5;
+        diagnostics
+            .write_path
+            .winfsp_callbacks
+            .os_cache_disabled_open = 7;
+        diagnostics
+            .write_path
+            .winfsp_callbacks
+            .os_cache_miss_read_callbacks = 11;
+        diagnostics
+            .write_path
+            .winfsp_callbacks
+            .os_cache_miss_read_bytes = 13 * 1024 * 1024;
         diagnostics.write_path.winfsp_write_path.write_bytes = 2048;
         diagnostics.write_path.vfs_read_path.calls = 5;
         diagnostics.write_path.vfs_read_path.requested_bytes = 4096;
@@ -1167,6 +1265,16 @@ mod tests {
         assert_eq!(snapshot.system.gauges["uptime_ms"].value, 3500);
         assert_eq!(snapshot.bridge.counters["read_callbacks"].value, 2);
         assert_eq!(snapshot.bridge.counters["write_callbacks"].value, 3);
+        assert_eq!(snapshot.bridge.counters["os_cache_enabled_open"].value, 5);
+        assert_eq!(snapshot.bridge.counters["os_cache_disabled_open"].value, 7);
+        assert_eq!(
+            snapshot.bridge.counters["os_cache_miss_read_callbacks"].value,
+            11
+        );
+        assert_eq!(
+            snapshot.bridge.counters["os_cache_miss_read_bytes"].value,
+            13 * 1024 * 1024
+        );
         assert_eq!(snapshot.bridge.counters["write_callback_bytes"].value, 2048);
         assert_eq!(snapshot.vfs_read.counters["calls"].value, 5);
         assert_eq!(snapshot.vfs_read.counters["requested_bytes"].value, 4096);
@@ -1555,7 +1663,7 @@ mod tests {
         assert!(output.contains("-----meta----"));
         assert!(output.contains("--blockcache--"));
         assert!(output.contains("---object---"));
-        assert!(output.contains(" cpu    mem   buf |"));
+        assert!(output.contains("     cpu      mem      buf |"));
         assert!(output.contains("2.4%"));
         assert!(output.contains("50M"));
         assert!(output.contains("4M"));
@@ -1563,6 +1671,7 @@ mod tests {
         assert!(output.contains("55M"));
         assert!(output.contains("9M"));
         assert!(output.contains("15"));
+        assert!(output.contains("3M"));
         assert!(output.contains("7M"));
     }
 
@@ -1589,7 +1698,15 @@ mod tests {
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("0.0%"));
-        assert!(output.lines().any(|line| line.starts_with(" 0.0%")));
+        assert!(output.lines().any(|line| line.starts_with("    0.0%")));
+    }
+
+    #[test]
+    fn table_cell_truncates_overflow_without_changing_width() {
+        let cell = table_cell("1234567890%");
+
+        assert_eq!(cell, "4567890%");
+        assert_eq!(cell.len(), TABLE_CELL_WIDTH);
     }
 
     #[test]

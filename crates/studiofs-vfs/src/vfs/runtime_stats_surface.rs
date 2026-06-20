@@ -121,6 +121,30 @@ impl StudioVfs {
         );
         insert_counter(
             &mut snapshot.bridge,
+            "os_cache_enabled_open",
+            "count",
+            write_path.winfsp_callbacks.os_cache_enabled_open,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_disabled_open",
+            "count",
+            write_path.winfsp_callbacks.os_cache_disabled_open,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_miss_read_callbacks",
+            "count",
+            write_path.winfsp_callbacks.os_cache_miss_read_callbacks,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "os_cache_miss_read_bytes",
+            "bytes",
+            write_path.winfsp_callbacks.os_cache_miss_read_bytes,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
             "callback_errors",
             "count",
             write_path

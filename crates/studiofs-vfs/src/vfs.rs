@@ -2202,6 +2202,10 @@ struct MetricsState {
     winfsp_flush_callbacks: AtomicU64,
     winfsp_close_callbacks: AtomicU64,
     winfsp_cleanup_flush_fh_callbacks: AtomicU64,
+    winfsp_os_cache_enabled_open: AtomicU64,
+    winfsp_os_cache_disabled_open: AtomicU64,
+    winfsp_os_cache_miss_read_callbacks: AtomicU64,
+    winfsp_os_cache_miss_read_bytes: AtomicU64,
     winfsp_cleanup_barrier_calls: AtomicU64,
     winfsp_flush_barrier_calls: AtomicU64,
     winfsp_close_barrier_calls: AtomicU64,
@@ -2337,6 +2341,10 @@ impl MetricsState {
             winfsp_flush_callbacks: AtomicU64::new(0),
             winfsp_close_callbacks: AtomicU64::new(0),
             winfsp_cleanup_flush_fh_callbacks: AtomicU64::new(0),
+            winfsp_os_cache_enabled_open: AtomicU64::new(0),
+            winfsp_os_cache_disabled_open: AtomicU64::new(0),
+            winfsp_os_cache_miss_read_callbacks: AtomicU64::new(0),
+            winfsp_os_cache_miss_read_bytes: AtomicU64::new(0),
             winfsp_cleanup_barrier_calls: AtomicU64::new(0),
             winfsp_flush_barrier_calls: AtomicU64::new(0),
             winfsp_close_barrier_calls: AtomicU64::new(0),
@@ -2462,6 +2470,10 @@ impl MetricsState {
             winfsp_flush_callbacks,
             winfsp_close_callbacks,
             winfsp_cleanup_flush_fh_callbacks,
+            winfsp_os_cache_enabled_open,
+            winfsp_os_cache_disabled_open,
+            winfsp_os_cache_miss_read_callbacks,
+            winfsp_os_cache_miss_read_bytes,
             winfsp_cleanup_barrier_calls,
             winfsp_flush_barrier_calls,
             winfsp_close_barrier_calls,
@@ -7130,6 +7142,28 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record whether a WinFSP open returned with Windows file cache enabled.
+    pub fn note_winfsp_os_cache_open(&self, disable_os_cache: bool) {
+        let counter = if disable_os_cache {
+            &self.state.metrics.winfsp_os_cache_disabled_open
+        } else {
+            &self.state.metrics.winfsp_os_cache_enabled_open
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a read callback on a handle that allowed Windows file cache.
+    pub fn note_winfsp_os_cache_miss_read(&self, bytes: u32) {
+        self.state
+            .metrics
+            .winfsp_os_cache_miss_read_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .winfsp_os_cache_miss_read_bytes
+            .fetch_add(u64::from(bytes), Ordering::Relaxed);
+    }
+
     fn note_winfsp_barrier_outcome(&self, barrier_type: WinfspBarrierType, flushed: bool) {
         let metrics = &self.state.metrics;
         let (calls, skipped_clean) = match barrier_type {
@@ -7610,6 +7644,26 @@ impl StudioVfs {
                     .state
                     .metrics
                     .winfsp_cleanup_flush_fh_callbacks
+                    .load(Ordering::Relaxed),
+                os_cache_enabled_open: self
+                    .state
+                    .metrics
+                    .winfsp_os_cache_enabled_open
+                    .load(Ordering::Relaxed),
+                os_cache_disabled_open: self
+                    .state
+                    .metrics
+                    .winfsp_os_cache_disabled_open
+                    .load(Ordering::Relaxed),
+                os_cache_miss_read_callbacks: self
+                    .state
+                    .metrics
+                    .winfsp_os_cache_miss_read_callbacks
+                    .load(Ordering::Relaxed),
+                os_cache_miss_read_bytes: self
+                    .state
+                    .metrics
+                    .winfsp_os_cache_miss_read_bytes
                     .load(Ordering::Relaxed),
             },
             winfsp_write_path: VfsWritePathWinfspWritePathStats {

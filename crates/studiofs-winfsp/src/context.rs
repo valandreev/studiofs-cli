@@ -1311,6 +1311,7 @@ impl FileSystemContext for StudioFsContext {
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
             || self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
+        self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1385,6 +1386,7 @@ impl FileSystemContext for StudioFsContext {
                 write_local_sync_policy_from_create_options(create_options),
             )?;
             handle.set_disable_os_cache(true);
+            self.vfs.note_winfsp_os_cache_open(true);
             set_current_winfsp_open_disable_cache(true);
             return Ok(handle);
         }
@@ -1401,6 +1403,7 @@ impl FileSystemContext for StudioFsContext {
         let mut handle = self.execute_create_callback_plan(plan, file_info)?;
         let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
+        self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1481,6 +1484,9 @@ impl FileSystemContext for StudioFsContext {
         match result {
             Ok(n) => {
                 context.record_read_callback(n);
+                if !context.disable_os_cache {
+                    self.vfs.note_winfsp_os_cache_miss_read(n);
+                }
                 trace!(
                     ino,
                     fh,
@@ -2276,6 +2282,29 @@ mod tests {
         handle.record_read_callback(256);
 
         assert_eq!(handle.read_callback_snapshot(), (2, 384));
+    }
+
+    #[test]
+    fn winfsp_os_cache_observability_tracks_cacheable_open_and_read_miss() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("winfsp-os-cache-observability");
+        let attr = vfs
+            .create(ROOT_INO, b"cacheable-read.txt", 0, 0, 0o644)
+            .expect("create file");
+        let mut handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
+
+        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle);
+        handle.set_disable_os_cache(disable_os_cache);
+        vfs.note_winfsp_os_cache_open(disable_os_cache);
+        handle.record_read_callback(4096);
+        if !handle.disable_os_cache {
+            vfs.note_winfsp_os_cache_miss_read(4096);
+        }
+
+        let callbacks = vfs.write_path_observability_snapshot().winfsp_callbacks;
+        assert_eq!(callbacks.os_cache_enabled_open, 1);
+        assert_eq!(callbacks.os_cache_disabled_open, 0);
+        assert_eq!(callbacks.os_cache_miss_read_callbacks, 1);
+        assert_eq!(callbacks.os_cache_miss_read_bytes, 4096);
     }
 
     #[test]

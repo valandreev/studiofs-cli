@@ -339,6 +339,7 @@ mod tests {
                 cleanup_flush_fh: 0,
                 flush: 5,
                 close: 7,
+                ..Default::default()
             },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
                 cleanup: 0,
