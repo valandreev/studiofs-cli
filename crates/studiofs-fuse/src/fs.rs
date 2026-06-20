@@ -647,7 +647,7 @@ pub struct StudioFuseFs {
     async_write_diagnostics_stop: Arc<AtomicBool>,
     async_write_diagnostics_task: Option<JoinHandle<()>>,
     next_runtime_stats_fh: u64,
-    runtime_stats_handles: Mutex<HashMap<u64, Vec<u8>>>,
+    runtime_stats_handles: HashMap<u64, Vec<u8>>,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -743,7 +743,7 @@ impl StudioFuseFs {
             async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
             async_write_diagnostics_task: None,
             next_runtime_stats_fh: u64::MAX / 2,
-            runtime_stats_handles: Mutex::new(HashMap::new()),
+            runtime_stats_handles: HashMap::new(),
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
@@ -790,14 +790,12 @@ impl StudioFuseFs {
         "linux"
     }
 
-    fn open_runtime_stats_handle(&mut self) -> Result<u64, i32> {
+    fn open_runtime_stats_handle(&mut self) -> u64 {
         let fh = self.next_runtime_stats_fh;
         self.next_runtime_stats_fh = self.next_runtime_stats_fh.saturating_add(1);
         self.runtime_stats_handles
-            .lock()
-            .map_err(|_| libc::EIO)?
             .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
-        Ok(fh)
+        fh
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -1292,10 +1290,8 @@ impl Filesystem for StudioFuseFs {
                 reply.error(libc::EROFS);
                 return;
             }
-            match self.open_runtime_stats_handle() {
-                Ok(fh) => reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO),
-                Err(errno) => reply.error(errno),
-            }
+            let fh = self.open_runtime_stats_handle();
+            reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
             return;
         }
         match self.vfs.open_file(ino, open_flags, trunc) {
@@ -1344,14 +1340,7 @@ impl Filesystem for StudioFuseFs {
             }
         };
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            let handles = match self.runtime_stats_handles.lock() {
-                Ok(handles) => handles,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-            let Some(bytes) = handles.get(&fh) else {
+            let Some(bytes) = self.runtime_stats_handles.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
@@ -1614,13 +1603,8 @@ impl Filesystem for StudioFuseFs {
         let started = Instant::now();
         debug!(ino, fh, "release started");
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            match self.runtime_stats_handles.lock() {
-                Ok(mut handles) => {
-                    handles.remove(&fh);
-                    reply.ok();
-                }
-                Err(_) => reply.error(libc::EIO),
-            }
+            self.runtime_stats_handles.remove(&fh);
+            reply.ok();
             return;
         }
         if self.async_write_enabled {

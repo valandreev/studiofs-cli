@@ -575,7 +575,22 @@ fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
         b's' as u16,
     ];
     let slice = path.as_slice();
-    slice == RUNTIME_STATS_BACKSLASH_PATH || slice == RUNTIME_STATS_SLASH_PATH
+    utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_BACKSLASH_PATH)
+        || utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_SLASH_PATH)
+}
+
+fn utf16_ascii_eq_ignore_case(actual: &[u16], expected_lower_ascii: &[u16]) -> bool {
+    actual.len() == expected_lower_ascii.len()
+        && actual
+            .iter()
+            .zip(expected_lower_ascii)
+            .all(|(&actual, &expected)| {
+                if actual <= 0x7f && expected <= 0x7f {
+                    (actual as u8).to_ascii_lowercase() as u16 == expected
+                } else {
+                    actual == expected
+                }
+            })
 }
 
 /// Resolve the parent directory inode for a given path.

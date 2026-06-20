@@ -1077,9 +1077,8 @@ impl StudioVfsAdapter {
                 return Err(libc::EROFS);
             }
             let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
-            self.runtime_stats_handles
-                .lock()
-                .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
+            let bytes = self.vfs.runtime_stats_file_text().into_bytes();
+            self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
@@ -1322,6 +1321,7 @@ impl StudioVfsAdapter {
         let size_usize = size as usize;
 
         if self.vfs.is_runtime_stats_file_ino(ino) {
+            let mut out = vec![0u8; size_usize];
             let handles = self.runtime_stats_handles.lock();
             let Some(bytes) = handles.get(&file_handle) else {
                 return Err(libc::EBADF);
@@ -1332,7 +1332,6 @@ impl StudioVfsAdapter {
             if start >= bytes.len() {
                 return Ok(Vec::new());
             }
-            let mut out = vec![0u8; size_usize.min(bytes.len() - start)];
             let n = studiofs_vfs::read_runtime_stats_buffer(bytes, offset, &mut out) as usize;
             out.truncate(n);
             return Ok(out);
@@ -1370,32 +1369,24 @@ impl StudioVfsAdapter {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         if state.vfs.is_runtime_stats_file_ino(request.ino) {
-            let handles = state.runtime_stats_handles.lock();
-            let Some(bytes) = handles.get(&request.file_handle) else {
-                return Err(libc::EBADF);
-            };
-            let Ok(start) = usize::try_from(request.offset) else {
-                return Ok(state
-                    .shared
-                    .read_buffers
-                    .clone()
-                    .acquire_with_capacity(0, 0));
-            };
-            if start >= bytes.len() {
-                return Ok(state
-                    .shared
-                    .read_buffers
-                    .clone()
-                    .acquire_with_capacity(0, 0));
-            }
-            let size = (request.size as usize)
-                .min(request.max_read_len as usize)
-                .min(bytes.len() - start);
+            let size = (request.size as usize).min(request.max_read_len as usize);
             let mut out = state
                 .shared
                 .read_buffers
                 .clone()
                 .acquire_with_capacity(size, size);
+            let handles = state.runtime_stats_handles.lock();
+            let Some(bytes) = handles.get(&request.file_handle) else {
+                return Err(libc::EBADF);
+            };
+            let Ok(start) = usize::try_from(request.offset) else {
+                out.truncate(0);
+                return Ok(out);
+            };
+            if start >= bytes.len() {
+                out.truncate(0);
+                return Ok(out);
+            }
             let n = studiofs_vfs::read_runtime_stats_buffer(bytes, request.offset, &mut out);
             out.truncate(n as usize);
             return Ok(out);

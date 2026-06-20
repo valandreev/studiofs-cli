@@ -28,6 +28,10 @@ impl StudioVfs {
     /// Return synthetic attributes for the runtime stats virtual file.
     pub fn runtime_stats_file_attr(&self) -> InodeAttr {
         let mut attr = InodeAttr::new_file(RUNTIME_STATS_FILE_INO, ROOT_INO, 0, 0, 0o444);
+        attr.atime = self.runtime_stats_file_time_nanos;
+        attr.mtime = self.runtime_stats_file_time_nanos;
+        attr.ctime = self.runtime_stats_file_time_nanos;
+        attr.crtime = self.runtime_stats_file_time_nanos;
         attr.size = RUNTIME_STATS_FILE_REPORTED_SIZE;
         attr.committed_size = attr.size;
         attr.win_attrs = 0x02 | 0x20; // HIDDEN | ARCHIVE

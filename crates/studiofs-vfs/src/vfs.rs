@@ -3123,6 +3123,7 @@ pub struct StudioVfs {
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
+    runtime_stats_file_time_nanos: i64,
     known_file_lock_overrides: Mutex<HashMap<Ino, FileLockLease>>,
     #[cfg(test)]
     metadata_authority_override: Mutex<Option<MetadataAuthorityStatus>>,
