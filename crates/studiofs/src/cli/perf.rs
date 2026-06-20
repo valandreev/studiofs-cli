@@ -190,10 +190,10 @@ fn stats_path(mountpoint: &Path) -> PathBuf {
         use std::path::{Component, Prefix};
 
         let mut components = mountpoint.components();
-        if let (Some(Component::Prefix(prefix)), None) = (components.next(), components.next()) {
-            if matches!(prefix.kind(), Prefix::Disk(_)) {
-                return PathBuf::from(format!("{}\\{RUNTIME_STATS_FILE}", mountpoint.display()));
-            }
+        if let (Some(Component::Prefix(prefix)), None) = (components.next(), components.next())
+            && matches!(prefix.kind(), Prefix::Disk(_))
+        {
+            return PathBuf::from(format!("{}\\{RUNTIME_STATS_FILE}", mountpoint.display()));
         }
     }
 
@@ -407,11 +407,7 @@ fn write_table_sample(
 }
 
 fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<()> {
-    let sections = options
-        .sections
-        .iter()
-        .copied()
-        .collect::<Vec<&'static str>>();
+    let sections = options.sections.to_vec();
     let payload = serde_json::json!({
         "schema_version": studiofs_vfs::RUNTIME_STATS_SCHEMA_VERSION,
         "stats_file": String::from_utf8_lossy(RUNTIME_STATS_FILE_NAME),
