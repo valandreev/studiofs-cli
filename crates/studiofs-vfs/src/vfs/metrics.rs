@@ -287,18 +287,10 @@ impl RuntimeStatsSnapshot {
         };
         match kind {
             "counter" => {
-                if let Some(existing) = target.counters.get_mut(key) {
-                    *existing = metric;
-                } else {
-                    target.counters.insert(key.to_owned(), metric);
-                }
+                target.counters.insert(key.to_owned(), metric);
             }
             "gauge" => {
-                if let Some(existing) = target.gauges.get_mut(key) {
-                    *existing = metric;
-                } else {
-                    target.gauges.insert(key.to_owned(), metric);
-                }
+                target.gauges.insert(key.to_owned(), metric);
             }
             _ => unreachable!("kind is validated by caller"),
         }
@@ -352,6 +344,8 @@ impl RuntimeStatsSnapshot {
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        // Avoid `entry(key.to_owned())` here: histogram buckets repeat the same
+        // key, and the borrowed lookup avoids allocating a discarded `String`.
         if let Some(histogram) = target.latencies.get_mut(key) {
             insert_latency_bucket(
                 &mut histogram.buckets,
@@ -455,7 +449,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let mut raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
-    raw_buckets.sort_by_key(|bucket| bucket.le_ns);
+    raw_buckets.sort_unstable_by_key(|bucket| bucket.le_ns);
 
     let mut buckets: Vec<RuntimeLatencyBucket> = Vec::with_capacity(raw_buckets.len());
     for bucket in raw_buckets {
