@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
-use super::TestCacheParams;
+use super::BenchmarkConfig;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
@@ -1086,7 +1086,7 @@ fn metadata_root_from_cache_path(cache_path: &Path) -> Option<String> {
 }
 
 fn build_mounted_runtime_report(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     mount_point: &Path,
     cache_path: Option<&Path>,
     workload: &WorkloadPlan,
@@ -1408,7 +1408,7 @@ async fn read_file_with_plan(
 }
 
 async fn run_mounted_write_phase(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     files: &[WorkFile],
     order: &[usize],
     size_class_bounds: SizeClassBounds,
@@ -1454,7 +1454,7 @@ async fn run_mounted_write_phase(
 }
 
 async fn run_mounted_read_phase(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     files: &[WorkFile],
     order: &[usize],
     size_class_bounds: SizeClassBounds,
@@ -1831,7 +1831,7 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
 }
 
 pub(crate) async fn run_mounted_end_to_end(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     mount_pid: u32,
     volume: &str,
     mount_point: &Path,
@@ -2262,8 +2262,8 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    fn test_cache_params_with_block_size(block_size: u64) -> TestCacheParams {
-        TestCacheParams {
+    fn test_cache_params_with_block_size(block_size: u64) -> BenchmarkConfig {
+        BenchmarkConfig {
             target: PathBuf::from(r"Z:\"),
             block_size,
             read_size: 128 * 1024,

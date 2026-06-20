@@ -9,7 +9,7 @@ use std::time::Instant;
 use studiofs_cache::{BenchmarkCache, BenchmarkCacheConfig, CacheReadLevel};
 use tokio::sync::Semaphore;
 
-use super::TestCacheParams;
+use super::BenchmarkConfig;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
@@ -377,7 +377,7 @@ async fn run_shim_reads_sequential_streams(
 }
 
 pub(super) async fn run_direct(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     cache_dir: &Path,
 ) -> Result<BenchmarkReport> {
     let cache_config = BenchmarkCacheConfig::new(cache_dir, params.l1_limit);

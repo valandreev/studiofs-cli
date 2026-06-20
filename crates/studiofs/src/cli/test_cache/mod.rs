@@ -5,17 +5,14 @@
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
 mod args;
-mod direct;
 mod mode;
-pub(crate) mod mounted;
-mod profiling;
-mod progress;
-mod reporting;
-pub(crate) mod result;
-mod telemetry;
-mod workload;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
+use crate::cli::benchmark_engine::{
+    BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, DEFAULT_TEST_CACHE_BLOCK_SIZE_STR,
+    MountedBenchmarkTarget, merge_profile_report, parse_size_arg, parse_sizes_arg,
+    render_human_summary, run_direct_shim, run_mounted, save_benchmark_report,
+};
 use crate::cli::test_cache_profile::TestCacheProfileSession;
 use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
 use anyhow::{Context, Result, anyhow};
@@ -26,16 +23,8 @@ use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 pub use args::TestCacheAccessPattern;
 pub(crate) use args::TestCacheArgs;
 
-use crate::cli::benchmark_engine::{MountedBenchmarkEngine, MountedBenchmarkTarget};
 use args::TestCacheRunRequest;
-use direct::run_direct;
 use mode::{ResolvedRunMode, resolve_run_mode};
-use profiling::merge_profile_report;
-use reporting::{render_human_summary, save_benchmark_report};
-use workload::{
-    DEFAULT_SMALL_CLASS_MAX_BYTES, DEFAULT_TEST_CACHE_BLOCK_SIZE_STR, WorkloadSizeInput,
-    parse_size_arg, parse_sizes_arg,
-};
 
 static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
 
@@ -104,28 +93,6 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         json_output: Some(report),
         full_file_reads: true,
     })
-}
-
-#[derive(Debug)]
-pub(crate) struct TestCacheParams {
-    pub(crate) target: PathBuf,
-    pub(crate) block_size: u64,
-    pub(crate) read_size: u64,
-    pub(crate) size_class_small_max: u64,
-    pub(crate) size_class_medium_max: u64,
-    pub(crate) workload_repeat: usize,
-    pub(crate) concurrency: usize,
-    pub(crate) sequential_streams: bool,
-    pub(crate) io_depth: usize,
-    pub(crate) warmup_runs: u32,
-    pub(crate) sizes: WorkloadSizeInput,
-    pub(crate) access_pattern: TestCacheAccessPattern,
-    pub(crate) during_upload_min_pending: usize,
-    pub(crate) during_upload_timeout: std::time::Duration,
-    pub(crate) l1_limit: u64,
-    pub(crate) profile: bool,
-    pub(crate) full_file_reads: bool,
-    pub(crate) run_id: String,
 }
 
 fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -240,8 +207,8 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         profile_enabled = profile.is_some(),
         "test-cache run started"
     );
-    let params = TestCacheParams {
-        target: target.clone(),
+    let config = BenchmarkConfig::new(
+        target.clone(),
         block_size,
         read_size,
         size_class_small_max,
@@ -254,12 +221,12 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         sizes,
         access_pattern,
         during_upload_min_pending,
-        during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
+        std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
-        profile: profile.is_some(),
+        profile.is_some(),
         full_file_reads,
-        run_id: run_id.clone(),
-    };
+        run_id.clone(),
+    );
 
     let resolved_mode = resolve_run_mode(&target)?;
     let benchmark_mode = match &resolved_mode {
@@ -284,7 +251,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     let rt = test_cache_runtime()?;
     let report = rt.block_on(async {
         match &resolved_mode {
-            ResolvedRunMode::DirectShim { cache_dir } => run_direct(&params, cache_dir).await,
+            ResolvedRunMode::DirectShim { cache_dir } => run_direct_shim(&config, cache_dir).await,
             ResolvedRunMode::MountedE2E {
                 pid,
                 volume,
@@ -292,8 +259,8 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                 work_root,
                 cache_path,
             } => {
-                MountedBenchmarkEngine::run(
-                    &params,
+                run_mounted(
+                    &config,
                     MountedBenchmarkTarget {
                         pid: *pid,
                         volume,

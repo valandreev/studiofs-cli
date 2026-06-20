@@ -142,7 +142,7 @@ pub(crate) fn save_benchmark_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache::result::{
+    use crate::cli::benchmark_engine::result::{
         MountedMemoryReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
         MountedPortableProcessReport, MountedPortableProfileReport, MountedWriteDiagnosticsReport,
         MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, sample_report,

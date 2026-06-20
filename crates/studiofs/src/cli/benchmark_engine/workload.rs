@@ -2,15 +2,15 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use studiofs_vfs::parse_size_bytes;
 
-use super::args::TestCacheAccessPattern;
+use crate::cli::test_cache::TestCacheAccessPattern;
 
 pub(super) const WORKLOAD_FILES_PER_TIER: usize = 100;
 pub(super) const DEFAULT_WORKLOAD_FILES: usize = WORKLOAD_FILES_PER_TIER * 3;
 pub(super) const SMALL_FILE_MIN_BYTES: u64 = 1024;
 pub(super) const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 pub(super) const LARGE_FILE_MULTIPLIER: u64 = 8;
-pub(super) const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
-pub(super) const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
+pub(crate) const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
+pub(crate) const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SizeClass {
@@ -111,7 +111,7 @@ impl XorShift64 {
     }
 }
 
-pub(super) fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
+pub(crate) fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(anyhow!("{label} is empty"));
@@ -125,7 +125,7 @@ pub(super) fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
         })
 }
 
-pub(super) fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
+pub(crate) fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
     let Some(raw) = raw else {
         return Ok(WorkloadSizeInput::Default);
     };

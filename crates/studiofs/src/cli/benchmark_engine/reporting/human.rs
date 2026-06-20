@@ -800,7 +800,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache::result::{
+    use crate::cli::benchmark_engine::result::{
         LatencyHistogramReport, MountedLocalFirstReadComparisonReport,
         MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedWritebackTimelineReport,
         MountedWritebackTimelineSampleReport, OpReport, sample_report,

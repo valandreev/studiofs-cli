@@ -88,7 +88,7 @@ pub(super) fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
     }
 }
 
-pub(super) fn merge_profile_report(
+pub(crate) fn merge_profile_report(
     mut report: BenchmarkReport,
     profile_report: Option<TestCacheProfileResult>,
 ) -> BenchmarkReport {
