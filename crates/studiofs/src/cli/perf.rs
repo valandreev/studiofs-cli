@@ -17,6 +17,7 @@ use studiofs_vfs::{
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const RUNTIME_STATS_FILE: &str = ".studiofs-runtime-stats";
+const SECTION_ALIAS_NAMES: &[&str] = &["runtime", "vfs", "upload", "object"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PerfVerbosity {
@@ -492,18 +493,38 @@ fn parse_sections(raw: &[String]) -> anyhow::Result<Vec<&'static str>> {
     let mut seen = BTreeSet::new();
     for section in raw {
         let normalized = section.replace('-', "_");
-        let Some(&known_section) = known.get(normalized.as_str()) else {
-            bail!(
-                "unknown runtime stats section '{}'; expected one of: {}",
-                section,
-                RUNTIME_STATS_SECTIONS.join(", ")
-            );
+        let expanded = match normalized.as_str() {
+            "runtime" => vec!["system"],
+            "vfs" => vec!["vfs_read", "vfs_write"],
+            "upload" => vec!["upload_queue"],
+            "object" => vec!["object_io"],
+            _ => {
+                let Some(&known_section) = known.get(normalized.as_str()) else {
+                    bail!(
+                        "unknown runtime stats section '{}'; expected one of: {}",
+                        section,
+                        section_help()
+                    );
+                };
+                vec![known_section]
+            }
         };
-        if seen.insert(known_section) {
-            sections.push(known_section);
+        for known_section in expanded {
+            if seen.insert(known_section) {
+                sections.push(known_section);
+            }
         }
     }
     Ok(sections)
+}
+
+fn section_help() -> String {
+    RUNTIME_STATS_SECTIONS
+        .iter()
+        .chain(SECTION_ALIAS_NAMES.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -573,6 +594,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_sections_expands_operator_aliases_to_stable_schema_sections() {
+        let sections = parse_sections(&[
+            "runtime".to_string(),
+            "vfs".to_string(),
+            "upload".to_string(),
+            "object".to_string(),
+        ])
+        .expect("parse aliases");
+
+        assert_eq!(
+            sections,
+            vec![
+                "system",
+                "vfs_read",
+                "vfs_write",
+                "upload_queue",
+                "object_io"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sections_defaults_to_all_stable_schema_sections() {
+        let sections = parse_sections(&[]).expect("default sections");
+
+        assert_eq!(sections, RUNTIME_STATS_SECTIONS);
+    }
+
+    #[test]
     fn into_options_rejects_zero_interval() {
         let args = PerfArgs {
             mountpoint: PathBuf::from("Z:"),
@@ -619,13 +669,11 @@ mod tests {
     #[test]
     fn parse_sections_rejects_unknown_section() {
         let error = parse_sections(&["unknown".to_string()]).expect_err("unknown section");
+        let message = error.to_string();
 
-        assert!(
-            error
-                .to_string()
-                .contains("unknown runtime stats section 'unknown'"),
-            "{error:#}"
-        );
+        assert!(message.contains("unknown runtime stats section 'unknown'"));
+        assert!(message.contains("runtime"));
+        assert!(message.contains("vfs"));
     }
 
     #[test]
