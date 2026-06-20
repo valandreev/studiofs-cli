@@ -1,9 +1,11 @@
-use super::file_session::VfsFileSessionStats;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+use super::file_session::VfsFileSessionStats;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Current version of the cross-platform runtime stats snapshot schema.
@@ -22,7 +24,7 @@ pub const RUNTIME_STATS_SECTIONS: &[&str] = &[
 ];
 
 /// Cross-platform runtime statistics snapshot for benchmarks and live performance reporting.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuntimeStatsSnapshot {
     /// Stable schema version. Readers must tolerate missing newer fields.
@@ -74,6 +76,11 @@ impl RuntimeStatsSnapshot {
     }
 
     /// Parse the stable local stats text representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeStatsParseError`] when a non-comment line is malformed
+    /// or references an unknown runtime stats section.
     pub fn parse_text(input: &str) -> Result<Self, RuntimeStatsParseError> {
         input.parse()
     }
@@ -106,8 +113,11 @@ impl FromStr for RuntimeStatsSnapshot {
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut snapshot = Self::default();
         for (line_index, raw_line) in input.lines().enumerate() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let line = raw_line
+                .split_once('#')
+                .map_or(raw_line, |(before_comment, _)| before_comment)
+                .trim();
+            if line.is_empty() {
                 continue;
             }
             let mut parts = line.split_whitespace();
@@ -295,23 +305,27 @@ impl RuntimeStatsSnapshot {
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
-        if !target.latencies.contains_key(key) {
-            target
-                .latencies
-                .insert(key.to_owned(), RuntimeLatencyHistogram::default());
+        let unit = parse_runtime_stats_unit(unit);
+        if let Some(histogram) = target.latencies.get_mut(key) {
+            histogram.unit = unit;
+            match kind {
+                "histogram_count" => histogram.count = value,
+                "histogram_sum" => histogram.sum = value,
+                _ => unreachable!("kind is validated by caller"),
+            }
+            return Ok(());
         }
-        let Some(histogram) = target.latencies.get_mut(key) else {
-            return Err(RuntimeStatsParseError::new(
-                line,
-                "failed to update histogram",
-            ));
+
+        let mut histogram = RuntimeLatencyHistogram {
+            unit,
+            ..RuntimeLatencyHistogram::default()
         };
-        histogram.unit = parse_runtime_stats_unit(unit);
         match kind {
             "histogram_count" => histogram.count = value,
             "histogram_sum" => histogram.sum = value,
             _ => unreachable!("kind is validated by caller"),
         }
+        target.latencies.insert(key.to_owned(), histogram);
         Ok(())
     }
 
@@ -327,14 +341,17 @@ impl RuntimeStatsSnapshot {
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
         if let Some(histogram) = target.latencies.get_mut(key) {
-            histogram
-                .buckets
-                .push(RuntimeLatencyBucket { le_ns, count });
+            insert_latency_bucket(
+                &mut histogram.buckets,
+                RuntimeLatencyBucket { le_ns, count },
+            );
         } else {
+            let mut buckets = Vec::new();
+            insert_latency_bucket(&mut buckets, RuntimeLatencyBucket { le_ns, count });
             target.latencies.insert(
                 key.to_owned(),
                 RuntimeLatencyHistogram {
-                    buckets: vec![RuntimeLatencyBucket { le_ns, count }],
+                    buckets,
                     ..RuntimeLatencyHistogram::default()
                 },
             );
@@ -344,7 +361,7 @@ impl RuntimeStatsSnapshot {
 }
 
 /// One runtime stats section containing monotonic counters, gauges, and latency histograms.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuntimeStatsSection {
     /// Monotonically increasing counters keyed by stable snake_case names.
@@ -402,6 +419,13 @@ fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
         "ms" => Cow::Borrowed("ms"),
         "percent" => Cow::Borrowed("percent"),
         _ => Cow::Owned(unit.to_owned()),
+    }
+}
+
+fn insert_latency_bucket(buckets: &mut Vec<RuntimeLatencyBucket>, bucket: RuntimeLatencyBucket) {
+    match buckets.binary_search_by_key(&bucket.le_ns, |existing| existing.le_ns) {
+        Ok(index) => buckets[index] = bucket,
+        Err(index) => buckets.insert(index, bucket),
     }
 }
 
@@ -1974,6 +1998,55 @@ mod tests {
             histogram_bucket
                 .to_string()
                 .contains("unexpected trailing fields")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_ignores_inline_comments() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            # leading comment\n\
+            counter vfs_read.calls count 4 # reads issued\n\
+            histogram_count object_io.get ns 2 # get samples\n\
+            histogram_bucket object_io.get 500000 1 # p50-ish bucket\n\
+            ",
+        )
+        .expect("parse runtime stats with inline comments");
+
+        assert_eq!(parsed.vfs_read.counters["calls"].value, 4);
+        assert_eq!(parsed.object_io.latencies["get"].count, 2);
+        assert_eq!(
+            parsed.object_io.latencies["get"].buckets,
+            vec![RuntimeLatencyBucket {
+                le_ns: 500_000,
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_sorts_and_deduplicates_histogram_buckets() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 500000 1\n\
+            histogram_bucket object_io.get 100000 2\n\
+            histogram_bucket object_io.get 500000 3\n\
+            ",
+        )
+        .expect("parse runtime stats histogram buckets");
+
+        assert_eq!(
+            parsed.object_io.latencies["get"].buckets,
+            vec![
+                RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                },
+                RuntimeLatencyBucket {
+                    le_ns: 500_000,
+                    count: 3,
+                },
+            ]
         );
     }
 }
