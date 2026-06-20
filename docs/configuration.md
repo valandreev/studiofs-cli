@@ -284,42 +284,11 @@ Notes:
   and skipped for safety.
 - `nlink` mismatches are currently report-only.
 
-### `test-cache`
+### Benchmark Profiling Environment
 
-Runs cache benchmarks without changing regular runtime configuration.
-
-```bash
-studiofs test-cache \
-  <path> \
-  [--block-size <e.g. 16MB>] \
-  [--read-size <e.g. 1MB>] \
-  [--small-max <e.g. 10KB>] \
-  [--medium-max <e.g. 16MB>] \
-  [--sizes <small=60,medium=30,large=10|4KB,128KB,1MB>] \
-  [--concurrency <usize>] \
-  [--sequential-streams] \
-  [--io-depth <usize>] \
-  [--warmup-runs <u32>] \
-  [--access-pattern <sequential|random|mixed>] \
-  [--l1-limit <e.g. 2GB>] \
-  [--profile[=pyroscope]]
-```
-
-Defaults:
-- `--block-size 16MB`
-- `--read-size` defaults to `block-size`
-- `--small-max 10KB`
-- `--medium-max` defaults to `block-size`
-- `--sizes` defaults to existing tiered profile: `100` small, `100` medium, `100` large files
-- `--concurrency 1`
-- `--sequential-streams false`
-- `--io-depth 32`
-- `--warmup-runs 0`
-- `--access-pattern sequential`
-- `--l1-limit 2GB`
-- `--profile` disabled by default
-- `--profile=pyroscope` enables Pyroscope sampling; `--profile` without a
-  value is accepted as shorthand for the same mode
+Benchmark and statistics tooling is being consolidated under the mounted
+filesystem benchmark path. The profiling environment below is retained for the
+benchmark engine and future `studiofs bench` implementation.
 
 Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL`: endpoint base URL for Grafana
@@ -333,49 +302,28 @@ Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_TENANT_ID`: optional Grafana Cloud / multi-tenant header
 
 Notes:
-- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-shim`
-  mode and treats `<path>` as cache directory.
-- If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
-  through the already running mounted process and uses
-  `<path>/.studiofs-test-cache` for temporary workload files.
-- `--warmup-runs` executes write+read cycles before measured phases; warm-up cycles are excluded from reported metrics.
-- Throughput in benchmark reports is phase-scoped: write-side metrics are
-  computed from write-phase wall time, and read-side metrics are computed from
-  read-phase wall time instead of total benchmark runtime.
-- `--sizes` accepts either class percentages (`small=60,medium=30,large=10`) or an explicit list (`4KB,128KB,1MB,16MB`).
-- `--sequential-streams` runs each stream over its own segment in order and emits per-stream read/write metrics in JSON and terminal output.
-- In `--sequential-streams` mode, effective in-flight I/O is bounded by `min(--concurrency, --io-depth)` because each stream executes I/O serially.
-- Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
-- Output includes a human-readable summary and JSON payload suitable for cross-platform run comparison.
-- JSON report includes a stable `run_id` for correlating `test-cache` output with tracing/profile hooks.
-- JSON report includes `advanced_metrics`:
-  - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
-  - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
-  - direct-shim only: `cache_levels` with L1 hits, misses, bytes served, and lookup latency histograms
-- On mounts started by newer StudioFS builds, `e2e` JSON output also includes
-  `local_first_read_comparison` with `baseline-read`,
-  `during-upload-read`, and `post-upload-read` rows plus the pending-upload
-  observations used to gate each phase.
-- When the mounted runtime exposes process and write-path observability, `e2e`
-  JSON output also includes `mounted_memory` with `mount_pid`,
+- Benchmark reports should include a stable `run_id` for correlating output
+  with tracing/profile hooks.
+- Mounted benchmark reports should include `local_first_read_comparison` with
+  `baseline-read`, `during-upload-read`, and `post-upload-read` rows plus the
+  pending-upload observations used to gate each phase.
+- When the mounted runtime exposes process and write-path observability,
+  benchmark JSON output should include `mounted_memory` with `mount_pid`,
   `rss_bytes_steady_state`, `rss_bytes_peak`, `dirty_bytes_steady_state`,
   `dirty_bytes_peak`, `staged_bytes_peak`, and `dirty_limit_bytes`.
   RSS and dirty-pressure fields are best-effort samples and may be omitted when
   StudioFS cannot observe that signal for the measured run.
-- The terminal summary prints the same `Local-First read comparison` table
-  when that mounted upload-state metadata is available.
-- The terminal summary prints a matching `Mounted memory` table when mounted
-  RSS and dirty-pressure samples are available.
-- `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
+- Pyroscope profiling is on-demand. The run still
   completes if profiling backends or the endpoint are missing; the command emits
   warnings and continues.
 - When profiling is enabled, local pprof artifacts are written beside the JSON
   report:
   - `...-cpu.pprof.gz`
   - `...-memory.pprof.gz`
-- `direct-shim` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
-- Current built-in workload volumes are modest (`128MB` direct-shim, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
-- For the focused `SFS-253` benchmark recipes and the surrounding Local-First
+- Benchmark output should include blocking-task pressure counters for cache hot
+  paths (`active`, `active_peak`, `submitted/started/completed`,
+  wait-before-exec and execution timings).
+- For the focused mounted benchmark recipes and the surrounding Local-First
   validation matrix, see
   [docs/local-first-validation-matrix.md](./local-first-validation-matrix.md).
 

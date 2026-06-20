@@ -180,7 +180,6 @@ studiofs mount myvolume Y:
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
 | `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
-| `test-cache` | Run direct L2 and end-to-end cache benchmarks |
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
 | `snapshot` | Create/list immutable metadata snapshots |
@@ -193,36 +192,10 @@ variables accept `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` suffixes (binary
 units, `1KB = 1024B`) and fractional values like `1.5GB` (rounded down to
 bytes).
 
-Quick benchmark example:
-
-```bash
-studiofs test-cache \
-  /tmp/studiofs-cache-bench \
-  --block-size 16MB \
-  --read-size 1MB \
-  --small-max 10KB \
-  --medium-max 16MB \
-  --concurrency 16 \
-  --io-depth 64 \
-  --access-pattern mixed \
-  --l1-limit 2GB \
-  --l2-limit 100GB
-```
-
-`test-cache` prints a readable terminal summary and also saves the full structured
-JSON report in the current working directory using an auto-generated file name
-such as `studiofs-test-cache-direct-l2-20260319-151255.json`. Use
-`--json-output <path>` to override the report location or file name.
-Use `--profile` for on-demand CPU/profile hooks; reports include a `run_id`
-that also tags profile tracing events and cache blocking-task pressure counters.
-The JSON report also contains an `advanced_metrics` section with per-size-class
-latency/throughput (small/medium/large), configurable boundaries, queue
-backpressure percentiles, and (in direct-l2 mode) L1/L2 hit-miss and bytes-served
-breakdown with per-level latency distributions.
-On mounts started by newer StudioFS builds, `test-cache` `e2e` mode also emits
-`buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
-`post-upload-read` phases, and the terminal summary renders the same mounted
-comparison as a `Local-First read comparison` table.
+Benchmark and statistics tooling is being consolidated under the mounted
+filesystem benchmark path. Prefer mounted validation recipes from
+`docs/local-first-validation-matrix.md` until the public `studiofs bench`
+command is available.
 
 ## Development
 

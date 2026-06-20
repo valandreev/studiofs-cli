@@ -134,6 +134,7 @@ enum Commands {
     Dump(dump_load::DumpArgs),
     Load(dump_load::LoadArgs),
     Test(test::TestArgs),
+    #[command(hide = true)]
     TestCache(test_cache::TestCacheArgs),
     Snapshot(snapshot::SnapshotArgs),
     Internal(internal::InternalArgs),
@@ -214,6 +215,30 @@ mod tests {
             }
             other => panic!("expected Test command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_hides_legacy_test_cache_command() {
+        let is_hidden = Cli::command()
+            .get_subcommands()
+            .find(|cmd| cmd.get_name() == "test-cache")
+            .map(clap::Command::is_hide_set)
+            .unwrap_or(false);
+
+        assert!(
+            is_hidden,
+            "legacy test-cache command must stay out of the public help surface"
+        );
+    }
+
+    #[test]
+    fn legacy_test_cache_command_remains_parseable_for_internal_reuse() {
+        let cli = parse_for_test(&["test-cache", "target/studiofs-cache-bench"]).unwrap();
+
+        assert!(
+            matches!(cli.command, Commands::TestCache(_)),
+            "hidden test-cache parser should remain available until bench owns these internals"
+        );
     }
 
     #[test]
