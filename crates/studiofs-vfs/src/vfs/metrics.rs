@@ -80,8 +80,8 @@ impl RuntimeStatsSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeStatsParseError`] when a non-comment line is malformed
-    /// or references an unknown runtime stats section.
+    /// Returns [`RuntimeStatsParseError`] when a non-comment line is malformed.
+    /// Unknown runtime stats sections are skipped for forward compatibility.
     pub fn parse_text(input: &str) -> Result<Self, RuntimeStatsParseError> {
         input.parse()
     }
