@@ -44,6 +44,7 @@ mod overlay;
 mod prefetch;
 mod read_context;
 mod read_path;
+mod runtime_stats_surface;
 mod startup;
 mod startup_replay;
 mod statfs;
@@ -89,6 +90,10 @@ pub use metrics::{
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
+pub use runtime_stats_surface::{
+    RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_REPORTED_SIZE,
+    read_runtime_stats_buffer,
+};
 
 use acl::AclState;
 use buffer_pool::BufferPool;
@@ -3118,6 +3123,7 @@ pub struct StudioVfs {
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
+    runtime_stats_file_time_nanos: i64,
     known_file_lock_overrides: Mutex<HashMap<Ino, FileLockLease>>,
     #[cfg(test)]
     metadata_authority_override: Mutex<Option<MetadataAuthorityStatus>>,

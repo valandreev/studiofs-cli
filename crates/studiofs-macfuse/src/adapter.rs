@@ -81,6 +81,8 @@ pub(crate) struct StudioVfsAdapter {
     write_capable_state: WriteCapableState,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
+    next_runtime_stats_fh: AtomicU64,
+    runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
 }
 
 #[derive(Debug)]
@@ -473,6 +475,7 @@ fn copy_window_bytes(window_offset: u64, bytes: &[u8], offset: u64, out: &mut [u
 struct ReadExecutionState {
     vfs: Arc<StudioVfs>,
     shared: Arc<AdapterSharedState>,
+    runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -890,6 +893,8 @@ impl StudioVfsAdapter {
             write_capable_state: WriteCapableState::default(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
+            next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
+            runtime_stats_handles: Arc::new(ParkingMutex::new(HashMap::new())),
         }
     }
 
@@ -983,6 +988,9 @@ impl StudioVfsAdapter {
 
     /// Get inode attributes.
     pub(crate) fn getattr(&self, ino: u64) -> Result<stat, i32> {
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            return Ok(self.attr_to_stat(&self.vfs.runtime_stats_file_attr()));
+        }
         self.vfs
             .getattr(ino)
             .map(|attr| self.attr_to_stat(&attr))
@@ -1060,6 +1068,18 @@ impl StudioVfsAdapter {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         if self.read_only && posix_open_requests_write(flags, trunc) {
             return Err(libc::EROFS);
+        }
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            if posix_open_requests_write(flags, trunc)
+                || open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
+                || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
+            {
+                return Err(libc::EROFS);
+            }
+            let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
+            let bytes = self.vfs.runtime_stats_file_text().into_bytes();
+            self.runtime_stats_handles.lock().insert(fh, bytes);
+            return Ok(OpenReply::new(fh).with_direct_io(true));
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.vfs
@@ -1300,6 +1320,17 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let mut out = vec![0u8; size_usize];
+            let handles = self.runtime_stats_handles.lock();
+            let Some(bytes) = handles.get(&file_handle) else {
+                return Err(libc::EBADF);
+            };
+            let n = studiofs_vfs::read_runtime_stats_buffer(bytes, offset, &mut out) as usize;
+            out.truncate(n);
+            return Ok(out);
+        }
+
         // Test-only synchronous reads return an owned Vec, so keep them off the
         // queued-read pool; otherwise this helper would consume pooled buffers.
         let mut out = vec![0u8; size_usize];
@@ -1330,6 +1361,21 @@ impl StudioVfsAdapter {
     ) -> Result<PooledReadBuffer, i32> {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
+        }
+        if state.vfs.is_runtime_stats_file_ino(request.ino) {
+            let size = (request.size as usize).min(request.max_read_len as usize);
+            let mut out = state
+                .shared
+                .read_buffers
+                .clone()
+                .acquire_with_capacity(size, size);
+            let handles = state.runtime_stats_handles.lock();
+            let Some(bytes) = handles.get(&request.file_handle) else {
+                return Err(libc::EBADF);
+            };
+            let n = studiofs_vfs::read_runtime_stats_buffer(bytes, request.offset, &mut out);
+            out.truncate(n as usize);
+            return Ok(out);
         }
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
@@ -1433,6 +1479,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1537,6 +1584,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1606,6 +1654,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1757,6 +1806,14 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+        if self
+            .runtime_stats_handles
+            .lock()
+            .remove(&file_handle)
+            .is_some()
+        {
+            return Ok(());
+        }
         let released_write_handle = self.write_capable_state.release_handle(file_handle);
         let result = self
             .runtime_handle

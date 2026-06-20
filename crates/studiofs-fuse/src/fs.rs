@@ -3,10 +3,11 @@
 mod handle_drain;
 mod pending_write_tracker;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -645,6 +646,8 @@ pub struct StudioFuseFs {
     mount_gid: u32,
     async_write_diagnostics_stop: Arc<AtomicBool>,
     async_write_diagnostics_task: Option<JoinHandle<()>>,
+    next_runtime_stats_fh: u64,
+    runtime_stats_handles: HashMap<u64, Vec<u8>>,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -739,6 +742,8 @@ impl StudioFuseFs {
             mount_gid,
             async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
             async_write_diagnostics_task: None,
+            next_runtime_stats_fh: u64::MAX / 2,
+            runtime_stats_handles: HashMap::new(),
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
@@ -783,6 +788,14 @@ impl StudioFuseFs {
 
     fn async_write_platform_policy_label(&self) -> &'static str {
         "linux"
+    }
+
+    fn open_runtime_stats_handle(&mut self) -> u64 {
+        let fh = self.next_runtime_stats_fh;
+        self.next_runtime_stats_fh = self.next_runtime_stats_fh.wrapping_add(1);
+        self.runtime_stats_handles
+            .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
+        fh
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -966,6 +979,11 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let attr = self.vfs.runtime_stats_file_attr();
+            reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid));
+            return;
+        }
         match self.vfs.getattr(ino) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
@@ -1264,6 +1282,18 @@ impl Filesystem for StudioFuseFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            if open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
+                || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
+                || trunc
+            {
+                reply.error(libc::EROFS);
+                return;
+            }
+            let fh = self.open_runtime_stats_handle();
+            reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
+            return;
+        }
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
                 let reply_flags = fuse_open_reply_flags(open_flags);
@@ -1309,6 +1339,23 @@ impl Filesystem for StudioFuseFs {
                 return;
             }
         };
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            let Some(bytes) = self.runtime_stats_handles.get(&fh) else {
+                reply.error(libc::EBADF);
+                return;
+            };
+            let Ok(start) = usize::try_from(offset) else {
+                reply.data(&[]);
+                return;
+            };
+            if start >= bytes.len() {
+                reply.data(&[]);
+                return;
+            }
+            let end = start.saturating_add(size as usize).min(bytes.len());
+            reply.data(&bytes[start..end]);
+            return;
+        }
         let clamped_size = match self.vfs.getattr(ino) {
             Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
             Err(e) => {
@@ -1554,6 +1601,11 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "release started");
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            self.runtime_stats_handles.remove(&fh);
+            reply.ok();
+            return;
+        }
         if self.async_write_enabled {
             let barrier = match self.pending_writes.begin_close(ino, fh) {
                 Ok(barrier) => barrier,

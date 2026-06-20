@@ -43,7 +43,8 @@ pub use vfs::{
     BarrierObservabilityPort, DeferredCleanupHintPort, DeleteCleanupPort, FlushGatePort,
     HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest, HandleReleasePort,
     KernelInvalidator, LocalSyncBarrierPort, LocalSyncPolicy, LockKind, NamespaceParent,
-    NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags, RUNTIME_STATS_SCHEMA_VERSION,
+    NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags, RUNTIME_STATS_FILE_INO,
+    RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_REPORTED_SIZE, RUNTIME_STATS_SCHEMA_VERSION,
     RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric,
     RuntimeStatsParseError, RuntimeStatsSection, RuntimeStatsSnapshot, StatFs, StudioVfs,
     VFS_RUNTIME_EVENT_CAPACITY, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsConfig,
@@ -60,5 +61,5 @@ pub use vfs::{
     VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
-    is_hidden_platform_root_metadata_name,
+    is_hidden_platform_root_metadata_name, read_runtime_stats_buffer,
 };

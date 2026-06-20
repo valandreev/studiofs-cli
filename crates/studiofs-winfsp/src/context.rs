@@ -110,6 +110,8 @@ pub struct StudioFileHandle {
     read_callback_bytes: AtomicU64,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
+    /// Captured text for synthetic runtime stats reads.
+    runtime_stats_snapshot: Option<Vec<u8>>,
 }
 
 impl StudioFileHandle {
@@ -142,7 +144,13 @@ impl StudioFileHandle {
             read_callbacks: AtomicU64::new(0),
             read_callback_bytes: AtomicU64::new(0),
             dir_buffer: DirBuffer::new(),
+            runtime_stats_snapshot: None,
         }
+    }
+
+    fn with_runtime_stats_snapshot(mut self, snapshot: Vec<u8>) -> Self {
+        self.runtime_stats_snapshot = Some(snapshot);
+        self
     }
 
     fn set_disable_os_cache(&mut self, disable_os_cache: bool) {
@@ -219,6 +227,7 @@ const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
 const FILE_SUPERSEDE_DISPOSITION: u32 = 0;
+const FILE_CREATE_DISPOSITION: u32 = 2;
 const FILE_OPEN_IF_DISPOSITION: u32 = 3;
 const FILE_OVERWRITE_DISPOSITION: u32 = 4;
 const FILE_OVERWRITE_IF_DISPOSITION: u32 = 5;
@@ -503,10 +512,85 @@ fn unix_nanos_to_filetime(unix_nanos: u64) -> u64 {
 /// Handles `.` (current dir), `..` (parent dir), and strips trailing
 /// dots/spaces from path components (standard Windows path semantics).
 fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
+    if is_runtime_stats_windows_path(path) {
+        return Ok(vfs.runtime_stats_file_attr());
+    }
     let s = path.to_string_lossy();
     vfs.namespace_resolver(NamespacePathStyle::Windows)
         .resolve_path(&s)
         .map_err(vfs_to_winfsp_err)
+}
+
+fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
+    const RUNTIME_STATS_BACKSLASH_PATH: &[u16] = &[
+        b'\\' as u16,
+        b'.' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'f' as u16,
+        b's' as u16,
+        b'-' as u16,
+        b'r' as u16,
+        b'u' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'i' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'-' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b's' as u16,
+    ];
+    const RUNTIME_STATS_SLASH_PATH: &[u16] = &[
+        b'/' as u16,
+        b'.' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'f' as u16,
+        b's' as u16,
+        b'-' as u16,
+        b'r' as u16,
+        b'u' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'i' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'-' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b's' as u16,
+    ];
+    let slice = path.as_slice();
+    utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_BACKSLASH_PATH)
+        || utf16_ascii_eq_ignore_case(slice, RUNTIME_STATS_SLASH_PATH)
+}
+
+fn utf16_ascii_eq_ignore_case(actual: &[u16], expected_lower_ascii: &[u16]) -> bool {
+    actual.len() == expected_lower_ascii.len()
+        && actual
+            .iter()
+            .zip(expected_lower_ascii)
+            .all(|(&actual, &expected)| {
+                if actual <= 0x7f && expected <= 0x7f {
+                    (actual as u8).to_ascii_lowercase() as u16 == expected
+                } else {
+                    actual == expected
+                }
+            })
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -1006,20 +1090,33 @@ impl StudioFsContext {
         write_local_sync_policy: LocalSyncPolicy,
     ) -> winfsp::Result<StudioFileHandle> {
         let is_dir = attr.kind == FileType::Directory;
-        let fh = if is_dir {
+        let fh = if self.vfs.is_runtime_stats_file_ino(attr.ino) {
+            if open_flags.contains(OpenFlags::WRONLY)
+                || open_flags.contains(OpenFlags::RDWR)
+                || trunc
+            {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
+            0
+        } else if is_dir {
             0
         } else {
             self.vfs
                 .open_file(attr.ino, open_flags, trunc)
                 .map_err(vfs_to_winfsp_err)?
         };
-        Ok(StudioFileHandle::new_with_local_sync_policy(
+        let handle = StudioFileHandle::new_with_local_sync_policy(
             attr.ino,
             is_dir,
             fh,
             open_flags,
             write_local_sync_policy,
-        ))
+        );
+        if self.vfs.is_runtime_stats_file_ino(attr.ino) {
+            Ok(handle.with_runtime_stats_snapshot(self.vfs.runtime_stats_file_text().into_bytes()))
+        } else {
+            Ok(handle)
+        }
     }
 
     fn write_open_file_info(out: &mut OpenFileInfo, attr: &InodeAttr) {
@@ -1271,7 +1368,8 @@ impl FileSystemContext for StudioFsContext {
         Self::write_open_file_info(file_info, &attr);
         let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
-        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
+            || self.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
@@ -1321,6 +1419,35 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        if is_runtime_stats_windows_path(file_name) {
+            let disposition = create_disposition_from_create_options(create_options);
+            if (create_options & FILE_DIRECTORY_FILE_OPTION) != 0 {
+                return Err(winfsp::FspError::from(STATUS_NOT_A_DIRECTORY));
+            }
+            if disposition == FILE_CREATE_DISPOSITION {
+                return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION));
+            }
+            if matches!(
+                disposition,
+                FILE_SUPERSEDE_DISPOSITION
+                    | FILE_OVERWRITE_DISPOSITION
+                    | FILE_OVERWRITE_IF_DISPOSITION
+            ) {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
+            let open_flags = open_flags_from_access(granted_access, create_options);
+            let attr = self.vfs.runtime_stats_file_attr();
+            Self::write_open_file_info(file_info, &attr);
+            let mut handle = self.open_file_handle_for_attr(
+                &attr,
+                open_flags,
+                false,
+                write_local_sync_policy_from_create_options(create_options),
+            )?;
+            handle.set_disable_os_cache(true);
+            set_current_winfsp_open_disable_cache(true);
+            return Ok(handle);
+        }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1353,6 +1480,10 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if self.vfs.is_runtime_stats_file_ino(context.ino) {
+            *file_info = attr_to_file_info(&self.vfs.runtime_stats_file_attr());
+            return Ok(());
+        }
         let attr = self
             .vfs
             .peek_dirty_attr(context.ino)
@@ -1370,6 +1501,14 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        if self.vfs.is_runtime_stats_file_ino(context.ino) {
+            let Some(bytes) = context.runtime_stats_snapshot.as_deref() else {
+                return Err(winfsp::FspError::from(STATUS_INVALID_PARAMETER));
+            };
+            return Ok(studiofs_vfs::read_runtime_stats_buffer(
+                bytes, offset, buffer,
+            ));
+        }
         if let Some(n) = self.try_handle_zero_fill_read(context, buffer, offset) {
             trace!(
                 ino = context.ino,
@@ -1607,6 +1746,9 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        if delete_file && self.vfs.is_runtime_stats_file_ino(context.ino) {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -2000,8 +2142,8 @@ mod tests {
         MetadataConfig, ROOT_INO, RedbMetaEngine, TimeSpec,
     };
     use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
-    use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig};
+    use studiofs_vfs::{RUNTIME_STATS_FILE_INO, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
@@ -2450,6 +2592,47 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_runtime_stats_create_disables_os_cache() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-create-cache-policy");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            0x0100_0000,
+            FILE_GENERIC_READ_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut file_info,
+        )
+        .expect("runtime stats create/open path");
+
+        assert!(handle.disable_os_cache);
+    }
+
+    #[test]
+    fn winfsp_runtime_stats_open_disables_os_cache() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-cache-policy");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("runtime stats open path");
+
+        assert!(handle.disable_os_cache);
+    }
+
+    #[test]
     fn winfsp_zero_allocation_size_truncates_existing_file_before_write() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("zero-allocation-truncates");
         let attr = vfs
@@ -2767,6 +2950,25 @@ mod tests {
             vfs.readdir(dir.ino).expect("readdir after heal").is_empty(),
             "legacy ghost child should be removed during delete precheck healing"
         );
+    }
+
+    #[test]
+    fn set_delete_rejects_runtime_stats_file_immediately() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime_stats_set_delete");
+        let handle = StudioFileHandle::new(RUNTIME_STATS_FILE_INO, false, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+
+        let result = <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            true,
+        );
+
+        let status = result
+            .expect_err("runtime stats delete should be denied")
+            .to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
     }
 
     #[test]

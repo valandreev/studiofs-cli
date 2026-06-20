@@ -511,6 +511,7 @@ impl VfsBootstrap {
             kernel_invalidator: RwLock::new(None),
             write_path_backend_tag: "local-payload-runtime".to_string(),
             write_path_started_at: Instant::now(),
+            runtime_stats_file_time_nanos: InodeAttr::now_nanos(),
             known_file_lock_overrides: Mutex::new(HashMap::new()),
             #[cfg(test)]
             metadata_authority_override: Mutex::new(None),

@@ -52,6 +52,36 @@ fn handle_backed_growth_may_defer_strict_flush(
 }
 
 impl StudioVfs {
+    fn runtime_stats_entry_exists_error(parent: Ino, name: &[u8]) -> VfsError {
+        VfsError::Meta(MetaError::EntryExists {
+            parent,
+            name: String::from_utf8_lossy(name).into_owned(),
+        })
+    }
+
+    fn runtime_stats_access_denied_error() -> VfsError {
+        VfsError::Meta(MetaError::AccessDenied {
+            ino: super::RUNTIME_STATS_FILE_INO,
+            principal: "runtime-stats-surface".to_string(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        })
+    }
+
+    fn reject_runtime_stats_entry_creation(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.is_runtime_stats_file_name(parent, name) {
+            return Err(Self::runtime_stats_entry_exists_error(parent, name));
+        }
+        Ok(())
+    }
+
+    fn reject_runtime_stats_entry_mutation(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.is_runtime_stats_file_name(parent, name) {
+            return Err(Self::runtime_stats_access_denied_error());
+        }
+        Ok(())
+    }
+
     /// Update inode metadata fields without an open-file handle context.
     ///
     /// This is the handle-free entry point for setattr operations and delegates to
@@ -71,6 +101,9 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_ino(ino) {
+            return Err(Self::runtime_stats_access_denied_error());
+        }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
             if let Some(new_size) = args.size {
@@ -926,6 +959,9 @@ impl StudioVfs {
     /// Returns the resolved `InodeAttr` or a metadata error when the entry is
     /// absent or blocked.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_name(parent, name) {
+            return Ok(self.runtime_stats_file_attr());
+        }
         self.namespace_resolver(NamespacePathStyle::Posix)
             .lookup_component(parent, name)
     }
@@ -1179,9 +1215,13 @@ impl StudioVfs {
     /// behavior remains consistent while avoiding metadata mutations.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
+        if self.is_runtime_stats_file_ino(ino) {
+            return Err(Self::runtime_stats_access_denied_error());
+        }
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         validate_name(new_name)?;
+        self.reject_runtime_stats_entry_creation(new_parent, new_name)?;
         if self.should_ignore_regular_file_path(new_parent, new_name) {
             let source_attr = self.getattr(ino)?;
             let ignored = self.create_ignored_entry(
@@ -1228,6 +1268,7 @@ impl StudioVfs {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
+        self.reject_runtime_stats_entry_creation(parent, name)?;
         if self.should_ignore_regular_file_path(parent, name) {
             let attr =
                 self.create_ignored_entry(parent, name, uid, gid, mode, FileType::RegularFile);
@@ -1269,6 +1310,7 @@ impl StudioVfs {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
+        self.reject_runtime_stats_entry_creation(parent, name)?;
         if self.should_ignore_directory_path(parent, name) {
             let attr = self.create_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
@@ -1294,6 +1336,7 @@ impl StudioVfs {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
+        self.reject_runtime_stats_entry_creation(parent, name)?;
         if self.should_ignore_regular_file_path(parent, name) {
             let attr = self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
@@ -1330,6 +1373,7 @@ impl StudioVfs {
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        self.reject_runtime_stats_entry_mutation(parent, name)?;
         if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(None);
@@ -1377,6 +1421,7 @@ impl StudioVfs {
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        self.reject_runtime_stats_entry_mutation(parent, name)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(());
@@ -1495,6 +1540,8 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
+        self.reject_runtime_stats_entry_mutation(parent, name)?;
+        self.reject_runtime_stats_entry_mutation(new_parent, new_name)?;
         let source_ignored = self.ignored_entry_lookup(parent, name);
         let target_is_ignored = self.should_ignore_regular_file_path(new_parent, new_name)
             || self.should_ignore_directory_path(new_parent, new_name);

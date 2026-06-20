@@ -1411,10 +1411,16 @@ impl StudioVfs {
     }
 
     pub(super) fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_ino(ino) {
+            return Ok(self.runtime_stats_file_attr());
+        }
         ReadMetadataResolver::new(self, ino).resolve_attr_sync()
     }
 
     pub(super) async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_ino(ino) {
+            return Ok(self.runtime_stats_file_attr());
+        }
         ReadMetadataResolver::new(self, ino).resolve_attr().await
     }
 

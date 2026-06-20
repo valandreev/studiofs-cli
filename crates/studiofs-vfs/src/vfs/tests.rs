@@ -120,6 +120,151 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+fn runtime_stats_test_tempdir() -> TempDir {
+    std::fs::create_dir_all("target").expect("create target dir");
+    tempfile::Builder::new()
+        .prefix("runtime-stats-")
+        .tempdir_in("target")
+        .expect("runtime stats tempdir in target")
+}
+
+#[test]
+fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");
+
+    let attr = vfs
+        .lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME)
+        .expect("lookup runtime stats surface");
+    let getattr_attr = vfs
+        .getattr(RUNTIME_STATS_FILE_INO)
+        .expect("getattr runtime stats surface by synthetic ino");
+    assert_eq!(attr.ino, RUNTIME_STATS_FILE_INO);
+    assert_eq!(getattr_attr.ino, RUNTIME_STATS_FILE_INO);
+    assert_eq!(getattr_attr.size, RUNTIME_STATS_FILE_REPORTED_SIZE);
+    assert_eq!(attr.kind, FileType::RegularFile);
+    assert_eq!(attr.mode, 0o444);
+    assert!(
+        meta.lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME).is_err(),
+        "runtime stats surface must not persist into volume metadata"
+    );
+    match vfs.setattr(RUNTIME_STATS_FILE_INO, SetattrArgs::size_only(0)) {
+        Err(VfsError::Meta(MetaError::AccessDenied { ino, .. })) => {
+            assert_eq!(ino, RUNTIME_STATS_FILE_INO);
+        }
+        other => panic!("expected AccessDenied for runtime stats setattr, got {other:?}"),
+    }
+
+    let entries = vfs.readdir(ROOT_INO).expect("readdir root");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.name == RUNTIME_STATS_FILE_NAME),
+        "runtime stats surface is explicit-path only and must not alter normal root readdir"
+    );
+
+    let mut out = vec![0u8; attr.size as usize];
+    let read = vfs.read_runtime_stats_file(0, &mut out);
+    out.truncate(read as usize);
+    let text = String::from_utf8(out).expect("runtime stats text is utf-8");
+    assert!(text.starts_with("# studiofs_runtime_stats schema_version=1\n"));
+
+    let parsed = RuntimeStatsSnapshot::parse_text(&text).expect("parse runtime stats text");
+    assert_eq!(parsed.schema_version, RUNTIME_STATS_SCHEMA_VERSION);
+    assert!(parsed.generated_unix_ms > 0);
+    assert!(parsed.bridge.counters.contains_key("read_callbacks"));
+    assert!(parsed.vfs_read.counters.contains_key("calls"));
+    assert!(parsed.upload_queue.gauges.contains_key("pending_depth"));
+}
+
+#[test]
+fn runtime_stats_surface_has_stable_attributes() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");
+
+    let first = vfs.runtime_stats_file_attr();
+    let second = vfs.runtime_stats_file_attr();
+
+    assert_eq!(first.atime, second.atime);
+    assert_eq!(first.mtime, second.mtime);
+    assert_eq!(first.ctime, second.ctime);
+    assert_eq!(first.crtime, second.crtime);
+}
+
+#[test]
+fn runtime_stats_reserved_name_rejects_namespace_mutations() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface-reserved-name");
+
+    let assert_entry_exists = |result: VfsResult<InodeAttr>| match result {
+        Err(VfsError::Meta(MetaError::EntryExists { parent, name })) => {
+            assert_eq!(parent, ROOT_INO);
+            assert_eq!(name, ".studiofs-runtime-stats");
+        }
+        other => panic!("expected EntryExists, got {other:?}"),
+    };
+    let assert_access_denied = |result: VfsResult<()>| match result {
+        Err(VfsError::Meta(MetaError::AccessDenied { ino, .. })) => {
+            assert_eq!(ino, RUNTIME_STATS_FILE_INO);
+        }
+        other => panic!("expected AccessDenied, got {other:?}"),
+    };
+    let assert_attr_access_denied = |result: VfsResult<InodeAttr>| match result {
+        Err(VfsError::Meta(MetaError::AccessDenied { ino, .. })) => {
+            assert_eq!(ino, RUNTIME_STATS_FILE_INO);
+        }
+        other => panic!("expected AccessDenied, got {other:?}"),
+    };
+
+    assert_entry_exists(vfs.create(ROOT_INO, RUNTIME_STATS_FILE_NAME, 0, 0, 0o644));
+    assert_entry_exists(vfs.mkdir(ROOT_INO, RUNTIME_STATS_FILE_NAME, 0, 0, 0o755));
+    assert_entry_exists(vfs.symlink(ROOT_INO, RUNTIME_STATS_FILE_NAME, b"target", 0, 0));
+
+    let source = vfs
+        .create(ROOT_INO, b"runtime-stats-source", 0, 0, 0o644)
+        .expect("create source file");
+    assert_entry_exists(vfs.link(source.ino, ROOT_INO, RUNTIME_STATS_FILE_NAME));
+    assert_attr_access_denied(vfs.link(RUNTIME_STATS_FILE_INO, ROOT_INO, b"runtime-stats-link"));
+    assert_access_denied(vfs.unlink(ROOT_INO, RUNTIME_STATS_FILE_NAME));
+    assert_access_denied(vfs.rmdir(ROOT_INO, RUNTIME_STATS_FILE_NAME));
+    assert_access_denied(vfs.rename(
+        ROOT_INO,
+        b"runtime-stats-source",
+        ROOT_INO,
+        RUNTIME_STATS_FILE_NAME,
+    ));
+    assert_access_denied(vfs.rename(
+        ROOT_INO,
+        RUNTIME_STATS_FILE_NAME,
+        ROOT_INO,
+        b"runtime-stats-target",
+    ));
+
+    assert!(
+        meta.lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME).is_err(),
+        "failed namespace mutations must not persist runtime stats name"
+    );
+    vfs.lookup(ROOT_INO, b"runtime-stats-source")
+        .expect("source should remain after rejected rename");
+}
+
+#[test]
+fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-offset");
+    let text = vfs.runtime_stats_file_text();
+    assert!(text.len() > 16);
+
+    let mut out = [0u8; 8];
+    let read = vfs.read_runtime_stats_file(2, &mut out);
+    assert_eq!(read, 8);
+    assert_eq!(&out, &text.as_bytes()[2..10]);
+
+    let mut eof = [0u8; 4];
+    let read = vfs.read_runtime_stats_file(u64::MAX, &mut eof);
+    assert_eq!(read, 0);
+}
+
 #[test]
 fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
     let mut fixture =
