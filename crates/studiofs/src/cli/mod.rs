@@ -221,8 +221,7 @@ mod tests {
     fn help_hides_legacy_test_cache_command() {
         let command = Cli::command();
         let cmd = command
-            .get_subcommands()
-            .find(|cmd| cmd.get_name() == "test-cache")
+            .find_subcommand("test-cache")
             .expect("hidden test-cache parser should exist for internal reuse");
 
         assert!(
