@@ -955,12 +955,6 @@ impl StudioVfs {
                 !super::is_blocked_root_macos_metadata(&entry.name)
                     && !super::is_probable_trash_component(&entry.name)
             });
-            if !entries
-                .iter()
-                .any(|entry| entry.name == super::runtime_stats_surface::RUNTIME_STATS_FILE_NAME)
-            {
-                entries.push(self.runtime_stats_dir_entry());
-            }
         }
 
         let mut confirmed_entry_inos = HashSet::new();

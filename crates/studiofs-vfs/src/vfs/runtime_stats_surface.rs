@@ -1,4 +1,4 @@
-use studiofs_meta::{DirEntry, FileType, Ino, InodeAttr, ROOT_INO};
+use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
 
 use super::{RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot, StudioVfs};
 use crate::utils::now_unix_millis;
@@ -17,14 +17,6 @@ impl StudioVfs {
     /// Return true when `ino` is the runtime stats virtual file.
     pub fn is_runtime_stats_file_ino(&self, ino: Ino) -> bool {
         ino == RUNTIME_STATS_FILE_INO
-    }
-
-    pub(super) fn runtime_stats_dir_entry(&self) -> DirEntry {
-        DirEntry {
-            name: RUNTIME_STATS_FILE_NAME.to_vec(),
-            ino: RUNTIME_STATS_FILE_INO,
-            kind: FileType::RegularFile,
-        }
     }
 
     /// Return synthetic attributes for the runtime stats virtual file.

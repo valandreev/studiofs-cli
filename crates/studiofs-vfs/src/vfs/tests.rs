@@ -137,9 +137,12 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     );
 
     let entries = vfs.readdir(ROOT_INO).expect("readdir root");
-    assert!(entries.iter().any(|entry| {
-        entry.ino == RUNTIME_STATS_FILE_INO && entry.name == RUNTIME_STATS_FILE_NAME
-    }));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.name == RUNTIME_STATS_FILE_NAME),
+        "runtime stats surface is explicit-path only and must not alter normal root readdir"
+    );
 
     let mut out = vec![0u8; attr.size as usize];
     let read = vfs.read_runtime_stats_file(0, &mut out);
