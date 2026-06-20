@@ -199,10 +199,7 @@ impl RuntimeStatsSnapshot {
         }
     }
 
-    fn split_metric_name<'a>(
-        name: &'a str,
-        line: usize,
-    ) -> Result<(&'a str, &'a str), RuntimeStatsParseError> {
+    fn split_metric_name(name: &str, line: usize) -> Result<(&str, &str), RuntimeStatsParseError> {
         name.split_once('.')
             .ok_or_else(|| RuntimeStatsParseError::new(line, "metric name must be section.key"))
     }
