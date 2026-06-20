@@ -1,4 +1,5 @@
 use std::ops::AddAssign;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::result::{
@@ -228,7 +229,7 @@ pub(crate) struct PhaseOperationLog {
     pub(crate) operation_index: u64,
     pub(crate) work_index: usize,
     pub(crate) worker_id: usize,
-    pub(crate) target: String,
+    pub(crate) target: Arc<str>,
     pub(crate) size_class: SizeClass,
     pub(crate) bytes: u64,
     pub(crate) elapsed: Duration,
@@ -260,7 +261,7 @@ impl PhaseTelemetry {
                     operation_index: log.operation_index,
                     work_index: log.work_index,
                     worker_id: log.worker_id,
-                    target: log.target,
+                    target: log.target.to_string(),
                     size_class: log.size_class.label().to_string(),
                     bytes: log.bytes,
                     elapsed_ms,
@@ -453,7 +454,7 @@ mod tests {
             operation_index: 9,
             work_index: 3,
             worker_id: 2,
-            target: "/mnt/studiofs-benchmark/0003.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0003.bin".into(),
             size_class: SizeClass::Medium,
             bytes: 4 * 1024 * 1024,
             elapsed: Duration::from_millis(12),
@@ -462,7 +463,7 @@ mod tests {
             operation_index: 4,
             work_index: 1,
             worker_id: 0,
-            target: "/mnt/studiofs-benchmark/0001.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0001.bin".into(),
             size_class: SizeClass::Small,
             bytes: 512 * 1024,
             elapsed: Duration::from_millis(3),

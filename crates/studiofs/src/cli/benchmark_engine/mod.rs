@@ -13,7 +13,6 @@ mod result;
 mod telemetry;
 mod workload;
 
-pub(crate) use mounted::run_mounted_end_to_end;
 pub(crate) use profiling::merge_profile_report;
 pub(crate) use profiling::{cpu_utilization_percent, process_cpu_time};
 pub(crate) use reporting::{render_human_summary, save_benchmark_report};
@@ -71,11 +70,12 @@ pub(crate) struct MountedBenchmarkTarget<'a> {
     pub(crate) cache_path: Option<&'a Path>,
 }
 
+/// Runs a mounted filesystem benchmark and returns the normalized benchmark report.
 pub(crate) async fn run_mounted(
     config: &BenchmarkConfig,
     target: MountedBenchmarkTarget<'_>,
 ) -> Result<BenchmarkReport> {
-    run_mounted_end_to_end(
+    mounted::run_mounted_end_to_end(
         config,
         target.pid,
         target.volume,
