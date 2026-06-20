@@ -2,6 +2,8 @@ use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Current version of the cross-platform runtime stats snapshot schema.
@@ -68,24 +70,40 @@ impl RuntimeStatsSnapshot {
     /// Each non-comment line has `kind name unit value`. Histogram bucket lines
     /// have `histogram_bucket name le_ns count`.
     pub fn to_text(&self) -> String {
-        let mut out = String::from("# studiofs_runtime_stats schema_version=1\n");
-        out.push_str(&format!(
-            "gauge system.schema_version count {}\n",
-            self.schema_version
-        ));
-        out.push_str(&format!(
-            "gauge system.generated_unix_ms ms {}\n",
-            self.generated_unix_ms
-        ));
-
-        for (section_name, section) in self.sections() {
-            section.write_text(section_name, &mut out);
-        }
-        out
+        self.to_string()
     }
 
     /// Parse the stable local stats text representation.
     pub fn parse_text(input: &str) -> Result<Self, RuntimeStatsParseError> {
+        input.parse()
+    }
+}
+
+impl fmt::Display for RuntimeStatsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "# studiofs_runtime_stats schema_version=1")?;
+        writeln!(
+            f,
+            "gauge system.schema_version count {}",
+            self.schema_version
+        )?;
+        writeln!(
+            f,
+            "gauge system.generated_unix_ms ms {}",
+            self.generated_unix_ms
+        )?;
+
+        for (section_name, section) in self.sections() {
+            section.write_text(section_name, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for RuntimeStatsSnapshot {
+    type Err = RuntimeStatsParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut snapshot = Self::default();
         for (line_index, raw_line) in input.lines().enumerate() {
             let line = raw_line.trim();
@@ -135,6 +153,12 @@ impl RuntimeStatsSnapshot {
                         .map_err(|_| {
                             RuntimeStatsParseError::new(line_index + 1, "invalid histogram value")
                         })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
                     snapshot.set_histogram_total(kind, name, unit, value, line_index + 1)?;
                 }
                 "histogram_bucket" => {
@@ -159,6 +183,12 @@ impl RuntimeStatsSnapshot {
                         .map_err(|_| {
                             RuntimeStatsParseError::new(line_index + 1, "invalid bucket count")
                         })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
                     snapshot.set_histogram_bucket(name, le_ns, count, line_index + 1)?;
                 }
                 _ => {
@@ -171,8 +201,10 @@ impl RuntimeStatsSnapshot {
         }
         Ok(snapshot)
     }
+}
 
-    fn sections(&self) -> [(&'static str, &RuntimeStatsSection); 8] {
+impl RuntimeStatsSnapshot {
+    fn sections(&self) -> impl Iterator<Item = (&'static str, &RuntimeStatsSection)> {
         [
             ("system", &self.system),
             ("bridge", &self.bridge),
@@ -183,6 +215,7 @@ impl RuntimeStatsSnapshot {
             ("object_io", &self.object_io),
             ("metadata", &self.metadata),
         ]
+        .into_iter()
     }
 
     fn section_mut(&mut self, section: &str) -> Option<&mut RuntimeStatsSection> {
@@ -228,7 +261,7 @@ impl RuntimeStatsSnapshot {
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
         let metric = RuntimeScalarMetric {
             value,
-            unit: unit.to_owned(),
+            unit: parse_runtime_stats_unit(unit),
         };
         match kind {
             "counter" => {
@@ -254,15 +287,8 @@ impl RuntimeStatsSnapshot {
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
-        let histogram =
-            target
-                .latencies
-                .entry(key.to_owned())
-                .or_insert_with(|| RuntimeLatencyHistogram {
-                    unit: unit.to_owned(),
-                    ..RuntimeLatencyHistogram::default()
-                });
-        histogram.unit = unit.to_owned();
+        let histogram = target.latencies.entry(key.to_owned()).or_default();
+        histogram.unit = parse_runtime_stats_unit(unit);
         match kind {
             "histogram_count" => histogram.count = value,
             "histogram_sum" => histogram.sum = value,
@@ -305,35 +331,52 @@ pub struct RuntimeStatsSection {
 }
 
 impl RuntimeStatsSection {
-    fn write_text(&self, section_name: &str, out: &mut String) {
+    fn write_text(&self, section_name: &str, out: &mut impl fmt::Write) -> fmt::Result {
         for (name, metric) in &self.counters {
-            out.push_str(&format!(
-                "counter {section_name}.{name} {} {}\n",
+            writeln!(
+                out,
+                "counter {section_name}.{name} {} {}",
                 metric.unit, metric.value
-            ));
+            )?;
         }
         for (name, metric) in &self.gauges {
-            out.push_str(&format!(
-                "gauge {section_name}.{name} {} {}\n",
+            writeln!(
+                out,
+                "gauge {section_name}.{name} {} {}",
                 metric.unit, metric.value
-            ));
+            )?;
         }
         for (name, histogram) in &self.latencies {
-            out.push_str(&format!(
-                "histogram_count {section_name}.{name} {} {}\n",
+            writeln!(
+                out,
+                "histogram_count {section_name}.{name} {} {}",
                 histogram.unit, histogram.count
-            ));
-            out.push_str(&format!(
-                "histogram_sum {section_name}.{name} {} {}\n",
+            )?;
+            writeln!(
+                out,
+                "histogram_sum {section_name}.{name} {} {}",
                 histogram.unit, histogram.sum
-            ));
+            )?;
             for bucket in &histogram.buckets {
-                out.push_str(&format!(
-                    "histogram_bucket {section_name}.{name} {} {}\n",
+                writeln!(
+                    out,
+                    "histogram_bucket {section_name}.{name} {} {}",
                     bucket.le_ns, bucket.count
-                ));
+                )?;
             }
         }
+        Ok(())
+    }
+}
+
+fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
+    match unit {
+        "count" => Cow::Borrowed("count"),
+        "bytes" => Cow::Borrowed("bytes"),
+        "ns" => Cow::Borrowed("ns"),
+        "ms" => Cow::Borrowed("ms"),
+        "percent" => Cow::Borrowed("percent"),
+        _ => Cow::Owned(unit.to_owned()),
     }
 }
 
@@ -343,7 +386,7 @@ pub struct RuntimeScalarMetric {
     /// Numeric value for this counter or gauge.
     pub value: u64,
     /// Stable unit string, such as `count`, `bytes`, `ns`, or `ms`.
-    pub unit: String,
+    pub unit: Cow<'static, str>,
 }
 
 /// Latency histogram with cumulative count and sum for interval averages.
@@ -355,7 +398,7 @@ pub struct RuntimeLatencyHistogram {
     /// Sum of observed latency values in `unit`.
     pub sum: u64,
     /// Unit used for `sum`; bucket bounds are always nanoseconds.
-    pub unit: String,
+    pub unit: Cow<'static, str>,
     /// Bucket counts keyed by inclusive upper-bound nanoseconds.
     pub buckets: Vec<RuntimeLatencyBucket>,
 }
@@ -370,7 +413,8 @@ pub struct RuntimeLatencyBucket {
 }
 
 /// Error returned when parsing the local runtime stats text surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("failed to parse runtime stats at line {line}: {message}")]
 pub struct RuntimeStatsParseError {
     line: usize,
     message: &'static str,
@@ -381,18 +425,6 @@ impl RuntimeStatsParseError {
         Self { line, message }
     }
 }
-
-impl std::fmt::Display for RuntimeStatsParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "failed to parse runtime stats at line {}: {}",
-            self.line, self.message
-        )
-    }
-}
-
-impl std::error::Error for RuntimeStatsParseError {}
 
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
@@ -1785,14 +1817,14 @@ mod tests {
             "bytes".to_owned(),
             RuntimeScalarMetric {
                 value: 4096,
-                unit: "bytes".to_owned(),
+                unit: Cow::Borrowed("bytes"),
             },
         );
         snapshot.upload_queue.gauges.insert(
             "pending_depth".to_owned(),
             RuntimeScalarMetric {
                 value: 2,
-                unit: "count".to_owned(),
+                unit: Cow::Borrowed("count"),
             },
         );
         snapshot.object_io.latencies.insert(
@@ -1800,7 +1832,7 @@ mod tests {
             RuntimeLatencyHistogram {
                 count: 3,
                 sum: 120_000,
-                unit: "ns".to_owned(),
+                unit: Cow::Borrowed("ns"),
                 buckets: vec![RuntimeLatencyBucket {
                     le_ns: 100_000,
                     count: 2,
@@ -1850,14 +1882,14 @@ mod tests {
             "read_callbacks".to_owned(),
             RuntimeScalarMetric {
                 value: 9,
-                unit: "count".to_owned(),
+                unit: Cow::Borrowed("count"),
             },
         );
         snapshot.cache.gauges.insert(
             "resident_bytes".to_owned(),
             RuntimeScalarMetric {
                 value: 8192,
-                unit: "bytes".to_owned(),
+                unit: Cow::Borrowed("bytes"),
             },
         );
         snapshot.metadata.latencies.insert(
@@ -1865,7 +1897,7 @@ mod tests {
             RuntimeLatencyHistogram {
                 count: 2,
                 sum: 300_000,
-                unit: "ns".to_owned(),
+                unit: Cow::Borrowed("ns"),
                 buckets: vec![
                     RuntimeLatencyBucket {
                         le_ns: 100_000,
@@ -1881,7 +1913,42 @@ mod tests {
 
         let text = snapshot.to_text();
         let parsed = RuntimeStatsSnapshot::parse_text(&text).expect("parse runtime stats text");
+        let parsed_from_trait: RuntimeStatsSnapshot = snapshot
+            .to_string()
+            .parse()
+            .expect("parse runtime stats text via FromStr");
 
         assert_eq!(parsed, snapshot);
+        assert_eq!(parsed_from_trait, snapshot);
+        assert!(matches!(
+            parsed.cache.gauges["resident_bytes"].unit,
+            Cow::Borrowed("bytes")
+        ));
+        assert!(matches!(
+            parsed.metadata.latencies["commit"].unit,
+            Cow::Borrowed("ns")
+        ));
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_trailing_histogram_fields() {
+        let histogram_total =
+            RuntimeStatsSnapshot::parse_text("histogram_count object_io.get ns 1 unexpected\n")
+                .expect_err("trailing histogram total field should fail");
+        let histogram_bucket = RuntimeStatsSnapshot::parse_text(
+            "histogram_bucket object_io.get 1000000 1 unexpected\n",
+        )
+        .expect_err("trailing histogram bucket field should fail");
+
+        assert!(
+            histogram_total
+                .to_string()
+                .contains("unexpected trailing fields")
+        );
+        assert!(
+            histogram_bucket
+                .to_string()
+                .contains("unexpected trailing fields")
+        );
     }
 }
