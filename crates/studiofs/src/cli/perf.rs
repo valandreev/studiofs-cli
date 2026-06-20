@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{Args, ValueEnum};
@@ -61,7 +61,7 @@ pub(crate) struct PerfArgs {
     #[arg(long, value_enum, default_value_t = PerfVerbosity::Normal)]
     pub(crate) verbosity: PerfVerbosity,
 
-    /// Print a finite sample set as pretty JSON. Requires --count.
+    /// Print a finite buffered sample set as pretty JSON. Requires --count.
     #[arg(long)]
     pub(crate) json: bool,
 
@@ -204,13 +204,14 @@ fn run_perf_with_sampler(
     let mut previous = read_next()?;
     let mut remaining = options.count;
     let mut table_state = TableOutputState::default();
+    let mut next_deadline = Instant::now() + options.interval;
 
     loop {
         if matches!(remaining, Some(0)) {
             return Ok(());
         }
 
-        sleep(options.interval);
+        sleep_until_next_deadline(&mut next_deadline, options.interval, &mut sleep);
         let current = read_next()?;
         let sample = build_sample(&previous, &current, options);
         write_sample(out, &sample, options, &mut table_state)?;
@@ -240,8 +241,9 @@ fn run_json_perf_with_sampler(
 
     let mut previous = read_next()?;
     let mut samples = Vec::new();
+    let mut next_deadline = Instant::now() + options.interval;
     for _ in 0..count {
-        sleep(options.interval);
+        sleep_until_next_deadline(&mut next_deadline, options.interval, &mut sleep);
         let current = read_next()?;
         samples.push(build_sample(&previous, &current, options));
         previous = current;
@@ -249,6 +251,18 @@ fn run_json_perf_with_sampler(
     write_json_samples(out, &samples)?;
     out.flush()?;
     Ok(())
+}
+
+fn sleep_until_next_deadline(
+    next_deadline: &mut Instant,
+    interval: Duration,
+    sleep: &mut impl FnMut(Duration),
+) {
+    let now = Instant::now();
+    if *next_deadline > now {
+        sleep(*next_deadline - now);
+    }
+    *next_deadline += interval;
 }
 
 fn stats_path(mountpoint: &Path) -> PathBuf {
@@ -533,16 +547,19 @@ fn display_section_name(section_name: &str) -> &'static str {
     }
 }
 
-fn display_metric_name(name: &str) -> String {
-    name.replace('_', " ")
+fn display_metric_name(name: &str) -> Cow<'_, str> {
+    if name.contains('_') {
+        Cow::Owned(name.replace('_', " "))
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<()> {
-    let sections = options.sections.to_vec();
     let payload = serde_json::json!({
         "schema_version": studiofs_vfs::RUNTIME_STATS_SCHEMA_VERSION,
         "stats_file": runtime_stats_file_name(),
-        "sections": sections,
+        "sections": &options.sections,
         "line_kinds": ["counter", "gauge", "histogram_count", "histogram_sum", "histogram_bucket"],
         "units": ["count", "bytes", "ns", "ms", "percent"],
     });
@@ -1093,6 +1110,15 @@ mod tests {
     }
 
     #[test]
+    fn display_metric_name_borrows_when_no_rewrite_is_needed() {
+        assert!(matches!(
+            display_metric_name("requests"),
+            Cow::Borrowed("requests")
+        ));
+        assert_eq!(display_metric_name("requested_bytes"), "requested bytes");
+    }
+
+    #[test]
     fn json_lines_output_is_one_compact_line_per_sample() {
         let options = PerfOptions {
             mountpoint: Some(PathBuf::from("Z:")),
@@ -1134,6 +1160,7 @@ mod tests {
             snapshot_at(1_500, 450, 0),
         ];
         let mut next_snapshot = 0;
+        let mut sleeps = Vec::new();
         let mut out = Vec::new();
 
         run_perf_with_sampler(
@@ -1144,7 +1171,7 @@ mod tests {
                 next_snapshot += 1;
                 Ok(snapshot)
             },
-            |_| {},
+            |duration| sleeps.push(duration),
         )
         .expect("write json");
         let payload: serde_json::Value = serde_json::from_slice(&out).expect("json samples");
@@ -1155,6 +1182,8 @@ mod tests {
             samples[1]["sections"]["vfs_read"]["counters"]["requested_bytes"]["delta"],
             250
         );
+        assert_eq!(sleeps.len(), 2);
+        assert!(sleeps[1] >= sleeps[0]);
     }
 
     #[test]
@@ -1251,7 +1280,8 @@ mod tests {
 
         assert_eq!(output.lines().count(), 2);
         assert_eq!(next_snapshot, 3);
-        assert_eq!(sleeps, vec![Duration::from_millis(250); 2]);
+        assert_eq!(sleeps.len(), 2);
+        assert!(sleeps[1] >= sleeps[0]);
     }
 
     #[test]
