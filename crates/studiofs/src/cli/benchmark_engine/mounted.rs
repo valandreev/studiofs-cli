@@ -1434,7 +1434,7 @@ async fn run_mounted_write_phase(
         let writes_by_stream = writes_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         Ok((merged, writes_by_stream))
     } else {
@@ -1482,7 +1482,7 @@ async fn run_mounted_read_phase(
         let reads_by_stream = reads_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &reads_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         Ok((merged, reads_by_stream))
     } else {
@@ -2264,7 +2264,7 @@ mod tests {
 
     fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
         BenchmarkConfig {
-            target: PathBuf::from(r"Z:\"),
+            target: PathBuf::from("/mnt/studiofs-benchmark"),
             block_size,
             read_size: 128 * 1024,
             size_class_small_max: 10 * 1024,
@@ -2553,7 +2553,12 @@ mod tests {
         let params = benchmark_config_with_block_size(block_size);
         let workload = single_file_workload();
 
-        let report = build_mounted_runtime_report(&params, Path::new(r"Z:\"), None, &workload);
+        let report = build_mounted_runtime_report(
+            &params,
+            Path::new("/mnt/studiofs-benchmark"),
+            None,
+            &workload,
+        );
 
         assert_eq!(report.block_size, block_size);
         assert_eq!(

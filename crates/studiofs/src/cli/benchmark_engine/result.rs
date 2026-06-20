@@ -861,7 +861,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         mounted_memory: None,
         mounted_portable_profile: None,
         mounted_runtime: Some(MountedRuntimeReport {
-            mounted_path: r"Z:\".to_string(),
+            mounted_path: "/mnt/studiofs-benchmark".to_string(),
             cache_root: r"D:\test-cache\vol-123".to_string(),
             metadata_root: Some(r"D:\test-cache".to_string()),
             block_size: DEFAULT_BLOCK_SIZE as u64,

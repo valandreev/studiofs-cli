@@ -9,18 +9,12 @@ use std::time::Instant;
 use studiofs_cache::{BenchmarkCache, BenchmarkCacheConfig, CacheReadLevel};
 use tokio::sync::Semaphore;
 
-use crate::cli::benchmark_engine::BenchmarkConfig;
-use crate::cli::benchmark_engine::profiling::{cpu_utilization_percent, process_cpu_time};
-use crate::cli::benchmark_engine::result::{
-    BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
-};
-use crate::cli::benchmark_engine::telemetry::{
-    DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
-    phase_telemetry_to_report, stream_reports_from_telemetry,
-};
-use crate::cli::benchmark_engine::workload::{
-    SizeClassBounds, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
-    split_stream_segments,
+use crate::cli::benchmark_engine::{
+    BenchmarkConfig, BenchmarkProfileReport, BenchmarkReport, CachePipelineReport,
+    CpuProfileReport, DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, SizeClassBounds,
+    build_access_sequence, build_advanced_metrics, build_work_sizes, classify_size,
+    cpu_utilization_percent, deterministic_bytes, phase_telemetry_to_report, process_cpu_time,
+    split_stream_segments, stream_reports_from_telemetry,
 };
 
 async fn run_shim_writes(
@@ -476,7 +470,7 @@ pub(super) async fn run_direct(
         .await?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         (merged, writes_by_stream)
     } else {
@@ -519,7 +513,7 @@ pub(super) async fn run_direct(
         .await?;
         let mut merged = DirectReadTelemetry::default();
         for stream in &reads_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         (merged, reads_by_stream)
     } else {

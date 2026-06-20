@@ -5,20 +5,29 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) mod mounted;
-pub(crate) mod profiling;
+mod mounted;
+mod profiling;
 mod progress;
 mod reporting;
-pub(crate) mod result;
-pub(crate) mod telemetry;
-pub(crate) mod workload;
+mod result;
+mod telemetry;
+mod workload;
 
+pub(crate) use mounted::run_mounted_end_to_end;
 pub(crate) use profiling::merge_profile_report;
+pub(crate) use profiling::{cpu_utilization_percent, process_cpu_time};
 pub(crate) use reporting::{render_human_summary, save_benchmark_report};
-pub(crate) use result::BenchmarkReport;
+pub(crate) use result::{
+    BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
+};
+pub(crate) use telemetry::{
+    DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
+    phase_telemetry_to_report, stream_reports_from_telemetry,
+};
 pub(crate) use workload::{
-    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, WorkloadSizeInput,
-    parse_size_arg, parse_sizes_arg,
+    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, SizeClassBounds,
+    WorkloadSizeInput, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
+    parse_size_arg, parse_sizes_arg, split_stream_segments,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -66,7 +75,7 @@ pub(crate) async fn run_mounted(
     config: &BenchmarkConfig,
     target: MountedBenchmarkTarget<'_>,
 ) -> Result<BenchmarkReport> {
-    mounted::run_mounted_end_to_end(
+    run_mounted_end_to_end(
         config,
         target.pid,
         target.volume,

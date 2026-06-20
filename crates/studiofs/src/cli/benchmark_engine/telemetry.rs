@@ -1,3 +1,4 @@
+use std::ops::AddAssign;
 use std::time::Duration;
 
 use super::result::{
@@ -146,8 +147,10 @@ impl LatencySamples {
             self.sample_keep_every.max(1)
         }
     }
+}
 
-    pub(crate) fn merge_from_ref(&mut self, other: &Self) {
+impl AddAssign<&Self> for LatencySamples {
+    fn add_assign(&mut self, other: &Self) {
         let self_keep = self.effective_keep_every();
         let other_keep = other.effective_keep_every();
         let mut target_keep = self_keep.max(other_keep);
@@ -203,11 +206,13 @@ impl SizeClassLatencySamples {
                 .to_size_class_report(SizeClass::Large, wall_elapsed_ms),
         ]
     }
+}
 
-    fn merge_from_ref(&mut self, other: &Self) {
-        self.small.merge_from_ref(&other.small);
-        self.medium.merge_from_ref(&other.medium);
-        self.large.merge_from_ref(&other.large);
+impl AddAssign<&Self> for SizeClassLatencySamples {
+    fn add_assign(&mut self, other: &Self) {
+        self.small += &other.small;
+        self.medium += &other.medium;
+        self.large += &other.large;
     }
 }
 
@@ -264,10 +269,12 @@ impl PhaseTelemetry {
             })
             .collect()
     }
+}
 
-    pub(crate) fn merge_from_ref(&mut self, other: &Self) {
-        self.overall.merge_from_ref(&other.overall);
-        self.by_size.merge_from_ref(&other.by_size);
+impl AddAssign<&Self> for PhaseTelemetry {
+    fn add_assign(&mut self, other: &Self) {
+        self.overall += &other.overall;
+        self.by_size += &other.by_size;
         self.operation_logs
             .extend(other.operation_logs.iter().cloned());
     }
@@ -308,13 +315,14 @@ impl CacheLevelTelemetryAccumulator {
             },
         }
     }
+}
 
-    pub(crate) fn merge_from_ref(&mut self, other: &Self) {
+impl AddAssign<&Self> for CacheLevelTelemetryAccumulator {
+    fn add_assign(&mut self, other: &Self) {
         self.l1_hits = self.l1_hits.saturating_add(other.l1_hits);
         self.l1_misses = self.l1_misses.saturating_add(other.l1_misses);
         self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
-        self.l1_lookup_latency
-            .merge_from_ref(&other.l1_lookup_latency);
+        self.l1_lookup_latency += &other.l1_lookup_latency;
     }
 }
 
@@ -324,10 +332,10 @@ pub(crate) struct DirectReadTelemetry {
     pub(crate) cache_levels: CacheLevelTelemetryAccumulator,
 }
 
-impl DirectReadTelemetry {
-    pub(crate) fn merge_from_ref(&mut self, other: &Self) {
-        self.phase.merge_from_ref(&other.phase);
-        self.cache_levels.merge_from_ref(&other.cache_levels);
+impl AddAssign<&Self> for DirectReadTelemetry {
+    fn add_assign(&mut self, other: &Self) {
+        self.phase += &other.phase;
+        self.cache_levels += &other.cache_levels;
     }
 }
 
@@ -413,7 +421,7 @@ mod tests {
             total_latency_ns: 0,
             sample_keep_every: 2,
         };
-        left.merge_from_ref(&right);
+        left += &right;
         assert_eq!(left.sample_keep_every, 4);
     }
 
@@ -433,7 +441,7 @@ mod tests {
             total_latency_ns: 0,
             sample_keep_every: 2,
         };
-        left.merge_from_ref(&right);
+        left += &right;
         assert_eq!(left.sample_keep_every, 2);
         assert_eq!(left.samples_ns, vec![1, 3, 10, 20, 30, 40]);
     }
@@ -445,7 +453,7 @@ mod tests {
             operation_index: 9,
             work_index: 3,
             worker_id: 2,
-            target: "Z:\\bench\\0003.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0003.bin".to_string(),
             size_class: SizeClass::Medium,
             bytes: 4 * 1024 * 1024,
             elapsed: Duration::from_millis(12),
@@ -454,7 +462,7 @@ mod tests {
             operation_index: 4,
             work_index: 1,
             worker_id: 0,
-            target: "Z:\\bench\\0001.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0001.bin".to_string(),
             size_class: SizeClass::Small,
             bytes: 512 * 1024,
             elapsed: Duration::from_millis(3),
@@ -466,11 +474,17 @@ mod tests {
         assert_eq!(report.operations_log.len(), 2);
         assert_eq!(report.operations_log[0].operation_index, 4);
         assert_eq!(report.operations_log[0].worker_id, 0);
-        assert_eq!(report.operations_log[0].target, "Z:\\bench\\0001.bin");
+        assert_eq!(
+            report.operations_log[0].target,
+            "/mnt/studiofs-benchmark/0001.bin"
+        );
         assert_eq!(report.operations_log[0].size_class, "small");
         assert_eq!(report.operations_log[1].operation_index, 9);
         assert_eq!(report.operations_log[1].worker_id, 2);
-        assert_eq!(report.operations_log[1].target, "Z:\\bench\\0003.bin");
+        assert_eq!(
+            report.operations_log[1].target,
+            "/mnt/studiofs-benchmark/0003.bin"
+        );
         assert_eq!(report.operations_log[1].size_class, "medium");
     }
 }
