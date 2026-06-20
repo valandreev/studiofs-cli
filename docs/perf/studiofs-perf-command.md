@@ -14,7 +14,7 @@ studiofs perf Z: --section bridge --section vfs
 studiofs perf Z: --section runtime --section upload --section object
 studiofs perf Z: --json --count 1
 studiofs perf Z: --json-lines --count 5
-studiofs perf Z: --schema
+studiofs perf --schema
 ```
 
 On Linux or macOS, pass the mount directory:
@@ -43,7 +43,7 @@ newline-delimited JSON, one sample per line. Both machine-readable modes keep
 the stable schema section keys such as `vfs_read` and `upload_queue`.
 
 `--schema` prints the supported schema version, stats file name, section list,
-line kinds, and units without reading the mounted stats file.
+line kinds, and units without requiring or reading a mounted stats file.
 
 ## Sections
 

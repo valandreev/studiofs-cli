@@ -251,7 +251,7 @@ mod tests {
                 json,
                 json_lines,
             }) => {
-                assert_eq!(mountpoint, std::path::PathBuf::from("Z:"));
+                assert_eq!(mountpoint, Some(std::path::PathBuf::from("Z:")));
                 assert_eq!(interval, 250);
                 assert_eq!(count, Some(2));
                 assert!(!schema);
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn perf_command_parses_schema_and_json_flags() {
-        let cli = parse_for_test(&["perf", "Z:", "--schema", "--json"]).unwrap();
+        let cli = parse_for_test(&["perf", "--schema", "--json"]).unwrap();
 
         match cli.command {
             Commands::Perf(perf::PerfArgs {
@@ -276,7 +276,7 @@ mod tests {
                 json_lines,
                 ..
             }) => {
-                assert_eq!(mountpoint, std::path::PathBuf::from("Z:"));
+                assert_eq!(mountpoint, None);
                 assert!(schema);
                 assert!(json);
                 assert!(!json_lines);

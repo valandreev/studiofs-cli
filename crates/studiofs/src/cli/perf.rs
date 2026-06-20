@@ -1,5 +1,6 @@
 //! `studiofs perf` - live runtime stats viewer for mounted StudioFS volumes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
@@ -33,11 +34,12 @@ EXAMPLES:
   studiofs perf /mnt/studio --interval 500 --count 10
   studiofs perf Z: --section bridge --section vfs-read
   studiofs perf Z: --json-lines --count 5
-  studiofs perf Z: --schema
+  studiofs perf --schema
 ")]
 pub(crate) struct PerfArgs {
     /// StudioFS mount point containing the hidden runtime stats file
-    pub(crate) mountpoint: PathBuf,
+    #[arg(required_unless_present = "schema")]
+    pub(crate) mountpoint: Option<PathBuf>,
 
     /// Sampling interval in milliseconds
     #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
@@ -87,6 +89,9 @@ impl PerfArgs {
                 "--json requires --count for finite output; use --json-lines for continuous streaming"
             );
         }
+        if !self.schema && self.mountpoint.is_none() {
+            bail!("<mountpoint> is required unless --schema is passed");
+        }
 
         Ok(PerfOptions {
             mountpoint: self.mountpoint,
@@ -108,7 +113,7 @@ impl PerfArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PerfOptions {
-    mountpoint: PathBuf,
+    mountpoint: Option<PathBuf>,
     interval: Duration,
     count: Option<u64>,
     schema: bool,
@@ -145,13 +150,13 @@ struct PerfCounterSample {
     total: u64,
     delta: u64,
     rate_per_sec: f64,
-    unit: String,
+    unit: Cow<'static, str>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 struct PerfGaugeSample {
     value: u64,
-    unit: String,
+    unit: Cow<'static, str>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -159,7 +164,7 @@ struct PerfLatencySample {
     count_delta: u64,
     sum_delta: u64,
     avg: Option<f64>,
-    unit: String,
+    unit: Cow<'static, str>,
 }
 
 fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
@@ -168,7 +173,11 @@ fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let stats_path = stats_path(&options.mountpoint);
+    let mountpoint = options
+        .mountpoint
+        .as_deref()
+        .context("<mountpoint> is required unless --schema is passed")?;
+    let stats_path = stats_path(mountpoint);
     run_perf_with_sampler(options, out, || read_snapshot(&stats_path), thread::sleep)
 }
 
@@ -189,6 +198,7 @@ fn run_perf_with_sampler(
     let mut previous = read_next()?;
     let mut remaining = options.count;
     let mut printed_header = false;
+    let mut printed_warnings = BTreeSet::new();
 
     loop {
         if matches!(remaining, Some(0)) {
@@ -198,7 +208,14 @@ fn run_perf_with_sampler(
         sleep(options.interval);
         let current = read_next()?;
         let sample = build_sample(&previous, &current, options);
-        write_sample(out, &sample, options, &mut printed_header)?;
+        write_sample(
+            out,
+            &sample,
+            options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )?;
+        out.flush()?;
         previous = current;
 
         if let Some(count) = remaining.as_mut() {
@@ -230,7 +247,9 @@ fn run_json_perf_with_sampler(
         samples.push(build_sample(&previous, &current, options));
         previous = current;
     }
-    write_json_samples(out, &samples)
+    write_json_samples(out, &samples)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn stats_path(mountpoint: &Path) -> PathBuf {
@@ -326,7 +345,7 @@ fn build_section_sample(
                 total: metric.value,
                 delta,
                 rate_per_sec: rate(delta, seconds),
-                unit: metric.unit.to_string(),
+                unit: metric.unit.clone(),
             },
         );
     }
@@ -336,7 +355,7 @@ fn build_section_sample(
             name.clone(),
             PerfGaugeSample {
                 value: metric.value,
-                unit: metric.unit.to_string(),
+                unit: metric.unit.clone(),
             },
         );
     }
@@ -366,7 +385,7 @@ fn build_latency_sample(
         count_delta,
         sum_delta,
         avg: (count_delta > 0).then_some(sum_delta as f64 / count_delta as f64),
-        unit: current.unit.to_string(),
+        unit: current.unit.clone(),
     }
 }
 
@@ -383,9 +402,10 @@ fn write_sample(
     sample: &PerfSample,
     options: &PerfOptions,
     printed_header: &mut bool,
+    printed_warnings: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     match options.output {
-        PerfOutput::Table => write_table_sample(out, sample, printed_header),
+        PerfOutput::Table => write_table_sample(out, sample, printed_header, printed_warnings),
         PerfOutput::Json => bail!("finite JSON output must be written as a sample array"),
         PerfOutput::JsonLines => {
             serde_json::to_writer(&mut *out, sample)?;
@@ -405,6 +425,7 @@ fn write_table_sample(
     out: &mut impl Write,
     sample: &PerfSample,
     printed_header: &mut bool,
+    printed_warnings: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     if !*printed_header {
         writeln!(
@@ -416,7 +437,9 @@ fn write_table_sample(
     }
 
     for warning in &sample.warnings {
-        writeln!(out, "warning: {warning}")?;
+        if printed_warnings.insert(warning.clone()) {
+            writeln!(out, "warning: {warning}")?;
+        }
     }
 
     for (section_name, section) in &sample.sections {
@@ -447,19 +470,20 @@ fn write_table_sample(
             )?;
         }
         for (name, latency) in &section.latencies {
+            let latency_rate = rate(latency.count_delta, sample.interval_ms as f64 / 1000.0);
             let avg = latency
                 .avg
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_string());
             writeln!(
                 out,
-                "{:<13} {:<13} {:<9} {:<28} {:>14} {:>14} {:<10}",
+                "{:<13} {:<13} {:<9} {:<28} {:>14.2} {:>14} {:<10}",
                 sample.generated_unix_ms,
                 display_section_name(section_name),
                 "latency",
                 display_metric_name(name),
+                latency_rate,
                 avg,
-                latency.count_delta,
                 latency.unit
             )?;
         }
@@ -567,7 +591,27 @@ fn section_help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
     use studiofs_vfs::{RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric};
+
+    #[derive(Default)]
+    struct FlushingBuffer {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushingBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
 
     fn scalar(value: u64, unit: &'static str) -> RuntimeScalarMetric {
         RuntimeScalarMetric {
@@ -662,7 +706,7 @@ mod tests {
     #[test]
     fn into_options_rejects_zero_interval() {
         let args = PerfArgs {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: 0,
             count: Some(1),
             schema: false,
@@ -683,7 +727,7 @@ mod tests {
     #[test]
     fn into_options_rejects_json_and_json_lines_together() {
         let args = PerfArgs {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: 1,
             count: Some(1),
             schema: false,
@@ -706,7 +750,7 @@ mod tests {
     #[test]
     fn into_options_rejects_continuous_json_without_count() {
         let args = PerfArgs {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: 1,
             count: None,
             schema: false,
@@ -739,7 +783,7 @@ mod tests {
     #[test]
     fn build_sample_computes_counter_rates_and_gauges_from_interval_delta() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
@@ -767,7 +811,7 @@ mod tests {
     #[test]
     fn build_sample_uses_configured_interval_when_snapshot_timestamps_do_not_advance() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_millis(250),
             count: Some(1),
             schema: false,
@@ -788,7 +832,7 @@ mod tests {
     #[test]
     fn build_sample_includes_latency_averages_when_verbose() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
@@ -812,7 +856,7 @@ mod tests {
     #[test]
     fn table_output_warns_when_selected_section_has_no_stats() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
@@ -827,17 +871,71 @@ mod tests {
         );
         let mut out = Vec::new();
         let mut printed_header = false;
+        let mut printed_warnings = BTreeSet::new();
 
-        write_sample(&mut out, &sample, &options, &mut printed_header).expect("write table");
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("warning: missing stats for section 'metadata'"));
     }
 
     #[test]
+    fn table_output_deduplicates_repeated_missing_section_warnings() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["metadata"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::Table,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+        let mut out = Vec::new();
+        let mut printed_header = false;
+        let mut printed_warnings = BTreeSet::new();
+
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write first table sample");
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write second table sample");
+        let output = String::from_utf8(out).expect("table is utf8");
+
+        assert_eq!(
+            output
+                .matches("missing stats for section 'metadata'")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn table_output_uses_readable_section_metric_and_kind_labels() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
@@ -852,8 +950,16 @@ mod tests {
         );
         let mut out = Vec::new();
         let mut printed_header = false;
+        let mut printed_warnings = BTreeSet::new();
 
-        write_sample(&mut out, &sample, &options, &mut printed_header).expect("write table");
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("time_ms"));
@@ -869,9 +975,45 @@ mod tests {
     }
 
     #[test]
+    fn table_output_labels_latency_rate_and_average_columns() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            schema: false,
+            sections: vec!["object_io"],
+            verbosity: PerfVerbosity::Verbose,
+            output: PerfOutput::Table,
+        };
+        let sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 300, 0),
+            &options,
+        );
+        let mut out = Vec::new();
+        let mut printed_header = false;
+        let mut printed_warnings = BTreeSet::new();
+
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write table");
+        let output = String::from_utf8(out).expect("table is utf8");
+
+        assert!(output.contains("latency"));
+        assert!(output.contains("2.00"));
+        assert!(output.contains("1000.00"));
+        assert!(output.contains("ns"));
+    }
+
+    #[test]
     fn json_lines_output_is_one_compact_line_per_sample() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: false,
@@ -886,8 +1028,16 @@ mod tests {
         );
         let mut out = Vec::new();
         let mut printed_header = false;
+        let mut printed_warnings = BTreeSet::new();
 
-        write_sample(&mut out, &sample, &options, &mut printed_header).expect("write json lines");
+        write_sample(
+            &mut out,
+            &sample,
+            &options,
+            &mut printed_header,
+            &mut printed_warnings,
+        )
+        .expect("write json lines");
         let output = String::from_utf8(out).expect("json lines is utf8");
 
         assert_eq!(output.lines().count(), 1);
@@ -896,7 +1046,7 @@ mod tests {
     #[test]
     fn json_output_is_parseable_pretty_sample_array() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_millis(250),
             count: Some(2),
             schema: false,
@@ -936,7 +1086,7 @@ mod tests {
     #[test]
     fn json_output_count_zero_is_empty_array_without_reading_stats() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_millis(250),
             count: Some(0),
             schema: false,
@@ -966,7 +1116,7 @@ mod tests {
     #[test]
     fn run_perf_count_zero_exits_without_reading_stats() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_secs(1),
             count: Some(0),
             schema: false,
@@ -995,7 +1145,7 @@ mod tests {
     #[test]
     fn run_perf_count_limited_run_prints_one_record_per_interval_sample() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: Some(PathBuf::from("Z:")),
             interval: Duration::from_millis(250),
             count: Some(2),
             schema: false,
@@ -1031,9 +1181,43 @@ mod tests {
     }
 
     #[test]
+    fn run_perf_flushes_after_each_streamed_sample() {
+        let options = PerfOptions {
+            mountpoint: Some(PathBuf::from("Z:")),
+            interval: Duration::from_millis(250),
+            count: Some(2),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::JsonLines,
+        };
+        let snapshots = [
+            snapshot_at(1_000, 100, 0),
+            snapshot_at(1_250, 200, 0),
+            snapshot_at(1_500, 450, 0),
+        ];
+        let mut next_snapshot = 0;
+        let mut out = FlushingBuffer::default();
+
+        run_perf_with_sampler(
+            &options,
+            &mut out,
+            || {
+                let snapshot = snapshots[next_snapshot].clone();
+                next_snapshot += 1;
+                Ok(snapshot)
+            },
+            |_| {},
+        )
+        .expect("count limited sampling");
+
+        assert_eq!(out.flushes, 2);
+    }
+
+    #[test]
     fn schema_output_includes_stable_sections_and_stats_file() {
         let options = PerfOptions {
-            mountpoint: PathBuf::from("Z:"),
+            mountpoint: None,
             interval: Duration::from_secs(1),
             count: Some(1),
             schema: true,
