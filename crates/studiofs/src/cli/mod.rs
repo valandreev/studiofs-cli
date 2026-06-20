@@ -222,8 +222,7 @@ mod tests {
         let is_hidden = Cli::command()
             .get_subcommands()
             .find(|cmd| cmd.get_name() == "test-cache")
-            .map(clap::Command::is_hide_set)
-            .unwrap_or(false);
+            .is_some_and(clap::Command::is_hide_set);
 
         assert!(
             is_hidden,
