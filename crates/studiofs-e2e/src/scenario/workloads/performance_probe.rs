@@ -178,30 +178,20 @@ fn validate_mounted_performance_probe(
             ),
         });
     }
-    if summary.workload_kind != PERFORMANCE_PROBE_WORKLOAD_KIND {
-        return Err(ScenarioError::PerformanceProbeValidationFailed {
-            detail: format!(
-                "performance probe workload kind is {}, expected {PERFORMANCE_PROBE_WORKLOAD_KIND}",
-                summary.workload_kind
-            ),
-        });
-    }
-    if summary.payload_file_count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT {
-        return Err(ScenarioError::PerformanceProbeValidationFailed {
-            detail: format!(
-                "performance probe payload file count is {}, expected {PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT}",
-                summary.payload_file_count
-            ),
-        });
-    }
+    validate_performance_probe_workload_shape(&summary)?;
 
     let validation = json!({
         "scenario": scenario_name,
         "run_id": context.run_id,
         "seed": context.seed,
         "status": "passed",
-        "workload_kind": summary.workload_kind,
-        "payload_file_count": summary.payload_file_count,
+        "workload_kind": summary
+            .workload_kind
+            .as_deref()
+            .unwrap_or(PERFORMANCE_PROBE_WORKLOAD_KIND),
+        "payload_file_count": summary
+            .payload_file_count
+            .unwrap_or(PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT),
         "file_bytes": summary.config.file_bytes,
         "read_passes": summary.config.read_passes,
         "read_observations": summary.read_observations,
@@ -217,6 +207,30 @@ fn validate_mounted_performance_probe(
         format!("artifacts/scenarios/{scenario_name}/{PERFORMANCE_PROBE_SAMPLES_FILE}"),
         format!("artifacts/scenarios/{scenario_name}/{PERFORMANCE_PROBE_VALIDATION_FILE}"),
     ])
+}
+
+fn validate_performance_probe_workload_shape(
+    summary: &PerformanceProbeSummary,
+) -> Result<(), ScenarioError> {
+    if let Some(ref workload_kind) = summary.workload_kind {
+        if workload_kind != PERFORMANCE_PROBE_WORKLOAD_KIND {
+            return Err(ScenarioError::PerformanceProbeValidationFailed {
+                detail: format!(
+                    "performance probe workload kind is {workload_kind}, expected {PERFORMANCE_PROBE_WORKLOAD_KIND}"
+                ),
+            });
+        }
+    }
+    if let Some(payload_file_count) = summary.payload_file_count {
+        if payload_file_count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT {
+            return Err(ScenarioError::PerformanceProbeValidationFailed {
+                detail: format!(
+                    "performance probe payload file count is {payload_file_count}, expected {PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn run_mounted_performance_probe(
@@ -335,8 +349,8 @@ fn run_mounted_performance_probe(
         file_path: probe_path.display().to_string(),
         metrics_path: metrics_path.display().to_string(),
         samples_path: samples_path.display().to_string(),
-        workload_kind: PERFORMANCE_PROBE_WORKLOAD_KIND.to_string(),
-        payload_file_count: PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT,
+        workload_kind: Some(PERFORMANCE_PROBE_WORKLOAD_KIND.to_string()),
+        payload_file_count: Some(PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT),
         config: PerformanceProbeConfigSummary::from(config),
         bootstrap_volume: client.volume_name.clone(),
         phases,
@@ -845,8 +859,8 @@ struct PerformanceProbeSummary {
     file_path: String,
     metrics_path: String,
     samples_path: String,
-    workload_kind: String,
-    payload_file_count: u32,
+    workload_kind: Option<String>,
+    payload_file_count: Option<u32>,
     config: PerformanceProbeConfigSummary,
     bootstrap_volume: String,
     phases: Vec<PerformanceProbePhase>,
@@ -1328,7 +1342,63 @@ mod tests {
 
     #[test]
     fn performance_probe_summary_records_single_large_file_workload_shape() {
-        let summary = PerformanceProbeSummary {
+        let summary = test_performance_probe_summary();
+
+        assert_eq!(
+            summary.workload_kind.as_deref(),
+            Some("single_file_sequential")
+        );
+        assert_eq!(summary.payload_file_count, Some(1));
+        let artifact = serde_json::to_value(&summary).expect("summary should serialize");
+        assert_eq!(artifact["workload_kind"], "single_file_sequential");
+        assert_eq!(artifact["payload_file_count"], 1);
+    }
+
+    #[test]
+    fn performance_probe_summary_accepts_legacy_artifact_without_workload_shape() {
+        let summary = test_performance_probe_summary();
+        let mut artifact = serde_json::to_value(&summary).expect("summary should serialize");
+        let object = artifact
+            .as_object_mut()
+            .expect("summary artifact should be a JSON object");
+        object.remove("workload_kind");
+        object.remove("payload_file_count");
+
+        let legacy_summary: PerformanceProbeSummary =
+            serde_json::from_value(artifact).expect("legacy summary should deserialize");
+
+        assert_eq!(legacy_summary.workload_kind, None);
+        assert_eq!(legacy_summary.payload_file_count, None);
+    }
+
+    #[test]
+    fn performance_probe_workload_shape_validation_accepts_legacy_missing_fields() {
+        let mut summary = test_performance_probe_summary();
+        summary.workload_kind = None;
+        summary.payload_file_count = None;
+
+        validate_performance_probe_workload_shape(&summary)
+            .expect("legacy summary missing workload shape should still validate");
+    }
+
+    #[test]
+    fn performance_probe_workload_shape_validation_rejects_mismatched_present_fields() {
+        let mut summary = test_performance_probe_summary();
+        summary.payload_file_count = Some(2);
+
+        let error = validate_performance_probe_workload_shape(&summary)
+            .expect_err("mismatched workload shape should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("performance probe payload file count is 2"),
+            "unexpected validation error: {error}"
+        );
+    }
+
+    fn test_performance_probe_summary() -> PerformanceProbeSummary {
+        PerformanceProbeSummary {
             scenario: MOUNTED_PERFORMANCE_PROBE.to_string(),
             run_id: "run-1".to_string(),
             seed: 42,
@@ -1338,8 +1408,8 @@ mod tests {
             file_path: "/mnt/studiofs/performance-probe/probe-data.bin".to_string(),
             metrics_path: "/tmp/write_path_observability.json".to_string(),
             samples_path: "/tmp/performance-probe-samples.ndjson".to_string(),
-            workload_kind: PERFORMANCE_PROBE_WORKLOAD_KIND.to_string(),
-            payload_file_count: PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT,
+            workload_kind: Some(PERFORMANCE_PROBE_WORKLOAD_KIND.to_string()),
+            payload_file_count: Some(PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT),
             config: PerformanceProbeConfigSummary {
                 file_bytes: DEFAULT_FILE_BYTES,
                 chunk_bytes: DEFAULT_CHUNK_BYTES,
@@ -1355,13 +1425,7 @@ mod tests {
             upload_drain: None,
             write_observations: PerformanceProbeWriteObservations::default(),
             read_observations: PerformanceProbeReadObservations::default(),
-        };
-
-        assert_eq!(summary.workload_kind, "single_file_sequential");
-        assert_eq!(summary.payload_file_count, 1);
-        let artifact = serde_json::to_value(&summary).expect("summary should serialize");
-        assert_eq!(artifact["workload_kind"], "single_file_sequential");
-        assert_eq!(artifact["payload_file_count"], 1);
+        }
     }
 
     #[test]
