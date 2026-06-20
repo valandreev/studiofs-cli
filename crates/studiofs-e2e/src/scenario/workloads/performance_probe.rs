@@ -212,23 +212,25 @@ fn validate_mounted_performance_probe(
 fn validate_performance_probe_workload_shape(
     summary: &PerformanceProbeSummary,
 ) -> Result<(), ScenarioError> {
-    if let Some(kind) = summary.workload_kind.as_deref()
-        && kind != PERFORMANCE_PROBE_WORKLOAD_KIND
-    {
-        return Err(ScenarioError::PerformanceProbeValidationFailed {
-            detail: format!(
-                "performance probe workload kind is {kind}, expected {PERFORMANCE_PROBE_WORKLOAD_KIND}"
-            ),
-        });
+    match &summary.workload_kind {
+        Some(kind) if kind != PERFORMANCE_PROBE_WORKLOAD_KIND => {
+            return Err(ScenarioError::PerformanceProbeValidationFailed {
+                detail: format!(
+                    "performance probe workload kind is {kind}, expected {PERFORMANCE_PROBE_WORKLOAD_KIND}"
+                ),
+            });
+        }
+        _ => {}
     }
-    if let Some(payload_file_count) = summary.payload_file_count
-        && payload_file_count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT
-    {
-        return Err(ScenarioError::PerformanceProbeValidationFailed {
-            detail: format!(
-                "performance probe payload file count is {payload_file_count}, expected {PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT}"
-            ),
-        });
+    match summary.payload_file_count {
+        Some(count) if count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT => {
+            return Err(ScenarioError::PerformanceProbeValidationFailed {
+                detail: format!(
+                    "performance probe payload file count is {count}, expected {PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT}"
+                ),
+            });
+        }
+        _ => {}
     }
     Ok(())
 }
