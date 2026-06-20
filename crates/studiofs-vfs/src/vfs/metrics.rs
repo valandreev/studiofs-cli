@@ -88,7 +88,11 @@ impl RuntimeStatsSnapshot {
 
 impl fmt::Display for RuntimeStatsSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "# studiofs_runtime_stats schema_version=1")?;
+        writeln!(
+            f,
+            "# studiofs_runtime_stats schema_version={}",
+            self.schema_version
+        )?;
         writeln!(
             f,
             "gauge system.schema_version count {}",
@@ -243,8 +247,16 @@ impl RuntimeStatsSnapshot {
     }
 
     fn split_metric_name(name: &str, line: usize) -> Result<(&str, &str), RuntimeStatsParseError> {
-        name.split_once('.')
-            .ok_or_else(|| RuntimeStatsParseError::new(line, "metric name must be section.key"))
+        let (section, key) = name
+            .split_once('.')
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "metric name must be section.key"))?;
+        if section.is_empty() || key.is_empty() {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "metric section and key must not be empty",
+            ));
+        }
+        Ok((section, key))
     }
 
     fn set_scalar_metric(
@@ -429,6 +441,20 @@ fn insert_latency_bucket(buckets: &mut Vec<RuntimeLatencyBucket>, bucket: Runtim
     }
 }
 
+fn deserialize_sorted_latency_buckets<'de, D>(
+    deserializer: D,
+) -> Result<Vec<RuntimeLatencyBucket>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
+    let mut buckets = Vec::with_capacity(raw_buckets.len());
+    for bucket in raw_buckets {
+        insert_latency_bucket(&mut buckets, bucket);
+    }
+    Ok(buckets)
+}
+
 /// Scalar counter or gauge value with a stable unit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeScalarMetric {
@@ -449,6 +475,7 @@ pub struct RuntimeLatencyHistogram {
     /// Unit used for `sum`; bucket bounds are always nanoseconds.
     pub unit: Cow<'static, str>,
     /// Bucket counts keyed by inclusive upper-bound nanoseconds.
+    #[serde(default, deserialize_with = "deserialize_sorted_latency_buckets")]
     pub buckets: Vec<RuntimeLatencyBucket>,
 }
 
@@ -1922,6 +1949,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_stats_snapshot_deserializes_sorted_unique_histogram_buckets() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "object_io": {
+                "latencies": {
+                    "get": {
+                        "count": 3,
+                        "sum": 90_000,
+                        "unit": "ns",
+                        "buckets": [
+                            { "le_ns": 500_000, "count": 1 },
+                            { "le_ns": 100_000, "count": 2 },
+                            { "le_ns": 500_000, "count": 3 }
+                        ]
+                    }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with unordered buckets");
+
+        assert_eq!(
+            snapshot.object_io.latencies["get"].buckets,
+            vec![
+                RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                },
+                RuntimeLatencyBucket {
+                    le_ns: 500_000,
+                    count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn runtime_stats_text_round_trips_counter_gauge_and_latency_histogram() {
         let mut snapshot = RuntimeStatsSnapshot {
             generated_unix_ms: 1_720_000_000_000,
@@ -1999,6 +2061,53 @@ mod tests {
                 .to_string()
                 .contains("unexpected trailing fields")
         );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_empty_metric_section_or_key() {
+        let empty_key = RuntimeStatsSnapshot::parse_text("counter system. count 1\n")
+            .expect_err("empty metric key should fail");
+        let empty_section = RuntimeStatsSnapshot::parse_text("counter .calls count 1\n")
+            .expect_err("empty metric section should fail");
+
+        assert!(
+            empty_key
+                .to_string()
+                .contains("metric section and key must not be empty")
+        );
+        assert!(
+            empty_section
+                .to_string()
+                .contains("metric section and key must not be empty")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_display_uses_snapshot_schema_version_in_header() {
+        let snapshot = RuntimeStatsSnapshot {
+            schema_version: 7,
+            ..RuntimeStatsSnapshot::default()
+        };
+
+        assert!(
+            snapshot
+                .to_string()
+                .starts_with("# studiofs_runtime_stats schema_version=7\n")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_sections_constant_matches_accessors() {
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        for section in RUNTIME_STATS_SECTIONS {
+            assert!(
+                snapshot.section_mut(section).is_some(),
+                "section {section} is missing from section_mut"
+            );
+        }
+
+        let section_names: Vec<&str> = snapshot.sections().map(|(name, _)| name).collect();
+        assert_eq!(section_names, RUNTIME_STATS_SECTIONS);
     }
 
     #[test]
