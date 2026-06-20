@@ -56,9 +56,13 @@ pub fn read_runtime_stats_buffer(bytes: &[u8], offset: u64, out: &mut [u8]) -> u
         Ok(offset) => offset.min(bytes.len()),
         Err(_) => bytes.len(),
     };
-    let readable = bytes.len().saturating_sub(offset).min(out.len());
+    let readable = bytes
+        .len()
+        .saturating_sub(offset)
+        .min(out.len())
+        .min(u32::MAX as usize);
     out[..readable].copy_from_slice(&bytes[offset..offset + readable]);
-    u32::try_from(readable).unwrap_or(u32::MAX)
+    readable as u32
 }
 
 impl StudioVfs {
