@@ -7,11 +7,11 @@
 mod args;
 mod direct;
 mod mode;
-mod mounted;
+pub(crate) mod mounted;
 mod profiling;
 mod progress;
 mod reporting;
-mod result;
+pub(crate) mod result;
 mod telemetry;
 mod workload;
 
@@ -26,10 +26,10 @@ use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 pub use args::TestCacheAccessPattern;
 pub(crate) use args::TestCacheArgs;
 
+use crate::cli::benchmark_engine::{MountedBenchmarkEngine, MountedBenchmarkTarget};
 use args::TestCacheRunRequest;
 use direct::run_direct;
 use mode::{ResolvedRunMode, resolve_run_mode};
-use mounted::run_mounted_end_to_end;
 use profiling::merge_profile_report;
 use reporting::{render_human_summary, save_benchmark_report};
 use workload::{
@@ -107,25 +107,25 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
 }
 
 #[derive(Debug)]
-struct TestCacheParams {
-    target: PathBuf,
-    block_size: u64,
-    read_size: u64,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
-    workload_repeat: usize,
-    concurrency: usize,
-    sequential_streams: bool,
-    io_depth: usize,
-    warmup_runs: u32,
-    sizes: WorkloadSizeInput,
-    access_pattern: TestCacheAccessPattern,
-    during_upload_min_pending: usize,
-    during_upload_timeout: std::time::Duration,
-    l1_limit: u64,
-    profile: bool,
-    full_file_reads: bool,
-    run_id: String,
+pub(crate) struct TestCacheParams {
+    pub(crate) target: PathBuf,
+    pub(crate) block_size: u64,
+    pub(crate) read_size: u64,
+    pub(crate) size_class_small_max: u64,
+    pub(crate) size_class_medium_max: u64,
+    pub(crate) workload_repeat: usize,
+    pub(crate) concurrency: usize,
+    pub(crate) sequential_streams: bool,
+    pub(crate) io_depth: usize,
+    pub(crate) warmup_runs: u32,
+    pub(crate) sizes: WorkloadSizeInput,
+    pub(crate) access_pattern: TestCacheAccessPattern,
+    pub(crate) during_upload_min_pending: usize,
+    pub(crate) during_upload_timeout: std::time::Duration,
+    pub(crate) l1_limit: u64,
+    pub(crate) profile: bool,
+    pub(crate) full_file_reads: bool,
+    pub(crate) run_id: String,
 }
 
 fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -292,13 +292,15 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                 work_root,
                 cache_path,
             } => {
-                run_mounted_end_to_end(
+                MountedBenchmarkEngine::run(
                     &params,
-                    *pid,
-                    volume,
-                    mount_point,
-                    work_root,
-                    cache_path.as_deref(),
+                    MountedBenchmarkTarget {
+                        pid: *pid,
+                        volume,
+                        mount_point,
+                        work_root,
+                        cache_path: cache_path.as_deref(),
+                    },
                 )
                 .await
             }

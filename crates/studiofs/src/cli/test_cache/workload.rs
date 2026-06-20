@@ -30,7 +30,7 @@ impl SizeClass {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum WorkloadSizeInput {
+pub(crate) enum WorkloadSizeInput {
     Default,
     Percentages { small: u8, medium: u8, large: u8 },
     ExplicitList(Vec<u64>),

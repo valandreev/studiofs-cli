@@ -116,6 +116,18 @@ foreground read path.
   startup replay. Publication is a separate control-plane step that flips remote
   visibility at file-version granularity after payload readiness is confirmed.
 
+## Mounted Benchmark Engine
+
+- The internal `cli::benchmark_engine` module is the reusable entry point for
+  mounted filesystem benchmarks. It accepts mounted runtime metadata, workload
+  parameters, and returns the existing benchmark report schema.
+- The hidden legacy `test-cache` command delegates mounted end-to-end runs to
+  this engine while keeping direct-shim behavior private to the legacy command.
+- Future `studiofs bench` commands should call the mounted engine instead of
+  reimplementing workload planning, latency sampling, phase aggregation,
+  profiling artifact collection, JSON reporting, or mounted observability
+  capture.
+
 ## Concurrency Model
 
 - Tokio owns async upload/fetch/background work.

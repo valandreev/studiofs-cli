@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 pub(crate) const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 
+pub(crate) mod benchmark_engine;
 pub mod cache_layout;
 pub mod destroy;
 pub mod discovery;

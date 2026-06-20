@@ -1830,7 +1830,7 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))
 }
 
-pub(super) async fn run_mounted_end_to_end(
+pub(crate) async fn run_mounted_end_to_end(
     params: &TestCacheParams,
     mount_pid: u32,
     volume: &str,

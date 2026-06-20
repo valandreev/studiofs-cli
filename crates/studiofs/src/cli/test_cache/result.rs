@@ -34,7 +34,7 @@ pub(super) struct OperationLogReport {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BenchmarkReport {
+pub(crate) struct BenchmarkReport {
     pub(super) run_id: String,
     pub(super) mode: String,
     pub(super) cache_dir: String,
