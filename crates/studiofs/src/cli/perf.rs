@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use studiofs_vfs::RuntimeScalarMetric;
 use studiofs_vfs::{
     RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_SECTIONS, RuntimeLatencyHistogram, RuntimeStatsSection,
     RuntimeStatsSnapshot,
 };
+
+use crate::diagnostics;
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const TABLE_HEADER_REPEAT_SAMPLES: u64 = 30;
@@ -183,6 +186,15 @@ fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
         .mountpoint
         .as_deref()
         .context("<mountpoint> is required unless --schema is passed")?;
+    if let Some(client) = diagnostics_client_for_mount(mountpoint)? {
+        return run_perf_with_sampler(
+            options,
+            out,
+            || read_diagnostics_snapshot(&client),
+            thread::sleep,
+        );
+    }
+
     let stats_path = stats_path(mountpoint);
     run_perf_with_sampler(options, out, || read_snapshot(&stats_path), thread::sleep)
 }
@@ -305,6 +317,311 @@ fn runtime_stats_unavailable_message(path: &Path) -> String {
         "StudioFS runtime stats surface is unavailable at '{}'; ensure this is a mounted StudioFS volume",
         path.display()
     )
+}
+
+fn diagnostics_client_for_mount(
+    mountpoint: &Path,
+) -> anyhow::Result<Option<diagnostics::LocalDiagnosticsClient>> {
+    let requested = mountpoint.to_string_lossy();
+    let client = diagnostics::discover_local_sessions()?
+        .into_iter()
+        .find(|session| mount_points_match(&session.mount_point, &requested))
+        .filter(|session| {
+            session.protocol_version >= diagnostics::DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION
+        })
+        .map(diagnostics::LocalDiagnosticsClient::new);
+    Ok(client)
+}
+
+fn read_diagnostics_snapshot(
+    client: &diagnostics::LocalDiagnosticsClient,
+) -> anyhow::Result<RuntimeStatsSnapshot> {
+    let snapshot = crate::runtime_bridge::block_on(async { client.runtime_snapshot().await })
+        .context("StudioFS diagnostics runtime stats surface is unavailable")?;
+    Ok(runtime_stats_from_diagnostics(snapshot))
+}
+
+fn mount_points_match(left: &str, right: &str) -> bool {
+    let left = normalize_perf_mountpoint(left);
+    let right = normalize_perf_mountpoint(right);
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(&right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn normalize_perf_mountpoint(raw: &str) -> String {
+    let normalized = crate::cli::utils::normalize_mount_point(raw.trim());
+    #[cfg(windows)]
+    {
+        let normalized = normalized.replace('/', "\\");
+        let mut chars = normalized.chars();
+        if let (Some(drive), Some(':'), rest) = (chars.next(), chars.next(), chars.as_str())
+            && drive.is_ascii_alphabetic()
+            && rest.chars().all(|ch| ch == '\\')
+        {
+            return format!("{}:", drive.to_ascii_uppercase());
+        }
+        normalized.trim_end_matches('\\').to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn runtime_stats_from_diagnostics(
+    diagnostics: diagnostics::DiagnosticsRuntimeSnapshot,
+) -> RuntimeStatsSnapshot {
+    let ingress = diagnostics.ingress;
+    let upload = diagnostics.upload;
+    let write_path = diagnostics.write_path;
+    let cache = diagnostics.cache.state;
+
+    let mut snapshot = RuntimeStatsSnapshot {
+        generated_unix_ms: diagnostics.generated_unix_ms,
+        ..RuntimeStatsSnapshot::default()
+    };
+
+    insert_gauge(
+        &mut snapshot.system,
+        "uptime_ms",
+        "ms",
+        (write_path.uptime_secs * 1000.0) as u64,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "read_callbacks",
+        "count",
+        write_path.fuse_callbacks.read.calls,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "write_callbacks",
+        "count",
+        write_path
+            .fuse_callbacks
+            .write
+            .calls
+            .saturating_add(write_path.winfsp_callbacks.write),
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "flush_callbacks",
+        "count",
+        write_path.winfsp_callbacks.flush,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "cleanup_callbacks",
+        "count",
+        write_path.winfsp_callbacks.cleanup,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "close_callbacks",
+        "count",
+        write_path.winfsp_callbacks.close,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "callback_errors",
+        "count",
+        write_path
+            .fuse_callbacks
+            .read
+            .errors
+            .saturating_add(write_path.fuse_callbacks.write.errors),
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "read_callback_bytes",
+        "bytes",
+        write_path.fuse_callbacks.read.bytes,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "write_callback_bytes",
+        "bytes",
+        write_path
+            .fuse_callbacks
+            .write
+            .bytes
+            .saturating_add(write_path.winfsp_write_path.write_bytes),
+    );
+    insert_counter(
+        &mut snapshot.vfs_read,
+        "calls",
+        "count",
+        write_path.vfs_read_path.calls,
+    );
+    insert_counter(
+        &mut snapshot.vfs_read,
+        "requested_bytes",
+        "bytes",
+        write_path.vfs_read_path.requested_bytes,
+    );
+    insert_counter(
+        &mut snapshot.vfs_write,
+        "calls",
+        "count",
+        write_path.vfs_write_path.calls,
+    );
+    insert_counter(
+        &mut snapshot.vfs_write,
+        "accepted_bytes",
+        "bytes",
+        write_path.vfs_write_path.write_bytes,
+    );
+    insert_counter(
+        &mut snapshot.vfs_write,
+        "flush_barrier_calls",
+        "count",
+        write_path.flush_barrier_calls,
+    );
+    insert_counter(
+        &mut snapshot.vfs_write,
+        "backpressure_events",
+        "count",
+        ingress.write_backpressure_events,
+    );
+    insert_gauge(
+        &mut snapshot.cache,
+        "dirty_bytes",
+        "bytes",
+        ingress.dirty_mem_bytes as u64,
+    );
+    insert_gauge(
+        &mut snapshot.cache,
+        "prefetch_queue_depth",
+        "count",
+        ingress.prefetch_queue_depth,
+    );
+    insert_gauge(
+        &mut snapshot.cache,
+        "resident_bytes",
+        "bytes",
+        cache.transit_memory.used_bytes as u64,
+    );
+    insert_gauge(&mut snapshot.cache, "evictable_bytes", "bytes", 0);
+    insert_gauge(
+        &mut snapshot.cache,
+        "local_backend_dirty_objects",
+        "count",
+        cache.local_backend_dirty_objects as u64,
+    );
+    insert_gauge(
+        &mut snapshot.upload_queue,
+        "pending_depth",
+        "count",
+        upload.pending_uploads as u64,
+    );
+    insert_gauge(
+        &mut snapshot.upload_queue,
+        "pending_bytes",
+        "bytes",
+        upload.pending_upload_bytes,
+    );
+    insert_gauge(
+        &mut snapshot.upload_queue,
+        "active_uploads",
+        "count",
+        upload.active_uploads as u64,
+    );
+    insert_gauge(
+        &mut snapshot.upload_queue,
+        "oldest_pending_age_ms",
+        "ms",
+        upload.oldest_pending_upload_age_ms,
+    );
+    insert_counter(
+        &mut snapshot.upload_queue,
+        "completed",
+        "count",
+        upload.completed_uploads,
+    );
+    insert_counter(
+        &mut snapshot.upload_queue,
+        "completed_bytes",
+        "bytes",
+        upload.completed_upload_bytes,
+    );
+    insert_counter(
+        &mut snapshot.upload_queue,
+        "requeued",
+        "count",
+        upload.upload_requeues,
+    );
+    insert_counter(
+        &mut snapshot.upload_queue,
+        "canceled",
+        "count",
+        upload
+            .canceled_deleted
+            .saturating_add(upload.canceled_stale),
+    );
+    insert_counter(
+        &mut snapshot.upload_queue,
+        "snapshot_pending_calls",
+        "count",
+        upload.pending_upload_snapshot_calls,
+    );
+    insert_counter(
+        &mut snapshot.object_io,
+        "put_calls",
+        "count",
+        upload.completed_uploads,
+    );
+    insert_counter(
+        &mut snapshot.object_io,
+        "put_bytes",
+        "bytes",
+        upload.completed_upload_bytes,
+    );
+    insert_counter(
+        &mut snapshot.object_io,
+        "encrypted_put_bytes",
+        "bytes",
+        upload.encrypted_bytes_written,
+    );
+    insert_counter(
+        &mut snapshot.object_io,
+        "errors",
+        "count",
+        upload.encrypted_object_write_failures,
+    );
+    insert_counter(
+        &mut snapshot.metadata,
+        "commit_calls",
+        "count",
+        write_path.metadata_commit.calls,
+    );
+
+    snapshot
+}
+
+fn insert_counter(section: &mut RuntimeStatsSection, name: &str, unit: &'static str, value: u64) {
+    section.counters.insert(
+        name.to_owned(),
+        RuntimeScalarMetric {
+            value,
+            unit: unit.into(),
+        },
+    );
+}
+
+fn insert_gauge(section: &mut RuntimeStatsSection, name: &str, unit: &'static str, value: u64) {
+    section.gauges.insert(
+        name.to_owned(),
+        RuntimeScalarMetric {
+            value,
+            unit: unit.into(),
+        },
+    );
 }
 
 fn build_sample(
@@ -707,6 +1024,68 @@ mod tests {
             },
         );
         snapshot
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_points_match_treats_drive_root_forms_as_equivalent() {
+        assert!(mount_points_match("Z:", r"Z:\"));
+        assert!(mount_points_match(r"\\?\Z:\", "z:"));
+    }
+
+    #[test]
+    fn runtime_stats_from_diagnostics_maps_perf_sections() {
+        let mut diagnostics = diagnostics::DiagnosticsRuntimeSnapshot {
+            generated_unix_ms: 42,
+            ..diagnostics::DiagnosticsRuntimeSnapshot::default()
+        };
+        diagnostics.write_path.uptime_secs = 3.5;
+        diagnostics.write_path.fuse_callbacks.read.calls = 2;
+        diagnostics.write_path.winfsp_callbacks.write = 3;
+        diagnostics.write_path.winfsp_write_path.write_bytes = 2048;
+        diagnostics.write_path.vfs_read_path.calls = 5;
+        diagnostics.write_path.vfs_read_path.requested_bytes = 4096;
+        diagnostics.write_path.vfs_write_path.calls = 7;
+        diagnostics.write_path.vfs_write_path.write_bytes = 8192;
+        diagnostics.write_path.metadata_commit.calls = 11;
+        diagnostics.ingress.dirty_mem_bytes = 13;
+        diagnostics.ingress.write_backpressure_events = 17;
+        diagnostics.cache.state.transit_memory.used_bytes = 19;
+        diagnostics.cache.state.local_backend_dirty_objects = 23;
+        diagnostics.upload.pending_uploads = 29;
+        diagnostics.upload.pending_upload_bytes = 31;
+        diagnostics.upload.completed_uploads = 37;
+        diagnostics.upload.completed_upload_bytes = 41;
+        diagnostics.upload.encrypted_bytes_written = 43;
+        diagnostics.upload.encrypted_object_write_failures = 47;
+
+        let snapshot = runtime_stats_from_diagnostics(diagnostics);
+
+        assert_eq!(snapshot.generated_unix_ms, 42);
+        assert_eq!(snapshot.system.gauges["uptime_ms"].value, 3500);
+        assert_eq!(snapshot.bridge.counters["read_callbacks"].value, 2);
+        assert_eq!(snapshot.bridge.counters["write_callbacks"].value, 3);
+        assert_eq!(snapshot.bridge.counters["write_callback_bytes"].value, 2048);
+        assert_eq!(snapshot.vfs_read.counters["calls"].value, 5);
+        assert_eq!(snapshot.vfs_read.counters["requested_bytes"].value, 4096);
+        assert_eq!(snapshot.vfs_write.counters["calls"].value, 7);
+        assert_eq!(snapshot.vfs_write.counters["accepted_bytes"].value, 8192);
+        assert_eq!(snapshot.vfs_write.counters["backpressure_events"].value, 17);
+        assert_eq!(snapshot.cache.gauges["dirty_bytes"].value, 13);
+        assert_eq!(snapshot.cache.gauges["resident_bytes"].value, 19);
+        assert_eq!(
+            snapshot.cache.gauges["local_backend_dirty_objects"].value,
+            23
+        );
+        assert_eq!(snapshot.upload_queue.gauges["pending_depth"].value, 29);
+        assert_eq!(snapshot.upload_queue.gauges["pending_bytes"].value, 31);
+        assert_eq!(snapshot.upload_queue.counters["completed"].value, 37);
+        assert_eq!(snapshot.upload_queue.counters["completed_bytes"].value, 41);
+        assert_eq!(snapshot.object_io.counters["put_calls"].value, 37);
+        assert_eq!(snapshot.object_io.counters["put_bytes"].value, 41);
+        assert_eq!(snapshot.object_io.counters["encrypted_put_bytes"].value, 43);
+        assert_eq!(snapshot.object_io.counters["errors"].value, 47);
+        assert_eq!(snapshot.metadata.counters["commit_calls"].value, 11);
     }
 
     #[test]
