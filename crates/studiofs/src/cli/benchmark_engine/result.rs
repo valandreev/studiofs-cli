@@ -1,3 +1,4 @@
+use crate::cli::benchmark_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
@@ -542,7 +543,7 @@ pub(crate) struct ProfileEndpointReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ProfileArtifactSummary {
-    pub(crate) kind: super::BenchmarkProfileArtifactKind,
+    pub(crate) kind: ProfileArtifactKind,
     pub(crate) path: String,
     pub(crate) bytes: u64,
     pub(crate) sent_to_endpoint: bool,
@@ -759,8 +760,8 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                 application_name: "studiofs.test-cache.direct-shim".to_string(),
             }),
             artifacts: vec![ProfileArtifactSummary {
-                kind: super::BenchmarkProfileArtifactKind::Cpu,
-                path: r"D:\test-cache\studiofs-test-cache-direct-shim-run-123-cpu.pprof.gz"
+                kind: ProfileArtifactKind::Cpu,
+                path: r"D:\test-cache\studiofs-benchmark-direct-shim-run-123-cpu.pprof.gz"
                     .to_string(),
                 bytes: 2048,
                 sent_to_endpoint: true,

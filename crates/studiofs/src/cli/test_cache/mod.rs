@@ -10,14 +10,12 @@ mod mode;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::benchmark_engine::{
-    BenchmarkAccessPattern, BenchmarkConfig, BenchmarkProfileArtifactKind,
-    BenchmarkProfileArtifactReport, BenchmarkProfileEndpoint, BenchmarkProfileResult,
-    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
-    merge_profile_report, parse_size_arg, parse_sizes_arg, render_human_summary, run_mounted,
-    save_benchmark_report,
+    BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_BENCHMARK_BLOCK_SIZE_STR,
+    DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, merge_profile_report, parse_size_arg,
+    parse_sizes_arg, render_human_summary, run_mounted, save_benchmark_report,
 };
-use crate::cli::test_cache_profile::TestCacheProfileSession;
-use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
+use crate::cli::benchmark_profile::BenchmarkProfileSession;
+use crate::cli::benchmark_profile_types::{BenchmarkProfileMode, BenchmarkProfileResult};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,45 +36,6 @@ impl From<TestCacheAccessPattern> for BenchmarkAccessPattern {
             TestCacheAccessPattern::Sequential => Self::Sequential,
             TestCacheAccessPattern::Random => Self::Random,
             TestCacheAccessPattern::Mixed => Self::Mixed,
-        }
-    }
-}
-
-impl From<TestCacheProfileResult> for BenchmarkProfileResult {
-    fn from(result: TestCacheProfileResult) -> Self {
-        Self {
-            endpoint: result.endpoint.map(|endpoint| BenchmarkProfileEndpoint {
-                url: endpoint.url,
-                application_name: endpoint.application_name,
-            }),
-            artifacts: result
-                .artifacts
-                .into_iter()
-                .map(|artifact| BenchmarkProfileArtifactReport {
-                    kind: artifact.kind.into(),
-                    path: artifact.path,
-                    bytes: artifact.bytes,
-                    sent_to_endpoint: artifact.sent_to_endpoint,
-                })
-                .collect(),
-            warnings: result.warnings,
-        }
-    }
-}
-
-impl From<crate::cli::test_cache_profile_types::ProfileArtifactKind>
-    for BenchmarkProfileArtifactKind
-{
-    fn from(kind: crate::cli::test_cache_profile_types::ProfileArtifactKind) -> Self {
-        match kind {
-            crate::cli::test_cache_profile_types::ProfileArtifactKind::Cpu => Self::Cpu,
-            crate::cli::test_cache_profile_types::ProfileArtifactKind::Memory => Self::Memory,
-            crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathObservability => {
-                Self::WritePathObservability
-            }
-            crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathSummary => {
-                Self::WritePathSummary
-            }
         }
     }
 }
@@ -142,7 +101,7 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         during_upload_min_pending: 1,
         during_upload_timeout_ms: 120_000,
         l1_limit: None,
-        profile: Some(TestCacheProfileMode::Pyroscope),
+        profile: Some(BenchmarkProfileMode::Pyroscope),
         json_output: Some(report),
         full_file_reads: true,
     })
@@ -294,7 +253,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     };
     let current_dir = std::env::current_dir().context("resolve current directory")?;
     let report_dir = resolve_report_dir(json_output.as_deref(), &current_dir);
-    let profile_session = TestCacheProfileSession::start(
+    let profile_session = BenchmarkProfileSession::start(
         profile,
         &run_id,
         benchmark_mode,
@@ -336,7 +295,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                 error = %err,
                 "profile session failed to finish; benchmark report will still be written"
             );
-            Some(TestCacheProfileResult {
+            Some(BenchmarkProfileResult {
                 endpoint: None,
                 artifacts: Vec::new(),
                 warnings: vec![format!(
@@ -346,7 +305,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         }
         None => None,
     };
-    let report = merge_profile_report(report, profile_report.map(Into::into));
+    let report = merge_profile_report(report, profile_report);
 
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, json_output.as_deref())?;

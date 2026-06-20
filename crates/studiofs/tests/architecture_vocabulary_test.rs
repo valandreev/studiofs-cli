@@ -551,8 +551,8 @@ fn cli_surface_avoids_legacy_runtime_product_wording() {
         "crates/studiofs/src/cli/runtime_tuning.rs",
         "crates/studiofs/src/cli/settings.rs",
         "crates/studiofs/src/cli/status.rs",
-        "crates/studiofs/src/cli/test_cache_profile_common.rs",
-        "crates/studiofs/src/cli/test_cache_profile_stub.rs",
+        "crates/studiofs/src/cli/benchmark_profile_common.rs",
+        "crates/studiofs/src/cli/benchmark_profile_stub.rs",
     ];
 
     let hits: Vec<_> = files
@@ -1303,7 +1303,7 @@ fn deterministic_simulation_architecture_covers_sfs395_baseline_rebase() {
 #[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
-        "crates/studiofs/src/cli/test_cache/reporting/human.rs",
+        "crates/studiofs/src/cli/benchmark_engine/reporting/human.rs",
         "crates/studiofs-vfs/tests/vfs_test.rs",
     ];
 

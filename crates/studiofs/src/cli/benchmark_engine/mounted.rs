@@ -2399,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_with_plan_rejects_corrupt_deterministic_payload() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("test_cache_file_000000.bin");
+        let path = temp.path().join("benchmark_file_000000.bin");
         fs::write(&path, vec![0xAA; 4096])
             .await
             .expect("write corrupt test payload");
@@ -2424,7 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("test_cache_file_000000.bin");
+        let path = temp.path().join("benchmark_file_000000.bin");
         write_deterministic_file(&path, 4096 + 257, 123, 1024)
             .await
             .expect("write deterministic test payload");

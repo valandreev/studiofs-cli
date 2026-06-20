@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use super::BenchmarkProfileResult;
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, ProfileArtifactSummary,
     ProfileEndpointReport,
 };
+use crate::cli::benchmark_profile_types::BenchmarkProfileResult;
 
 pub(crate) fn process_cpu_time() -> Option<Duration> {
     #[cfg(unix)]

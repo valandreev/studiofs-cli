@@ -20,6 +20,10 @@ pub mod mount_profile;
 pub mod mount_profile_stub;
 #[cfg(not(unix))]
 pub use self::mount_profile_stub as mount_profile;
+#[cfg(unix)]
+pub mod benchmark_profile;
+#[cfg(not(unix))]
+pub mod benchmark_profile_stub;
 pub mod mount_profile_types;
 pub mod runtime_tuning;
 pub mod settings;
@@ -27,14 +31,10 @@ pub mod snapshot;
 pub mod status;
 pub mod test;
 pub mod test_cache;
-#[cfg(unix)]
-pub mod test_cache_profile;
 #[cfg(not(unix))]
-pub mod test_cache_profile_stub;
-#[cfg(not(unix))]
-pub use self::test_cache_profile_stub as test_cache_profile;
-pub mod test_cache_profile_common;
-pub mod test_cache_profile_types;
+pub use self::benchmark_profile_stub as benchmark_profile;
+pub mod benchmark_profile_common;
+pub mod benchmark_profile_types;
 pub mod umount;
 pub mod utils;
 #[cfg(windows)]

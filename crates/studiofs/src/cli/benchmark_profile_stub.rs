@@ -1,18 +1,18 @@
-use crate::cli::test_cache_profile_common::collect_write_path_artifacts;
-use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
+use crate::cli::benchmark_profile_common::collect_write_path_artifacts;
+use crate::cli::benchmark_profile_types::{BenchmarkProfileMode, BenchmarkProfileResult};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-pub struct TestCacheProfileSession {
+pub struct BenchmarkProfileSession {
     run_id: String,
     benchmark_mode: String,
     write_path_observability_path: Option<PathBuf>,
     warnings: Vec<String>,
 }
 
-impl TestCacheProfileSession {
+impl BenchmarkProfileSession {
     pub fn start(
-        mode: Option<TestCacheProfileMode>,
+        mode: Option<BenchmarkProfileMode>,
         run_id: &str,
         benchmark_mode: &str,
         write_path_observability_path: Option<PathBuf>,
@@ -31,7 +31,7 @@ impl TestCacheProfileSession {
         }))
     }
 
-    pub fn finish(mut self, output_dir: &Path) -> Result<TestCacheProfileResult> {
+    pub fn finish(mut self, output_dir: &Path) -> Result<BenchmarkProfileResult> {
         let artifacts = collect_write_path_artifacts(
             output_dir,
             &self.run_id,
@@ -40,7 +40,7 @@ impl TestCacheProfileSession {
             &mut self.warnings,
         )?;
 
-        Ok(TestCacheProfileResult {
+        Ok(BenchmarkProfileResult {
             endpoint: None,
             artifacts,
             warnings: self.warnings,
@@ -50,8 +50,8 @@ impl TestCacheProfileSession {
 
 #[cfg(test)]
 mod tests {
-    use super::TestCacheProfileSession;
-    use crate::cli::test_cache_profile_types::TestCacheProfileMode;
+    use super::BenchmarkProfileSession;
+    use crate::cli::benchmark_profile_types::BenchmarkProfileMode;
     use studiofs_vfs::{
         VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
         VfsWritePathWinfspForegroundFlushStats,
@@ -80,8 +80,8 @@ mod tests {
         )
         .expect("write metrics snapshot");
 
-        let session = TestCacheProfileSession::start(
-            Some(TestCacheProfileMode::Pyroscope),
+        let session = BenchmarkProfileSession::start(
+            Some(BenchmarkProfileMode::Pyroscope),
             "run-123",
             "mounted",
             Some(metrics_path),
@@ -115,7 +115,7 @@ mod tests {
             .iter()
             .find(|artifact| {
                 artifact.kind
-                    == crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathSummary
+                    == crate::cli::benchmark_profile_types::ProfileArtifactKind::WritePathSummary
             })
             .expect("write-path summary artifact");
         let summary =

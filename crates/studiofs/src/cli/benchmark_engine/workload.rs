@@ -400,7 +400,7 @@ pub(crate) fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<
         .iter()
         .enumerate()
         .map(|(idx, size)| WorkFile {
-            path: mount_root.join(format!("test_cache_file_{idx:06}.bin")),
+            path: mount_root.join(format!("benchmark_file_{idx:06}.bin")),
             size: *size,
             index: idx,
         })

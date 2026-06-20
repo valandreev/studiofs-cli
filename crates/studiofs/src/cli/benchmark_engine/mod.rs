@@ -52,53 +52,6 @@ pub(crate) struct BenchmarkConfig {
     pub(crate) run_id: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct BenchmarkProfileResult {
-    pub(crate) endpoint: Option<BenchmarkProfileEndpoint>,
-    pub(crate) artifacts: Vec<BenchmarkProfileArtifactReport>,
-    pub(crate) warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BenchmarkProfileEndpoint {
-    pub(crate) url: String,
-    pub(crate) application_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BenchmarkProfileArtifactReport {
-    pub(crate) kind: BenchmarkProfileArtifactKind,
-    pub(crate) path: String,
-    pub(crate) bytes: u64,
-    pub(crate) sent_to_endpoint: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum BenchmarkProfileArtifactKind {
-    Cpu,
-    Memory,
-    WritePathObservability,
-    WritePathSummary,
-}
-
-impl BenchmarkProfileArtifactKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Memory => "memory",
-            Self::WritePathObservability => "write-path-observability",
-            Self::WritePathSummary => "write-path-summary",
-        }
-    }
-}
-
-impl std::fmt::Display for BenchmarkProfileArtifactKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
 /// Mounted runtime metadata required to run an end-to-end filesystem benchmark.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MountedBenchmarkTarget<'a> {
