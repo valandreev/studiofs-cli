@@ -219,13 +219,14 @@ mod tests {
 
     #[test]
     fn help_hides_legacy_test_cache_command() {
-        let is_hidden = Cli::command()
+        let command = Cli::command();
+        let cmd = command
             .get_subcommands()
             .find(|cmd| cmd.get_name() == "test-cache")
-            .is_some_and(clap::Command::is_hide_set);
+            .expect("hidden test-cache parser should exist for internal reuse");
 
         assert!(
-            is_hidden,
+            cmd.is_hide_set(),
             "legacy test-cache command must stay out of the public help surface"
         );
     }

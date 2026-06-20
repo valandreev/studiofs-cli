@@ -212,10 +212,8 @@ fn validate_mounted_performance_probe(
 fn validate_performance_probe_workload_shape(
     summary: &PerformanceProbeSummary,
 ) -> Result<(), ScenarioError> {
-    if let Some(kind) = summary
-        .workload_kind
-        .as_deref()
-        .filter(|kind| *kind != PERFORMANCE_PROBE_WORKLOAD_KIND)
+    if let Some(kind) = summary.workload_kind.as_deref()
+        && kind != PERFORMANCE_PROBE_WORKLOAD_KIND
     {
         return Err(ScenarioError::PerformanceProbeValidationFailed {
             detail: format!(
@@ -223,9 +221,8 @@ fn validate_performance_probe_workload_shape(
             ),
         });
     }
-    if let Some(payload_file_count) = summary
-        .payload_file_count
-        .filter(|count| *count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT)
+    if let Some(payload_file_count) = summary.payload_file_count
+        && payload_file_count != PERFORMANCE_PROBE_PAYLOAD_FILE_COUNT
     {
         return Err(ScenarioError::PerformanceProbeValidationFailed {
             detail: format!(
