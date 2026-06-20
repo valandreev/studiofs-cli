@@ -59,7 +59,7 @@ pub(crate) struct PerfArgs {
     #[arg(long, value_enum, default_value_t = PerfVerbosity::Normal)]
     pub(crate) verbosity: PerfVerbosity,
 
-    /// Print each sample as pretty JSON
+    /// Print a finite sample set as pretty JSON. Requires --count.
     #[arg(long)]
     pub(crate) json: bool,
 
@@ -386,11 +386,7 @@ fn write_sample(
 ) -> anyhow::Result<()> {
     match options.output {
         PerfOutput::Table => write_table_sample(out, sample, printed_header),
-        PerfOutput::Json => {
-            serde_json::to_writer_pretty(&mut *out, sample)?;
-            writeln!(out)?;
-            Ok(())
-        }
+        PerfOutput::Json => bail!("finite JSON output must be written as a sample array"),
         PerfOutput::JsonLines => {
             serde_json::to_writer(&mut *out, sample)?;
             writeln!(out)?;
