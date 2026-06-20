@@ -2262,7 +2262,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    fn test_cache_params_with_block_size(block_size: u64) -> BenchmarkConfig {
+    fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
         BenchmarkConfig {
             target: PathBuf::from(r"Z:\"),
             block_size,
@@ -2275,7 +2275,7 @@ mod tests {
             io_depth: 1,
             warmup_runs: 0,
             sizes: super::super::workload::WorkloadSizeInput::ExplicitList(vec![4096]),
-            access_pattern: super::super::TestCacheAccessPattern::Sequential,
+            access_pattern: super::super::BenchmarkAccessPattern::Sequential,
             during_upload_min_pending: 1,
             during_upload_timeout: Duration::from_secs(1),
             l1_limit: 64 * 1024 * 1024,
@@ -2550,7 +2550,7 @@ mod tests {
     #[test]
     fn mounted_runtime_report_uses_schema_chunk_size_not_block_size() {
         let block_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64 / 2;
-        let params = test_cache_params_with_block_size(block_size);
+        let params = benchmark_config_with_block_size(block_size);
         let workload = single_file_workload();
 
         let report = build_mounted_runtime_report(&params, Path::new(r"Z:\"), None, &workload);

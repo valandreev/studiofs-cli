@@ -1,12 +1,12 @@
-use crate::cli::test_cache_profile_types::TestCacheProfileResult;
 use std::time::Duration;
 
+use super::BenchmarkProfileResult;
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, ProfileArtifactSummary,
     ProfileEndpointReport,
 };
 
-pub(super) fn process_cpu_time() -> Option<Duration> {
+pub(crate) fn process_cpu_time() -> Option<Duration> {
     #[cfg(unix)]
     {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
@@ -79,7 +79,7 @@ pub(super) fn process_cpu_time() -> Option<Duration> {
     }
 }
 
-pub(super) fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
+pub(crate) fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
     let wall_ns = wall.as_nanos() as f64;
     if wall_ns <= 0.0 {
         0.0
@@ -90,7 +90,7 @@ pub(super) fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
 
 pub(crate) fn merge_profile_report(
     mut report: BenchmarkReport,
-    profile_report: Option<TestCacheProfileResult>,
+    profile_report: Option<BenchmarkProfileResult>,
 ) -> BenchmarkReport {
     let Some(profile_report) = profile_report else {
         return report;

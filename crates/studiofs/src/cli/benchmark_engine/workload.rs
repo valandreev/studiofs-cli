@@ -2,25 +2,25 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use studiofs_vfs::parse_size_bytes;
 
-use crate::cli::test_cache::TestCacheAccessPattern;
+use super::BenchmarkAccessPattern;
 
-pub(super) const WORKLOAD_FILES_PER_TIER: usize = 100;
-pub(super) const DEFAULT_WORKLOAD_FILES: usize = WORKLOAD_FILES_PER_TIER * 3;
-pub(super) const SMALL_FILE_MIN_BYTES: u64 = 1024;
-pub(super) const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
-pub(super) const LARGE_FILE_MULTIPLIER: u64 = 8;
+pub(crate) const WORKLOAD_FILES_PER_TIER: usize = 100;
+pub(crate) const DEFAULT_WORKLOAD_FILES: usize = WORKLOAD_FILES_PER_TIER * 3;
+pub(crate) const SMALL_FILE_MIN_BYTES: u64 = 1024;
+pub(crate) const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
+pub(crate) const LARGE_FILE_MULTIPLIER: u64 = 8;
 pub(crate) const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
-pub(crate) const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
+pub(crate) const DEFAULT_BENCHMARK_BLOCK_SIZE_STR: &str = "16MB";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SizeClass {
+pub(crate) enum SizeClass {
     Small,
     Medium,
     Large,
 }
 
 impl SizeClass {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Small => "small",
             Self::Medium => "medium",
@@ -51,21 +51,21 @@ impl WorkloadSizeInput {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct WorkloadPlan {
-    pub(super) sizes: Vec<u64>,
-    pub(super) source: String,
-    pub(super) small_files: usize,
-    pub(super) medium_files: usize,
-    pub(super) large_files: usize,
+pub(crate) struct WorkloadPlan {
+    pub(crate) sizes: Vec<u64>,
+    pub(crate) source: String,
+    pub(crate) small_files: usize,
+    pub(crate) medium_files: usize,
+    pub(crate) large_files: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SizeClassBounds {
-    pub(super) small_max: u64,
-    pub(super) medium_max: u64,
+pub(crate) struct SizeClassBounds {
+    pub(crate) small_max: u64,
+    pub(crate) medium_max: u64,
 }
 
-pub(super) fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
+pub(crate) fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
     if size <= small_max {
         SizeClass::Small
     } else if size <= medium_max {
@@ -76,10 +76,10 @@ pub(super) fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeC
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct WorkFile {
-    pub(super) path: PathBuf,
-    pub(super) size: u64,
-    pub(super) index: usize,
+pub(crate) struct WorkFile {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) index: usize,
 }
 
 #[derive(Clone)]
@@ -215,9 +215,9 @@ pub(crate) fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
     Ok(WorkloadSizeInput::ExplicitList(sizes))
 }
 
-pub(super) fn build_access_sequence(
+pub(crate) fn build_access_sequence(
     len: usize,
-    pattern: TestCacheAccessPattern,
+    pattern: BenchmarkAccessPattern,
     seed: u64,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..len).collect();
@@ -227,14 +227,14 @@ pub(super) fn build_access_sequence(
     let mut rng = XorShift64::new(seed);
 
     match pattern {
-        TestCacheAccessPattern::Sequential => {}
-        TestCacheAccessPattern::Random => {
+        BenchmarkAccessPattern::Sequential => {}
+        BenchmarkAccessPattern::Random => {
             for i in (1..order.len()).rev() {
                 let j = rng.next_usize(i + 1);
                 order.swap(i, j);
             }
         }
-        TestCacheAccessPattern::Mixed => {
+        BenchmarkAccessPattern::Mixed => {
             let swaps = (order.len() / 4).max(1);
             for _ in 0..swaps {
                 let a = rng.next_usize(order.len());
@@ -247,7 +247,7 @@ pub(super) fn build_access_sequence(
     order
 }
 
-pub(super) fn build_work_sizes(
+pub(crate) fn build_work_sizes(
     block_size: u64,
     size_input: &WorkloadSizeInput,
     size_class_bounds: SizeClassBounds,
@@ -386,7 +386,7 @@ fn repeat_workload_plan(plan: WorkloadPlan, workload_repeat: usize) -> WorkloadP
     }
 }
 
-pub(super) fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
+pub(crate) fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = XorShift64::new(seed ^ 0x6ac9_fe0f);
     let mut out = vec![0u8; len];
     for byte in &mut out {
@@ -395,7 +395,7 @@ pub(super) fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-pub(super) fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<WorkFile> {
+pub(crate) fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<WorkFile> {
     work_sizes
         .iter()
         .enumerate()
@@ -407,7 +407,7 @@ pub(super) fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<
         .collect()
 }
 
-pub(super) fn split_stream_segments(order: &[usize], stream_count: usize) -> Vec<Vec<usize>> {
+pub(crate) fn split_stream_segments(order: &[usize], stream_count: usize) -> Vec<Vec<usize>> {
     if order.is_empty() {
         return Vec::new();
     }

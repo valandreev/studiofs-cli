@@ -1,27 +1,33 @@
 //! Internal benchmark engine entry points shared by legacy test-cache and bench.
 
 use anyhow::Result;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-mod direct;
 pub(crate) mod mounted;
-mod profiling;
+pub(crate) mod profiling;
 mod progress;
 mod reporting;
 pub(crate) mod result;
-mod telemetry;
+pub(crate) mod telemetry;
 pub(crate) mod workload;
-
-use crate::cli::test_cache::TestCacheAccessPattern;
 
 pub(crate) use profiling::merge_profile_report;
 pub(crate) use reporting::{render_human_summary, save_benchmark_report};
 pub(crate) use result::BenchmarkReport;
 pub(crate) use workload::{
-    DEFAULT_SMALL_CLASS_MAX_BYTES, DEFAULT_TEST_CACHE_BLOCK_SIZE_STR, WorkloadSizeInput,
+    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, WorkloadSizeInput,
     parse_size_arg, parse_sizes_arg,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BenchmarkAccessPattern {
+    Sequential,
+    Random,
+    Mixed,
+}
 
 /// Complete benchmark engine configuration after CLI/default validation.
 #[derive(Debug)]
@@ -37,13 +43,60 @@ pub(crate) struct BenchmarkConfig {
     pub(crate) io_depth: usize,
     pub(crate) warmup_runs: u32,
     pub(crate) sizes: WorkloadSizeInput,
-    pub(crate) access_pattern: TestCacheAccessPattern,
+    pub(crate) access_pattern: BenchmarkAccessPattern,
     pub(crate) during_upload_min_pending: usize,
     pub(crate) during_upload_timeout: Duration,
     pub(crate) l1_limit: u64,
     pub(crate) profile: bool,
     pub(crate) full_file_reads: bool,
     pub(crate) run_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkProfileResult {
+    pub(crate) endpoint: Option<BenchmarkProfileEndpoint>,
+    pub(crate) artifacts: Vec<BenchmarkProfileArtifactReport>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkProfileEndpoint {
+    pub(crate) url: String,
+    pub(crate) application_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkProfileArtifactReport {
+    pub(crate) kind: BenchmarkProfileArtifactKind,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) sent_to_endpoint: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BenchmarkProfileArtifactKind {
+    Cpu,
+    Memory,
+    WritePathObservability,
+    WritePathSummary,
+}
+
+impl BenchmarkProfileArtifactKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::WritePathObservability => "write-path-observability",
+            Self::WritePathSummary => "write-path-summary",
+        }
+    }
+}
+
+impl std::fmt::Display for BenchmarkProfileArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 /// Mounted runtime metadata required to run an end-to-end filesystem benchmark.
@@ -54,13 +107,6 @@ pub(crate) struct MountedBenchmarkTarget<'a> {
     pub(crate) mount_point: &'a Path,
     pub(crate) work_root: &'a Path,
     pub(crate) cache_path: Option<&'a Path>,
-}
-
-pub(crate) async fn run_direct_shim(
-    config: &BenchmarkConfig,
-    cache_dir: &Path,
-) -> Result<BenchmarkReport> {
-    direct::run_direct(config, cache_dir).await
 }
 
 pub(crate) async fn run_mounted(

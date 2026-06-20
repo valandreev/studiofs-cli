@@ -9,16 +9,16 @@ use std::time::Instant;
 use studiofs_cache::{BenchmarkCache, BenchmarkCacheConfig, CacheReadLevel};
 use tokio::sync::Semaphore;
 
-use super::BenchmarkConfig;
-use super::profiling::{cpu_utilization_percent, process_cpu_time};
-use super::result::{
+use crate::cli::benchmark_engine::BenchmarkConfig;
+use crate::cli::benchmark_engine::profiling::{cpu_utilization_percent, process_cpu_time};
+use crate::cli::benchmark_engine::result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
 };
-use super::telemetry::{
+use crate::cli::benchmark_engine::telemetry::{
     DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
     phase_telemetry_to_report, stream_reports_from_telemetry,
 };
-use super::workload::{
+use crate::cli::benchmark_engine::workload::{
     SizeClassBounds, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
     split_stream_segments,
 };

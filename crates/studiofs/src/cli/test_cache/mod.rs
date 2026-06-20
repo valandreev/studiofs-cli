@@ -5,13 +5,16 @@
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
 mod args;
+mod direct;
 mod mode;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::benchmark_engine::{
-    BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, DEFAULT_TEST_CACHE_BLOCK_SIZE_STR,
-    MountedBenchmarkTarget, merge_profile_report, parse_size_arg, parse_sizes_arg,
-    render_human_summary, run_direct_shim, run_mounted, save_benchmark_report,
+    BenchmarkAccessPattern, BenchmarkConfig, BenchmarkProfileArtifactKind,
+    BenchmarkProfileArtifactReport, BenchmarkProfileEndpoint, BenchmarkProfileResult,
+    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
+    merge_profile_report, parse_size_arg, parse_sizes_arg, render_human_summary, run_mounted,
+    save_benchmark_report,
 };
 use crate::cli::test_cache_profile::TestCacheProfileSession;
 use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
@@ -24,9 +27,59 @@ pub use args::TestCacheAccessPattern;
 pub(crate) use args::TestCacheArgs;
 
 use args::TestCacheRunRequest;
+use direct::run_direct;
 use mode::{ResolvedRunMode, resolve_run_mode};
 
 static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+
+impl From<TestCacheAccessPattern> for BenchmarkAccessPattern {
+    fn from(pattern: TestCacheAccessPattern) -> Self {
+        match pattern {
+            TestCacheAccessPattern::Sequential => Self::Sequential,
+            TestCacheAccessPattern::Random => Self::Random,
+            TestCacheAccessPattern::Mixed => Self::Mixed,
+        }
+    }
+}
+
+impl From<TestCacheProfileResult> for BenchmarkProfileResult {
+    fn from(result: TestCacheProfileResult) -> Self {
+        Self {
+            endpoint: result.endpoint.map(|endpoint| BenchmarkProfileEndpoint {
+                url: endpoint.url,
+                application_name: endpoint.application_name,
+            }),
+            artifacts: result
+                .artifacts
+                .into_iter()
+                .map(|artifact| BenchmarkProfileArtifactReport {
+                    kind: artifact.kind.into(),
+                    path: artifact.path,
+                    bytes: artifact.bytes,
+                    sent_to_endpoint: artifact.sent_to_endpoint,
+                })
+                .collect(),
+            warnings: result.warnings,
+        }
+    }
+}
+
+impl From<crate::cli::test_cache_profile_types::ProfileArtifactKind>
+    for BenchmarkProfileArtifactKind
+{
+    fn from(kind: crate::cli::test_cache_profile_types::ProfileArtifactKind) -> Self {
+        match kind {
+            crate::cli::test_cache_profile_types::ProfileArtifactKind::Cpu => Self::Cpu,
+            crate::cli::test_cache_profile_types::ProfileArtifactKind::Memory => Self::Memory,
+            crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathObservability => {
+                Self::WritePathObservability
+            }
+            crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathSummary => {
+                Self::WritePathSummary
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MountedRuntimeInfo {
@@ -149,7 +202,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         "block-size",
         block_size
             .as_deref()
-            .unwrap_or(DEFAULT_TEST_CACHE_BLOCK_SIZE_STR),
+            .unwrap_or(DEFAULT_BENCHMARK_BLOCK_SIZE_STR),
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_MEMORY_CACHE_SIZE.to_string();
@@ -219,7 +272,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         io_depth,
         warmup_runs,
         sizes,
-        access_pattern,
+        access_pattern: access_pattern.into(),
         during_upload_min_pending,
         during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
@@ -251,7 +304,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     let rt = test_cache_runtime()?;
     let report = rt.block_on(async {
         match &resolved_mode {
-            ResolvedRunMode::DirectShim { cache_dir } => run_direct_shim(&config, cache_dir).await,
+            ResolvedRunMode::DirectShim { cache_dir } => run_direct(&config, cache_dir).await,
             ResolvedRunMode::MountedE2E {
                 pid,
                 volume,
@@ -293,7 +346,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         }
         None => None,
     };
-    let report = merge_profile_report(report, profile_report);
+    let report = merge_profile_report(report, profile_report.map(Into::into));
 
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, json_output.as_deref())?;
