@@ -257,6 +257,18 @@ Required artifacts:
 - `artifacts/scenarios/mounted-performance-probe/performance-probe-summary.json`
 - `artifacts/scenarios/mounted-performance-probe/performance-probe-validation.json`
 
+The `mounted-performance-probe` summary and validation artifacts must make the
+Linux scenario 24 workload shape explicit: `workload_kind` is
+`single_file_sequential`, `payload_file_count` is `1`, and the payload is the
+single path `performance-probe/probe-data.bin` sized by
+`STUDIOFS_E2E_PERF_FILE_BYTES` with a 4 GiB default. Every repeated read pass
+opens and sequentially reads that same file.
+
+For Linux StudioFS/JuiceFS comparisons, place the StudioFS scenario 24
+artifacts, the local JuiceFS fio result over `/home/val/mnt/jfs`, optional raw
+cache-disk fio output, and CPU samples under one report directory so
+throughput, warm-read, backlog, and CPU numbers can be compared side by side.
+
 Recommended macOS command:
 
 ```text
