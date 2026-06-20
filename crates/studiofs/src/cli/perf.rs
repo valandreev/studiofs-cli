@@ -571,6 +571,62 @@ mod tests {
     }
 
     #[test]
+    fn into_options_rejects_zero_interval() {
+        let args = PerfArgs {
+            mountpoint: PathBuf::from("Z:"),
+            interval: 0,
+            count: Some(1),
+            schema: false,
+            sections: Vec::new(),
+            verbosity: PerfVerbosity::Normal,
+            json: false,
+            json_lines: false,
+        };
+
+        let error = args.into_options().expect_err("zero interval should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "--interval must be greater than zero milliseconds"
+        );
+    }
+
+    #[test]
+    fn into_options_rejects_json_and_json_lines_together() {
+        let args = PerfArgs {
+            mountpoint: PathBuf::from("Z:"),
+            interval: 1,
+            count: Some(1),
+            schema: false,
+            sections: Vec::new(),
+            verbosity: PerfVerbosity::Normal,
+            json: true,
+            json_lines: true,
+        };
+
+        let error = args
+            .into_options()
+            .expect_err("json output modes should conflict");
+
+        assert_eq!(
+            error.to_string(),
+            "--json and --json-lines are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parse_sections_rejects_unknown_section() {
+        let error = parse_sections(&["unknown".to_string()]).expect_err("unknown section");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown runtime stats section 'unknown'"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn build_sample_computes_counter_rates_and_gauges_from_interval_delta() {
         let options = PerfOptions {
             mountpoint: PathBuf::from("Z:"),

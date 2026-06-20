@@ -265,6 +265,27 @@ mod tests {
     }
 
     #[test]
+    fn perf_command_parses_schema_and_json_flags() {
+        let cli = parse_for_test(&["perf", "Z:", "--schema", "--json"]).unwrap();
+
+        match cli.command {
+            Commands::Perf(perf::PerfArgs {
+                mountpoint,
+                schema,
+                json,
+                json_lines,
+                ..
+            }) => {
+                assert_eq!(mountpoint, std::path::PathBuf::from("Z:"));
+                assert!(schema);
+                assert!(json);
+                assert!(!json_lines);
+            }
+            other => panic!("expected Perf command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn help_hides_legacy_test_cache_command() {
         let command = Cli::command();
         let cmd = command
