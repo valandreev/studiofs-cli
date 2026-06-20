@@ -265,10 +265,18 @@ impl RuntimeStatsSnapshot {
         };
         match kind {
             "counter" => {
-                target.counters.insert(key.to_owned(), metric);
+                if let Some(existing) = target.counters.get_mut(key) {
+                    *existing = metric;
+                } else {
+                    target.counters.insert(key.to_owned(), metric);
+                }
             }
             "gauge" => {
-                target.gauges.insert(key.to_owned(), metric);
+                if let Some(existing) = target.gauges.get_mut(key) {
+                    *existing = metric;
+                } else {
+                    target.gauges.insert(key.to_owned(), metric);
+                }
             }
             _ => unreachable!("kind is validated by caller"),
         }
@@ -287,7 +295,17 @@ impl RuntimeStatsSnapshot {
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
-        let histogram = target.latencies.entry(key.to_owned()).or_default();
+        if !target.latencies.contains_key(key) {
+            target
+                .latencies
+                .insert(key.to_owned(), RuntimeLatencyHistogram::default());
+        }
+        let Some(histogram) = target.latencies.get_mut(key) else {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "failed to update histogram",
+            ));
+        };
         histogram.unit = parse_runtime_stats_unit(unit);
         match kind {
             "histogram_count" => histogram.count = value,
@@ -308,12 +326,19 @@ impl RuntimeStatsSnapshot {
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
-        target
-            .latencies
-            .entry(key.to_owned())
-            .or_default()
-            .buckets
-            .push(RuntimeLatencyBucket { le_ns, count });
+        if let Some(histogram) = target.latencies.get_mut(key) {
+            histogram
+                .buckets
+                .push(RuntimeLatencyBucket { le_ns, count });
+        } else {
+            target.latencies.insert(
+                key.to_owned(),
+                RuntimeLatencyHistogram {
+                    buckets: vec![RuntimeLatencyBucket { le_ns, count }],
+                    ..RuntimeLatencyHistogram::default()
+                },
+            );
+        }
         Ok(())
     }
 }
