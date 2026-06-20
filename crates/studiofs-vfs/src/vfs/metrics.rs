@@ -447,10 +447,18 @@ fn deserialize_sorted_latency_buckets<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
-    let mut buckets = Vec::with_capacity(raw_buckets.len());
+    let mut raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
+    raw_buckets.sort_by_key(|bucket| bucket.le_ns);
+
+    let mut buckets: Vec<RuntimeLatencyBucket> = Vec::with_capacity(raw_buckets.len());
     for bucket in raw_buckets {
-        insert_latency_bucket(&mut buckets, bucket);
+        if let Some(last) = buckets.last_mut()
+            && last.le_ns == bucket.le_ns
+        {
+            *last = bucket;
+        } else {
+            buckets.push(bucket);
+        }
     }
     Ok(buckets)
 }
@@ -465,7 +473,7 @@ pub struct RuntimeScalarMetric {
 }
 
 /// Latency histogram with cumulative count and sum for interval averages.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuntimeLatencyHistogram {
     /// Total observations.
@@ -477,6 +485,17 @@ pub struct RuntimeLatencyHistogram {
     /// Bucket counts keyed by inclusive upper-bound nanoseconds.
     #[serde(default, deserialize_with = "deserialize_sorted_latency_buckets")]
     pub buckets: Vec<RuntimeLatencyBucket>,
+}
+
+impl Default for RuntimeLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0,
+            unit: Cow::Borrowed("ns"),
+            buckets: Vec::new(),
+        }
+    }
 }
 
 /// One latency histogram bucket.
@@ -499,6 +518,16 @@ pub struct RuntimeStatsParseError {
 impl RuntimeStatsParseError {
     fn new(line: usize, message: &'static str) -> Self {
         Self { line, message }
+    }
+
+    /// One-based input line where parsing failed.
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// Static parser error reason.
+    pub fn message(&self) -> &'static str {
+        self.message
     }
 }
 
@@ -2075,6 +2104,11 @@ mod tests {
                 .to_string()
                 .contains("metric section and key must not be empty")
         );
+        assert_eq!(empty_key.line(), 1);
+        assert_eq!(
+            empty_key.message(),
+            "metric section and key must not be empty"
+        );
         assert!(
             empty_section
                 .to_string()
@@ -2157,5 +2191,6 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(parsed.object_io.latencies["get"].unit, Cow::Borrowed("ns"));
     }
 }
