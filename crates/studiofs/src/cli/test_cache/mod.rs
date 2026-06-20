@@ -275,10 +275,13 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                     &config,
                     MountedBenchmarkTarget {
                         pid: *pid,
-                        volume,
-                        mount_point,
-                        work_root,
-                        cache_path: cache_path.as_deref(),
+                        volume: volume.as_str(),
+                        mount_point: mount_point.as_path(),
+                        work_root: work_root.as_path(),
+                        cache_path: match cache_path {
+                            Some(path) => Some(path.as_path()),
+                            None => None,
+                        },
                     },
                 )
                 .await
