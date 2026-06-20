@@ -1,7 +1,401 @@
 use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
+
+/// Current version of the cross-platform runtime stats snapshot schema.
+pub const RUNTIME_STATS_SCHEMA_VERSION: u16 = 1;
+
+/// Stable runtime stats sections exposed by all StudioFS bridge implementations.
+pub const RUNTIME_STATS_SECTIONS: &[&str] = &[
+    "system",
+    "bridge",
+    "vfs_read",
+    "vfs_write",
+    "cache",
+    "upload_queue",
+    "object_io",
+    "metadata",
+];
+
+/// Cross-platform runtime statistics snapshot for benchmarks and live performance reporting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuntimeStatsSnapshot {
+    /// Stable schema version. Readers must tolerate missing newer fields.
+    pub schema_version: u16,
+    /// Snapshot generation timestamp in Unix milliseconds.
+    pub generated_unix_ms: u64,
+    /// System and runtime process counters.
+    pub system: RuntimeStatsSection,
+    /// FUSE, macFUSE, WinFSP, or future bridge callback counters.
+    pub bridge: RuntimeStatsSection,
+    /// VFS read-path counters.
+    pub vfs_read: RuntimeStatsSection,
+    /// VFS write-path counters.
+    pub vfs_write: RuntimeStatsSection,
+    /// Local cache counters and gauges.
+    pub cache: RuntimeStatsSection,
+    /// Upload queue counters and gauges.
+    pub upload_queue: RuntimeStatsSection,
+    /// Object-store I/O counters.
+    pub object_io: RuntimeStatsSection,
+    /// Metadata operation counters.
+    pub metadata: RuntimeStatsSection,
+}
+
+impl Default for RuntimeStatsSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: RUNTIME_STATS_SCHEMA_VERSION,
+            generated_unix_ms: 0,
+            system: RuntimeStatsSection::default(),
+            bridge: RuntimeStatsSection::default(),
+            vfs_read: RuntimeStatsSection::default(),
+            vfs_write: RuntimeStatsSection::default(),
+            cache: RuntimeStatsSection::default(),
+            upload_queue: RuntimeStatsSection::default(),
+            object_io: RuntimeStatsSection::default(),
+            metadata: RuntimeStatsSection::default(),
+        }
+    }
+}
+
+impl RuntimeStatsSnapshot {
+    /// Render a stable, JuiceFS-style local stats text surface.
+    ///
+    /// Each non-comment line has `kind name unit value`. Histogram bucket lines
+    /// have `histogram_bucket name le_ns count`.
+    pub fn to_text(&self) -> String {
+        let mut out = String::from("# studiofs_runtime_stats schema_version=1\n");
+        out.push_str(&format!(
+            "gauge system.schema_version count {}\n",
+            self.schema_version
+        ));
+        out.push_str(&format!(
+            "gauge system.generated_unix_ms ms {}\n",
+            self.generated_unix_ms
+        ));
+
+        for (section_name, section) in self.sections() {
+            section.write_text(section_name, &mut out);
+        }
+        out
+    }
+
+    /// Parse the stable local stats text representation.
+    pub fn parse_text(input: &str) -> Result<Self, RuntimeStatsParseError> {
+        let mut snapshot = Self::default();
+        for (line_index, raw_line) in input.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(kind) = parts.next() else { continue };
+            match kind {
+                "counter" | "gauge" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing metric name")
+                    })?;
+                    let unit = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing metric unit")
+                    })?;
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing metric value")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid metric value")
+                        })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
+                    snapshot.set_scalar_metric(kind, name, unit, value, line_index + 1)?;
+                }
+                "histogram_count" | "histogram_sum" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram name")
+                    })?;
+                    let unit = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram unit")
+                    })?;
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing histogram value")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid histogram value")
+                        })?;
+                    snapshot.set_histogram_total(kind, name, unit, value, line_index + 1)?;
+                }
+                "histogram_bucket" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram name")
+                    })?;
+                    let le_ns = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing bucket bound")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid bucket bound")
+                        })?;
+                    let count = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing bucket count")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid bucket count")
+                        })?;
+                    snapshot.set_histogram_bucket(name, le_ns, count, line_index + 1)?;
+                }
+                _ => {
+                    return Err(RuntimeStatsParseError::new(
+                        line_index + 1,
+                        "unknown runtime stats line kind",
+                    ));
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn sections(&self) -> [(&'static str, &RuntimeStatsSection); 8] {
+        [
+            ("system", &self.system),
+            ("bridge", &self.bridge),
+            ("vfs_read", &self.vfs_read),
+            ("vfs_write", &self.vfs_write),
+            ("cache", &self.cache),
+            ("upload_queue", &self.upload_queue),
+            ("object_io", &self.object_io),
+            ("metadata", &self.metadata),
+        ]
+    }
+
+    fn section_mut(&mut self, section: &str) -> Option<&mut RuntimeStatsSection> {
+        match section {
+            "system" => Some(&mut self.system),
+            "bridge" => Some(&mut self.bridge),
+            "vfs_read" => Some(&mut self.vfs_read),
+            "vfs_write" => Some(&mut self.vfs_write),
+            "cache" => Some(&mut self.cache),
+            "upload_queue" => Some(&mut self.upload_queue),
+            "object_io" => Some(&mut self.object_io),
+            "metadata" => Some(&mut self.metadata),
+            _ => None,
+        }
+    }
+
+    fn split_metric_name<'a>(
+        name: &'a str,
+        line: usize,
+    ) -> Result<(&'a str, &'a str), RuntimeStatsParseError> {
+        name.split_once('.')
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "metric name must be section.key"))
+    }
+
+    fn set_scalar_metric(
+        &mut self,
+        kind: &str,
+        name: &str,
+        unit: &str,
+        value: u64,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        if section == "system" && key == "schema_version" {
+            self.schema_version = value.try_into().map_err(|_| {
+                RuntimeStatsParseError::new(line, "schema_version does not fit u16")
+            })?;
+            return Ok(());
+        }
+        if section == "system" && key == "generated_unix_ms" {
+            self.generated_unix_ms = value;
+            return Ok(());
+        }
+        let target = self
+            .section_mut(section)
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        let metric = RuntimeScalarMetric {
+            value,
+            unit: unit.to_owned(),
+        };
+        match kind {
+            "counter" => {
+                target.counters.insert(key.to_owned(), metric);
+            }
+            "gauge" => {
+                target.gauges.insert(key.to_owned(), metric);
+            }
+            _ => unreachable!("kind is validated by caller"),
+        }
+        Ok(())
+    }
+
+    fn set_histogram_total(
+        &mut self,
+        kind: &str,
+        name: &str,
+        unit: &str,
+        value: u64,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        let target = self
+            .section_mut(section)
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        let histogram =
+            target
+                .latencies
+                .entry(key.to_owned())
+                .or_insert_with(|| RuntimeLatencyHistogram {
+                    unit: unit.to_owned(),
+                    ..RuntimeLatencyHistogram::default()
+                });
+        histogram.unit = unit.to_owned();
+        match kind {
+            "histogram_count" => histogram.count = value,
+            "histogram_sum" => histogram.sum = value,
+            _ => unreachable!("kind is validated by caller"),
+        }
+        Ok(())
+    }
+
+    fn set_histogram_bucket(
+        &mut self,
+        name: &str,
+        le_ns: u64,
+        count: u64,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        let target = self
+            .section_mut(section)
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
+        target
+            .latencies
+            .entry(key.to_owned())
+            .or_default()
+            .buckets
+            .push(RuntimeLatencyBucket { le_ns, count });
+        Ok(())
+    }
+}
+
+/// One runtime stats section containing monotonic counters, gauges, and latency histograms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuntimeStatsSection {
+    /// Monotonically increasing counters keyed by stable snake_case names.
+    pub counters: BTreeMap<String, RuntimeScalarMetric>,
+    /// Point-in-time gauges keyed by stable snake_case names.
+    pub gauges: BTreeMap<String, RuntimeScalarMetric>,
+    /// Latency histograms keyed by stable snake_case operation names.
+    pub latencies: BTreeMap<String, RuntimeLatencyHistogram>,
+}
+
+impl RuntimeStatsSection {
+    fn write_text(&self, section_name: &str, out: &mut String) {
+        for (name, metric) in &self.counters {
+            out.push_str(&format!(
+                "counter {section_name}.{name} {} {}\n",
+                metric.unit, metric.value
+            ));
+        }
+        for (name, metric) in &self.gauges {
+            out.push_str(&format!(
+                "gauge {section_name}.{name} {} {}\n",
+                metric.unit, metric.value
+            ));
+        }
+        for (name, histogram) in &self.latencies {
+            out.push_str(&format!(
+                "histogram_count {section_name}.{name} {} {}\n",
+                histogram.unit, histogram.count
+            ));
+            out.push_str(&format!(
+                "histogram_sum {section_name}.{name} {} {}\n",
+                histogram.unit, histogram.sum
+            ));
+            for bucket in &histogram.buckets {
+                out.push_str(&format!(
+                    "histogram_bucket {section_name}.{name} {} {}\n",
+                    bucket.le_ns, bucket.count
+                ));
+            }
+        }
+    }
+}
+
+/// Scalar counter or gauge value with a stable unit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeScalarMetric {
+    /// Numeric value for this counter or gauge.
+    pub value: u64,
+    /// Stable unit string, such as `count`, `bytes`, `ns`, or `ms`.
+    pub unit: String,
+}
+
+/// Latency histogram with cumulative count and sum for interval averages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeLatencyHistogram {
+    /// Total observations.
+    pub count: u64,
+    /// Sum of observed latency values in `unit`.
+    pub sum: u64,
+    /// Unit used for `sum`; bucket bounds are always nanoseconds.
+    pub unit: String,
+    /// Bucket counts keyed by inclusive upper-bound nanoseconds.
+    pub buckets: Vec<RuntimeLatencyBucket>,
+}
+
+/// One latency histogram bucket.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLatencyBucket {
+    /// Inclusive upper-bound in nanoseconds.
+    pub le_ns: u64,
+    /// Count observed in this bucket.
+    pub count: u64,
+}
+
+/// Error returned when parsing the local runtime stats text surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeStatsParseError {
+    line: usize,
+    message: &'static str,
+}
+
+impl RuntimeStatsParseError {
+    fn new(line: usize, message: &'static str) -> Self {
+        Self { line, message }
+    }
+}
+
+impl std::fmt::Display for RuntimeStatsParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to parse runtime stats at line {}: {}",
+            self.line, self.message
+        )
+    }
+}
+
+impl std::error::Error for RuntimeStatsParseError {}
 
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
@@ -1382,5 +1776,115 @@ mod tests {
             .expect("deserialize macFUSE open-cache stats with renamed field");
 
         assert_eq!(stats.read_only_not_regular_file, 7);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_serializes_machine_readable_sections() {
+        let mut snapshot = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_720_000_000_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        snapshot.vfs_read.counters.insert(
+            "bytes".to_owned(),
+            RuntimeScalarMetric {
+                value: 4096,
+                unit: "bytes".to_owned(),
+            },
+        );
+        snapshot.upload_queue.gauges.insert(
+            "pending_depth".to_owned(),
+            RuntimeScalarMetric {
+                value: 2,
+                unit: "count".to_owned(),
+            },
+        );
+        snapshot.object_io.latencies.insert(
+            "get".to_owned(),
+            RuntimeLatencyHistogram {
+                count: 3,
+                sum: 120_000,
+                unit: "ns".to_owned(),
+                buckets: vec![RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                }],
+            },
+        );
+
+        let serialized = serde_json::to_value(&snapshot).expect("serialize runtime stats snapshot");
+
+        assert_eq!(serialized["schema_version"], RUNTIME_STATS_SCHEMA_VERSION);
+        assert_eq!(serialized["vfs_read"]["counters"]["bytes"]["unit"], "bytes");
+        assert_eq!(
+            serialized["upload_queue"]["gauges"]["pending_depth"]["value"],
+            2
+        );
+        assert_eq!(serialized["object_io"]["latencies"]["get"]["count"], 3);
+        assert_eq!(serialized["object_io"]["latencies"]["get"]["sum"], 120_000);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_missing_optional_fields_as_defaults() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "generated_unix_ms": 44,
+            "vfs_write": {
+                "counters": {
+                    "bytes": { "value": 128, "unit": "bytes" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with omitted sections");
+
+        assert_eq!(snapshot.generated_unix_ms, 44);
+        assert_eq!(snapshot.vfs_write.counters["bytes"].value, 128);
+        assert!(snapshot.system.counters.is_empty());
+        assert!(snapshot.bridge.gauges.is_empty());
+        assert!(snapshot.metadata.latencies.is_empty());
+    }
+
+    #[test]
+    fn runtime_stats_text_round_trips_counter_gauge_and_latency_histogram() {
+        let mut snapshot = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_720_000_000_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        snapshot.bridge.counters.insert(
+            "read_callbacks".to_owned(),
+            RuntimeScalarMetric {
+                value: 9,
+                unit: "count".to_owned(),
+            },
+        );
+        snapshot.cache.gauges.insert(
+            "resident_bytes".to_owned(),
+            RuntimeScalarMetric {
+                value: 8192,
+                unit: "bytes".to_owned(),
+            },
+        );
+        snapshot.metadata.latencies.insert(
+            "commit".to_owned(),
+            RuntimeLatencyHistogram {
+                count: 2,
+                sum: 300_000,
+                unit: "ns".to_owned(),
+                buckets: vec![
+                    RuntimeLatencyBucket {
+                        le_ns: 100_000,
+                        count: 1,
+                    },
+                    RuntimeLatencyBucket {
+                        le_ns: 500_000,
+                        count: 1,
+                    },
+                ],
+            },
+        );
+
+        let text = snapshot.to_text();
+        let parsed = RuntimeStatsSnapshot::parse_text(&text).expect("parse runtime stats text");
+
+        assert_eq!(parsed, snapshot);
     }
 }
