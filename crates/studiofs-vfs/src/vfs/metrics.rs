@@ -117,6 +117,7 @@ impl FromStr for RuntimeStatsSnapshot {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut snapshot = Self::default();
+        let mut explicit_histogram_units = BTreeMap::new();
         for (line_index, raw_line) in input.lines().enumerate() {
             let line = raw_line
                 .split_once('#')
@@ -174,7 +175,14 @@ impl FromStr for RuntimeStatsSnapshot {
                             "unexpected trailing fields",
                         ));
                     }
-                    snapshot.set_histogram_total(kind, name, unit, value, line_index + 1)?;
+                    snapshot.set_histogram_total(
+                        kind,
+                        name,
+                        unit,
+                        value,
+                        line_index + 1,
+                        &mut explicit_histogram_units,
+                    )?;
                 }
                 "histogram_bucket" => {
                     let name = parts.next().ok_or_else(|| {
@@ -335,6 +343,7 @@ impl RuntimeStatsSnapshot {
         unit: &str,
         value: u64,
         line: usize,
+        explicit_histogram_units: &mut BTreeMap<String, Cow<'static, str>>,
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
         Self::validate_not_root_system_histogram(section, key, line)?;
@@ -342,6 +351,14 @@ impl RuntimeStatsSnapshot {
             return Ok(());
         };
         let unit = parse_runtime_stats_unit(unit);
+        let explicit_unit_key = format!("{section}.{key}");
+        if let Some(existing_unit) = explicit_histogram_units.get(&explicit_unit_key) {
+            if existing_unit != &unit {
+                return Err(RuntimeStatsParseError::new(line, "histogram unit mismatch"));
+            }
+        } else {
+            explicit_histogram_units.insert(explicit_unit_key, unit.clone());
+        }
         if let Some(histogram) = target.latencies.get_mut(key) {
             set_histogram_unit(histogram, unit, line)?;
             match kind {
@@ -538,6 +555,8 @@ where
     let mut write_index = 0;
     for read_index in 1..raw_buckets.len() {
         if raw_buckets[write_index].le_ns == raw_buckets[read_index].le_ns {
+            // Keep the last duplicate bound; `Vec::dedup_by_key` would retain
+            // the first and change backwards-compatible parsing behavior.
             raw_buckets[write_index] = raw_buckets[read_index];
         } else {
             write_index += 1;
@@ -2396,6 +2415,21 @@ mod tests {
         .expect_err("histogram total unit mismatch should fail");
 
         assert_eq!(error.line(), 2);
+        assert_eq!(error.message(), "histogram unit mismatch");
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_zero_value_histogram_unit_mismatch_after_bucket() {
+        let error = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 100000 1\n\
+            histogram_count object_io.get ns 0\n\
+            histogram_sum object_io.get ms 0\n\
+            ",
+        )
+        .expect_err("explicit zero-valued histogram unit mismatch should fail");
+
+        assert_eq!(error.line(), 3);
         assert_eq!(error.message(), "histogram unit mismatch");
     }
 
