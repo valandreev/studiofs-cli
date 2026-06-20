@@ -140,8 +140,8 @@ fio build and does not indicate a StudioFS write failure.
   scale: the process max RSS stayed around 95 MiB across the sync and async
   variants. The current mounted smoke tests do not emit the live
   `pending async write bytes` counter directly; for a throughput decision, use
-  a full mounted `studiofs test-cache` report or add a larger Linux benchmark
-  harness that records `mounted_observability.write_callback`.
+  a full mounted benchmark report or add a larger Linux benchmark harness that
+  records `mounted_observability.write_callback`.
 - CPU stayed in the same broad band for the cargo-test harness. Because this is
   dominated by test process overhead, CPU data here should only be used as a
   regression smoke signal.
@@ -156,9 +156,9 @@ STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 \
 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_fio_multi_job -- --ignored --exact --nocapture
 ```
 
-Then run mounted `studiofs test-cache` sequential write, multi-job write,
-dirty-pressure workload, fsync-heavy workload, CPU, memory, and pending async
-write bytes capture for both default synchronous mode and async write opt-in.
+Then run mounted sequential write, multi-job write, dirty-pressure workload,
+fsync-heavy workload, CPU, memory, and pending async write bytes capture for
+both default synchronous mode and async write opt-in.
 The current fio smoke validates correctness for the async path, but it does not
 compare default synchronous mode against async mode with a sustained payload.
 Keep Linux writer page-size default unchanged unless that larger benchmark set

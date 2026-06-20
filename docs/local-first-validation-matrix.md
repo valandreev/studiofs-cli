@@ -238,64 +238,23 @@ read benchmark against committed remote-visible state:
 cargo test -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen -- --ignored --nocapture --test-threads=1
 ```
 
-### Cache-Cold And Cache-Warm Direct-Shim Runs
+### Cache-Cold And Cache-Warm Runs
 
-Use `studiofs test-cache` in direct-shim mode for local cache benchmarking
-without a mounted filesystem:
+Cache-cold and cache-warm evidence should come from mounted filesystem
+workloads so the report captures VFS policy, bridge behavior, namespace lookup,
+and the cache/object pipeline together. Capture an initial cold pass and a
+repeat warm pass with the same mounted path, workload shape, cache disk, and
+metadata disk.
 
-```bash
-cargo run -p studiofs -- test-cache ./target/test-cache/direct-cold \
-  --access-pattern sequential \
-  --block-size 16MB \
-  --read-size 1MB \
-  --sizes 4MB,16MB,64MB \
-  --concurrency 2 \
-  --io-depth 32 \
-  --warmup-runs 0
-```
-
-Re-run against the same cache directory with warm-ups enabled to capture the
-warm-cache path:
-
-```bash
-cargo run -p studiofs -- test-cache ./target/test-cache/direct-cold \
-  --access-pattern sequential \
-  --block-size 16MB \
-  --read-size 1MB \
-  --sizes 4MB,16MB,64MB \
-  --concurrency 2 \
-  --io-depth 32 \
-  --warmup-runs 2
-```
-
-Use the JSON report's `advanced_metrics.cache_levels` section for L1 hit/miss
-evidence.
+Use the report's cache-level counters when they are available as diagnostic
+evidence, but do not replace the mounted workload with a direct cache-only
+benchmark for user-facing parity claims.
 
 ### Mounted End-To-End Sequential / Random Runs
 
-Run these against a mounted StudioFS path after the mount is already active:
-
-```bash
-cargo run -p studiofs -- test-cache <mounted-path> \
-  --access-pattern sequential \
-  --block-size 16MB \
-  --read-size 1MB \
-  --sizes 16MB,64MB,256MB \
-  --concurrency 2 \
-  --io-depth 16 \
-  --warmup-runs 1
-```
-
-```bash
-cargo run -p studiofs -- test-cache <mounted-path> \
-  --access-pattern random \
-  --block-size 16MB \
-  --read-size 256KB \
-  --sizes 16MB,64MB,256MB \
-  --concurrency 4 \
-  --io-depth 32 \
-  --warmup-runs 1
-```
+Run sequential and random workloads against a mounted StudioFS path after the
+mount is already active. Record the workload shape explicitly: access pattern,
+block size, read size, file sizes, concurrency, queue depth, and warm-up count.
 
 When the mounted runtime exposes upload-state metadata, inspect the human
 summary or JSON `local_first_read_comparison` section for the
@@ -304,8 +263,7 @@ is valid only when upload idle was observed first; otherwise the JSON report
 marks it invalid and records the timeout reason.
 
 For SFS-299 parity reports, prefer `studiofs test <mounted-path> --report
-<path>` or the equivalent `test-cache` command with `--report`. The JSON report
-must include:
+<path>`. The JSON report must include:
 
 - `mounted_runtime`: mounted path, cache root, inferred metadata root when the
   default `<meta-dir>/cache/<uuid>` layout is visible, block/chunk size, read
@@ -337,38 +295,23 @@ when the measured run does not expose that signal.
 Use this mounted recipe when you want a latency-sensitive small-file benchmark
 instead of the larger throughput-oriented defaults:
 
-```bash
-cargo run -p studiofs -- test-cache <mounted-path> \
-  --access-pattern random \
-  --block-size 64KB \
-  --read-size 4KB \
-  --sizes 4KB,16KB,64KB \
-  --concurrency 16 \
-  --io-depth 64 \
-  --warmup-runs 1
-```
+Use a mounted path for this recipe because it exercises namespace lookups, VFS
+policy, cache behavior, and small-read amplification together. Record a random
+access pattern with small files such as 4 KiB, 16 KiB, and 64 KiB, a 4 KiB read
+size, and enough concurrency/queue depth to expose metadata-sensitive latency.
 
-Prefer the mounted path for this recipe because it exercises namespace lookups,
-VFS policy, cache behavior, and small-read amplification together. Use the same
-shape against a direct-shim path only when isolating local cache behavior from
-the mounted filesystem stack.
+Use direct cache-only runs only as developer diagnostics when isolating local
+cache behavior from the mounted filesystem stack; do not treat them as the
+user-facing benchmark workflow.
 
 ### Writeback-Heavy End-To-End Run
 
 Use a mounted path and mixed access to keep upload/writeback pressure active
 while still measuring read-side service quality:
 
-```bash
-cargo run -p studiofs -- test-cache <mounted-path> \
-  --access-pattern mixed \
-  --block-size 16MB \
-  --read-size 1MB \
-  --sizes 16MB,64MB,256MB \
-  --concurrency 4 \
-  --io-depth 32 \
-  --warmup-runs 1 \
-  --sequential-streams
-```
+Record a mounted mixed-access workload with background upload/writeback
+pressure, repeated read phases, and enough concurrency/queue depth to expose
+foreground service quality during upload.
 
 For a stricter regression gate on the same concern, pair the command above with:
 
@@ -530,8 +473,8 @@ cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --tes
 
 ### Mounted Benchmark Sweep
 
-Run the sequential, random, and writeback-heavy `studiofs test-cache`
-commands above against the same mounted volume and archive the JSON reports.
+Run the sequential, random, and writeback-heavy mounted benchmark shapes above
+against the same mounted volume and archive the JSON reports.
 
 ### Optional JuiceFS Reference Sweep
 

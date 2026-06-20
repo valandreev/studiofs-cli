@@ -173,81 +173,10 @@ Repair mode currently:
 - leaves orphan directories / hardlink-like orphan cases and `nlink` mismatch
   entries as report-only
 
-## 9. Benchmark Cache (`test-cache`)
+## 9. Benchmarks
 
-Direct-shim benchmark (bypass VFS/mount):
-
-```bash
-studiofs test-cache \
-  /tmp/studiofs-cache-bench \
-  --block-size 16MB \
-  --read-size 1MB \
-  --small-max 10KB \
-  --medium-max 16MB \
-  --sizes small=60,medium=30,large=10 \
-  --concurrency 2 \
-  --sequential-streams \
-  --io-depth 64 \
-  --warmup-runs 2 \
-  --access-pattern mixed \
-  --l1-limit 2GB \
-  --profile=pyroscope
-```
-
-End-to-end benchmark through an already mounted filesystem:
-
-```bash
-studiofs test-cache \
-  /mnt/studio/bench
-```
-
-Notes:
-- If `<path>` is not inside an active StudioFS mount, benchmark runs in
-  `direct-shim` mode and uses `<path>` as cache dir.
-- If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
-  through that mounted process and writes temp workload files into
-  `<path>/.studiofs-test-cache`.
-- Terminal output is a readable benchmark summary. The full structured JSON
-  report is saved in the directory where `studiofs test-cache` was started,
-  using an auto-generated file name unless `--json-output <path>` is provided.
-- `--sizes` accepts percentages (`small=60,medium=30,large=10`) or explicit lists (`4KB,64KB,1MB,16MB`).
-- `--warmup-runs` runs prefill cycles that are not included in measured
-  metrics.
-- Throughput in benchmark reports is phase-scoped: write-side metrics use
-  write-phase wall time, and read-side metrics use read-phase wall time (not
-  total benchmark wall time).
-- `--sequential-streams` runs each stream in-order and emits per-stream results
-  in both terminal and JSON output.
-- in `--sequential-streams` mode, effective in-flight I/O is
-  `min(--concurrency, --io-depth)` because each stream executes serially.
-- JSON report contains a `run_id` field to correlate benchmark output with
-  tracing/profile events.
-- When `--profile=pyroscope` is enabled, `studiofs test-cache` writes local
-  pprof artifacts next to the JSON report. If `STUDIOFS_PYROSCOPE_URL` is set,
-  the same CPU and memory profiles are also pushed to that endpoint.
-- JSON report contains an `advanced_metrics` section with:
-  - size-class boundaries (`small_max_bytes`, `medium_max_bytes`)
-  - per-size-class throughput and latency percentiles (p50/p95/p99)
-  - upload queue depth counters
-- `direct-shim` JSON output includes a `cache_pipeline` section with:
-  - L1 staging throughput + latency histograms
-  - `materialize_batches` batch size/duration/concurrency metrics
-  - `upload_queue` depth and queue counters
-  - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
-- `direct-shim` `advanced_metrics.cache_levels` reports L1 hit/miss counters,
-  bytes served from L1, and L1 lookup latency distributions.
-- On mounts started by newer StudioFS builds, `e2e` JSON output also includes
-  `local_first_read_comparison`, which records `baseline-read`,
-  `during-upload-read`, and `post-upload-read` phases plus the pending-upload
-  wait observations used to bracket them.
-- The terminal summary shows the same mounted comparison as a
-  `Local-First read comparison` table, including wait target/observation and
-  pending upload counts before and after each read phase.
-- When mounted runtime observability is available, `e2e` output also includes
-  `mounted_memory` for mounted-process RSS and, when available, dirty-pressure
-  snapshots. These fields are best-effort and may be omitted when StudioFS
-  cannot observe that signal for the measured run; the terminal summary prints
-  the same data as a `Mounted memory` table.
-- `e2e` mode still keeps filesystem-level read/write reports; cache internals
-  continue to be emitted through mount logs (`upload pipeline counters`).
+Benchmark and statistics tooling is being consolidated around mounted
+filesystem workloads. Use the mounted validation recipes in
+[docs/local-first-validation-matrix.md](./local-first-validation-matrix.md)
+until the public `studiofs bench` command is available.
 

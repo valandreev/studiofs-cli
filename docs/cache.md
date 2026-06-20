@@ -15,7 +15,7 @@ Runtime components:
 | Local cache backend | `payload_layout`, `payload_index`, `payload_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
 | Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Writer pages, staging, cached reads, pending-upload queue, upload helpers, pinning, and runtime metrics |
-| Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |
+| Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by benchmark internals |
 
 ## Architecture
 
@@ -89,8 +89,8 @@ runtime. It is intentionally focused on:
 - upload helpers used by the background uploader
 - runtime metrics used by `status`
 
-`BenchmarkCache` is separate and only backs `studiofs test-cache`; it is not
-part of the production mount runtime.
+`BenchmarkCache` is separate and only backs benchmark internals; it is not part
+of the production mount runtime.
 
 Durable local payload state lives in the cached store plus local metadata; the
 mount must not create a second foreground payload pipeline.

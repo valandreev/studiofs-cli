@@ -1102,7 +1102,7 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
         "cargo test -p studiofs-macfuse",
         "cargo test -p studiofs-fuse --test mount_sanity",
         "cargo test -p studiofs-winfsp --test mount_sanity",
-        "studiofs test-cache --mounted",
+        "Capture mounted benchmark reports for the macFUSE candidate and fuser baseline",
         "docs/configuration.md",
         "docs/platform-bridges.md",
     ];
