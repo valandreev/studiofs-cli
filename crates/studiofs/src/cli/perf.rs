@@ -410,7 +410,11 @@ fn runtime_stats_from_diagnostics(
         &mut snapshot.bridge,
         "read_callbacks",
         "count",
-        write_path.fuse_callbacks.read.calls,
+        write_path
+            .fuse_callbacks
+            .read
+            .calls
+            .saturating_add(write_path.winfsp_callbacks.read),
     );
     insert_counter(
         &mut snapshot.bridge,
@@ -478,7 +482,11 @@ fn runtime_stats_from_diagnostics(
         &mut snapshot.bridge,
         "read_callback_bytes",
         "bytes",
-        write_path.fuse_callbacks.read.bytes,
+        write_path
+            .fuse_callbacks
+            .read
+            .bytes
+            .saturating_add(write_path.winfsp_callbacks.read_bytes),
     );
     insert_counter(
         &mut snapshot.bridge,
@@ -489,6 +497,22 @@ fn runtime_stats_from_diagnostics(
             .write
             .bytes
             .saturating_add(write_path.winfsp_write_path.write_bytes),
+    );
+    insert_latency(
+        &mut snapshot.bridge,
+        "callback",
+        "ns",
+        write_path
+            .fuse_callbacks
+            .read
+            .calls
+            .saturating_add(write_path.fuse_callbacks.write.calls)
+            .saturating_add(write_path.winfsp_callbacks.read)
+            .saturating_add(write_path.winfsp_callbacks.write),
+        ms_sum_to_ns(write_path.fuse_callbacks.read.total_ms)
+            .saturating_add(ms_sum_to_ns(write_path.fuse_callbacks.write.total_ms))
+            .saturating_add(write_path.winfsp_callbacks.read_total_ns)
+            .saturating_add(ms_sum_to_ns(write_path.winfsp_write_path.callback.total_ms)),
     );
     insert_counter(
         &mut snapshot.vfs_read,
@@ -551,6 +575,30 @@ fn runtime_stats_from_diagnostics(
         "count",
         cache.local_backend_dirty_objects as u64,
     );
+    insert_counter(
+        &mut snapshot.cache,
+        "hit_calls",
+        "count",
+        write_path.fetch.cache_hits,
+    );
+    insert_counter(
+        &mut snapshot.cache,
+        "hit_bytes",
+        "bytes",
+        write_path.fetch.cache_hit_bytes,
+    );
+    insert_counter(
+        &mut snapshot.cache,
+        "read_calls",
+        "count",
+        write_path.fetch.local_cache_io_calls,
+    );
+    insert_counter(
+        &mut snapshot.cache,
+        "read_bytes",
+        "bytes",
+        write_path.fetch.cache_hit_bytes,
+    );
     insert_gauge(
         &mut snapshot.upload_queue,
         "pending_depth",
@@ -609,6 +657,21 @@ fn runtime_stats_from_diagnostics(
     );
     insert_counter(
         &mut snapshot.object_io,
+        "get_calls",
+        "count",
+        write_path.fetch.s3_get_calls,
+    );
+    insert_counter(
+        &mut snapshot.object_io,
+        "get_bytes",
+        "bytes",
+        write_path
+            .fetch
+            .encrypted_bytes_read
+            .max(write_path.fetch.bytes_downloaded),
+    );
+    insert_counter(
+        &mut snapshot.object_io,
         "put_calls",
         "count",
         upload.completed_uploads,
@@ -637,6 +700,13 @@ fn runtime_stats_from_diagnostics(
         "count",
         write_path.metadata_commit.calls,
     );
+    insert_latency(
+        &mut snapshot.metadata,
+        "commit",
+        "ns",
+        write_path.metadata_commit.calls,
+        ms_sum_to_ns(write_path.metadata_commit.total_ms),
+    );
 
     snapshot
 }
@@ -659,6 +729,28 @@ fn insert_gauge(section: &mut RuntimeStatsSection, name: &str, unit: &'static st
             unit: unit.into(),
         },
     );
+}
+
+fn insert_latency(
+    section: &mut RuntimeStatsSection,
+    name: &str,
+    unit: &'static str,
+    count: u64,
+    sum: u64,
+) {
+    section.latencies.insert(
+        name.to_owned(),
+        RuntimeLatencyHistogram {
+            count,
+            sum,
+            unit: unit.into(),
+            buckets: Vec::new(),
+        },
+    );
+}
+
+fn ms_sum_to_ns(value: f64) -> u64 {
+    (value.max(0.0) * 1_000_000.0).round() as u64
 }
 
 fn build_sample(
@@ -689,7 +781,16 @@ fn build_sample(
         }
         sections.insert(
             *section_name,
-            build_section_sample(before, after, seconds, options.verbosity),
+            build_section_sample(
+                before,
+                after,
+                seconds,
+                if matches!(options.output, PerfOutput::Table) {
+                    PerfVerbosity::Verbose
+                } else {
+                    options.verbosity
+                },
+            ),
         );
     }
 
@@ -836,7 +937,7 @@ fn write_table_sample(
     let row = dstat_row(sample);
     writeln!(
         out,
-        "{} {} {} | {} {} {} {} | {} {} | {} {} | {} {}",
+        "{} {} {} | {} {} {} {} | {} {} | {} {} {} | {} {}",
         table_cell(&row.cpu),
         table_cell(&row.mem),
         table_cell(&row.buf),
@@ -846,6 +947,7 @@ fn write_table_sample(
         table_cell(&row.fuse_write),
         table_cell(&row.meta_ops),
         table_cell(&row.meta_lat),
+        table_cell(&row.cache_hit),
         table_cell(&row.cache_read),
         table_cell(&row.cache_write),
         table_cell(&row.object_get),
@@ -862,12 +964,12 @@ fn write_table_header(out: &mut impl Write) -> anyhow::Result<()> {
         table_group("usage", 3),
         table_group("fuse", 4),
         table_group("meta", 2),
-        table_group("blockcache", 2),
+        table_group("blockcache", 3),
         table_group("object", 2),
     )?;
     writeln!(
         out,
-        "{} {} {} | {} {} {} {} | {} {} | {} {} | {} {}",
+        "{} {} {} | {} {} {} {} | {} {} | {} {} {} | {} {}",
         table_label("cpu"),
         table_label("mem"),
         table_label("buf"),
@@ -877,6 +979,7 @@ fn write_table_header(out: &mut impl Write) -> anyhow::Result<()> {
         table_label("write"),
         table_label("ops"),
         table_label("lat"),
+        table_label("hit"),
         table_label("read"),
         table_label("write"),
         table_label("get"),
@@ -919,6 +1022,7 @@ struct DstatRow {
     fuse_write: String,
     meta_ops: String,
     meta_lat: String,
+    cache_hit: String,
     cache_read: String,
     cache_write: String,
     object_get: String,
@@ -945,14 +1049,17 @@ fn dstat_row(sample: &PerfSample) -> DstatRow {
                 + counter_rate(bridge, "cleanup_callbacks")
                 + counter_rate(bridge, "close_callbacks"),
         ),
-        fuse_lat: "0".to_string(),
+        fuse_lat: format_latency_ms(latency_avg(bridge, "callback")),
         fuse_read: format_bytes_rate(counter_rate(vfs_read, "requested_bytes")),
         fuse_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
         meta_ops: format_rate(counter_rate(metadata, "commit_calls")),
-        meta_lat: "0".to_string(),
-        cache_read: format_bytes_rate(counter_rate(bridge, "os_cache_miss_read_bytes")),
+        meta_lat: format_latency_ms(latency_avg(metadata, "commit")),
+        cache_hit: format_rate(counter_rate(cache, "hit_calls")),
+        cache_read: format_bytes_rate(
+            counter_rate(cache, "read_bytes").max(counter_rate(bridge, "os_cache_miss_read_bytes")),
+        ),
         cache_write: format_bytes_rate(counter_rate(vfs_write, "accepted_bytes")),
-        object_get: "0".to_string(),
+        object_get: format_bytes_rate(counter_rate(object, "get_bytes")),
         object_put: format_bytes_rate(counter_rate(object, "put_bytes")),
     }
 }
@@ -969,6 +1076,12 @@ fn gauge_value(section: Option<&PerfSectionSample>, name: &str) -> u64 {
         .map_or(0, |metric| metric.value)
 }
 
+fn latency_avg(section: Option<&PerfSectionSample>, name: &str) -> Option<f64> {
+    section
+        .and_then(|section| section.latencies.get(name))
+        .and_then(|metric| metric.avg)
+}
+
 fn format_rate(value: f64) -> String {
     if value == 0.0 {
         "0".to_string()
@@ -981,6 +1094,20 @@ fn format_rate(value: f64) -> String {
 
 fn format_bytes_rate(value: f64) -> String {
     format_bytes(value.max(0.0) as u64)
+}
+
+fn format_latency_ms(value_ns: Option<f64>) -> String {
+    let Some(value_ns) = value_ns else {
+        return "0".to_string();
+    };
+    let value_ms = value_ns / 1_000_000.0;
+    if value_ms == 0.0 {
+        "0".to_string()
+    } else if value_ms < 10.0 {
+        format!("{value_ms:.1}")
+    } else {
+        format!("{value_ms:.0}")
+    }
 }
 
 fn format_cpu(value_x10: u64) -> String {
@@ -1183,6 +1310,15 @@ mod tests {
             "write_callbacks".to_string(),
             scalar(20 * multiplier, "count"),
         );
+        snapshot.bridge.latencies.insert(
+            "callback".to_string(),
+            RuntimeLatencyHistogram {
+                count: 10 * multiplier,
+                sum: 20_000_000 * multiplier,
+                unit: "ns".into(),
+                buckets: Vec::new(),
+            },
+        );
         snapshot.vfs_read.counters.insert(
             "requested_bytes".to_string(),
             scalar(55 * 1024 * 1024 * multiplier, "bytes"),
@@ -1195,6 +1331,27 @@ mod tests {
             .metadata
             .counters
             .insert("commit_calls".to_string(), scalar(15 * multiplier, "count"));
+        snapshot.metadata.latencies.insert(
+            "commit".to_string(),
+            RuntimeLatencyHistogram {
+                count: 15 * multiplier,
+                sum: 45_000_000 * multiplier,
+                unit: "ns".into(),
+                buckets: Vec::new(),
+            },
+        );
+        snapshot
+            .cache
+            .counters
+            .insert("hit_calls".to_string(), scalar(8 * multiplier, "count"));
+        snapshot.cache.counters.insert(
+            "read_bytes".to_string(),
+            scalar(33 * 1024 * 1024 * multiplier, "bytes"),
+        );
+        snapshot.object_io.counters.insert(
+            "get_bytes".to_string(),
+            scalar(44 * 1024 * 1024 * multiplier, "bytes"),
+        );
         snapshot.object_io.counters.insert(
             "put_bytes".to_string(),
             scalar(7 * 1024 * 1024 * multiplier, "bytes"),
@@ -1238,12 +1395,25 @@ mod tests {
             .write_path
             .winfsp_callbacks
             .os_cache_miss_read_bytes = 13 * 1024 * 1024;
+        diagnostics.write_path.winfsp_callbacks.read = 17;
+        diagnostics.write_path.winfsp_callbacks.read_bytes = 19 * 1024 * 1024;
+        diagnostics.write_path.winfsp_callbacks.read_total_ns = 23_000_000;
+        diagnostics.write_path.fuse_callbacks.read.bytes = 3 * 1024 * 1024;
+        diagnostics.write_path.fuse_callbacks.read.total_ms = 5.0;
         diagnostics.write_path.winfsp_write_path.write_bytes = 2048;
+        diagnostics.write_path.winfsp_write_path.callback.total_ms = 7.0;
         diagnostics.write_path.vfs_read_path.calls = 5;
         diagnostics.write_path.vfs_read_path.requested_bytes = 4096;
         diagnostics.write_path.vfs_write_path.calls = 7;
         diagnostics.write_path.vfs_write_path.write_bytes = 8192;
         diagnostics.write_path.metadata_commit.calls = 11;
+        diagnostics.write_path.metadata_commit.total_ms = 13.0;
+        diagnostics.write_path.fetch.cache_hits = 31;
+        diagnostics.write_path.fetch.cache_hit_bytes = 37 * 1024 * 1024;
+        diagnostics.write_path.fetch.local_cache_io_calls = 41;
+        diagnostics.write_path.fetch.s3_get_calls = 43;
+        diagnostics.write_path.fetch.bytes_downloaded = 47 * 1024 * 1024;
+        diagnostics.write_path.fetch.encrypted_bytes_read = 53 * 1024 * 1024;
         diagnostics.process.cpu_percent = 12.3;
         diagnostics.process.rss_bytes = 51 * 1024 * 1024;
         diagnostics.ingress.dirty_mem_bytes = 13;
@@ -1263,7 +1433,7 @@ mod tests {
         assert_eq!(snapshot.system.gauges["cpu_percent_x10"].value, 123);
         assert_eq!(snapshot.system.gauges["rss_bytes"].value, 51 * 1024 * 1024);
         assert_eq!(snapshot.system.gauges["uptime_ms"].value, 3500);
-        assert_eq!(snapshot.bridge.counters["read_callbacks"].value, 2);
+        assert_eq!(snapshot.bridge.counters["read_callbacks"].value, 19);
         assert_eq!(snapshot.bridge.counters["write_callbacks"].value, 3);
         assert_eq!(snapshot.bridge.counters["os_cache_enabled_open"].value, 5);
         assert_eq!(snapshot.bridge.counters["os_cache_disabled_open"].value, 7);
@@ -1275,7 +1445,13 @@ mod tests {
             snapshot.bridge.counters["os_cache_miss_read_bytes"].value,
             13 * 1024 * 1024
         );
+        assert_eq!(
+            snapshot.bridge.counters["read_callback_bytes"].value,
+            22 * 1024 * 1024
+        );
         assert_eq!(snapshot.bridge.counters["write_callback_bytes"].value, 2048);
+        assert_eq!(snapshot.bridge.latencies["callback"].count, 22);
+        assert_eq!(snapshot.bridge.latencies["callback"].sum, 35_000_000);
         assert_eq!(snapshot.vfs_read.counters["calls"].value, 5);
         assert_eq!(snapshot.vfs_read.counters["requested_bytes"].value, 4096);
         assert_eq!(snapshot.vfs_write.counters["calls"].value, 7);
@@ -1287,15 +1463,29 @@ mod tests {
             snapshot.cache.gauges["local_backend_dirty_objects"].value,
             23
         );
+        assert_eq!(snapshot.cache.counters["hit_calls"].value, 31);
+        assert_eq!(snapshot.cache.counters["hit_bytes"].value, 37 * 1024 * 1024);
+        assert_eq!(snapshot.cache.counters["read_calls"].value, 41);
+        assert_eq!(
+            snapshot.cache.counters["read_bytes"].value,
+            37 * 1024 * 1024
+        );
         assert_eq!(snapshot.upload_queue.gauges["pending_depth"].value, 29);
         assert_eq!(snapshot.upload_queue.gauges["pending_bytes"].value, 31);
         assert_eq!(snapshot.upload_queue.counters["completed"].value, 37);
         assert_eq!(snapshot.upload_queue.counters["completed_bytes"].value, 41);
+        assert_eq!(snapshot.object_io.counters["get_calls"].value, 43);
+        assert_eq!(
+            snapshot.object_io.counters["get_bytes"].value,
+            53 * 1024 * 1024
+        );
         assert_eq!(snapshot.object_io.counters["put_calls"].value, 37);
         assert_eq!(snapshot.object_io.counters["put_bytes"].value, 41);
         assert_eq!(snapshot.object_io.counters["encrypted_put_bytes"].value, 43);
         assert_eq!(snapshot.object_io.counters["errors"].value, 47);
         assert_eq!(snapshot.metadata.counters["commit_calls"].value, 11);
+        assert_eq!(snapshot.metadata.latencies["commit"].count, 11);
+        assert_eq!(snapshot.metadata.latencies["commit"].sum, 13_000_000);
     }
 
     #[test]
@@ -1661,17 +1851,22 @@ mod tests {
         assert!(output.contains("------usage------"));
         assert!(output.contains("---------fuse---------"));
         assert!(output.contains("-----meta----"));
-        assert!(output.contains("--blockcache--"));
+        assert!(output.contains("-------blockcache-------"));
         assert!(output.contains("---object---"));
         assert!(output.contains("     cpu      mem      buf |"));
+        assert!(output.contains("     hit     read    write |"));
         assert!(output.contains("2.4%"));
         assert!(output.contains("50M"));
         assert!(output.contains("4M"));
         assert!(output.contains("30"));
+        assert!(output.contains("2.0"));
         assert!(output.contains("55M"));
         assert!(output.contains("9M"));
         assert!(output.contains("15"));
-        assert!(output.contains("3M"));
+        assert!(output.contains("3.0"));
+        assert!(output.contains("8.0"));
+        assert!(output.contains("33M"));
+        assert!(output.contains("44M"));
         assert!(output.contains("7M"));
     }
 

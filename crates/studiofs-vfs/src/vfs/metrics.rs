@@ -776,6 +776,15 @@ pub struct VfsWritePathSyncDataStats {
 /// WinFSP callback counters for the write path.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspCallbackStats {
+    /// Number of read callbacks.
+    #[serde(default)]
+    pub read: u64,
+    /// Bytes handled by read callbacks.
+    #[serde(default)]
+    pub read_bytes: u64,
+    /// Total read callback wall time in nanoseconds.
+    #[serde(default)]
+    pub read_total_ns: u64,
     /// Number of write callbacks.
     pub write: u64,
     /// Number of overwrite callbacks.
@@ -1319,6 +1328,9 @@ pub struct VfsWritePathTuningStats {
 pub struct VfsFetchStats {
     /// Cache hits in fetch flow.
     pub cache_hits: u64,
+    /// Bytes served by local block-cache hits.
+    #[serde(default)]
+    pub cache_hit_bytes: u64,
     /// S3 fetch request count.
     pub s3_fetches: u64,
     /// S3 fetch error count.

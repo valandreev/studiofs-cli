@@ -1469,6 +1469,7 @@ impl FileSystemContext for StudioFsContext {
         let fh = context.fh;
         let out_buf = SendMutBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
+        let callback_start = Instant::now();
 
         let result: Result<u32, _> = self.spawn_wait(async move {
             // SAFETY:
@@ -1483,6 +1484,8 @@ impl FileSystemContext for StudioFsContext {
 
         match result {
             Ok(n) => {
+                self.vfs
+                    .record_winfsp_read_callback_observability(n, callback_start.elapsed());
                 context.record_read_callback(n);
                 if !context.disable_os_cache {
                     self.vfs.note_winfsp_os_cache_miss_read(n);
@@ -2082,6 +2085,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;
+    use std::time::Duration;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::{
         CURRENT_FORMAT_VERSION, DirEntryValue, FileType, FormatInfo, Ino, InodeAttr, MetaFormat,
@@ -2295,12 +2299,16 @@ mod tests {
         let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle);
         handle.set_disable_os_cache(disable_os_cache);
         vfs.note_winfsp_os_cache_open(disable_os_cache);
+        vfs.record_winfsp_read_callback_observability(4096, Duration::from_millis(2));
         handle.record_read_callback(4096);
         if !handle.disable_os_cache {
             vfs.note_winfsp_os_cache_miss_read(4096);
         }
 
         let callbacks = vfs.write_path_observability_snapshot().winfsp_callbacks;
+        assert_eq!(callbacks.read, 1);
+        assert_eq!(callbacks.read_bytes, 4096);
+        assert_eq!(callbacks.read_total_ns, 2_000_000);
         assert_eq!(callbacks.os_cache_enabled_open, 1);
         assert_eq!(callbacks.os_cache_disabled_open, 0);
         assert_eq!(callbacks.os_cache_miss_read_callbacks, 1);

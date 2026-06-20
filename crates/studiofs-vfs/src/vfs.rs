@@ -2197,6 +2197,10 @@ struct MetricsState {
     winfsp_write_callback_write_through_bytes: AtomicU64,
     winfsp_write_callback_opportunistic_calls: AtomicU64,
     winfsp_write_callback_opportunistic_bytes: AtomicU64,
+    winfsp_read_callbacks: AtomicU64,
+    winfsp_read_callback_bytes: AtomicU64,
+    winfsp_read_callback_total_ns: AtomicU64,
+    winfsp_read_callback_max_ns: AtomicU64,
     winfsp_overwrite_callbacks: AtomicU64,
     winfsp_cleanup_callbacks: AtomicU64,
     winfsp_flush_callbacks: AtomicU64,
@@ -2336,6 +2340,10 @@ impl MetricsState {
             winfsp_write_callback_write_through_bytes: AtomicU64::new(0),
             winfsp_write_callback_opportunistic_calls: AtomicU64::new(0),
             winfsp_write_callback_opportunistic_bytes: AtomicU64::new(0),
+            winfsp_read_callbacks: AtomicU64::new(0),
+            winfsp_read_callback_bytes: AtomicU64::new(0),
+            winfsp_read_callback_total_ns: AtomicU64::new(0),
+            winfsp_read_callback_max_ns: AtomicU64::new(0),
             winfsp_overwrite_callbacks: AtomicU64::new(0),
             winfsp_cleanup_callbacks: AtomicU64::new(0),
             winfsp_flush_callbacks: AtomicU64::new(0),
@@ -2465,6 +2473,10 @@ impl MetricsState {
             winfsp_write_callback_vfs_max_ns,
             winfsp_write_callback_getattr_total_ns,
             winfsp_write_callback_getattr_max_ns,
+            winfsp_read_callbacks,
+            winfsp_read_callback_bytes,
+            winfsp_read_callback_total_ns,
+            winfsp_read_callback_max_ns,
             winfsp_overwrite_callbacks,
             winfsp_cleanup_callbacks,
             winfsp_flush_callbacks,
@@ -6822,6 +6834,28 @@ impl StudioVfs {
         );
     }
 
+    /// Record WinFSP read callback bytes and callback wall time.
+    pub fn record_winfsp_read_callback_observability(
+        &self,
+        read_bytes: u32,
+        callback_elapsed: Duration,
+    ) {
+        let metrics = &self.state.metrics;
+        let elapsed_ns = Self::duration_ns_u64(callback_elapsed);
+        metrics
+            .winfsp_read_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .winfsp_read_callback_bytes
+            .fetch_add(u64::from(read_bytes), Ordering::Relaxed);
+        metrics
+            .winfsp_read_callback_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        metrics
+            .winfsp_read_callback_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
     /// Record VFS write call counters and byte totals.
     pub(super) fn note_vfs_write_call(&self, write_bytes: usize) {
         self.state
@@ -7254,6 +7288,9 @@ impl StudioVfs {
             winfsp_write_callback_vfs_max_ns: winfsp_write_callback_vfs_max_ns,
             winfsp_write_callback_getattr_total_ns: winfsp_write_callback_getattr_total_ns,
             winfsp_write_callback_getattr_max_ns: winfsp_write_callback_getattr_max_ns,
+            winfsp_read_callbacks: winfsp_read_callbacks,
+            winfsp_read_callback_bytes: winfsp_read_callback_bytes,
+            winfsp_read_callback_total_ns: winfsp_read_callback_total_ns,
             fuse_read_callbacks: fuse_read_callbacks,
             fuse_read_callback_bytes: fuse_read_callback_bytes,
             fuse_read_callback_errors: fuse_read_callback_errors,
@@ -7423,6 +7460,7 @@ impl StudioVfs {
         let upload_stats = self.upload_stats();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
+        let fetch_cache_hit_bytes = fetch_metrics.cache_hit_bytes.load(Ordering::Relaxed);
         let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
         let fetch_s3_errors = fetch_metrics.s3_errors.load(Ordering::Relaxed);
         let fetch_singleflight_joins = fetch_metrics.singleflight_joins.load(Ordering::Relaxed);
@@ -7615,6 +7653,9 @@ impl StudioVfs {
                 },
             },
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
+                read: winfsp_read_callbacks,
+                read_bytes: winfsp_read_callback_bytes,
+                read_total_ns: winfsp_read_callback_total_ns,
                 write: self
                     .state
                     .metrics
@@ -7977,6 +8018,7 @@ impl StudioVfs {
             upload: upload_stats,
             fetch: VfsFetchStats {
                 cache_hits: fetch_cache_hits,
+                cache_hit_bytes: fetch_cache_hit_bytes,
                 s3_fetches: fetch_s3_fetches,
                 s3_errors: fetch_s3_errors,
                 singleflight_joins: fetch_singleflight_joins,
