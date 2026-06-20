@@ -1,7 +1,641 @@
-use super::file_session::VfsFileSessionStats;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+use super::file_session::VfsFileSessionStats;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
+
+/// Current version of the cross-platform runtime stats snapshot schema.
+pub const RUNTIME_STATS_SCHEMA_VERSION: u16 = 1;
+
+/// Stable runtime stats sections exposed by all StudioFS bridge implementations.
+pub const RUNTIME_STATS_SECTIONS: &[&str] = &[
+    "system",
+    "bridge",
+    "vfs_read",
+    "vfs_write",
+    "cache",
+    "upload_queue",
+    "object_io",
+    "metadata",
+];
+
+/// Cross-platform runtime statistics snapshot for benchmarks and live performance reporting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeStatsSnapshot {
+    /// Stable schema version. Readers must tolerate missing newer fields.
+    pub schema_version: u16,
+    /// Snapshot generation timestamp in Unix milliseconds.
+    pub generated_unix_ms: u64,
+    /// System and runtime process counters.
+    #[serde(default, deserialize_with = "deserialize_system_runtime_stats_section")]
+    pub system: RuntimeStatsSection,
+    /// FUSE, macFUSE, WinFSP, or future bridge callback counters.
+    pub bridge: RuntimeStatsSection,
+    /// VFS read-path counters.
+    pub vfs_read: RuntimeStatsSection,
+    /// VFS write-path counters.
+    pub vfs_write: RuntimeStatsSection,
+    /// Local cache counters and gauges.
+    pub cache: RuntimeStatsSection,
+    /// Upload queue counters and gauges.
+    pub upload_queue: RuntimeStatsSection,
+    /// Object-store I/O counters.
+    pub object_io: RuntimeStatsSection,
+    /// Metadata operation counters.
+    pub metadata: RuntimeStatsSection,
+}
+
+impl Default for RuntimeStatsSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: RUNTIME_STATS_SCHEMA_VERSION,
+            generated_unix_ms: 0,
+            system: RuntimeStatsSection::default(),
+            bridge: RuntimeStatsSection::default(),
+            vfs_read: RuntimeStatsSection::default(),
+            vfs_write: RuntimeStatsSection::default(),
+            cache: RuntimeStatsSection::default(),
+            upload_queue: RuntimeStatsSection::default(),
+            object_io: RuntimeStatsSection::default(),
+            metadata: RuntimeStatsSection::default(),
+        }
+    }
+}
+
+impl RuntimeStatsSnapshot {
+    /// Render a stable, JuiceFS-style local stats text surface.
+    ///
+    /// Each non-comment line has `kind name unit value`. Histogram bucket lines
+    /// have `histogram_bucket name le_ns count`.
+    pub fn to_text(&self) -> String {
+        self.to_string()
+    }
+
+    /// Parse the stable local stats text representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeStatsParseError`] when a non-comment line is malformed.
+    /// Unknown runtime stats sections are skipped for forward compatibility.
+    pub fn parse_text(input: &str) -> Result<Self, RuntimeStatsParseError> {
+        input.parse()
+    }
+}
+
+impl fmt::Display for RuntimeStatsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "# studiofs_runtime_stats schema_version={}",
+            self.schema_version
+        )?;
+        writeln!(
+            f,
+            "gauge system.schema_version count {}",
+            self.schema_version
+        )?;
+        writeln!(
+            f,
+            "gauge system.generated_unix_ms ms {}",
+            self.generated_unix_ms
+        )?;
+
+        for (section_name, section) in self.sections() {
+            section.write_text(section_name, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for RuntimeStatsSnapshot {
+    type Err = RuntimeStatsParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut snapshot = Self::default();
+        let mut explicit_histogram_units = BTreeMap::new();
+        for (line_index, raw_line) in input.lines().enumerate() {
+            let line = raw_line
+                .split_once('#')
+                .map_or(raw_line, |(before_comment, _)| before_comment)
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(kind) = parts.next() else { continue };
+            match kind {
+                "counter" | "gauge" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing metric name")
+                    })?;
+                    let unit = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing metric unit")
+                    })?;
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing metric value")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid metric value")
+                        })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
+                    snapshot.set_scalar_metric(kind, name, unit, value, line_index + 1)?;
+                }
+                "histogram_count" | "histogram_sum" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram name")
+                    })?;
+                    let unit = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram unit")
+                    })?;
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing histogram value")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid histogram value")
+                        })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
+                    snapshot.set_histogram_total(
+                        kind,
+                        name,
+                        unit,
+                        value,
+                        line_index + 1,
+                        &mut explicit_histogram_units,
+                    )?;
+                }
+                "histogram_bucket" => {
+                    let name = parts.next().ok_or_else(|| {
+                        RuntimeStatsParseError::new(line_index + 1, "missing histogram name")
+                    })?;
+                    let le_ns = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing bucket bound")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid bucket bound")
+                        })?;
+                    let count = parts
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeStatsParseError::new(line_index + 1, "missing bucket count")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            RuntimeStatsParseError::new(line_index + 1, "invalid bucket count")
+                        })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeStatsParseError::new(
+                            line_index + 1,
+                            "unexpected trailing fields",
+                        ));
+                    }
+                    snapshot.set_histogram_bucket(name, le_ns, count, line_index + 1)?;
+                }
+                _ => {
+                    return Err(RuntimeStatsParseError::new(
+                        line_index + 1,
+                        "unknown runtime stats line kind",
+                    ));
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+impl RuntimeStatsSnapshot {
+    fn sections(&self) -> impl Iterator<Item = (&'static str, &RuntimeStatsSection)> {
+        [
+            ("system", &self.system),
+            ("bridge", &self.bridge),
+            ("vfs_read", &self.vfs_read),
+            ("vfs_write", &self.vfs_write),
+            ("cache", &self.cache),
+            ("upload_queue", &self.upload_queue),
+            ("object_io", &self.object_io),
+            ("metadata", &self.metadata),
+        ]
+        .into_iter()
+    }
+
+    fn section_mut(&mut self, section: &str) -> Option<&mut RuntimeStatsSection> {
+        match section {
+            "system" => Some(&mut self.system),
+            "bridge" => Some(&mut self.bridge),
+            "vfs_read" => Some(&mut self.vfs_read),
+            "vfs_write" => Some(&mut self.vfs_write),
+            "cache" => Some(&mut self.cache),
+            "upload_queue" => Some(&mut self.upload_queue),
+            "object_io" => Some(&mut self.object_io),
+            "metadata" => Some(&mut self.metadata),
+            _ => None,
+        }
+    }
+
+    fn split_metric_name(name: &str, line: usize) -> Result<(&str, &str), RuntimeStatsParseError> {
+        let (section, key) = name
+            .split_once('.')
+            .ok_or_else(|| RuntimeStatsParseError::new(line, "metric name must be section.key"))?;
+        if section.is_empty() || key.is_empty() {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "metric section and key must not be empty",
+            ));
+        }
+        if key.contains('.') {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "metric key must not contain dots",
+            ));
+        }
+        Ok((section, key))
+    }
+
+    fn set_scalar_metric(
+        &mut self,
+        kind: &str,
+        name: &str,
+        unit: &str,
+        value: u64,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        if section == "system" && key == "schema_version" {
+            if kind != "gauge" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "schema_version must be a gauge",
+                ));
+            }
+            if unit != "count" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "schema_version must have unit 'count'",
+                ));
+            }
+            self.schema_version = value.try_into().map_err(|_| {
+                RuntimeStatsParseError::new(line, "schema_version does not fit u16")
+            })?;
+            return Ok(());
+        }
+        if section == "system" && key == "generated_unix_ms" {
+            if kind != "gauge" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "generated_unix_ms must be a gauge",
+                ));
+            }
+            if unit != "ms" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "generated_unix_ms must have unit 'ms'",
+                ));
+            }
+            self.generated_unix_ms = value;
+            return Ok(());
+        }
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
+        let metric = RuntimeScalarMetric {
+            value,
+            unit: parse_runtime_stats_unit(unit),
+        };
+        match kind {
+            "counter" => {
+                target.counters.insert(key.to_owned(), metric);
+            }
+            "gauge" => {
+                target.gauges.insert(key.to_owned(), metric);
+            }
+            _ => unreachable!("kind is validated by caller"),
+        }
+        Ok(())
+    }
+
+    fn set_histogram_total<'a>(
+        &mut self,
+        kind: &str,
+        name: &'a str,
+        unit: &str,
+        value: u64,
+        line: usize,
+        explicit_histogram_units: &mut BTreeMap<(&'a str, &'a str), Cow<'static, str>>,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        Self::validate_not_root_system_histogram(section, key, line)?;
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
+        let unit = parse_runtime_stats_unit(unit);
+        let explicit_unit_key = (section, key);
+        if let Some(existing_unit) = explicit_histogram_units.get(&explicit_unit_key) {
+            if existing_unit != &unit {
+                return Err(RuntimeStatsParseError::new(line, "histogram unit mismatch"));
+            }
+        } else {
+            explicit_histogram_units.insert(explicit_unit_key, unit.clone());
+        }
+        if let Some(histogram) = target.latencies.get_mut(key) {
+            set_histogram_unit(histogram, unit, line)?;
+            match kind {
+                "histogram_count" => histogram.count = value,
+                "histogram_sum" => histogram.sum = value,
+                _ => unreachable!("kind is validated by caller"),
+            }
+            return Ok(());
+        }
+
+        let mut histogram = RuntimeLatencyHistogram {
+            unit,
+            ..RuntimeLatencyHistogram::default()
+        };
+        match kind {
+            "histogram_count" => histogram.count = value,
+            "histogram_sum" => histogram.sum = value,
+            _ => unreachable!("kind is validated by caller"),
+        }
+        target.latencies.insert(key.to_owned(), histogram);
+        Ok(())
+    }
+
+    fn set_histogram_bucket(
+        &mut self,
+        name: &str,
+        le_ns: u64,
+        count: u64,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        let (section, key) = Self::split_metric_name(name, line)?;
+        Self::validate_not_root_system_histogram(section, key, line)?;
+        let Some(target) = self.section_mut(section) else {
+            return Ok(());
+        };
+        // Avoid `entry(key.to_owned())` here: histogram buckets repeat the same
+        // key, and the borrowed lookup avoids allocating a discarded `String`.
+        if let Some(histogram) = target.latencies.get_mut(key) {
+            insert_latency_bucket(
+                &mut histogram.buckets,
+                RuntimeLatencyBucket { le_ns, count },
+            );
+        } else {
+            target.latencies.insert(
+                key.to_owned(),
+                RuntimeLatencyHistogram {
+                    buckets: vec![RuntimeLatencyBucket { le_ns, count }],
+                    ..RuntimeLatencyHistogram::default()
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_not_root_system_histogram(
+        section: &str,
+        key: &str,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        if is_root_runtime_stats_gauge(section, key) {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "system schema_version and generated_unix_ms cannot be histograms",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One runtime stats section containing monotonic counters, gauges, and latency histograms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeStatsSection {
+    /// Monotonically increasing counters keyed by stable snake_case names.
+    pub counters: BTreeMap<String, RuntimeScalarMetric>,
+    /// Point-in-time gauges keyed by stable snake_case names.
+    pub gauges: BTreeMap<String, RuntimeScalarMetric>,
+    /// Latency histograms keyed by stable snake_case operation names.
+    pub latencies: BTreeMap<String, RuntimeLatencyHistogram>,
+}
+
+impl RuntimeStatsSection {
+    fn write_text(&self, section_name: &str, out: &mut impl fmt::Write) -> fmt::Result {
+        for (name, metric) in &self.counters {
+            writeln!(
+                out,
+                "counter {section_name}.{name} {} {}",
+                metric.unit, metric.value
+            )?;
+        }
+        for (name, metric) in &self.gauges {
+            if is_root_runtime_stats_gauge(section_name, name) {
+                continue;
+            }
+            writeln!(
+                out,
+                "gauge {section_name}.{name} {} {}",
+                metric.unit, metric.value
+            )?;
+        }
+        for (name, histogram) in &self.latencies {
+            writeln!(
+                out,
+                "histogram_count {section_name}.{name} {} {}",
+                histogram.unit, histogram.count
+            )?;
+            writeln!(
+                out,
+                "histogram_sum {section_name}.{name} {} {}",
+                histogram.unit, histogram.sum
+            )?;
+            for bucket in &histogram.buckets {
+                writeln!(
+                    out,
+                    "histogram_bucket {section_name}.{name} {} {}",
+                    bucket.le_ns, bucket.count
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_root_runtime_stats_gauge(section_name: &str, name: &str) -> bool {
+    section_name == "system" && matches!(name, "schema_version" | "generated_unix_ms")
+}
+
+fn remove_root_runtime_stats_metrics(section: &mut RuntimeStatsSection) {
+    section.counters.remove("schema_version");
+    section.counters.remove("generated_unix_ms");
+    section.gauges.remove("schema_version");
+    section.gauges.remove("generated_unix_ms");
+    section.latencies.remove("schema_version");
+    section.latencies.remove("generated_unix_ms");
+}
+
+fn deserialize_system_runtime_stats_section<'de, D>(
+    deserializer: D,
+) -> Result<RuntimeStatsSection, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut section = RuntimeStatsSection::deserialize(deserializer)?;
+    remove_root_runtime_stats_metrics(&mut section);
+    Ok(section)
+}
+
+fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
+    match unit {
+        "count" => Cow::Borrowed("count"),
+        "bytes" => Cow::Borrowed("bytes"),
+        "ns" => Cow::Borrowed("ns"),
+        "ms" => Cow::Borrowed("ms"),
+        "percent" => Cow::Borrowed("percent"),
+        _ => Cow::Owned(unit.to_owned()),
+    }
+}
+
+fn set_histogram_unit(
+    histogram: &mut RuntimeLatencyHistogram,
+    unit: Cow<'static, str>,
+    line: usize,
+) -> Result<(), RuntimeStatsParseError> {
+    let can_replace_bucket_default = histogram.count == 0
+        && histogram.sum == 0
+        && histogram.unit == "ns"
+        && !histogram.buckets.is_empty();
+    if histogram.unit != unit && !can_replace_bucket_default {
+        return Err(RuntimeStatsParseError::new(line, "histogram unit mismatch"));
+    }
+    histogram.unit = unit;
+    Ok(())
+}
+
+fn insert_latency_bucket(buckets: &mut Vec<RuntimeLatencyBucket>, bucket: RuntimeLatencyBucket) {
+    match buckets.binary_search_by_key(&bucket.le_ns, |existing| existing.le_ns) {
+        Ok(index) => buckets[index] = bucket,
+        Err(index) => buckets.insert(index, bucket),
+    }
+}
+
+fn deserialize_sorted_latency_buckets<'de, D>(
+    deserializer: D,
+) -> Result<Vec<RuntimeLatencyBucket>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
+    raw_buckets.sort_by_key(|bucket| bucket.le_ns);
+    if raw_buckets.len() < 2 {
+        return Ok(raw_buckets);
+    }
+
+    let mut write_index = 0;
+    for read_index in 1..raw_buckets.len() {
+        if raw_buckets[write_index].le_ns == raw_buckets[read_index].le_ns {
+            // Keep the last duplicate bound; `Vec::dedup_by_key` would retain
+            // the first and change backwards-compatible parsing behavior.
+            raw_buckets[write_index] = raw_buckets[read_index];
+        } else {
+            write_index += 1;
+            if write_index != read_index {
+                raw_buckets[write_index] = raw_buckets[read_index];
+            }
+        }
+    }
+    raw_buckets.truncate(write_index + 1);
+    Ok(raw_buckets)
+}
+
+/// Scalar counter or gauge value with a stable unit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeScalarMetric {
+    /// Numeric value for this counter or gauge.
+    pub value: u64,
+    /// Stable unit string, such as `count`, `bytes`, `ns`, or `ms`.
+    pub unit: Cow<'static, str>,
+}
+
+/// Latency histogram with cumulative count and sum for interval averages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeLatencyHistogram {
+    /// Total observations.
+    pub count: u64,
+    /// Sum of observed latency values in `unit`.
+    pub sum: u64,
+    /// Unit used for `sum`; bucket bounds are always nanoseconds.
+    pub unit: Cow<'static, str>,
+    /// Bucket counts keyed by inclusive upper-bound nanoseconds.
+    #[serde(default, deserialize_with = "deserialize_sorted_latency_buckets")]
+    pub buckets: Vec<RuntimeLatencyBucket>,
+}
+
+impl Default for RuntimeLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0,
+            unit: Cow::Borrowed("ns"),
+            buckets: Vec::new(),
+        }
+    }
+}
+
+/// One latency histogram bucket.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLatencyBucket {
+    /// Inclusive upper-bound in nanoseconds.
+    pub le_ns: u64,
+    /// Count observed in this bucket.
+    pub count: u64,
+}
+
+/// Error returned when parsing the local runtime stats text surface.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("failed to parse runtime stats at line {line}: {message}")]
+pub struct RuntimeStatsParseError {
+    line: usize,
+    message: &'static str,
+}
+
+impl RuntimeStatsParseError {
+    fn new(line: usize, message: &'static str) -> Self {
+        Self { line, message }
+    }
+
+    /// One-based input line where parsing failed.
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// Static parser error reason.
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
 
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
@@ -1382,5 +2016,512 @@ mod tests {
             .expect("deserialize macFUSE open-cache stats with renamed field");
 
         assert_eq!(stats.read_only_not_regular_file, 7);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_serializes_machine_readable_sections() {
+        let mut snapshot = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_720_000_000_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        snapshot.vfs_read.counters.insert(
+            "bytes".to_owned(),
+            RuntimeScalarMetric {
+                value: 4096,
+                unit: Cow::Borrowed("bytes"),
+            },
+        );
+        snapshot.upload_queue.gauges.insert(
+            "pending_depth".to_owned(),
+            RuntimeScalarMetric {
+                value: 2,
+                unit: Cow::Borrowed("count"),
+            },
+        );
+        snapshot.object_io.latencies.insert(
+            "get".to_owned(),
+            RuntimeLatencyHistogram {
+                count: 3,
+                sum: 120_000,
+                unit: Cow::Borrowed("ns"),
+                buckets: vec![RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                }],
+            },
+        );
+
+        let serialized = serde_json::to_value(&snapshot).expect("serialize runtime stats snapshot");
+
+        assert_eq!(serialized["schema_version"], RUNTIME_STATS_SCHEMA_VERSION);
+        assert_eq!(serialized["vfs_read"]["counters"]["bytes"]["unit"], "bytes");
+        assert_eq!(
+            serialized["upload_queue"]["gauges"]["pending_depth"]["value"],
+            2
+        );
+        assert_eq!(serialized["object_io"]["latencies"]["get"]["count"], 3);
+        assert_eq!(serialized["object_io"]["latencies"]["get"]["sum"], 120_000);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_missing_optional_fields_as_defaults() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "generated_unix_ms": 44,
+            "vfs_write": {
+                "counters": {
+                    "bytes": { "value": 128, "unit": "bytes" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with omitted sections");
+
+        assert_eq!(snapshot.generated_unix_ms, 44);
+        assert_eq!(snapshot.vfs_write.counters["bytes"].value, 128);
+        assert!(snapshot.system.counters.is_empty());
+        assert!(snapshot.bridge.gauges.is_empty());
+        assert!(snapshot.metadata.latencies.is_empty());
+    }
+
+    #[test]
+    fn runtime_stats_text_omits_duplicate_root_system_gauges() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "gauges": {
+                    "schema_version": { "value": 1, "unit": "count" },
+                    "generated_unix_ms": { "value": 1, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with duplicate system gauges");
+
+        let text = snapshot.to_text();
+
+        assert!(!snapshot.system.gauges.contains_key("schema_version"));
+        assert!(!snapshot.system.gauges.contains_key("generated_unix_ms"));
+        assert_eq!(text.matches("gauge system.schema_version").count(), 1);
+        assert_eq!(text.matches("gauge system.generated_unix_ms").count(), 1);
+        assert!(text.contains("gauge system.uptime_ms ms 12\n"));
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_duplicate_system_gauges_as_root_fields() {
+        let from_json: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "gauges": {
+                    "schema_version": { "value": 7, "unit": "count" },
+                    "generated_unix_ms": { "value": 55, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with duplicate system gauges");
+
+        let from_text =
+            RuntimeStatsSnapshot::parse_text(&from_json.to_text()).expect("parse rendered stats");
+
+        assert_eq!(from_json, from_text);
+        assert_eq!(from_json.schema_version, 7);
+        assert_eq!(from_json.generated_unix_ms, 55);
+        assert_eq!(from_json.system.gauges["uptime_ms"].value, 12);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_reserved_system_keys_only_as_root_fields() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "counters": {
+                    "schema_version": { "value": 1, "unit": "count" },
+                    "calls": { "value": 2, "unit": "count" }
+                },
+                "gauges": {
+                    "generated_unix_ms": { "value": 1, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                },
+                "latencies": {
+                    "schema_version": {
+                        "count": 1,
+                        "sum": 1,
+                        "unit": "ns",
+                        "buckets": []
+                    },
+                    "poll": {
+                        "count": 1,
+                        "sum": 2,
+                        "unit": "ns",
+                        "buckets": []
+                    }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with reserved system keys");
+
+        assert!(!snapshot.system.counters.contains_key("schema_version"));
+        assert!(!snapshot.system.gauges.contains_key("generated_unix_ms"));
+        assert!(!snapshot.system.latencies.contains_key("schema_version"));
+        assert_eq!(snapshot.system.counters["calls"].value, 2);
+        assert_eq!(snapshot.system.gauges["uptime_ms"].value, 12);
+        assert_eq!(snapshot.system.latencies["poll"].sum, 2);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_sorted_unique_histogram_buckets() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "object_io": {
+                "latencies": {
+                    "get": {
+                        "count": 3,
+                        "sum": 90_000,
+                        "unit": "ns",
+                        "buckets": [
+                            { "le_ns": 500_000, "count": 1 },
+                            { "le_ns": 100_000, "count": 2 },
+                            { "le_ns": 500_000, "count": 3 }
+                        ]
+                    }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with unordered buckets");
+
+        assert_eq!(
+            snapshot.object_io.latencies["get"].buckets,
+            vec![
+                RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                },
+                RuntimeLatencyBucket {
+                    le_ns: 500_000,
+                    count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_round_trips_counter_gauge_and_latency_histogram() {
+        let mut snapshot = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_720_000_000_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        snapshot.bridge.counters.insert(
+            "read_callbacks".to_owned(),
+            RuntimeScalarMetric {
+                value: 9,
+                unit: Cow::Borrowed("count"),
+            },
+        );
+        snapshot.cache.gauges.insert(
+            "resident_bytes".to_owned(),
+            RuntimeScalarMetric {
+                value: 8192,
+                unit: Cow::Borrowed("bytes"),
+            },
+        );
+        snapshot.metadata.latencies.insert(
+            "commit".to_owned(),
+            RuntimeLatencyHistogram {
+                count: 2,
+                sum: 300_000,
+                unit: Cow::Borrowed("ns"),
+                buckets: vec![
+                    RuntimeLatencyBucket {
+                        le_ns: 100_000,
+                        count: 1,
+                    },
+                    RuntimeLatencyBucket {
+                        le_ns: 500_000,
+                        count: 1,
+                    },
+                ],
+            },
+        );
+
+        let text = snapshot.to_text();
+        let parsed = RuntimeStatsSnapshot::parse_text(&text).expect("parse runtime stats text");
+        let parsed_from_trait: RuntimeStatsSnapshot = snapshot
+            .to_string()
+            .parse()
+            .expect("parse runtime stats text via FromStr");
+
+        assert_eq!(parsed, snapshot);
+        assert_eq!(parsed_from_trait, snapshot);
+        assert!(matches!(
+            parsed.cache.gauges["resident_bytes"].unit,
+            Cow::Borrowed("bytes")
+        ));
+        assert!(matches!(
+            parsed.metadata.latencies["commit"].unit,
+            Cow::Borrowed("ns")
+        ));
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_trailing_histogram_fields() {
+        let histogram_total =
+            RuntimeStatsSnapshot::parse_text("histogram_count object_io.get ns 1 unexpected\n")
+                .expect_err("trailing histogram total field should fail");
+        let histogram_bucket = RuntimeStatsSnapshot::parse_text(
+            "histogram_bucket object_io.get 1000000 1 unexpected\n",
+        )
+        .expect_err("trailing histogram bucket field should fail");
+
+        assert!(
+            histogram_total
+                .to_string()
+                .contains("unexpected trailing fields")
+        );
+        assert!(
+            histogram_bucket
+                .to_string()
+                .contains("unexpected trailing fields")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_empty_metric_section_or_key() {
+        let empty_key = RuntimeStatsSnapshot::parse_text("counter system. count 1\n")
+            .expect_err("empty metric key should fail");
+        let empty_section = RuntimeStatsSnapshot::parse_text("counter .calls count 1\n")
+            .expect_err("empty metric section should fail");
+
+        assert!(
+            empty_key
+                .to_string()
+                .contains("metric section and key must not be empty")
+        );
+        assert_eq!(empty_key.line(), 1);
+        assert_eq!(
+            empty_key.message(),
+            "metric section and key must not be empty"
+        );
+        assert!(
+            empty_section
+                .to_string()
+                .contains("metric section and key must not be empty")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_metric_keys_with_extra_dots() {
+        let error =
+            RuntimeStatsSnapshot::parse_text("counter vfs_read.read.failed_bytes bytes 1\n")
+                .expect_err("dotted metric key should fail");
+
+        assert_eq!(error.line(), 1);
+        assert_eq!(error.message(), "metric key must not contain dots");
+    }
+
+    #[test]
+    fn runtime_stats_text_ignores_unknown_future_sections() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            counter network.rx_bytes bytes 64\n\
+            gauge network.connected count 1\n\
+            histogram_count network.round_trip ns 2\n\
+            histogram_sum network.round_trip ns 300\n\
+            histogram_bucket network.round_trip 500 2\n\
+            counter vfs_read.calls count 4\n\
+            ",
+        )
+        .expect("unknown future sections should be skipped");
+
+        assert_eq!(parsed.vfs_read.counters["calls"].value, 4);
+        for section in [
+            &parsed.system,
+            &parsed.bridge,
+            &parsed.vfs_write,
+            &parsed.cache,
+            &parsed.upload_queue,
+            &parsed.object_io,
+            &parsed.metadata,
+        ] {
+            assert!(section.counters.is_empty());
+            assert!(section.gauges.is_empty());
+            assert!(section.latencies.is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_with_wrong_units() {
+        let schema_version =
+            RuntimeStatsSnapshot::parse_text("gauge system.schema_version bytes 1\n")
+                .expect_err("schema version unit should fail");
+        let generated_unix_ms =
+            RuntimeStatsSnapshot::parse_text("gauge system.generated_unix_ms count 1\n")
+                .expect_err("generated timestamp unit should fail");
+
+        assert_eq!(
+            schema_version.message(),
+            "schema_version must have unit 'count'"
+        );
+        assert_eq!(
+            generated_unix_ms.message(),
+            "generated_unix_ms must have unit 'ms'"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_as_counters() {
+        let schema_version =
+            RuntimeStatsSnapshot::parse_text("counter system.schema_version count 1\n")
+                .expect_err("schema version counter should fail");
+        let generated_unix_ms =
+            RuntimeStatsSnapshot::parse_text("counter system.generated_unix_ms ms 1\n")
+                .expect_err("generated timestamp counter should fail");
+
+        assert_eq!(schema_version.message(), "schema_version must be a gauge");
+        assert_eq!(
+            generated_unix_ms.message(),
+            "generated_unix_ms must be a gauge"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_as_histograms() {
+        let total =
+            RuntimeStatsSnapshot::parse_text("histogram_count system.schema_version ns 1\n")
+                .expect_err("schema version histogram total should fail");
+        let bucket =
+            RuntimeStatsSnapshot::parse_text("histogram_bucket system.generated_unix_ms 100 1\n")
+                .expect_err("generated timestamp histogram bucket should fail");
+
+        assert_eq!(
+            total.message(),
+            "system schema_version and generated_unix_ms cannot be histograms"
+        );
+        assert_eq!(
+            bucket.message(),
+            "system schema_version and generated_unix_ms cannot be histograms"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_histogram_unit_mismatch() {
+        let error = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_count object_io.get ns 1\n\
+            histogram_sum object_io.get ms 2\n\
+            ",
+        )
+        .expect_err("histogram total unit mismatch should fail");
+
+        assert_eq!(error.line(), 2);
+        assert_eq!(error.message(), "histogram unit mismatch");
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_zero_value_histogram_unit_mismatch_after_bucket() {
+        let error = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 100000 1\n\
+            histogram_count object_io.get ns 0\n\
+            histogram_sum object_io.get ms 0\n\
+            ",
+        )
+        .expect_err("explicit zero-valued histogram unit mismatch should fail");
+
+        assert_eq!(error.line(), 3);
+        assert_eq!(error.message(), "histogram unit mismatch");
+    }
+
+    #[test]
+    fn runtime_stats_text_allows_bucket_before_histogram_total_unit() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 100000 1\n\
+            histogram_count object_io.get ms 1\n\
+            histogram_sum object_io.get ms 2\n\
+            ",
+        )
+        .expect("bucket-created default unit should accept first total unit");
+
+        assert_eq!(parsed.object_io.latencies["get"].unit, Cow::Borrowed("ms"));
+    }
+
+    #[test]
+    fn runtime_stats_display_uses_snapshot_schema_version_in_header() {
+        let snapshot = RuntimeStatsSnapshot {
+            schema_version: 7,
+            ..RuntimeStatsSnapshot::default()
+        };
+
+        assert!(
+            snapshot
+                .to_string()
+                .starts_with("# studiofs_runtime_stats schema_version=7\n")
+        );
+    }
+
+    #[test]
+    fn runtime_stats_sections_constant_matches_accessors() {
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        for section in RUNTIME_STATS_SECTIONS {
+            assert!(
+                snapshot.section_mut(section).is_some(),
+                "section {section} is missing from section_mut"
+            );
+        }
+
+        let section_names: Vec<&str> = snapshot.sections().map(|(name, _)| name).collect();
+        assert_eq!(section_names, RUNTIME_STATS_SECTIONS);
+    }
+
+    #[test]
+    fn runtime_stats_text_ignores_inline_comments() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            # leading comment\n\
+            counter vfs_read.calls count 4 # reads issued\n\
+            histogram_count object_io.get ns 2 # get samples\n\
+            histogram_bucket object_io.get 500000 1 # p50-ish bucket\n\
+            ",
+        )
+        .expect("parse runtime stats with inline comments");
+
+        assert_eq!(parsed.vfs_read.counters["calls"].value, 4);
+        assert_eq!(parsed.object_io.latencies["get"].count, 2);
+        assert_eq!(
+            parsed.object_io.latencies["get"].buckets,
+            vec![RuntimeLatencyBucket {
+                le_ns: 500_000,
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_sorts_and_deduplicates_histogram_buckets() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 500000 1\n\
+            histogram_bucket object_io.get 100000 2\n\
+            histogram_bucket object_io.get 500000 3\n\
+            ",
+        )
+        .expect("parse runtime stats histogram buckets");
+
+        assert_eq!(
+            parsed.object_io.latencies["get"].buckets,
+            vec![
+                RuntimeLatencyBucket {
+                    le_ns: 100_000,
+                    count: 2,
+                },
+                RuntimeLatencyBucket {
+                    le_ns: 500_000,
+                    count: 3,
+                },
+            ]
+        );
+        assert_eq!(parsed.object_io.latencies["get"].unit, Cow::Borrowed("ns"));
     }
 }
