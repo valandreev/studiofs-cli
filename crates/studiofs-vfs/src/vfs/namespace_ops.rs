@@ -101,6 +101,9 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
+        if self.is_runtime_stats_file_ino(ino) {
+            return Err(Self::runtime_stats_access_denied_error());
+        }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
             if let Some(new_size) = args.size {

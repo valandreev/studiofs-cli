@@ -29,7 +29,7 @@ use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, read_runtime_stats_buffer,
+    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -792,7 +792,7 @@ impl StudioFuseFs {
 
     fn open_runtime_stats_handle(&mut self) -> u64 {
         let fh = self.next_runtime_stats_fh;
-        self.next_runtime_stats_fh = self.next_runtime_stats_fh.saturating_add(1);
+        self.next_runtime_stats_fh = self.next_runtime_stats_fh.wrapping_add(1);
         self.runtime_stats_handles
             .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
         fh
@@ -1352,9 +1352,8 @@ impl Filesystem for StudioFuseFs {
                 reply.data(&[]);
                 return;
             }
-            let mut out = vec![0u8; size.min((bytes.len() - start) as u32) as usize];
-            let n = read_runtime_stats_buffer(bytes, offset, &mut out) as usize;
-            reply.data(&out[..n]);
+            let end = start.saturating_add(size as usize).min(bytes.len());
+            reply.data(&bytes[start..end]);
             return;
         }
         let clamped_size = match self.vfs.getattr(ino) {

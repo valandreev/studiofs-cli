@@ -1742,6 +1742,9 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        if delete_file && self.vfs.is_runtime_stats_file_ino(context.ino) {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -2135,8 +2138,8 @@ mod tests {
         MetadataConfig, ROOT_INO, RedbMetaEngine, TimeSpec,
     };
     use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
-    use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig};
+    use studiofs_vfs::{RUNTIME_STATS_FILE_INO, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
@@ -2902,6 +2905,25 @@ mod tests {
             vfs.readdir(dir.ino).expect("readdir after heal").is_empty(),
             "legacy ghost child should be removed during delete precheck healing"
         );
+    }
+
+    #[test]
+    fn set_delete_rejects_runtime_stats_file_immediately() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime_stats_set_delete");
+        let handle = StudioFileHandle::new(RUNTIME_STATS_FILE_INO, false, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+
+        let result = <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            true,
+        );
+
+        let status = result
+            .expect_err("runtime stats delete should be denied")
+            .to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
     }
 
     #[test]

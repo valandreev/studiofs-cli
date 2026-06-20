@@ -120,21 +120,40 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+fn runtime_stats_test_tempdir() -> TempDir {
+    std::fs::create_dir_all("target").expect("create target dir");
+    tempfile::Builder::new()
+        .prefix("runtime-stats-")
+        .tempdir_in("target")
+        .expect("runtime stats tempdir in target")
+}
+
 #[test]
 fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");
 
     let attr = vfs
         .lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME)
         .expect("lookup runtime stats surface");
+    let getattr_attr = vfs
+        .getattr(RUNTIME_STATS_FILE_INO)
+        .expect("getattr runtime stats surface by synthetic ino");
     assert_eq!(attr.ino, RUNTIME_STATS_FILE_INO);
+    assert_eq!(getattr_attr.ino, RUNTIME_STATS_FILE_INO);
+    assert_eq!(getattr_attr.size, RUNTIME_STATS_FILE_REPORTED_SIZE);
     assert_eq!(attr.kind, FileType::RegularFile);
     assert_eq!(attr.mode, 0o444);
     assert!(
         meta.lookup(ROOT_INO, RUNTIME_STATS_FILE_NAME).is_err(),
         "runtime stats surface must not persist into volume metadata"
     );
+    match vfs.setattr(RUNTIME_STATS_FILE_INO, SetattrArgs::size_only(0)) {
+        Err(VfsError::Meta(MetaError::AccessDenied { ino, .. })) => {
+            assert_eq!(ino, RUNTIME_STATS_FILE_INO);
+        }
+        other => panic!("expected AccessDenied for runtime stats setattr, got {other:?}"),
+    }
 
     let entries = vfs.readdir(ROOT_INO).expect("readdir root");
     assert!(
@@ -160,7 +179,7 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
 
 #[test]
 fn runtime_stats_surface_has_stable_attributes() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");
 
     let first = vfs.runtime_stats_file_attr();
@@ -174,7 +193,7 @@ fn runtime_stats_surface_has_stable_attributes() {
 
 #[test]
 fn runtime_stats_reserved_name_rejects_namespace_mutations() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface-reserved-name");
 
     let assert_entry_exists = |result: VfsResult<InodeAttr>| match result {
@@ -231,7 +250,7 @@ fn runtime_stats_reserved_name_rejects_namespace_mutations() {
 
 #[test]
 fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-offset");
     let text = vfs.runtime_stats_file_text();
     assert!(text.len() > 16);
