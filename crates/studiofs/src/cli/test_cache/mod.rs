@@ -207,8 +207,8 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         profile_enabled = profile.is_some(),
         "test-cache run started"
     );
-    let config = BenchmarkConfig::new(
-        target.clone(),
+    let config = BenchmarkConfig {
+        target: target.clone(),
         block_size,
         read_size,
         size_class_small_max,
@@ -221,12 +221,12 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         sizes,
         access_pattern,
         during_upload_min_pending,
-        std::time::Duration::from_millis(during_upload_timeout_ms),
+        during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
-        profile.is_some(),
+        profile: profile.is_some(),
         full_file_reads,
-        run_id.clone(),
-    );
+        run_id: run_id.clone(),
+    };
 
     let resolved_mode = resolve_run_mode(&target)?;
     let benchmark_mode = match &resolved_mode {

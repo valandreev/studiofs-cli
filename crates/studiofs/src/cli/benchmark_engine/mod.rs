@@ -23,75 +23,31 @@ pub(crate) use workload::{
     parse_size_arg, parse_sizes_arg,
 };
 
+/// Complete benchmark engine configuration after CLI/default validation.
+#[derive(Debug)]
 pub(crate) struct BenchmarkConfig {
-    target: PathBuf,
-    block_size: u64,
-    read_size: u64,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
-    workload_repeat: usize,
-    concurrency: usize,
-    sequential_streams: bool,
-    io_depth: usize,
-    warmup_runs: u32,
-    sizes: WorkloadSizeInput,
-    access_pattern: TestCacheAccessPattern,
-    during_upload_min_pending: usize,
-    during_upload_timeout: Duration,
-    l1_limit: u64,
-    profile: bool,
-    full_file_reads: bool,
-    run_id: String,
+    pub(crate) target: PathBuf,
+    pub(crate) block_size: u64,
+    pub(crate) read_size: u64,
+    pub(crate) size_class_small_max: u64,
+    pub(crate) size_class_medium_max: u64,
+    pub(crate) workload_repeat: usize,
+    pub(crate) concurrency: usize,
+    pub(crate) sequential_streams: bool,
+    pub(crate) io_depth: usize,
+    pub(crate) warmup_runs: u32,
+    pub(crate) sizes: WorkloadSizeInput,
+    pub(crate) access_pattern: TestCacheAccessPattern,
+    pub(crate) during_upload_min_pending: usize,
+    pub(crate) during_upload_timeout: Duration,
+    pub(crate) l1_limit: u64,
+    pub(crate) profile: bool,
+    pub(crate) full_file_reads: bool,
+    pub(crate) run_id: String,
 }
 
-impl BenchmarkConfig {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "CLI parsing validates each independent benchmark knob before constructing the engine config"
-    )]
-    pub(crate) fn new(
-        target: PathBuf,
-        block_size: u64,
-        read_size: u64,
-        size_class_small_max: u64,
-        size_class_medium_max: u64,
-        workload_repeat: usize,
-        concurrency: usize,
-        sequential_streams: bool,
-        io_depth: usize,
-        warmup_runs: u32,
-        sizes: WorkloadSizeInput,
-        access_pattern: TestCacheAccessPattern,
-        during_upload_min_pending: usize,
-        during_upload_timeout: Duration,
-        l1_limit: u64,
-        profile: bool,
-        full_file_reads: bool,
-        run_id: String,
-    ) -> Self {
-        Self {
-            target,
-            block_size,
-            read_size,
-            size_class_small_max,
-            size_class_medium_max,
-            workload_repeat,
-            concurrency,
-            sequential_streams,
-            io_depth,
-            warmup_runs,
-            sizes,
-            access_pattern,
-            during_upload_min_pending,
-            during_upload_timeout,
-            l1_limit,
-            profile,
-            full_file_reads,
-            run_id,
-        }
-    }
-}
-
+/// Mounted runtime metadata required to run an end-to-end filesystem benchmark.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct MountedBenchmarkTarget<'a> {
     pub(crate) pid: u32,
     pub(crate) volume: &'a str,
