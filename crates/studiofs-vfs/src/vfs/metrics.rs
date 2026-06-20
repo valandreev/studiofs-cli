@@ -32,6 +32,7 @@ pub struct RuntimeStatsSnapshot {
     /// Snapshot generation timestamp in Unix milliseconds.
     pub generated_unix_ms: u64,
     /// System and runtime process counters.
+    #[serde(default, deserialize_with = "deserialize_system_runtime_stats_section")]
     pub system: RuntimeStatsSection,
     /// FUSE, macFUSE, WinFSP, or future bridge callback counters.
     pub bridge: RuntimeStatsSection,
@@ -256,6 +257,12 @@ impl RuntimeStatsSnapshot {
                 "metric section and key must not be empty",
             ));
         }
+        if key.contains('.') {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "metric key must not contain dots",
+            ));
+        }
         Ok((section, key))
     }
 
@@ -269,12 +276,36 @@ impl RuntimeStatsSnapshot {
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
         if section == "system" && key == "schema_version" {
+            if kind != "gauge" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "schema_version must be a gauge",
+                ));
+            }
+            if unit != "count" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "schema_version must have unit 'count'",
+                ));
+            }
             self.schema_version = value.try_into().map_err(|_| {
                 RuntimeStatsParseError::new(line, "schema_version does not fit u16")
             })?;
             return Ok(());
         }
         if section == "system" && key == "generated_unix_ms" {
+            if kind != "gauge" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "generated_unix_ms must be a gauge",
+                ));
+            }
+            if unit != "ms" {
+                return Err(RuntimeStatsParseError::new(
+                    line,
+                    "generated_unix_ms must have unit 'ms'",
+                ));
+            }
             self.generated_unix_ms = value;
             return Ok(());
         }
@@ -306,12 +337,13 @@ impl RuntimeStatsSnapshot {
         line: usize,
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
+        Self::validate_not_root_system_histogram(section, key, line)?;
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
         let unit = parse_runtime_stats_unit(unit);
         if let Some(histogram) = target.latencies.get_mut(key) {
-            histogram.unit = unit;
+            set_histogram_unit(histogram, unit, line)?;
             match kind {
                 "histogram_count" => histogram.count = value,
                 "histogram_sum" => histogram.sum = value,
@@ -341,6 +373,7 @@ impl RuntimeStatsSnapshot {
         line: usize,
     ) -> Result<(), RuntimeStatsParseError> {
         let (section, key) = Self::split_metric_name(name, line)?;
+        Self::validate_not_root_system_histogram(section, key, line)?;
         let target = self
             .section_mut(section)
             .ok_or_else(|| RuntimeStatsParseError::new(line, "unknown runtime stats section"))?;
@@ -352,15 +385,27 @@ impl RuntimeStatsSnapshot {
                 RuntimeLatencyBucket { le_ns, count },
             );
         } else {
-            let mut buckets = Vec::new();
-            insert_latency_bucket(&mut buckets, RuntimeLatencyBucket { le_ns, count });
             target.latencies.insert(
                 key.to_owned(),
                 RuntimeLatencyHistogram {
-                    buckets,
+                    buckets: vec![RuntimeLatencyBucket { le_ns, count }],
                     ..RuntimeLatencyHistogram::default()
                 },
             );
+        }
+        Ok(())
+    }
+
+    fn validate_not_root_system_histogram(
+        section: &str,
+        key: &str,
+        line: usize,
+    ) -> Result<(), RuntimeStatsParseError> {
+        if is_root_runtime_stats_gauge(section, key) {
+            return Err(RuntimeStatsParseError::new(
+                line,
+                "system schema_version and generated_unix_ms cannot be histograms",
+            ));
         }
         Ok(())
     }
@@ -424,6 +469,26 @@ fn is_root_runtime_stats_gauge(section_name: &str, name: &str) -> bool {
     section_name == "system" && matches!(name, "schema_version" | "generated_unix_ms")
 }
 
+fn remove_root_runtime_stats_metrics(section: &mut RuntimeStatsSection) {
+    section.counters.remove("schema_version");
+    section.counters.remove("generated_unix_ms");
+    section.gauges.remove("schema_version");
+    section.gauges.remove("generated_unix_ms");
+    section.latencies.remove("schema_version");
+    section.latencies.remove("generated_unix_ms");
+}
+
+fn deserialize_system_runtime_stats_section<'de, D>(
+    deserializer: D,
+) -> Result<RuntimeStatsSection, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut section = RuntimeStatsSection::deserialize(deserializer)?;
+    remove_root_runtime_stats_metrics(&mut section);
+    Ok(section)
+}
+
 fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
     match unit {
         "count" => Cow::Borrowed("count"),
@@ -433,6 +498,22 @@ fn parse_runtime_stats_unit(unit: &str) -> Cow<'static, str> {
         "percent" => Cow::Borrowed("percent"),
         _ => Cow::Owned(unit.to_owned()),
     }
+}
+
+fn set_histogram_unit(
+    histogram: &mut RuntimeLatencyHistogram,
+    unit: Cow<'static, str>,
+    line: usize,
+) -> Result<(), RuntimeStatsParseError> {
+    let can_replace_bucket_default = histogram.count == 0
+        && histogram.sum == 0
+        && histogram.unit == "ns"
+        && !histogram.buckets.is_empty();
+    if histogram.unit != unit && !can_replace_bucket_default {
+        return Err(RuntimeStatsParseError::new(line, "histogram unit mismatch"));
+    }
+    histogram.unit = unit;
+    Ok(())
 }
 
 fn insert_latency_bucket(buckets: &mut Vec<RuntimeLatencyBucket>, bucket: RuntimeLatencyBucket) {
@@ -449,7 +530,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let mut raw_buckets = Vec::<RuntimeLatencyBucket>::deserialize(deserializer)?;
-    raw_buckets.sort_unstable_by_key(|bucket| bucket.le_ns);
+    raw_buckets.sort_by_key(|bucket| bucket.le_ns);
 
     let mut buckets: Vec<RuntimeLatencyBucket> = Vec::with_capacity(raw_buckets.len());
     for bucket in raw_buckets {
@@ -1995,9 +2076,75 @@ mod tests {
 
         let text = snapshot.to_text();
 
+        assert!(!snapshot.system.gauges.contains_key("schema_version"));
+        assert!(!snapshot.system.gauges.contains_key("generated_unix_ms"));
         assert_eq!(text.matches("gauge system.schema_version").count(), 1);
         assert_eq!(text.matches("gauge system.generated_unix_ms").count(), 1);
         assert!(text.contains("gauge system.uptime_ms ms 12\n"));
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_duplicate_system_gauges_as_root_fields() {
+        let from_json: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "gauges": {
+                    "schema_version": { "value": 7, "unit": "count" },
+                    "generated_unix_ms": { "value": 55, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with duplicate system gauges");
+
+        let from_text =
+            RuntimeStatsSnapshot::parse_text(&from_json.to_text()).expect("parse rendered stats");
+
+        assert_eq!(from_json, from_text);
+        assert_eq!(from_json.schema_version, 7);
+        assert_eq!(from_json.generated_unix_ms, 55);
+        assert_eq!(from_json.system.gauges["uptime_ms"].value, 12);
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_deserializes_reserved_system_keys_only_as_root_fields() {
+        let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version": 7,
+            "generated_unix_ms": 55,
+            "system": {
+                "counters": {
+                    "schema_version": { "value": 1, "unit": "count" },
+                    "calls": { "value": 2, "unit": "count" }
+                },
+                "gauges": {
+                    "generated_unix_ms": { "value": 1, "unit": "ms" },
+                    "uptime_ms": { "value": 12, "unit": "ms" }
+                },
+                "latencies": {
+                    "schema_version": {
+                        "count": 1,
+                        "sum": 1,
+                        "unit": "ns",
+                        "buckets": []
+                    },
+                    "poll": {
+                        "count": 1,
+                        "sum": 2,
+                        "unit": "ns",
+                        "buckets": []
+                    }
+                }
+            }
+        }))
+        .expect("deserialize runtime stats snapshot with reserved system keys");
+
+        assert!(!snapshot.system.counters.contains_key("schema_version"));
+        assert!(!snapshot.system.gauges.contains_key("generated_unix_ms"));
+        assert!(!snapshot.system.latencies.contains_key("schema_version"));
+        assert_eq!(snapshot.system.counters["calls"].value, 2);
+        assert_eq!(snapshot.system.gauges["uptime_ms"].value, 12);
+        assert_eq!(snapshot.system.latencies["poll"].sum, 2);
     }
 
     #[test]
@@ -2137,6 +2284,98 @@ mod tests {
                 .to_string()
                 .contains("metric section and key must not be empty")
         );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_metric_keys_with_extra_dots() {
+        let error =
+            RuntimeStatsSnapshot::parse_text("counter vfs_read.read.failed_bytes bytes 1\n")
+                .expect_err("dotted metric key should fail");
+
+        assert_eq!(error.line(), 1);
+        assert_eq!(error.message(), "metric key must not contain dots");
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_with_wrong_units() {
+        let schema_version =
+            RuntimeStatsSnapshot::parse_text("gauge system.schema_version bytes 1\n")
+                .expect_err("schema version unit should fail");
+        let generated_unix_ms =
+            RuntimeStatsSnapshot::parse_text("gauge system.generated_unix_ms count 1\n")
+                .expect_err("generated timestamp unit should fail");
+
+        assert_eq!(
+            schema_version.message(),
+            "schema_version must have unit 'count'"
+        );
+        assert_eq!(
+            generated_unix_ms.message(),
+            "generated_unix_ms must have unit 'ms'"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_as_counters() {
+        let schema_version =
+            RuntimeStatsSnapshot::parse_text("counter system.schema_version count 1\n")
+                .expect_err("schema version counter should fail");
+        let generated_unix_ms =
+            RuntimeStatsSnapshot::parse_text("counter system.generated_unix_ms ms 1\n")
+                .expect_err("generated timestamp counter should fail");
+
+        assert_eq!(schema_version.message(), "schema_version must be a gauge");
+        assert_eq!(
+            generated_unix_ms.message(),
+            "generated_unix_ms must be a gauge"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_root_system_metrics_as_histograms() {
+        let total =
+            RuntimeStatsSnapshot::parse_text("histogram_count system.schema_version ns 1\n")
+                .expect_err("schema version histogram total should fail");
+        let bucket =
+            RuntimeStatsSnapshot::parse_text("histogram_bucket system.generated_unix_ms 100 1\n")
+                .expect_err("generated timestamp histogram bucket should fail");
+
+        assert_eq!(
+            total.message(),
+            "system schema_version and generated_unix_ms cannot be histograms"
+        );
+        assert_eq!(
+            bucket.message(),
+            "system schema_version and generated_unix_ms cannot be histograms"
+        );
+    }
+
+    #[test]
+    fn runtime_stats_text_rejects_histogram_unit_mismatch() {
+        let error = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_count object_io.get ns 1\n\
+            histogram_sum object_io.get ms 2\n\
+            ",
+        )
+        .expect_err("histogram total unit mismatch should fail");
+
+        assert_eq!(error.line(), 2);
+        assert_eq!(error.message(), "histogram unit mismatch");
+    }
+
+    #[test]
+    fn runtime_stats_text_allows_bucket_before_histogram_total_unit() {
+        let parsed = RuntimeStatsSnapshot::parse_text(
+            "\
+            histogram_bucket object_io.get 100000 1\n\
+            histogram_count object_io.get ms 1\n\
+            histogram_sum object_io.get ms 2\n\
+            ",
+        )
+        .expect("bucket-created default unit should accept first total unit");
+
+        assert_eq!(parsed.object_io.latencies["get"].unit, Cow::Borrowed("ms"));
     }
 
     #[test]
