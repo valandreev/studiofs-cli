@@ -214,18 +214,20 @@ fn stats_path(mountpoint: &Path) -> PathBuf {
 }
 
 fn read_snapshot(path: &Path) -> anyhow::Result<RuntimeStatsSnapshot> {
-    let text = fs::read_to_string(path).with_context(|| {
-        format!(
-            "failed to read StudioFS runtime stats at '{}'; ensure this is a mounted StudioFS volume",
-            path.display()
-        )
-    })?;
+    let text = fs::read_to_string(path).with_context(|| runtime_stats_unavailable_message(path))?;
     RuntimeStatsSnapshot::parse_text(&text).with_context(|| {
         format!(
-            "failed to parse StudioFS runtime stats at '{}'",
+            "StudioFS runtime stats surface at '{}' is malformed; ensure this is a mounted StudioFS volume with a compatible stats schema",
             path.display()
         )
     })
+}
+
+fn runtime_stats_unavailable_message(path: &Path) -> String {
+    format!(
+        "StudioFS runtime stats surface is unavailable at '{}'; ensure this is a mounted StudioFS volume",
+        path.display()
+    )
 }
 
 fn build_sample(
@@ -921,8 +923,39 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("ensure this is a mounted StudioFS volume"),
+                .contains("StudioFS runtime stats surface is unavailable"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn read_snapshot_reports_clear_unreadable_stats_surface_error() {
+        let dir = target_tempdir();
+        let path = stats_path(dir.path());
+        std::fs::create_dir(&path).expect("stats path directory");
+
+        let error = read_snapshot(&path).expect_err("directory stats path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("StudioFS runtime stats surface is unavailable"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn read_snapshot_reports_clear_malformed_stats_surface_error() {
+        let dir = target_tempdir();
+        let path = stats_path(dir.path());
+        std::fs::write(&path, "counter vfs_read.calls count nope\n").expect("stats text");
+
+        let error = read_snapshot(&path).expect_err("malformed stats should fail");
+
+        assert!(
+            error.to_string().contains("StudioFS runtime stats surface"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("malformed"), "{error:#}");
     }
 }
