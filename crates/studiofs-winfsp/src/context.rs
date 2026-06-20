@@ -110,6 +110,8 @@ pub struct StudioFileHandle {
     read_callback_bytes: AtomicU64,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
+    /// Captured text for synthetic runtime stats reads.
+    runtime_stats_snapshot: Option<Vec<u8>>,
 }
 
 impl StudioFileHandle {
@@ -142,7 +144,13 @@ impl StudioFileHandle {
             read_callbacks: AtomicU64::new(0),
             read_callback_bytes: AtomicU64::new(0),
             dir_buffer: DirBuffer::new(),
+            runtime_stats_snapshot: None,
         }
+    }
+
+    fn with_runtime_stats_snapshot(mut self, snapshot: Vec<u8>) -> Self {
+        self.runtime_stats_snapshot = Some(snapshot);
+        self
     }
 
     fn set_disable_os_cache(&mut self, disable_os_cache: bool) {
@@ -219,6 +227,7 @@ const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
 const FILE_SUPERSEDE_DISPOSITION: u32 = 0;
+const FILE_CREATE_DISPOSITION: u32 = 2;
 const FILE_OPEN_IF_DISPOSITION: u32 = 3;
 const FILE_OVERWRITE_DISPOSITION: u32 = 4;
 const FILE_OVERWRITE_IF_DISPOSITION: u32 = 5;
@@ -513,9 +522,60 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
-    let s = path.to_string_lossy();
-    let name = String::from_utf8_lossy(studiofs_vfs::RUNTIME_STATS_FILE_NAME);
-    s == format!("\\{name}") || s == format!("/{name}")
+    const RUNTIME_STATS_BACKSLASH_PATH: &[u16] = &[
+        b'\\' as u16,
+        b'.' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'f' as u16,
+        b's' as u16,
+        b'-' as u16,
+        b'r' as u16,
+        b'u' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'i' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'-' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b's' as u16,
+    ];
+    const RUNTIME_STATS_SLASH_PATH: &[u16] = &[
+        b'/' as u16,
+        b'.' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'f' as u16,
+        b's' as u16,
+        b'-' as u16,
+        b'r' as u16,
+        b'u' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'i' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'-' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b's' as u16,
+    ];
+    let slice = path.as_slice();
+    slice == RUNTIME_STATS_BACKSLASH_PATH || slice == RUNTIME_STATS_SLASH_PATH
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -1030,13 +1090,18 @@ impl StudioFsContext {
                 .open_file(attr.ino, open_flags, trunc)
                 .map_err(vfs_to_winfsp_err)?
         };
-        Ok(StudioFileHandle::new_with_local_sync_policy(
+        let handle = StudioFileHandle::new_with_local_sync_policy(
             attr.ino,
             is_dir,
             fh,
             open_flags,
             write_local_sync_policy,
-        ))
+        );
+        if self.vfs.is_runtime_stats_file_ino(attr.ino) {
+            Ok(handle.with_runtime_stats_snapshot(self.vfs.runtime_stats_file_text().into_bytes()))
+        } else {
+            Ok(handle)
+        }
     }
 
     fn write_open_file_info(out: &mut OpenFileInfo, attr: &InodeAttr) {
@@ -1339,6 +1404,21 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         if is_runtime_stats_windows_path(file_name) {
+            let disposition = create_disposition_from_create_options(create_options);
+            if (create_options & FILE_DIRECTORY_FILE_OPTION) != 0 {
+                return Err(winfsp::FspError::from(STATUS_NOT_A_DIRECTORY));
+            }
+            if disposition == FILE_CREATE_DISPOSITION {
+                return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION));
+            }
+            if matches!(
+                disposition,
+                FILE_SUPERSEDE_DISPOSITION
+                    | FILE_OVERWRITE_DISPOSITION
+                    | FILE_OVERWRITE_IF_DISPOSITION
+            ) {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
             let open_flags = open_flags_from_access(granted_access, create_options);
             let attr = self.vfs.runtime_stats_file_attr();
             Self::write_open_file_info(file_info, &attr);
@@ -1403,7 +1483,12 @@ impl FileSystemContext for StudioFsContext {
         offset: u64,
     ) -> winfsp::Result<u32> {
         if self.vfs.is_runtime_stats_file_ino(context.ino) {
-            return Ok(self.vfs.read_runtime_stats_file(offset, buffer));
+            let Some(bytes) = context.runtime_stats_snapshot.as_deref() else {
+                return Err(winfsp::FspError::from(STATUS_INVALID_PARAMETER));
+            };
+            return Ok(studiofs_vfs::read_runtime_stats_buffer(
+                bytes, offset, buffer,
+            ));
         }
         if let Some(n) = self.try_handle_zero_fill_read(context, buffer, offset) {
             trace!(
@@ -1614,9 +1699,6 @@ impl FileSystemContext for StudioFsContext {
 
                 let child_attr = match self.vfs.getattr(entry.ino) {
                     Ok(a) => a,
-                    Err(_) if self.vfs.is_runtime_stats_file_ino(entry.ino) => {
-                        self.vfs.runtime_stats_file_attr()
-                    }
                     Err(e) => {
                         let display_name = String::from_utf8_lossy(&entry.name);
                         warn!(

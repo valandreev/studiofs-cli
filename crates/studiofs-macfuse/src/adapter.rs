@@ -81,6 +81,8 @@ pub(crate) struct StudioVfsAdapter {
     write_capable_state: WriteCapableState,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
+    next_runtime_stats_fh: AtomicU64,
+    runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
 }
 
 #[derive(Debug)]
@@ -473,6 +475,7 @@ fn copy_window_bytes(window_offset: u64, bytes: &[u8], offset: u64, out: &mut [u
 struct ReadExecutionState {
     vfs: Arc<StudioVfs>,
     shared: Arc<AdapterSharedState>,
+    runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -890,6 +893,8 @@ impl StudioVfsAdapter {
             write_capable_state: WriteCapableState::default(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
+            next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
+            runtime_stats_handles: Arc::new(ParkingMutex::new(HashMap::new())),
         }
     }
 
@@ -1071,7 +1076,11 @@ impl StudioVfsAdapter {
             {
                 return Err(libc::EROFS);
             }
-            return Ok(OpenReply::new(0).with_direct_io(true));
+            let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
+            self.runtime_stats_handles
+                .lock()
+                .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
+            return Ok(OpenReply::new(fh).with_direct_io(true));
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.vfs
@@ -1313,8 +1322,18 @@ impl StudioVfsAdapter {
         let size_usize = size as usize;
 
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            let mut out = vec![0u8; size_usize];
-            let n = self.vfs.read_runtime_stats_file(offset, &mut out) as usize;
+            let handles = self.runtime_stats_handles.lock();
+            let Some(bytes) = handles.get(&file_handle) else {
+                return Err(libc::EBADF);
+            };
+            let Ok(start) = usize::try_from(offset) else {
+                return Ok(Vec::new());
+            };
+            if start >= bytes.len() {
+                return Ok(Vec::new());
+            }
+            let mut out = vec![0u8; size_usize.min(bytes.len() - start)];
+            let n = studiofs_vfs::read_runtime_stats_buffer(bytes, offset, &mut out) as usize;
             out.truncate(n);
             return Ok(out);
         }
@@ -1351,15 +1370,33 @@ impl StudioVfsAdapter {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         if state.vfs.is_runtime_stats_file_ino(request.ino) {
-            let size = request.size.min(request.max_read_len) as usize;
+            let handles = state.runtime_stats_handles.lock();
+            let Some(bytes) = handles.get(&request.file_handle) else {
+                return Err(libc::EBADF);
+            };
+            let Ok(start) = usize::try_from(request.offset) else {
+                return Ok(state
+                    .shared
+                    .read_buffers
+                    .clone()
+                    .acquire_with_capacity(0, 0));
+            };
+            if start >= bytes.len() {
+                return Ok(state
+                    .shared
+                    .read_buffers
+                    .clone()
+                    .acquire_with_capacity(0, 0));
+            }
+            let size = (request.size as usize)
+                .min(request.max_read_len as usize)
+                .min(bytes.len() - start);
             let mut out = state
                 .shared
                 .read_buffers
                 .clone()
                 .acquire_with_capacity(size, size);
-            let n = state
-                .vfs
-                .read_runtime_stats_file(request.offset, out.as_mut_slice());
+            let n = studiofs_vfs::read_runtime_stats_buffer(bytes, request.offset, &mut out);
             out.truncate(n as usize);
             return Ok(out);
         }
@@ -1465,6 +1502,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1569,6 +1607,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1638,6 +1677,7 @@ impl StudioVfsAdapter {
         let state = ReadExecutionState {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1789,6 +1829,14 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+        if self
+            .runtime_stats_handles
+            .lock()
+            .remove(&file_handle)
+            .is_some()
+        {
+            return Ok(());
+        }
         let released_write_handle = self.write_capable_state.release_handle(file_handle);
         let result = self
             .runtime_handle
@@ -1975,9 +2023,6 @@ impl StudioVfsAdapter {
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
-        if self.vfs.is_runtime_stats_file_ino(entry.ino) {
-            return self.attr_to_stat(&self.vfs.runtime_stats_file_attr());
-        }
         let mut out = minimal_stat(entry.ino);
         out.st_ino = entry.ino;
         out.st_mode = match entry.kind {

@@ -7,6 +7,12 @@ use crate::utils::now_unix_millis;
 pub const RUNTIME_STATS_FILE_NAME: &[u8] = b".studiofs-runtime-stats";
 /// Synthetic inode reserved for the runtime stats surface.
 pub const RUNTIME_STATS_FILE_INO: Ino = Ino::MAX - 1;
+/// Stable reported size for the synthetic stats file.
+///
+/// The actual content is generated on open by each bridge and reads naturally
+/// hit EOF for the captured buffer. Keeping getattr cheap avoids collecting
+/// and serializing full stats from high-frequency attribute probes.
+pub const RUNTIME_STATS_FILE_REPORTED_SIZE: u64 = 64 * 1024;
 
 impl StudioVfs {
     /// Return true when `parent/name` addresses the runtime stats virtual file.
@@ -22,8 +28,7 @@ impl StudioVfs {
     /// Return synthetic attributes for the runtime stats virtual file.
     pub fn runtime_stats_file_attr(&self) -> InodeAttr {
         let mut attr = InodeAttr::new_file(RUNTIME_STATS_FILE_INO, ROOT_INO, 0, 0, 0o444);
-        let text_len = self.runtime_stats_file_text().len();
-        attr.size = u64::try_from(text_len).unwrap_or(u64::MAX);
+        attr.size = RUNTIME_STATS_FILE_REPORTED_SIZE;
         attr.committed_size = attr.size;
         attr.win_attrs = 0x02 | 0x20; // HIDDEN | ARCHIVE
         attr
@@ -37,16 +42,22 @@ impl StudioVfs {
     /// Read a slice from the live runtime stats virtual file.
     pub fn read_runtime_stats_file(&self, offset: u64, out: &mut [u8]) -> u32 {
         let text = self.runtime_stats_file_text();
-        let bytes = text.as_bytes();
-        let offset = match usize::try_from(offset) {
-            Ok(offset) => offset.min(bytes.len()),
-            Err(_) => bytes.len(),
-        };
-        let readable = bytes.len().saturating_sub(offset).min(out.len());
-        out[..readable].copy_from_slice(&bytes[offset..offset + readable]);
-        u32::try_from(readable).unwrap_or(u32::MAX)
+        read_runtime_stats_buffer(text.as_bytes(), offset, out)
     }
+}
 
+/// Read a slice from a captured runtime stats buffer.
+pub fn read_runtime_stats_buffer(bytes: &[u8], offset: u64, out: &mut [u8]) -> u32 {
+    let offset = match usize::try_from(offset) {
+        Ok(offset) => offset.min(bytes.len()),
+        Err(_) => bytes.len(),
+    };
+    let readable = bytes.len().saturating_sub(offset).min(out.len());
+    out[..readable].copy_from_slice(&bytes[offset..offset + readable]);
+    u32::try_from(readable).unwrap_or(u32::MAX)
+}
+
+impl StudioVfs {
     /// Build the shared cross-platform runtime stats snapshot for mounted readers.
     pub fn runtime_stats_snapshot(&self) -> RuntimeStatsSnapshot {
         let generated_unix_ms = now_unix_millis();
@@ -64,7 +75,7 @@ impl StudioVfs {
             &mut snapshot.system,
             "uptime_ms",
             "ms",
-            write_path.uptime_secs as u64 * 1000,
+            (write_path.uptime_secs * 1000.0) as u64,
         );
         insert_counter(
             &mut snapshot.bridge,
