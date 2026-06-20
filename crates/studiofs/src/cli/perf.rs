@@ -163,7 +163,20 @@ fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
     }
 
     let stats_path = stats_path(&options.mountpoint);
-    let mut previous = read_snapshot(&stats_path)?;
+    run_perf_with_sampler(options, out, || read_snapshot(&stats_path), thread::sleep)
+}
+
+fn run_perf_with_sampler(
+    options: &PerfOptions,
+    out: &mut impl Write,
+    mut read_next: impl FnMut() -> anyhow::Result<RuntimeStatsSnapshot>,
+    mut sleep: impl FnMut(Duration),
+) -> anyhow::Result<()> {
+    if matches!(options.count, Some(0)) {
+        return Ok(());
+    }
+
+    let mut previous = read_next()?;
     let mut remaining = options.count;
     let mut printed_header = false;
 
@@ -172,8 +185,8 @@ fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        thread::sleep(options.interval);
-        let current = read_snapshot(&stats_path)?;
+        sleep(options.interval);
+        let current = read_next()?;
         let sample = build_sample(&previous, &current, options);
         write_sample(out, &sample, options, &mut printed_header)?;
         previous = current;
@@ -680,6 +693,73 @@ mod tests {
             payload["sections"]["vfs_read"]["counters"]["requested_bytes"]["delta"],
             200
         );
+    }
+
+    #[test]
+    fn run_perf_count_zero_exits_without_reading_stats() {
+        let options = PerfOptions {
+            mountpoint: PathBuf::from("Z:"),
+            interval: Duration::from_secs(1),
+            count: Some(0),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::JsonLines,
+        };
+        let mut reads = 0;
+        let mut sleeps = 0;
+        let mut out = Vec::new();
+
+        run_perf_with_sampler(
+            &options,
+            &mut out,
+            || {
+                reads += 1;
+                Ok(snapshot_at(1_000, 100, 0))
+            },
+            |_| sleeps += 1,
+        )
+        .expect("count zero should exit cleanly");
+
+        assert_eq!((reads, sleeps, out.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn run_perf_count_limited_run_prints_one_record_per_interval_sample() {
+        let options = PerfOptions {
+            mountpoint: PathBuf::from("Z:"),
+            interval: Duration::from_millis(250),
+            count: Some(2),
+            schema: false,
+            sections: vec!["vfs_read"],
+            verbosity: PerfVerbosity::Normal,
+            output: PerfOutput::JsonLines,
+        };
+        let snapshots = [
+            snapshot_at(1_000, 100, 0),
+            snapshot_at(1_250, 200, 0),
+            snapshot_at(1_500, 450, 0),
+        ];
+        let mut next_snapshot = 0;
+        let mut sleeps = Vec::new();
+        let mut out = Vec::new();
+
+        run_perf_with_sampler(
+            &options,
+            &mut out,
+            || {
+                let snapshot = snapshots[next_snapshot].clone();
+                next_snapshot += 1;
+                Ok(snapshot)
+            },
+            |duration| sleeps.push(duration),
+        )
+        .expect("count limited sampling");
+        let output = String::from_utf8(out).expect("json lines utf8");
+
+        assert_eq!(output.lines().count(), 2);
+        assert_eq!(next_snapshot, 3);
+        assert_eq!(sleeps, vec![Duration::from_millis(250); 2]);
     }
 
     #[test]
