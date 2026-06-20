@@ -1,4 +1,4 @@
-use crate::cli::test_cache_profile_types::TestCacheProfileMode;
+use crate::cli::benchmark_profile_types::BenchmarkProfileMode;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ pub(crate) struct TestCacheRunRequest {
     pub(super) during_upload_min_pending: usize,
     pub(super) during_upload_timeout_ms: u64,
     pub(super) l1_limit: Option<String>,
-    pub(super) profile: Option<TestCacheProfileMode>,
+    pub(super) profile: Option<BenchmarkProfileMode>,
     pub(super) json_output: Option<PathBuf>,
     pub(super) full_file_reads: bool,
 }
@@ -56,7 +56,7 @@ pub(crate) struct TestCacheArgs {
     ///
     /// If path is inside an active StudioFS mount, benchmark runs end-to-end
     /// through that mounted process and stores temporary files under
-    /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct-shim mode
+    /// `<path>/.studiofs-benchmark`. Otherwise benchmark runs direct-shim mode
     /// and treats this path as cache directory.
     path: PathBuf,
 
@@ -129,7 +129,7 @@ pub(crate) struct TestCacheArgs {
 
     /// Enable on-demand profiling for this benchmark run.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "pyroscope")]
-    profile: Option<TestCacheProfileMode>,
+    profile: Option<BenchmarkProfileMode>,
 }
 
 impl TestCacheArgs {
@@ -151,7 +151,7 @@ pub enum TestCacheAccessPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache_profile_types::TestCacheProfileMode;
+    use crate::cli::benchmark_profile_types::BenchmarkProfileMode;
     use std::path::PathBuf;
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
                     PathBuf::from("reports/cache-run.json")
                 );
                 assert!(full_file_reads);
-                assert!(matches!(profile, Some(TestCacheProfileMode::Pyroscope)));
+                assert!(matches!(profile, Some(BenchmarkProfileMode::Pyroscope)));
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -289,7 +289,7 @@ mod tests {
 
         match cli.command {
             crate::cli::Commands::TestCache(TestCacheArgs { profile, .. }) => {
-                assert!(matches!(profile, Some(TestCacheProfileMode::Pyroscope)));
+                assert!(matches!(profile, Some(BenchmarkProfileMode::Pyroscope)));
             }
             other => panic!("expected TestCache, got {other:?}"),
         }

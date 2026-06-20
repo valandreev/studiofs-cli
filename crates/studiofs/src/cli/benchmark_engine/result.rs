@@ -1,4 +1,4 @@
-use crate::cli::test_cache_profile_types::ProfileArtifactKind;
+use crate::cli::benchmark_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
@@ -7,546 +7,546 @@ use studiofs_vfs::{
 };
 
 #[derive(Debug, Serialize)]
-pub(super) struct OpReport {
-    pub(super) operations: u64,
-    pub(super) bytes: u64,
-    pub(super) elapsed_ms: f64,
-    pub(super) avg_latency_ms: f64,
-    pub(super) p50_ms: f64,
-    pub(super) p95_ms: f64,
-    pub(super) p99_ms: f64,
-    pub(super) throughput_bytes_per_sec: f64,
-    pub(super) latency_histogram: LatencyHistogramReport,
+pub(crate) struct OpReport {
+    pub(crate) operations: u64,
+    pub(crate) bytes: u64,
+    pub(crate) elapsed_ms: f64,
+    pub(crate) avg_latency_ms: f64,
+    pub(crate) p50_ms: f64,
+    pub(crate) p95_ms: f64,
+    pub(crate) p99_ms: f64,
+    pub(crate) throughput_bytes_per_sec: f64,
+    pub(crate) latency_histogram: LatencyHistogramReport,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) operations_log: Vec<OperationLogReport>,
+    pub(crate) operations_log: Vec<OperationLogReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct OperationLogReport {
-    pub(super) operation_index: u64,
-    pub(super) work_index: usize,
-    pub(super) worker_id: usize,
-    pub(super) target: String,
-    pub(super) size_class: String,
-    pub(super) bytes: u64,
-    pub(super) elapsed_ms: f64,
-    pub(super) throughput_bytes_per_sec: f64,
+pub(crate) struct OperationLogReport {
+    pub(crate) operation_index: u64,
+    pub(crate) work_index: usize,
+    pub(crate) worker_id: usize,
+    pub(crate) target: String,
+    pub(crate) size_class: String,
+    pub(crate) bytes: u64,
+    pub(crate) elapsed_ms: f64,
+    pub(crate) throughput_bytes_per_sec: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BenchmarkReport {
-    pub(super) run_id: String,
-    pub(super) mode: String,
-    pub(super) cache_dir: String,
-    pub(super) started_at: String,
-    pub(super) completed_at: String,
-    pub(super) total_elapsed_ms: f64,
-    pub(super) block_size: u64,
-    pub(super) read_size: u64,
-    pub(super) concurrency: usize,
-    pub(super) sequential_streams: bool,
-    pub(super) io_depth: usize,
-    pub(super) warmup_runs: u32,
-    pub(super) sizes: String,
-    pub(super) workload_repeat: usize,
-    pub(super) workload_files: usize,
-    pub(super) workload_small_files: usize,
-    pub(super) workload_medium_files: usize,
-    pub(super) workload_large_files: usize,
-    pub(super) access_pattern: String,
-    pub(super) l1_limit: u64,
+pub(crate) struct BenchmarkReport {
+    pub(crate) run_id: String,
+    pub(crate) mode: String,
+    pub(crate) cache_dir: String,
+    pub(crate) started_at: String,
+    pub(crate) completed_at: String,
+    pub(crate) total_elapsed_ms: f64,
+    pub(crate) block_size: u64,
+    pub(crate) read_size: u64,
+    pub(crate) concurrency: usize,
+    pub(crate) sequential_streams: bool,
+    pub(crate) io_depth: usize,
+    pub(crate) warmup_runs: u32,
+    pub(crate) sizes: String,
+    pub(crate) workload_repeat: usize,
+    pub(crate) workload_files: usize,
+    pub(crate) workload_small_files: usize,
+    pub(crate) workload_medium_files: usize,
+    pub(crate) workload_large_files: usize,
+    pub(crate) access_pattern: String,
+    pub(crate) l1_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) work_root: Option<String>,
+    pub(crate) work_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) volume: Option<String>,
+    pub(crate) volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mount_point: Option<String>,
+    pub(crate) mount_point: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) l1_bytes: Option<u64>,
+    pub(crate) l1_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_pipeline: Option<CachePipelineReport>,
+    pub(crate) cache_pipeline: Option<CachePipelineReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) profile: Option<BenchmarkProfileReport>,
+    pub(crate) profile: Option<BenchmarkProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) advanced_metrics: Option<AdvancedMetricsReport>,
+    pub(crate) advanced_metrics: Option<AdvancedMetricsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
+    pub(crate) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) stream_results: Option<Vec<StreamResultReport>>,
+    pub(crate) stream_results: Option<Vec<StreamResultReport>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_memory: Option<MountedMemoryReport>,
+    pub(crate) mounted_memory: Option<MountedMemoryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_portable_profile: Option<MountedPortableProfileReport>,
+    pub(crate) mounted_portable_profile: Option<MountedPortableProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_runtime: Option<MountedRuntimeReport>,
+    pub(crate) mounted_runtime: Option<MountedRuntimeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_observability: Option<MountedObservabilityReport>,
+    pub(crate) mounted_observability: Option<MountedObservabilityReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_write_path_window: Option<MountedWritePathWindowReport>,
+    pub(crate) mounted_write_path_window: Option<MountedWritePathWindowReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_writeback_timeline: Option<MountedWritebackTimelineReport>,
+    pub(crate) mounted_writeback_timeline: Option<MountedWritebackTimelineReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mounted_write_diagnostics: Option<MountedWriteDiagnosticsReport>,
-    pub(super) writes: OpReport,
-    pub(super) reads: OpReport,
+    pub(crate) mounted_write_diagnostics: Option<MountedWriteDiagnosticsReport>,
+    pub(crate) writes: OpReport,
+    pub(crate) reads: OpReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedRuntimeReport {
-    pub(super) mounted_path: String,
-    pub(super) cache_root: String,
+pub(crate) struct MountedRuntimeReport {
+    pub(crate) mounted_path: String,
+    pub(crate) cache_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) metadata_root: Option<String>,
-    pub(super) block_size: u64,
-    pub(super) chunk_size: u64,
-    pub(super) read_size: u64,
-    pub(super) workload_shape: MountedWorkloadShapeReport,
-    pub(super) os: String,
-    pub(super) bridge_type: String,
+    pub(crate) metadata_root: Option<String>,
+    pub(crate) block_size: u64,
+    pub(crate) chunk_size: u64,
+    pub(crate) read_size: u64,
+    pub(crate) workload_shape: MountedWorkloadShapeReport,
+    pub(crate) os: String,
+    pub(crate) bridge_type: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWorkloadShapeReport {
-    pub(super) sizes: String,
-    pub(super) repeat: usize,
-    pub(super) files: usize,
-    pub(super) small_files: usize,
-    pub(super) medium_files: usize,
-    pub(super) large_files: usize,
-    pub(super) access_pattern: String,
-    pub(super) concurrency: usize,
-    pub(super) sequential_streams: bool,
-    pub(super) io_depth: usize,
+pub(crate) struct MountedWorkloadShapeReport {
+    pub(crate) sizes: String,
+    pub(crate) repeat: usize,
+    pub(crate) files: usize,
+    pub(crate) small_files: usize,
+    pub(crate) medium_files: usize,
+    pub(crate) large_files: usize,
+    pub(crate) access_pattern: String,
+    pub(crate) concurrency: usize,
+    pub(crate) sequential_streams: bool,
+    pub(crate) io_depth: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedObservabilityReport {
+pub(crate) struct MountedObservabilityReport {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) write_callback: Option<MountedWriteCallbackReport>,
+    pub(crate) write_callback: Option<MountedWriteCallbackReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) writer: Option<MountedWriterStateReport>,
+    pub(crate) writer: Option<MountedWriterStateReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cached_store: Option<MountedCachedStoreReport>,
+    pub(crate) cached_store: Option<MountedCachedStoreReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) upload: Option<MountedUploadReport>,
+    pub(crate) upload: Option<MountedUploadReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) fetch: Option<MountedFetchReport>,
+    pub(crate) fetch: Option<MountedFetchReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) process: Option<MountedProcessReport>,
+    pub(crate) process: Option<MountedProcessReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) barriers: Option<MountedBarrierReport>,
+    pub(crate) barriers: Option<MountedBarrierReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) post_upload_idle: Option<MountedPostUploadIdleReport>,
+    pub(crate) post_upload_idle: Option<MountedPostUploadIdleReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWriteCallbackReport {
-    pub(super) callbacks: u64,
-    pub(super) bytes: u64,
-    pub(super) throughput_bytes_per_sec: f64,
-    pub(super) latency: VfsWritePathStageLatencyStats,
+pub(crate) struct MountedWriteCallbackReport {
+    pub(crate) callbacks: u64,
+    pub(crate) bytes: u64,
+    pub(crate) throughput_bytes_per_sec: f64,
+    pub(crate) latency: VfsWritePathStageLatencyStats,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWriterStateReport {
-    pub(super) dirty_bytes: usize,
-    pub(super) dirty_slice_count: usize,
-    pub(super) frozen_slice_count: usize,
-    pub(super) staged_bytes: usize,
-    pub(super) dirty_limit_bytes: usize,
+pub(crate) struct MountedWriterStateReport {
+    pub(crate) dirty_bytes: usize,
+    pub(crate) dirty_slice_count: usize,
+    pub(crate) frozen_slice_count: usize,
+    pub(crate) staged_bytes: usize,
+    pub(crate) dirty_limit_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedCachedStoreReport {
-    pub(super) staging_bytes: usize,
-    pub(super) staging_throughput_bytes_per_sec: f64,
-    pub(super) staging_latency: VfsWritePathStageLatencyStats,
-    pub(super) local_cache_backend_latency: studiofs_vfs::VfsWritePathLocalCacheIoStats,
-    pub(super) cache_counters_available: bool,
+pub(crate) struct MountedCachedStoreReport {
+    pub(crate) staging_bytes: usize,
+    pub(crate) staging_throughput_bytes_per_sec: f64,
+    pub(crate) staging_latency: VfsWritePathStageLatencyStats,
+    pub(crate) local_cache_backend_latency: studiofs_vfs::VfsWritePathLocalCacheIoStats,
+    pub(crate) cache_counters_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_counters_unavailable_reason: Option<String>,
+    pub(crate) cache_counters_unavailable_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_hits: Option<u64>,
+    pub(crate) cache_hits: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_misses: Option<u64>,
+    pub(crate) cache_misses: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedUploadReport {
-    pub(super) backlog_count: usize,
-    pub(super) backlog_bytes: u64,
-    pub(super) throughput_bytes_per_sec: f64,
-    pub(super) retry_count: u64,
-    pub(super) active_uploads: usize,
-    pub(super) completed_uploads: u64,
-    pub(super) completed_upload_bytes: u64,
-    pub(super) raw: VfsUploadStats,
+pub(crate) struct MountedUploadReport {
+    pub(crate) backlog_count: usize,
+    pub(crate) backlog_bytes: u64,
+    pub(crate) throughput_bytes_per_sec: f64,
+    pub(crate) retry_count: u64,
+    pub(crate) active_uploads: usize,
+    pub(crate) completed_uploads: u64,
+    pub(crate) completed_upload_bytes: u64,
+    pub(crate) raw: VfsUploadStats,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedFetchReport {
-    pub(super) cache_hits: u64,
-    pub(super) s3_fetches: u64,
-    pub(super) s3_errors: u64,
-    pub(super) singleflight_joins: u64,
-    pub(super) retries: u64,
-    pub(super) bytes_downloaded: u64,
-    pub(super) prefetch_skips: u64,
-    pub(super) raw: VfsFetchStats,
+pub(crate) struct MountedFetchReport {
+    pub(crate) cache_hits: u64,
+    pub(crate) s3_fetches: u64,
+    pub(crate) s3_errors: u64,
+    pub(crate) singleflight_joins: u64,
+    pub(crate) retries: u64,
+    pub(crate) bytes_downloaded: u64,
+    pub(crate) prefetch_skips: u64,
+    pub(crate) raw: VfsFetchStats,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedProcessReport {
-    pub(super) mount_pid: u32,
+pub(crate) struct MountedProcessReport {
+    pub(crate) mount_pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_steady_state: Option<u64>,
+    pub(crate) rss_bytes_steady_state: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_peak: Option<u64>,
+    pub(crate) rss_bytes_peak: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedBarrierReport {
-    pub(super) flush_barrier_calls: u64,
-    pub(super) cleanup_barrier_calls: u64,
-    pub(super) fsync_barrier_calls: u64,
-    pub(super) close_barrier_calls: u64,
-    pub(super) flush_fsync_close_latency: VfsWritePathSyncDataStats,
+pub(crate) struct MountedBarrierReport {
+    pub(crate) flush_barrier_calls: u64,
+    pub(crate) cleanup_barrier_calls: u64,
+    pub(crate) fsync_barrier_calls: u64,
+    pub(crate) close_barrier_calls: u64,
+    pub(crate) flush_fsync_close_latency: VfsWritePathSyncDataStats,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedPostUploadIdleReport {
-    pub(super) observed: bool,
-    pub(super) timed_out: bool,
-    pub(super) wait_ms: f64,
-    pub(super) pending_uploads_before: usize,
-    pub(super) pending_uploads_after: usize,
+pub(crate) struct MountedPostUploadIdleReport {
+    pub(crate) observed: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) wait_ms: f64,
+    pub(crate) pending_uploads_before: usize,
+    pub(crate) pending_uploads_after: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reason: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedMemoryReport {
-    pub(super) mount_pid: u32,
+pub(crate) struct MountedMemoryReport {
+    pub(crate) mount_pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_steady_state: Option<u64>,
+    pub(crate) rss_bytes_steady_state: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_peak: Option<u64>,
+    pub(crate) rss_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dirty_bytes_steady_state: Option<u64>,
+    pub(crate) dirty_bytes_steady_state: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dirty_bytes_peak: Option<u64>,
+    pub(crate) dirty_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) staged_bytes_peak: Option<u64>,
+    pub(crate) staged_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dirty_limit_bytes: Option<u64>,
+    pub(crate) dirty_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct MountedPortableProfileReport {
-    pub(super) process: MountedPortableProcessReport,
+pub(crate) struct MountedPortableProfileReport {
+    pub(crate) process: MountedPortableProcessReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) allocator: Option<MountedPortableAllocatorReport>,
+    pub(crate) allocator: Option<MountedPortableAllocatorReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) phases: Vec<MountedPortablePhaseProfileReport>,
+    pub(crate) phases: Vec<MountedPortablePhaseProfileReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct MountedPortablePhaseProfileReport {
-    pub(super) phase: String,
-    pub(super) process: MountedPortableProcessReport,
+pub(crate) struct MountedPortablePhaseProfileReport {
+    pub(crate) phase: String,
+    pub(crate) process: MountedPortableProcessReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) allocator: Option<MountedPortableAllocatorReport>,
+    pub(crate) allocator: Option<MountedPortableAllocatorReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct MountedPortableProcessReport {
-    pub(super) mount_pid: u32,
-    pub(super) sample_count: u64,
+pub(crate) struct MountedPortableProcessReport {
+    pub(crate) mount_pid: u32,
+    pub(crate) sample_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_steady_state: Option<u64>,
+    pub(crate) rss_bytes_steady_state: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_peak: Option<u64>,
+    pub(crate) rss_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) virtual_memory_bytes_peak: Option<u64>,
+    pub(crate) virtual_memory_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cpu_usage_percent_avg: Option<f64>,
+    pub(crate) cpu_usage_percent_avg: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cpu_usage_percent_peak: Option<f64>,
+    pub(crate) cpu_usage_percent_peak: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cpu_time_ms_delta: Option<u64>,
+    pub(crate) cpu_time_ms_delta: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) disk_read_bytes_delta: Option<u64>,
+    pub(crate) disk_read_bytes_delta: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) disk_write_bytes_delta: Option<u64>,
+    pub(crate) disk_write_bytes_delta: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct MountedPortableAllocatorReport {
-    pub(super) current_bytes: u64,
-    pub(super) peak_bytes: u64,
-    pub(super) allocated_total_bytes: u64,
-    pub(super) deallocated_total_bytes: u64,
-    pub(super) allocation_count: u64,
-    pub(super) deallocation_count: u64,
-    pub(super) reallocation_count: u64,
+pub(crate) struct MountedPortableAllocatorReport {
+    pub(crate) current_bytes: u64,
+    pub(crate) peak_bytes: u64,
+    pub(crate) allocated_total_bytes: u64,
+    pub(crate) deallocated_total_bytes: u64,
+    pub(crate) allocation_count: u64,
+    pub(crate) deallocation_count: u64,
+    pub(crate) reallocation_count: u64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedLocalFirstReadComparisonReport {
-    pub(super) cache_path: String,
-    pub(super) upload_dir: String,
-    pub(super) phases: Vec<MountedLocalFirstReadPhaseReport>,
+pub(crate) struct MountedLocalFirstReadComparisonReport {
+    pub(crate) cache_path: String,
+    pub(crate) upload_dir: String,
+    pub(crate) phases: Vec<MountedLocalFirstReadPhaseReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWritePathWindowReport {
+pub(crate) struct MountedWritePathWindowReport {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) before: Option<VfsWritePathObservabilitySnapshot>,
+    pub(crate) before: Option<VfsWritePathObservabilitySnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) after: Option<VfsWritePathObservabilitySnapshot>,
+    pub(crate) after: Option<VfsWritePathObservabilitySnapshot>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWritebackTimelineReport {
-    pub(super) bucket_ms: u64,
+pub(crate) struct MountedWritebackTimelineReport {
+    pub(crate) bucket_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) samples: Vec<MountedWritebackTimelineSampleReport>,
+    pub(crate) samples: Vec<MountedWritebackTimelineSampleReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWritebackTimelineSampleReport {
-    pub(super) elapsed_ms: u64,
-    pub(super) phase: String,
-    pub(super) foreground_write_bytes_per_sec: f64,
-    pub(super) payload_persist_bytes_per_sec: f64,
-    pub(super) upload_completed_bytes_per_sec: f64,
-    pub(super) writer_stack_dirty_bytes: u64,
-    pub(super) pending_persisted_slice_bytes: u64,
-    pub(super) pending_upload_bytes: u64,
-    pub(super) upload_queue_depth: usize,
-    pub(super) active_uploads: usize,
-    pub(super) backpressure_events_delta: u64,
-    pub(super) backpressure_wait_ms_delta: u64,
-    pub(super) soft_throttle_events_delta: u64,
-    pub(super) hard_backpressure_events_delta: u64,
-    pub(super) materialization_calls_delta: u64,
-    pub(super) materialization_total_ms_delta: f64,
-    pub(super) local_cache_io_calls_delta: u64,
-    pub(super) local_cache_backend_io_total_ms_delta: f64,
-    pub(super) local_cache_backend_io_cumulative_max_ms: f64,
+pub(crate) struct MountedWritebackTimelineSampleReport {
+    pub(crate) elapsed_ms: u64,
+    pub(crate) phase: String,
+    pub(crate) foreground_write_bytes_per_sec: f64,
+    pub(crate) payload_persist_bytes_per_sec: f64,
+    pub(crate) upload_completed_bytes_per_sec: f64,
+    pub(crate) writer_stack_dirty_bytes: u64,
+    pub(crate) pending_persisted_slice_bytes: u64,
+    pub(crate) pending_upload_bytes: u64,
+    pub(crate) upload_queue_depth: usize,
+    pub(crate) active_uploads: usize,
+    pub(crate) backpressure_events_delta: u64,
+    pub(crate) backpressure_wait_ms_delta: u64,
+    pub(crate) soft_throttle_events_delta: u64,
+    pub(crate) hard_backpressure_events_delta: u64,
+    pub(crate) materialization_calls_delta: u64,
+    pub(crate) materialization_total_ms_delta: f64,
+    pub(crate) local_cache_io_calls_delta: u64,
+    pub(crate) local_cache_backend_io_total_ms_delta: f64,
+    pub(crate) local_cache_backend_io_cumulative_max_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedWriteDiagnosticsReport {
-    pub(super) pass: bool,
+pub(crate) struct MountedWriteDiagnosticsReport {
+    pub(crate) pass: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) blockers: Vec<String>,
-    pub(super) write_throughput_target_bytes_per_sec: f64,
-    pub(super) write_throughput_bytes_per_sec: f64,
-    pub(super) write_throughput_mib_per_sec: f64,
-    pub(super) write_throughput_target_met: bool,
-    pub(super) rss_peak_target_bytes: u64,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) write_throughput_target_bytes_per_sec: f64,
+    pub(crate) write_throughput_bytes_per_sec: f64,
+    pub(crate) write_throughput_mib_per_sec: f64,
+    pub(crate) write_throughput_target_met: bool,
+    pub(crate) rss_peak_target_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_bytes_peak: Option<u64>,
+    pub(crate) rss_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rss_target_met: Option<bool>,
-    pub(super) logical_write_bytes: u64,
-    pub(super) winfsp_write_bytes_delta: u64,
-    pub(super) vfs_write_bytes_delta: u64,
-    pub(super) payload_persisted_bytes_delta: u64,
-    pub(super) payload_accounted_bytes_delta: u64,
-    pub(super) landing_accepted_bytes_delta: u64,
+    pub(crate) rss_target_met: Option<bool>,
+    pub(crate) logical_write_bytes: u64,
+    pub(crate) winfsp_write_bytes_delta: u64,
+    pub(crate) vfs_write_bytes_delta: u64,
+    pub(crate) payload_persisted_bytes_delta: u64,
+    pub(crate) payload_accounted_bytes_delta: u64,
+    pub(crate) landing_accepted_bytes_delta: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) known_local_write_amplification: Option<f64>,
-    pub(super) landing_journal_active: bool,
+    pub(crate) known_local_write_amplification: Option<f64>,
+    pub(crate) landing_journal_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dirty_bytes_peak: Option<u64>,
+    pub(crate) dirty_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) staged_bytes_peak: Option<u64>,
+    pub(crate) staged_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dirty_limit_bytes: Option<u64>,
+    pub(crate) dirty_limit_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) writer_stack_dirty_bytes_after: Option<u64>,
+    pub(crate) writer_stack_dirty_bytes_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) pending_persisted_slice_bytes_after: Option<u64>,
+    pub(crate) pending_persisted_slice_bytes_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) pending_upload_bytes_after: Option<u64>,
+    pub(crate) pending_upload_bytes_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_pressure_bytes_after: Option<u64>,
+    pub(crate) cache_pressure_bytes_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) total_accounted_bytes_after: Option<u64>,
-    pub(super) payload_persist_calls_delta: u64,
-    pub(super) local_cache_io_calls_delta: u64,
-    pub(super) local_cache_backend_io_total_ms_delta: f64,
-    pub(super) hard_backpressure_events_delta: u64,
-    pub(super) soft_throttle_events_delta: u64,
+    pub(crate) total_accounted_bytes_after: Option<u64>,
+    pub(crate) payload_persist_calls_delta: u64,
+    pub(crate) local_cache_io_calls_delta: u64,
+    pub(crate) local_cache_backend_io_total_ms_delta: f64,
+    pub(crate) hard_backpressure_events_delta: u64,
+    pub(crate) soft_throttle_events_delta: u64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedLocalFirstReadPhaseReport {
-    pub(super) phase: String,
-    pub(super) wait_target: String,
-    pub(super) target_state_observed: bool,
-    pub(super) valid_for_target: bool,
-    pub(super) required_pending_uploads: usize,
-    pub(super) wait_ms: f64,
-    pub(super) pending_uploads_before: usize,
-    pub(super) pending_uploads_after: usize,
+pub(crate) struct MountedLocalFirstReadPhaseReport {
+    pub(crate) phase: String,
+    pub(crate) wait_target: String,
+    pub(crate) target_state_observed: bool,
+    pub(crate) valid_for_target: bool,
+    pub(crate) required_pending_uploads: usize,
+    pub(crate) wait_ms: f64,
+    pub(crate) pending_uploads_before: usize,
+    pub(crate) pending_uploads_after: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) validation_message: Option<String>,
-    pub(super) results: OpReport,
+    pub(crate) validation_message: Option<String>,
+    pub(crate) results: OpReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct StreamResultReport {
-    pub(super) stream_id: usize,
-    pub(super) writes: OpReport,
-    pub(super) reads: OpReport,
+pub(crate) struct StreamResultReport {
+    pub(crate) stream_id: usize,
+    pub(crate) writes: OpReport,
+    pub(crate) reads: OpReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct AdvancedMetricsReport {
-    pub(super) size_class_boundaries: SizeClassBoundaryReport,
-    pub(super) size_class_stats: SizeClassStatsReport,
+pub(crate) struct AdvancedMetricsReport {
+    pub(crate) size_class_boundaries: SizeClassBoundaryReport,
+    pub(crate) size_class_stats: SizeClassStatsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) cache_levels: Option<CacheLevelsReport>,
+    pub(crate) cache_levels: Option<CacheLevelsReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SizeClassBoundaryReport {
-    pub(super) small_max_bytes: u64,
-    pub(super) medium_max_bytes: u64,
+pub(crate) struct SizeClassBoundaryReport {
+    pub(crate) small_max_bytes: u64,
+    pub(crate) medium_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SizeClassStatsReport {
-    pub(super) writes: Vec<SizeClassOpReport>,
-    pub(super) reads: Vec<SizeClassOpReport>,
+pub(crate) struct SizeClassStatsReport {
+    pub(crate) writes: Vec<SizeClassOpReport>,
+    pub(crate) reads: Vec<SizeClassOpReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SizeClassOpReport {
-    pub(super) class: String,
-    pub(super) operations: u64,
-    pub(super) bytes: u64,
-    pub(super) avg_latency_ms: f64,
-    pub(super) p50_ms: f64,
-    pub(super) p95_ms: f64,
-    pub(super) p99_ms: f64,
-    pub(super) throughput_bytes_per_sec: f64,
+pub(crate) struct SizeClassOpReport {
+    pub(crate) class: String,
+    pub(crate) operations: u64,
+    pub(crate) bytes: u64,
+    pub(crate) avg_latency_ms: f64,
+    pub(crate) p50_ms: f64,
+    pub(crate) p95_ms: f64,
+    pub(crate) p99_ms: f64,
+    pub(crate) throughput_bytes_per_sec: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct CacheLevelsReport {
-    pub(super) l1: CacheLevelReport,
+pub(crate) struct CacheLevelsReport {
+    pub(crate) l1: CacheLevelReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct CacheLevelReport {
-    pub(super) hits: u64,
-    pub(super) misses: u64,
-    pub(super) bytes_served: u64,
-    pub(super) throughput_bytes_per_sec: f64,
-    pub(super) avg_latency_ms: f64,
-    pub(super) p50_ms: f64,
-    pub(super) p95_ms: f64,
-    pub(super) p99_ms: f64,
-    pub(super) latency_histogram: LatencyHistogramReport,
+pub(crate) struct CacheLevelReport {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) bytes_served: u64,
+    pub(crate) throughput_bytes_per_sec: f64,
+    pub(crate) avg_latency_ms: f64,
+    pub(crate) p50_ms: f64,
+    pub(crate) p95_ms: f64,
+    pub(crate) p99_ms: f64,
+    pub(crate) latency_histogram: LatencyHistogramReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct LatencyHistogramReport {
-    pub(super) bucket_upper_bounds_ns: Vec<u64>,
-    pub(super) bucket_counts: Vec<u64>,
+pub(crate) struct LatencyHistogramReport {
+    pub(crate) bucket_upper_bounds_ns: Vec<u64>,
+    pub(crate) bucket_counts: Vec<u64>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MaterializeBatchStatsReport {
-    pub(super) batches: u64,
-    pub(super) payloads: u64,
-    pub(super) bytes: u64,
-    pub(super) inflight_batches: usize,
-    pub(super) inflight_batches_peak: usize,
-    pub(super) duration_histogram: LatencyHistogramReport,
+pub(crate) struct MaterializeBatchStatsReport {
+    pub(crate) batches: u64,
+    pub(crate) payloads: u64,
+    pub(crate) bytes: u64,
+    pub(crate) inflight_batches: usize,
+    pub(crate) inflight_batches_peak: usize,
+    pub(crate) duration_histogram: LatencyHistogramReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct UploadQueueStatsReport {
-    pub(super) pending_depth: usize,
-    pub(super) pending_depth_peak: usize,
-    pub(super) submitted: u64,
-    pub(super) completed: u64,
-    pub(super) completed_bytes: u64,
-    pub(super) requeued: u64,
-    pub(super) canceled: u64,
+pub(crate) struct UploadQueueStatsReport {
+    pub(crate) pending_depth: usize,
+    pub(crate) pending_depth_peak: usize,
+    pub(crate) submitted: u64,
+    pub(crate) completed: u64,
+    pub(crate) completed_bytes: u64,
+    pub(crate) requeued: u64,
+    pub(crate) canceled: u64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct CachePipelineReport {
-    pub(super) materialize_batches: MaterializeBatchStatsReport,
-    pub(super) upload_queue: UploadQueueStatsReport,
-    pub(super) blocking_tasks: BlockingTaskStatsReport,
+pub(crate) struct CachePipelineReport {
+    pub(crate) materialize_batches: MaterializeBatchStatsReport,
+    pub(crate) upload_queue: UploadQueueStatsReport,
+    pub(crate) blocking_tasks: BlockingTaskStatsReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BlockingTaskStatsReport {
-    pub(super) total: BlockingTaskSingleStatsReport,
-    pub(super) by_kind: Vec<BlockingTaskKindStatsReport>,
+pub(crate) struct BlockingTaskStatsReport {
+    pub(crate) total: BlockingTaskSingleStatsReport,
+    pub(crate) by_kind: Vec<BlockingTaskKindStatsReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BlockingTaskKindStatsReport {
-    pub(super) task_kind: String,
-    pub(super) stats: BlockingTaskSingleStatsReport,
+pub(crate) struct BlockingTaskKindStatsReport {
+    pub(crate) task_kind: String,
+    pub(crate) stats: BlockingTaskSingleStatsReport,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BlockingTaskSingleStatsReport {
-    pub(super) active: usize,
-    pub(super) active_peak: usize,
-    pub(super) submitted: u64,
-    pub(super) started: u64,
-    pub(super) completed: u64,
-    pub(super) queue_wait_avg_ms: f64,
-    pub(super) queue_wait_max_ms: f64,
-    pub(super) execution_avg_ms: f64,
-    pub(super) execution_max_ms: f64,
+pub(crate) struct BlockingTaskSingleStatsReport {
+    pub(crate) active: usize,
+    pub(crate) active_peak: usize,
+    pub(crate) submitted: u64,
+    pub(crate) started: u64,
+    pub(crate) completed: u64,
+    pub(crate) queue_wait_avg_ms: f64,
+    pub(crate) queue_wait_max_ms: f64,
+    pub(crate) execution_avg_ms: f64,
+    pub(crate) execution_max_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct BenchmarkProfileReport {
-    pub(super) enabled: bool,
-    pub(super) profile_mode: String,
-    pub(super) cpu_profile: CpuProfileReport,
+pub(crate) struct BenchmarkProfileReport {
+    pub(crate) enabled: bool,
+    pub(crate) profile_mode: String,
+    pub(crate) cpu_profile: CpuProfileReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) endpoint: Option<ProfileEndpointReport>,
+    pub(crate) endpoint: Option<ProfileEndpointReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) artifacts: Vec<ProfileArtifactSummary>,
+    pub(crate) artifacts: Vec<ProfileArtifactSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct CpuProfileReport {
-    pub(super) total_wall_ms: f64,
-    pub(super) total_cpu_ms: f64,
-    pub(super) cpu_utilization_percent: f64,
-    pub(super) write_phase_cpu_percent: f64,
-    pub(super) read_phase_cpu_percent: f64,
+pub(crate) struct CpuProfileReport {
+    pub(crate) total_wall_ms: f64,
+    pub(crate) total_cpu_ms: f64,
+    pub(crate) cpu_utilization_percent: f64,
+    pub(crate) write_phase_cpu_percent: f64,
+    pub(crate) read_phase_cpu_percent: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct ProfileEndpointReport {
-    pub(super) url: String,
-    pub(super) application_name: String,
+pub(crate) struct ProfileEndpointReport {
+    pub(crate) url: String,
+    pub(crate) application_name: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct ProfileArtifactSummary {
-    pub(super) kind: ProfileArtifactKind,
-    pub(super) path: String,
-    pub(super) bytes: u64,
-    pub(super) sent_to_endpoint: bool,
+pub(crate) struct ProfileArtifactSummary {
+    pub(crate) kind: ProfileArtifactKind,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) sent_to_endpoint: bool,
 }
 
 impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
@@ -761,7 +761,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             }),
             artifacts: vec![ProfileArtifactSummary {
                 kind: ProfileArtifactKind::Cpu,
-                path: r"D:\test-cache\studiofs-test-cache-direct-shim-run-123-cpu.pprof.gz"
+                path: r"D:\test-cache\studiofs-benchmark-direct-shim-run-123-cpu.pprof.gz"
                     .to_string(),
                 bytes: 2048,
                 sent_to_endpoint: true,
@@ -861,7 +861,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         mounted_memory: None,
         mounted_portable_profile: None,
         mounted_runtime: Some(MountedRuntimeReport {
-            mounted_path: r"Z:\".to_string(),
+            mounted_path: "/mnt/studiofs-benchmark".to_string(),
             cache_root: r"D:\test-cache\vol-123".to_string(),
             metadata_root: Some(r"D:\test-cache".to_string()),
             block_size: DEFAULT_BLOCK_SIZE as u64,

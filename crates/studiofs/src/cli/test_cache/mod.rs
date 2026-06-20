@@ -7,17 +7,15 @@
 mod args;
 mod direct;
 mod mode;
-mod mounted;
-mod profiling;
-mod progress;
-mod reporting;
-mod result;
-mod telemetry;
-mod workload;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
-use crate::cli::test_cache_profile::TestCacheProfileSession;
-use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
+use crate::cli::benchmark_engine::{
+    BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_BENCHMARK_BLOCK_SIZE_STR,
+    DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, merge_profile_report, parse_size_arg,
+    parse_sizes_arg, render_human_summary, run_mounted, save_benchmark_report,
+};
+use crate::cli::benchmark_profile::BenchmarkProfileSession;
+use crate::cli::benchmark_profile_types::{BenchmarkProfileMode, BenchmarkProfileResult};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -29,15 +27,18 @@ pub(crate) use args::TestCacheArgs;
 use args::TestCacheRunRequest;
 use direct::run_direct;
 use mode::{ResolvedRunMode, resolve_run_mode};
-use mounted::run_mounted_end_to_end;
-use profiling::merge_profile_report;
-use reporting::{render_human_summary, save_benchmark_report};
-use workload::{
-    DEFAULT_SMALL_CLASS_MAX_BYTES, DEFAULT_TEST_CACHE_BLOCK_SIZE_STR, WorkloadSizeInput,
-    parse_size_arg, parse_sizes_arg,
-};
 
 static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+
+impl From<TestCacheAccessPattern> for BenchmarkAccessPattern {
+    fn from(pattern: TestCacheAccessPattern) -> Self {
+        match pattern {
+            TestCacheAccessPattern::Sequential => Self::Sequential,
+            TestCacheAccessPattern::Random => Self::Random,
+            TestCacheAccessPattern::Mixed => Self::Mixed,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MountedRuntimeInfo {
@@ -100,32 +101,10 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         during_upload_min_pending: 1,
         during_upload_timeout_ms: 120_000,
         l1_limit: None,
-        profile: Some(TestCacheProfileMode::Pyroscope),
+        profile: Some(BenchmarkProfileMode::Pyroscope),
         json_output: Some(report),
         full_file_reads: true,
     })
-}
-
-#[derive(Debug)]
-struct TestCacheParams {
-    target: PathBuf,
-    block_size: u64,
-    read_size: u64,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
-    workload_repeat: usize,
-    concurrency: usize,
-    sequential_streams: bool,
-    io_depth: usize,
-    warmup_runs: u32,
-    sizes: WorkloadSizeInput,
-    access_pattern: TestCacheAccessPattern,
-    during_upload_min_pending: usize,
-    during_upload_timeout: std::time::Duration,
-    l1_limit: u64,
-    profile: bool,
-    full_file_reads: bool,
-    run_id: String,
 }
 
 fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -182,7 +161,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         "block-size",
         block_size
             .as_deref()
-            .unwrap_or(DEFAULT_TEST_CACHE_BLOCK_SIZE_STR),
+            .unwrap_or(DEFAULT_BENCHMARK_BLOCK_SIZE_STR),
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_MEMORY_CACHE_SIZE.to_string();
@@ -240,7 +219,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         profile_enabled = profile.is_some(),
         "test-cache run started"
     );
-    let params = TestCacheParams {
+    let config = BenchmarkConfig {
         target: target.clone(),
         block_size,
         read_size,
@@ -252,7 +231,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         io_depth,
         warmup_runs,
         sizes,
-        access_pattern,
+        access_pattern: access_pattern.into(),
         during_upload_min_pending,
         during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
@@ -274,7 +253,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     };
     let current_dir = std::env::current_dir().context("resolve current directory")?;
     let report_dir = resolve_report_dir(json_output.as_deref(), &current_dir);
-    let profile_session = TestCacheProfileSession::start(
+    let profile_session = BenchmarkProfileSession::start(
         profile,
         &run_id,
         benchmark_mode,
@@ -284,7 +263,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     let rt = test_cache_runtime()?;
     let report = rt.block_on(async {
         match &resolved_mode {
-            ResolvedRunMode::DirectShim { cache_dir } => run_direct(&params, cache_dir).await,
+            ResolvedRunMode::DirectShim { cache_dir } => run_direct(&config, cache_dir).await,
             ResolvedRunMode::MountedE2E {
                 pid,
                 volume,
@@ -292,13 +271,18 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                 work_root,
                 cache_path,
             } => {
-                run_mounted_end_to_end(
-                    &params,
-                    *pid,
-                    volume,
-                    mount_point,
-                    work_root,
-                    cache_path.as_deref(),
+                run_mounted(
+                    &config,
+                    MountedBenchmarkTarget {
+                        pid: *pid,
+                        volume: volume.as_str(),
+                        mount_point: mount_point.as_path(),
+                        work_root: work_root.as_path(),
+                        cache_path: match cache_path {
+                            Some(path) => Some(path.as_path()),
+                            None => None,
+                        },
+                    },
                 )
                 .await
             }
@@ -314,7 +298,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
                 error = %err,
                 "profile session failed to finish; benchmark report will still be written"
             );
-            Some(TestCacheProfileResult {
+            Some(BenchmarkProfileResult {
                 endpoint: None,
                 artifacts: Vec::new(),
                 warnings: vec![format!(

@@ -9,18 +9,12 @@ use std::time::Instant;
 use studiofs_cache::{BenchmarkCache, BenchmarkCacheConfig, CacheReadLevel};
 use tokio::sync::Semaphore;
 
-use super::TestCacheParams;
-use super::profiling::{cpu_utilization_percent, process_cpu_time};
-use super::result::{
-    BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
-};
-use super::telemetry::{
-    DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
-    phase_telemetry_to_report, stream_reports_from_telemetry,
-};
-use super::workload::{
-    SizeClassBounds, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
-    split_stream_segments,
+use crate::cli::benchmark_engine::{
+    BenchmarkConfig, BenchmarkProfileReport, BenchmarkReport, CachePipelineReport,
+    CpuProfileReport, DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, SizeClassBounds,
+    build_access_sequence, build_advanced_metrics, build_work_sizes, classify_size,
+    cpu_utilization_percent, deterministic_bytes, phase_telemetry_to_report, process_cpu_time,
+    split_stream_segments, stream_reports_from_telemetry,
 };
 
 async fn run_shim_writes(
@@ -90,7 +84,7 @@ async fn run_shim_writes(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: format!("object:{object_id}"),
+                    target: format!("object:{object_id}").into(),
                     size_class: class,
                     bytes: sizes[work_index],
                     elapsed,
@@ -185,7 +179,7 @@ async fn run_shim_reads(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: format!("object:{object_id}"),
+                    target: format!("object:{object_id}").into(),
                     size_class: class,
                     bytes: read as u64,
                     elapsed,
@@ -266,7 +260,7 @@ async fn run_shim_writes_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: format!("object:{object_id}"),
+                    target: format!("object:{object_id}").into(),
                     size_class: class,
                     bytes: sizes[work_index],
                     elapsed,
@@ -341,7 +335,7 @@ async fn run_shim_reads_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: format!("object:{object_id}"),
+                    target: format!("object:{object_id}").into(),
                     size_class: class,
                     bytes: read as u64,
                     elapsed,
@@ -377,7 +371,7 @@ async fn run_shim_reads_sequential_streams(
 }
 
 pub(super) async fn run_direct(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     cache_dir: &Path,
 ) -> Result<BenchmarkReport> {
     let cache_config = BenchmarkCacheConfig::new(cache_dir, params.l1_limit);
@@ -476,7 +470,7 @@ pub(super) async fn run_direct(
         .await?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         (merged, writes_by_stream)
     } else {
@@ -519,7 +513,7 @@ pub(super) async fn run_direct(
         .await?;
         let mut merged = DirectReadTelemetry::default();
         for stream in &reads_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         (merged, reads_by_stream)
     } else {

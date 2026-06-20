@@ -1,7 +1,7 @@
-use crate::cli::test_cache_profile_common::collect_write_path_artifacts;
-use crate::cli::test_cache_profile_types::{
-    ProfileArtifactKind, ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode,
-    TestCacheProfileResult,
+use crate::cli::benchmark_profile_common::collect_write_path_artifacts;
+use crate::cli::benchmark_profile_types::{
+    BenchmarkProfileMode, BenchmarkProfileResult, ProfileArtifactKind, ProfileArtifactReport,
+    ProfileEndpointReport,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -21,10 +21,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const DEFAULT_APP_NAME: &str = "studiofs.test-cache";
+const DEFAULT_APP_NAME: &str = "studiofs.benchmark";
 const DEFAULT_SAMPLE_RATE: u32 = 100;
 
-pub struct TestCacheProfileSession {
+pub struct BenchmarkProfileSession {
     run_id: String,
     benchmark_mode: String,
     started_at: DateTime<Utc>,
@@ -45,9 +45,9 @@ struct ProfileEndpoint {
     tenant_id: Option<String>,
 }
 
-impl TestCacheProfileSession {
+impl BenchmarkProfileSession {
     pub fn start(
-        mode: Option<TestCacheProfileMode>,
+        mode: Option<BenchmarkProfileMode>,
         run_id: &str,
         benchmark_mode: &str,
         write_path_observability_path: Option<PathBuf>,
@@ -93,7 +93,7 @@ impl TestCacheProfileSession {
         }))
     }
 
-    pub fn finish(mut self, output_dir: &Path) -> Result<TestCacheProfileResult> {
+    pub fn finish(mut self, output_dir: &Path) -> Result<BenchmarkProfileResult> {
         let mut artifacts = Vec::new();
         let finished_at = Utc::now();
 
@@ -202,7 +202,7 @@ impl TestCacheProfileSession {
             }
         }
 
-        Ok(TestCacheProfileResult {
+        Ok(BenchmarkProfileResult {
             endpoint: self
                 .endpoint
                 .as_ref()
@@ -268,7 +268,7 @@ fn write_artifact(
 ) -> Result<PathBuf> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create profile output directory {}", output_dir.display()))?;
-    let filename = format!("studiofs-test-cache-{benchmark_mode}-{run_id}-{kind}.{suffix}");
+    let filename = format!("studiofs-benchmark-{benchmark_mode}-{run_id}-{kind}.{suffix}");
     let path = output_dir.join(filename);
     fs::write(&path, bytes)
         .with_context(|| format!("write profile artifact {}", path.display()))?;

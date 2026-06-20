@@ -28,7 +28,7 @@ fn slugify_report_segment(value: &str) -> String {
 
 fn default_report_file_name(report: &BenchmarkReport, now: DateTime<Utc>) -> String {
     format!(
-        "studiofs-test-cache-{}-{}.json",
+        "studiofs-benchmark-{}-{}.json",
         slugify_report_segment(&report.mode),
         now.format("%Y%m%d-%H%M%S"),
     )
@@ -42,7 +42,7 @@ fn next_available_path(path: &Path, suffix: usize) -> PathBuf {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("studiofs-test-cache");
+        .unwrap_or("studiofs-benchmark");
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let candidate_name = if extension.is_empty() {
         format!("{stem}-{suffix}")
@@ -142,7 +142,7 @@ pub(crate) fn save_benchmark_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache::result::{
+    use crate::cli::benchmark_engine::result::{
         MountedMemoryReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
         MountedPortableProcessReport, MountedPortableProfileReport, MountedWriteDiagnosticsReport,
         MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, sample_report,
@@ -163,14 +163,14 @@ mod tests {
         assert_eq!(
             first,
             temp.path()
-                .join("studiofs-test-cache-direct-shim-20260319-151255.json")
+                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
         );
 
         let second = save_benchmark_report_in(&report, None, temp.path(), now).unwrap();
         assert_eq!(
             second,
             temp.path()
-                .join("studiofs-test-cache-direct-shim-20260319-151255-2.json")
+                .join("studiofs-benchmark-direct-shim-20260319-151255-2.json")
         );
     }
 

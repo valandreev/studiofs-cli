@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
-use super::TestCacheParams;
+use super::BenchmarkConfig;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
@@ -1086,7 +1086,7 @@ fn metadata_root_from_cache_path(cache_path: &Path) -> Option<String> {
 }
 
 fn build_mounted_runtime_report(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     mount_point: &Path,
     cache_path: Option<&Path>,
     workload: &WorkloadPlan,
@@ -1408,7 +1408,7 @@ async fn read_file_with_plan(
 }
 
 async fn run_mounted_write_phase(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     files: &[WorkFile],
     order: &[usize],
     size_class_bounds: SizeClassBounds,
@@ -1434,7 +1434,7 @@ async fn run_mounted_write_phase(
         let writes_by_stream = writes_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         Ok((merged, writes_by_stream))
     } else {
@@ -1454,7 +1454,7 @@ async fn run_mounted_write_phase(
 }
 
 async fn run_mounted_read_phase(
-    params: &TestCacheParams,
+    params: &BenchmarkConfig,
     files: &[WorkFile],
     order: &[usize],
     size_class_bounds: SizeClassBounds,
@@ -1482,7 +1482,7 @@ async fn run_mounted_read_phase(
         let reads_by_stream = reads_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &reads_by_stream {
-            merged.merge_from_ref(stream);
+            merged += stream;
         }
         Ok((merged, reads_by_stream))
     } else {
@@ -1563,7 +1563,7 @@ async fn run_filesystem_writes(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: item.path.display().to_string(),
+                    target: item.path.display().to_string().into(),
                     size_class: class,
                     bytes: item.size,
                     elapsed,
@@ -1654,7 +1654,7 @@ async fn run_filesystem_reads(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: item.path.display().to_string(),
+                    target: item.path.display().to_string().into(),
                     size_class: class,
                     bytes: bytes_read,
                     elapsed,
@@ -1724,7 +1724,7 @@ async fn run_filesystem_writes_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: item.path.display().to_string(),
+                    target: item.path.display().to_string().into(),
                     size_class: class,
                     bytes: item.size,
                     elapsed,
@@ -1797,7 +1797,7 @@ async fn run_filesystem_reads_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: item.path.display().to_string(),
+                    target: item.path.display().to_string().into(),
                     size_class: class,
                     bytes: bytes_read,
                     elapsed,
@@ -1830,8 +1830,8 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))
 }
 
-pub(super) async fn run_mounted_end_to_end(
-    params: &TestCacheParams,
+pub(crate) async fn run_mounted_end_to_end(
+    params: &BenchmarkConfig,
     mount_pid: u32,
     volume: &str,
     mount_point: &Path,
@@ -2262,9 +2262,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    fn test_cache_params_with_block_size(block_size: u64) -> TestCacheParams {
-        TestCacheParams {
-            target: PathBuf::from(r"Z:\"),
+    fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
+        BenchmarkConfig {
+            target: PathBuf::from("/mnt/studiofs-benchmark"),
             block_size,
             read_size: 128 * 1024,
             size_class_small_max: 10 * 1024,
@@ -2275,7 +2275,7 @@ mod tests {
             io_depth: 1,
             warmup_runs: 0,
             sizes: super::super::workload::WorkloadSizeInput::ExplicitList(vec![4096]),
-            access_pattern: super::super::TestCacheAccessPattern::Sequential,
+            access_pattern: super::super::BenchmarkAccessPattern::Sequential,
             during_upload_min_pending: 1,
             during_upload_timeout: Duration::from_secs(1),
             l1_limit: 64 * 1024 * 1024,
@@ -2399,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_with_plan_rejects_corrupt_deterministic_payload() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("test_cache_file_000000.bin");
+        let path = temp.path().join("benchmark_file_000000.bin");
         fs::write(&path, vec![0xAA; 4096])
             .await
             .expect("write corrupt test payload");
@@ -2424,7 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
         let temp = tempdir().expect("tempdir");
-        let path = temp.path().join("test_cache_file_000000.bin");
+        let path = temp.path().join("benchmark_file_000000.bin");
         write_deterministic_file(&path, 4096 + 257, 123, 1024)
             .await
             .expect("write deterministic test payload");
@@ -2550,10 +2550,15 @@ mod tests {
     #[test]
     fn mounted_runtime_report_uses_schema_chunk_size_not_block_size() {
         let block_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64 / 2;
-        let params = test_cache_params_with_block_size(block_size);
+        let params = benchmark_config_with_block_size(block_size);
         let workload = single_file_workload();
 
-        let report = build_mounted_runtime_report(&params, Path::new(r"Z:\"), None, &workload);
+        let report = build_mounted_runtime_report(
+            &params,
+            Path::new("/mnt/studiofs-benchmark"),
+            None,
+            &workload,
+        );
 
         assert_eq!(report.block_size, block_size);
         assert_eq!(

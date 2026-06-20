@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
-pub enum TestCacheProfileMode {
+pub enum BenchmarkProfileMode {
     Pyroscope,
 }
 
@@ -47,7 +47,7 @@ pub struct ProfileEndpointReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TestCacheProfileResult {
+pub struct BenchmarkProfileResult {
     pub endpoint: Option<ProfileEndpointReport>,
     pub artifacts: Vec<ProfileArtifactReport>,
     pub warnings: Vec<String>,

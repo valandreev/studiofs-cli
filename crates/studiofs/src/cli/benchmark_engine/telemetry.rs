@@ -1,3 +1,5 @@
+use std::ops::AddAssign;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::result::{
@@ -10,7 +12,7 @@ use super::workload::{SizeClass, SizeClassBounds};
 const MAX_LATENCY_SAMPLES: usize = 200_000;
 
 #[derive(Default, Clone)]
-pub(super) struct LatencySamples {
+pub(crate) struct LatencySamples {
     samples_ns: Vec<u64>,
     total_ops: u64,
     total_bytes: u64,
@@ -19,7 +21,7 @@ pub(super) struct LatencySamples {
 }
 
 impl LatencySamples {
-    pub(super) fn record(&mut self, elapsed: Duration, bytes: u64) {
+    pub(crate) fn record(&mut self, elapsed: Duration, bytes: u64) {
         let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
         self.total_latency_ns = self.total_latency_ns.saturating_add(ns as u128);
         self.total_ops = self.total_ops.saturating_add(1);
@@ -56,7 +58,7 @@ impl LatencySamples {
         samples[idx.min(samples.len().saturating_sub(1))]
     }
 
-    pub(super) fn to_report(&self, wall_elapsed_ms: f64) -> OpReport {
+    pub(crate) fn to_report(&self, wall_elapsed_ms: f64) -> OpReport {
         let total_ms = self.total_duration_ms();
         let avg_ms = self.avg_ns() / 1_000_000.0;
         let mut sorted_samples = self.samples_ns.clone();
@@ -146,8 +148,10 @@ impl LatencySamples {
             self.sample_keep_every.max(1)
         }
     }
+}
 
-    pub(super) fn merge_from_ref(&mut self, other: &Self) {
+impl AddAssign<&Self> for LatencySamples {
+    fn add_assign(&mut self, other: &Self) {
         let self_keep = self.effective_keep_every();
         let other_keep = other.effective_keep_every();
         let mut target_keep = self_keep.max(other_keep);
@@ -178,7 +182,7 @@ impl LatencySamples {
 }
 
 #[derive(Default, Clone)]
-pub(super) struct SizeClassLatencySamples {
+pub(crate) struct SizeClassLatencySamples {
     small: LatencySamples,
     medium: LatencySamples,
     large: LatencySamples,
@@ -203,39 +207,41 @@ impl SizeClassLatencySamples {
                 .to_size_class_report(SizeClass::Large, wall_elapsed_ms),
         ]
     }
+}
 
-    fn merge_from_ref(&mut self, other: &Self) {
-        self.small.merge_from_ref(&other.small);
-        self.medium.merge_from_ref(&other.medium);
-        self.large.merge_from_ref(&other.large);
+impl AddAssign<&Self> for SizeClassLatencySamples {
+    fn add_assign(&mut self, other: &Self) {
+        self.small += &other.small;
+        self.medium += &other.medium;
+        self.large += &other.large;
     }
 }
 
 #[derive(Default, Clone)]
-pub(super) struct PhaseTelemetry {
-    pub(super) overall: LatencySamples,
+pub(crate) struct PhaseTelemetry {
+    pub(crate) overall: LatencySamples,
     by_size: SizeClassLatencySamples,
     operation_logs: Vec<PhaseOperationLog>,
 }
 
 #[derive(Clone)]
-pub(super) struct PhaseOperationLog {
-    pub(super) operation_index: u64,
-    pub(super) work_index: usize,
-    pub(super) worker_id: usize,
-    pub(super) target: String,
-    pub(super) size_class: SizeClass,
-    pub(super) bytes: u64,
-    pub(super) elapsed: Duration,
+pub(crate) struct PhaseOperationLog {
+    pub(crate) operation_index: u64,
+    pub(crate) work_index: usize,
+    pub(crate) worker_id: usize,
+    pub(crate) target: Arc<str>,
+    pub(crate) size_class: SizeClass,
+    pub(crate) bytes: u64,
+    pub(crate) elapsed: Duration,
 }
 
 impl PhaseTelemetry {
-    pub(super) fn record(&mut self, class: SizeClass, elapsed: Duration, bytes: u64) {
+    pub(crate) fn record(&mut self, class: SizeClass, elapsed: Duration, bytes: u64) {
         self.overall.record(elapsed, bytes);
         self.by_size.get_mut(class).record(elapsed, bytes);
     }
 
-    pub(super) fn record_operation(&mut self, operation: PhaseOperationLog) {
+    pub(crate) fn record_operation(&mut self, operation: PhaseOperationLog) {
         self.record(operation.size_class, operation.elapsed, operation.bytes);
         self.operation_logs.push(operation);
     }
@@ -255,7 +261,7 @@ impl PhaseTelemetry {
                     operation_index: log.operation_index,
                     work_index: log.work_index,
                     worker_id: log.worker_id,
-                    target: log.target,
+                    target: log.target.to_string(),
                     size_class: log.size_class.label().to_string(),
                     bytes: log.bytes,
                     elapsed_ms,
@@ -264,17 +270,19 @@ impl PhaseTelemetry {
             })
             .collect()
     }
+}
 
-    pub(super) fn merge_from_ref(&mut self, other: &Self) {
-        self.overall.merge_from_ref(&other.overall);
-        self.by_size.merge_from_ref(&other.by_size);
+impl AddAssign<&Self> for PhaseTelemetry {
+    fn add_assign(&mut self, other: &Self) {
+        self.overall += &other.overall;
+        self.by_size += &other.by_size;
         self.operation_logs
             .extend(other.operation_logs.iter().cloned());
     }
 }
 
 #[derive(Default, Clone)]
-pub(super) struct CacheLevelTelemetryAccumulator {
+pub(crate) struct CacheLevelTelemetryAccumulator {
     l1_hits: u64,
     l1_misses: u64,
     l1_bytes_served: u64,
@@ -282,7 +290,7 @@ pub(super) struct CacheLevelTelemetryAccumulator {
 }
 
 impl CacheLevelTelemetryAccumulator {
-    pub(super) fn record_l1(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
+    pub(crate) fn record_l1(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
         self.l1_lookup_latency.record(elapsed, bytes_served);
         if hit {
             self.l1_hits = self.l1_hits.saturating_add(1);
@@ -308,30 +316,31 @@ impl CacheLevelTelemetryAccumulator {
             },
         }
     }
+}
 
-    pub(super) fn merge_from_ref(&mut self, other: &Self) {
+impl AddAssign<&Self> for CacheLevelTelemetryAccumulator {
+    fn add_assign(&mut self, other: &Self) {
         self.l1_hits = self.l1_hits.saturating_add(other.l1_hits);
         self.l1_misses = self.l1_misses.saturating_add(other.l1_misses);
         self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
-        self.l1_lookup_latency
-            .merge_from_ref(&other.l1_lookup_latency);
+        self.l1_lookup_latency += &other.l1_lookup_latency;
     }
 }
 
 #[derive(Default, Clone)]
-pub(super) struct DirectReadTelemetry {
-    pub(super) phase: PhaseTelemetry,
-    pub(super) cache_levels: CacheLevelTelemetryAccumulator,
+pub(crate) struct DirectReadTelemetry {
+    pub(crate) phase: PhaseTelemetry,
+    pub(crate) cache_levels: CacheLevelTelemetryAccumulator,
 }
 
-impl DirectReadTelemetry {
-    pub(super) fn merge_from_ref(&mut self, other: &Self) {
-        self.phase.merge_from_ref(&other.phase);
-        self.cache_levels.merge_from_ref(&other.cache_levels);
+impl AddAssign<&Self> for DirectReadTelemetry {
+    fn add_assign(&mut self, other: &Self) {
+        self.phase += &other.phase;
+        self.cache_levels += &other.cache_levels;
     }
 }
 
-pub(super) fn stream_reports_from_telemetry(
+pub(crate) fn stream_reports_from_telemetry(
     writes_by_stream: &[PhaseTelemetry],
     reads_by_stream: &[PhaseTelemetry],
     writes_wall_elapsed_ms: f64,
@@ -360,7 +369,7 @@ pub(super) fn stream_reports_from_telemetry(
     )
 }
 
-pub(super) fn phase_telemetry_to_report(
+pub(crate) fn phase_telemetry_to_report(
     telemetry: &PhaseTelemetry,
     wall_elapsed: Duration,
 ) -> OpReport {
@@ -371,7 +380,7 @@ pub(super) fn phase_telemetry_to_report(
     report
 }
 
-pub(super) fn build_advanced_metrics(
+pub(crate) fn build_advanced_metrics(
     size_class_bounds: SizeClassBounds,
     writes: &PhaseTelemetry,
     reads: &PhaseTelemetry,
@@ -413,7 +422,7 @@ mod tests {
             total_latency_ns: 0,
             sample_keep_every: 2,
         };
-        left.merge_from_ref(&right);
+        left += &right;
         assert_eq!(left.sample_keep_every, 4);
     }
 
@@ -433,7 +442,7 @@ mod tests {
             total_latency_ns: 0,
             sample_keep_every: 2,
         };
-        left.merge_from_ref(&right);
+        left += &right;
         assert_eq!(left.sample_keep_every, 2);
         assert_eq!(left.samples_ns, vec![1, 3, 10, 20, 30, 40]);
     }
@@ -445,7 +454,7 @@ mod tests {
             operation_index: 9,
             work_index: 3,
             worker_id: 2,
-            target: "Z:\\bench\\0003.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0003.bin".into(),
             size_class: SizeClass::Medium,
             bytes: 4 * 1024 * 1024,
             elapsed: Duration::from_millis(12),
@@ -454,7 +463,7 @@ mod tests {
             operation_index: 4,
             work_index: 1,
             worker_id: 0,
-            target: "Z:\\bench\\0001.bin".to_string(),
+            target: "/mnt/studiofs-benchmark/0001.bin".into(),
             size_class: SizeClass::Small,
             bytes: 512 * 1024,
             elapsed: Duration::from_millis(3),
@@ -466,11 +475,17 @@ mod tests {
         assert_eq!(report.operations_log.len(), 2);
         assert_eq!(report.operations_log[0].operation_index, 4);
         assert_eq!(report.operations_log[0].worker_id, 0);
-        assert_eq!(report.operations_log[0].target, "Z:\\bench\\0001.bin");
+        assert_eq!(
+            report.operations_log[0].target,
+            "/mnt/studiofs-benchmark/0001.bin"
+        );
         assert_eq!(report.operations_log[0].size_class, "small");
         assert_eq!(report.operations_log[1].operation_index, 9);
         assert_eq!(report.operations_log[1].worker_id, 2);
-        assert_eq!(report.operations_log[1].target, "Z:\\bench\\0003.bin");
+        assert_eq!(
+            report.operations_log[1].target,
+            "/mnt/studiofs-benchmark/0003.bin"
+        );
         assert_eq!(report.operations_log[1].size_class, "medium");
     }
 }

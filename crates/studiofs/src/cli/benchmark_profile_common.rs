@@ -1,5 +1,5 @@
-use crate::cli::test_cache_profile_types::ProfileArtifactKind;
-use crate::cli::test_cache_profile_types::ProfileArtifactReport;
+use crate::cli::benchmark_profile_types::ProfileArtifactKind;
+use crate::cli::benchmark_profile_types::ProfileArtifactReport;
 use crate::cli::utils::format_bytes;
 use anyhow::{Context, Result};
 use std::convert::TryFrom;
@@ -88,7 +88,7 @@ fn write_artifact(
 ) -> Result<std::path::PathBuf> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create profile output directory {}", output_dir.display()))?;
-    let filename = format!("studiofs-test-cache-{benchmark_mode}-{run_id}-{kind}.{suffix}");
+    let filename = format!("studiofs-benchmark-{benchmark_mode}-{run_id}-{kind}.{suffix}");
     let path = output_dir.join(filename);
     fs::write(&path, bytes)
         .with_context(|| format!("write profile artifact {}", path.display()))?;
@@ -321,7 +321,7 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{collect_write_path_artifacts, render_write_path_summary};
-    use crate::cli::test_cache_profile_types::ProfileArtifactKind;
+    use crate::cli::benchmark_profile_types::ProfileArtifactKind;
     use studiofs_vfs::{
         VfsFetchStats, VfsUploadStats, VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats,
         VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
