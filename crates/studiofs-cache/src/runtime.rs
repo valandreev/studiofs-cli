@@ -192,11 +192,9 @@ pub enum LocalPayloadWriteMode {
 impl LocalPayloadWriteMode {
     /// Default write mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
-        if cfg!(windows) {
-            Self::UnbufferedFast
-        } else {
-            Self::Buffered
-        }
+        // Buffered writes keep newly materialized payloads in the OS cache for
+        // immediate reads through the mount and shell file managers.
+        Self::Buffered
     }
 }
 
@@ -214,11 +212,9 @@ pub enum LocalPayloadReadMode {
 impl LocalPayloadReadMode {
     /// Default read mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
-        if cfg!(windows) {
-            Self::Unbuffered
-        } else {
-            Self::Buffered
-        }
+        // Keep ordinary cache reads buffered so Windows can apply the system
+        // file cache, sequential readahead, and explicit warmup hints.
+        Self::Buffered
     }
 }
 

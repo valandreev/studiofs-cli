@@ -1650,6 +1650,50 @@ mod tests {
     }
 
     #[test]
+    fn default_mount_write_mode_keeps_payload_writes_cacheable() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_sync_and_write_mode(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::default_for_mount_path(),
+        )
+        .unwrap();
+        let payload = vec![0xAB; 4096];
+
+        store.put(4298, &payload).unwrap();
+
+        assert_eq!(store.get(4298).unwrap().as_ref(), payload.as_slice());
+        let writes = store.write_mode_snapshot();
+        assert_eq!(writes.unbuffered_write_attempts, 0);
+        assert_eq!(writes.unbuffered_write_successes, 0);
+        assert_eq!(writes.unbuffered_write_fallbacks, 0);
+    }
+
+    #[test]
+    fn default_mount_read_mode_keeps_buffered_reads_cacheable() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_sync_and_write_mode(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+        )
+        .unwrap();
+        let payload = vec![0xCD; 4096];
+
+        store.put(4299, &payload).unwrap();
+
+        let mut out = vec![0_u8; 4096];
+        assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
+        assert_eq!(out, payload);
+        let reads = store.read_mode_snapshot();
+        assert_eq!(reads.unbuffered_read_attempts, 0);
+        assert_eq!(reads.unbuffered_read_successes, 0);
+        assert_eq!(reads.unbuffered_read_fallbacks, 0);
+    }
+
+    #[test]
     fn unbuffered_read_mode_roundtrips_aligned_read_into() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
