@@ -109,20 +109,20 @@ pub(crate) struct BenchmarkCommandMetadataReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BenchmarkPlatformMetadataReport {
-    pub(crate) os: String,
-    pub(crate) arch: String,
-    pub(crate) family: String,
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) family: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BenchmarkBuildMetadataReport {
-    pub(crate) package_name: String,
-    pub(crate) package_version: String,
+    pub(crate) package_name: &'static str,
+    pub(crate) package_version: &'static str,
     pub(crate) debug_build: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) git_sha: Option<String>,
+    pub(crate) git_sha: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) git_branch: Option<String>,
+    pub(crate) git_branch: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -676,23 +676,19 @@ pub(crate) fn benchmark_command_metadata(
 
 pub(crate) fn benchmark_platform_metadata() -> BenchmarkPlatformMetadataReport {
     BenchmarkPlatformMetadataReport {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        family: std::env::consts::FAMILY.to_string(),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        family: std::env::consts::FAMILY,
     }
 }
 
 pub(crate) fn benchmark_build_metadata() -> BenchmarkBuildMetadataReport {
     BenchmarkBuildMetadataReport {
-        package_name: env!("CARGO_PKG_NAME").to_string(),
-        package_version: env!("CARGO_PKG_VERSION").to_string(),
+        package_name: env!("CARGO_PKG_NAME"),
+        package_version: env!("CARGO_PKG_VERSION"),
         debug_build: cfg!(debug_assertions),
-        git_sha: option_env!("VERGEN_GIT_SHA")
-            .or(option_env!("GIT_SHA"))
-            .map(str::to_string),
-        git_branch: option_env!("VERGEN_GIT_BRANCH")
-            .or(option_env!("GIT_BRANCH"))
-            .map(str::to_string),
+        git_sha: option_env!("VERGEN_GIT_SHA").or(option_env!("GIT_SHA")),
+        git_branch: option_env!("VERGEN_GIT_BRANCH").or(option_env!("GIT_BRANCH")),
     }
 }
 

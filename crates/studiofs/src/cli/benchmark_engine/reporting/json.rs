@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::io::Write as _;
+use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::super::result::BenchmarkReport;
@@ -82,20 +82,38 @@ fn resolve_report_target(
     )
 }
 
-fn write_report_file(report_path: &Path, json: &[u8], auto_named: bool) -> Result<PathBuf> {
-    if !auto_named {
-        if let Some(parent) = report_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create report dir {}", parent.display()))?;
-        }
-        std::fs::write(report_path, json)
-            .with_context(|| format!("write benchmark report {}", report_path.display()))?;
-        return Ok(report_path.to_path_buf());
-    }
+fn write_json_report(
+    file: std::fs::File,
+    report: &BenchmarkReport,
+    report_path: &Path,
+) -> Result<()> {
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, report)
+        .with_context(|| format!("serialize benchmark report {}", report_path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush benchmark report {}", report_path.display()))
+}
 
+fn write_report_file(
+    report_path: &Path,
+    report: &BenchmarkReport,
+    auto_named: bool,
+) -> Result<PathBuf> {
     if let Some(parent) = report_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create report dir {}", parent.display()))?;
+    }
+
+    if !auto_named {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(report_path)
+            .with_context(|| format!("create benchmark report {}", report_path.display()))?;
+        write_json_report(file, report, report_path)?;
+        return Ok(report_path.to_path_buf());
     }
 
     let mut candidate = report_path.to_path_buf();
@@ -106,11 +124,8 @@ fn write_report_file(report_path: &Path, json: &[u8], auto_named: bool) -> Resul
             .create_new(true)
             .open(&candidate)
         {
-            Ok(mut file) => {
-                file.write_all(json)
-                    .with_context(|| format!("write benchmark report {}", candidate.display()))?;
-                file.flush()
-                    .with_context(|| format!("flush benchmark report {}", candidate.display()))?;
+            Ok(file) => {
+                write_json_report(file, report, &candidate)?;
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -131,10 +146,8 @@ fn save_benchmark_report_in(
     current_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<PathBuf> {
-    let json =
-        serde_json::to_vec_pretty(report).context("serialize benchmark report as JSON report")?;
     let (report_path, auto_named) = resolve_report_target(report, json_output, current_dir, now);
-    write_report_file(&report_path, &json, auto_named)
+    write_report_file(&report_path, report, auto_named)
 }
 
 pub(crate) fn save_benchmark_report(
