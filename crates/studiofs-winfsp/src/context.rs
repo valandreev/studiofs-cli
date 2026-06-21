@@ -285,12 +285,23 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
     LocalSyncPolicy::Opportunistic
 }
 
-fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
-    !is_dir && open_flags_allow_write(open_flags)
+fn should_disable_winfsp_file_cache(
+    is_dir: bool,
+    open_flags: OpenFlags,
+    truncates_on_open: bool,
+) -> bool {
+    if is_dir {
+        return false;
+    }
+
+    open_flags.contains(OpenFlags::WRONLY) || truncates_on_open
 }
 
-fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
-    should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
+fn should_disable_winfsp_file_cache_for_handle(
+    handle: &StudioFileHandle,
+    truncates_on_open: bool,
+) -> bool {
+    should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, truncates_on_open)
 }
 
 fn winfsp_read_cache_diagnostics_enabled() -> bool {
@@ -904,8 +915,12 @@ impl StudioFsContext {
         }
     }
 
-    fn should_disable_os_cache_for_handle(&self, handle: &StudioFileHandle) -> bool {
-        should_disable_winfsp_file_cache_for_handle(handle)
+    fn should_disable_os_cache_for_handle(
+        &self,
+        handle: &StudioFileHandle,
+        truncates_on_open: bool,
+    ) -> bool {
+        should_disable_winfsp_file_cache_for_handle(handle, truncates_on_open)
     }
 
     fn record_handle_zero_fill_range(&self, fh: u64, old_size: u64, new_size: u64) {
@@ -1321,7 +1336,7 @@ impl FileSystemContext for StudioFsContext {
         let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || self.should_disable_os_cache_for_handle(&handle);
+            || self.should_disable_os_cache_for_handle(&handle, trunc);
         handle.set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -1412,8 +1427,11 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
+        let raw_create_options = current_winfsp_create_options(plan.create_options);
+        let truncates_on_open =
+            should_truncate_existing_file_on_open(raw_create_options, plan.open_flags);
         let mut handle = self.execute_create_callback_plan(plan, file_info)?;
-        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle);
+        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle, truncates_on_open);
         handle.set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -1423,6 +1441,8 @@ impl FileSystemContext for StudioFsContext {
             is_dir = handle.is_dir,
             fh = handle.fh,
             open_flags = handle.open_flags.bits(),
+            raw_create_options,
+            truncates_on_open,
             disable_os_cache,
             "create {:?}",
             file_name.to_string_lossy()
@@ -2285,7 +2305,7 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(!should_disable_winfsp_file_cache(false, flags));
+        assert!(!should_disable_winfsp_file_cache(false, flags, false));
     }
 
     #[test]
@@ -2308,7 +2328,7 @@ mod tests {
             .expect("create file");
         let mut handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
 
-        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle);
+        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle, false);
         handle.set_disable_os_cache(disable_os_cache);
         vfs.note_winfsp_os_cache_open(disable_os_cache);
         vfs.record_winfsp_read_callback_observability(4096, Duration::from_millis(2));
@@ -2328,12 +2348,85 @@ mod tests {
     }
 
     #[test]
-    fn write_capable_file_handles_disable_winfsp_file_cache() {
-        assert!(!should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
-        assert!(should_disable_winfsp_file_cache(false, OpenFlags::WRONLY));
-        assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
-        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
-        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::RDWR));
+    fn winfsp_file_cache_policy_tracks_write_intent() {
+        assert!(!should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::RDONLY,
+            false
+        ));
+        assert!(should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::WRONLY,
+            false
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::RDWR,
+            false
+        ));
+        assert!(should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::RDWR,
+            true
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            true,
+            OpenFlags::WRONLY,
+            true
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            true,
+            OpenFlags::RDWR,
+            true
+        ));
+    }
+
+    #[test]
+    fn non_truncating_readwrite_open_keeps_winfsp_file_cache() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("readwrite-open-keeps-cache");
+        vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644)
+            .expect("create existing file");
+
+        let file_name = U16CString::from_str(r"\existing.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file read-write");
+
+        assert_eq!(handle.open_flags.bits(), OpenFlags::RDWR.bits());
+        assert!(
+            !handle.disable_os_cache,
+            "read-write opens without overwrite/truncate must remain cache-manager eligible"
+        );
+    }
+
+    #[test]
+    fn truncating_readwrite_open_disables_winfsp_file_cache() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("truncate-open-disables-cache");
+        vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644)
+            .expect("create existing file");
+
+        let file_name = U16CString::from_str(r"\existing.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0x0500_0000,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file with truncate disposition");
+
+        assert_eq!(handle.open_flags.bits(), OpenFlags::RDWR.bits());
+        assert!(
+            handle.disable_os_cache,
+            "overwrite/truncate opens must not keep a stale cached file image"
+        );
     }
 
     #[test]
@@ -2345,8 +2438,8 @@ mod tests {
         let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
         let dir_handle = StudioFileHandle::new(ROOT_INO, true, 2, OpenFlags::RDONLY);
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false));
         queue.lock().push(attr.ino);
 
         let notifications = ctx.should_notify().expect("pending WinFSP notification");
@@ -2356,8 +2449,8 @@ mod tests {
                 .any(|notification| notification.ino == attr.ino)
         );
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false));
     }
 
     #[test]
