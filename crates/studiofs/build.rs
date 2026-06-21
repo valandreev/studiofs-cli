@@ -29,13 +29,10 @@ fn emit_git_metadata() {
             && let Some(reference) = head.trim().strip_prefix("ref: ")
         {
             let ref_path = git_dir.join(reference);
-            if ref_path.exists() {
-                println!("cargo:rerun-if-changed={}", ref_path.display());
-            } else {
-                let packed_refs = git_dir.join("packed-refs");
-                if packed_refs.exists() {
-                    println!("cargo:rerun-if-changed={}", packed_refs.display());
-                }
+            println!("cargo:rerun-if-changed={}", ref_path.display());
+            let packed_refs = git_dir.join("packed-refs");
+            if packed_refs.exists() {
+                println!("cargo:rerun-if-changed={}", packed_refs.display());
             }
         }
     }

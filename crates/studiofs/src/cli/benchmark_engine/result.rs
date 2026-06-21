@@ -1,5 +1,6 @@
 use crate::cli::benchmark_profile_types::ProfileArtifactKind;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
@@ -173,14 +174,14 @@ pub(crate) struct RuntimeStatsCounterDeltaReport {
     pub(crate) before: u64,
     pub(crate) after: u64,
     pub(crate) delta: u64,
-    pub(crate) unit: String,
+    pub(crate) unit: Cow<'static, str>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RuntimeStatsGaugeDeltaReport {
     pub(crate) before: Option<u64>,
     pub(crate) after: u64,
-    pub(crate) unit: String,
+    pub(crate) unit: Cow<'static, str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,7 +192,7 @@ pub(crate) struct RuntimeStatsLatencyDeltaReport {
     pub(crate) sum_before: u64,
     pub(crate) sum_after: u64,
     pub(crate) sum_delta: u64,
-    pub(crate) unit: String,
+    pub(crate) unit: Cow<'static, str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) buckets: Vec<RuntimeStatsLatencyBucketDeltaReport>,
 }
@@ -737,6 +738,12 @@ pub(crate) fn runtime_stats_delta(
 ) -> RuntimeStatsDeltaReport {
     let mut sections = BTreeMap::new();
     let mut warnings = Vec::new();
+    if after.generated_unix_ms < before.generated_unix_ms {
+        warnings.push(format!(
+            "runtime stats timestamp moved backward during {label}; interval uses 0ms because after ({}) < before ({})",
+            after.generated_unix_ms, before.generated_unix_ms
+        ));
+    }
     for (name, before_section, after_section) in runtime_stats_sections(before, after) {
         sections.insert(
             name.to_string(),
@@ -819,7 +826,7 @@ fn runtime_stats_section_delta(
                 before: before_value,
                 after: metric.value,
                 delta: reset_aware_delta(before_value, metric.value),
-                unit: metric.unit.to_string(),
+                unit: metric.unit.clone(),
             },
         );
     }
@@ -829,7 +836,7 @@ fn runtime_stats_section_delta(
             RuntimeStatsGaugeDeltaReport {
                 before: before.gauges.get(name).map(|metric| metric.value),
                 after: metric.value,
-                unit: metric.unit.to_string(),
+                unit: metric.unit.clone(),
             },
         );
     }
@@ -863,7 +870,7 @@ fn runtime_stats_section_delta(
                 sum_before,
                 sum_after: histogram.sum,
                 sum_delta: reset_aware_delta(sum_before, histogram.sum),
-                unit: histogram.unit.to_string(),
+                unit: histogram.unit.clone(),
                 buckets,
             },
         );
@@ -875,10 +882,12 @@ fn runtime_stats_latency_bucket_deltas(
     before: &[RuntimeLatencyBucket],
     after: &[RuntimeLatencyBucket],
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
+    let mut before_index = 0usize;
     after
         .iter()
         .map(|bucket| {
-            let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
+            let count_before =
+                runtime_stats_latency_bucket_count(before, &mut before_index, bucket.le_ns);
             RuntimeStatsLatencyBucketDeltaReport {
                 le_ns: bucket.le_ns,
                 count_before,
@@ -900,18 +909,29 @@ fn runtime_stats_latency_reset(
     if count_after < count_before || sum_after < sum_before {
         return true;
     }
+    let mut before_index = 0usize;
     after.iter().any(|bucket| {
-        before
-            .binary_search_by_key(&bucket.le_ns, |before_bucket| before_bucket.le_ns)
-            .is_ok_and(|index| bucket.count < before[index].count)
+        let count_before =
+            runtime_stats_latency_bucket_count(before, &mut before_index, bucket.le_ns);
+        count_before != 0 && bucket.count < count_before
     })
 }
 
-fn runtime_stats_latency_bucket_count(before: &[RuntimeLatencyBucket], le_ns: u64) -> u64 {
+fn runtime_stats_latency_bucket_count(
+    before: &[RuntimeLatencyBucket],
+    before_index: &mut usize,
+    le_ns: u64,
+) -> u64 {
+    while before
+        .get(*before_index)
+        .is_some_and(|bucket| bucket.le_ns < le_ns)
+    {
+        *before_index += 1;
+    }
     before
-        .binary_search_by_key(&le_ns, |bucket| bucket.le_ns)
-        .map(|index| before[index].count)
-        .unwrap_or_default()
+        .get(*before_index)
+        .filter(|bucket| bucket.le_ns == le_ns)
+        .map_or(0, |bucket| bucket.count)
 }
 
 fn reset_aware_delta(before: u64, after: u64) -> u64 {
@@ -1544,5 +1564,16 @@ mod tests {
             1
         );
         assert_eq!(report.phases[0].phase, "write");
+
+        let mut backward_after = before.clone();
+        backward_after.generated_unix_ms = 900;
+        let backward_delta = runtime_stats_delta("backward-clock", &before, &backward_after);
+        assert_eq!(backward_delta.interval_ms, 0);
+        assert!(
+            backward_delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("timestamp moved backward"))
+        );
     }
 }
