@@ -1719,7 +1719,7 @@ async fn run_filesystem_writes(
 
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
-            let mut scratch = Vec::new();
+            let mut scratch = Vec::with_capacity(write_options.chunk_size);
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
@@ -1878,7 +1878,7 @@ async fn run_filesystem_writes_sequential_streams(
         let progress = progress.clone();
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
-            let mut scratch = Vec::new();
+            let mut scratch = Vec::with_capacity(write_options.chunk_size);
             for work_index in segment {
                 let item = &files[work_index];
                 let permit = sem
@@ -2450,7 +2450,7 @@ pub(crate) async fn run_mounted_end_to_end(
     match benchmark_result {
         Ok(report) => Ok(report),
         Err(err) => {
-            let _ = fs::remove_dir_all(work_root).await;
+            let _ = cleanup_mount_artifacts_report(work_root).await;
             Err(err)
         }
     }

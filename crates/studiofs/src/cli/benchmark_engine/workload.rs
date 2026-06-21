@@ -398,11 +398,11 @@ pub(crate) fn fill_deterministic_bytes(buffer: &mut Vec<u8>, len: usize, seed: u
     let out = &mut buffer[..len];
     let mut chunks = out.chunks_exact_mut(8);
     for chunk in &mut chunks {
-        chunk.copy_from_slice(&rng.next_u64().to_ne_bytes());
+        chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
     }
     let remainder = chunks.into_remainder();
     if !remainder.is_empty() {
-        let bytes = rng.next_u64().to_ne_bytes();
+        let bytes = rng.next_u64().to_le_bytes();
         remainder.copy_from_slice(&bytes[..remainder.len()]);
     }
 }
