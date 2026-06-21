@@ -36,7 +36,8 @@ use super::telemetry::{
 };
 use super::workload::{
     SizeClass, SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
-    build_work_sizes, classify_size, deterministic_bytes, split_stream_segments,
+    build_work_sizes, classify_size, deterministic_bytes, fill_deterministic_bytes,
+    split_stream_segments,
 };
 use studiofs_vfs::VfsPortableAllocatorStats;
 
@@ -1321,20 +1322,21 @@ fn deterministic_write_seed(item: &WorkFile, run_seed: u64, stream_id: Option<us
         .wrapping_add(stream_id.unwrap_or_default() as u64)
 }
 
-async fn write_deterministic_file(
+async fn write_deterministic_file_with_buffer(
     path: &Path,
     total_size: u64,
     seed: u64,
     max_chunk_size: usize,
+    scratch: &mut Vec<u8>,
 ) -> Result<()> {
     let chunks = deterministic_write_chunks(total_size, max_chunk_size);
     let max_len = chunks.iter().map(|(_, len)| *len).max().unwrap_or_default();
-    let buffer = deterministic_bytes(max_len, seed);
+    fill_deterministic_bytes(scratch, max_len, seed);
     let mut out = fs::File::create(path)
         .await
         .with_context(|| format!("create {}", path.display()))?;
     for (_, len) in chunks {
-        out.write_all(&buffer[..len])
+        out.write_all(&scratch[..len])
             .await
             .with_context(|| format!("write {}", path.display()))?;
     }
@@ -1587,7 +1589,7 @@ async fn run_mounted_stat_phase(
 
     let worker_count = concurrency.max(1).min(stat_order.len());
     let next_operation = Arc::new(AtomicUsize::new(0));
-    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let files: Arc<[WorkFile]> = Arc::from(files);
     let targets = operation_log_targets(&files);
     let stat_order: Arc<[usize]> = Arc::from(stat_order);
     let mut join_set = JoinSet::new();
@@ -1646,12 +1648,27 @@ async fn run_mounted_stat_phase(
 }
 
 async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
+    const CLEANUP_ATTEMPTS: usize = 5;
+    const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
     let mut telemetry = PhaseTelemetry::default();
     let started = Instant::now();
-    match fs::remove_dir_all(path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    for attempt in 1..=CLEANUP_ATTEMPTS {
+        match fs::remove_dir_all(path).await {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) if attempt < CLEANUP_ATTEMPTS => {
+                tracing::warn!(
+                    target: "studiofs.cache.profile",
+                    error = %err,
+                    work_root = %path.display(),
+                    attempt,
+                    "cache benchmark cleanup retrying"
+                );
+                tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+        }
     }
     let elapsed = started.elapsed();
     telemetry.record(SizeClass::Small, elapsed, 0);
@@ -1687,9 +1704,9 @@ async fn run_filesystem_writes(
     let worker_count = concurrency.max(queue_depth);
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let files: Arc<[WorkFile]> = Arc::from(files);
     let targets = operation_log_targets(&files);
-    let order: Arc<[usize]> = Arc::from(order.to_vec());
+    let order: Arc<[usize]> = Arc::from(order);
     let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
@@ -1702,6 +1719,7 @@ async fn run_filesystem_writes(
 
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
+            let mut scratch = Vec::new();
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
@@ -1715,11 +1733,12 @@ async fn run_filesystem_writes(
                     .map_err(|e| anyhow!("filesystem write semaphore closed: {e}"))?;
                 let _permit = permit;
                 let start = Instant::now();
-                write_deterministic_file(
+                write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
                     deterministic_write_seed(item, write_options.run_seed, None),
                     write_options.chunk_size,
+                    &mut scratch,
                 )
                 .await
                 .with_context(|| format!("write {}", item.path.display()))?;
@@ -1765,9 +1784,9 @@ async fn run_filesystem_reads(
     let worker_count = concurrency.max(queue_depth);
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let files: Arc<[WorkFile]> = Arc::from(files);
     let targets = operation_log_targets(&files);
-    let order: Arc<[usize]> = Arc::from(order.to_vec());
+    let order: Arc<[usize]> = Arc::from(order);
     let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
@@ -1848,7 +1867,7 @@ async fn run_filesystem_writes_sequential_streams(
     let segments = split_stream_segments(order, stream_count);
     let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let files: Arc<[WorkFile]> = Arc::from(files);
     let targets = operation_log_targets(&files);
     let mut join_set = JoinSet::new();
 
@@ -1859,6 +1878,7 @@ async fn run_filesystem_writes_sequential_streams(
         let progress = progress.clone();
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
+            let mut scratch = Vec::new();
             for work_index in segment {
                 let item = &files[work_index];
                 let permit = sem
@@ -1867,11 +1887,12 @@ async fn run_filesystem_writes_sequential_streams(
                     .map_err(|e| anyhow!("filesystem sequential write semaphore closed: {e}"))?;
                 let _permit = permit;
                 let start = Instant::now();
-                write_deterministic_file(
+                write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
                     deterministic_write_seed(item, write_options.run_seed, Some(stream_id)),
                     write_options.chunk_size,
+                    &mut scratch,
                 )
                 .await
                 .with_context(|| format!("write {}", item.path.display()))?;
@@ -1917,7 +1938,7 @@ async fn run_filesystem_reads_sequential_streams(
     let segments = split_stream_segments(order, stream_count);
     let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let files: Arc<[WorkFile]> = Arc::from(files);
     let targets = operation_log_targets(&files);
     let mut join_set = JoinSet::new();
 
@@ -2448,8 +2469,10 @@ mod tests {
     };
 
     fn target_tempdir() -> tempfile::TempDir {
-        let target = std::env::current_dir()
-            .expect("current dir")
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
             .join("target")
             .join("studiofs-mounted-tests");
         std::fs::create_dir_all(&target).expect("create target test dir");
@@ -2622,7 +2645,8 @@ mod tests {
     async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
         let temp = target_tempdir();
         let path = temp.path().join("benchmark_file_000000.bin");
-        write_deterministic_file(&path, 4096 + 257, 123, 1024)
+        let mut scratch = Vec::new();
+        write_deterministic_file_with_buffer(&path, 4096 + 257, 123, 1024, &mut scratch)
             .await
             .expect("write deterministic test payload");
 

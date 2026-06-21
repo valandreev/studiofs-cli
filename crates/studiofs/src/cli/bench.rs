@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
@@ -11,6 +11,11 @@ use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 
 const MAX_BENCH_SMALL_FILE_COUNT: usize = 1_000_000;
+
+enum BenchRunOutcome {
+    Completed(Box<crate::cli::benchmark_engine::BenchmarkReport>),
+    Interrupted,
+}
 
 #[derive(Debug, Args)]
 #[command(about = "Run a mounted StudioFS filesystem benchmark")]
@@ -114,32 +119,60 @@ fn run(args: BenchArgs) -> Result<()> {
         work_root: work_root.as_path(),
         cache_path: runtime.cache_path.as_deref(),
     };
-    let report = async_runtime.block_on(async {
+    let outcome = async_runtime.block_on(async {
         tokio::select! {
-            report = run_mounted(&config, mounted_target) => report,
+            report = run_mounted(&config, mounted_target) => {
+                report.map(|report| BenchRunOutcome::Completed(Box::new(report)))
+            }
             signal = tokio::signal::ctrl_c() => {
                 signal.context("listen for Ctrl+C")?;
-                match tokio::fs::remove_dir_all(&work_root).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            work_root = %work_root.display(),
-                            "bench interrupt cleanup failed"
-                        );
-                    }
-                }
-                Err(anyhow!("benchmark interrupted by Ctrl+C"))
+                Ok(BenchRunOutcome::Interrupted)
             }
         }
     })?;
+    drop(async_runtime);
+    let report = match outcome {
+        BenchRunOutcome::Completed(report) => *report,
+        BenchRunOutcome::Interrupted => {
+            cleanup_bench_work_root_after_interrupt(&work_root);
+            return Err(anyhow!("benchmark interrupted by Ctrl+C"));
+        }
+    };
 
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, args.json_output.as_deref())
         .context("save benchmark JSON report")?;
     println!("JSON report: {}", report_path.display());
     Ok(())
+}
+
+fn cleanup_bench_work_root_after_interrupt(work_root: &Path) {
+    const CLEANUP_ATTEMPTS: usize = 5;
+    const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    for attempt in 1..=CLEANUP_ATTEMPTS {
+        match std::fs::remove_dir_all(work_root) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt < CLEANUP_ATTEMPTS => {
+                tracing::warn!(
+                    error = %error,
+                    work_root = %work_root.display(),
+                    attempt,
+                    "bench interrupt cleanup retrying"
+                );
+                std::thread::sleep(CLEANUP_RETRY_DELAY);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    work_root = %work_root.display(),
+                    "bench interrupt cleanup failed"
+                );
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
