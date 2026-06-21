@@ -2382,7 +2382,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_stale_mount_cleanup_attempts_are_timeout_bounded() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let started = Instant::now();
         let err = run_macos_unmount_attempt_with_timeout(
             "sh",
@@ -2402,7 +2402,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_stale_mount_cleanup_attempts_drain_large_output() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let output = run_macos_unmount_attempt_with_timeout(
             "sh",
             &["-c", "yes studiofs-unmount-output | head -c 200000"],
@@ -2417,7 +2417,7 @@ mod tests {
 
     #[test]
     fn client_env_bounds_winfsp_file_info_timeout_for_invalidation_runs() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let client = client_spec_for(
             temp.path(),
             "projectfs",
@@ -2466,7 +2466,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn linux_mountinfo_detection_does_not_require_existing_mount_point_path() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let path = temp.path().join("missing-mount");
         let mountinfo = format!(
             "42 31 0:49 / / rw,relatime - overlay overlay rw\n\

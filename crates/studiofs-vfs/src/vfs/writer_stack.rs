@@ -1552,7 +1552,7 @@ mod tests {
         MountedWriterStack,
         mpsc::UnboundedReceiver<PendingUpload>,
     ) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
                 .expect("open backend")
@@ -1579,7 +1579,7 @@ mod tests {
         MountedWriterStack,
         mpsc::UnboundedReceiver<PendingUpload>,
     ) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
                 .expect("open backend")
@@ -1960,7 +1960,7 @@ mod tests {
 
     #[test]
     fn writer_stack_finish_does_not_hold_shard_lock_during_staging() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
                 .expect("open backend")
@@ -2012,7 +2012,7 @@ mod tests {
 
     #[test]
     fn writer_stack_finish_does_not_hold_file_lock_during_staging() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
                 .expect("open backend")
@@ -2063,7 +2063,7 @@ mod tests {
 
     #[test]
     fn writer_stack_detached_completed_block_remains_readable_while_staging() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000292")
                 .expect("open backend")
@@ -2141,7 +2141,7 @@ mod tests {
 
     #[test]
     fn writer_stack_retries_transient_materialization_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000293")
                 .expect("open backend")

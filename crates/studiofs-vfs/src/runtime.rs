@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn meta_executor_run_sync_reads_from_narrow_sync_engine() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
         let info = FormatInfo::new(
@@ -690,7 +690,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn meta_executor_run_maps_meta_errors() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
         let info = FormatInfo::new(

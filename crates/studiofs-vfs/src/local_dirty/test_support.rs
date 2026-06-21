@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn pending_slice_commit_without_dirty_attr_extends_visible_size() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-attr-recovery");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn stale_pending_slice_commit_without_dirty_attr_preserves_newer_size() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-attr");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn stale_pending_slice_commit_with_dirty_attr_preserves_newer_metadata() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-dirty-attr");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn subtract_pending_local_dirty_bytes_saturates_without_panicking() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-bytes-underflow");
         let _guard = rt.enter();
         vfs.state
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn commit_pending_local_dirty_slices_trims_committed_prefix() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-prefix");
         let ino = 77;
         let chunk_id = 0;
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn pending_persisted_slice_byte_counter_tracks_insert_trim_and_clear() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-byte-counter");
         let ino = 80;
         let chunk_id = 0;
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn pending_slice_counters_track_insert_commit_and_clear() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counters");
         let ino = 81;
         let chunk_id = 0;
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn opportunistic_pending_slice_commit_waits_for_chunk_sized_wave_while_tail_is_open() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-chunk-wave");
         let _guard = rt.enter();
         let ino = rt.block_on(async {
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn opportunistic_pending_slice_commit_drains_aged_tail_when_upload_pipeline_is_idle() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-idle-tail");
         let _guard = rt.enter();
         let ino = rt.block_on(async {
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn opportunistic_pending_slice_commit_drains_time_aged_tail_before_five_seconds() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-short-tail-age");
         let _guard = rt.enter();
         let ino = rt.block_on(async {
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn buffered_write_spill_batches_preserve_cloud_object_boundaries() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "spill-object-boundaries");
         let block_size = vfs.block_size as usize;
         let blocks = vec![
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "pending_slice_count underflow")]
     fn pending_slice_counter_underflow_is_caught_in_debug_builds() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counter-underflow");
 
         vfs.subtract_pending_slice_counts(1, 0);
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "pending_persisted_slice_count underflow")]
     fn pending_persisted_slice_counter_underflow_is_caught_in_debug_builds() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) =
             make_unstarted_test_vfs(&tmp, "pending-persisted-slice-counter-underflow");
 
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn trim_local_payload_staging_trims_and_drops_pending_slices() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "trim-pending-slices");
         let ino = 78;
         let block_index = 3;
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn snapshot_pending_dirty_slice_read_spans_handles_boundaries_and_offsets() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-slices");
         let ino = 79;
         let block_index = 4;

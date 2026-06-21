@@ -620,7 +620,6 @@ mod tests {
     use std::{fs, os::unix::fs::symlink};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
     use studiofs_meta::{MetaEngine, MetaFormat, RedbMetaEngine};
-    use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
@@ -683,7 +682,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_new_selects_local_payload_runtime_for_runtime_root_layout() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
@@ -719,7 +718,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_new_does_not_spawn_background_workers() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
@@ -761,7 +760,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_new_accepts_metaengine_compatibility_shim() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
@@ -794,7 +793,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_new_applies_bootstrap_plan_fields_to_constructed_vfs() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
@@ -954,7 +953,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remove_retired_ingress_spill_removes_broken_symlink() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let cache_root = tmp.path().join("cache");
         fs::create_dir_all(&cache_root).expect("create cache root");
         let retired_path = cache_root.join("ingress_spill");
@@ -978,7 +977,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remove_retired_ingress_spill_removes_symlink_without_touching_target() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let cache_root = tmp.path().join("cache");
         fs::create_dir_all(&cache_root).expect("create cache root");
         let target_dir = tmp.path().join("retired-target");

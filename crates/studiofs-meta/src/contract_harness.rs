@@ -850,6 +850,8 @@ impl ContractTempDir {
     fn new(label: &str) -> MetaResult<Self> {
         let safe = sanitize_label(label);
         let prefix = format!("studiofs-contract-core-{safe}-");
+        // This harness is part of the normal studiofs-meta library surface, so
+        // it cannot depend on the dev-only workspace target tempdir helper.
         let inner = tempfile::Builder::new()
             .prefix(&prefix)
             .tempdir()

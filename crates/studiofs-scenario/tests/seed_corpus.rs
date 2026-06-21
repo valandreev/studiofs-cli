@@ -583,12 +583,5 @@ fn cli_replays_saved_simulation_counterexample_artifact() {
 }
 
 fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after unix epoch")
-            .as_nanos()
-    ))
+    studiofs_test_support::workspace_target_temp_path(&format!("{name}-"))
 }

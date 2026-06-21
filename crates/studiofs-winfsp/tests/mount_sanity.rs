@@ -793,7 +793,7 @@ fn winfsp_mount_unmount_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let event_name = format!("Local\\StudioFsMountSmoke-{}", std::process::id());
@@ -822,7 +822,7 @@ fn winfsp_mount_write_read_unmount_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
     let event_name = format!("Local\\StudioFsWriteReadSmoke-{}", std::process::id());
@@ -898,7 +898,7 @@ fn winfsp_mount_fio_multi_job_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "fio_multi_job_smoke", &rt);
     let event_name = format!("Local\\StudioFsWinfspFioSmoke-{}", std::process::id());
@@ -951,7 +951,7 @@ fn winfsp_mount_regular_file_attributes_do_not_materialize_directories() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "file_attribute_smoke", &rt);
     let event_name = format!("Local\\StudioFsFileAttributeSmoke-{}", std::process::id());
@@ -1098,7 +1098,7 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "callback_observability_smoke", &rt);
     let vfs_observer = vfs.clone();
@@ -1225,7 +1225,7 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "aja_style_sequential_writer", &rt);
     let vfs_observer = vfs.clone();
@@ -1378,7 +1378,7 @@ fn winfsp_mount_reopen_read_after_upload_finalize_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "post_upload_read", &rt);
     let vfs_observer = vfs.clone();
@@ -1430,7 +1430,7 @@ fn winfsp_mount_copy_read_after_upload_finalize_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let source_file = tmp.path().join("copy-source.bin");
     let source_payload: Vec<u8> = (0..(20 * 1024 * 1024))
         .map(|index| ((index as u64).wrapping_mul(11400714819323198485) >> 33) as u8)
@@ -1493,7 +1493,7 @@ fn winfsp_mount_set_len_chunked_write_read_after_upload_finalize_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let payload: Vec<u8> = (0..(17 * 1024 * 1024 + 37_777))
         .map(|index| (index as u8).wrapping_mul(19).wrapping_add(0x5D))
         .collect();
@@ -1578,7 +1578,7 @@ fn winfsp_mount_same_handle_read_after_upload_finalize_smoke() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let payload: Vec<u8> = (0..(14 * 1024 * 1024 + 8191))
         .map(|index| (index as u8).wrapping_mul(7).wrapping_add(0x33))
         .collect();
@@ -1654,7 +1654,7 @@ fn winfsp_mount_reader_open_during_upload_stays_readable_after_finalize_smoke() 
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let payload: Vec<u8> = (0..(24 * 1024 * 1024 + 123_457))
         .map(|index| (index as u8).wrapping_mul(23).wrapping_add(0x41))
         .collect();
@@ -1755,7 +1755,7 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let payload: Vec<u8> = (0..(18 * 1024 * 1024 + 65_537))
         .map(|index| (index as u8).wrapping_mul(29).wrapping_add(0x17))
         .collect();
@@ -1887,7 +1887,7 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
     const TOTAL_BYTES: usize = CHUNK_BYTES * CHUNK_COUNT;
     const MAX_ELAPSED_SECS: u64 = 120;
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
 
     // Build VFS inline with a tiny valid dirty cap so the hard-backpressure guard

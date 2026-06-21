@@ -9,11 +9,10 @@ use studiofs_e2e::mounted_tree::{
     compare_snapshots, snapshot_client_tree, validate_namespace_invariants, wait_for_convergence,
     write_divergence_artifacts,
 };
-use tempfile::tempdir;
 
 #[test]
 fn snapshot_records_sorted_paths_file_metadata_and_sha256() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("client-a");
     fs::create_dir_all(mount.join("dir")).unwrap();
     fs::write(mount.join("dir").join("a.txt"), b"hello").unwrap();
@@ -47,7 +46,7 @@ fn snapshot_records_sorted_paths_file_metadata_and_sha256() {
 
 #[test]
 fn comparison_requires_file_content_checksum_not_only_size() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a = temp.path().join("client-a");
     let client_b = temp.path().join("client-b");
     fs::create_dir_all(&client_a).unwrap();
@@ -126,7 +125,7 @@ fn namespace_invariants_detect_duplicate_paths_missing_parents_and_resurrection(
 
 #[test]
 fn divergence_artifacts_include_each_client_snapshot_and_readable_diff() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a = temp.path().join("client-a");
     let client_b = temp.path().join("client-b");
     let client_c = temp.path().join("client-c");
@@ -167,7 +166,7 @@ fn divergence_artifacts_include_each_client_snapshot_and_readable_diff() {
 
 #[test]
 fn wait_for_convergence_retries_until_trees_match_without_failure_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a = temp.path().join("client-a");
     let client_b = temp.path().join("client-b");
     fs::create_dir_all(&client_a).unwrap();
@@ -199,7 +198,7 @@ fn wait_for_convergence_retries_until_trees_match_without_failure_artifacts() {
 
 #[test]
 fn wait_for_convergence_treats_transient_snapshot_io_errors_as_not_yet_converged() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a = temp.path().join("client-a");
     let client_b = temp.path().join("client-b");
     fs::create_dir_all(&client_a).unwrap();
@@ -231,7 +230,7 @@ fn wait_for_convergence_treats_transient_snapshot_io_errors_as_not_yet_converged
 
 #[test]
 fn wait_for_convergence_reports_timeout_when_snapshots_never_succeed() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let missing_client = temp.path().join("missing-client");
 
     let err = wait_for_convergence(
@@ -277,7 +276,7 @@ fn comparison_detects_symlink_target_divergence() {
 fn snapshot_records_symlink_target() {
     use std::os::unix::fs::symlink;
 
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a = temp.path().join("client-a");
     fs::create_dir_all(&client_a).unwrap();
     symlink("target-a", client_a.join("link")).unwrap();
@@ -299,7 +298,7 @@ fn snapshot_rejects_non_utf8_relative_paths_instead_of_lossy_encoding() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt as _;
 
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("client-a");
     fs::create_dir_all(&mount).unwrap();
     let non_utf8_path = mount.join(OsString::from_vec(vec![b'f', 0x80, b'e']));

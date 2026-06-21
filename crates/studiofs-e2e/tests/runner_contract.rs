@@ -22,7 +22,6 @@ use studiofs_e2e::runner::{
     CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
     ScenarioStatus,
 };
-use tempfile::tempdir;
 
 #[test]
 fn cli_parses_required_runner_entrypoints() {
@@ -545,7 +544,7 @@ fn sfs469_fuse_write_baseline_uses_reserved_98_selector() {
 
 #[test]
 fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("symlink-attribute-contract-run".to_string()),
@@ -617,7 +616,7 @@ fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("invalidation-dropout-contract-run".to_string()),
@@ -698,7 +697,7 @@ fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn stale_remount_cold_discover_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("stale-remount-cold-discover-contract-run".to_string()),
@@ -776,7 +775,7 @@ fn stale_remount_cold_discover_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("cold-observer-contract-run".to_string()),
@@ -856,7 +855,7 @@ fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn sparse_range_scenario_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("sparse-range-contract-run".to_string()),
@@ -939,7 +938,7 @@ fn sparse_range_scenario_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn namespace_collision_scenario_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("collision-contract-run".to_string()),
@@ -996,7 +995,7 @@ fn namespace_collision_scenario_disabled_run_writes_reproducible_artifacts() {
 
 #[test]
 fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("runner-contract-run".to_string()),
@@ -1106,7 +1105,7 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
 
 #[test]
 fn report_links_runner_scenario_and_client_diagnostic_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
         run_id: Some("diagnostic-artifacts-run".to_string()),
@@ -1151,7 +1150,7 @@ fn report_links_runner_scenario_and_client_diagnostic_artifacts() {
 
 #[test]
 fn explicit_report_path_receives_copy_while_canonical_report_stays_in_sandbox() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let report_copy = temp.path().join("reports").join("latest.json");
     let request = RunRequest {
         root: temp.path().join("e2e-runs"),
@@ -1181,7 +1180,7 @@ fn explicit_report_path_receives_copy_while_canonical_report_stays_in_sandbox() 
 
 #[test]
 fn clean_removes_only_runner_owned_sandboxes() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let request = RunRequest {
         root: root.clone(),
@@ -1213,7 +1212,7 @@ fn clean_removes_only_runner_owned_sandboxes() {
 
 #[test]
 fn clean_removes_interrupted_runner_owned_sandbox_without_final_reports() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let run_id = "interrupted-run";
     let sandbox = root.join(run_id);
@@ -1248,7 +1247,7 @@ fn clean_removes_interrupted_runner_owned_sandbox_without_final_reports() {
 
 #[test]
 fn clean_ignores_manifest_only_directories_without_runner_marker_and_layout() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let fake = root.join("fake-run");
     fs::create_dir_all(&fake).unwrap();
@@ -1268,7 +1267,7 @@ fn clean_ignores_manifest_only_directories_without_runner_marker_and_layout() {
 
 #[test]
 fn run_rejects_run_id_path_traversal_before_creating_sandbox() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let request = RunRequest {
         root,
@@ -1292,7 +1291,7 @@ fn run_rejects_run_id_path_traversal_before_creating_sandbox() {
 
 #[test]
 fn run_rejects_unknown_scenario_before_creating_sandbox() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let request = RunRequest {
         root,
@@ -1322,7 +1321,7 @@ fn run_rejects_unknown_scenario_before_creating_sandbox() {
 
 #[test]
 fn clean_continues_after_malformed_owned_candidate() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let root = temp.path().join("e2e-runs");
     let valid = RunRequest {
         root: root.clone(),

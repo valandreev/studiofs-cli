@@ -1500,7 +1500,7 @@ mod tests {
 
     #[test]
     fn readdir_hydrates_attr_cache_for_followup_getattr() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "readdir-attr-hydration");
         let created = vfs
             .create(ROOT_INO, b"batch-stat.txt", 1000, 1000, 0o644)
@@ -1544,7 +1544,7 @@ mod tests {
 
     #[test]
     fn readdir_keeps_dangling_dentry_but_evicts_stale_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-attr-dangling-dentry");
         let created = vfs
             .create(ROOT_INO, b"dangling-cached.txt", 1000, 1000, 0o644)
@@ -1585,7 +1585,7 @@ mod tests {
 
     #[test]
     fn readdir_invalidates_stale_negative_path_shortcut_for_observed_child() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-negative-path-shortcut");
         let dir = vfs
             .mkdir(ROOT_INO, b"observer", 1000, 1000, 0o755)
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn remote_upload_placeholder_visibility_is_disabled_before_first_publish() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "remote-upload-placeholder-visibility");
         let ino = 9_201;
         let mut attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
@@ -1656,7 +1656,7 @@ mod tests {
 
     #[test]
     fn namespace_mutations_update_dentry_cache_entries() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "dentry-cache-hooks");
         let key = DentryCacheKey::new(ROOT_INO, b"cache-test.txt");
 
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn unlink_invalidates_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-invalidates-parent-attr-cache");
         let dir = vfs
             .mkdir(ROOT_INO, b"dir", 1000, 1000, 0o755)
@@ -1714,7 +1714,7 @@ mod tests {
 
     #[test]
     fn link_invalidates_new_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "link-invalidates-parent-attr-cache");
         let source = vfs
             .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
@@ -1740,7 +1740,7 @@ mod tests {
 
     #[test]
     fn setattr_does_not_bump_namespace_generations() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "setattr-no-namespace-invalidate");
         let created = vfs
             .create(ROOT_INO, b"setattr.txt", 1000, 1000, 0o644)
@@ -1790,7 +1790,7 @@ mod tests {
 
     #[test]
     fn write_does_not_bump_namespace_generations() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-no-namespace-invalidate");
         let created = vfs
             .create(ROOT_INO, b"write.txt", 1000, 1000, 0o644)
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn namespace_resolver_path_shortcut_hits_and_renames_invalidate() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-rename-invalidate");
 
         let a = vfs
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[test]
     fn namespace_resolver_path_shortcut_invalidation_on_delete_subtree() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-delete-invalidate");
 
         let parent = vfs
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "fullpath-component-parity");
 
         let ignored_dir = vfs
@@ -1938,7 +1938,7 @@ mod tests {
 
     #[test]
     fn namespace_resolver_windows_and_posix_match_on_same_namespace_entry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-posix-parity");
 
         let dir = vfs
@@ -1962,7 +1962,7 @@ mod tests {
 
     #[test]
     fn namespace_resolver_windows_parent_normalization_matches_winfsp_semantics() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-parent-normalization");
 
         let dir = vfs
@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn heal_dangling_entry_if_inode_missing_prunes_stale_root_trashes_dentry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "heal-hidden-root-trashes");
 
         let trashes = meta

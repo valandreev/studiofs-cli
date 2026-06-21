@@ -8,7 +8,7 @@ fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worke
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-lock-workers-lazy-start");
     let info = volume.format_info();

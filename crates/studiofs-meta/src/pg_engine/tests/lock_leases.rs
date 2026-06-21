@@ -8,8 +8,8 @@ fn test_pg_file_lock_lease_blocks_peer_until_release() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-lock-blocks-peer");
@@ -76,8 +76,8 @@ fn test_pg_file_lock_first_acquire_serializes_concurrent_racers() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-lock-first-acquire-race");
@@ -150,7 +150,7 @@ fn test_pg_open_recreates_missing_file_lock_lease_table() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-open-recreates-file-lock-lease-table");
     let info = volume.format_info();
@@ -182,8 +182,8 @@ fn test_pg_file_lock_lease_expires_for_peer() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-lock-expiry");
@@ -239,8 +239,8 @@ fn test_pg_file_lock_lease_renew_keeps_peer_blocked() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-lock-renew");
@@ -315,8 +315,8 @@ fn test_pg_file_lock_known_state_refreshes_from_notify() {
 
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-lock-notify-refresh");

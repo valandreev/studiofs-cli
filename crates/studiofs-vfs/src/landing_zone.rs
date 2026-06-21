@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn landing_zone_accepts_sequential_segments_and_reopens_manifest() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
 
         zone.accept(LandingWrite {
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn landing_zone_clear_inode_retires_recovered_segments() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
 
         zone.accept(LandingWrite {
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn landing_zone_open_recovers_manifest_backup_after_interrupted_swap() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         {
             let zone = LandingZone::open(tmp.path()).expect("open landing zone");
             zone.accept(LandingWrite {
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn landing_zone_clear_inode_preserves_other_inode_manifest_records() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
         zone.accept(LandingWrite {
             ino: 1,
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn landing_zone_recovers_valid_prefix_before_torn_manifest_tail() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
         zone.accept(LandingWrite {
             ino: 1,
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn landing_zone_stats_track_recoverable_segments_without_reparse() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
         assert_eq!(zone.stats().recoverable_segments, 0);
         zone.accept(LandingWrite {
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn opportunistic_accept_defers_sync_until_landing_records_retire() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
 
         zone.accept(LandingWrite {
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[test]
     fn landing_zone_accept_enqueues_without_waiting_for_writer_file_lock() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
         let files_guard = zone.files.lock().expect("hold landing files lock");
 
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn landing_zone_read_uses_cached_manifest_segments() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = LandingZone::open(tmp.path()).expect("open landing zone");
         zone.accept(LandingWrite {
             ino: 9,
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn landing_zone_accept_blocks_when_queue_limit_is_reached() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let zone = Arc::new(
             LandingZone::open_with_queue_limits(
                 tmp.path(),

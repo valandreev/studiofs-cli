@@ -1655,7 +1655,7 @@ async fn wait_until_n_payload_slices_async(
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_write_read_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "cwr");
 
     // Create a file in root directory (inode 1)
@@ -1690,11 +1690,11 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         return;
     }
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap();
-    let reader_tmp = tempfile::tempdir().unwrap();
+    let reader_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let reader_db = reader_tmp.path().join("reader.redb");
     let reader_cache = reader_tmp.path().join("reader-cache");
     let reader_cache_str = reader_cache.to_str().unwrap();
@@ -1886,7 +1886,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_read_large_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "large");
 
     let attr = vfs.create(1, b"big.bin", 0, 0, 0o644).unwrap();
@@ -1911,7 +1911,7 @@ async fn test_write_read_large_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_at_offset() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "offset");
 
     let attr = vfs.create(1, b"offset.txt", 0, 0, 0o644).unwrap();
@@ -1938,7 +1938,7 @@ async fn test_write_at_offset() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_overwrite_and_read() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "overwrite");
 
     let attr = vfs.create(1, b"over.txt", 0, 0, 0o644).unwrap();
@@ -1967,7 +1967,7 @@ async fn test_overwrite_and_read() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_block_allocation() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "blocks");
 
     let attr = vfs.create(1, b"blocks.bin", 0, 0, 0o644).unwrap();
@@ -2006,7 +2006,7 @@ async fn test_block_allocation() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_partial_block() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "partial");
 
     let attr = vfs.create(1, b"partial.bin", 0, 0, 0o644).unwrap();
@@ -2038,7 +2038,7 @@ async fn test_partial_block() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_directory_operations() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "dirs");
 
     // Create a subdirectory
@@ -2083,7 +2083,7 @@ async fn test_directory_operations() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename");
 
     let attr = vfs.create(1, b"old.txt", 0, 0, 0o644).unwrap();
@@ -2116,7 +2116,7 @@ async fn test_rename_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "truncate");
 
     let attr = vfs.create(1, b"trunc.txt", 0, 0, 0o644).unwrap();
@@ -2158,7 +2158,7 @@ async fn test_truncate_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_pending_deletions_gc() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "gc");
     let info = vfs.meta().get_format_info().unwrap();
     let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
@@ -2239,7 +2239,7 @@ async fn test_pending_deletions_gc() {
 async fn test_background_janitor_removes_orphan_object() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(&tmp, "janitor_orphan", fast_janitor_vfs_config());
     let info = vfs.meta().get_format_info().unwrap();
     let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
@@ -2279,7 +2279,7 @@ async fn test_background_janitor_removes_orphan_object() {
 async fn test_background_janitor_cleans_simulated_crash_orphan() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(&tmp, "janitor_crash_orphan", fast_janitor_vfs_config());
     let info = vfs.meta().get_format_info().unwrap();
     let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
@@ -2351,7 +2351,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 async fn test_background_janitor_does_not_heal_dangling_dentry_without_foreground_access() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(&tmp, "janitor_dangling_dentry", fast_janitor_vfs_config());
 
     let dangling = vfs.create(1, b"janitor-dangling.txt", 0, 0, 0o644).unwrap();
@@ -2373,7 +2373,7 @@ async fn test_background_janitor_does_not_heal_dangling_dentry_without_foregroun
 async fn test_background_janitor_recovers_pending_create_intent_runtime() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(
         &tmp,
         "janitor_pending_create_runtime",
@@ -2436,7 +2436,7 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
 async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(
         &tmp,
         "janitor_deferred_undo_runtime",
@@ -2497,7 +2497,7 @@ async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime()
 async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime() {
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(
         &tmp,
         "janitor_mixed_undo_runtime",
@@ -2584,7 +2584,7 @@ fn test_crash_recovery_replays_pending_journal() {
         .unwrap();
     boot_rt.block_on(ensure_bucket());
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -2726,7 +2726,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
         .unwrap();
     boot_rt.block_on(ensure_bucket());
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -2919,7 +2919,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -2984,7 +2984,7 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3110,7 +3110,7 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3188,7 +3188,7 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
     let _env = ScopedTestEnv::new();
     install_zeroio_replay_offline_env();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3282,7 +3282,7 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
     let _env = ScopedTestEnv::new();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3412,7 +3412,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3568,11 +3568,11 @@ fn remote_clients_see_uploading_marker_without_precise_progress() {
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -3620,11 +3620,11 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -3685,7 +3685,7 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -3789,11 +3789,11 @@ fn remote_clients_keep_previous_committed_version_during_update() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -3896,11 +3896,11 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -4036,11 +4036,11 @@ fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -4129,11 +4129,11 @@ fn remote_snapshot_switches_nested_overwrite_to_replacement_inode() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("remote.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -4244,11 +4244,11 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "250");
     set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("meta-a.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("meta-b.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -4359,11 +4359,11 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
     apply_test_online_s3_env();
     set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
 
-    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let writer_db = writer_tmp.path().join("meta-a.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
     let writer_cache_str = writer_cache.to_str().unwrap().to_string();
-    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let remote_db = remote_tmp.path().join("meta-b.redb");
     let remote_cache = remote_tmp.path().join("remote-cache");
     let remote_cache_str = remote_cache.to_str().unwrap().to_string();
@@ -4457,7 +4457,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -4790,7 +4790,7 @@ fn new_empty_file_stays_idle_without_pending_incarnation() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -4855,7 +4855,7 @@ fn committed_file_mutation_enters_updating_state() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -4974,7 +4974,7 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5073,7 +5073,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5212,7 +5212,7 @@ fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen(
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cold_cache_dir = tmp.path().join("cache-cold");
@@ -5369,7 +5369,7 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5444,7 +5444,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5524,7 +5524,7 @@ fn single_inode_never_has_two_pending_incarnations() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5640,7 +5640,7 @@ fn large_file_unlink_cancels_pending_uploads() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5719,7 +5719,7 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5814,7 +5814,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -5929,7 +5929,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6083,7 +6083,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6155,7 +6155,7 @@ async fn rename_into_trashes_deletes_and_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6208,7 +6208,7 @@ async fn rename_into_windows_recycle_bin_deletes_and_evicts_local_payload_object
     apply_test_online_s3_env();
     ensure_bucket().await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6273,7 +6273,7 @@ fn update_base_graph_reuses_untouched_committed_extents() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6381,7 +6381,7 @@ fn restart_replays_only_live_pending_extents() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6488,7 +6488,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6612,7 +6612,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6731,7 +6731,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -6890,7 +6890,7 @@ fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7027,7 +7027,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7103,7 +7103,7 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     provision_cache_runtime_layout(&cache_dir);
@@ -7240,7 +7240,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7447,7 +7447,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
     set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
     set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7533,7 +7533,7 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
 
-    let roomy_tmp = tempfile::tempdir().unwrap();
+    let roomy_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let roomy_db = roomy_tmp.path().join("meta.redb");
     let roomy_cache = roomy_tmp.path().join("cache");
     let roomy_cache_str = roomy_cache.to_str().unwrap().to_string();
@@ -7596,7 +7596,7 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
         rt.shutdown_background();
     }
 
-    let tight_tmp = tempfile::tempdir().unwrap();
+    let tight_tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let tight_db = tight_tmp.path().join("meta.redb");
     let tight_cache = tight_tmp.path().join("cache");
     let tight_cache_str = tight_cache.to_str().unwrap().to_string();
@@ -7692,7 +7692,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7785,7 +7785,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7928,7 +7928,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
     let iterations = parse_env_usize("STUDIOFS_SOAK_ITERATIONS").unwrap_or(200);
     let max_op_ms = parse_env_u64("STUDIOFS_SOAK_MAX_OP_MS").unwrap_or(1500);
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8017,7 +8017,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8104,7 +8104,7 @@ fn test_single_mode_ingress_write_path_materializes_local_payloads() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (vfs, payload) = build_vfs(&tmp, &format!("single-mode-{}", std::process::id()));
         let attr = vfs.create(1, b"single-mode.bin", 0, 0, 0o644).unwrap();
         assert_eq!(
@@ -8144,7 +8144,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8237,7 +8237,7 @@ fn test_ingress_pressure_reflects_buffered_partial_write_until_flush() {
     set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
     set_test_env("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8319,7 +8319,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "512KB");
     set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "250");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8388,7 +8388,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8456,7 +8456,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
 
 #[test]
 fn test_ingress_multi_writer_spill_recovers_after_crash() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8549,7 +8549,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
 #[test]
 #[ignore = "requires crash-recovery + spill-segment stress setup and is intentionally ignored by default"]
 fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -8711,7 +8711,7 @@ async fn test_object_key_format() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_sequential_write_performance() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs_with_config(
         &tmp,
         "perf",
@@ -8774,7 +8774,7 @@ async fn test_sequential_write_performance() {
 /// Test attribute cache with TTL and invalidation on writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_attr_cache_ttl() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "attr_cache");
 
     // Create a file
@@ -8826,7 +8826,7 @@ async fn test_attr_cache_ttl() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_file_and_release() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "handle1");
 
     let attr = vfs.create(1, b"handle.txt", 0, 0, 0o644).unwrap();
@@ -8860,7 +8860,7 @@ async fn test_open_file_and_release() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_trunc() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "handle_trunc");
 
     let attr = vfs.create(1, b"trunc.txt", 0, 0, 0o644).unwrap();
@@ -8884,7 +8884,7 @@ async fn test_open_trunc() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_unlink_deferred_cleanup() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "orphan");
 
     let attr = vfs.create(1, b"orphan.txt", 0, 0, 0o644).unwrap();
@@ -8928,7 +8928,7 @@ async fn test_open_unlink_deferred_cleanup() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_release_fh_orphan_cleanup_is_idempotent_when_inode_already_missing() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "orphan-idempotent-cleanup");
 
     let attr = vfs
@@ -8954,7 +8954,7 @@ async fn test_release_fh_orphan_cleanup_is_idempotent_when_inode_already_missing
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_restart_recovers_deferred_open_unlink_cleanup() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let volume_suffix = "orphan-restart-recovery";
 
     let vfs = make_vfs(&tmp, volume_suffix);
@@ -9002,7 +9002,7 @@ async fn test_restart_recovers_deferred_open_unlink_cleanup() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_multiple_handles_open_unlink() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "multi_handle");
 
     let attr = vfs.create(1, b"multi.txt", 0, 0, 0o644).unwrap();
@@ -9044,7 +9044,7 @@ async fn test_multiple_handles_open_unlink() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_dangling_dentry_is_self_healed_on_lookup_and_unlink() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "dangling-dentry-heal");
 
     let dangling = vfs.create(1, b"dangling.txt", 0, 0, 0o644).unwrap();
@@ -9073,7 +9073,7 @@ async fn test_dangling_dentry_is_self_healed_on_lookup_and_unlink() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_dangling_dentry_is_self_healed_on_readdir() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "dangling-dentry-readdir-heal");
 
     let dangling = vfs.create(1, b"dangling-readdir.txt", 0, 0, 0o644).unwrap();
@@ -9105,7 +9105,7 @@ async fn test_dangling_dentry_is_self_healed_on_readdir() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_fsync() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "fsync");
 
     let attr = vfs.create(1, b"fsync.txt", 0, 0, 0o644).unwrap();
@@ -9136,7 +9136,7 @@ async fn test_fsync() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_timestamps() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "setattr_ts");
 
     let attr = vfs.create(1, b"ts.txt", 0, 0, 0o644).unwrap();
@@ -9182,7 +9182,7 @@ async fn test_setattr_timestamps() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_mode_uid_gid() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "setattr_mode");
 
     let attr = vfs.create(1, b"chmod.txt", 0, 0, 0o644).unwrap();
@@ -9212,7 +9212,7 @@ async fn test_setattr_mode_uid_gid() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_create_and_readlink() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "symlink_basic");
 
     // Create a symlink
@@ -9237,7 +9237,7 @@ async fn test_symlink_create_and_readlink() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_unlink() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "symlink_unlink");
 
     let attr = vfs.symlink(1, b"del_link", b"/target", 0, 0).unwrap();
@@ -9259,7 +9259,7 @@ async fn test_symlink_unlink() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_in_readdir() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "symlink_readdir");
 
     // Create a regular file and a symlink
@@ -9284,7 +9284,7 @@ async fn test_symlink_in_readdir() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_create_and_read() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hardlink_create");
 
     // Create a file and write data
@@ -9311,7 +9311,7 @@ async fn test_hardlink_create_and_read() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_unlink_keeps_data() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hardlink_unlink");
 
     // Create a file and write data
@@ -9348,7 +9348,7 @@ async fn test_hardlink_unlink_keeps_data() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_dir_fails() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hardlink_dir_fail");
 
     let dir = vfs.mkdir(1, b"mydir", 0, 0, 0o755).unwrap();
@@ -9364,7 +9364,7 @@ async fn test_hardlink_dir_fails() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_exclusive_blocks() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flock_excl");
 
     let attr = vfs.create(1, b"locked.txt", 0, 0, 0o644).unwrap();
@@ -9392,7 +9392,7 @@ async fn test_flock_exclusive_blocks() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_shared_allows_multiple() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flock_shared");
 
     let attr = vfs.create(1, b"shared.txt", 0, 0, 0o644).unwrap();
@@ -9420,7 +9420,7 @@ async fn test_flock_shared_allows_multiple() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_unlock_and_relock() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flock_relock");
 
     let attr = vfs.create(1, b"relock.txt", 0, 0, 0o644).unwrap();
@@ -9449,7 +9449,7 @@ async fn test_flock_unlock_and_relock() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_set_get_remove() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr_basic");
 
     let attr = vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
@@ -9477,7 +9477,7 @@ async fn test_xattr_set_get_remove() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_cascade_on_unlink() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr_cascade");
 
     let attr = vfs.create(1, b"doomed.txt", 0, 0, 0o644).unwrap();
@@ -9495,7 +9495,7 @@ async fn test_xattr_cascade_on_unlink() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_multiple_attrs() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr_multi");
 
     let attr = vfs.create(1, b"multi.txt", 0, 0, 0o644).unwrap();
@@ -9520,7 +9520,7 @@ async fn test_xattr_limit_exact_and_exceeds_boundaries() {
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
     set_test_env("STUDIOFS_XATTR_MAX_BYTES", "16");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr_limit_boundary");
     let attr = vfs.create(1, b"xattr-limit.txt", 0, 0, 0o644).unwrap();
 
@@ -9548,7 +9548,7 @@ async fn test_xattr_resource_fork_honors_limit() {
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
     set_test_env("STUDIOFS_XATTR_MAX_BYTES", "8");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr_limit_resource_fork");
     let attr = vfs.create(1, b"fork.bin", 0, 0, 0o644).unwrap();
     let fork_name = b"com.apple.ResourceFork";
@@ -9573,7 +9573,7 @@ async fn test_xattr_resource_fork_honors_limit() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_create_rejects_invalid() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "validate_create");
 
     // Empty name
@@ -9598,7 +9598,7 @@ async fn test_validate_name_create_rejects_invalid() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_mkdir_rejects_invalid() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "validate_mkdir");
 
     assert!(vfs.mkdir(1, b"", 0, 0, 0o755).is_err());
@@ -9611,7 +9611,7 @@ async fn test_validate_name_mkdir_rejects_invalid() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_rename_rejects_invalid() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "validate_rename");
 
     vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
@@ -9633,7 +9633,7 @@ async fn test_validate_name_rename_rejects_invalid() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_statfs_initial() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "statfs_init");
 
     let st = vfs.statfs().unwrap();
@@ -9651,7 +9651,7 @@ async fn test_statfs_initial() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_statfs_after_write() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "statfs_write");
 
     let st_before = vfs.statfs().unwrap();
@@ -9698,7 +9698,7 @@ async fn test_statfs_after_write() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_to_exact_block_boundary() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "trunc-boundary");
     let block_size = vfs.meta().get_format_info().unwrap().block_size;
 
@@ -9736,7 +9736,7 @@ async fn test_truncate_to_exact_block_boundary() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_extend_creates_sparse_hole() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "trunc-extend");
 
     let attr = vfs.create(1, b"sparse.bin", 0, 0, 0o644).unwrap();
@@ -9774,7 +9774,7 @@ async fn test_truncate_extend_creates_sparse_hole() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "trunc-shrink-extend");
 
     let attr = vfs.create(1, b"tail-zero.bin", 0, 0, 0o644).unwrap();
@@ -9804,7 +9804,7 @@ async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_at_exact_block_boundary_transition() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "boundary-trans");
     let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
 
@@ -9845,7 +9845,7 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -9939,7 +9939,7 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10016,7 +10016,7 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10094,7 +10094,7 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10196,7 +10196,7 @@ fn append_after_create_stays_buffered_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10267,7 +10267,7 @@ fn truncate_after_create_is_locally_durable_without_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10323,7 +10323,7 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10423,7 +10423,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10545,7 +10545,7 @@ fn write_stages_full_blocks_without_explicit_flush() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10619,7 +10619,7 @@ fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10716,7 +10716,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10800,7 +10800,7 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -10911,7 +10911,7 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
 #[ignore = "requires offline S3 test env with injected unreachable endpoint and tuned local settings"]
 async fn test_truncate_to_zero_then_rewrite() {
     let _env = setup_offline_local_s3_env();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "trunc-zero-rw");
 
     let attr = vfs.create(1, b"overwrite.bin", 0, 0, 0o644).unwrap();
@@ -10963,7 +10963,7 @@ async fn test_truncate_to_zero_then_rewrite() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_beyond_eof_returns_empty() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "read-eof");
 
     let attr = vfs.create(1, b"small.txt", 0, 0, 0o644).unwrap();
@@ -10985,7 +10985,7 @@ async fn test_read_beyond_eof_returns_empty() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_spanning_allocated_and_sparse_blocks() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "read-sparse");
     let block_size = vfs.meta().get_format_info().unwrap().block_size as u64;
 
@@ -11019,7 +11019,7 @@ async fn test_read_spanning_allocated_and_sparse_blocks() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flush_empty_file_is_noop() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flush-empty");
 
     let attr = vfs.create(1, b"empty.txt", 0, 0, 0o644).unwrap();
@@ -11039,7 +11039,7 @@ async fn test_flush_empty_file_is_noop() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_zero_bytes() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "read-zero");
 
     let attr = vfs.create(1, b"content.txt", 0, 0, 0o644).unwrap();
@@ -11055,7 +11055,7 @@ async fn test_read_zero_bytes() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_zero_bytes_is_noop() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "write-zero");
 
     let attr = vfs.create(1, b"noop.txt", 0, 0, 0o644).unwrap();
@@ -11068,7 +11068,7 @@ async fn test_write_zero_bytes_is_noop() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn create_should_persist_ds_store_as_regular_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "persist-ds-store");
 
     let attr = vfs.create(1, b".DS_Store", 1000, 1000, 0o644).unwrap();
@@ -11089,7 +11089,7 @@ async fn create_should_persist_ds_store_as_regular_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "ignore-appledouble");
 
     let attr = vfs.create(1, b"._photo.jpg", 1000, 1000, 0o644).unwrap();
@@ -11112,7 +11112,7 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn rename_should_persist_ds_store_target() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename-persist-ds-store");
 
     let attr = vfs.create(1, b"normal.txt", 1000, 1000, 0o644).unwrap();
@@ -11130,7 +11130,7 @@ async fn rename_should_persist_ds_store_target() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "ignore-concurrent-create");
 
     let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -11162,7 +11162,7 @@ async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_children() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "ignore-root-macos-dirs");
 
     let dir = vfs.mkdir(1, b".Spotlight-V100", 1000, 1000, 0o755).unwrap();
@@ -11206,7 +11206,7 @@ async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_chil
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_creation() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "ignore-root-macos-metadata-names");
 
     let file = vfs.create(1, b".fseventsd", 1000, 1000, 0o644).unwrap();
@@ -11236,7 +11236,7 @@ async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_crea
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hide-legacy-root-macos-dirs");
 
     vfs.meta()
@@ -11267,7 +11267,7 @@ async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "unlink-legacy-root-blocked-file");
 
     vfs.meta()
@@ -11287,7 +11287,7 @@ async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_cross_directory() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename-cross");
 
     // Set up directories.
@@ -11333,7 +11333,7 @@ async fn test_rename_cross_directory() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_overwrite_existing_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename-overwrite");
 
     // Create target file with data.
@@ -11377,7 +11377,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     let _env = setup_offline_local_s3_env();
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "open-unlink-gc");
 
     let attr = vfs.create(1, b"orphan.txt", 0, 0, 0o644).unwrap();
@@ -11431,7 +11431,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rmdir_nonempty_fails() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rmdir-nonempty");
 
     let dir = vfs.mkdir(1, b"nonempty", 0, 0, 0o755).unwrap();
@@ -11446,7 +11446,7 @@ async fn test_rmdir_nonempty_fails() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_readdir_many_entries() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "readdir-many");
 
     let count = 100;
@@ -11477,7 +11477,7 @@ async fn test_readdir_many_entries() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_concurrent_read_write_same_file() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "conc-rw");
     let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
 
@@ -11535,7 +11535,7 @@ async fn test_concurrent_read_write_same_file() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_concurrent_flush_does_not_deadlock() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "conc-flush");
 
     let attr = vfs.create(1, b"conc-flush.bin", 0, 0, 0o644).unwrap();
@@ -11567,7 +11567,7 @@ async fn test_concurrent_flush_does_not_deadlock() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_write_unlink_race() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "create-unlink-race");
 
     // Create and immediately delete files in a tight loop.
@@ -11601,7 +11601,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     let _env = setup_offline_local_s3_env();
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "multi-fh-orphan");
 
     let attr = vfs.create(1, b"multi-fh.txt", 0, 0, 0o644).unwrap();
@@ -11649,7 +11649,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_trunc_clears_data() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "open-trunc-clear");
 
     let attr = vfs.create(1, b"trunc-open.txt", 0, 0, 0o644).unwrap();
@@ -11679,7 +11679,7 @@ async fn test_open_trunc_clears_data() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_on_directory() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "setattr-dir");
 
     let dir = vfs.mkdir(1, b"mydir", 0, 0, 0o755).unwrap();
@@ -11708,7 +11708,7 @@ async fn test_setattr_on_directory() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_on_directory() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr-dir");
 
     let dir = vfs.mkdir(1, b"xattr-dir", 0, 0, 0o755).unwrap();
@@ -11755,7 +11755,7 @@ fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "40");
     set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -11872,7 +11872,7 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
     set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -11966,7 +11966,7 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
     set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -12170,7 +12170,7 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
 /// local payload sources instead of depending on transient in-memory state.
 #[test]
 fn upload_backlog_progresses_via_persisted_local_payload_reads() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let _env = setup_offline_local_s3_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -12239,7 +12239,7 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
 /// all reads are served from local state without requiring remote fetch.
 #[test]
 fn warm_cache_sequential_read_bounded_latency_after_write() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -12334,7 +12334,7 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
 /// independently of the upload outcome.
 #[test]
 fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -12487,7 +12487,7 @@ fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
 
 #[test]
 fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -12573,7 +12573,7 @@ fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
 /// Does not require a real S3 backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_session_flush_ordering_is_deterministic() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let _env = setup_offline_local_s3_env();
     // Use a modest block size so the test runs quickly on any machine.
     let block_size: u32 = 128 * 1024;
@@ -12650,7 +12650,7 @@ async fn file_session_flush_ordering_is_deterministic() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_getattr_nonexistent_inode() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "getattr-noent");
 
     let result = vfs.getattr(999999);
@@ -12662,7 +12662,7 @@ async fn test_getattr_nonexistent_inode() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_lookup_nonexistent_entry() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "lookup-noent");
 
     let result = vfs.lookup(1, b"does-not-exist.txt");
@@ -12677,7 +12677,7 @@ async fn test_lookup_nonexistent_entry() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_increments_total_inodes() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "inode-count");
 
     let before = vfs
@@ -12702,7 +12702,7 @@ async fn test_create_increments_total_inodes() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_dangling_target() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "sym-dangle");
 
     let attr = vfs
@@ -12717,7 +12717,7 @@ async fn test_symlink_dangling_target() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_nlink_increments() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hardlink-nlink");
 
     let attr = vfs.create(1, b"original.txt", 0, 0, 0o644).unwrap();
@@ -12747,7 +12747,7 @@ async fn test_hardlink_nlink_increments() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_unlink_one_keeps_other() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "hardlink-unlink");
 
     let attr = vfs.create(1, b"hl-orig.txt", 0, 0, 0o644).unwrap();
@@ -12784,7 +12784,7 @@ async fn test_hardlink_unlink_one_keeps_other() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_exclusive_nonblocking_conflict() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flock-conflict");
 
     let attr = vfs.create(1, b"flock.txt", 0, 0, 0o644).unwrap();
@@ -12814,7 +12814,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_shared_then_exclusive_conflict() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "flock-sh-ex");
 
     let attr = vfs.create(1, b"flock-share.txt", 0, 0, 0o644).unwrap();
@@ -12867,7 +12867,7 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -12911,7 +12911,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -12968,7 +12968,7 @@ fn zeroio_startup_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13008,7 +13008,7 @@ fn zeroio_direct_studiovfs_new_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13067,7 +13067,7 @@ async fn ctrl_c_during_small_file_churn_does_not_hang() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13122,7 +13122,7 @@ async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13173,7 +13173,7 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13235,7 +13235,7 @@ async fn pending_upload_helpers_use_live_index_without_directory_scan() {
     set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
     set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13281,7 +13281,7 @@ async fn pending_upload_helpers_use_live_index_without_directory_scan() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_shutdown_drains_dirty_buffers() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "shutdown-drain");
     let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
 
@@ -13312,7 +13312,7 @@ async fn test_shutdown_drains_dirty_buffers() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_double_shutdown_does_not_panic() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "double-shutdown");
 
     vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
@@ -13328,7 +13328,7 @@ async fn test_double_shutdown_does_not_panic() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_double_unlink_fails() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "double-unlink");
 
     vfs.create(1, b"once.txt", 0, 0, 0o644).unwrap();
@@ -13342,7 +13342,7 @@ async fn test_double_unlink_fails() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_to_self_is_noop() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename-self");
 
     let attr = vfs.create(1, b"self.txt", 0, 0, 0o644).unwrap();
@@ -13364,7 +13364,7 @@ async fn test_rename_to_self_is_noop() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_sparse_write_at_high_offset() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "sparse-high");
     let block_size = vfs.meta().get_format_info().unwrap().block_size as u64;
 
@@ -13403,7 +13403,7 @@ async fn test_sparse_write_at_high_offset() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_unlink_child_then_rmdir_parent() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rmdir-after-unlink");
 
     let dir = vfs.mkdir(1, b"parent", 0, 0, 0o755).unwrap();
@@ -13426,7 +13426,7 @@ async fn test_unlink_child_then_rmdir_parent() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_mkdir_duplicate_name_fails() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "mkdir-dup");
 
     vfs.mkdir(1, b"dup-dir", 0, 0, 0o755).unwrap();
@@ -13439,7 +13439,7 @@ async fn test_mkdir_duplicate_name_fails() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_duplicate_name_fails() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "create-dup");
 
     vfs.create(1, b"dup.txt", 0, 0, 0o644).unwrap();
@@ -13453,7 +13453,7 @@ async fn test_create_duplicate_name_fails() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_mid_block_overwrite_preserves_surrounding_data() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "mid-block-overwrite");
 
     let attr = vfs.create(1, b"mid.bin", 0, 0, 0o644).unwrap();
@@ -13495,7 +13495,7 @@ async fn test_mid_block_overwrite_preserves_surrounding_data() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_remove_one_preserves_others() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "xattr-remove-one");
 
     let attr = vfs.create(1, b"xattr-rm.txt", 0, 0, 0o644).unwrap();
@@ -13519,7 +13519,7 @@ async fn test_xattr_remove_one_preserves_others() {
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_directory_with_children() {
     ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "rename-dir-tree");
 
     let dir = vfs.mkdir(1, b"old-name", 0, 0, 0o755).unwrap();
@@ -13546,7 +13546,7 @@ async fn test_rename_directory_with_children() {
 
 #[tokio::test]
 async fn acl_no_access_hides_directory_from_lookup_and_readdir() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "acl-hide");
 
     let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
@@ -13566,7 +13566,7 @@ async fn acl_no_access_hides_directory_from_lookup_and_readdir() {
 
 #[tokio::test]
 async fn acl_read_only_denies_writes_but_allows_reads() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "acl-ro");
 
     let file = vfs.create(1, b"ro.txt", 0, 0, 0o644).unwrap();
@@ -13591,7 +13591,7 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
     let _restore_principal = ScopedEnvVar::capture("STUDIOFS_PRINCIPAL");
     set_test_env("STUDIOFS_PRINCIPAL", "alice");
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let vfs = make_vfs(&tmp, "acl-wildcard-fallback");
 
     let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
@@ -13635,7 +13635,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -13757,7 +13757,7 @@ fn concurrent_reads_through_upload_finalization() {
     boot_rt.block_on(ensure_bucket());
     boot_rt.shutdown_background();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();

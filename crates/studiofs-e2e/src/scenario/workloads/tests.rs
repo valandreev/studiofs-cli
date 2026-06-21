@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use tempfile::tempdir;
-
 use super::*;
 use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
 use crate::scenario::{available_scenarios, resolve_scenario};

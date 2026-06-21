@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_open_meta_engine_missing_file_creates_redb() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let path = dir.path().join("missing-meta.db");
         assert!(!path.exists());
 

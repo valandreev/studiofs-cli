@@ -31,6 +31,7 @@ ctrlc = { version = "3", features = ["termination"] }
 [dev-dependencies]
 syn = { version = "2", features = ["full"] }
 tempfile.workspace = true
+studiofs-test-support.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

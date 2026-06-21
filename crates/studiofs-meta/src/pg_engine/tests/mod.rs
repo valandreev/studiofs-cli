@@ -3,7 +3,6 @@ use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use tempfile::tempdir;
 use uuid::Uuid;
 
 mod inode_allocator;
@@ -458,7 +457,7 @@ fn create_published_small_file(
 }
 
 pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
     local.init_root(0, 0).expect("init root");

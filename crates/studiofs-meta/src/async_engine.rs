@@ -46,7 +46,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn seed_format_engine() -> (TempDir, Arc<RedbMetaEngine>) {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
         let info = FormatInfo::new(

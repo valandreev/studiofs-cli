@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn upload_stage_roundtrip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().expect("provision");
         let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn upload_stage_link_payload_is_idempotent() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().expect("provision");
         let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");

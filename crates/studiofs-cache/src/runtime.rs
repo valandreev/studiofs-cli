@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn empty_root_has_no_runtime_backend() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let detection = detect_cache_backends(temp.path()).unwrap();
 
         assert!(!detection.has_runtime_layout());
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn detects_current_runtime_layout() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1556,7 +1556,7 @@ mod tests {
 
     #[test]
     fn partial_runtime_layout_is_not_reported_as_current_backend() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
@@ -1569,7 +1569,7 @@ mod tests {
 
     #[test]
     fn local_payload_backend_requires_runtime_dirs() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let err = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0xAB; 16],
@@ -1584,7 +1584,7 @@ mod tests {
     #[test]
     fn local_payload_backend_satisfies_local_payload_backend_contract() {
         assert_local_payload_backend_contract(|| {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
             let layout = LocalPayloadLayout::from_cache_root(temp.path());
             create_v3_marker(&layout);
             let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
@@ -1598,7 +1598,7 @@ mod tests {
 
     #[test]
     fn local_payload_backend_roundtrips_payload_and_index_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn local_payload_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn local_backend_uses_index_state_after_reopen() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1698,7 +1698,7 @@ mod tests {
 
     #[test]
     fn local_payload_backend_reopens_existing_index_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1730,7 +1730,7 @@ mod tests {
 
     #[test]
     fn local_backend_object_stats_distinguish_local_pending_and_downloaded_cache() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1755,7 +1755,7 @@ mod tests {
 
     #[test]
     fn local_backend_get_refreshes_access_order() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1775,7 +1775,7 @@ mod tests {
 
     #[test]
     fn local_backend_read_into_refreshes_access_order() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[test]
     fn local_payload_backend_persists_payload_objects_in_file_per_object_layout() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1820,7 +1820,7 @@ mod tests {
 
     #[test]
     fn local_backend_reopens_with_existing_payload_file() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn local_backend_open_reconciles_stale_index_entries() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1874,7 +1874,7 @@ mod tests {
 
     #[test]
     fn local_backend_open_removes_orphan_temp_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1894,7 +1894,7 @@ mod tests {
 
     #[test]
     fn local_backend_failed_upload_requeues_without_losing_payload_bytes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1932,7 +1932,7 @@ mod tests {
 
     #[test]
     fn local_backend_prunes_missing_payload_entries_from_dirty_replay() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1959,7 +1959,7 @@ mod tests {
 
     #[test]
     fn local_backend_object_stats_do_not_prune_missing_payload_entries() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn local_backend_enforces_budget_with_deterministic_eviction_order() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2015,7 +2015,7 @@ mod tests {
 
     #[test]
     fn local_backend_returns_capacity_exhausted_for_non_evictable_pressure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn local_backend_waits_for_pending_upload_drain_before_capacity_exhausted() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2084,7 +2084,7 @@ mod tests {
 
     #[test]
     fn local_backend_retry_low_space_reclaims_when_pending_upload_already_finished() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2123,7 +2123,7 @@ mod tests {
 
     #[test]
     fn local_backend_retry_reclaims_completed_upload_while_other_dirty_objects_remain() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2165,7 +2165,7 @@ mod tests {
 
     #[test]
     fn low_space_retry_exits_immediately_when_no_dirty_objects_remain() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2200,7 +2200,7 @@ mod tests {
 
     #[test]
     fn low_space_retry_extends_while_upload_drain_makes_progress() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn low_space_retry_stops_promptly_without_upload_drain_progress() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2268,7 +2268,7 @@ mod tests {
 
     #[test]
     fn low_space_retry_has_bounded_progress_driven_waits() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2312,7 +2312,7 @@ mod tests {
 
     #[test]
     fn local_backend_background_pressure_reclaims_to_low_watermark() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2346,7 +2346,7 @@ mod tests {
 
     #[test]
     fn local_runtime_pins_do_not_persist_across_reopen() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2377,7 +2377,7 @@ mod tests {
 
     #[test]
     fn local_backend_eviction_tracks_skipped_non_evictable_scan_rows() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -2414,7 +2414,7 @@ mod tests {
 
     #[test]
     fn dirty_validation_gate_allows_single_runner_per_interval() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 

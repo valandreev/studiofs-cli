@@ -175,7 +175,7 @@ fn encryption_config_deserialization_rejects_malformed_or_unsupported_json() {
 
 #[test]
 fn test_read_format_info_readonly_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("probe.db");
 
     let engine = RedbMetaEngine::open(&path).unwrap();
@@ -204,7 +204,7 @@ fn test_read_format_info_readonly_roundtrip() {
 
 #[test]
 fn test_read_format_info_readonly_returns_not_formatted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("probe-not-formatted.db");
 
     let engine = RedbMetaEngine::open(&path).unwrap();
@@ -217,7 +217,7 @@ fn test_read_format_info_readonly_returns_not_formatted() {
 
 #[test]
 fn test_read_format_info_readonly_reports_serialization_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("probe-invalid-format.db");
 
     let engine = RedbMetaEngine::open(&path).unwrap();

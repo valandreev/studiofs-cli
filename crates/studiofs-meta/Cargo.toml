@@ -31,3 +31,4 @@ zeroize.workspace = true
 [dev-dependencies]
 dotenvy.workspace = true
 uuid.workspace = true
+studiofs-test-support.workspace = true

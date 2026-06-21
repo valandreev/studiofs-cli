@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn mounted_chaos_initial_barrier_rejects_unreplicated_seed_tree() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -45,7 +45,7 @@ fn mounted_chaos_initial_barrier_rejects_unreplicated_seed_tree() {
 
 #[test]
 fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let writer = client_spec_for(
         &sandbox,
@@ -74,7 +74,7 @@ fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
 
 #[test]
 fn stale_remount_warm_history_rejects_stale_zero_byte_nested_file() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = temp.path().join("scenario");
     let shared_mount = temp.path().join("mounts").join("shared");
@@ -115,7 +115,7 @@ fn stale_remount_warm_history_rejects_stale_zero_byte_nested_file() {
 
 #[test]
 fn stale_remount_warm_history_uses_bounded_helper_for_rename() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = temp.path().join("scenario");
     let shared_mount = temp.path().join("mounts").join("shared");
@@ -157,7 +157,7 @@ fn stale_remount_warm_history_uses_bounded_helper_for_rename() {
 
 #[test]
 fn mounted_initial_payload_barrier_rejects_wrong_peer_payload() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let clients = ADVANCED_MOUNTED_CLIENT_NAMES
         .iter()
@@ -207,7 +207,7 @@ fn mounted_initial_payload_barrier_rejects_wrong_peer_payload() {
 
 #[test]
 fn mounted_initial_payload_probe_timeout_reports_blocked_client_without_waiting_forever() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let clients = ["client-a", "client-b"]
         .into_iter()
@@ -246,7 +246,7 @@ fn mounted_initial_payload_probe_timeout_reports_blocked_client_without_waiting_
 
 #[test]
 fn mounted_probe_timeout_poison_skips_remaining_validation_probes() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let clients = ["client-a", "client-b"]
         .into_iter()
@@ -293,7 +293,7 @@ fn mounted_probe_timeout_poison_skips_remaining_validation_probes() {
 
 #[test]
 fn open_handle_initial_seed_rejects_stale_zero_byte_file() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let writer = client_spec_for(
         &sandbox,
@@ -333,7 +333,7 @@ fn open_handle_initial_seed_rejects_stale_zero_byte_file() {
 
 #[test]
 fn mounted_chaos_initial_readback_waits_for_delayed_visibility() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let file_path = temp.path().join("chaos").join("delayed.txt");
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, b"").unwrap();
@@ -360,7 +360,7 @@ fn mounted_chaos_initial_readback_waits_for_delayed_visibility() {
 
 #[test]
 fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let missing_path = temp.path().join("missing-empty.txt");
 
     let pool = BoundedMountedIoPool::new(1);
@@ -382,7 +382,7 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
 
 #[test]
 fn mounted_payload_readback_accepts_existing_empty_file() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let empty_path = temp.path().join("empty.txt");
     std::fs::write(&empty_path, []).unwrap();
 
@@ -478,7 +478,7 @@ fn bounded_mounted_io_fails_fast_when_previous_worker_is_stuck() {
 
 #[test]
 fn mounted_chaos_initial_barrier_accepts_replicated_seed_tree() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -521,7 +521,7 @@ fn mounted_chaos_initial_barrier_accepts_replicated_seed_tree() {
 
 #[test]
 fn hotspot_churn_initial_barrier_rejects_unreplicated_hotspot_dir() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -564,7 +564,7 @@ fn hotspot_churn_initial_barrier_rejects_unreplicated_hotspot_dir() {
 
 #[test]
 fn hotspot_churn_initial_barrier_accepts_replicated_hotspot_dir() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -602,7 +602,7 @@ fn hotspot_churn_initial_barrier_accepts_replicated_hotspot_dir() {
 
 #[test]
 fn advanced_mounted_validate_rejects_failed_long_history_oracle() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-long-history-validation");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -675,7 +675,7 @@ fn advanced_mounted_validate_rejects_failed_long_history_oracle() {
 
 #[test]
 fn open_handle_initial_barrier_rejects_unreplicated_initial_tree() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -718,7 +718,7 @@ fn open_handle_initial_barrier_rejects_unreplicated_initial_tree() {
 
 #[test]
 fn open_handle_initial_barrier_accepts_replicated_initial_tree() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -782,7 +782,7 @@ fn open_handle_initial_barrier_accepts_replicated_initial_tree() {
 
 #[test]
 fn mounted_smoke_reports_unmount_error_when_body_also_fails() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")

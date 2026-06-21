@@ -17,11 +17,10 @@ use studiofs_e2e::client::{
     PeerVolumeBootstrapOptions, S3Config, VolumeBootstrapOptions,
 };
 use studiofs_e2e::infra::ServicePort;
-use tempfile::tempdir;
 
 #[test]
 fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let calls = Rc::clone(&executor.calls);
     let killed = Rc::clone(&executor.killed);
@@ -99,7 +98,7 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
 
 #[test]
 fn controller_can_discover_and_mount_late_observer_after_warm_clients() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let calls = Rc::clone(&executor.calls);
     let config = test_config(temp.path());
@@ -135,7 +134,7 @@ fn controller_can_discover_and_mount_late_observer_after_warm_clients() {
 
 #[test]
 fn mount_env_overrides_are_scoped_to_the_named_client() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let calls = Rc::clone(&executor.calls);
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
@@ -189,7 +188,7 @@ fn mount_env_overrides_are_scoped_to_the_named_client() {
 
 #[test]
 fn mount_arg_overrides_are_scoped_to_the_named_client() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let calls = Rc::clone(&executor.calls);
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
@@ -218,7 +217,7 @@ fn mount_arg_overrides_are_scoped_to_the_named_client() {
 
 #[test]
 fn mount_metadata_records_process_id_after_successful_mount() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
 
@@ -236,7 +235,7 @@ fn mount_metadata_records_process_id_after_successful_mount() {
 
 #[test]
 fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         create_local_metadata_db: true,
         fail_if_local_metadata_dir_preexists: true,
@@ -285,7 +284,7 @@ fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
 
 #[test]
 fn peer_bootstrap_initializes_each_client_volume_and_cross_discovers_neighbors() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         create_local_metadata_db: true,
         fail_if_local_metadata_dir_preexists: true,
@@ -352,7 +351,7 @@ fn peer_bootstrap_initializes_each_client_volume_and_cross_discovers_neighbors()
 
 #[test]
 fn controller_can_select_peer_volume_for_sequential_mount_validation() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         create_local_metadata_db: true,
         fail_if_local_metadata_dir_preexists: true,
@@ -395,7 +394,7 @@ fn controller_can_select_peer_volume_for_sequential_mount_validation() {
 
 #[test]
 fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stale_db = temp
         .path()
         .join("run-1")
@@ -432,7 +431,7 @@ fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
 
 #[test]
 fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let metadata_path = temp
         .path()
         .join("run-1")
@@ -461,7 +460,7 @@ fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path()
 
 #[test]
 fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = ClientControllerConfig::from_compose_services(
         Path::new("studiofs-test-bin").to_path_buf(),
         temp.path().join("run-1"),
@@ -488,7 +487,7 @@ fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
 
 #[test]
 fn compose_service_config_can_scope_volume_to_scenario() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = ClientControllerConfig::from_compose_services_for_scenario(
         Path::new("studiofs-test-bin").to_path_buf(),
         temp.path().join("run-1"),
@@ -511,7 +510,7 @@ fn compose_service_config_can_scope_volume_to_scenario() {
 
 #[test]
 fn compose_service_config_keeps_bucket_name_within_s3_length_limit() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = ClientControllerConfig::from_compose_services(
         Path::new("studiofs-test-bin").to_path_buf(),
         temp.path().join("run-1"),
@@ -542,7 +541,7 @@ fn compose_service_config_keeps_bucket_name_within_s3_length_limit() {
 
 #[test]
 fn create_clients_rejects_path_traversal_client_names() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
 
@@ -562,7 +561,7 @@ fn create_clients_rejects_path_traversal_client_names() {
 
 #[test]
 fn configured_mount_points_override_client_artifact_metadata_dirs() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut config = test_config(temp.path());
     let mount_a = temp.path().join("mount-a");
     let mount_b = temp.path().join("mount-b");
@@ -590,7 +589,7 @@ fn configured_mount_points_override_client_artifact_metadata_dirs() {
 #[cfg(windows)]
 #[test]
 fn default_windows_mount_points_are_drive_roots_not_metadata_dirs() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut controller =
         MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
 
@@ -617,7 +616,7 @@ fn default_windows_mount_points_are_drive_roots_not_metadata_dirs() {
 
 #[test]
 fn mount_rejects_already_active_mount_point_before_spawning() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         mount_ready_before_spawn: true,
         ..RecordingExecutor::new()
@@ -638,7 +637,7 @@ fn mount_rejects_already_active_mount_point_before_spawning() {
 
 #[test]
 fn system_readiness_does_not_accept_precreated_mount_directory() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = studiofs_e2e::client::SystemClientProcessExecutor;
     let command = client_command_for_mount_point(temp.path().join("mount"));
     std::fs::create_dir_all(&command.mount_point).unwrap();
@@ -648,7 +647,7 @@ fn system_readiness_does_not_accept_precreated_mount_directory() {
 
 #[test]
 fn client_index_out_of_range_is_distinct_from_no_clients() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut controller =
         MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
     controller.create_clients(["client-a"]).unwrap();
@@ -663,7 +662,7 @@ fn client_index_out_of_range_is_distinct_from_no_clients() {
 
 #[test]
 fn create_clients_refuses_to_drop_running_process_handles() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let killed = Rc::clone(&executor.killed);
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
@@ -680,7 +679,7 @@ fn create_clients_refuses_to_drop_running_process_handles() {
 
 #[test]
 fn unmount_waits_for_mount_process_to_exit() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let process_wait_calls = Rc::clone(&executor.process_wait_calls);
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
@@ -699,7 +698,7 @@ fn unmount_waits_for_mount_process_to_exit() {
 
 #[test]
 fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let calls = Rc::clone(&executor.calls);
     let killed = Rc::clone(&executor.killed);
@@ -737,7 +736,7 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
 
 #[test]
 fn force_kill_all_attempts_every_client_and_clears_state_after_kill_error() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         kill_error_after: Cell::new(Some(1)),
         ..RecordingExecutor::new()
@@ -762,7 +761,7 @@ fn force_kill_all_attempts_every_client_and_clears_state_after_kill_error() {
 
 #[test]
 fn force_kill_all_waits_for_mount_processes_to_exit_after_termination() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
     let wait_calls = Rc::clone(&executor.process_wait_calls);
     let mut controller = MultiClientController::new(test_config(temp.path()), executor);
@@ -782,7 +781,7 @@ fn force_kill_all_waits_for_mount_processes_to_exit_after_termination() {
 
 #[test]
 fn unmount_all_force_kills_mount_process_that_survives_graceful_umount() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut config = test_config(temp.path());
     config.mount_exit_timeout = Duration::from_millis(20);
     config.poll_interval = Duration::from_millis(1);
@@ -813,7 +812,7 @@ fn unmount_all_force_kills_mount_process_that_survives_graceful_umount() {
 
 #[test]
 fn mount_reports_process_exit_while_waiting_for_readiness() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         mount_ready: Cell::new(false),
         process_exit_status: Cell::new(42),
@@ -838,7 +837,7 @@ fn mount_reports_process_exit_while_waiting_for_readiness() {
 
 #[test]
 fn command_failure_includes_stdout_and_stderr() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         run_status: Cell::new(17),
         run_stdout: "stdout diagnostics".to_string(),
@@ -857,7 +856,7 @@ fn command_failure_includes_stdout_and_stderr() {
 
 #[test]
 fn command_failure_truncates_large_stdout_and_stderr() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         run_status: Cell::new(17),
         run_stdout: "o".repeat(10_000),
@@ -875,7 +874,7 @@ fn command_failure_truncates_large_stdout_and_stderr() {
 
 #[test]
 fn unmount_all_continues_after_stuck_client_and_clears_failed_handle_state() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor {
         exit_requires_kill: true,
         kill_error_after: Cell::new(Some(1)),

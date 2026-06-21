@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn postgres_outage_records_local_operations_and_recovery_metrics() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -100,7 +100,7 @@ fn postgres_outage_records_local_operations_and_recovery_metrics() {
 
 #[test]
 fn postgres_outage_allows_missing_writer_recovery_after_unclean_shutdown() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -152,7 +152,7 @@ fn postgres_outage_allows_missing_writer_recovery_after_unclean_shutdown() {
 
 #[test]
 fn postgres_outage_empty_writer_placeholder_fails_final_convergence() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -197,7 +197,7 @@ fn postgres_outage_empty_writer_placeholder_fails_final_convergence() {
 
 #[test]
 fn postgres_outage_writer_recovery_reports_equal_length_corruption() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -240,7 +240,7 @@ fn postgres_outage_writer_recovery_reports_equal_length_corruption() {
 
 #[test]
 fn postgres_outage_duration_includes_postgres_restart_wait() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -283,7 +283,7 @@ fn postgres_outage_duration_includes_postgres_restart_wait() {
 
 #[test]
 fn rustfs_outage_keeps_local_writes_private_until_recovery_and_records_checksums() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -394,7 +394,7 @@ fn rustfs_outage_keeps_local_writes_private_until_recovery_and_records_checksums
 
 #[test]
 fn rustfs_outage_records_all_peer_visibility_and_final_checksums() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-four-client");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -437,7 +437,7 @@ fn rustfs_outage_records_all_peer_visibility_and_final_checksums() {
 
 #[test]
 fn rustfs_outage_duration_excludes_peer_visibility_probe_latency() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -479,7 +479,7 @@ fn rustfs_outage_duration_excludes_peer_visibility_probe_latency() {
 
 #[test]
 fn rustfs_peer_visibility_probe_propagates_unexpected_io_errors() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let mount = temp.path().join("mounts").join("client-b");
     std::fs::create_dir_all(mount.join(RUSTFS_OUTAGE_FILE_NAME)).unwrap();
@@ -492,7 +492,7 @@ fn rustfs_peer_visibility_probe_propagates_unexpected_io_errors() {
 
 #[test]
 fn compose_control_reports_missing_run_manifest_path() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let context = ScenarioContext {
         run_id: "run-1".to_string(),
         seed: 325,
@@ -509,7 +509,7 @@ fn compose_control_reports_missing_run_manifest_path() {
 
 #[test]
 fn outage_operations_log_rejected_writer_write_before_failing_expected_operation() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -551,7 +551,7 @@ fn outage_operations_log_rejected_writer_write_before_failing_expected_operation
 
 #[test]
 fn outage_operations_require_existing_scenario_dir() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let context = ScenarioContext {
         run_id: "run-1".to_string(),
         seed: 325,

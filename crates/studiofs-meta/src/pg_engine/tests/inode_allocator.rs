@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn persisted_pg_client_slot_roundtrips_in_local_counter() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -83,7 +83,7 @@ fn prime_local_id_ranges_migrates_legacy_inode_ranges_to_durable_windows() {
 
 #[test]
 fn open_with_persisted_slot_and_ranges_survives_pg_unavailable() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -130,7 +130,7 @@ fn open_with_persisted_slot_and_ranges_survives_pg_unavailable() {
 
 #[test]
 fn sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -243,7 +243,7 @@ fn sfs315_failed_object_batch_preserves_smaller_inode_headroom() {
 
 #[test]
 fn open_with_persisted_slot_and_legacy_inode_ranges_survives_pg_unavailable() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -297,7 +297,7 @@ fn open_with_persisted_slot_and_legacy_inode_ranges_survives_pg_unavailable() {
 
 #[test]
 fn open_with_persisted_slot_without_ranges_still_requires_pg() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -329,7 +329,7 @@ fn open_with_persisted_ranges_does_not_require_file_lock_schema() {
     let _schema_error = set_schema_ensure_test_override(
         "postgres file lock lease schema ensure failed: permission denied (sqlstate=42501)",
     );
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -832,8 +832,8 @@ fn test_pg_clients_reserve_disjoint_local_id_ranges() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-client-slots");
@@ -892,8 +892,8 @@ fn test_pg_inode_windows_are_scoped_per_volume() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume_a = PgTestVolume::new(&dsn, "pg-inode-window-volume-a");
@@ -936,8 +936,8 @@ fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-rename-overwrite");

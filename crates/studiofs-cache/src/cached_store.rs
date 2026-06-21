@@ -1589,7 +1589,7 @@ mod tests {
 
     #[test]
     fn writer_slice_accepts_in_order_writes_into_pages() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1605,7 +1605,7 @@ mod tests {
 
     #[test]
     fn writer_slice_zero_fills_sparse_gap_before_offset() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_slice_full_block_flush_stages_and_registers_upload() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn detached_persist_without_upload_does_not_report_pending_upload_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
         let mut config = writer_config();
         config.submit_upload = false;
@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn detached_persist_with_upload_counts_pending_bytes_once() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1691,7 +1691,7 @@ mod tests {
 
     #[test]
     fn writer_slice_full_block_flush_uses_compact_hot_upload_payload() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let inner_backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
@@ -1731,7 +1731,7 @@ mod tests {
 
     #[test]
     fn writer_slice_hot_upload_copies_payload_when_dirty_tail_remains() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let inner_backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
@@ -1769,7 +1769,7 @@ mod tests {
 
     #[test]
     fn writer_slice_keeps_dirty_prefix_retryable_after_owned_put_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let inner_backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[test]
     fn writer_slice_keeps_dirty_prefix_retryable_after_upload_stage_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
         let layout = LocalPayloadLayout::from_cache_root(dir.path());
@@ -1840,7 +1840,7 @@ mod tests {
 
     #[test]
     fn writer_slice_flush_completed_blocks_leaves_partial_tail_buffered() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1862,7 +1862,7 @@ mod tests {
 
     #[test]
     fn writer_slice_finish_stages_partial_tail() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1883,7 +1883,7 @@ mod tests {
 
     #[test]
     fn writer_slice_age_threshold_freezes_dirty_tail() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1904,7 +1904,7 @@ mod tests {
 
     #[test]
     fn writer_slice_staged_payload_survives_reopen_under_same_cache_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let object_id = {
             let (cached_store, _rx) = temp_cached_store(&dir);
             let mut writer = cached_store.open_writer_slice(writer_config());
@@ -1925,7 +1925,7 @@ mod tests {
 
     #[test]
     fn writer_slice_pressure_accounting_reports_throttle_events() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut config = writer_config();
         config.dirty_byte_limit = Some(4);
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[test]
     fn writer_slice_rejects_sparse_write_before_allocating_past_buffer_limit() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut config = writer_config();
         config.max_buffer_bytes = Some(8);
@@ -1962,7 +1962,7 @@ mod tests {
 
     #[test]
     fn writer_slice_default_buffer_limit_rejects_unbounded_sparse_gap() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -1982,7 +1982,7 @@ mod tests {
 
     #[test]
     fn writer_slice_rejects_write_when_rounded_capacity_exceeds_buffer_limit() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut config = writer_config();
         config.page_size = 16;
@@ -2006,7 +2006,7 @@ mod tests {
 
     #[test]
     fn writer_slice_drop_releases_unstaged_dirty_byte_accounting() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
 
         {
@@ -2020,7 +2020,7 @@ mod tests {
 
     #[test]
     fn writer_slice_flushes_multiple_blocks_and_keeps_tail_readable() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let mut writer = cached_store.open_writer_slice(writer_config());
 
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_and_complete_tracks_pending_and_pin_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(1, 0, 101, 1);
@@ -2057,7 +2057,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_clears_pending_and_pin_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(7, 4096, 202, 3);
@@ -2071,7 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn requeue_preserves_pending_depth() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(9, 8192, 303, 4);
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn upload_stage_roundtrip_through_cached_store_api() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
         let put = LocalPayloadPut {
             object_id: 404,
@@ -2113,7 +2113,7 @@ mod tests {
 
     #[test]
     fn hot_upload_buffer_evicts_oldest_entries_over_budget() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
@@ -2209,7 +2209,7 @@ mod tests {
 
     #[test]
     fn pressure_maintenance_does_not_evict_pinned_uploaded_blocks() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
 
         cached_store.put(20, &[0x01; 30], true).expect("put 20");
@@ -2230,7 +2230,7 @@ mod tests {
 
     #[test]
     fn double_pin_requires_double_unpin_before_eviction_can_resume() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
 
         cached_store.put(20, &[0x01; 30], true).expect("put 20");

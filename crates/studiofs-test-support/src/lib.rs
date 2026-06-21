@@ -32,6 +32,24 @@ pub fn workspace_target_tempdir(prefix: &str) -> tempfile::TempDir {
         .expect("create workspace target tempdir")
 }
 
+/// Returns a unique path under the workspace `target/` directory.
+///
+/// This is for tests that need to hand an artifact root path to code that
+/// creates the directory itself instead of owning a [`tempfile::TempDir`].
+#[must_use]
+pub fn workspace_target_temp_path(prefix: &str) -> PathBuf {
+    let temp_root = workspace_root().join("target").join(TARGET_TEST_DIR);
+    std::fs::create_dir_all(&temp_root).expect("create workspace target test dir");
+    temp_root.join(format!(
+        "{prefix}{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_nanos()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,5 +59,12 @@ mod tests {
         let temp = workspace_target_tempdir("helper-");
 
         assert!(temp.path().starts_with(workspace_root().join("target")));
+    }
+
+    #[test]
+    fn workspace_target_temp_path_returns_path_under_workspace_target() {
+        let path = workspace_target_temp_path("helper-");
+
+        assert!(path.starts_with(workspace_root().join("target")));
     }
 }

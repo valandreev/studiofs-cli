@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn effective_access_level_depth_limit_fails_closed() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) =
             make_test_vfs(&tmp, "depth-limit-fails-closed", VfsConfig::default());
 
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn effective_acl_cache_overflow_evicts_partially() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let cfg = VfsConfig {
             effective_acl_cache_capacity: 4,
             ..VfsConfig::default()

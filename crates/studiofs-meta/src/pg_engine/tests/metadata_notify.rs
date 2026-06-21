@@ -7,8 +7,8 @@ fn test_pg_sync_metadata_between_clients() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-sync");
@@ -40,8 +40,8 @@ fn test_pg_metadata_notify_listener_wakes_remote_sync_without_poll() {
 
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-sync");
@@ -112,8 +112,8 @@ fn test_pg_metadata_notify_listener_start_syncs_missed_change() {
 
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-missed");
@@ -166,7 +166,7 @@ fn test_pg_metadata_notify_listener_releases_engine_after_drop() {
 
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-drop");
     let info = volume.format_info();

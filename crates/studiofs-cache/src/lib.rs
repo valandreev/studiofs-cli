@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn prepare_local_payload_runtime_creates_contract_paths() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
 
         let prepared =
             prepare_local_payload_runtime(temp.path()).expect("prepare local payload runtime");
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn prepare_local_payload_runtime_is_idempotent() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
 
         let first = prepare_local_payload_runtime(temp.path()).expect("first prepare");
         let second = prepare_local_payload_runtime(temp.path()).expect("second prepare");
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn prepare_local_payload_runtime_removes_retired_v3_subtree() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let retired_root = temp.path().join(RETIRED_LOCAL_PAYLOAD_SUBTREE);
         std::fs::create_dir_all(retired_root.join("payload")).expect("create retired payload");
         std::fs::create_dir_all(retired_root.join("index")).expect("create retired index");
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn prepare_local_payload_runtime_keeps_unrecognized_v3_entry() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let retired_root = temp.path().join(RETIRED_LOCAL_PAYLOAD_SUBTREE);
         std::fs::create_dir_all(&retired_root).expect("create unrelated v3 dir");
         std::fs::write(retired_root.join("notes.txt"), b"user data").expect("write unrelated file");
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn prepared_local_payload_runtime_opens_local_payload_backend() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let prepared =
             prepare_local_payload_runtime(temp.path()).expect("prepare local payload runtime");
 
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn prepared_local_payload_runtime_reuses_detection_to_open_budgeted_backend() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let prepared =
             prepare_local_payload_runtime(temp.path()).expect("prepare local payload runtime");
 
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn local_payload_runtime_root_opens_local_payload_backend() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let cache_root = temp.path();
         let layout = LocalPayloadLayout::from_cache_root(cache_root);
         layout.provision().expect("provision runtime layout");
