@@ -95,6 +95,24 @@ struct MeasuredMountedPhaseResult {
     during_upload_observation: Option<PendingUploadObservation>,
 }
 
+#[derive(Clone)]
+struct MountedWorkloadFiles {
+    files: Arc<[WorkFile]>,
+    targets: Arc<[Arc<str>]>,
+}
+
+impl MountedWorkloadFiles {
+    fn new(files: Vec<WorkFile>) -> Self {
+        let files: Arc<[WorkFile]> = Arc::from(files);
+        let targets = operation_log_targets(&files);
+        Self { files, targets }
+    }
+
+    fn len(&self) -> usize {
+        self.files.len()
+    }
+}
+
 #[derive(Default)]
 struct MountedMemoryAccumulator {
     mount_pid: u32,
@@ -1414,7 +1432,7 @@ async fn read_file_with_plan(
 
 async fn run_mounted_write_phase(
     params: &BenchmarkConfig,
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     size_class_bounds: SizeClassBounds,
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
@@ -1426,7 +1444,7 @@ async fn run_mounted_write_phase(
     };
     if params.sequential_streams {
         let writes_by_stream = run_filesystem_writes_sequential_streams(
-            files,
+            workload_files,
             order,
             params.concurrency,
             params.io_depth,
@@ -1444,7 +1462,7 @@ async fn run_mounted_write_phase(
         Ok((merged, writes_by_stream))
     } else {
         let writes = run_filesystem_writes(
-            files,
+            workload_files,
             order,
             params.io_depth,
             params.concurrency,
@@ -1460,7 +1478,7 @@ async fn run_mounted_write_phase(
 
 async fn run_mounted_read_phase(
     params: &BenchmarkConfig,
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     size_class_bounds: SizeClassBounds,
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
@@ -1474,7 +1492,7 @@ async fn run_mounted_read_phase(
     };
     if params.sequential_streams {
         let reads_by_stream = run_filesystem_reads_sequential_streams(
-            files,
+            workload_files,
             order,
             params.concurrency,
             params.io_depth,
@@ -1492,7 +1510,7 @@ async fn run_mounted_read_phase(
         Ok((merged, reads_by_stream))
     } else {
         let reads = run_filesystem_reads(
-            files,
+            workload_files,
             order,
             params.io_depth,
             params.concurrency,
@@ -1569,7 +1587,7 @@ async fn collect_stream_workers(
 }
 
 async fn run_mounted_stat_phase(
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     concurrency: usize,
     size_class_bounds: SizeClassBounds,
@@ -1579,7 +1597,7 @@ async fn run_mounted_stat_phase(
         .copied()
         .filter(|work_index| {
             classify_size(
-                files[*work_index].size,
+                workload_files.files[*work_index].size,
                 size_class_bounds.small_max,
                 size_class_bounds.medium_max,
             ) == SizeClass::Small
@@ -1593,14 +1611,12 @@ async fn run_mounted_stat_phase(
 
     let worker_count = concurrency.max(1).min(stat_order.len());
     let next_operation = Arc::new(AtomicUsize::new(0));
-    let files: Arc<[WorkFile]> = Arc::from(files);
-    let targets = operation_log_targets(&files);
     let stat_order: Arc<[usize]> = Arc::from(stat_order);
     let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
-        let files = Arc::clone(&files);
-        let targets = Arc::clone(&targets);
+        let files = Arc::clone(&workload_files.files);
+        let targets = Arc::clone(&workload_files.targets);
         let stat_order = Arc::clone(&stat_order);
         let next_operation = Arc::clone(&next_operation);
         let counter = counter.clone();
@@ -1696,7 +1712,7 @@ async fn cleanup_mount_artifacts_best_effort(path: &Path, run_id: &str) -> Optio
 }
 
 async fn run_filesystem_writes(
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
@@ -1708,14 +1724,12 @@ async fn run_filesystem_writes(
     let worker_count = concurrency.max(queue_depth);
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let files: Arc<[WorkFile]> = Arc::from(files);
-    let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order);
     let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
-        let files = Arc::clone(&files);
-        let targets = Arc::clone(&targets);
+        let files = Arc::clone(&workload_files.files);
+        let targets = Arc::clone(&workload_files.targets);
         let order = Arc::clone(&order);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -1776,7 +1790,7 @@ async fn run_filesystem_writes(
 }
 
 async fn run_filesystem_reads(
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
@@ -1788,14 +1802,12 @@ async fn run_filesystem_reads(
     let worker_count = concurrency.max(queue_depth);
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let files: Arc<[WorkFile]> = Arc::from(files);
-    let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order);
     let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
-        let files = Arc::clone(&files);
-        let targets = Arc::clone(&targets);
+        let files = Arc::clone(&workload_files.files);
+        let targets = Arc::clone(&workload_files.targets);
         let order = Arc::clone(&order);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -1860,7 +1872,7 @@ async fn run_filesystem_reads(
 }
 
 async fn run_filesystem_writes_sequential_streams(
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     stream_count: usize,
     io_depth: usize,
@@ -1871,14 +1883,12 @@ async fn run_filesystem_writes_sequential_streams(
     let segments = split_stream_segments(order, stream_count);
     let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let files: Arc<[WorkFile]> = Arc::from(files);
-    let targets = operation_log_targets(&files);
     let mut join_set = JoinSet::new();
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
-        let files = Arc::clone(&files);
-        let targets = Arc::clone(&targets);
+        let files = Arc::clone(&workload_files.files);
+        let targets = Arc::clone(&workload_files.targets);
         let progress = progress.clone();
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
@@ -1931,7 +1941,7 @@ async fn run_filesystem_writes_sequential_streams(
 }
 
 async fn run_filesystem_reads_sequential_streams(
-    files: &[WorkFile],
+    workload_files: MountedWorkloadFiles,
     order: &[usize],
     stream_count: usize,
     io_depth: usize,
@@ -1942,14 +1952,12 @@ async fn run_filesystem_reads_sequential_streams(
     let segments = split_stream_segments(order, stream_count);
     let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let files: Arc<[WorkFile]> = Arc::from(files);
-    let targets = operation_log_targets(&files);
     let mut join_set = JoinSet::new();
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
-        let files = Arc::clone(&files);
-        let targets = Arc::clone(&targets);
+        let files = Arc::clone(&workload_files.files);
+        let targets = Arc::clone(&workload_files.targets);
         let progress = progress.clone();
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
@@ -2040,9 +2048,13 @@ pub(crate) async fn run_mounted_end_to_end(
         if workload.sizes.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
-        let files = build_file_worklist(&workload.sizes, work_root);
-        let order =
-            build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
+        let workload_files =
+            MountedWorkloadFiles::new(build_file_worklist(&workload.sizes, work_root));
+        let order = build_access_sequence(
+            workload_files.len(),
+            params.access_pattern,
+            0x55aa_55aa_d00d_f00d,
+        );
 
         for warmup in 0..params.warmup_runs {
             tracing::info!(
@@ -2052,8 +2064,12 @@ pub(crate) async fn run_mounted_end_to_end(
                 total_warmups = params.warmup_runs,
                 "cache benchmark warm-up cycle started"
             );
-            let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
-            let _ = run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+            let _ =
+                run_mounted_write_phase(params, workload_files.clone(), &order, size_class_bounds)
+                    .await?;
+            let _ =
+                run_mounted_read_phase(params, workload_files.clone(), &order, size_class_bounds)
+                    .await?;
         }
 
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
@@ -2065,7 +2081,7 @@ pub(crate) async fn run_mounted_end_to_end(
             None => None,
         };
         let measured_write_path_before_for_report = measured_write_path_before.clone();
-        let files_ref = &files;
+        let workload_files_ref = workload_files.clone();
         let order_ref = &order;
         let cache_upload_dir_ref = &cache_upload_dir;
         let write_path_observability_path_ref = &write_path_observability_path;
@@ -2088,9 +2104,13 @@ pub(crate) async fn run_mounted_end_to_end(
                     portable_profile.set_phase("write");
                     let writes_wall_start = Instant::now();
                     let writes_cpu_start = process_cpu_time();
-                    let (writes, writes_by_stream) =
-                        run_mounted_write_phase(params, files_ref, order_ref, size_class_bounds)
-                            .await?;
+                    let (writes, writes_by_stream) = run_mounted_write_phase(
+                        params,
+                        workload_files_ref.clone(),
+                        order_ref,
+                        size_class_bounds,
+                    )
+                    .await?;
                     let writes_wall = writes_wall_start.elapsed();
                     let writes_cpu = writes_cpu_start
                         .and_then(|start_cpu| {
@@ -2124,9 +2144,13 @@ pub(crate) async fn run_mounted_end_to_end(
                     portable_profile.set_phase("during-upload-read");
                     let reads_wall_start = Instant::now();
                     let reads_cpu_start = process_cpu_time();
-                    let (reads, reads_by_stream) =
-                        run_mounted_read_phase(params, files_ref, order_ref, size_class_bounds)
-                            .await?;
+                    let (reads, reads_by_stream) = run_mounted_read_phase(
+                        params,
+                        workload_files_ref.clone(),
+                        order_ref,
+                        size_class_bounds,
+                    )
+                    .await?;
                     let reads_wall = reads_wall_start.elapsed();
                     let reads_cpu = reads_cpu_start
                         .and_then(|start_cpu| {
@@ -2143,7 +2167,7 @@ pub(crate) async fn run_mounted_end_to_end(
                     portable_profile.set_phase("stat");
                     let stats_wall_start = Instant::now();
                     let stats = run_mounted_stat_phase(
-                        files_ref,
+                        workload_files_ref.clone(),
                         order_ref,
                         params.concurrency,
                         size_class_bounds,
@@ -2256,6 +2280,7 @@ pub(crate) async fn run_mounted_end_to_end(
                 };
                 let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
                 let metrics_path = write_path_observability_path.as_deref();
+                let post_workload_files = workload_files.clone();
                 let ((comparison, final_snapshot), _, _, drain_timeline) =
                     sample_mounted_profile_during(
                         mount_pid,
@@ -2311,8 +2336,8 @@ pub(crate) async fn run_mounted_end_to_end(
                             let post_wall_start = Instant::now();
                             let (post_reads, _) = run_mounted_read_phase(
                                 params,
-                                files_ref,
-                                order_ref,
+                                post_workload_files.clone(),
+                                &order,
                                 size_class_bounds,
                             )
                             .await?;
@@ -2419,7 +2444,7 @@ pub(crate) async fn run_mounted_end_to_end(
             warmup_runs: params.warmup_runs,
             sizes: workload.source,
             workload_repeat: params.workload_repeat,
-            workload_files: files.len(),
+            workload_files: workload_files.len(),
             workload_small_files: workload.small_files,
             workload_medium_files: workload.medium_files,
             workload_large_files: workload.large_files,
@@ -2714,7 +2739,7 @@ mod tests {
         fs::write(&medium_path, vec![0x22; 8192])
             .await
             .expect("write medium file");
-        let files = vec![
+        let workload_files = MountedWorkloadFiles::new(vec![
             WorkFile {
                 path: small_path,
                 size: 1024,
@@ -2725,10 +2750,10 @@ mod tests {
                 size: 8192,
                 index: 1,
             },
-        ];
+        ]);
 
         let telemetry = run_mounted_stat_phase(
-            &files,
+            workload_files,
             &[0, 1],
             4,
             SizeClassBounds {
