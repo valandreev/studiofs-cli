@@ -1328,7 +1328,7 @@ pub struct VfsWritePathTuningStats {
 pub struct VfsFetchStats {
     /// Cache hits in fetch flow.
     pub cache_hits: u64,
-    /// Bytes served by local block-cache hits.
+    /// Bytes served by local payload-cache hits.
     #[serde(default)]
     pub cache_hit_bytes: u64,
     /// S3 fetch request count.
