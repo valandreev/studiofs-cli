@@ -310,7 +310,7 @@ fn write_wall_blocking_artifact_fixture(
 }
 
 fn mounts_dir_temp() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
+    studiofs_test_support::workspace_target_tempdir("test-")
 }
 
 fn sample_discovery(protocol_version: u32) -> LocalDiagnosticsDiscovery {
@@ -2355,7 +2355,7 @@ fn profiling_status_does_not_block_while_backend_is_starting() {
 
 #[test]
 fn wall_blocking_profiling_writes_summary_artifact() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut source = static_source();
     source.session.cache_path = temp.path().to_string_lossy().into_owned();
     let profiling =

@@ -1989,7 +1989,7 @@ mod tests {
 
     fn resolve_default_cache_for_client_root(root: &Path, name: &str) -> PathBuf {
         let root = std::path::absolute(root).expect("absolute client root");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = root.join("meta").join(name);
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn prepare_volume_cache_runtime_scopes_layout_by_volume_uuid() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let prepared =
             prepare_volume_cache_runtime(temp.path(), "volume-uuid").expect("cache path prepared");
 
@@ -2097,7 +2097,7 @@ mod tests {
 
     #[test]
     fn mount_plan_defaults_to_meta_cache_and_foreground_launch() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
@@ -2129,7 +2129,7 @@ mod tests {
 
     #[test]
     fn mount_plan_default_cache_tracks_client_root_metadata_dir() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root_a = temp.path().join("client-a");
         let root_b = temp.path().join("client-b");
 
@@ -2143,7 +2143,7 @@ mod tests {
 
     #[test]
     fn mount_plan_prefers_cli_runtime_settings_over_defaults() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let configured_cache_dir = temp.path().join("configured-cache");
@@ -2262,7 +2262,7 @@ mod tests {
 
     #[test]
     fn mount_plan_rejects_invalid_endpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2286,7 +2286,7 @@ mod tests {
 
     #[test]
     fn mount_plan_accepts_explicit_http_endpoint_override() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2308,7 +2308,7 @@ mod tests {
 
     #[test]
     fn mount_plan_marks_snapshot_mount_read_only() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2332,7 +2332,7 @@ mod tests {
 
     #[test]
     fn mount_plan_marks_explicit_live_mount_read_only() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[test]
     fn mount_meta_session_uses_live_metadata_when_snapshot_id_is_none() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, format_info) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
@@ -2373,7 +2373,7 @@ mod tests {
 
     #[test]
     fn foreground_shutdown_releases_vfs_handles_before_runtime_shutdown() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
         drop(seed_engine);
         let mount_point = startup_mount_point(&temp);
@@ -2422,7 +2422,7 @@ mod tests {
 
     #[test]
     fn mount_meta_session_materializes_snapshot_engine_and_marks_read_only() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _format_info) = seed_mount_meta_db(&temp, "demo");
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
@@ -2449,7 +2449,7 @@ mod tests {
 
     #[test]
     fn mount_meta_session_applies_endpoint_override_to_runtime_format_info() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
@@ -2467,7 +2467,7 @@ mod tests {
 
     #[test]
     fn mount_meta_session_accepts_persisted_explicit_http_endpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, mut format_info) = seed_mount_meta_db(&temp, "demo");
         format_info.endpoint = "http://192.168.1.20:10000".to_string();
         engine
@@ -2496,7 +2496,7 @@ mod tests {
 
     #[test]
     fn mount_plan_prepare_marks_snapshot_mount_read_only_and_uses_fake_backend() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
@@ -2549,7 +2549,7 @@ mod tests {
 
     #[test]
     fn mount_plan_prepare_daemon_skips_foreground_runtime() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
@@ -2627,7 +2627,7 @@ mod tests {
 
     #[test]
     fn prepared_mount_launch_success_invokes_backend_and_removes_pid_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2667,7 +2667,7 @@ mod tests {
 
     #[test]
     fn prepared_mount_launch_failure_removes_pid_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2753,7 +2753,7 @@ mod tests {
 
     #[test]
     fn prepared_mount_launch_cleans_up_snapshot_mount_db_on_backend_failure() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
@@ -2803,7 +2803,7 @@ mod tests {
     fn prepared_mount_launch_publishes_live_diagnostics_and_supports_attach() {
         let _guard = diagnostics::lock_diagnostics_test_mutex();
         let _investigation_guard = lock_investigation_test_mutex();
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store_dir = temp.path().join("investigations-store");
         set_test_store_base_dir(Some(&store_dir));
         struct ResetInvestigationStoreDir;
@@ -3108,7 +3108,7 @@ mod tests {
         }
         let _reset = ResetDiagnosticsFailure;
 
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));

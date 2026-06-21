@@ -1607,7 +1607,7 @@ mod tests {
     fn client_root_scopes_default_investigation_store_dir() {
         let _guard = lock_investigation_test_mutex();
         set_test_store_base_dir(None);
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = std::path::absolute(temp.path().join("client-a")).expect("absolute root");
 
         let dir = default_store_dir_in_client_root(&root).expect("default store dir");
@@ -1618,7 +1618,7 @@ mod tests {
 
     #[test]
     fn store_persists_case_run_and_timeline_across_reopen() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1662,7 +1662,7 @@ mod tests {
 
     #[test]
     fn store_orders_mixed_source_timeline_entries_by_sequence() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1719,7 +1719,7 @@ mod tests {
 
     #[test]
     fn loud_safe_action_audit_entries_round_trip_with_action_kind() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn store_persists_timeline_in_append_only_log() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1821,7 +1821,7 @@ mod tests {
 
     #[test]
     fn store_migrates_legacy_embedded_timeline_to_log_on_append() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1884,7 +1884,7 @@ mod tests {
 
     #[test]
     fn store_migrates_legacy_embedded_timeline_when_log_exists_but_is_empty() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -1944,7 +1944,7 @@ mod tests {
 
     #[test]
     fn store_ignores_truncated_final_timeline_line() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2007,7 +2007,7 @@ mod tests {
 
     #[test]
     fn append_profiling_window_persists_capture_metadata() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2069,7 +2069,7 @@ mod tests {
 
     #[test]
     fn append_profiling_window_keeps_fail_open_failure_metadata() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2124,7 +2124,7 @@ mod tests {
 
     #[test]
     fn append_profiling_window_preserves_provided_occurrence_timestamp() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2171,7 +2171,7 @@ mod tests {
 
     #[test]
     fn store_persists_report_artifact_and_links_it_from_run() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn load_report_rejects_non_uuid_ids() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
 
         let error = store
@@ -2322,7 +2322,7 @@ mod tests {
 
     #[test]
     fn append_report_cleans_up_orphaned_report_when_run_save_fails() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2398,7 +2398,7 @@ mod tests {
 
     #[test]
     fn append_marker_snapshot_persists_runtime_boundary() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2461,7 +2461,7 @@ mod tests {
 
     #[test]
     fn store_persists_span_comparison_and_hypothesis_status_history() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {
@@ -2605,7 +2605,7 @@ mod tests {
     #[test]
     fn workflow_run_persists_step_status_artifacts_and_operator_acknowledgement() {
         let _guard = lock_investigation_test_mutex();
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         set_test_store_base_dir(Some(temp.path()));
         struct ResetStoreDir;
         impl Drop for ResetStoreDir {
@@ -2692,7 +2692,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn store_restricts_permissions_for_directories_and_files() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let case = store
             .create_case(NewInvestigationCase {

@@ -4840,6 +4840,7 @@ dependencies = [
  "studiofs-fuse",
  "studiofs-macfuse",
  "studiofs-meta",
+ "studiofs-test-support",
  "studiofs-vfs",
  "studiofs-winfsp",
  "syn 2.0.116",
@@ -5001,6 +5002,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "studiofs-test-support"
+version = "0.1.1"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

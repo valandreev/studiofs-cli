@@ -351,7 +351,7 @@ mod tests {
     use studiofs_cache::runtime::LocalPayloadLayout;
 
     fn detection(has_layout: bool) -> LocalPayloadRuntimeDetection {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         LocalPayloadRuntimeDetection {
             layout,
@@ -364,7 +364,7 @@ mod tests {
     }
 
     fn partial_detection() -> LocalPayloadRuntimeDetection {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         LocalPayloadRuntimeDetection {
             layout,

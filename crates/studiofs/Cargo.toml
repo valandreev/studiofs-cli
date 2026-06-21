@@ -82,3 +82,4 @@ ignored = ["winfsp"]
 dotenvy.workspace = true
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full"] }
+studiofs-test-support.workspace = true

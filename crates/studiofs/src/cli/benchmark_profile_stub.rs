@@ -72,7 +72,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let metrics_path = temp.path().join("write_path_observability.json");
         std::fs::write(
             &metrics_path,

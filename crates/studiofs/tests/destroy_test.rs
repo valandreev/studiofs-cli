@@ -319,7 +319,7 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
     ensure_pg_schema(&studio_dsn);
 
     let name = random_name(prefix);
-    let home_dir = tempfile::tempdir().expect("create temp home");
+    let home_dir = studiofs_test_support::workspace_target_tempdir("home-");
     let meta_dir = home_meta_dir(home_dir.path(), &name);
 
     let (pg_volume_id, pg_uuid) = insert_pg_volume(&studio_dsn, &name);
@@ -353,7 +353,7 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
 
 #[test]
 fn destroy_fails_for_missing_volume_name() {
-    let home = tempfile::tempdir().expect("create temp home");
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
     let volume_name = random_name("destroy-missing");
     let output = run_destroy_cmd(home.path(), &volume_name, false, &volume_name);
     assert!(

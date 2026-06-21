@@ -11,6 +11,7 @@ members = [
     "crates/studiofs-winfsp",
     "crates/studiofs-e2e",
     "crates/studiofs-scenario",
+    "crates/studiofs-test-support",
 ]
 resolver = "3"
 
@@ -104,3 +105,4 @@ studiofs-macfuse = { path = "crates/studiofs-macfuse" }
 studiofs-winfsp = { path = "crates/studiofs-winfsp" }
 studiofs-e2e = { path = "crates/studiofs-e2e" }
 studiofs-scenario = { path = "crates/studiofs-scenario" }
+studiofs-test-support = { path = "crates/studiofs-test-support" }

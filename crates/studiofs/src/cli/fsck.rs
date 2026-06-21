@@ -615,7 +615,7 @@ mod tests {
     use studiofs_meta::{MetaNamespace, RedbMetaEngine};
 
     fn temp_engine() -> RedbMetaEngine {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let path = dir.path().join("fsck-test.db");
         let engine = RedbMetaEngine::open(&path).expect("open redb");
         engine.init_root(1000, 1000).expect("init root");

@@ -1252,16 +1252,6 @@ mod tests {
         }
     }
 
-    fn target_tempdir() -> tempfile::TempDir {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root")
-            .join("target");
-        std::fs::create_dir_all(&target).expect("target dir");
-        tempfile::tempdir_in(target).expect("tempdir")
-    }
-
     fn snapshot_at(
         generated_unix_ms: u64,
         read_bytes: u64,
@@ -2188,7 +2178,7 @@ mod tests {
 
     #[test]
     fn read_snapshot_reports_clear_non_studiofs_mount_error() {
-        let dir = target_tempdir();
+        let dir = studiofs_test_support::workspace_target_tempdir("perf-");
         let error =
             read_snapshot(&stats_path(dir.path())).expect_err("missing stats file should fail");
 
@@ -2202,7 +2192,7 @@ mod tests {
 
     #[test]
     fn read_snapshot_reports_clear_unreadable_stats_surface_error() {
-        let dir = target_tempdir();
+        let dir = studiofs_test_support::workspace_target_tempdir("perf-");
         let path = stats_path(dir.path());
         std::fs::create_dir(&path).expect("stats path directory");
 
@@ -2218,7 +2208,7 @@ mod tests {
 
     #[test]
     fn read_snapshot_reports_clear_malformed_stats_surface_error() {
-        let dir = target_tempdir();
+        let dir = studiofs_test_support::workspace_target_tempdir("perf-");
         let path = stats_path(dir.path());
         std::fs::write(&path, "counter vfs_read.calls count nope\n").expect("stats text");
 

@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn janitor_inspects_local_runtime_via_generic_backend_api() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         let cache_base = temp.path().join("cache-root");
         let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn janitor_local_cache_inspection_is_best_effort_when_backend_is_locked() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         let cache_base = temp.path().join("cache-root");
         let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn janitor_local_cache_inspection_does_not_provision_missing_runtime_paths() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
         let cache_base = temp.path().join("cache-root");
         let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";

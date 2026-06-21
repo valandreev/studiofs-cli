@@ -2497,20 +2497,6 @@ mod tests {
         VfsWritePathStageLatencyStats,
     };
 
-    fn target_tempdir() -> tempfile::TempDir {
-        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root")
-            .join("target")
-            .join("studiofs-mounted-tests");
-        std::fs::create_dir_all(&target).expect("create target test dir");
-        tempfile::Builder::new()
-            .prefix("mounted-")
-            .tempdir_in(target)
-            .expect("tempdir")
-    }
-
     struct DropCounter {
         drops: Arc<AtomicUsize>,
     }
@@ -2644,7 +2630,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_write_path_observability_snapshot_ignores_mismatched_publisher_pid() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let metrics_path = temp.path().join("write_path_observability.json");
         write_snapshot(&metrics_path, 7, 512, 1024).await;
 
@@ -2657,7 +2643,7 @@ mod tests {
 
     #[tokio::test]
     async fn sample_mounted_memory_during_scopes_collection_to_measured_run() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let metrics_path = temp.path().join("write_path_observability.json");
         let mount_pid = std::process::id();
 
@@ -2682,7 +2668,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_with_plan_rejects_corrupt_deterministic_payload() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let path = temp.path().join("benchmark_file_000000.bin");
         fs::write(&path, vec![0xAA; 4096])
             .await
@@ -2707,7 +2693,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let path = temp.path().join("benchmark_file_000000.bin");
         let mut scratch = Vec::new();
         write_deterministic_file_with_buffer(&path, 4096 + 257, 123, 1024, &mut scratch)
@@ -2730,7 +2716,7 @@ mod tests {
 
     #[tokio::test]
     async fn mounted_stat_phase_records_only_small_files() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let small_path = temp.path().join("small.bin");
         let medium_path = temp.path().join("medium.bin");
         fs::write(&small_path, vec![0x11; 1024])
@@ -2774,7 +2760,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_mount_artifacts_best_effort_keeps_report_on_cleanup_failure() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let file_path = temp.path().join("not-a-directory");
         fs::write(&file_path, b"still here")
             .await
@@ -2788,7 +2774,7 @@ mod tests {
 
     #[tokio::test]
     async fn sample_mounted_profile_during_tracks_phase_and_allocator_peaks() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let metrics_path = temp.path().join("write_path_observability.json");
         let mount_pid = std::process::id();
 
@@ -2866,7 +2852,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_pending_uploads_prefers_live_snapshot_pending_count() {
-        let temp = target_tempdir();
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
         let metrics_path = temp.path().join("write_path_observability.json");
         let upload_dir = temp.path().join("upload");
         fs::create_dir_all(&upload_dir)
