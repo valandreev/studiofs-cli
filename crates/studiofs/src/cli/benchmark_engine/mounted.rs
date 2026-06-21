@@ -1503,6 +1503,72 @@ async fn run_mounted_read_phase(
     }
 }
 
+fn operation_log_targets(files: &[WorkFile]) -> Arc<[Arc<str>]> {
+    files
+        .iter()
+        .map(|file| Arc::<str>::from(file.path.display().to_string()))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn abort_unit_workers(handles: &[tokio::task::JoinHandle<Result<()>>]) {
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+async fn wait_for_unit_workers(
+    mut handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    panic_context: &'static str,
+    failure_context: &'static str,
+) -> Result<()> {
+    while let Some(handle) = handles.pop() {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                abort_unit_workers(&handles);
+                return Err(err).context(failure_context);
+            }
+            Err(err) => {
+                abort_unit_workers(&handles);
+                return Err(err).context(panic_context);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abort_stream_workers(handles: &[tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>]) {
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+async fn collect_stream_workers(
+    mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>>,
+    stream_count: usize,
+    panic_context: &'static str,
+    failure_context: &'static str,
+) -> Result<Vec<PhaseTelemetry>> {
+    let mut by_stream = vec![PhaseTelemetry::default(); stream_count];
+    while let Some(handle) = handles.pop() {
+        match handle.await {
+            Ok(Ok((stream_id, telemetry))) => {
+                by_stream[stream_id] = telemetry;
+            }
+            Ok(Err(err)) => {
+                abort_stream_workers(&handles);
+                return Err(err).context(failure_context);
+            }
+            Err(err) => {
+                abort_stream_workers(&handles);
+                return Err(err).context(panic_context);
+            }
+        }
+    }
+    Ok(by_stream)
+}
+
 async fn run_mounted_stat_phase(
     files: &[WorkFile],
     order: &[usize],
@@ -1530,17 +1596,17 @@ async fn run_mounted_stat_phase(
     let worker_count = concurrency.max(1).min(stat_order.len());
     let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let next_operation = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let targets = operation_log_targets(&files);
     let stat_order: Arc<[usize]> = Arc::from(stat_order);
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
+        let targets = Arc::clone(&targets);
         let stat_order = Arc::clone(&stat_order);
         let stats = Arc::clone(&stats);
         let next_operation = Arc::clone(&next_operation);
-        let sem = Arc::clone(&sem);
         let counter = counter.clone();
 
         handles.push(tokio::spawn(async move {
@@ -1551,11 +1617,6 @@ async fn run_mounted_stat_phase(
                 }
                 let work_index = stat_order[op_index];
                 let item = &files[work_index];
-                let permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow!("filesystem stat semaphore closed: {e}"))?;
-                let _permit = permit;
                 let start = Instant::now();
                 let metadata = fs::metadata(&item.path)
                     .await
@@ -1576,7 +1637,7 @@ async fn run_mounted_stat_phase(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: item.path.display().to_string().into(),
+                    target: Arc::clone(&targets[work_index]),
                     size_class: SizeClass::Small,
                     bytes: 0,
                     elapsed,
@@ -1586,12 +1647,12 @@ async fn run_mounted_stat_phase(
         }));
     }
 
-    for handle in handles {
-        handle
-            .await
-            .context("filesystem stat worker panicked")?
-            .context("filesystem stat worker failed")?;
-    }
+    wait_for_unit_workers(
+        handles,
+        "filesystem stat worker panicked",
+        "filesystem stat worker failed",
+    )
+    .await?;
     progress.finish();
     Arc::try_unwrap(stats)
         .map_err(|_| anyhow!("filesystem stat worker coordination failed"))?
@@ -1612,6 +1673,22 @@ async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
     Ok(phase_telemetry_to_report(&telemetry, elapsed))
 }
 
+async fn cleanup_mount_artifacts_best_effort(path: &Path, run_id: &str) -> Option<OpReport> {
+    match cleanup_mount_artifacts_report(path).await {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(
+                target: "studiofs.cache.profile",
+                run_id,
+                error = %error,
+                work_root = %path.display(),
+                "cache benchmark cleanup failed"
+            );
+            None
+        }
+    }
+}
+
 async fn run_filesystem_writes(
     files: &[WorkFile],
     order: &[usize],
@@ -1627,11 +1704,13 @@ async fn run_filesystem_writes(
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
+        let targets = Arc::clone(&targets);
         let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
@@ -1674,7 +1753,7 @@ async fn run_filesystem_writes(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: item.path.display().to_string().into(),
+                    target: Arc::clone(&targets[work_index]),
                     size_class: class,
                     bytes: item.size,
                     elapsed,
@@ -1684,12 +1763,12 @@ async fn run_filesystem_writes(
         }));
     }
 
-    for handle in handles {
-        handle
-            .await
-            .context("filesystem write worker panicked")?
-            .context("filesystem write worker failed")?;
-    }
+    wait_for_unit_workers(
+        handles,
+        "filesystem write worker panicked",
+        "filesystem write worker failed",
+    )
+    .await?;
 
     Arc::try_unwrap(stats)
         .map_err(|_| anyhow!("filesystem write worker coordination failed"))?
@@ -1712,11 +1791,13 @@ async fn run_filesystem_reads(
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
+        let targets = Arc::clone(&targets);
         let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
@@ -1765,7 +1846,7 @@ async fn run_filesystem_reads(
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    target: item.path.display().to_string().into(),
+                    target: Arc::clone(&targets[work_index]),
                     size_class: class,
                     bytes: bytes_read,
                     elapsed,
@@ -1775,12 +1856,12 @@ async fn run_filesystem_reads(
         }));
     }
 
-    for handle in handles {
-        handle
-            .await
-            .context("filesystem read worker panicked")?
-            .context("filesystem read worker failed")?;
-    }
+    wait_for_unit_workers(
+        handles,
+        "filesystem read worker panicked",
+        "filesystem read worker failed",
+    )
+    .await?;
 
     Arc::try_unwrap(stats)
         .map_err(|_| anyhow!("filesystem read worker coordination failed"))?
@@ -1798,14 +1879,17 @@ async fn run_filesystem_writes_sequential_streams(
     progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
+    let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let targets = operation_log_targets(&files);
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
+        let targets = Arc::clone(&targets);
         let progress = progress.clone();
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
@@ -1835,7 +1919,7 @@ async fn run_filesystem_writes_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: item.path.display().to_string().into(),
+                    target: Arc::clone(&targets[work_index]),
                     size_class: class,
                     bytes: item.size,
                     elapsed,
@@ -1846,15 +1930,13 @@ async fn run_filesystem_writes_sequential_streams(
         }));
     }
 
-    let mut by_stream = vec![PhaseTelemetry::default(); handles.len()];
-    for handle in handles {
-        let (stream_id, telemetry) = handle
-            .await
-            .context("filesystem sequential write stream panicked")?
-            .context("filesystem sequential write stream failed")?;
-        by_stream[stream_id] = telemetry;
-    }
-    Ok(by_stream)
+    collect_stream_workers(
+        handles,
+        stream_slots,
+        "filesystem sequential write stream panicked",
+        "filesystem sequential write stream failed",
+    )
+    .await
 }
 
 async fn run_filesystem_reads_sequential_streams(
@@ -1867,14 +1949,17 @@ async fn run_filesystem_reads_sequential_streams(
     progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
+    let stream_slots = segments.len();
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let targets = operation_log_targets(&files);
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
+        let targets = Arc::clone(&targets);
         let progress = progress.clone();
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
@@ -1908,7 +1993,7 @@ async fn run_filesystem_reads_sequential_streams(
                     operation_index: work_index as u64,
                     work_index,
                     worker_id: stream_id,
-                    target: item.path.display().to_string().into(),
+                    target: Arc::clone(&targets[work_index]),
                     size_class: class,
                     bytes: bytes_read,
                     elapsed,
@@ -1919,15 +2004,13 @@ async fn run_filesystem_reads_sequential_streams(
         }));
     }
 
-    let mut by_stream = vec![PhaseTelemetry::default(); handles.len()];
-    for handle in handles {
-        let (stream_id, telemetry) = handle
-            .await
-            .context("filesystem sequential read stream panicked")?
-            .context("filesystem sequential read stream failed")?;
-        by_stream[stream_id] = telemetry;
-    }
-    Ok(by_stream)
+    collect_stream_workers(
+        handles,
+        stream_slots,
+        "filesystem sequential read stream panicked",
+        "filesystem sequential read stream failed",
+    )
+    .await
 }
 
 async fn clear_mount_artifacts(path: &Path) -> Result<()> {
@@ -2327,7 +2410,7 @@ pub(crate) async fn run_mounted_end_to_end(
             measured_write_path_after_for_report.as_ref(),
         ));
 
-        let cleanup = Some(cleanup_mount_artifacts_report(work_root).await?);
+        let cleanup = cleanup_mount_artifacts_best_effort(work_root, &params.run_id).await;
         let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
         let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -2398,7 +2481,18 @@ mod tests {
         VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
         VfsWritePathStageLatencyStats,
     };
-    use tempfile::tempdir;
+
+    fn target_tempdir() -> tempfile::TempDir {
+        let target = std::env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join("studiofs-mounted-tests");
+        std::fs::create_dir_all(&target).expect("create target test dir");
+        tempfile::Builder::new()
+            .prefix("mounted-")
+            .tempdir_in(target)
+            .expect("tempdir")
+    }
 
     fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
         BenchmarkConfig {
@@ -2498,7 +2592,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_write_path_observability_snapshot_ignores_mismatched_publisher_pid() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let metrics_path = temp.path().join("write_path_observability.json");
         write_snapshot(&metrics_path, 7, 512, 1024).await;
 
@@ -2511,7 +2605,7 @@ mod tests {
 
     #[tokio::test]
     async fn sample_mounted_memory_during_scopes_collection_to_measured_run() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let metrics_path = temp.path().join("write_path_observability.json");
         let mount_pid = std::process::id();
 
@@ -2536,7 +2630,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_with_plan_rejects_corrupt_deterministic_payload() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let path = temp.path().join("benchmark_file_000000.bin");
         fs::write(&path, vec![0xAA; 4096])
             .await
@@ -2561,7 +2655,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let path = temp.path().join("benchmark_file_000000.bin");
         write_deterministic_file(&path, 4096 + 257, 123, 1024)
             .await
@@ -2583,7 +2677,7 @@ mod tests {
 
     #[tokio::test]
     async fn mounted_stat_phase_records_only_small_files() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let small_path = temp.path().join("small.bin");
         let medium_path = temp.path().join("medium.bin");
         fs::write(&small_path, vec![0x11; 1024])
@@ -2626,8 +2720,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_mount_artifacts_best_effort_keeps_report_on_cleanup_failure() {
+        let temp = target_tempdir();
+        let file_path = temp.path().join("not-a-directory");
+        fs::write(&file_path, b"still here")
+            .await
+            .expect("write file");
+
+        let cleanup = cleanup_mount_artifacts_best_effort(&file_path, "run-1").await;
+
+        assert!(cleanup.is_none());
+        assert!(file_path.exists());
+    }
+
+    #[tokio::test]
     async fn sample_mounted_profile_during_tracks_phase_and_allocator_peaks() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let metrics_path = temp.path().join("write_path_observability.json");
         let mount_pid = std::process::id();
 
@@ -2705,7 +2813,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_pending_uploads_prefers_live_snapshot_pending_count() {
-        let temp = tempdir().expect("tempdir");
+        let temp = target_tempdir();
         let metrics_path = temp.path().join("write_path_observability.json");
         let upload_dir = temp.path().join("upload");
         fs::create_dir_all(&upload_dir)
