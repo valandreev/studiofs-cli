@@ -766,15 +766,39 @@ fn runtime_stats_sections<'a>(
     &'a RuntimeStatsSection,
     &'a RuntimeStatsSection,
 ); 8] {
+    let RuntimeStatsSnapshot {
+        schema_version: _,
+        generated_unix_ms: _,
+        system: before_system,
+        bridge: before_bridge,
+        vfs_read: before_vfs_read,
+        vfs_write: before_vfs_write,
+        cache: before_cache,
+        upload_queue: before_upload_queue,
+        object_io: before_object_io,
+        metadata: before_metadata,
+    } = before;
+    let RuntimeStatsSnapshot {
+        schema_version: _,
+        generated_unix_ms: _,
+        system: after_system,
+        bridge: after_bridge,
+        vfs_read: after_vfs_read,
+        vfs_write: after_vfs_write,
+        cache: after_cache,
+        upload_queue: after_upload_queue,
+        object_io: after_object_io,
+        metadata: after_metadata,
+    } = after;
     [
-        ("system", &before.system, &after.system),
-        ("bridge", &before.bridge, &after.bridge),
-        ("vfs_read", &before.vfs_read, &after.vfs_read),
-        ("vfs_write", &before.vfs_write, &after.vfs_write),
-        ("cache", &before.cache, &after.cache),
-        ("upload_queue", &before.upload_queue, &after.upload_queue),
-        ("object_io", &before.object_io, &after.object_io),
-        ("metadata", &before.metadata, &after.metadata),
+        ("system", before_system, after_system),
+        ("bridge", before_bridge, after_bridge),
+        ("vfs_read", before_vfs_read, after_vfs_read),
+        ("vfs_write", before_vfs_write, after_vfs_write),
+        ("cache", before_cache, after_cache),
+        ("upload_queue", before_upload_queue, after_upload_queue),
+        ("object_io", before_object_io, after_object_io),
+        ("metadata", before_metadata, after_metadata),
     ]
 }
 
@@ -855,17 +879,10 @@ fn runtime_stats_latency_bucket_deltas(
     before: &[RuntimeLatencyBucket],
     after: &[RuntimeLatencyBucket],
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
-    let before_by_bound: BTreeMap<_, _> = before
-        .iter()
-        .map(|bucket| (bucket.le_ns, bucket.count))
-        .collect();
     after
         .iter()
         .map(|bucket| {
-            let count_before = before_by_bound
-                .get(&bucket.le_ns)
-                .copied()
-                .unwrap_or_default();
+            let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
             RuntimeStatsLatencyBucketDeltaReport {
                 le_ns: bucket.le_ns,
                 count_before,
@@ -887,15 +904,18 @@ fn runtime_stats_latency_reset(
     if count_after < count_before || sum_after < sum_before {
         return true;
     }
-    let before_by_bound: BTreeMap<_, _> = before
-        .iter()
-        .map(|bucket| (bucket.le_ns, bucket.count))
-        .collect();
     after.iter().any(|bucket| {
-        before_by_bound
-            .get(&bucket.le_ns)
-            .is_some_and(|count_before| bucket.count < *count_before)
+        before
+            .binary_search_by_key(&bucket.le_ns, |before_bucket| before_bucket.le_ns)
+            .is_ok_and(|index| bucket.count < before[index].count)
     })
+}
+
+fn runtime_stats_latency_bucket_count(before: &[RuntimeLatencyBucket], le_ns: u64) -> u64 {
+    before
+        .binary_search_by_key(&le_ns, |bucket| bucket.le_ns)
+        .map(|index| before[index].count)
+        .unwrap_or_default()
 }
 
 fn reset_aware_delta(before: u64, after: u64) -> u64 {
