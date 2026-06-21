@@ -172,4 +172,38 @@ mod tests {
 
         assert!(err.to_string().contains("--threads must be >= 1"));
     }
+
+    #[test]
+    fn bench_config_rejects_zero_small_file_count() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "4MB".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 0,
+            threads: 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+
+        assert!(err.to_string().contains("--small-file-count must be >= 1"));
+    }
+
+    #[test]
+    fn bench_config_rejects_invalid_size_arg() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "4not-a-size".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+
+        assert!(err.to_string().contains("invalid block-size"));
+    }
 }

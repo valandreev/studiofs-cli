@@ -1506,6 +1506,7 @@ async fn run_mounted_read_phase(
 async fn run_mounted_stat_phase(
     files: &[WorkFile],
     order: &[usize],
+    concurrency: usize,
     size_class_bounds: SizeClassBounds,
 ) -> Result<PhaseTelemetry> {
     let stat_order: Vec<usize> = order
@@ -1521,39 +1522,81 @@ async fn run_mounted_stat_phase(
         .collect();
     let progress = ProgressBar::start("StudioFS test stat", stat_order.len());
     let counter = progress.counter();
-    let mut telemetry = PhaseTelemetry::default();
-    for (op_index, work_index) in stat_order.into_iter().enumerate() {
-        let item = &files[work_index];
-        let start = Instant::now();
-        let metadata = fs::metadata(&item.path)
+    if stat_order.is_empty() {
+        progress.finish();
+        return Ok(PhaseTelemetry::default());
+    }
+
+    let worker_count = concurrency.max(1).min(stat_order.len());
+    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
+    let next_operation = Arc::new(AtomicUsize::new(0));
+    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let stat_order: Arc<[usize]> = Arc::from(stat_order);
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
+
+    for worker_id in 0..worker_count {
+        let files = Arc::clone(&files);
+        let stat_order = Arc::clone(&stat_order);
+        let stats = Arc::clone(&stats);
+        let next_operation = Arc::clone(&next_operation);
+        let sem = Arc::clone(&sem);
+        let counter = counter.clone();
+
+        handles.push(tokio::spawn(async move {
+            loop {
+                let op_index = next_operation.fetch_add(1, Ordering::Relaxed);
+                if op_index >= stat_order.len() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                let work_index = stat_order[op_index];
+                let item = &files[work_index];
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow!("filesystem stat semaphore closed: {e}"))?;
+                let _permit = permit;
+                let start = Instant::now();
+                let metadata = fs::metadata(&item.path)
+                    .await
+                    .with_context(|| format!("stat {}", item.path.display()))?;
+                let elapsed = start.elapsed();
+                if metadata.len() != item.size {
+                    bail!(
+                        "stat {} reported size {}, expected {}",
+                        item.path.display(),
+                        metadata.len(),
+                        item.size
+                    );
+                }
+                let mut s = stats
+                    .lock()
+                    .map_err(|_| anyhow!("filesystem stat latency stats lock poisoned"))?;
+                s.record_operation(PhaseOperationLog {
+                    operation_index: op_index as u64,
+                    work_index,
+                    worker_id,
+                    target: item.path.display().to_string().into(),
+                    size_class: SizeClass::Small,
+                    bytes: 0,
+                    elapsed,
+                });
+                counter.inc();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle
             .await
-            .with_context(|| format!("stat {}", item.path.display()))?;
-        let elapsed = start.elapsed();
-        if metadata.len() != item.size {
-            bail!(
-                "stat {} reported size {}, expected {}",
-                item.path.display(),
-                metadata.len(),
-                item.size
-            );
-        }
-        telemetry.record_operation(PhaseOperationLog {
-            operation_index: op_index as u64,
-            work_index,
-            worker_id: 0,
-            target: item.path.display().to_string().into(),
-            size_class: classify_size(
-                item.size,
-                size_class_bounds.small_max,
-                size_class_bounds.medium_max,
-            ),
-            bytes: 0,
-            elapsed,
-        });
-        counter.inc();
+            .context("filesystem stat worker panicked")?
+            .context("filesystem stat worker failed")?;
     }
     progress.finish();
-    Ok(telemetry)
+    Arc::try_unwrap(stats)
+        .map_err(|_| anyhow!("filesystem stat worker coordination failed"))?
+        .into_inner()
+        .map_err(|_| anyhow!("filesystem stat latency stats lock poisoned"))
 }
 
 async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
@@ -2026,8 +2069,13 @@ pub(crate) async fn run_mounted_end_to_end(
                     );
                     portable_profile.set_phase("stat");
                     let stats_wall_start = Instant::now();
-                    let stats =
-                        run_mounted_stat_phase(files_ref, order_ref, size_class_bounds).await?;
+                    let stats = run_mounted_stat_phase(
+                        files_ref,
+                        order_ref,
+                        params.concurrency,
+                        size_class_bounds,
+                    )
+                    .await?;
                     let stats_wall = stats_wall_start.elapsed();
 
                     let total_wall = Instant::now() - started;
@@ -2531,6 +2579,50 @@ mod tests {
         .expect("read deterministic test payload");
 
         assert_eq!(bytes_read, 4096 + 257);
+    }
+
+    #[tokio::test]
+    async fn mounted_stat_phase_records_only_small_files() {
+        let temp = tempdir().expect("tempdir");
+        let small_path = temp.path().join("small.bin");
+        let medium_path = temp.path().join("medium.bin");
+        fs::write(&small_path, vec![0x11; 1024])
+            .await
+            .expect("write small file");
+        fs::write(&medium_path, vec![0x22; 8192])
+            .await
+            .expect("write medium file");
+        let files = vec![
+            WorkFile {
+                path: small_path,
+                size: 1024,
+                index: 0,
+            },
+            WorkFile {
+                path: medium_path,
+                size: 8192,
+                index: 1,
+            },
+        ];
+
+        let telemetry = run_mounted_stat_phase(
+            &files,
+            &[0, 1],
+            4,
+            SizeClassBounds {
+                small_max: 1024,
+                medium_max: 8192,
+            },
+        )
+        .await
+        .expect("stat phase");
+        let report = phase_telemetry_to_report(&telemetry, Duration::from_millis(1));
+
+        assert_eq!(report.operations, 1);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(report.operations_log.len(), 1);
+        assert_eq!(report.operations_log[0].work_index, 0);
+        assert_eq!(report.operations_log[0].size_class, "small");
     }
 
     #[tokio::test]

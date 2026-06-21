@@ -446,7 +446,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     }
     out.push('\n');
     let _ = writeln!(&mut out, "Operation results");
-    let operation_rows = vec![
+    let mut operation_rows = vec![
         vec![
             "Write".to_string(),
             report.writes.operations.to_string(),
@@ -468,7 +468,6 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
             format_duration_ms(report.reads.p99_ms),
         ],
     ];
-    let mut operation_rows = operation_rows;
     if let Some(stats) = &report.small_file_stats {
         operation_rows.push(vec![
             "Stat".to_string(),
