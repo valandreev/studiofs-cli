@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use super::BenchmarkConfig;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
@@ -1511,57 +1512,48 @@ fn operation_log_targets(files: &[WorkFile]) -> Arc<[Arc<str>]> {
         .into()
 }
 
-fn abort_unit_workers(handles: &[tokio::task::JoinHandle<Result<()>>]) {
-    for handle in handles {
-        handle.abort();
-    }
-}
-
-async fn wait_for_unit_workers(
-    mut handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+async fn collect_phase_workers(
+    mut join_set: JoinSet<Result<PhaseTelemetry>>,
     panic_context: &'static str,
     failure_context: &'static str,
-) -> Result<()> {
-    while let Some(handle) = handles.pop() {
-        match handle.await {
-            Ok(Ok(())) => {}
+) -> Result<PhaseTelemetry> {
+    let mut merged = PhaseTelemetry::default();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(telemetry)) => {
+                merged += &telemetry;
+            }
             Ok(Err(err)) => {
-                abort_unit_workers(&handles);
+                join_set.abort_all();
                 return Err(err).context(failure_context);
             }
             Err(err) => {
-                abort_unit_workers(&handles);
+                join_set.abort_all();
                 return Err(err).context(panic_context);
             }
         }
     }
-    Ok(())
-}
-
-fn abort_stream_workers(handles: &[tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>]) {
-    for handle in handles {
-        handle.abort();
-    }
+    Ok(merged)
 }
 
 async fn collect_stream_workers(
-    mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>>,
+    mut join_set: JoinSet<Result<(usize, PhaseTelemetry)>>,
     stream_count: usize,
     panic_context: &'static str,
     failure_context: &'static str,
 ) -> Result<Vec<PhaseTelemetry>> {
     let mut by_stream = vec![PhaseTelemetry::default(); stream_count];
-    while let Some(handle) = handles.pop() {
-        match handle.await {
+    while let Some(result) = join_set.join_next().await {
+        match result {
             Ok(Ok((stream_id, telemetry))) => {
                 by_stream[stream_id] = telemetry;
             }
             Ok(Err(err)) => {
-                abort_stream_workers(&handles);
+                join_set.abort_all();
                 return Err(err).context(failure_context);
             }
             Err(err) => {
-                abort_stream_workers(&handles);
+                join_set.abort_all();
                 return Err(err).context(panic_context);
             }
         }
@@ -1594,26 +1586,25 @@ async fn run_mounted_stat_phase(
     }
 
     let worker_count = concurrency.max(1).min(stat_order.len());
-    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let next_operation = Arc::new(AtomicUsize::new(0));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let targets = operation_log_targets(&files);
     let stat_order: Arc<[usize]> = Arc::from(stat_order);
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
+    let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
         let targets = Arc::clone(&targets);
         let stat_order = Arc::clone(&stat_order);
-        let stats = Arc::clone(&stats);
         let next_operation = Arc::clone(&next_operation);
         let counter = counter.clone();
 
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
             loop {
                 let op_index = next_operation.fetch_add(1, Ordering::Relaxed);
                 if op_index >= stat_order.len() {
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<_, anyhow::Error>(telemetry);
                 }
                 let work_index = stat_order[op_index];
                 let item = &files[work_index];
@@ -1630,10 +1621,7 @@ async fn run_mounted_stat_phase(
                         item.size
                     );
                 }
-                let mut s = stats
-                    .lock()
-                    .map_err(|_| anyhow!("filesystem stat latency stats lock poisoned"))?;
-                s.record_operation(PhaseOperationLog {
+                telemetry.record_operation(PhaseOperationLog {
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
@@ -1644,20 +1632,17 @@ async fn run_mounted_stat_phase(
                 });
                 counter.inc();
             }
-        }));
+        });
     }
 
-    wait_for_unit_workers(
-        handles,
+    let telemetry = collect_phase_workers(
+        join_set,
         "filesystem stat worker panicked",
         "filesystem stat worker failed",
     )
     .await?;
     progress.finish();
-    Arc::try_unwrap(stats)
-        .map_err(|_| anyhow!("filesystem stat worker coordination failed"))?
-        .into_inner()
-        .map_err(|_| anyhow!("filesystem stat latency stats lock poisoned"))
+    Ok(telemetry)
 }
 
 async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
@@ -1700,28 +1685,27 @@ async fn run_filesystem_writes(
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order.to_vec());
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
+    let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
         let targets = Arc::clone(&targets);
         let order = Arc::clone(&order);
-        let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
         let progress = progress.clone();
 
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<_, anyhow::Error>(telemetry);
                 }
                 let work_index = order[op_index];
                 let item = &files[work_index];
@@ -1746,10 +1730,7 @@ async fn run_filesystem_writes(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                let mut s = stats
-                    .lock()
-                    .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))?;
-                s.record_operation(PhaseOperationLog {
+                telemetry.record_operation(PhaseOperationLog {
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
@@ -1760,20 +1741,15 @@ async fn run_filesystem_writes(
                 });
                 progress.inc();
             }
-        }));
+        });
     }
 
-    wait_for_unit_workers(
-        handles,
+    collect_phase_workers(
+        join_set,
         "filesystem write worker panicked",
         "filesystem write worker failed",
     )
-    .await?;
-
-    Arc::try_unwrap(stats)
-        .map_err(|_| anyhow!("filesystem write worker coordination failed"))?
-        .into_inner()
-        .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))
+    .await
 }
 
 async fn run_filesystem_reads(
@@ -1787,28 +1763,27 @@ async fn run_filesystem_reads(
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let targets = operation_log_targets(&files);
     let order: Arc<[usize]> = Arc::from(order.to_vec());
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
+    let mut join_set = JoinSet::new();
 
     for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
         let targets = Arc::clone(&targets);
         let order = Arc::clone(&order);
-        let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
         let progress = progress.clone();
 
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<_, anyhow::Error>(telemetry);
                 }
                 let work_index = order[op_index];
                 let item = &files[work_index];
@@ -1839,10 +1814,7 @@ async fn run_filesystem_reads(
                     size_class_bounds.medium_max,
                 );
 
-                let mut s = stats
-                    .lock()
-                    .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))?;
-                s.record_operation(PhaseOperationLog {
+                telemetry.record_operation(PhaseOperationLog {
                     operation_index: op_index as u64,
                     work_index,
                     worker_id,
@@ -1853,20 +1825,15 @@ async fn run_filesystem_reads(
                 });
                 progress.inc();
             }
-        }));
+        });
     }
 
-    wait_for_unit_workers(
-        handles,
+    collect_phase_workers(
+        join_set,
         "filesystem read worker panicked",
         "filesystem read worker failed",
     )
-    .await?;
-
-    Arc::try_unwrap(stats)
-        .map_err(|_| anyhow!("filesystem read worker coordination failed"))?
-        .into_inner()
-        .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))
+    .await
 }
 
 async fn run_filesystem_writes_sequential_streams(
@@ -1883,15 +1850,14 @@ async fn run_filesystem_writes_sequential_streams(
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let targets = operation_log_targets(&files);
-    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
-        Vec::with_capacity(segments.len());
+    let mut join_set = JoinSet::new();
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
         let targets = Arc::clone(&targets);
         let progress = progress.clone();
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
                 let item = &files[work_index];
@@ -1927,11 +1893,11 @@ async fn run_filesystem_writes_sequential_streams(
                 progress.inc();
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
-        }));
+        });
     }
 
     collect_stream_workers(
-        handles,
+        join_set,
         stream_slots,
         "filesystem sequential write stream panicked",
         "filesystem sequential write stream failed",
@@ -1953,15 +1919,14 @@ async fn run_filesystem_reads_sequential_streams(
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
     let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let targets = operation_log_targets(&files);
-    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
-        Vec::with_capacity(segments.len());
+    let mut join_set = JoinSet::new();
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
         let targets = Arc::clone(&targets);
         let progress = progress.clone();
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
                 let item = &files[work_index];
@@ -2001,11 +1966,11 @@ async fn run_filesystem_reads_sequential_streams(
                 progress.inc();
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
-        }));
+        });
     }
 
     collect_stream_workers(
-        handles,
+        join_set,
         stream_slots,
         "filesystem sequential read stream panicked",
         "filesystem sequential read stream failed",

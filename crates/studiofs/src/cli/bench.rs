@@ -10,6 +10,8 @@ use crate::cli::benchmark_engine::{
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 
+const MAX_BENCH_SMALL_FILE_COUNT: usize = 1_000_000;
+
 #[derive(Debug, Args)]
 #[command(about = "Run a mounted StudioFS filesystem benchmark")]
 pub(crate) struct BenchArgs {
@@ -54,6 +56,11 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
     }
     if args.small_file_count == 0 {
         return Err(anyhow!("--small-file-count must be >= 1"));
+    }
+    if args.small_file_count > MAX_BENCH_SMALL_FILE_COUNT {
+        return Err(anyhow!(
+            "--small-file-count must be <= {MAX_BENCH_SMALL_FILE_COUNT}"
+        ));
     }
 
     let block_size = parse_size_arg("block-size", &args.block_size)?;
@@ -100,16 +107,33 @@ fn run(args: BenchArgs) -> Result<()> {
     let work_root = args.mountpoint.join(".studiofs-benchmark");
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
-    let report = async_runtime.block_on(run_mounted(
-        &config,
-        MountedBenchmarkTarget {
-            pid: runtime.pid,
-            volume: runtime.volume.as_str(),
-            mount_point: runtime.mount_point.as_path(),
-            work_root: work_root.as_path(),
-            cache_path: runtime.cache_path.as_deref(),
-        },
-    ))?;
+    let mounted_target = MountedBenchmarkTarget {
+        pid: runtime.pid,
+        volume: runtime.volume.as_str(),
+        mount_point: runtime.mount_point.as_path(),
+        work_root: work_root.as_path(),
+        cache_path: runtime.cache_path.as_deref(),
+    };
+    let report = async_runtime.block_on(async {
+        tokio::select! {
+            report = run_mounted(&config, mounted_target) => report,
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("listen for Ctrl+C")?;
+                match tokio::fs::remove_dir_all(&work_root).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            work_root = %work_root.display(),
+                            "bench interrupt cleanup failed"
+                        );
+                    }
+                }
+                Err(anyhow!("benchmark interrupted by Ctrl+C"))
+            }
+        }
+    })?;
 
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, args.json_output.as_deref())
@@ -202,6 +226,26 @@ mod tests {
         let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("--small-file-count must be >= 1"));
+    }
+
+    #[test]
+    fn bench_config_rejects_excessive_small_file_count() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "4MB".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: MAX_BENCH_SMALL_FILE_COUNT + 1,
+            threads: 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--small-file-count must be <= 1000000")
+        );
     }
 
     #[test]

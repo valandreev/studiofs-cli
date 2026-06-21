@@ -30,7 +30,7 @@ todo = "warn"
 
 [workspace.dependencies]
 # Async
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "net", "signal"] }
 tokio-util = "0.7"
 futures = "0.3"
 tokio-postgres = "0.7"
