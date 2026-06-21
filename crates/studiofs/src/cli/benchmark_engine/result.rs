@@ -720,6 +720,8 @@ pub(crate) fn runtime_stats_report(
     for phase in &phases {
         warnings.extend(phase.delta.warnings.iter().cloned());
     }
+    warnings.sort();
+    warnings.dedup();
     BenchmarkRuntimeStatsReport {
         available: true,
         stats_path: Some(stats_path),
@@ -882,12 +884,10 @@ fn runtime_stats_latency_bucket_deltas(
     before: &[RuntimeLatencyBucket],
     after: &[RuntimeLatencyBucket],
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
-    let mut before_index = 0usize;
     after
         .iter()
         .map(|bucket| {
-            let count_before =
-                runtime_stats_latency_bucket_count(before, &mut before_index, bucket.le_ns);
+            let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
             RuntimeStatsLatencyBucketDeltaReport {
                 le_ns: bucket.le_ns,
                 count_before,
@@ -909,28 +909,16 @@ fn runtime_stats_latency_reset(
     if count_after < count_before || sum_after < sum_before {
         return true;
     }
-    let mut before_index = 0usize;
     after.iter().any(|bucket| {
-        let count_before =
-            runtime_stats_latency_bucket_count(before, &mut before_index, bucket.le_ns);
+        let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
         count_before != 0 && bucket.count < count_before
     })
 }
 
-fn runtime_stats_latency_bucket_count(
-    before: &[RuntimeLatencyBucket],
-    before_index: &mut usize,
-    le_ns: u64,
-) -> u64 {
-    while before
-        .get(*before_index)
-        .is_some_and(|bucket| bucket.le_ns < le_ns)
-    {
-        *before_index += 1;
-    }
+fn runtime_stats_latency_bucket_count(before: &[RuntimeLatencyBucket], le_ns: u64) -> u64 {
     before
-        .get(*before_index)
-        .filter(|bucket| bucket.le_ns == le_ns)
+        .iter()
+        .find(|bucket| bucket.le_ns == le_ns)
         .map_or(0, |bucket| bucket.count)
 }
 
@@ -1502,7 +1490,10 @@ mod tests {
             before.clone(),
             after.clone(),
             vec![phase],
-            Vec::new(),
+            vec![
+                "preexisting warning".to_string(),
+                "preexisting warning".to_string(),
+            ],
         );
 
         let whole_run = report.whole_run.as_ref().expect("whole-run delta");
@@ -1564,6 +1555,14 @@ mod tests {
             1
         );
         assert_eq!(report.phases[0].phase, "write");
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|warning| warning.as_str() == "preexisting warning")
+                .count(),
+            1
+        );
 
         let mut backward_after = before.clone();
         backward_after.generated_unix_ms = 900;

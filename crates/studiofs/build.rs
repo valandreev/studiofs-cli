@@ -29,7 +29,11 @@ fn emit_git_metadata() {
             && let Some(reference) = head.trim().strip_prefix("ref: ")
         {
             let ref_path = git_dir.join(reference);
-            println!("cargo:rerun-if-changed={}", ref_path.display());
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            } else if let Some(parent) = nearest_existing_parent(&ref_path, &git_dir) {
+                println!("cargo:rerun-if-changed={}", parent.display());
+            }
             let packed_refs = git_dir.join("packed-refs");
             if packed_refs.exists() {
                 println!("cargo:rerun-if-changed={}", packed_refs.display());
@@ -43,6 +47,14 @@ fn emit_git_metadata() {
         "GIT_BRANCH",
         &["rev-parse", "--abbrev-ref", "HEAD"],
     );
+}
+
+fn nearest_existing_parent(path: &Path, boundary: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(boundary))
+        .find(|ancestor| ancestor.exists())
+        .map(Path::to_path_buf)
 }
 
 fn resolve_git_dir(manifest_dir: &Path) -> Option<PathBuf> {

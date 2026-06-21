@@ -2081,24 +2081,16 @@ fn build_runtime_stats_phase_deltas(
         }
     }
 
-    match (before_read.as_ref(), after_read.as_ref()) {
-        (Some(before_read), Some(after_read)) => {
-            push_runtime_stats_phase_delta(
-                &mut phases,
-                "during-upload-read",
-                before_read,
-                after_read,
-            );
-            if let Some(after_stat) = after_stat {
-                push_runtime_stats_phase_delta(&mut phases, "stat", after_read, after_stat);
-            }
-        }
-        (None, Some(after_read)) => {
-            if let Some(after_stat) = after_stat {
-                push_runtime_stats_phase_delta(&mut phases, "stat", after_read, after_stat);
-            }
-        }
-        _ => {}
+    if let (Some(before_read), Some(after_read)) = (before_read.as_ref(), after_read.as_ref()) {
+        push_runtime_stats_phase_delta(&mut phases, "during-upload-read", before_read, after_read);
+    }
+
+    let stat_before = after_read
+        .as_ref()
+        .or(before_read.as_ref())
+        .or(after_write.as_ref());
+    if let (Some(stat_before), Some(after_stat)) = (stat_before, after_stat.as_ref()) {
+        push_runtime_stats_phase_delta(&mut phases, "stat", stat_before, after_stat);
     }
 
     phases
@@ -2758,6 +2750,27 @@ mod tests {
         assert_eq!(phases[2].delta.interval_ms, 100);
         assert_eq!(phases[3].phase, "stat");
         assert_eq!(phases[3].delta.interval_ms, 50);
+    }
+
+    #[test]
+    fn runtime_stats_phase_deltas_use_last_snapshot_before_stat_when_after_read_missing() {
+        let whole_run_before = runtime_snapshot_at(100);
+        let after_write = runtime_snapshot_at(200);
+        let before_read = runtime_snapshot_at(350);
+        let after_stat = runtime_snapshot_at(500);
+
+        let phases = build_runtime_stats_phase_deltas(
+            &whole_run_before,
+            &Some(after_write),
+            &Some(before_read),
+            &None,
+            &Some(after_stat),
+        );
+
+        assert_eq!(phases[0].phase, "write");
+        assert_eq!(phases[1].phase, "upload-transition");
+        assert_eq!(phases[2].phase, "stat");
+        assert_eq!(phases[2].delta.interval_ms, 150);
     }
 
     fn single_file_workload() -> WorkloadPlan {

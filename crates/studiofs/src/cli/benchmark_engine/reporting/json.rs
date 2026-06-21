@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 use super::super::result::BenchmarkReport;
 
@@ -86,11 +87,11 @@ fn resolve_report_target(
 }
 
 fn write_json_report(
-    file: std::fs::File,
+    temp_file: &mut NamedTempFile,
     report: &BenchmarkReport,
     report_path: &Path,
 ) -> Result<()> {
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(temp_file.as_file_mut());
     serde_json::to_writer_pretty(&mut writer, report)
         .with_context(|| format!("serialize benchmark report {}", report_path.display()))?;
     writer
@@ -103,40 +104,35 @@ fn write_report_file(
     report: &BenchmarkReport,
     auto_named: bool,
 ) -> Result<PathBuf> {
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create report dir {}", parent.display()))?;
-    }
+    let parent = report_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create report dir {}", parent.display()))?;
 
     if !auto_named {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(report_path)
-            .with_context(|| format!("create benchmark report {}", report_path.display()))?;
-        write_json_report(file, report, report_path)?;
+        let mut temp_file = NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temporary report file in {}", parent.display()))?;
+        write_json_report(&mut temp_file, report, report_path)?;
+        temp_file
+            .persist(report_path)
+            .with_context(|| format!("replace benchmark report {}", report_path.display()))?;
         return Ok(report_path.to_path_buf());
     }
 
     let mut candidate = report_path.to_path_buf();
     let mut suffix = 2usize;
     loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                write_json_report(file, report, &candidate)?;
-                return Ok(candidate);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        let mut temp_file = NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temporary report file in {}", parent.display()))?;
+        write_json_report(&mut temp_file, report, &candidate)?;
+        match temp_file.persist_noclobber(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = err.file.close();
                 candidate = next_available_path(report_path, suffix);
                 suffix = suffix.saturating_add(1);
             }
             Err(err) => {
-                return Err(err)
+                return Err(err.error)
                     .with_context(|| format!("create benchmark report {}", candidate.display()));
             }
         }
