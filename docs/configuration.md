@@ -330,6 +330,12 @@ platform, build, mount, and runtime-stats metadata. If the mounted
 still completes, prints a warning, and records `runtime_stats.available: false`
 with the warning text in JSON.
 
+For repeatable Windows, macOS, and Linux evidence capture around `studiofs
+bench`, use the validation scripts documented in
+[docs/perf/benchmark-validation.md](./perf/benchmark-validation.md). They
+standardize `target/perf` artifact directories, command capture, stdout
+capture, JSON reports, summary files, and before/after comparison guidance.
+
 Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL`: endpoint base URL for Grafana
   Pyroscope

@@ -2,6 +2,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use proc_macro2::LineColumn;
 use syn::spanned::Spanned;
@@ -22,6 +23,10 @@ fn read_workspace_file(path: &str) -> String {
 
 fn workspace_line_count(path: &str) -> usize {
     read_workspace_file(path).lines().count()
+}
+
+fn workspace_path_exists<P: AsRef<Path>>(path: P) -> bool {
+    repo_root().join(path).exists()
 }
 
 fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
@@ -1116,6 +1121,136 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
         missing.is_empty(),
         "SFS-485 macOS native bridge readiness report is missing required decision-gate surfaces:\n{}",
         missing.join("\n")
+    );
+}
+
+fn benchmark_validation_required_files() -> [&'static str; 5] {
+    [
+        "tools/perf/validate-bench-windows.ps1",
+        "tools/perf/validate-bench-unix.sh",
+        "tools/perf/validate-bench-macos.sh",
+        "tools/perf/validate-bench-linux.sh",
+        "docs/perf/benchmark-validation.md",
+    ]
+}
+
+fn benchmark_validation_combined_text() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
+        let unix_script = read_workspace_file("tools/perf/validate-bench-unix.sh");
+        let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
+        let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
+        let docs = read_workspace_file("docs/perf/benchmark-validation.md");
+
+        format!("{windows_script}\n{unix_script}\n{macos_script}\n{linux_script}\n{docs}")
+    })
+}
+
+#[test]
+fn benchmark_validation_files_exist() {
+    let missing_files: Vec<_> = benchmark_validation_required_files()
+        .iter()
+        .copied()
+        .filter(|path| !workspace_path_exists(path))
+        .collect();
+    assert!(
+        missing_files.is_empty(),
+        "SFS-557 benchmark validation is missing files:\n{}",
+        missing_files.join("\n")
+    );
+}
+
+#[test]
+fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
+    let combined = benchmark_validation_combined_text();
+    let normalized_combined = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "target/perf",
+        "studiofs bench",
+        "--json-output",
+        "validate-bench-unix.sh",
+        "studiofs bench failed",
+        "target\\release\\studiofs.exe",
+        "target\\debug\\studiofs.exe",
+        "target/release/studiofs",
+        "target/debug/studiofs",
+        "--runs",
+        "--threads",
+        "--small-file-count",
+        "must be a positive integer",
+        "normalize_positive_int",
+        "10#$value",
+        "is_executable_command",
+        "$command_path\" == */* && -x \"$command_path",
+        "a path value",
+        "Starting benchmark run",
+        "command.txt",
+        "stdout.txt",
+        "environment.json",
+        "summary.md",
+        "report.json",
+        "run-001",
+        "Do not overwrite previous benchmark artifacts",
+        "recommended run count is 5",
+        "compare medians",
+        "p95",
+        "p99",
+        "mount point",
+        "git commit",
+        "OS",
+        "benchmark settings",
+        "Windows",
+        "macOS",
+        "Linux",
+    ];
+    let missing_terms: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&combined, &normalized_combined, term))
+        .collect();
+
+    assert!(
+        missing_terms.is_empty(),
+        "SFS-557 benchmark validation contract is missing terms:\n{}",
+        missing_terms.join("\n")
+    );
+}
+
+#[test]
+fn benchmark_validation_scripts_avoid_review_blocked_terms() {
+    let combined = benchmark_validation_combined_text();
+    let normalized_combined = normalize_doc_whitespace(&combined);
+
+    let forbidden_terms = [
+        "$args = @(",
+        "for run in $(seq",
+        "while [[ -e \"$validation_dir\"",
+        "repo_root_for_fallback",
+        "${2:?}",
+        "\"$runs\" -lt 1",
+        "\"$small_file_count\" -lt 1",
+        "\"$threads\" -lt 1",
+        "> $stdoutPath 2>&1",
+        "$ErrorActionPreference = \"Continue\"",
+        "value=\"${value//$'\\n'/\\\\n}\"",
+        "value=\"${value//$'\\r'/\\\\r}\"",
+        "value=\"${value//$'\\t'/\\\\t}\"",
+        "if (-not (Test-Path -LiteralPath $candidate))",
+        "``$MountPoint``",
+        "``$gitCommit``",
+        "``$runDir``",
+    ];
+    let forbidden_hits: Vec<_> = forbidden_terms
+        .iter()
+        .copied()
+        .filter(|term| contains_doc_term(&combined, &normalized_combined, term))
+        .collect();
+
+    assert!(
+        forbidden_hits.is_empty(),
+        "SFS-557 benchmark validation scripts still contain review-blocked terms:\n{}",
+        forbidden_hits.join("\n")
     );
 }
 

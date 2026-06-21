@@ -256,6 +256,12 @@ Run sequential and random workloads against a mounted StudioFS path after the
 mount is already active. Record the workload shape explicitly: access pattern,
 block size, read size, file sizes, concurrency, queue depth, and warm-up count.
 
+For repeatable cross-platform artifact capture, use the SFS-557 validation
+scripts in `tools/perf` and the layout described in
+[docs/perf/benchmark-validation.md](./perf/benchmark-validation.md). They write
+command, stdout, JSON report, environment, and summary artifacts under
+`target/perf` without overwriting previous runs.
+
 For the public mounted benchmark surface, start with:
 
 ```bash
