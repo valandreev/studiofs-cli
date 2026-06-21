@@ -1123,15 +1123,27 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
     );
 }
 
-#[test]
-fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
-    let required_files = [
+fn benchmark_validation_required_files() -> [&'static str; 4] {
+    [
         "tools/perf/validate-bench-windows.ps1",
         "tools/perf/validate-bench-macos.sh",
         "tools/perf/validate-bench-linux.sh",
         "docs/perf/benchmark-validation.md",
-    ];
-    let missing_files: Vec<_> = required_files
+    ]
+}
+
+fn benchmark_validation_combined_text() -> String {
+    let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
+    let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
+    let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
+    let docs = read_workspace_file("docs/perf/benchmark-validation.md");
+
+    format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}")
+}
+
+#[test]
+fn benchmark_validation_files_exist() {
+    let missing_files: Vec<_> = benchmark_validation_required_files()
         .iter()
         .copied()
         .filter(|path| !workspace_path_exists(path))
@@ -1141,25 +1153,30 @@ fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
         "SFS-557 benchmark validation is missing files:\n{}",
         missing_files.join("\n")
     );
+}
 
-    let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
-    let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
-    let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
-    let docs = read_workspace_file("docs/perf/benchmark-validation.md");
-    let combined = format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}");
+#[test]
+fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
+    let combined = benchmark_validation_combined_text();
     let normalized_combined = normalize_doc_whitespace(&combined);
     let required_terms = [
         "target/perf",
         "studiofs bench",
         "--json-output",
+        "Test-StudioFsCommand",
+        "Write-Utf8NoBom",
         "Invoke-OptionalCommand",
         "git_success",
+        "N/A",
         "$benchArgs",
         "(\\\\*)\"",
         "(\\\\+)$",
         "\\r",
         "\\t",
         "studiofs bench failed",
+        "exitCode = 1",
+        "--runs must be a positive integer",
+        "command -v",
         "for ((run=1; run<=runs; run++))",
         "command.txt",
         "stdout.txt",
@@ -1191,6 +1208,12 @@ fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
         "SFS-557 benchmark validation contract is missing terms:\n{}",
         missing_terms.join("\n")
     );
+}
+
+#[test]
+fn benchmark_validation_scripts_avoid_review_blocked_terms() {
+    let combined = benchmark_validation_combined_text();
+    let normalized_combined = normalize_doc_whitespace(&combined);
 
     let forbidden_terms = ["$args = @(", "for run in $(seq"];
     let forbidden_hits: Vec<_> = forbidden_terms

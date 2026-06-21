@@ -39,6 +39,18 @@ function New-UniqueDirectory {
     throw "Could not create a unique benchmark artifact directory under $Root"
 }
 
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Value, $utf8NoBom)
+}
+
 function Quote-CommandPart {
     param([Parameter(Mandatory = $true)][string]$Value)
     if ($Value -match '\s') {
@@ -47,6 +59,14 @@ function Quote-CommandPart {
         return '"' + $escaped + '"'
     }
     return $Value
+}
+
+function Test-StudioFsCommand {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Get-Command $Path -ErrorAction SilentlyContinue)) {
+        throw "Error: studiofs binary not found or not executable at: $Path"
+    }
 }
 
 function Invoke-OptionalCommand {
@@ -77,6 +97,8 @@ if ($Runs -lt 1) {
     throw "-Runs must be >= 1"
 }
 
+Test-StudioFsCommand -Path $StudioFsPath
+
 $repoRoot = Get-RepoRoot
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repoRoot "target\perf"
@@ -98,7 +120,7 @@ $gitCommit = $gitCommitResult.output
 $studiofsVersion = $studiofsVersionResult.output
 $git_success = $gitCommitResult.success
 
-[pscustomobject][ordered]@{
+$environmentJson = [pscustomobject][ordered]@{
     platform             = "Windows"
     os                   = [System.Environment]::OSVersion.VersionString
     mount_point          = $MountPoint
@@ -106,7 +128,8 @@ $git_success = $gitCommitResult.success
     studiofs_version     = $studiofsVersion
     benchmark_settings   = $settings
     artifact_layout_note = "Do not overwrite previous benchmark artifacts"
-} | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $validationDir "environment.json") -Encoding utf8
+} | ConvertTo-Json -Depth 20
+Write-Utf8NoBom -Path (Join-Path $validationDir "environment.json") -Value $environmentJson
 
 $runDirs = @()
 for ($run = 1; $run -le $Runs; $run += 1) {
@@ -128,7 +151,7 @@ for ($run = 1; $run -le $Runs; $run += 1) {
         "--json-output", $reportPath
     )
     $commandLine = (Quote-CommandPart $StudioFsPath) + " " + (($benchArgs | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " ")
-    Set-Content -LiteralPath $commandPath -Value $commandLine -Encoding utf8
+    Write-Utf8NoBom -Path $commandPath -Value $commandLine
 
     try {
         $output = & $StudioFsPath @benchArgs 2>&1
@@ -136,9 +159,9 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     }
     catch {
         $output = $_ | Out-String
-        $exitCode = if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $LASTEXITCODE } else { 1 }
+        $exitCode = 1
     }
-    $output | Out-String | Set-Content -LiteralPath $stdoutPath -Encoding utf8
+    Write-Utf8NoBom -Path $stdoutPath -Value ($output | Out-String)
     if ($exitCode -ne 0) {
         throw "studiofs bench failed with exit code $exitCode. See $stdoutPath"
     }
@@ -155,7 +178,8 @@ $lines.Add("# StudioFS Windows benchmark validation")
 $lines.Add("")
 $lines.Add("- Platform: Windows")
 $lines.Add("- Mount point: ``$MountPoint``")
-$lines.Add("- Git commit: ``$gitCommit``")
+$gitCommitText = if ($gitCommit) { "``$gitCommit``" } else { "N/A" }
+$lines.Add("- Git commit: $gitCommitText")
 $lines.Add("- Runs: $Runs; recommended run count is 5")
 $lines.Add("- Benchmark settings: block size $BlockSize, big file size $BigFileSize, small file size $SmallFileSize, small file count $SmallFileCount, threads $Threads")
 $lines.Add("")
@@ -166,6 +190,6 @@ $lines.Add("")
 foreach ($runDir in $runDirs) {
     $lines.Add("- ``$runDir``: command.txt, stdout.txt, report.json")
 }
-$lines -join [Environment]::NewLine | Set-Content -LiteralPath $summaryPath -Encoding utf8
+Write-Utf8NoBom -Path $summaryPath -Value ($lines -join [Environment]::NewLine)
 
 Write-Host "Benchmark validation artifacts: $validationDir"

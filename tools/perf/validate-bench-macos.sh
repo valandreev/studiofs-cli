@@ -58,9 +58,14 @@ if [[ -z "$mount_point" ]]; then
   usage >&2
   exit 2
 fi
-if [[ "$runs" -lt 1 ]]; then
-  echo "--runs must be >= 1" >&2
+if [[ ! "$runs" =~ ^[0-9]+$ ]] || [[ "$runs" -lt 1 ]]; then
+  echo "Error: --runs must be a positive integer" >&2
   exit 2
+fi
+
+if ! command -v "$studiofs_path" >/dev/null 2>&1; then
+  echo "Error: studiofs binary not found or not executable at: $studiofs_path" >&2
+  exit 1
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -143,7 +148,11 @@ summary_path="$validation_dir/summary.md"
   echo
   echo "- Platform: macOS"
   echo "- Mount point: \`$mount_point\`"
-  echo "- Git commit: \`$git_commit\`"
+  commit_text="N/A"
+  if [[ -n "$git_commit" ]]; then
+    commit_text="\`$git_commit\`"
+  fi
+  echo "- Git commit: $commit_text"
   echo "- Runs: $runs; recommended run count is 5"
   echo "- Benchmark settings: block size $block_size, big file size $big_file_size, small file size $small_file_size, small file count $small_file_count, threads $threads"
   echo
