@@ -104,7 +104,10 @@ fn write_report_file(
     report: &BenchmarkReport,
     auto_named: bool,
 ) -> Result<PathBuf> {
-    let parent = report_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = report_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create report dir {}", parent.display()))?;
 
@@ -253,6 +256,23 @@ mod tests {
         assert_eq!(parsed["runtime_stats"]["available"], false);
         assert!(parsed["runtime_stats"]["warnings"][0].is_string());
         assert!(content.contains("\n  \"mode\""));
+    }
+
+    #[test]
+    fn save_benchmark_report_writes_bare_requested_file_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("report.json")), temp.path(), now)
+                .unwrap();
+
+        assert_eq!(saved, temp.path().join("report.json"));
+        assert!(saved.is_file());
     }
 
     #[test]

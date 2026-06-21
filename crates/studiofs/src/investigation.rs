@@ -4,9 +4,9 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -20,6 +20,8 @@ pub(crate) const INVESTIGATION_REPORT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_COMPARISON_SCHEMA_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_HYPOTHESIS_SCHEMA_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_WORKFLOW_RUN_SCHEMA_VERSION: u32 = 1;
+const WINDOWS_TEMPFILE_PERSIST_RETRIES: usize = 20;
+const WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -1252,10 +1254,7 @@ impl InvestigationStore {
         temp_file.as_file().sync_all().with_context(|| {
             format!("sync temporary investigation file for '{}'", path.display())
         })?;
-        temp_file
-            .persist(path)
-            .map_err(|error| error.error)
-            .with_context(|| format!("persist investigation file '{}'", path.display()))?;
+        persist_named_temp_file(temp_file, path, "persist investigation file")?;
         ensure_private_file(path)?;
         sync_directory(parent)?;
         Ok(())
@@ -1297,10 +1296,7 @@ fn append_timeline_entries(path: &Path, entries: &[TimelineEntry]) -> Result<()>
     } else {
         let temp_file = NamedTempFile::new_in(parent)
             .with_context(|| format!("create temporary timeline log in '{}'", parent.display()))?;
-        let persisted = temp_file
-            .persist(path)
-            .map_err(|error| error.error)
-            .with_context(|| format!("persist timeline log '{}'", path.display()))?;
+        let persisted = persist_named_temp_file(temp_file, path, "persist timeline log")?;
         ensure_private_file(path)?;
         sync_directory(parent)?;
         persisted
@@ -1317,6 +1313,35 @@ fn append_timeline_entries(path: &Path, entries: &[TimelineEntry]) -> Result<()>
     file.sync_all()
         .with_context(|| format!("sync timeline log '{}'", path.display()))?;
     Ok(())
+}
+
+fn persist_named_temp_file(
+    mut temp_file: NamedTempFile,
+    path: &Path,
+    context: &'static str,
+) -> Result<File> {
+    let mut retries = 0;
+    loop {
+        match temp_file.persist(path) {
+            Ok(file) => return Ok(file),
+            Err(error) => {
+                if should_retry_tempfile_persist(&error.error, retries) {
+                    temp_file = error.file;
+                    retries += 1;
+                    std::thread::sleep(WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY);
+                    continue;
+                }
+
+                return Err(error.error).with_context(|| format!("{context} '{}'", path.display()));
+            }
+        }
+    }
+}
+
+fn should_retry_tempfile_persist(error: &std::io::Error, retries: usize) -> bool {
+    cfg!(windows)
+        && retries < WINDOWS_TEMPFILE_PERSIST_RETRIES
+        && error.kind() == ErrorKind::PermissionDenied
 }
 
 fn load_timeline_entries(path: &Path) -> Result<Vec<TimelineEntry>> {
@@ -1817,6 +1842,40 @@ mod tests {
         assert_eq!(persisted_run.timeline.len(), 2);
         assert_eq!(persisted_run.timeline[0].sequence, 1);
         assert_eq!(persisted_run.timeline[1].sequence, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_json_retries_windows_destination_access_denied() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let path = temp.path().join("investigations").join("run.json");
+        let parent = path.parent().expect("run json parent");
+        fs::create_dir_all(parent).expect("create parent");
+        fs::write(&path, br#"{"old":true}"#).expect("write existing run json");
+
+        let blocking_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect("open destination without delete sharing");
+        let release_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(blocking_handle);
+        });
+
+        store
+            .save_json(&path, &serde_json::json!({ "new": true }))
+            .expect("save json after transient destination access denied");
+        release_handle.join().expect("release blocking handle");
+
+        let saved = fs::read_to_string(path).expect("read saved json");
+        assert!(saved.contains("\"new\": true"));
     }
 
     #[test]
