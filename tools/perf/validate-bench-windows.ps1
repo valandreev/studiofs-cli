@@ -80,8 +80,14 @@ function Resolve-StudioFsCommand {
         return $command.Source
     }
 
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $Path).Path
+    $pathCandidates = @($Path)
+    if ([string]::IsNullOrEmpty([System.IO.Path]::GetExtension($Path))) {
+        $pathCandidates += "$Path.exe"
+    }
+    foreach ($pathCandidate in $pathCandidates) {
+        if (Test-Path -LiteralPath $pathCandidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $pathCandidate).Path
+        }
     }
 
     if ($Path -eq "studiofs") {
@@ -96,6 +102,49 @@ function Resolve-StudioFsCommand {
     }
 
     throw "Error: studiofs binary not found or not executable at: $Path"
+}
+
+function Invoke-BenchmarkCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(Mandatory = $true)]
+        [string[]]$CommandArguments,
+        [Parameter(Mandatory = $true)]
+        [string]$StdoutPath
+    )
+
+    $stdoutRawPath = "$StdoutPath.stdout"
+    $stderrRawPath = "$StdoutPath.stderr"
+    Remove-Item -LiteralPath $stdoutRawPath, $stderrRawPath -Force -ErrorAction SilentlyContinue
+
+    try {
+        $argumentLine = ($CommandArguments | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " "
+        $process = Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $argumentLine `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutRawPath `
+            -RedirectStandardError $stderrRawPath
+        $outputBytes = [System.IO.File]::ReadAllBytes($stdoutRawPath)
+        if (Test-Path -LiteralPath $stderrRawPath -PathType Leaf) {
+            $stderrBytes = [System.IO.File]::ReadAllBytes($stderrRawPath)
+            if ($stderrBytes.Length -gt 0) {
+                $outputBytes = $outputBytes + $stderrBytes
+            }
+        }
+        [System.IO.File]::WriteAllBytes($StdoutPath, $outputBytes)
+        return $process.ExitCode
+    }
+    catch {
+        Write-Utf8NoBom -Path $StdoutPath -Value ($_ | Out-String)
+        return 1
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutRawPath, $stderrRawPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-OptionalCommand {
@@ -188,19 +237,7 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     Write-Utf8NoBom -Path $commandPath -Value $commandLine
 
     Write-Host "Starting benchmark run $run of $Runs..."
-    $oldEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & $StudioFsPath @benchArgs > $stdoutPath 2>&1
-        $exitCode = $LASTEXITCODE
-    }
-    catch {
-        Write-Utf8NoBom -Path $stdoutPath -Value ($_ | Out-String)
-        $exitCode = 1
-    }
-    finally {
-        $ErrorActionPreference = $oldEap
-    }
+    $exitCode = Invoke-BenchmarkCommand -FilePath $StudioFsPath -CommandArguments $benchArgs -StdoutPath $stdoutPath
     if ($exitCode -ne 0) {
         throw "studiofs bench failed with exit code $exitCode. See $stdoutPath"
     }

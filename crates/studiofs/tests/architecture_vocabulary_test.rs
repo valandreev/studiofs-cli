@@ -1124,9 +1124,10 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
     );
 }
 
-fn benchmark_validation_required_files() -> [&'static str; 4] {
+fn benchmark_validation_required_files() -> [&'static str; 5] {
     [
         "tools/perf/validate-bench-windows.ps1",
+        "tools/perf/validate-bench-unix.sh",
         "tools/perf/validate-bench-macos.sh",
         "tools/perf/validate-bench-linux.sh",
         "docs/perf/benchmark-validation.md",
@@ -1137,11 +1138,12 @@ fn benchmark_validation_combined_text() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
         let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
+        let unix_script = read_workspace_file("tools/perf/validate-bench-unix.sh");
         let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
         let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
         let docs = read_workspace_file("docs/perf/benchmark-validation.md");
 
-        format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}")
+        format!("{windows_script}\n{unix_script}\n{macos_script}\n{linux_script}\n{docs}")
     })
 }
 
@@ -1167,41 +1169,17 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
         "target/perf",
         "studiofs bench",
         "--json-output",
-        "Write-Utf8NoBom",
-        "Invoke-OptionalCommand",
-        "git_success",
-        "N/A",
-        "local nl=$'\\n'",
-        "local cr=$'\\r'",
-        "local tab=$'\\t'",
-        "$benchArgs",
-        "(\\\\*)\"",
-        "(\\\\+)$",
-        "\\r",
-        "\\t",
+        "validate-bench-unix.sh",
         "studiofs bench failed",
-        "$oldEap",
-        "$ErrorActionPreference = \"Continue\"",
-        "$ErrorActionPreference = $oldEap",
-        "Resolve-StudioFsCommand",
         "target\\release\\studiofs.exe",
         "target\\debug\\studiofs.exe",
-        "Test-Path -LiteralPath $Path -PathType Leaf",
-        "New-Item -ItemType Directory -Path $candidate -ErrorAction Stop",
-        "> $stdoutPath 2>&1",
-        "exitCode = 1",
+        "target/release/studiofs",
+        "target/debug/studiofs",
         "--runs must be a positive integer",
         "--threads must be a positive integer",
         "--small-file-count must be a positive integer",
-        "command -v",
-        "target/release/studiofs",
-        "target/debug/studiofs",
-        "max_attempts=100",
-        "escaped_git_commit_json",
-        "escaped_studiofs_version_json",
-        "while ! mkdir \"$validation_dir\"",
+        "a path value",
         "Starting benchmark run",
-        "for ((run=1; run<=runs; run++))",
         "command.txt",
         "stdout.txt",
         "environment.json",
@@ -1243,6 +1221,10 @@ fn benchmark_validation_scripts_avoid_review_blocked_terms() {
         "$args = @(",
         "for run in $(seq",
         "while [[ -e \"$validation_dir\"",
+        "repo_root_for_fallback",
+        "${2:?}",
+        "> $stdoutPath 2>&1",
+        "$ErrorActionPreference = \"Continue\"",
         "value=\"${value//$'\\n'/\\\\n}\"",
         "value=\"${value//$'\\r'/\\\\r}\"",
         "value=\"${value//$'\\t'/\\\\t}\"",

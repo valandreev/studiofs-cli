@@ -14,6 +14,9 @@ validation scripts:
 - macOS: `validate-bench-macos.sh`
 - Linux: `validate-bench-linux.sh`
 
+The macOS and Linux entrypoints call the shared `validate-bench-unix.sh`
+implementation to keep Unix argument handling and artifact generation aligned.
+
 Those scripts write non-overwriting run directories under `target/perf`; see
 [`docs/perf/benchmark-validation.md`](../../docs/perf/benchmark-validation.md).
 

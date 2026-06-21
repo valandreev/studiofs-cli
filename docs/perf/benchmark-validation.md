@@ -10,6 +10,10 @@ The scripts are:
 - macOS: `tools/perf/validate-bench-macos.sh`
 - Linux: `tools/perf/validate-bench-linux.sh`
 
+The macOS and Linux entrypoints are thin wrappers around the shared
+`tools/perf/validate-bench-unix.sh` implementation so option parsing, artifact
+layout, and benchmark invocation behavior stay in sync across Unix platforms.
+
 ## Usage
 
 Windows:
@@ -41,6 +45,8 @@ If `studiofs` is not available in `PATH`, the scripts automatically try the
 workspace `target/release/studiofs` and `target/debug/studiofs` build outputs
 for the default `studiofs` command name. You can also pass an explicit binary
 with `-StudioFsPath` on Windows or `--studiofs` on macOS/Linux.
+On Windows, `-StudioFsPath target\release\studiofs` also resolves the matching
+`.exe` file when it exists.
 
 ## Artifact Layout
 
