@@ -220,6 +220,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         "test-cache run started"
     );
     let config = BenchmarkConfig {
+        command_name: "studiofs test-cache",
         target: target.clone(),
         block_size,
         read_size,

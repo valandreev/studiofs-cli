@@ -18,6 +18,8 @@ pub(crate) use profiling::{cpu_utilization_percent, process_cpu_time};
 pub(crate) use reporting::{render_human_summary, save_benchmark_report};
 pub(crate) use result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
+    benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,
+    missing_runtime_stats_report,
 };
 pub(crate) use telemetry::{
     DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
@@ -40,6 +42,7 @@ pub(crate) enum BenchmarkAccessPattern {
 /// Complete benchmark engine configuration after CLI/default validation.
 #[derive(Debug)]
 pub(crate) struct BenchmarkConfig {
+    pub(crate) command_name: &'static str,
     pub(crate) target: PathBuf,
     pub(crate) block_size: u64,
     pub(crate) read_size: u64,

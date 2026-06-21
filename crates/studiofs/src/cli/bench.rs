@@ -44,8 +44,9 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) threads: usize,
 
-    /// JSON report output path. Defaults to an auto-named file in the
-    /// current working directory.
+    /// JSON report output path. Defaults to an auto-named file under target/perf/.
+    /// Existing directories or paths ending with a separator receive an auto-named file;
+    /// other paths are treated as explicit files.
     #[arg(long)]
     pub(crate) json_output: Option<PathBuf>,
 }
@@ -89,6 +90,7 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
         .max(size_class_small_max.saturating_add(1));
 
     Ok(BenchmarkConfig {
+        command_name: "studiofs bench",
         target: args.mountpoint.clone(),
         block_size,
         read_size: block_size,
@@ -149,6 +151,9 @@ fn run(args: BenchArgs) -> Result<()> {
     };
 
     print!("{}", render_human_summary(&report));
+    for warning in &report.runtime_stats.warnings {
+        eprintln!("Warning: {warning}");
+    }
     let report_path = save_benchmark_report(&report, args.json_output.as_deref())
         .context("save benchmark JSON report")?;
     println!("JSON report: {}", report_path.display());
@@ -202,6 +207,7 @@ mod tests {
 
         let config = build_bench_config(&args, "run-1".to_string()).unwrap();
 
+        assert_eq!(config.command_name, "studiofs bench");
         assert_eq!(config.block_size, 4 * 1024 * 1024);
         assert_eq!(config.read_size, 4 * 1024 * 1024);
         assert_eq!(config.concurrency, 4);

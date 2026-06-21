@@ -1,9 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::io::Write as _;
+use std::fs::File;
+use std::io::ErrorKind;
+use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tempfile::NamedTempFile;
 
 use super::super::result::BenchmarkReport;
+
+const WINDOWS_TEMPFILE_PERSIST_RETRIES: usize = 20;
+const WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 fn slugify_report_segment(value: &str) -> String {
     let mut out = String::new();
@@ -59,64 +66,139 @@ fn resolve_report_target(
     now: DateTime<Utc>,
 ) -> (PathBuf, bool) {
     if let Some(json_output) = json_output {
+        let output_text = json_output.to_string_lossy();
         let explicit = if json_output.is_absolute() {
             json_output.to_path_buf()
         } else {
             current_dir.join(json_output)
         };
-        if explicit.is_dir() {
+        let default_report_dir = current_dir.join("target").join("perf");
+        let treat_as_dir = explicit == default_report_dir
+            || explicit.is_dir()
+            || output_text.ends_with('/')
+            || output_text.ends_with('\\');
+        if treat_as_dir {
             return (explicit.join(default_report_file_name(report, now)), true);
         }
         return (explicit, false);
     }
 
     (
-        current_dir.join(default_report_file_name(report, now)),
+        current_dir
+            .join("target")
+            .join("perf")
+            .join(default_report_file_name(report, now)),
         true,
     )
 }
 
-fn write_report_file(report_path: &Path, json: &[u8], auto_named: bool) -> Result<PathBuf> {
+fn write_json_report(
+    temp_file: &mut NamedTempFile,
+    report: &BenchmarkReport,
+    report_path: &Path,
+) -> Result<()> {
+    let mut writer = BufWriter::new(temp_file.as_file_mut());
+    serde_json::to_writer_pretty(&mut writer, report)
+        .with_context(|| format!("serialize benchmark report {}", report_path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flush benchmark report {}", report_path.display()))
+}
+
+fn write_report_file(
+    report_path: &Path,
+    report: &BenchmarkReport,
+    auto_named: bool,
+) -> Result<PathBuf> {
+    let parent = report_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create report dir {}", parent.display()))?;
+
     if !auto_named {
-        if let Some(parent) = report_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create report dir {}", parent.display()))?;
-        }
-        std::fs::write(report_path, json)
-            .with_context(|| format!("write benchmark report {}", report_path.display()))?;
+        let mut temp_file = NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temporary report file in {}", parent.display()))?;
+        write_json_report(&mut temp_file, report, report_path)?;
+        persist_named_temp_file(temp_file, report_path, "replace benchmark report")?;
         return Ok(report_path.to_path_buf());
     }
 
     let mut candidate = report_path.to_path_buf();
     let mut suffix = 2usize;
+    while candidate.exists() {
+        candidate = next_available_path(report_path, suffix);
+        suffix = suffix.saturating_add(1);
+    }
     loop {
-        if let Some(parent) = candidate.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create report dir {}", parent.display()))?;
-        }
-
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                file.write_all(json)
-                    .with_context(|| format!("write benchmark report {}", candidate.display()))?;
-                file.flush()
-                    .with_context(|| format!("flush benchmark report {}", candidate.display()))?;
-                return Ok(candidate);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        let mut temp_file = NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temporary report file in {}", parent.display()))?;
+        write_json_report(&mut temp_file, report, &candidate)?;
+        match persist_named_temp_file_noclobber(temp_file, &candidate)? {
+            Some(_) => return Ok(candidate),
+            None => {
                 candidate = next_available_path(report_path, suffix);
                 suffix = suffix.saturating_add(1);
             }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("create benchmark report {}", candidate.display()));
+        }
+    }
+}
+
+fn persist_named_temp_file(
+    mut temp_file: NamedTempFile,
+    path: &Path,
+    context: &'static str,
+) -> Result<File> {
+    let mut retries = 0;
+    loop {
+        match temp_file.persist(path) {
+            Ok(file) => return Ok(file),
+            Err(error) => {
+                if should_retry_tempfile_persist(&error.error, retries) {
+                    temp_file = error.file;
+                    retries += 1;
+                    std::thread::sleep(WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY);
+                    continue;
+                }
+
+                return Err(error.error).with_context(|| format!("{context} {}", path.display()));
             }
         }
     }
+}
+
+fn persist_named_temp_file_noclobber(
+    mut temp_file: NamedTempFile,
+    path: &Path,
+) -> Result<Option<File>> {
+    let mut retries = 0;
+    loop {
+        match temp_file.persist_noclobber(path) {
+            Ok(file) => return Ok(Some(file)),
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+                let _ = error.file.close();
+                return Ok(None);
+            }
+            Err(error) => {
+                if should_retry_tempfile_persist(&error.error, retries) {
+                    temp_file = error.file;
+                    retries += 1;
+                    std::thread::sleep(WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY);
+                    continue;
+                }
+
+                return Err(error.error)
+                    .with_context(|| format!("create benchmark report {}", path.display()));
+            }
+        }
+    }
+}
+
+fn should_retry_tempfile_persist(error: &std::io::Error, retries: usize) -> bool {
+    cfg!(windows)
+        && retries < WINDOWS_TEMPFILE_PERSIST_RETRIES
+        && error.kind() == ErrorKind::PermissionDenied
 }
 
 fn save_benchmark_report_in(
@@ -125,10 +207,8 @@ fn save_benchmark_report_in(
     current_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<PathBuf> {
-    let json =
-        serde_json::to_vec_pretty(report).context("serialize benchmark report as JSON report")?;
     let (report_path, auto_named) = resolve_report_target(report, json_output, current_dir, now);
-    write_report_file(&report_path, &json, auto_named)
+    write_report_file(&report_path, report, auto_named)
 }
 
 pub(crate) fn save_benchmark_report(
@@ -150,7 +230,7 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn default_report_path_uses_current_dir_and_avoids_collisions() {
+    fn default_report_path_uses_target_perf_and_avoids_collisions() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
@@ -162,6 +242,8 @@ mod tests {
         assert_eq!(
             first,
             temp.path()
+                .join("target")
+                .join("perf")
                 .join("studiofs-benchmark-direct-shim-20260319-151255.json")
         );
 
@@ -169,8 +251,36 @@ mod tests {
         assert_eq!(
             second,
             temp.path()
+                .join("target")
+                .join("perf")
                 .join("studiofs-benchmark-direct-shim-20260319-151255-2.json")
         );
+    }
+
+    #[test]
+    fn save_benchmark_report_overwrites_requested_file_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+        let existing = temp.path().join("reports/cache-run.json");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "stale report").unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("reports/cache-run.json")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(saved, existing);
+        let content = std::fs::read_to_string(saved).unwrap();
+        assert!(content.contains("\n  \"mode\""));
+        assert!(!content.contains("stale report"));
     }
 
     #[test]
@@ -195,7 +305,113 @@ mod tests {
         let content = std::fs::read_to_string(saved).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mode"], "direct-shim");
+        assert_eq!(parsed["command"]["name"], "studiofs test-cache");
+        assert!(parsed["platform"]["os"].is_string());
+        assert!(parsed["build"]["package_version"].is_string());
+        assert_eq!(parsed["runtime_stats"]["available"], false);
+        assert!(parsed["runtime_stats"]["warnings"][0].is_string());
         assert!(content.contains("\n  \"mode\""));
+    }
+
+    #[test]
+    fn save_benchmark_report_writes_bare_requested_file_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("report.json")), temp.path(), now)
+                .unwrap();
+
+        assert_eq!(saved, temp.path().join("report.json"));
+        assert!(saved.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_benchmark_report_retries_windows_overwrite_access_denied() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+        let path = temp.path().join("report.json");
+        std::fs::write(&path, "stale report").unwrap();
+
+        let blocking_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect("open destination without delete sharing");
+        let release_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(blocking_handle);
+        });
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("report.json")), temp.path(), now)
+                .expect("save report after transient destination access denied");
+        release_handle.join().expect("release blocking handle");
+
+        assert_eq!(saved, path);
+        let content = std::fs::read_to_string(saved).unwrap();
+        assert!(content.contains("\n  \"mode\""));
+        assert!(!content.contains("stale report"));
+    }
+
+    #[test]
+    fn save_benchmark_report_writes_extensionless_requested_path_as_file() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("target/new_reports_dir")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(saved, temp.path().join("target").join("new_reports_dir"));
+        assert!(saved.is_file());
+    }
+
+    #[test]
+    fn save_benchmark_report_treats_default_perf_output_as_directory() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("target/perf")), temp.path(), now)
+                .unwrap();
+
+        assert_eq!(
+            saved,
+            temp.path()
+                .join("target")
+                .join("perf")
+                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
+        );
+        assert!(saved.is_file());
+        assert!(temp.path().join("target").join("perf").is_dir());
     }
 
     #[test]

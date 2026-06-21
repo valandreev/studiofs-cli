@@ -12,9 +12,11 @@ use tokio::sync::Semaphore;
 use crate::cli::benchmark_engine::{
     BenchmarkConfig, BenchmarkProfileReport, BenchmarkReport, CachePipelineReport,
     CpuProfileReport, DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, SizeClassBounds,
+    benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,
     build_access_sequence, build_advanced_metrics, build_work_sizes, classify_size,
-    cpu_utilization_percent, deterministic_bytes, phase_telemetry_to_report, process_cpu_time,
-    split_stream_segments, stream_reports_from_telemetry,
+    cpu_utilization_percent, deterministic_bytes, missing_runtime_stats_report,
+    phase_telemetry_to_report, process_cpu_time, split_stream_segments,
+    stream_reports_from_telemetry,
 };
 
 async fn run_shim_writes(
@@ -599,6 +601,17 @@ pub(super) async fn run_direct(
         workload_large_files: workload.large_files,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
         l1_limit: params.l1_limit,
+        command: benchmark_command_metadata(
+            params.command_name,
+            "direct-shim",
+            params.run_id.clone(),
+        ),
+        platform: benchmark_platform_metadata(),
+        build: benchmark_build_metadata(),
+        runtime_stats: missing_runtime_stats_report(
+            None,
+            "runtime stats are only available for mounted StudioFS benchmarks",
+        ),
         volume: None,
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),

@@ -197,3 +197,7 @@ studiofs bench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
 The command must run inside an active StudioFS mount. It does not fall back to
 the legacy direct cache benchmark.
 
+Without `--json-output`, reports are saved under `target/perf` with an
+auto-generated file name. Each report includes command, platform, build, mount,
+and runtime-stats sections. Missing runtime stats are warnings, not benchmark
+failures, and are represented as `runtime_stats.available: false` in JSON.

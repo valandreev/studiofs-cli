@@ -322,6 +322,14 @@ studiofs bench /mnt/studio/myvolume \
 The command requires an active StudioFS mount and does not silently run the
 legacy direct cache path outside a mount.
 
+By default, the command writes a pretty JSON report under `target/perf` with an
+auto-generated file name and prints `JSON report: <path>`. Passing
+`--json-output <file-or-dir>` overrides that location. Reports include command,
+platform, build, mount, and runtime-stats metadata. If the mounted
+`.studiofs-runtime-stats` surface is unavailable or malformed, the benchmark
+still completes, prints a warning, and records `runtime_stats.available: false`
+with the warning text in JSON.
+
 Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL`: endpoint base URL for Grafana
   Pyroscope

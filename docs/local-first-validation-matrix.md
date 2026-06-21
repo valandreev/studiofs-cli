@@ -286,9 +286,16 @@ marks it invalid and records the timeout reason.
 For SFS-299 parity reports, prefer `studiofs test <mounted-path> --report
 <path>`. The JSON report must include:
 
+- `command`, `platform`, and `build`: command identity, run id, OS/arch/family,
+  package version, debug/release mode, and git metadata when the build exposes
+  it.
 - `mounted_runtime`: mounted path, cache root, inferred metadata root when the
   default `<meta-dir>/cache/<uuid>` layout is visible, block/chunk size, read
   size, workload shape, OS, and bridge type.
+- `runtime_stats`: raw before/after snapshots, whole-run deltas, and per-phase
+  deltas for the mounted runtime stats surface. If the surface is unavailable,
+  the report records `available: false` plus warning text instead of failing the
+  benchmark.
 - `writes.latency_histogram` and `reads.latency_histogram` alongside throughput
   and percentile fields.
 - `mounted_observability.writer`: dirty bytes, dirty slice count, frozen slice

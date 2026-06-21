@@ -1,9 +1,11 @@
 use crate::cli::benchmark_profile_types::ProfileArtifactKind;
 use serde::Serialize;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
-    VfsFetchStats, VfsUploadStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    RuntimeLatencyBucket, RuntimeStatsSection, RuntimeStatsSnapshot, VfsFetchStats, VfsUploadStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
 };
 
 #[derive(Debug, Serialize)]
@@ -55,6 +57,10 @@ pub(crate) struct BenchmarkReport {
     pub(crate) workload_large_files: usize,
     pub(crate) access_pattern: String,
     pub(crate) l1_limit: u64,
+    pub(crate) command: BenchmarkCommandMetadataReport,
+    pub(crate) platform: BenchmarkPlatformMetadataReport,
+    pub(crate) build: BenchmarkBuildMetadataReport,
+    pub(crate) runtime_stats: BenchmarkRuntimeStatsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) work_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +99,110 @@ pub(crate) struct BenchmarkReport {
     pub(crate) cleanup: Option<OpReport>,
     pub(crate) writes: OpReport,
     pub(crate) reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BenchmarkCommandMetadataReport {
+    pub(crate) name: String,
+    pub(crate) mode: String,
+    pub(crate) run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BenchmarkPlatformMetadataReport {
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) family: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BenchmarkBuildMetadataReport {
+    pub(crate) package_name: &'static str,
+    pub(crate) package_version: &'static str,
+    pub(crate) debug_build: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) git_sha: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) git_branch: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BenchmarkRuntimeStatsReport {
+    pub(crate) available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stats_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) before: Option<RuntimeStatsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) after: Option<RuntimeStatsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) whole_run: Option<RuntimeStatsDeltaReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) phases: Vec<RuntimeStatsPhaseDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsPhaseDeltaReport {
+    pub(crate) phase: String,
+    pub(crate) delta: RuntimeStatsDeltaReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsDeltaReport {
+    pub(crate) schema_version_before: u16,
+    pub(crate) schema_version_after: u16,
+    pub(crate) interval_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
+    pub(crate) sections: BTreeMap<String, RuntimeStatsSectionDeltaReport>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RuntimeStatsSectionDeltaReport {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) counters: BTreeMap<String, RuntimeStatsCounterDeltaReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) gauges: BTreeMap<String, RuntimeStatsGaugeDeltaReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) latencies: BTreeMap<String, RuntimeStatsLatencyDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsCounterDeltaReport {
+    pub(crate) before: u64,
+    pub(crate) after: u64,
+    pub(crate) delta: u64,
+    pub(crate) unit: Cow<'static, str>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsGaugeDeltaReport {
+    pub(crate) before: Option<u64>,
+    pub(crate) after: u64,
+    pub(crate) unit: Cow<'static, str>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsLatencyDeltaReport {
+    pub(crate) count_before: u64,
+    pub(crate) count_after: u64,
+    pub(crate) count_delta: u64,
+    pub(crate) sum_before: u64,
+    pub(crate) sum_after: u64,
+    pub(crate) sum_delta: u64,
+    pub(crate) unit: Cow<'static, str>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) buckets: Vec<RuntimeStatsLatencyBucketDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsLatencyBucketDeltaReport {
+    pub(crate) le_ns: u64,
+    pub(crate) count_before: u64,
+    pub(crate) count_after: u64,
+    pub(crate) count_delta: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -553,6 +663,296 @@ pub(crate) struct ProfileArtifactSummary {
     pub(crate) sent_to_endpoint: bool,
 }
 
+pub(crate) fn benchmark_command_metadata(
+    name: impl Into<String>,
+    mode: impl Into<String>,
+    run_id: impl Into<String>,
+) -> BenchmarkCommandMetadataReport {
+    BenchmarkCommandMetadataReport {
+        name: name.into(),
+        mode: mode.into(),
+        run_id: run_id.into(),
+    }
+}
+
+pub(crate) fn benchmark_platform_metadata() -> BenchmarkPlatformMetadataReport {
+    BenchmarkPlatformMetadataReport {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        family: std::env::consts::FAMILY,
+    }
+}
+
+pub(crate) fn benchmark_build_metadata() -> BenchmarkBuildMetadataReport {
+    BenchmarkBuildMetadataReport {
+        package_name: env!("CARGO_PKG_NAME"),
+        package_version: env!("CARGO_PKG_VERSION"),
+        debug_build: cfg!(debug_assertions),
+        git_sha: option_env!("VERGEN_GIT_SHA").or(option_env!("GIT_SHA")),
+        git_branch: option_env!("VERGEN_GIT_BRANCH").or(option_env!("GIT_BRANCH")),
+    }
+}
+
+pub(crate) fn missing_runtime_stats_report(
+    stats_path: Option<String>,
+    warning: impl Into<String>,
+) -> BenchmarkRuntimeStatsReport {
+    BenchmarkRuntimeStatsReport {
+        available: false,
+        stats_path,
+        warnings: vec![warning.into()],
+        before: None,
+        after: None,
+        whole_run: None,
+        phases: Vec::new(),
+    }
+}
+
+pub(crate) fn runtime_stats_report(
+    stats_path: String,
+    before: RuntimeStatsSnapshot,
+    after: RuntimeStatsSnapshot,
+    phases: Vec<RuntimeStatsPhaseDeltaReport>,
+    mut warnings: Vec<String>,
+) -> BenchmarkRuntimeStatsReport {
+    let whole_run = runtime_stats_delta("whole-run", &before, &after);
+    warnings.extend(whole_run.warnings.iter().cloned());
+    for phase in &phases {
+        warnings.extend(phase.delta.warnings.iter().cloned());
+    }
+    warnings.sort();
+    warnings.dedup();
+    BenchmarkRuntimeStatsReport {
+        available: true,
+        stats_path: Some(stats_path),
+        warnings,
+        before: Some(before),
+        after: Some(after),
+        whole_run: Some(whole_run),
+        phases,
+    }
+}
+
+pub(crate) fn runtime_stats_delta(
+    label: &str,
+    before: &RuntimeStatsSnapshot,
+    after: &RuntimeStatsSnapshot,
+) -> RuntimeStatsDeltaReport {
+    let mut sections = BTreeMap::new();
+    let mut warnings = Vec::new();
+    if before.schema_version != after.schema_version {
+        warnings.push(format!(
+            "runtime stats schema version changed during {label} from {} to {}; deltas may be inaccurate or mismatched",
+            before.schema_version, after.schema_version
+        ));
+    }
+    if after.generated_unix_ms < before.generated_unix_ms {
+        warnings.push(format!(
+            "runtime stats timestamp moved backward during {label}; interval uses 0ms because after ({}) < before ({})",
+            after.generated_unix_ms, before.generated_unix_ms
+        ));
+    }
+    for (name, before_section, after_section) in runtime_stats_sections(before, after) {
+        sections.insert(
+            name.to_string(),
+            runtime_stats_section_delta(label, name, before_section, after_section, &mut warnings),
+        );
+    }
+    RuntimeStatsDeltaReport {
+        schema_version_before: before.schema_version,
+        schema_version_after: after.schema_version,
+        interval_ms: after
+            .generated_unix_ms
+            .saturating_sub(before.generated_unix_ms),
+        warnings,
+        sections,
+    }
+}
+
+fn runtime_stats_sections<'a>(
+    before: &'a RuntimeStatsSnapshot,
+    after: &'a RuntimeStatsSnapshot,
+) -> [(
+    &'static str,
+    &'a RuntimeStatsSection,
+    &'a RuntimeStatsSection,
+); 8] {
+    let RuntimeStatsSnapshot {
+        schema_version: _,
+        generated_unix_ms: _,
+        system: before_system,
+        bridge: before_bridge,
+        vfs_read: before_vfs_read,
+        vfs_write: before_vfs_write,
+        cache: before_cache,
+        upload_queue: before_upload_queue,
+        object_io: before_object_io,
+        metadata: before_metadata,
+    } = before;
+    let RuntimeStatsSnapshot {
+        schema_version: _,
+        generated_unix_ms: _,
+        system: after_system,
+        bridge: after_bridge,
+        vfs_read: after_vfs_read,
+        vfs_write: after_vfs_write,
+        cache: after_cache,
+        upload_queue: after_upload_queue,
+        object_io: after_object_io,
+        metadata: after_metadata,
+    } = after;
+    [
+        ("system", before_system, after_system),
+        ("bridge", before_bridge, after_bridge),
+        ("vfs_read", before_vfs_read, after_vfs_read),
+        ("vfs_write", before_vfs_write, after_vfs_write),
+        ("cache", before_cache, after_cache),
+        ("upload_queue", before_upload_queue, after_upload_queue),
+        ("object_io", before_object_io, after_object_io),
+        ("metadata", before_metadata, after_metadata),
+    ]
+}
+
+fn runtime_stats_section_delta(
+    label: &str,
+    section_name: &str,
+    before: &RuntimeStatsSection,
+    after: &RuntimeStatsSection,
+    warnings: &mut Vec<String>,
+) -> RuntimeStatsSectionDeltaReport {
+    let mut report = RuntimeStatsSectionDeltaReport::default();
+    for (name, metric) in &after.counters {
+        let before_value = before.counters.get(name).map_or(0, |metric| metric.value);
+        if metric.value < before_value {
+            warnings.push(format!(
+                "runtime stats reset detected for {section_name}.{name} during {label}; delta uses the post-reset value"
+            ));
+        }
+        report.counters.insert(
+            name.clone(),
+            RuntimeStatsCounterDeltaReport {
+                before: before_value,
+                after: metric.value,
+                delta: reset_aware_delta(before_value, metric.value),
+                unit: metric.unit.clone(),
+            },
+        );
+    }
+    for (name, metric) in &after.gauges {
+        report.gauges.insert(
+            name.clone(),
+            RuntimeStatsGaugeDeltaReport {
+                before: before.gauges.get(name).map(|metric| metric.value),
+                after: metric.value,
+                unit: metric.unit.clone(),
+            },
+        );
+    }
+    for (name, histogram) in &after.latencies {
+        let before_histogram = before.latencies.get(name);
+        let count_before = before_histogram.map_or(0, |histogram| histogram.count);
+        let sum_before = before_histogram.map_or(0, |histogram| histogram.sum);
+        let histogram_reset = runtime_stats_latency_reset(
+            before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
+            histogram.buckets.as_slice(),
+            count_before,
+            histogram.count,
+            sum_before,
+            histogram.sum,
+        );
+        if histogram_reset {
+            warnings.push(format!(
+                "runtime stats latency reset detected for {section_name}.{name} during {label}; deltas use post-reset values"
+            ));
+        }
+        let buckets = runtime_stats_latency_bucket_deltas(
+            before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
+            histogram.buckets.as_slice(),
+            histogram_reset,
+        );
+        let (count_delta, sum_delta) = if histogram_reset {
+            (histogram.count, histogram.sum)
+        } else {
+            (
+                reset_aware_delta(count_before, histogram.count),
+                reset_aware_delta(sum_before, histogram.sum),
+            )
+        };
+        report.latencies.insert(
+            name.clone(),
+            RuntimeStatsLatencyDeltaReport {
+                count_before,
+                count_after: histogram.count,
+                count_delta,
+                sum_before,
+                sum_after: histogram.sum,
+                sum_delta,
+                unit: histogram.unit.clone(),
+                buckets,
+            },
+        );
+    }
+    report
+}
+
+fn runtime_stats_latency_bucket_deltas(
+    before: &[RuntimeLatencyBucket],
+    after: &[RuntimeLatencyBucket],
+    force_reset: bool,
+) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
+    let before_map = runtime_stats_latency_bucket_counts(before);
+    after
+        .iter()
+        .map(|bucket| {
+            let count_before = before_map.get(&bucket.le_ns).copied().unwrap_or(0);
+            let count_delta = if force_reset {
+                bucket.count
+            } else {
+                reset_aware_delta(count_before, bucket.count)
+            };
+            RuntimeStatsLatencyBucketDeltaReport {
+                le_ns: bucket.le_ns,
+                count_before,
+                count_after: bucket.count,
+                count_delta,
+            }
+        })
+        .collect()
+}
+
+fn runtime_stats_latency_reset(
+    before: &[RuntimeLatencyBucket],
+    after: &[RuntimeLatencyBucket],
+    count_before: u64,
+    count_after: u64,
+    sum_before: u64,
+    sum_after: u64,
+) -> bool {
+    if count_after < count_before || sum_after < sum_before {
+        return true;
+    }
+    let before_map = runtime_stats_latency_bucket_counts(before);
+    after.iter().any(|bucket| {
+        let count_before = before_map.get(&bucket.le_ns).copied().unwrap_or(0);
+        count_before != 0 && bucket.count < count_before
+    })
+}
+
+fn runtime_stats_latency_bucket_counts(before: &[RuntimeLatencyBucket]) -> HashMap<u64, u64> {
+    before
+        .iter()
+        .map(|bucket| (bucket.le_ns, bucket.count))
+        .collect()
+}
+
+fn reset_aware_delta(before: u64, after: u64) -> u64 {
+    if after >= before {
+        after - before
+    } else {
+        after
+    }
+}
+
 impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
     fn from(snapshot: studiofs_cache::metrics::LatencyHistogramSnapshot) -> Self {
         Self {
@@ -680,6 +1080,13 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         workload_large_files: WORKLOAD_FILES_PER_TIER,
         access_pattern: "sequential".to_string(),
         l1_limit: 2 * 1024 * 1024 * 1024,
+        command: benchmark_command_metadata("studiofs test-cache", "direct-shim", "run-123"),
+        platform: benchmark_platform_metadata(),
+        build: benchmark_build_metadata(),
+        runtime_stats: missing_runtime_stats_report(
+            None,
+            "runtime stats were not captured for this sample report",
+        ),
         work_root: None,
         volume: None,
         mount_point: None,
@@ -1018,5 +1425,184 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             latency_histogram: sample_latency_histogram(),
             operations_log: Vec::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_vfs::{RuntimeLatencyHistogram, RuntimeScalarMetric};
+
+    #[test]
+    fn runtime_stats_report_computes_units_and_reset_aware_deltas() {
+        let mut before = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        before.bridge.counters.insert(
+            "read_callbacks".to_string(),
+            RuntimeScalarMetric {
+                value: 10,
+                unit: "count".into(),
+            },
+        );
+        before.system.gauges.insert(
+            "rss_bytes".to_string(),
+            RuntimeScalarMetric {
+                value: 4096,
+                unit: "bytes".into(),
+            },
+        );
+        before.metadata.latencies.insert(
+            "commit".to_string(),
+            RuntimeLatencyHistogram {
+                count: 7,
+                sum: 700,
+                unit: "ns".into(),
+                buckets: vec![RuntimeLatencyBucket {
+                    le_ns: 1_000,
+                    count: 4,
+                }],
+            },
+        );
+        before.metadata.latencies.insert(
+            "rollback".to_string(),
+            RuntimeLatencyHistogram {
+                count: 10,
+                sum: 1_000,
+                unit: "ns".into(),
+                buckets: vec![
+                    RuntimeLatencyBucket {
+                        le_ns: 1_000,
+                        count: 5,
+                    },
+                    RuntimeLatencyBucket {
+                        le_ns: 2_000,
+                        count: 10,
+                    },
+                ],
+            },
+        );
+
+        let mut after = before.clone();
+        after.generated_unix_ms = 1_250;
+        after
+            .bridge
+            .counters
+            .get_mut("read_callbacks")
+            .unwrap()
+            .value = 3;
+        after.system.gauges.get_mut("rss_bytes").unwrap().value = 8192;
+        let commit = after.metadata.latencies.get_mut("commit").unwrap();
+        commit.count = 9;
+        commit.sum = 950;
+        commit.buckets[0].count = 8;
+        let rollback = after.metadata.latencies.get_mut("rollback").unwrap();
+        rollback.count = 12;
+        rollback.sum = 1_200;
+        rollback.buckets[0].count = 1;
+        rollback.buckets[1].count = 12;
+
+        let phase = RuntimeStatsPhaseDeltaReport {
+            phase: "write".to_string(),
+            delta: runtime_stats_delta("write", &before, &after),
+        };
+
+        let report = runtime_stats_report(
+            ".studiofs-runtime-stats".to_string(),
+            before.clone(),
+            after.clone(),
+            vec![phase],
+            vec![
+                "preexisting warning".to_string(),
+                "preexisting warning".to_string(),
+            ],
+        );
+
+        let whole_run = report.whole_run.as_ref().expect("whole-run delta");
+        assert_eq!(whole_run.interval_ms, 250);
+        assert_eq!(
+            whole_run.sections["bridge"].counters["read_callbacks"].delta,
+            3
+        );
+        assert_eq!(
+            whole_run.sections["bridge"].counters["read_callbacks"].unit,
+            "count"
+        );
+        assert_eq!(
+            whole_run.sections["system"].gauges["rss_bytes"].before,
+            Some(4096)
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["commit"].sum_delta,
+            250
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["commit"].buckets[0].count_delta,
+            4
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].count_delta,
+            12
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].sum_delta,
+            1_200
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].buckets[0].count_delta,
+            1
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].buckets[1].count_delta,
+            12
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bridge.read_callbacks"))
+        );
+        assert!(
+            whole_run
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bridge.read_callbacks"))
+        );
+        assert_eq!(
+            whole_run
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("metadata.rollback"))
+                .count(),
+            1
+        );
+        assert_eq!(report.phases[0].phase, "write");
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|warning| warning.as_str() == "preexisting warning")
+                .count(),
+            1
+        );
+
+        let mut backward_after = before.clone();
+        backward_after.generated_unix_ms = 900;
+        backward_after.schema_version = backward_after.schema_version.saturating_add(1);
+        let backward_delta = runtime_stats_delta("backward-clock", &before, &backward_after);
+        assert_eq!(backward_delta.interval_ms, 0);
+        assert!(
+            backward_delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("timestamp moved backward"))
+        );
+        assert!(
+            backward_delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("schema version changed"))
+        );
     }
 }
