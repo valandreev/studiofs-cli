@@ -42,9 +42,35 @@ function New-UniqueDirectory {
 function Quote-CommandPart {
     param([Parameter(Mandatory = $true)][string]$Value)
     if ($Value -match '\s') {
-        return '"' + ($Value -replace '"', '\"') + '"'
+        $escaped = $Value -replace '(\\*)"', '$1$1\"'
+        $escaped = $escaped -replace '(\\+)$', '$1$1'
+        return '"' + $escaped + '"'
     }
     return $Value
+}
+
+function Invoke-OptionalCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$CommandArguments
+    )
+
+    try {
+        $output = & $FilePath @CommandArguments 2>$null
+        $exitCode = $LASTEXITCODE
+        return [pscustomobject]@{
+            success = $exitCode -eq 0
+            output  = if ($exitCode -eq 0) { ($output | Out-String).Trim() } else { $null }
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            success = $false
+            output  = $null
+        }
+    }
 }
 
 if ($Runs -lt 1) {
@@ -66,14 +92,17 @@ $settings = [ordered]@{
     threads          = $Threads
     run_count        = $Runs
 }
-$gitCommit = (& git -C $repoRoot rev-parse HEAD 2>$null)
-$studiofsVersion = (& $StudioFsPath --version 2>$null)
+$gitCommitResult = Invoke-OptionalCommand -FilePath "git" -CommandArguments @("-C", $repoRoot, "rev-parse", "HEAD")
+$studiofsVersionResult = Invoke-OptionalCommand -FilePath $StudioFsPath -CommandArguments @("--version")
+$gitCommit = $gitCommitResult.output
+$studiofsVersion = $studiofsVersionResult.output
+$git_success = $gitCommitResult.success
 
 [pscustomobject][ordered]@{
     platform             = "Windows"
     os                   = [System.Environment]::OSVersion.VersionString
     mount_point          = $MountPoint
-    git_commit           = if ($LASTEXITCODE -eq 0) { $gitCommit } else { $null }
+    git_commit           = if ($git_success) { $gitCommit } else { $null }
     studiofs_version     = $studiofsVersion
     benchmark_settings   = $settings
     artifact_layout_note = "Do not overwrite previous benchmark artifacts"
@@ -88,7 +117,7 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     $stdoutPath = Join-Path $runDir "stdout.txt"
     $commandPath = Join-Path $runDir "command.txt"
 
-    $args = @(
+    $benchArgs = @(
         "bench",
         $MountPoint,
         "--block-size", $BlockSize,
@@ -98,11 +127,17 @@ for ($run = 1; $run -le $Runs; $run += 1) {
         "--threads", $Threads.ToString(),
         "--json-output", $reportPath
     )
-    $commandLine = (Quote-CommandPart $StudioFsPath) + " " + (($args | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " ")
+    $commandLine = (Quote-CommandPart $StudioFsPath) + " " + (($benchArgs | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " ")
     Set-Content -LiteralPath $commandPath -Value $commandLine -Encoding utf8
 
-    $output = & $StudioFsPath @args 2>&1
-    $exitCode = $LASTEXITCODE
+    try {
+        $output = & $StudioFsPath @benchArgs 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        $output = $_ | Out-String
+        $exitCode = if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $LASTEXITCODE } else { 1 }
+    }
     $output | Out-String | Set-Content -LiteralPath $stdoutPath -Encoding utf8
     if ($exitCode -ne 0) {
         throw "studiofs bench failed with exit code $exitCode. See $stdoutPath"

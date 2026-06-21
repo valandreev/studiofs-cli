@@ -1152,6 +1152,15 @@ fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
         "target/perf",
         "studiofs bench",
         "--json-output",
+        "Invoke-OptionalCommand",
+        "git_success",
+        "$benchArgs",
+        "(\\\\*)\"",
+        "(\\\\+)$",
+        "\\r",
+        "\\t",
+        "studiofs bench failed",
+        "for ((run=1; run<=runs; run++))",
         "command.txt",
         "stdout.txt",
         "environment.json",
@@ -1181,6 +1190,19 @@ fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
         missing_terms.is_empty(),
         "SFS-557 benchmark validation contract is missing terms:\n{}",
         missing_terms.join("\n")
+    );
+
+    let forbidden_terms = ["$args = @(", "for run in $(seq"];
+    let forbidden_hits: Vec<_> = forbidden_terms
+        .iter()
+        .copied()
+        .filter(|term| contains_doc_term(&combined, &normalized_combined, term))
+        .collect();
+
+    assert!(
+        forbidden_hits.is_empty(),
+        "SFS-557 benchmark validation scripts still contain review-blocked terms:\n{}",
+        forbidden_hits.join("\n")
     );
 }
 

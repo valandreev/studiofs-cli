@@ -32,6 +32,8 @@ json_escape() {
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
   printf '%s' "$value"
 }
 
@@ -107,7 +109,7 @@ cat > "$validation_dir/environment.json" <<JSON
 }
 JSON
 
-for run in $(seq 1 "$runs"); do
+for ((run=1; run<=runs; run++)); do
   run_name="$(printf 'run-%03d' "$run")"
   run_dir="$validation_dir/$run_name"
   mkdir "$run_dir"
@@ -125,8 +127,14 @@ for run in $(seq 1 "$runs"); do
   )
   printf '%q ' "${cmd[@]}" > "$command_path"
   printf '\n' >> "$command_path"
-  "${cmd[@]}" > "$stdout_path" 2>&1
-  test -f "$report_path"
+  if ! "${cmd[@]}" > "$stdout_path" 2>&1; then
+    echo "studiofs bench failed on $run_name. See $stdout_path" >&2
+    exit 1
+  fi
+  if [[ ! -f "$report_path" ]]; then
+    echo "studiofs bench did not write report.json for $run_name" >&2
+    exit 1
+  fi
 done
 
 summary_path="$validation_dir/summary.md"
@@ -143,7 +151,7 @@ summary_path="$validation_dir/summary.md"
   echo
   echo "## Artifacts"
   echo
-  for run in $(seq 1 "$runs"); do
+  for ((run=1; run<=runs; run++)); do
     printf -- "- \`%s/run-%03d\`: command.txt, stdout.txt, report.json\n" "$validation_dir" "$run"
   done
 } > "$summary_path"
