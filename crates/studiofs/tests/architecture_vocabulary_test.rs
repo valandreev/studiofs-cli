@@ -24,6 +24,10 @@ fn workspace_line_count(path: &str) -> usize {
     read_workspace_file(path).lines().count()
 }
 
+fn workspace_path_exists(path: &str) -> bool {
+    repo_root().join(path).exists()
+}
+
 fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
     let manifest =
         toml::from_str::<toml::Table>(root_manifest).expect("root Cargo.toml should be valid TOML");
@@ -1116,6 +1120,67 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
         missing.is_empty(),
         "SFS-485 macOS native bridge readiness report is missing required decision-gate surfaces:\n{}",
         missing.join("\n")
+    );
+}
+
+#[test]
+fn benchmark_validation_artifacts_cover_sfs557_cross_platform_contract() {
+    let required_files = [
+        "tools/perf/validate-bench-windows.ps1",
+        "tools/perf/validate-bench-macos.sh",
+        "tools/perf/validate-bench-linux.sh",
+        "docs/perf/benchmark-validation.md",
+    ];
+    let missing_files: Vec<_> = required_files
+        .iter()
+        .copied()
+        .filter(|path| !workspace_path_exists(path))
+        .collect();
+    assert!(
+        missing_files.is_empty(),
+        "SFS-557 benchmark validation is missing files:\n{}",
+        missing_files.join("\n")
+    );
+
+    let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
+    let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
+    let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
+    let docs = read_workspace_file("docs/perf/benchmark-validation.md");
+    let combined = format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}");
+    let normalized_combined = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "target/perf",
+        "studiofs bench",
+        "--json-output",
+        "command.txt",
+        "stdout.txt",
+        "environment.json",
+        "summary.md",
+        "report.json",
+        "run-001",
+        "Do not overwrite previous benchmark artifacts",
+        "recommended run count is 5",
+        "compare medians",
+        "p95",
+        "p99",
+        "mount point",
+        "git commit",
+        "OS",
+        "benchmark settings",
+        "Windows",
+        "macOS",
+        "Linux",
+    ];
+    let missing_terms: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&combined, &normalized_combined, term))
+        .collect();
+
+    assert!(
+        missing_terms.is_empty(),
+        "SFS-557 benchmark validation contract is missing terms:\n{}",
+        missing_terms.join("\n")
     );
 }
 
