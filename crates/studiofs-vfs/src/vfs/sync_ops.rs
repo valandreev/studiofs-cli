@@ -1147,6 +1147,7 @@ impl StudioVfs {
                 "debug target read_into_fh before file-session gate"
             );
         }
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session

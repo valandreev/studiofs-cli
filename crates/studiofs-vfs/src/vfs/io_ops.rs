@@ -7,6 +7,7 @@ use super::{
 impl StudioVfs {
     /// Read file data at the given offset.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session
@@ -58,6 +59,7 @@ impl StudioVfs {
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session
