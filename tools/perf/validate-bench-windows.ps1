@@ -30,9 +30,15 @@ function New-UniqueDirectory {
     for ($suffix = 0; $suffix -lt 1000; $suffix += 1) {
         $candidateName = if ($suffix -eq 0) { $Name } else { "$Name-$($suffix + 1)" }
         $candidate = Join-Path $Root $candidateName
-        if (-not (Test-Path -LiteralPath $candidate)) {
-            New-Item -ItemType Directory -Path $candidate | Out-Null
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
             return (Resolve-Path -LiteralPath $candidate).Path
+        }
+        catch {
+            if (Test-Path -LiteralPath $candidate -PathType Container) {
+                continue
+            }
+            throw
         }
     }
 
@@ -72,6 +78,10 @@ function Resolve-StudioFsCommand {
     $command = Get-Command $Path -ErrorAction SilentlyContinue
     if ($null -ne $command) {
         return $command.Source
+    }
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $Path).Path
     }
 
     if ($Path -eq "studiofs") {
@@ -206,8 +216,8 @@ $lines = New-Object System.Collections.Generic.List[string]
 $lines.Add("# StudioFS Windows benchmark validation")
 $lines.Add("")
 $lines.Add("- Platform: Windows")
-$lines.Add("- Mount point: ``$MountPoint``")
-$gitCommitText = if ($gitCommit) { "``$gitCommit``" } else { "N/A" }
+$lines.Add("- Mount point: " + '`' + $MountPoint + '`')
+$gitCommitText = if ($gitCommit) { '`' + $gitCommit + '`' } else { "N/A" }
 $lines.Add("- Git commit: $gitCommitText")
 $lines.Add("- Runs: $Runs; recommended run count is 5")
 $lines.Add("- Benchmark settings: block size $BlockSize, big file size $BigFileSize, small file size $SmallFileSize, small file count $SmallFileCount, threads $Threads")
@@ -217,7 +227,7 @@ $lines.Add("")
 $lines.Add("## Artifacts")
 $lines.Add("")
 foreach ($runDir in $runDirs) {
-    $lines.Add("- ``$runDir``: command.txt, stdout.txt, report.json")
+    $lines.Add("- " + '`' + $runDir + '`' + ": command.txt, stdout.txt, report.json")
 }
 Write-Utf8NoBom -Path $summaryPath -Value ($lines -join [Environment]::NewLine)
 

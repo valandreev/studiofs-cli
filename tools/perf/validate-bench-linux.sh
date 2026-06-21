@@ -29,11 +29,14 @@ USAGE
 
 json_escape() {
   local value="$1"
+  local nl=$'\n'
+  local cr=$'\r'
+  local tab=$'\t'
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
-  value="${value//$'\n'/\\n}"
-  value="${value//$'\r'/\\r}"
-  value="${value//$'\t'/\\t}"
+  value="${value//$nl/\\n}"
+  value="${value//$cr/\\r}"
+  value="${value//$tab/\\t}"
   printf '%s' "$value"
 }
 

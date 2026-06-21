@@ -1171,6 +1171,9 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
         "Invoke-OptionalCommand",
         "git_success",
         "N/A",
+        "local nl=$'\\n'",
+        "local cr=$'\\r'",
+        "local tab=$'\\t'",
         "$benchArgs",
         "(\\\\*)\"",
         "(\\\\+)$",
@@ -1183,6 +1186,8 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
         "Resolve-StudioFsCommand",
         "target\\release\\studiofs.exe",
         "target\\debug\\studiofs.exe",
+        "Test-Path -LiteralPath $Path -PathType Leaf",
+        "New-Item -ItemType Directory -Path $candidate -ErrorAction Stop",
         "> $stdoutPath 2>&1",
         "exitCode = 1",
         "--runs must be a positive integer",
@@ -1238,6 +1243,13 @@ fn benchmark_validation_scripts_avoid_review_blocked_terms() {
         "$args = @(",
         "for run in $(seq",
         "while [[ -e \"$validation_dir\"",
+        "value=\"${value//$'\\n'/\\\\n}\"",
+        "value=\"${value//$'\\r'/\\\\r}\"",
+        "value=\"${value//$'\\t'/\\\\t}\"",
+        "if (-not (Test-Path -LiteralPath $candidate))",
+        "``$MountPoint``",
+        "``$gitCommit``",
+        "``$runDir``",
     ];
     let forbidden_hits: Vec<_> = forbidden_terms
         .iter()
