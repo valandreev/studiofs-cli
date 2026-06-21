@@ -821,84 +821,6 @@ fn reset_aware_delta(before: u64, after: u64) -> u64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use studiofs_vfs::{RuntimeLatencyHistogram, RuntimeScalarMetric};
-
-    #[test]
-    fn runtime_stats_report_computes_units_and_reset_aware_deltas() {
-        let mut before = RuntimeStatsSnapshot {
-            generated_unix_ms: 1_000,
-            ..RuntimeStatsSnapshot::default()
-        };
-        before.bridge.counters.insert(
-            "read_callbacks".to_string(),
-            RuntimeScalarMetric {
-                value: 10,
-                unit: "count".into(),
-            },
-        );
-        before.system.gauges.insert(
-            "rss_bytes".to_string(),
-            RuntimeScalarMetric {
-                value: 4096,
-                unit: "bytes".into(),
-            },
-        );
-        before.metadata.latencies.insert(
-            "commit".to_string(),
-            RuntimeLatencyHistogram {
-                count: 7,
-                sum: 700,
-                unit: "ns".into(),
-                buckets: Vec::new(),
-            },
-        );
-
-        let mut after = before.clone();
-        after.generated_unix_ms = 1_250;
-        after
-            .bridge
-            .counters
-            .get_mut("read_callbacks")
-            .unwrap()
-            .value = 3;
-        after.system.gauges.get_mut("rss_bytes").unwrap().value = 8192;
-        let commit = after.metadata.latencies.get_mut("commit").unwrap();
-        commit.count = 9;
-        commit.sum = 950;
-
-        let report = runtime_stats_report(
-            ".studiofs-runtime-stats".to_string(),
-            before.clone(),
-            after.clone(),
-            vec![("write".to_string(), before, after)],
-            Vec::new(),
-        );
-
-        let whole_run = report.whole_run.as_ref().expect("whole-run delta");
-        assert_eq!(whole_run.interval_ms, 250);
-        assert_eq!(
-            whole_run.sections["bridge"].counters["read_callbacks"].delta,
-            3
-        );
-        assert_eq!(
-            whole_run.sections["bridge"].counters["read_callbacks"].unit,
-            "count"
-        );
-        assert_eq!(
-            whole_run.sections["system"].gauges["rss_bytes"].before,
-            Some(4096)
-        );
-        assert_eq!(
-            whole_run.sections["metadata"].latencies["commit"].sum_delta,
-            250
-        );
-        assert_eq!(report.phases[0].phase, "write");
-    }
-}
-
 impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
     fn from(snapshot: studiofs_cache::metrics::LatencyHistogramSnapshot) -> Self {
         Self {
@@ -1371,5 +1293,83 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             latency_histogram: sample_latency_histogram(),
             operations_log: Vec::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_vfs::{RuntimeLatencyHistogram, RuntimeScalarMetric};
+
+    #[test]
+    fn runtime_stats_report_computes_units_and_reset_aware_deltas() {
+        let mut before = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        before.bridge.counters.insert(
+            "read_callbacks".to_string(),
+            RuntimeScalarMetric {
+                value: 10,
+                unit: "count".into(),
+            },
+        );
+        before.system.gauges.insert(
+            "rss_bytes".to_string(),
+            RuntimeScalarMetric {
+                value: 4096,
+                unit: "bytes".into(),
+            },
+        );
+        before.metadata.latencies.insert(
+            "commit".to_string(),
+            RuntimeLatencyHistogram {
+                count: 7,
+                sum: 700,
+                unit: "ns".into(),
+                buckets: Vec::new(),
+            },
+        );
+
+        let mut after = before.clone();
+        after.generated_unix_ms = 1_250;
+        after
+            .bridge
+            .counters
+            .get_mut("read_callbacks")
+            .unwrap()
+            .value = 3;
+        after.system.gauges.get_mut("rss_bytes").unwrap().value = 8192;
+        let commit = after.metadata.latencies.get_mut("commit").unwrap();
+        commit.count = 9;
+        commit.sum = 950;
+
+        let report = runtime_stats_report(
+            ".studiofs-runtime-stats".to_string(),
+            before.clone(),
+            after.clone(),
+            vec![("write".to_string(), before, after)],
+            Vec::new(),
+        );
+
+        let whole_run = report.whole_run.as_ref().expect("whole-run delta");
+        assert_eq!(whole_run.interval_ms, 250);
+        assert_eq!(
+            whole_run.sections["bridge"].counters["read_callbacks"].delta,
+            3
+        );
+        assert_eq!(
+            whole_run.sections["bridge"].counters["read_callbacks"].unit,
+            "count"
+        );
+        assert_eq!(
+            whole_run.sections["system"].gauges["rss_bytes"].before,
+            Some(4096)
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["commit"].sum_delta,
+            250
+        );
+        assert_eq!(report.phases[0].phase, "write");
     }
 }
