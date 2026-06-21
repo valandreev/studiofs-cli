@@ -71,7 +71,10 @@ fn resolve_report_target(
     }
 
     (
-        current_dir.join(default_report_file_name(report, now)),
+        current_dir
+            .join("target")
+            .join("perf")
+            .join(default_report_file_name(report, now)),
         true,
     )
 }
@@ -150,7 +153,7 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn default_report_path_uses_current_dir_and_avoids_collisions() {
+    fn default_report_path_uses_target_perf_and_avoids_collisions() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
@@ -162,6 +165,8 @@ mod tests {
         assert_eq!(
             first,
             temp.path()
+                .join("target")
+                .join("perf")
                 .join("studiofs-benchmark-direct-shim-20260319-151255.json")
         );
 
@@ -169,6 +174,8 @@ mod tests {
         assert_eq!(
             second,
             temp.path()
+                .join("target")
+                .join("perf")
                 .join("studiofs-benchmark-direct-shim-20260319-151255-2.json")
         );
     }
@@ -195,6 +202,11 @@ mod tests {
         let content = std::fs::read_to_string(saved).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mode"], "direct-shim");
+        assert_eq!(parsed["command"]["name"], "studiofs test-cache");
+        assert!(parsed["platform"]["os"].is_string());
+        assert!(parsed["build"]["package_version"].is_string());
+        assert_eq!(parsed["runtime_stats"]["available"], false);
+        assert!(parsed["runtime_stats"]["warnings"][0].is_string());
         assert!(content.contains("\n  \"mode\""));
     }
 

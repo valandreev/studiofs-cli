@@ -28,7 +28,8 @@ use super::result::{
     MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
     MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
     MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
-    OpReport,
+    OpReport, benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,
+    missing_runtime_stats_report, runtime_stats_report,
 };
 use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -39,7 +40,7 @@ use super::workload::{
     build_work_sizes, classify_size, deterministic_bytes, fill_deterministic_bytes,
     split_stream_segments,
 };
-use studiofs_vfs::VfsPortableAllocatorStats;
+use studiofs_vfs::{RUNTIME_STATS_FILE_NAME, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
 
 #[derive(Clone, Copy)]
 enum PendingUploadTarget {
@@ -90,6 +91,10 @@ struct MeasuredMountedPhaseResult {
     reads_cpu: Duration,
     stats: PhaseTelemetry,
     stats_wall: Duration,
+    runtime_stats_after_write: Option<RuntimeStatsSnapshot>,
+    runtime_stats_after_read: Option<RuntimeStatsSnapshot>,
+    runtime_stats_after_stat: Option<RuntimeStatsSnapshot>,
+    runtime_stats_warnings: Vec<String>,
     total_wall: Duration,
     total_cpu: Duration,
     during_upload_observation: Option<PendingUploadObservation>,
@@ -2022,6 +2027,38 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))
 }
 
+fn runtime_stats_file_name() -> &'static str {
+    std::str::from_utf8(RUNTIME_STATS_FILE_NAME)
+        .expect("StudioFS runtime stats file name must be UTF-8")
+}
+
+async fn capture_runtime_stats_snapshot(
+    path: &Path,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<RuntimeStatsSnapshot> {
+    let text = match fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(error) => {
+            warnings.push(format!(
+                "runtime stats unavailable at {} for {label}: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    match RuntimeStatsSnapshot::parse_text(&text) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            warnings.push(format!(
+                "runtime stats malformed at {} for {label}: {error}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
 pub(crate) async fn run_mounted_end_to_end(
     params: &BenchmarkConfig,
     mount_pid: u32,
@@ -2055,6 +2092,7 @@ pub(crate) async fn run_mounted_end_to_end(
             params.access_pattern,
             0x55aa_55aa_d00d_f00d,
         );
+        let runtime_stats_path = mount_point.join(runtime_stats_file_name());
 
         for warmup in 0..params.warmup_runs {
             tracing::info!(
@@ -2071,6 +2109,13 @@ pub(crate) async fn run_mounted_end_to_end(
                 run_mounted_read_phase(params, workload_files.clone(), &order, size_class_bounds)
                     .await?;
         }
+        let mut runtime_stats_warnings = Vec::new();
+        let runtime_stats_before = capture_runtime_stats_snapshot(
+            &runtime_stats_path,
+            "benchmark start",
+            &mut runtime_stats_warnings,
+        )
+        .await;
 
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
         let write_path_observability_path =
@@ -2085,11 +2130,13 @@ pub(crate) async fn run_mounted_end_to_end(
         let order_ref = &order;
         let cache_upload_dir_ref = &cache_upload_dir;
         let write_path_observability_path_ref = &write_path_observability_path;
+        let runtime_stats_path_ref = &runtime_stats_path;
         let (measured, mounted_memory, mounted_portable_profile, mounted_writeback_timeline) =
             sample_mounted_profile_during(
                 mount_pid,
                 write_path_observability_path.as_deref(),
                 move |portable_profile| async move {
+                    let mut runtime_stats_warnings = Vec::new();
                     let started = Instant::now();
                     let started_cpu = process_cpu_time();
                     let started_at =
@@ -2117,6 +2164,12 @@ pub(crate) async fn run_mounted_end_to_end(
                             process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
                         })
                         .unwrap_or_default();
+                    let runtime_stats_after_write = capture_runtime_stats_snapshot(
+                        runtime_stats_path_ref,
+                        "write phase",
+                        &mut runtime_stats_warnings,
+                    )
+                    .await;
 
                     let during_upload_observation =
                         if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {
@@ -2157,6 +2210,12 @@ pub(crate) async fn run_mounted_end_to_end(
                             process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
                         })
                         .unwrap_or_default();
+                    let runtime_stats_after_read = capture_runtime_stats_snapshot(
+                        runtime_stats_path_ref,
+                        "during-upload-read phase",
+                        &mut runtime_stats_warnings,
+                    )
+                    .await;
 
                     tracing::info!(
                         target: "studiofs.cache.profile",
@@ -2174,6 +2233,12 @@ pub(crate) async fn run_mounted_end_to_end(
                     )
                     .await?;
                     let stats_wall = stats_wall_start.elapsed();
+                    let runtime_stats_after_stat = capture_runtime_stats_snapshot(
+                        runtime_stats_path_ref,
+                        "stat phase",
+                        &mut runtime_stats_warnings,
+                    )
+                    .await;
 
                     let total_wall = Instant::now() - started;
                     let total_cpu = started_cpu
@@ -2195,6 +2260,10 @@ pub(crate) async fn run_mounted_end_to_end(
                         reads_cpu,
                         stats,
                         stats_wall,
+                        runtime_stats_after_write,
+                        runtime_stats_after_read,
+                        runtime_stats_after_stat,
+                        runtime_stats_warnings,
                         total_wall,
                         total_cpu,
                         during_upload_observation,
@@ -2424,6 +2493,53 @@ pub(crate) async fn run_mounted_end_to_end(
             measured_write_path_before_for_report.as_ref(),
             measured_write_path_after_for_report.as_ref(),
         ));
+        runtime_stats_warnings.extend(measured.runtime_stats_warnings);
+        let runtime_stats_after = capture_runtime_stats_snapshot(
+            &runtime_stats_path,
+            "benchmark end",
+            &mut runtime_stats_warnings,
+        )
+        .await;
+        let runtime_stats_path_display = runtime_stats_path.display().to_string();
+        let runtime_stats = match (runtime_stats_before, runtime_stats_after) {
+            (Some(before), Some(after)) => {
+                let mut phase_snapshots = Vec::new();
+                if let Some(after_write) = measured.runtime_stats_after_write.clone() {
+                    phase_snapshots.push(("write".to_string(), before.clone(), after_write));
+                }
+                if let (Some(before_read), Some(after_read)) = (
+                    measured.runtime_stats_after_write.clone(),
+                    measured.runtime_stats_after_read.clone(),
+                ) {
+                    phase_snapshots.push((
+                        "during-upload-read".to_string(),
+                        before_read,
+                        after_read,
+                    ));
+                }
+                if let (Some(before_stat), Some(after_stat)) = (
+                    measured.runtime_stats_after_read.clone(),
+                    measured.runtime_stats_after_stat.clone(),
+                ) {
+                    phase_snapshots.push(("stat".to_string(), before_stat, after_stat));
+                }
+                runtime_stats_report(
+                    runtime_stats_path_display,
+                    before,
+                    after,
+                    phase_snapshots,
+                    runtime_stats_warnings,
+                )
+            }
+            _ => missing_runtime_stats_report(
+                Some(runtime_stats_path_display),
+                if runtime_stats_warnings.is_empty() {
+                    "runtime stats were unavailable for this benchmark run".to_string()
+                } else {
+                    runtime_stats_warnings.join("; ")
+                },
+            ),
+        };
 
         let cleanup = cleanup_mount_artifacts_best_effort(work_root, &params.run_id).await;
         let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
@@ -2450,6 +2566,10 @@ pub(crate) async fn run_mounted_end_to_end(
             workload_large_files: workload.large_files,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
             l1_limit: params.l1_limit,
+            command: benchmark_command_metadata(params.command_name, "e2e", params.run_id.clone()),
+            platform: benchmark_platform_metadata(),
+            build: benchmark_build_metadata(),
+            runtime_stats,
             work_root: Some(work_root.display().to_string()),
             volume: Some(volume.to_string()),
             mount_point: Some(mount_point.display().to_string()),
@@ -2534,6 +2654,7 @@ mod tests {
 
     fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
         BenchmarkConfig {
+            command_name: "studiofs test-cache",
             target: PathBuf::from("/mnt/studiofs-benchmark"),
             block_size,
             read_size: 128 * 1024,
