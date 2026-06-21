@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
-    RuntimeStatsSection, RuntimeStatsSnapshot, VfsFetchStats, VfsUploadStats,
+    RuntimeLatencyBucket, RuntimeStatsSection, RuntimeStatsSnapshot, VfsFetchStats, VfsUploadStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
 };
 
@@ -153,6 +153,8 @@ pub(crate) struct RuntimeStatsDeltaReport {
     pub(crate) schema_version_before: u16,
     pub(crate) schema_version_after: u16,
     pub(crate) interval_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
     pub(crate) sections: BTreeMap<String, RuntimeStatsSectionDeltaReport>,
 }
 
@@ -190,6 +192,16 @@ pub(crate) struct RuntimeStatsLatencyDeltaReport {
     pub(crate) sum_after: u64,
     pub(crate) sum_delta: u64,
     pub(crate) unit: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) buckets: Vec<RuntimeStatsLatencyBucketDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsLatencyBucketDeltaReport {
+    pub(crate) le_ns: u64,
+    pub(crate) count_before: u64,
+    pub(crate) count_after: u64,
+    pub(crate) count_delta: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -704,16 +716,20 @@ pub(crate) fn runtime_stats_report(
     before: RuntimeStatsSnapshot,
     after: RuntimeStatsSnapshot,
     phase_snapshots: Vec<(String, RuntimeStatsSnapshot, RuntimeStatsSnapshot)>,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> BenchmarkRuntimeStatsReport {
-    let phases = phase_snapshots
+    let phases: Vec<_> = phase_snapshots
         .into_iter()
         .map(|(phase, before, after)| RuntimeStatsPhaseDeltaReport {
+            delta: runtime_stats_delta(&phase, &before, &after),
             phase,
-            delta: runtime_stats_delta(&before, &after),
         })
         .collect();
-    let whole_run = runtime_stats_delta(&before, &after);
+    let whole_run = runtime_stats_delta("whole-run", &before, &after);
+    warnings.extend(whole_run.warnings.iter().cloned());
+    for phase in &phases {
+        warnings.extend(phase.delta.warnings.iter().cloned());
+    }
     BenchmarkRuntimeStatsReport {
         available: true,
         stats_path: Some(stats_path),
@@ -726,14 +742,16 @@ pub(crate) fn runtime_stats_report(
 }
 
 fn runtime_stats_delta(
+    label: &str,
     before: &RuntimeStatsSnapshot,
     after: &RuntimeStatsSnapshot,
 ) -> RuntimeStatsDeltaReport {
     let mut sections = BTreeMap::new();
+    let mut warnings = Vec::new();
     for (name, before_section, after_section) in runtime_stats_sections(before, after) {
         sections.insert(
             name.to_string(),
-            runtime_stats_section_delta(before_section, after_section),
+            runtime_stats_section_delta(label, name, before_section, after_section, &mut warnings),
         );
     }
     RuntimeStatsDeltaReport {
@@ -742,6 +760,7 @@ fn runtime_stats_delta(
         interval_ms: after
             .generated_unix_ms
             .saturating_sub(before.generated_unix_ms),
+        warnings,
         sections,
     }
 }
@@ -767,8 +786,11 @@ fn runtime_stats_sections<'a>(
 }
 
 fn runtime_stats_section_delta(
+    label: &str,
+    section_name: &str,
     before: &RuntimeStatsSection,
     after: &RuntimeStatsSection,
+    warnings: &mut Vec<String>,
 ) -> RuntimeStatsSectionDeltaReport {
     let mut report = RuntimeStatsSectionDeltaReport::default();
     for (name, metric) in &after.counters {
@@ -778,7 +800,14 @@ fn runtime_stats_section_delta(
             RuntimeStatsCounterDeltaReport {
                 before: before_value,
                 after: metric.value,
-                delta: reset_aware_delta(before_value, metric.value),
+                delta: reset_aware_delta(
+                    before_value,
+                    metric.value,
+                    label,
+                    section_name,
+                    name,
+                    warnings,
+                ),
                 unit: metric.unit.to_string(),
             },
         );
@@ -797,26 +826,95 @@ fn runtime_stats_section_delta(
         let before_histogram = before.latencies.get(name);
         let count_before = before_histogram.map_or(0, |histogram| histogram.count);
         let sum_before = before_histogram.map_or(0, |histogram| histogram.sum);
+        let buckets = runtime_stats_latency_bucket_deltas(
+            before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
+            histogram.buckets.as_slice(),
+            label,
+            section_name,
+            name,
+            warnings,
+        );
         report.latencies.insert(
             name.clone(),
             RuntimeStatsLatencyDeltaReport {
                 count_before,
                 count_after: histogram.count,
-                count_delta: reset_aware_delta(count_before, histogram.count),
+                count_delta: reset_aware_delta(
+                    count_before,
+                    histogram.count,
+                    label,
+                    section_name,
+                    name,
+                    warnings,
+                ),
                 sum_before,
                 sum_after: histogram.sum,
-                sum_delta: reset_aware_delta(sum_before, histogram.sum),
+                sum_delta: reset_aware_delta(
+                    sum_before,
+                    histogram.sum,
+                    label,
+                    section_name,
+                    name,
+                    warnings,
+                ),
                 unit: histogram.unit.to_string(),
+                buckets,
             },
         );
     }
     report
 }
 
-fn reset_aware_delta(before: u64, after: u64) -> u64 {
+fn runtime_stats_latency_bucket_deltas(
+    before: &[RuntimeLatencyBucket],
+    after: &[RuntimeLatencyBucket],
+    label: &str,
+    section_name: &str,
+    metric_name: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
+    let before_by_bound: BTreeMap<_, _> = before
+        .iter()
+        .map(|bucket| (bucket.le_ns, bucket.count))
+        .collect();
+    after
+        .iter()
+        .map(|bucket| {
+            let count_before = before_by_bound
+                .get(&bucket.le_ns)
+                .copied()
+                .unwrap_or_default();
+            RuntimeStatsLatencyBucketDeltaReport {
+                le_ns: bucket.le_ns,
+                count_before,
+                count_after: bucket.count,
+                count_delta: reset_aware_delta(
+                    count_before,
+                    bucket.count,
+                    label,
+                    section_name,
+                    metric_name,
+                    warnings,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn reset_aware_delta(
+    before: u64,
+    after: u64,
+    label: &str,
+    section_name: &str,
+    metric_name: &str,
+    warnings: &mut Vec<String>,
+) -> u64 {
     if after >= before {
         after - before
     } else {
+        warnings.push(format!(
+            "runtime stats reset detected for {section_name}.{metric_name} during {label}; delta uses the post-reset value"
+        ));
         after
     }
 }
@@ -1327,7 +1425,10 @@ mod tests {
                 count: 7,
                 sum: 700,
                 unit: "ns".into(),
-                buckets: Vec::new(),
+                buckets: vec![RuntimeLatencyBucket {
+                    le_ns: 1_000,
+                    count: 4,
+                }],
             },
         );
 
@@ -1343,6 +1444,7 @@ mod tests {
         let commit = after.metadata.latencies.get_mut("commit").unwrap();
         commit.count = 9;
         commit.sum = 950;
+        commit.buckets[0].count = 8;
 
         let report = runtime_stats_report(
             ".studiofs-runtime-stats".to_string(),
@@ -1369,6 +1471,22 @@ mod tests {
         assert_eq!(
             whole_run.sections["metadata"].latencies["commit"].sum_delta,
             250
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["commit"].buckets[0].count_delta,
+            4
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bridge.read_callbacks"))
+        );
+        assert!(
+            whole_run
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bridge.read_callbacks"))
         );
         assert_eq!(report.phases[0].phase, "write");
     }

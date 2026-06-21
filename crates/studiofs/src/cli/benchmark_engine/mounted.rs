@@ -2068,8 +2068,18 @@ fn build_runtime_stats_phase_snapshots(
     after_stat: Option<RuntimeStatsSnapshot>,
 ) -> Vec<(String, RuntimeStatsSnapshot, RuntimeStatsSnapshot)> {
     let mut phase_snapshots = Vec::new();
+    let before_read_for_transition = before_read.clone();
     if let Some(after_write) = after_write {
-        phase_snapshots.push(("write".to_string(), whole_run_before.clone(), after_write));
+        if let Some(before_read) = before_read_for_transition {
+            phase_snapshots.push((
+                "write".to_string(),
+                whole_run_before.clone(),
+                after_write.clone(),
+            ));
+            phase_snapshots.push(("upload-transition".to_string(), after_write, before_read));
+        } else {
+            phase_snapshots.push(("write".to_string(), whole_run_before.clone(), after_write));
+        }
     }
 
     match (before_read, after_read) {
@@ -2725,7 +2735,7 @@ mod tests {
         let phase_snapshots = build_runtime_stats_phase_snapshots(
             &whole_run_before,
             Some(after_write),
-            Some(before_read),
+            Some(before_read.clone()),
             Some(after_read),
             Some(after_stat),
         );
@@ -2733,12 +2743,15 @@ mod tests {
         assert_eq!(phase_snapshots[0].0, "write");
         assert_eq!(phase_snapshots[0].1.generated_unix_ms, 100);
         assert_eq!(phase_snapshots[0].2.generated_unix_ms, 200);
-        assert_eq!(phase_snapshots[1].0, "during-upload-read");
-        assert_eq!(phase_snapshots[1].1.generated_unix_ms, 350);
-        assert_eq!(phase_snapshots[1].2.generated_unix_ms, 450);
-        assert_eq!(phase_snapshots[2].0, "stat");
-        assert_eq!(phase_snapshots[2].1.generated_unix_ms, 450);
-        assert_eq!(phase_snapshots[2].2.generated_unix_ms, 500);
+        assert_eq!(phase_snapshots[1].0, "upload-transition");
+        assert_eq!(phase_snapshots[1].1.generated_unix_ms, 200);
+        assert_eq!(phase_snapshots[1].2.generated_unix_ms, 350);
+        assert_eq!(phase_snapshots[2].0, "during-upload-read");
+        assert_eq!(phase_snapshots[2].1.generated_unix_ms, 350);
+        assert_eq!(phase_snapshots[2].2.generated_unix_ms, 450);
+        assert_eq!(phase_snapshots[3].0, "stat");
+        assert_eq!(phase_snapshots[3].1.generated_unix_ms, 450);
+        assert_eq!(phase_snapshots[3].2.generated_unix_ms, 500);
     }
 
     fn single_file_workload() -> WorkloadPlan {

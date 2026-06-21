@@ -44,8 +44,7 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) threads: usize,
 
-    /// JSON report output path. Defaults to an auto-named file in the
-    /// current working directory.
+    /// JSON report output path. Defaults to an auto-named file under target/perf/.
     #[arg(long)]
     pub(crate) json_output: Option<PathBuf>,
 }

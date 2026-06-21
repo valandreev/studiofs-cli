@@ -59,12 +59,17 @@ fn resolve_report_target(
     now: DateTime<Utc>,
 ) -> (PathBuf, bool) {
     if let Some(json_output) = json_output {
+        let output_text = json_output.to_string_lossy();
         let explicit = if json_output.is_absolute() {
             json_output.to_path_buf()
         } else {
             current_dir.join(json_output)
         };
-        if explicit.is_dir() {
+        let treat_as_dir = explicit.is_dir()
+            || output_text.ends_with('/')
+            || output_text.ends_with('\\')
+            || json_output.extension().is_none();
+        if treat_as_dir {
             return (explicit.join(default_report_file_name(report, now)), true);
         }
         return (explicit, false);
@@ -208,6 +213,33 @@ mod tests {
         assert_eq!(parsed["runtime_stats"]["available"], false);
         assert!(parsed["runtime_stats"]["warnings"][0].is_string());
         assert!(content.contains("\n  \"mode\""));
+    }
+
+    #[test]
+    fn save_benchmark_report_treats_extensionless_output_as_directory() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("target/new_reports_dir")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            saved,
+            temp.path()
+                .join("target")
+                .join("new_reports_dir")
+                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
+        );
+        assert!(saved.is_file());
     }
 
     #[test]
