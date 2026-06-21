@@ -1,7 +1,7 @@
 use crate::cli::benchmark_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
     RuntimeLatencyBucket, RuntimeStatsSection, RuntimeStatsSnapshot, VfsFetchStats, VfsUploadStats,
@@ -900,10 +900,11 @@ fn runtime_stats_latency_bucket_deltas(
     after: &[RuntimeLatencyBucket],
     force_reset: bool,
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
+    let before_map = runtime_stats_latency_bucket_counts(before);
     after
         .iter()
         .map(|bucket| {
-            let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
+            let count_before = before_map.get(&bucket.le_ns).copied().unwrap_or(0);
             let count_delta = if force_reset {
                 bucket.count
             } else {
@@ -930,17 +931,18 @@ fn runtime_stats_latency_reset(
     if count_after < count_before || sum_after < sum_before {
         return true;
     }
+    let before_map = runtime_stats_latency_bucket_counts(before);
     after.iter().any(|bucket| {
-        let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
+        let count_before = before_map.get(&bucket.le_ns).copied().unwrap_or(0);
         count_before != 0 && bucket.count < count_before
     })
 }
 
-fn runtime_stats_latency_bucket_count(before: &[RuntimeLatencyBucket], le_ns: u64) -> u64 {
+fn runtime_stats_latency_bucket_counts(before: &[RuntimeLatencyBucket]) -> HashMap<u64, u64> {
     before
         .iter()
-        .find(|bucket| bucket.le_ns == le_ns)
-        .map_or(0, |bucket| bucket.count)
+        .map(|bucket| (bucket.le_ns, bucket.count))
+        .collect()
 }
 
 fn reset_aware_delta(before: u64, after: u64) -> u64 {

@@ -1,10 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::fs::File;
+use std::io::ErrorKind;
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 use super::super::result::BenchmarkReport;
+
+const WINDOWS_TEMPFILE_PERSIST_RETRIES: usize = 20;
+const WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 fn slugify_report_segment(value: &str) -> String {
     let mut out = String::new();
@@ -115,9 +121,7 @@ fn write_report_file(
         let mut temp_file = NamedTempFile::new_in(parent)
             .with_context(|| format!("create temporary report file in {}", parent.display()))?;
         write_json_report(&mut temp_file, report, report_path)?;
-        temp_file
-            .persist(report_path)
-            .with_context(|| format!("replace benchmark report {}", report_path.display()))?;
+        persist_named_temp_file(temp_file, report_path, "replace benchmark report")?;
         return Ok(report_path.to_path_buf());
     }
 
@@ -131,19 +135,70 @@ fn write_report_file(
         let mut temp_file = NamedTempFile::new_in(parent)
             .with_context(|| format!("create temporary report file in {}", parent.display()))?;
         write_json_report(&mut temp_file, report, &candidate)?;
-        match temp_file.persist_noclobber(&candidate) {
-            Ok(_) => return Ok(candidate),
-            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = err.file.close();
+        match persist_named_temp_file_noclobber(temp_file, &candidate)? {
+            Some(_) => return Ok(candidate),
+            None => {
                 candidate = next_available_path(report_path, suffix);
                 suffix = suffix.saturating_add(1);
             }
-            Err(err) => {
-                return Err(err.error)
-                    .with_context(|| format!("create benchmark report {}", candidate.display()));
+        }
+    }
+}
+
+fn persist_named_temp_file(
+    mut temp_file: NamedTempFile,
+    path: &Path,
+    context: &'static str,
+) -> Result<File> {
+    let mut retries = 0;
+    loop {
+        match temp_file.persist(path) {
+            Ok(file) => return Ok(file),
+            Err(error) => {
+                if should_retry_tempfile_persist(&error.error, retries) {
+                    temp_file = error.file;
+                    retries += 1;
+                    std::thread::sleep(WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY);
+                    continue;
+                }
+
+                return Err(error.error).with_context(|| format!("{context} {}", path.display()));
             }
         }
     }
+}
+
+fn persist_named_temp_file_noclobber(
+    mut temp_file: NamedTempFile,
+    path: &Path,
+) -> Result<Option<File>> {
+    let mut retries = 0;
+    loop {
+        match temp_file.persist_noclobber(path) {
+            Ok(file) => return Ok(Some(file)),
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+                let _ = error.file.close();
+                return Ok(None);
+            }
+            Err(error) => {
+                if should_retry_tempfile_persist(&error.error, retries) {
+                    temp_file = error.file;
+                    retries += 1;
+                    std::thread::sleep(WINDOWS_TEMPFILE_PERSIST_RETRY_DELAY);
+                    continue;
+                }
+
+                return Err(error.error)
+                    .with_context(|| format!("create benchmark report {}", path.display()));
+            }
+        }
+    }
+}
+
+fn should_retry_tempfile_persist(error: &std::io::Error, retries: usize) -> bool {
+    cfg!(windows)
+        && retries < WINDOWS_TEMPFILE_PERSIST_RETRIES
+        && error.kind() == ErrorKind::PermissionDenied
 }
 
 fn save_benchmark_report_in(
@@ -273,6 +328,45 @@ mod tests {
 
         assert_eq!(saved, temp.path().join("report.json"));
         assert!(saved.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_benchmark_report_retries_windows_overwrite_access_denied() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+        let path = temp.path().join("report.json");
+        std::fs::write(&path, "stale report").unwrap();
+
+        let blocking_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect("open destination without delete sharing");
+        let release_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(blocking_handle);
+        });
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("report.json")), temp.path(), now)
+                .expect("save report after transient destination access denied");
+        release_handle.join().expect("release blocking handle");
+
+        assert_eq!(saved, path);
+        let content = std::fs::read_to_string(saved).unwrap();
+        assert!(content.contains("\n  \"mode\""));
+        assert!(!content.contains("stale report"));
     }
 
     #[test]

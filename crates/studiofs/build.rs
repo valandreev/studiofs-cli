@@ -25,9 +25,10 @@ fn emit_git_metadata() {
         if git_head.exists() {
             println!("cargo:rerun-if-changed={}", git_head.display());
         }
-        if let Ok(head) = std::fs::read_to_string(&git_head)
-            && let Some(reference) = head.trim().strip_prefix("ref: ")
-        {
+        let reference = std::fs::read_to_string(&git_head)
+            .ok()
+            .and_then(|head| head.trim().strip_prefix("ref: ").map(str::to_owned));
+        if let Some(reference) = reference {
             let ref_path = git_dir.join(reference);
             if ref_path.exists() {
                 println!("cargo:rerun-if-changed={}", ref_path.display());
