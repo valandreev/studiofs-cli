@@ -75,10 +75,9 @@ fn resolve_workspace_root() -> PathBuf {
 fn discover_workspace_root_from(mut current: PathBuf) -> Option<PathBuf> {
     loop {
         let manifest = current.join("Cargo.toml");
-        if let Ok(content) = std::fs::read_to_string(&manifest)
-            && content.contains("[workspace]")
-        {
-            return Some(current);
+        match std::fs::read_to_string(&manifest) {
+            Ok(content) if content.contains("[workspace]") => return Some(current),
+            _ => {}
         }
 
         if !current.pop() {
