@@ -42,6 +42,11 @@ use super::workload::{
 };
 use studiofs_vfs::{RUNTIME_STATS_FILE_NAME, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
 
+const RUNTIME_STATS_FILE_NAME_STR: &str = match std::str::from_utf8(RUNTIME_STATS_FILE_NAME) {
+    Ok(value) => value,
+    Err(_) => panic!("StudioFS runtime stats file name must be UTF-8"),
+};
+
 #[derive(Clone, Copy)]
 enum PendingUploadTarget {
     Active,
@@ -92,6 +97,7 @@ struct MeasuredMountedPhaseResult {
     stats: PhaseTelemetry,
     stats_wall: Duration,
     runtime_stats_after_write: Option<RuntimeStatsSnapshot>,
+    runtime_stats_before_read: Option<RuntimeStatsSnapshot>,
     runtime_stats_after_read: Option<RuntimeStatsSnapshot>,
     runtime_stats_after_stat: Option<RuntimeStatsSnapshot>,
     runtime_stats_warnings: Vec<String>,
@@ -2027,11 +2033,6 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))
 }
 
-fn runtime_stats_file_name() -> &'static str {
-    std::str::from_utf8(RUNTIME_STATS_FILE_NAME)
-        .expect("StudioFS runtime stats file name must be UTF-8")
-}
-
 async fn capture_runtime_stats_snapshot(
     path: &Path,
     label: &str,
@@ -2057,6 +2058,42 @@ async fn capture_runtime_stats_snapshot(
             None
         }
     }
+}
+
+fn build_runtime_stats_phase_snapshots(
+    whole_run_before: &RuntimeStatsSnapshot,
+    after_write: Option<RuntimeStatsSnapshot>,
+    before_read: Option<RuntimeStatsSnapshot>,
+    after_read: Option<RuntimeStatsSnapshot>,
+    after_stat: Option<RuntimeStatsSnapshot>,
+) -> Vec<(String, RuntimeStatsSnapshot, RuntimeStatsSnapshot)> {
+    let mut phase_snapshots = Vec::new();
+    if let Some(after_write) = after_write {
+        phase_snapshots.push(("write".to_string(), whole_run_before.clone(), after_write));
+    }
+
+    match (before_read, after_read) {
+        (Some(before_read), Some(after_read)) => {
+            if let Some(after_stat) = after_stat {
+                phase_snapshots.push((
+                    "during-upload-read".to_string(),
+                    before_read,
+                    after_read.clone(),
+                ));
+                phase_snapshots.push(("stat".to_string(), after_read, after_stat));
+            } else {
+                phase_snapshots.push(("during-upload-read".to_string(), before_read, after_read));
+            }
+        }
+        (None, Some(after_read)) => {
+            if let Some(after_stat) = after_stat {
+                phase_snapshots.push(("stat".to_string(), after_read, after_stat));
+            }
+        }
+        _ => {}
+    }
+
+    phase_snapshots
 }
 
 pub(crate) async fn run_mounted_end_to_end(
@@ -2092,7 +2129,7 @@ pub(crate) async fn run_mounted_end_to_end(
             params.access_pattern,
             0x55aa_55aa_d00d_f00d,
         );
-        let runtime_stats_path = mount_point.join(runtime_stats_file_name());
+        let runtime_stats_path = mount_point.join(RUNTIME_STATS_FILE_NAME_STR);
 
         for warmup in 0..params.warmup_runs {
             tracing::info!(
@@ -2187,6 +2224,12 @@ pub(crate) async fn run_mounted_end_to_end(
                         } else {
                             None
                         };
+                    let runtime_stats_before_read = capture_runtime_stats_snapshot(
+                        runtime_stats_path_ref,
+                        "during-upload-read phase start",
+                        &mut runtime_stats_warnings,
+                    )
+                    .await;
 
                     tracing::info!(
                         target: "studiofs.cache.profile",
@@ -2261,6 +2304,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         stats,
                         stats_wall,
                         runtime_stats_after_write,
+                        runtime_stats_before_read,
                         runtime_stats_after_read,
                         runtime_stats_after_stat,
                         runtime_stats_warnings,
@@ -2503,26 +2547,13 @@ pub(crate) async fn run_mounted_end_to_end(
         let runtime_stats_path_display = runtime_stats_path.display().to_string();
         let runtime_stats = match (runtime_stats_before, runtime_stats_after) {
             (Some(before), Some(after)) => {
-                let mut phase_snapshots = Vec::new();
-                if let Some(after_write) = measured.runtime_stats_after_write.clone() {
-                    phase_snapshots.push(("write".to_string(), before.clone(), after_write));
-                }
-                if let (Some(before_read), Some(after_read)) = (
-                    measured.runtime_stats_after_write.clone(),
-                    measured.runtime_stats_after_read.clone(),
-                ) {
-                    phase_snapshots.push((
-                        "during-upload-read".to_string(),
-                        before_read,
-                        after_read,
-                    ));
-                }
-                if let (Some(before_stat), Some(after_stat)) = (
-                    measured.runtime_stats_after_read.clone(),
-                    measured.runtime_stats_after_stat.clone(),
-                ) {
-                    phase_snapshots.push(("stat".to_string(), before_stat, after_stat));
-                }
+                let phase_snapshots = build_runtime_stats_phase_snapshots(
+                    &before,
+                    measured.runtime_stats_after_write,
+                    measured.runtime_stats_before_read,
+                    measured.runtime_stats_after_read,
+                    measured.runtime_stats_after_stat,
+                );
                 runtime_stats_report(
                     runtime_stats_path_display,
                     before,
@@ -2674,6 +2705,40 @@ mod tests {
             full_file_reads: false,
             run_id: "test-run".to_string(),
         }
+    }
+
+    fn runtime_snapshot_at(generated_unix_ms: u64) -> RuntimeStatsSnapshot {
+        RuntimeStatsSnapshot {
+            generated_unix_ms,
+            ..RuntimeStatsSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn runtime_stats_phase_snapshots_start_read_after_transition_wait() {
+        let whole_run_before = runtime_snapshot_at(100);
+        let after_write = runtime_snapshot_at(200);
+        let before_read = runtime_snapshot_at(350);
+        let after_read = runtime_snapshot_at(450);
+        let after_stat = runtime_snapshot_at(500);
+
+        let phase_snapshots = build_runtime_stats_phase_snapshots(
+            &whole_run_before,
+            Some(after_write),
+            Some(before_read),
+            Some(after_read),
+            Some(after_stat),
+        );
+
+        assert_eq!(phase_snapshots[0].0, "write");
+        assert_eq!(phase_snapshots[0].1.generated_unix_ms, 100);
+        assert_eq!(phase_snapshots[0].2.generated_unix_ms, 200);
+        assert_eq!(phase_snapshots[1].0, "during-upload-read");
+        assert_eq!(phase_snapshots[1].1.generated_unix_ms, 350);
+        assert_eq!(phase_snapshots[1].2.generated_unix_ms, 450);
+        assert_eq!(phase_snapshots[2].0, "stat");
+        assert_eq!(phase_snapshots[2].1.generated_unix_ms, 450);
+        assert_eq!(phase_snapshots[2].2.generated_unix_ms, 500);
     }
 
     fn single_file_workload() -> WorkloadPlan {

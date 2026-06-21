@@ -90,14 +90,14 @@ fn write_report_file(report_path: &Path, json: &[u8], auto_named: bool) -> Resul
         return Ok(report_path.to_path_buf());
     }
 
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create report dir {}", parent.display()))?;
+    }
+
     let mut candidate = report_path.to_path_buf();
     let mut suffix = 2usize;
     loop {
-        if let Some(parent) = candidate.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create report dir {}", parent.display()))?;
-        }
-
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
