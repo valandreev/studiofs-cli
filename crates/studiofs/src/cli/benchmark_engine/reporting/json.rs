@@ -120,6 +120,10 @@ fn write_report_file(
 
     let mut candidate = report_path.to_path_buf();
     let mut suffix = 2usize;
+    while candidate.exists() {
+        candidate = next_available_path(report_path, suffix);
+        suffix = suffix.saturating_add(1);
+    }
     loop {
         let mut temp_file = NamedTempFile::new_in(parent)
             .with_context(|| format!("create temporary report file in {}", parent.display()))?;

@@ -740,6 +740,12 @@ pub(crate) fn runtime_stats_delta(
 ) -> RuntimeStatsDeltaReport {
     let mut sections = BTreeMap::new();
     let mut warnings = Vec::new();
+    if before.schema_version != after.schema_version {
+        warnings.push(format!(
+            "runtime stats schema version changed during {label} from {} to {}; deltas may be inaccurate or mismatched",
+            before.schema_version, after.schema_version
+        ));
+    }
     if after.generated_unix_ms < before.generated_unix_ms {
         warnings.push(format!(
             "runtime stats timestamp moved backward during {label}; interval uses 0ms because after ({}) < before ({})",
@@ -862,16 +868,25 @@ fn runtime_stats_section_delta(
         let buckets = runtime_stats_latency_bucket_deltas(
             before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
             histogram.buckets.as_slice(),
+            histogram_reset,
         );
+        let (count_delta, sum_delta) = if histogram_reset {
+            (histogram.count, histogram.sum)
+        } else {
+            (
+                reset_aware_delta(count_before, histogram.count),
+                reset_aware_delta(sum_before, histogram.sum),
+            )
+        };
         report.latencies.insert(
             name.clone(),
             RuntimeStatsLatencyDeltaReport {
                 count_before,
                 count_after: histogram.count,
-                count_delta: reset_aware_delta(count_before, histogram.count),
+                count_delta,
                 sum_before,
                 sum_after: histogram.sum,
-                sum_delta: reset_aware_delta(sum_before, histogram.sum),
+                sum_delta,
                 unit: histogram.unit.clone(),
                 buckets,
             },
@@ -883,16 +898,22 @@ fn runtime_stats_section_delta(
 fn runtime_stats_latency_bucket_deltas(
     before: &[RuntimeLatencyBucket],
     after: &[RuntimeLatencyBucket],
+    force_reset: bool,
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
     after
         .iter()
         .map(|bucket| {
             let count_before = runtime_stats_latency_bucket_count(before, bucket.le_ns);
+            let count_delta = if force_reset {
+                bucket.count
+            } else {
+                reset_aware_delta(count_before, bucket.count)
+            };
             RuntimeStatsLatencyBucketDeltaReport {
                 le_ns: bucket.le_ns,
                 count_before,
                 count_after: bucket.count,
-                count_delta: reset_aware_delta(count_before, bucket.count),
+                count_delta,
             }
         })
         .collect()
@@ -1475,10 +1496,10 @@ mod tests {
         commit.sum = 950;
         commit.buckets[0].count = 8;
         let rollback = after.metadata.latencies.get_mut("rollback").unwrap();
-        rollback.count = 2;
-        rollback.sum = 200;
+        rollback.count = 12;
+        rollback.sum = 1_200;
         rollback.buckets[0].count = 1;
-        rollback.buckets[1].count = 2;
+        rollback.buckets[1].count = 12;
 
         let phase = RuntimeStatsPhaseDeltaReport {
             phase: "write".to_string(),
@@ -1520,11 +1541,11 @@ mod tests {
         );
         assert_eq!(
             whole_run.sections["metadata"].latencies["rollback"].count_delta,
-            2
+            12
         );
         assert_eq!(
             whole_run.sections["metadata"].latencies["rollback"].sum_delta,
-            200
+            1_200
         );
         assert_eq!(
             whole_run.sections["metadata"].latencies["rollback"].buckets[0].count_delta,
@@ -1532,7 +1553,7 @@ mod tests {
         );
         assert_eq!(
             whole_run.sections["metadata"].latencies["rollback"].buckets[1].count_delta,
-            2
+            12
         );
         assert!(
             report
@@ -1566,6 +1587,7 @@ mod tests {
 
         let mut backward_after = before.clone();
         backward_after.generated_unix_ms = 900;
+        backward_after.schema_version = backward_after.schema_version.saturating_add(1);
         let backward_delta = runtime_stats_delta("backward-clock", &before, &backward_after);
         assert_eq!(backward_delta.interval_ms, 0);
         assert!(
@@ -1573,6 +1595,12 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("timestamp moved backward"))
+        );
+        assert!(
+            backward_delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("schema version changed"))
         );
     }
 }

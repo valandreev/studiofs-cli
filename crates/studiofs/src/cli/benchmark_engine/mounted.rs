@@ -2088,8 +2088,9 @@ fn build_runtime_stats_phase_deltas(
     let stat_before = after_read
         .as_ref()
         .or(before_read.as_ref())
-        .or(after_write.as_ref());
-    if let (Some(stat_before), Some(after_stat)) = (stat_before, after_stat.as_ref()) {
+        .or(after_write.as_ref())
+        .unwrap_or(whole_run_before);
+    if let Some(after_stat) = after_stat.as_ref() {
         push_runtime_stats_phase_delta(&mut phases, "stat", stat_before, after_stat);
     }
 
@@ -2771,6 +2772,23 @@ mod tests {
         assert_eq!(phases[1].phase, "upload-transition");
         assert_eq!(phases[2].phase, "stat");
         assert_eq!(phases[2].delta.interval_ms, 150);
+    }
+
+    #[test]
+    fn runtime_stats_phase_deltas_use_whole_run_start_before_stat_when_intermediate_missing() {
+        let whole_run_before = runtime_snapshot_at(100);
+        let after_stat = runtime_snapshot_at(500);
+
+        let phases = build_runtime_stats_phase_deltas(
+            &whole_run_before,
+            &None,
+            &None,
+            &None,
+            &Some(after_stat),
+        );
+
+        assert_eq!(phases[0].phase, "stat");
+        assert_eq!(phases[0].delta.interval_ms, 400);
     }
 
     fn single_file_workload() -> WorkloadPlan {

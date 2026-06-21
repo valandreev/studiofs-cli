@@ -45,6 +45,8 @@ pub(crate) struct BenchArgs {
     pub(crate) threads: usize,
 
     /// JSON report output path. Defaults to an auto-named file under target/perf/.
+    /// Existing directories or paths ending with a separator receive an auto-named file;
+    /// other paths are treated as explicit files.
     #[arg(long)]
     pub(crate) json_output: Option<PathBuf>,
 }
