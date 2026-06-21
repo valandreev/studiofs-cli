@@ -57,6 +57,28 @@ require_value() {
   fi
 }
 
+normalize_positive_int() {
+  local option="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "Error: $option must be a positive integer" >&2
+    exit 2
+  fi
+
+  local normalized=$((10#$value))
+  if (( normalized < 1 )); then
+    echo "Error: $option must be a positive integer" >&2
+    exit 2
+  fi
+
+  printf '%s' "$normalized"
+}
+
+is_executable_command() {
+  local command_path="$1"
+  command -v "$command_path" >/dev/null 2>&1 || [[ "$command_path" == */* && -x "$command_path" ]]
+}
+
 json_escape() {
   local value="$1"
   local nl=$'\n'
@@ -127,20 +149,11 @@ if [[ -z "$mount_point" ]]; then
   usage >&2
   exit 2
 fi
-if [[ ! "$runs" =~ ^[0-9]+$ ]] || [[ "$runs" -lt 1 ]]; then
-  echo "Error: --runs must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "$small_file_count" =~ ^[0-9]+$ ]] || [[ "$small_file_count" -lt 1 ]]; then
-  echo "Error: --small-file-count must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "$threads" =~ ^[0-9]+$ ]] || [[ "$threads" -lt 1 ]]; then
-  echo "Error: --threads must be a positive integer" >&2
-  exit 2
-fi
+runs="$(normalize_positive_int "--runs" "$runs")"
+small_file_count="$(normalize_positive_int "--small-file-count" "$small_file_count")"
+threads="$(normalize_positive_int "--threads" "$threads")"
 
-if ! command -v "$studiofs_path" >/dev/null 2>&1; then
+if ! is_executable_command "$studiofs_path"; then
   if [[ "$studiofs_path" == "studiofs" ]]; then
     if [[ -x "$repo_root/target/release/studiofs" ]]; then
       studiofs_path="$repo_root/target/release/studiofs"
@@ -150,7 +163,7 @@ if ! command -v "$studiofs_path" >/dev/null 2>&1; then
   fi
 fi
 
-if ! command -v "$studiofs_path" >/dev/null 2>&1; then
+if ! is_executable_command "$studiofs_path"; then
   echo "Error: studiofs binary not found or not executable at: $studiofs_path" >&2
   exit 1
 fi
