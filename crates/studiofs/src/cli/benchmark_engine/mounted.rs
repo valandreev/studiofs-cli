@@ -28,8 +28,9 @@ use super::result::{
     MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
     MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
     MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
-    OpReport, benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,
-    missing_runtime_stats_report, runtime_stats_report,
+    OpReport, RuntimeStatsPhaseDeltaReport, benchmark_build_metadata, benchmark_command_metadata,
+    benchmark_platform_metadata, missing_runtime_stats_report, runtime_stats_delta,
+    runtime_stats_report,
 };
 use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -2060,50 +2061,59 @@ async fn capture_runtime_stats_snapshot(
     }
 }
 
-fn build_runtime_stats_phase_snapshots(
+fn build_runtime_stats_phase_deltas(
     whole_run_before: &RuntimeStatsSnapshot,
-    after_write: Option<RuntimeStatsSnapshot>,
-    before_read: Option<RuntimeStatsSnapshot>,
-    after_read: Option<RuntimeStatsSnapshot>,
-    after_stat: Option<RuntimeStatsSnapshot>,
-) -> Vec<(String, RuntimeStatsSnapshot, RuntimeStatsSnapshot)> {
-    let mut phase_snapshots = Vec::new();
-    let before_read_for_transition = before_read.clone();
+    after_write: &Option<RuntimeStatsSnapshot>,
+    before_read: &Option<RuntimeStatsSnapshot>,
+    after_read: &Option<RuntimeStatsSnapshot>,
+    after_stat: &Option<RuntimeStatsSnapshot>,
+) -> Vec<RuntimeStatsPhaseDeltaReport> {
+    let mut phases = Vec::new();
     if let Some(after_write) = after_write {
-        if let Some(before_read) = before_read_for_transition {
-            phase_snapshots.push((
-                "write".to_string(),
-                whole_run_before.clone(),
-                after_write.clone(),
-            ));
-            phase_snapshots.push(("upload-transition".to_string(), after_write, before_read));
-        } else {
-            phase_snapshots.push(("write".to_string(), whole_run_before.clone(), after_write));
+        push_runtime_stats_phase_delta(&mut phases, "write", whole_run_before, after_write);
+        if let Some(before_read) = before_read {
+            push_runtime_stats_phase_delta(
+                &mut phases,
+                "upload-transition",
+                after_write,
+                before_read,
+            );
         }
     }
 
-    match (before_read, after_read) {
+    match (before_read.as_ref(), after_read.as_ref()) {
         (Some(before_read), Some(after_read)) => {
+            push_runtime_stats_phase_delta(
+                &mut phases,
+                "during-upload-read",
+                before_read,
+                after_read,
+            );
             if let Some(after_stat) = after_stat {
-                phase_snapshots.push((
-                    "during-upload-read".to_string(),
-                    before_read,
-                    after_read.clone(),
-                ));
-                phase_snapshots.push(("stat".to_string(), after_read, after_stat));
-            } else {
-                phase_snapshots.push(("during-upload-read".to_string(), before_read, after_read));
+                push_runtime_stats_phase_delta(&mut phases, "stat", after_read, after_stat);
             }
         }
         (None, Some(after_read)) => {
             if let Some(after_stat) = after_stat {
-                phase_snapshots.push(("stat".to_string(), after_read, after_stat));
+                push_runtime_stats_phase_delta(&mut phases, "stat", after_read, after_stat);
             }
         }
         _ => {}
     }
 
-    phase_snapshots
+    phases
+}
+
+fn push_runtime_stats_phase_delta(
+    phases: &mut Vec<RuntimeStatsPhaseDeltaReport>,
+    phase: &str,
+    before: &RuntimeStatsSnapshot,
+    after: &RuntimeStatsSnapshot,
+) {
+    phases.push(RuntimeStatsPhaseDeltaReport {
+        phase: phase.to_string(),
+        delta: runtime_stats_delta(phase, before, after),
+    });
 }
 
 pub(crate) async fn run_mounted_end_to_end(
@@ -2557,18 +2567,18 @@ pub(crate) async fn run_mounted_end_to_end(
         let runtime_stats_path_display = runtime_stats_path.display().to_string();
         let runtime_stats = match (runtime_stats_before, runtime_stats_after) {
             (Some(before), Some(after)) => {
-                let phase_snapshots = build_runtime_stats_phase_snapshots(
+                let phases = build_runtime_stats_phase_deltas(
                     &before,
-                    measured.runtime_stats_after_write,
-                    measured.runtime_stats_before_read,
-                    measured.runtime_stats_after_read,
-                    measured.runtime_stats_after_stat,
+                    &measured.runtime_stats_after_write,
+                    &measured.runtime_stats_before_read,
+                    &measured.runtime_stats_after_read,
+                    &measured.runtime_stats_after_stat,
                 );
                 runtime_stats_report(
                     runtime_stats_path_display,
                     before,
                     after,
-                    phase_snapshots,
+                    phases,
                     runtime_stats_warnings,
                 )
             }
@@ -2725,33 +2735,29 @@ mod tests {
     }
 
     #[test]
-    fn runtime_stats_phase_snapshots_start_read_after_transition_wait() {
+    fn runtime_stats_phase_deltas_start_read_after_transition_wait() {
         let whole_run_before = runtime_snapshot_at(100);
         let after_write = runtime_snapshot_at(200);
         let before_read = runtime_snapshot_at(350);
         let after_read = runtime_snapshot_at(450);
         let after_stat = runtime_snapshot_at(500);
 
-        let phase_snapshots = build_runtime_stats_phase_snapshots(
+        let phases = build_runtime_stats_phase_deltas(
             &whole_run_before,
-            Some(after_write),
-            Some(before_read.clone()),
-            Some(after_read),
-            Some(after_stat),
+            &Some(after_write),
+            &Some(before_read),
+            &Some(after_read),
+            &Some(after_stat),
         );
 
-        assert_eq!(phase_snapshots[0].0, "write");
-        assert_eq!(phase_snapshots[0].1.generated_unix_ms, 100);
-        assert_eq!(phase_snapshots[0].2.generated_unix_ms, 200);
-        assert_eq!(phase_snapshots[1].0, "upload-transition");
-        assert_eq!(phase_snapshots[1].1.generated_unix_ms, 200);
-        assert_eq!(phase_snapshots[1].2.generated_unix_ms, 350);
-        assert_eq!(phase_snapshots[2].0, "during-upload-read");
-        assert_eq!(phase_snapshots[2].1.generated_unix_ms, 350);
-        assert_eq!(phase_snapshots[2].2.generated_unix_ms, 450);
-        assert_eq!(phase_snapshots[3].0, "stat");
-        assert_eq!(phase_snapshots[3].1.generated_unix_ms, 450);
-        assert_eq!(phase_snapshots[3].2.generated_unix_ms, 500);
+        assert_eq!(phases[0].phase, "write");
+        assert_eq!(phases[0].delta.interval_ms, 100);
+        assert_eq!(phases[1].phase, "upload-transition");
+        assert_eq!(phases[1].delta.interval_ms, 150);
+        assert_eq!(phases[2].phase, "during-upload-read");
+        assert_eq!(phases[2].delta.interval_ms, 100);
+        assert_eq!(phases[3].phase, "stat");
+        assert_eq!(phases[3].delta.interval_ms, 50);
     }
 
     fn single_file_workload() -> WorkloadPlan {

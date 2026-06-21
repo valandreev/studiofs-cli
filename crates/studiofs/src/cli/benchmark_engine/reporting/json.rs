@@ -65,10 +65,8 @@ fn resolve_report_target(
         } else {
             current_dir.join(json_output)
         };
-        let treat_as_dir = explicit.is_dir()
-            || output_text.ends_with('/')
-            || output_text.ends_with('\\')
-            || json_output.extension().is_none();
+        let treat_as_dir =
+            explicit.is_dir() || output_text.ends_with('/') || output_text.ends_with('\\');
         if treat_as_dir {
             return (explicit.join(default_report_file_name(report, now)), true);
         }
@@ -186,6 +184,32 @@ mod tests {
     }
 
     #[test]
+    fn save_benchmark_report_overwrites_requested_file_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+        let existing = temp.path().join("reports/cache-run.json");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "stale report").unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("reports/cache-run.json")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(saved, existing);
+        let content = std::fs::read_to_string(saved).unwrap();
+        assert!(content.contains("\n  \"mode\""));
+        assert!(!content.contains("stale report"));
+    }
+
+    #[test]
     fn save_benchmark_report_writes_pretty_json_to_requested_path() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
@@ -216,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn save_benchmark_report_treats_extensionless_output_as_directory() {
+    fn save_benchmark_report_writes_extensionless_requested_path_as_file() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
@@ -232,13 +256,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            saved,
-            temp.path()
-                .join("target")
-                .join("new_reports_dir")
-                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
-        );
+        assert_eq!(saved, temp.path().join("target").join("new_reports_dir"));
         assert!(saved.is_file());
     }
 

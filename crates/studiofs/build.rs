@@ -3,6 +3,7 @@
 //! Ensures WinFSP delayed-loading linker flags are applied at the binary
 //! link stage so `/DELAYLOAD:winfsp-x64.dll` affects the final executable.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Entry point for the build script.
@@ -16,27 +17,63 @@ fn main() {
 }
 
 fn emit_git_metadata() {
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD")
-        && let Some(reference) = head.trim().strip_prefix("ref: ")
-    {
-        println!("cargo:rerun-if-changed=../../.git/{reference}");
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Some(git_dir) = resolve_git_dir(&manifest_dir) {
+        let git_head = git_dir.join("HEAD");
+        if git_head.exists() {
+            println!("cargo:rerun-if-changed={}", git_head.display());
+        }
+        if let Ok(head) = std::fs::read_to_string(&git_head)
+            && let Some(reference) = head.trim().strip_prefix("ref: ")
+        {
+            let ref_path = git_dir.join(reference);
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
     }
 
-    emit_git_env("GIT_SHA", &["rev-parse", "--verify", "HEAD"]);
-    emit_git_env("GIT_BRANCH", &["rev-parse", "--abbrev-ref", "HEAD"]);
+    emit_git_env(&manifest_dir, "GIT_SHA", &["rev-parse", "--verify", "HEAD"]);
+    emit_git_env(
+        &manifest_dir,
+        "GIT_BRANCH",
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    );
 }
 
-fn emit_git_env(name: &str, args: &[&str]) {
-    let Ok(output) = Command::new("git").args(args).output() else {
+fn resolve_git_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let git_dir = run_git(manifest_dir, &["rev-parse", "--git-dir"])?;
+    let git_dir = PathBuf::from(git_dir);
+    Some(if git_dir.is_absolute() {
+        git_dir
+    } else {
+        manifest_dir.join(git_dir)
+    })
+}
+
+fn emit_git_env(manifest_dir: &Path, name: &str, args: &[&str]) {
+    let Some(value) = run_git(manifest_dir, args) else {
         return;
     };
-    if !output.status.success() {
-        return;
-    }
-    let value = String::from_utf8_lossy(&output.stdout);
-    let value = value.trim();
     if !value.is_empty() {
         println!("cargo:rustc-env={name}={value}");
     }
+}
+
+fn run_git(manifest_dir: &Path, args: &[&str]) -> Option<String> {
+    let Ok(output) = Command::new("git")
+        .current_dir(manifest_dir)
+        .args(args)
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }

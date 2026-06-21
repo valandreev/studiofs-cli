@@ -715,16 +715,9 @@ pub(crate) fn runtime_stats_report(
     stats_path: String,
     before: RuntimeStatsSnapshot,
     after: RuntimeStatsSnapshot,
-    phase_snapshots: Vec<(String, RuntimeStatsSnapshot, RuntimeStatsSnapshot)>,
+    phases: Vec<RuntimeStatsPhaseDeltaReport>,
     mut warnings: Vec<String>,
 ) -> BenchmarkRuntimeStatsReport {
-    let phases: Vec<_> = phase_snapshots
-        .into_iter()
-        .map(|(phase, before, after)| RuntimeStatsPhaseDeltaReport {
-            delta: runtime_stats_delta(&phase, &before, &after),
-            phase,
-        })
-        .collect();
     let whole_run = runtime_stats_delta("whole-run", &before, &after);
     warnings.extend(whole_run.warnings.iter().cloned());
     for phase in &phases {
@@ -741,7 +734,7 @@ pub(crate) fn runtime_stats_report(
     }
 }
 
-fn runtime_stats_delta(
+pub(crate) fn runtime_stats_delta(
     label: &str,
     before: &RuntimeStatsSnapshot,
     after: &RuntimeStatsSnapshot,
@@ -795,19 +788,17 @@ fn runtime_stats_section_delta(
     let mut report = RuntimeStatsSectionDeltaReport::default();
     for (name, metric) in &after.counters {
         let before_value = before.counters.get(name).map_or(0, |metric| metric.value);
+        if metric.value < before_value {
+            warnings.push(format!(
+                "runtime stats reset detected for {section_name}.{name} during {label}; delta uses the post-reset value"
+            ));
+        }
         report.counters.insert(
             name.clone(),
             RuntimeStatsCounterDeltaReport {
                 before: before_value,
                 after: metric.value,
-                delta: reset_aware_delta(
-                    before_value,
-                    metric.value,
-                    label,
-                    section_name,
-                    name,
-                    warnings,
-                ),
+                delta: reset_aware_delta(before_value, metric.value),
                 unit: metric.unit.to_string(),
             },
         );
@@ -826,37 +817,32 @@ fn runtime_stats_section_delta(
         let before_histogram = before.latencies.get(name);
         let count_before = before_histogram.map_or(0, |histogram| histogram.count);
         let sum_before = before_histogram.map_or(0, |histogram| histogram.sum);
+        let histogram_reset = runtime_stats_latency_reset(
+            before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
+            histogram.buckets.as_slice(),
+            count_before,
+            histogram.count,
+            sum_before,
+            histogram.sum,
+        );
+        if histogram_reset {
+            warnings.push(format!(
+                "runtime stats latency reset detected for {section_name}.{name} during {label}; deltas use post-reset values"
+            ));
+        }
         let buckets = runtime_stats_latency_bucket_deltas(
             before_histogram.map_or(&[][..], |histogram| histogram.buckets.as_slice()),
             histogram.buckets.as_slice(),
-            label,
-            section_name,
-            name,
-            warnings,
         );
         report.latencies.insert(
             name.clone(),
             RuntimeStatsLatencyDeltaReport {
                 count_before,
                 count_after: histogram.count,
-                count_delta: reset_aware_delta(
-                    count_before,
-                    histogram.count,
-                    label,
-                    section_name,
-                    name,
-                    warnings,
-                ),
+                count_delta: reset_aware_delta(count_before, histogram.count),
                 sum_before,
                 sum_after: histogram.sum,
-                sum_delta: reset_aware_delta(
-                    sum_before,
-                    histogram.sum,
-                    label,
-                    section_name,
-                    name,
-                    warnings,
-                ),
+                sum_delta: reset_aware_delta(sum_before, histogram.sum),
                 unit: histogram.unit.to_string(),
                 buckets,
             },
@@ -868,10 +854,6 @@ fn runtime_stats_section_delta(
 fn runtime_stats_latency_bucket_deltas(
     before: &[RuntimeLatencyBucket],
     after: &[RuntimeLatencyBucket],
-    label: &str,
-    section_name: &str,
-    metric_name: &str,
-    warnings: &mut Vec<String>,
 ) -> Vec<RuntimeStatsLatencyBucketDeltaReport> {
     let before_by_bound: BTreeMap<_, _> = before
         .iter()
@@ -888,33 +870,38 @@ fn runtime_stats_latency_bucket_deltas(
                 le_ns: bucket.le_ns,
                 count_before,
                 count_after: bucket.count,
-                count_delta: reset_aware_delta(
-                    count_before,
-                    bucket.count,
-                    label,
-                    section_name,
-                    metric_name,
-                    warnings,
-                ),
+                count_delta: reset_aware_delta(count_before, bucket.count),
             }
         })
         .collect()
 }
 
-fn reset_aware_delta(
-    before: u64,
-    after: u64,
-    label: &str,
-    section_name: &str,
-    metric_name: &str,
-    warnings: &mut Vec<String>,
-) -> u64 {
+fn runtime_stats_latency_reset(
+    before: &[RuntimeLatencyBucket],
+    after: &[RuntimeLatencyBucket],
+    count_before: u64,
+    count_after: u64,
+    sum_before: u64,
+    sum_after: u64,
+) -> bool {
+    if count_after < count_before || sum_after < sum_before {
+        return true;
+    }
+    let before_by_bound: BTreeMap<_, _> = before
+        .iter()
+        .map(|bucket| (bucket.le_ns, bucket.count))
+        .collect();
+    after.iter().any(|bucket| {
+        before_by_bound
+            .get(&bucket.le_ns)
+            .is_some_and(|count_before| bucket.count < *count_before)
+    })
+}
+
+fn reset_aware_delta(before: u64, after: u64) -> u64 {
     if after >= before {
         after - before
     } else {
-        warnings.push(format!(
-            "runtime stats reset detected for {section_name}.{metric_name} during {label}; delta uses the post-reset value"
-        ));
         after
     }
 }
@@ -1431,6 +1418,24 @@ mod tests {
                 }],
             },
         );
+        before.metadata.latencies.insert(
+            "rollback".to_string(),
+            RuntimeLatencyHistogram {
+                count: 10,
+                sum: 1_000,
+                unit: "ns".into(),
+                buckets: vec![
+                    RuntimeLatencyBucket {
+                        le_ns: 1_000,
+                        count: 5,
+                    },
+                    RuntimeLatencyBucket {
+                        le_ns: 2_000,
+                        count: 10,
+                    },
+                ],
+            },
+        );
 
         let mut after = before.clone();
         after.generated_unix_ms = 1_250;
@@ -1445,12 +1450,22 @@ mod tests {
         commit.count = 9;
         commit.sum = 950;
         commit.buckets[0].count = 8;
+        let rollback = after.metadata.latencies.get_mut("rollback").unwrap();
+        rollback.count = 2;
+        rollback.sum = 200;
+        rollback.buckets[0].count = 1;
+        rollback.buckets[1].count = 2;
+
+        let phase = RuntimeStatsPhaseDeltaReport {
+            phase: "write".to_string(),
+            delta: runtime_stats_delta("write", &before, &after),
+        };
 
         let report = runtime_stats_report(
             ".studiofs-runtime-stats".to_string(),
             before.clone(),
             after.clone(),
-            vec![("write".to_string(), before, after)],
+            vec![phase],
             Vec::new(),
         );
 
@@ -1476,6 +1491,22 @@ mod tests {
             whole_run.sections["metadata"].latencies["commit"].buckets[0].count_delta,
             4
         );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].count_delta,
+            2
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].sum_delta,
+            200
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].buckets[0].count_delta,
+            1
+        );
+        assert_eq!(
+            whole_run.sections["metadata"].latencies["rollback"].buckets[1].count_delta,
+            2
+        );
         assert!(
             report
                 .warnings
@@ -1487,6 +1518,14 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("bridge.read_callbacks"))
+        );
+        assert_eq!(
+            whole_run
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("metadata.rollback"))
+                .count(),
+            1
         );
         assert_eq!(report.phases[0].phase, "write");
     }
