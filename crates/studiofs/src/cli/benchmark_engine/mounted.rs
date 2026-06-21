@@ -1526,16 +1526,21 @@ async fn collect_phase_workers(
                 merged += &telemetry;
             }
             Ok(Err(err)) => {
-                join_set.abort_all();
+                abort_and_drain_workers(&mut join_set).await;
                 return Err(err).context(failure_context);
             }
             Err(err) => {
-                join_set.abort_all();
+                abort_and_drain_workers(&mut join_set).await;
                 return Err(err).context(panic_context);
             }
         }
     }
     Ok(merged)
+}
+
+async fn abort_and_drain_workers<T: 'static>(join_set: &mut JoinSet<T>) {
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
 }
 
 async fn collect_stream_workers(
@@ -1551,11 +1556,11 @@ async fn collect_stream_workers(
                 by_stream[stream_id] = telemetry;
             }
             Ok(Err(err)) => {
-                join_set.abort_all();
+                abort_and_drain_workers(&mut join_set).await;
                 return Err(err).context(failure_context);
             }
             Err(err) => {
-                join_set.abort_all();
+                abort_and_drain_workers(&mut join_set).await;
                 return Err(err).context(panic_context);
             }
         }
@@ -1580,12 +1585,11 @@ async fn run_mounted_stat_phase(
             ) == SizeClass::Small
         })
         .collect();
-    let progress = ProgressBar::start("StudioFS test stat", stat_order.len());
-    let counter = progress.counter();
     if stat_order.is_empty() {
-        progress.finish();
         return Ok(PhaseTelemetry::default());
     }
+    let progress = ProgressBar::start("StudioFS test stat", stat_order.len());
+    let counter = progress.counter();
 
     let worker_count = concurrency.max(1).min(stat_order.len());
     let next_operation = Arc::new(AtomicUsize::new(0));
@@ -2480,6 +2484,41 @@ mod tests {
             .prefix("mounted-")
             .tempdir_in(target)
             .expect("tempdir")
+    }
+
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_phase_workers_drains_aborted_tasks_after_failure() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut join_set = JoinSet::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pending_drops = Arc::clone(&drops);
+        join_set.spawn(async move {
+            let _guard = DropCounter {
+                drops: pending_drops,
+            };
+            let _ = started_tx.send(());
+            std::future::pending::<Result<PhaseTelemetry>>().await
+        });
+        started_rx.await.expect("pending worker started");
+        join_set.spawn(async { Err::<PhaseTelemetry, _>(anyhow!("stop")) });
+
+        let result = collect_phase_workers(join_set, "worker panicked", "worker failed").await;
+        let Err(err) = result else {
+            panic!("expected worker failure");
+        };
+
+        assert!(err.to_string().contains("worker failed"));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {

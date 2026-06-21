@@ -11,6 +11,7 @@ use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 
 const MAX_BENCH_SMALL_FILE_COUNT: usize = 1_000_000;
+const MAX_BENCH_THREADS: usize = 512;
 
 enum BenchRunOutcome {
     Completed(Box<crate::cli::benchmark_engine::BenchmarkReport>),
@@ -59,6 +60,9 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
     if args.threads == 0 {
         return Err(anyhow!("--threads must be >= 1"));
     }
+    if args.threads > MAX_BENCH_THREADS {
+        return Err(anyhow!("--threads must be <= {MAX_BENCH_THREADS}"));
+    }
     if args.small_file_count == 0 {
         return Err(anyhow!("--small-file-count must be >= 1"));
     }
@@ -71,6 +75,11 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
     let block_size = parse_size_arg("block-size", &args.block_size)?;
     let big_file_size = parse_size_arg("big-file-size", &args.big_file_size)?;
     let small_file_size = parse_size_arg("small-file-size", &args.small_file_size)?;
+    if big_file_size <= small_file_size {
+        return Err(anyhow!(
+            "--big-file-size must be greater than --small-file-size"
+        ));
+    }
     let mut sizes = Vec::with_capacity(args.small_file_count.saturating_add(1));
     sizes.push(big_file_size);
     sizes.extend(std::iter::repeat_n(small_file_size, args.small_file_count));
@@ -245,6 +254,23 @@ mod tests {
     }
 
     #[test]
+    fn bench_config_rejects_excessive_threads() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "4MB".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: MAX_BENCH_THREADS + 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+
+        assert!(err.to_string().contains("--threads must be <= 512"));
+    }
+
+    #[test]
     fn bench_config_rejects_zero_small_file_count() {
         let args = BenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
@@ -259,6 +285,26 @@ mod tests {
         let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("--small-file-count must be >= 1"));
+    }
+
+    #[test]
+    fn bench_config_rejects_big_file_size_not_greater_than_small_file_size() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "4MB".to_string(),
+            big_file_size: "128KB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--big-file-size must be greater than --small-file-size")
+        );
     }
 
     #[test]

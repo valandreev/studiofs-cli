@@ -89,8 +89,9 @@ struct XorShift64 {
 
 impl XorShift64 {
     fn new(seed: u64) -> Self {
+        let state = seed ^ 0x9e3779b97f4a7c15;
         Self {
-            state: seed ^ 0x9e3779b97f4a7c15,
+            state: state.max(1),
         }
     }
 
@@ -584,6 +585,15 @@ mod tests {
         let second = deterministic_bytes(31, 43);
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn deterministic_bytes_avoid_xorshift_zero_state() {
+        let zero_state_seed = 0x9e3779b97f4a7c15 ^ 0x6ac9_fe0f;
+
+        let bytes = deterministic_bytes(31, zero_state_seed);
+
+        assert!(bytes.iter().any(|byte| *byte != 0));
     }
 
     #[test]
