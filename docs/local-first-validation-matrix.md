@@ -256,6 +256,27 @@ Run sequential and random workloads against a mounted StudioFS path after the
 mount is already active. Record the workload shape explicitly: access pattern,
 block size, read size, file sizes, concurrency, queue depth, and warm-up count.
 
+For the public mounted benchmark surface, start with:
+
+```bash
+studiofs bench /mnt/studio/myvolume \
+  --block-size 4MB \
+  --big-file-size 1GB \
+  --small-file-size 128KB \
+  --small-file-count 1000 \
+  --threads 4 \
+  --json-output reports/studiofs-bench.json
+```
+
+On Windows:
+
+```powershell
+studiofs bench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
+```
+
+`studiofs bench` must target an active StudioFS mount; direct cache-only runs
+remain developer diagnostics rather than user-facing benchmark evidence.
+
 When the mounted runtime exposes upload-state metadata, inspect the human
 summary or JSON `local_first_read_comparison` section for the
 `during-upload-read` and `post-upload-read` phases. A `post-upload-read` phase
@@ -299,6 +320,17 @@ Use a mounted path for this recipe because it exercises namespace lookups, VFS
 policy, cache behavior, and small-read amplification together. Record a random
 access pattern with small files such as 4 KiB, 16 KiB, and 64 KiB, a 4 KiB read
 size, and enough concurrency/queue depth to expose metadata-sensitive latency.
+For the public command, reduce `--small-file-size`, increase
+`--small-file-count`, and keep the target inside the mounted tree:
+
+```bash
+studiofs bench /mnt/studio/myvolume \
+  --block-size 4KB \
+  --big-file-size 64MB \
+  --small-file-size 4KB \
+  --small-file-count 10000 \
+  --threads 8
+```
 
 Use direct cache-only runs only as developer diagnostics when isolating local
 cache behavior from the mounted filesystem stack; do not treat them as the

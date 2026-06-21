@@ -89,8 +89,9 @@ struct XorShift64 {
 
 impl XorShift64 {
     fn new(seed: u64) -> Self {
+        let state = seed ^ 0x9e3779b97f4a7c15;
         Self {
-            state: seed ^ 0x9e3779b97f4a7c15,
+            state: state.max(1),
         }
     }
 
@@ -387,12 +388,24 @@ fn repeat_workload_plan(plan: WorkloadPlan, workload_repeat: usize) -> WorkloadP
 }
 
 pub(crate) fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
-    let mut rng = XorShift64::new(seed ^ 0x6ac9_fe0f);
     let mut out = vec![0u8; len];
-    for byte in &mut out {
-        *byte = rng.next_u64() as u8;
-    }
+    fill_deterministic_bytes(&mut out, len, seed);
     out
+}
+
+pub(crate) fn fill_deterministic_bytes(buffer: &mut Vec<u8>, len: usize, seed: u64) {
+    buffer.resize(len, 0);
+    let mut rng = XorShift64::new(seed ^ 0x6ac9_fe0f);
+    let out = &mut buffer[..len];
+    let mut chunks = out.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    let remainder = chunks.into_remainder();
+    if !remainder.is_empty() {
+        let bytes = rng.next_u64().to_le_bytes();
+        remainder.copy_from_slice(&bytes[..remainder.len()]);
+    }
 }
 
 pub(crate) fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<WorkFile> {
@@ -556,5 +569,44 @@ mod tests {
         assert_eq!(plan.sizes[0], 4 * 1024);
         assert_eq!(plan.sizes[3], 4 * 1024);
         assert_eq!(plan.sizes[4], DEFAULT_BLOCK_SIZE as u64);
+    }
+
+    #[test]
+    fn deterministic_bytes_are_stable_across_calls() {
+        let first = deterministic_bytes(31, 42);
+        let second = deterministic_bytes(31, 42);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn deterministic_bytes_depend_on_seed() {
+        let first = deterministic_bytes(31, 42);
+        let second = deterministic_bytes(31, 43);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn deterministic_bytes_avoid_xorshift_zero_state() {
+        let zero_state_seed = 0x9e3779b97f4a7c15 ^ 0x6ac9_fe0f;
+
+        let bytes = deterministic_bytes(31, zero_state_seed);
+
+        assert!(bytes.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn fill_deterministic_bytes_reuses_existing_capacity() {
+        let mut buffer = Vec::with_capacity(64);
+        fill_deterministic_bytes(&mut buffer, 31, 42);
+        let capacity = buffer.capacity();
+        let expected = deterministic_bytes(31, 42);
+        assert_eq!(&buffer[..31], expected.as_slice());
+
+        fill_deterministic_bytes(&mut buffer, 16, 43);
+
+        assert_eq!(buffer.capacity(), capacity);
+        assert_eq!(buffer.len(), 16);
     }
 }

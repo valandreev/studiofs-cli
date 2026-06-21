@@ -103,7 +103,7 @@ pub enum FetchError {
 pub struct FetchMetrics {
     /// Cache hit count.
     pub cache_hits: AtomicU64,
-    /// Bytes served from the local block cache fast path.
+    /// Bytes served from the local payload-cache fast path.
     pub cache_hit_bytes: AtomicU64,
     /// Number of S3 fetch attempts (including retries that progressed to fetch stage).
     pub s3_fetches: AtomicU64,

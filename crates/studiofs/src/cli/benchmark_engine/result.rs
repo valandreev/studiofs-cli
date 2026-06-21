@@ -87,6 +87,10 @@ pub(crate) struct BenchmarkReport {
     pub(crate) mounted_writeback_timeline: Option<MountedWritebackTimelineReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mounted_write_diagnostics: Option<MountedWriteDiagnosticsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) small_file_stats: Option<OpReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cleanup: Option<OpReport>,
     pub(crate) writes: OpReport,
     pub(crate) reads: OpReport,
 }
@@ -988,6 +992,8 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         mounted_write_path_window: None,
         mounted_writeback_timeline: None,
         mounted_write_diagnostics: None,
+        small_file_stats: None,
+        cleanup: None,
         writes: OpReport {
             operations: 16,
             bytes: 128 * 1024 * 1024,

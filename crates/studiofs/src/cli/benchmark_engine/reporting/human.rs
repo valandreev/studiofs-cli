@@ -446,7 +446,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     }
     out.push('\n');
     let _ = writeln!(&mut out, "Operation results");
-    let operation_rows = vec![
+    let mut operation_rows = vec![
         vec![
             "Write".to_string(),
             report.writes.operations.to_string(),
@@ -468,6 +468,30 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
             format_duration_ms(report.reads.p99_ms),
         ],
     ];
+    if let Some(stats) = &report.small_file_stats {
+        operation_rows.push(vec![
+            "Stat".to_string(),
+            stats.operations.to_string(),
+            format_bytes(stats.bytes),
+            format_throughput(stats.throughput_bytes_per_sec),
+            format_duration_ms(stats.avg_latency_ms),
+            format_duration_ms(stats.p50_ms),
+            format_duration_ms(stats.p95_ms),
+            format_duration_ms(stats.p99_ms),
+        ]);
+    }
+    if let Some(cleanup) = &report.cleanup {
+        operation_rows.push(vec![
+            "Cleanup".to_string(),
+            cleanup.operations.to_string(),
+            format_bytes(cleanup.bytes),
+            format_throughput(cleanup.throughput_bytes_per_sec),
+            format_duration_ms(cleanup.avg_latency_ms),
+            format_duration_ms(cleanup.p50_ms),
+            format_duration_ms(cleanup.p95_ms),
+            format_duration_ms(cleanup.p99_ms),
+        ]);
+    }
     let _ = write!(
         &mut out,
         "{}",
@@ -917,6 +941,40 @@ mod tests {
         assert!(summary.contains("Steady dirty"));
         assert!(summary.contains("Peak staged"));
         assert!(summary.contains("Dirty limit"));
+    }
+
+    #[test]
+    fn render_human_summary_includes_stat_and_cleanup_rows_when_present() {
+        let mut report = sample_report();
+        report.small_file_stats = Some(OpReport {
+            operations: 100,
+            bytes: 0,
+            elapsed_ms: 25.0,
+            avg_latency_ms: 0.25,
+            p50_ms: 0.2,
+            p95_ms: 0.4,
+            p99_ms: 0.5,
+            throughput_bytes_per_sec: 0.0,
+            latency_histogram: test_latency_histogram(),
+            operations_log: Vec::new(),
+        });
+        report.cleanup = Some(OpReport {
+            operations: 1,
+            bytes: 0,
+            elapsed_ms: 10.0,
+            avg_latency_ms: 10.0,
+            p50_ms: 10.0,
+            p95_ms: 10.0,
+            p99_ms: 10.0,
+            throughput_bytes_per_sec: 0.0,
+            latency_histogram: test_latency_histogram(),
+            operations_log: Vec::new(),
+        });
+
+        let summary = render_human_summary(&report);
+
+        assert!(summary.contains("| Stat"));
+        assert!(summary.contains("| Cleanup"));
     }
 
     #[test]
