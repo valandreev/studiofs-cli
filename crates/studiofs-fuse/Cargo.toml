@@ -28,3 +28,4 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 dotenvy.workspace = true
+studiofs-test-support.workspace = true

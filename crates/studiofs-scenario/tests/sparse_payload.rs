@@ -232,12 +232,5 @@ fn sparse_payload_counterexample_artifact_replays_with_range_operations() {
 }
 
 fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after unix epoch")
-            .as_nanos()
-    ))
+    studiofs_test_support::workspace_target_temp_path(&format!("{name}-"))
 }

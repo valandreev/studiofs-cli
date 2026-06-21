@@ -2188,7 +2188,7 @@ mod tests {
         StudioFsContext,
         Arc<Mutex<Vec<u64>>>,
     ) {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let queue = Arc::new(Mutex::new(Vec::new()));
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);

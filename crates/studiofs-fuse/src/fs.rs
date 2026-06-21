@@ -2391,7 +2391,7 @@ mod tests {
     pub(super) fn make_test_fuse_fs(
         volume_suffix: &str,
     ) -> (TempDir, Arc<Runtime>, Arc<StudioVfs>, StudioFuseFs) {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");

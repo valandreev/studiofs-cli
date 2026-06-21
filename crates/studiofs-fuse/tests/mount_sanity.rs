@@ -226,7 +226,7 @@ fn async_mounted_matrix_includes_unmount_teardown_scenario() {
 
 #[test]
 fn command_path_is_available_only_when_executable() {
-    let tmp = target_tempdir("command-availability-");
+    let tmp = studiofs_test_support::workspace_target_tempdir("command-availability-");
     let command_path = tmp.path().join("fio");
     std::fs::write(&command_path, b"not executable").expect("write fake command");
 
@@ -259,17 +259,6 @@ fn workspace_root() -> std::path::PathBuf {
         .and_then(|path| path.parent())
         .expect("workspace root")
         .to_path_buf()
-}
-
-fn target_tempdir(prefix: &str) -> tempfile::TempDir {
-    let temp_root = workspace_root()
-        .join("target")
-        .join("studiofs-fuse-mount-tests");
-    std::fs::create_dir_all(&temp_root).expect("create target-backed test temp root");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(temp_root)
-        .expect("target-backed tempdir")
 }
 
 fn workspace_env_path() -> std::path::PathBuf {
@@ -649,7 +638,7 @@ fn mounted_fuse_cleanup_caps_join_poll_sleep_to_remaining_timeout() {
 
 #[test]
 fn mounted_fuse_cleanup_detects_mount_path_device_restoration() {
-    let mount_dir = target_tempdir("mount-detection-");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-detection-");
     use std::os::unix::fs::MetadataExt;
     let original_dev = std::fs::metadata(mount_dir.path())
         .expect("mount detection tempdir metadata")
@@ -736,8 +725,8 @@ fn with_mounted_fuse(
         return;
     }
 
-    let tmp = target_tempdir("vfs-");
-    let mount_dir = target_tempdir("mount-");
+    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, suffix, &rt);
     let fs = StudioFuseFs::new_with_runtime_options(
@@ -960,8 +949,8 @@ fn fuse_session_mount_and_drop_smoke() {
         return;
     }
 
-    let tmp = target_tempdir("vfs-");
-    let mount_dir = target_tempdir("mount-");
+    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());
@@ -987,8 +976,8 @@ fn fuse_mount_write_read_unmount_smoke() {
         return;
     }
 
-    let tmp = target_tempdir("vfs-");
-    let mount_dir = target_tempdir("mount-");
+    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());

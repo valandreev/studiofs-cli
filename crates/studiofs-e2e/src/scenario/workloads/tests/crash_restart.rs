@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -84,7 +84,7 @@ fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
 
 #[test]
 fn crash_restart_recovery_accepts_peer_visible_before_convergence() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-peer-visible");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -131,7 +131,7 @@ fn crash_restart_recovery_accepts_peer_visible_before_convergence() {
 
 #[test]
 fn crash_restart_before_convergence_publish_reports_missing_source() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-missing-source");
     let clients = CRASH_RESTART_CLIENT_NAMES
         .iter()
@@ -157,7 +157,7 @@ fn crash_restart_before_convergence_publish_reports_missing_source() {
 
 #[test]
 fn crash_restart_recovery_uses_recovered_writer_checksum_as_oracle() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-recovered-writer");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -205,7 +205,7 @@ fn crash_restart_recovery_uses_recovered_writer_checksum_as_oracle() {
 
 #[test]
 fn crash_restart_before_publication_requires_final_peer_convergence() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-before-publication-writer-only");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -259,7 +259,7 @@ fn crash_restart_before_publication_requires_final_peer_convergence() {
 
 #[test]
 fn crash_restart_before_publication_fails_when_recovered_state_never_converges() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-before-publication-missing-peer");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -304,7 +304,7 @@ fn crash_restart_before_publication_fails_when_recovered_state_never_converges()
 
 #[test]
 fn crash_restart_reports_peer_convergence_failure_when_recovered_state_is_not_published() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -344,7 +344,7 @@ fn crash_restart_reports_peer_convergence_failure_when_recovered_state_is_not_pu
 
 #[test]
 fn crash_restart_reports_unrecoverable_loss_when_writer_cannot_read_after_restart() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-unrecoverable");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -386,7 +386,7 @@ fn crash_restart_reports_unrecoverable_loss_when_writer_cannot_read_after_restar
 
 #[test]
 fn crash_restart_reports_corrupt_advertised_file_when_final_peer_differs_from_recovered_writer() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -427,7 +427,7 @@ fn crash_restart_reports_corrupt_advertised_file_when_final_peer_differs_from_re
 
 #[test]
 fn crash_restart_convergence_includes_every_available_client() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")

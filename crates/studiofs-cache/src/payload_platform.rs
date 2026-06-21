@@ -756,7 +756,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_unbuffered_alignment_for_path_is_at_least_default_alignment() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
 
         let alignment = unbuffered_write_alignment_for_path(temp.path());
 

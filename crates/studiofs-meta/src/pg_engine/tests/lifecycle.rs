@@ -100,7 +100,7 @@ fn startup_snapshot_replay_uses_previous_epoch_when_snapshot_has_no_cursor() {
 
 #[test]
 fn remote_snapshot_does_not_export_local_pg_state() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -148,7 +148,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
 
 #[test]
 fn remote_snapshot_import_drops_legacy_local_pg_state() {
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
@@ -348,7 +348,7 @@ fn test_pg_flush_advances_checkpoint_version() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-test");
     seed_local(&db, &volume.format_info());
@@ -386,8 +386,8 @@ fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-snapshot-visibility");
@@ -425,7 +425,7 @@ fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
     assert!(peer_snapshot.pinned_object_ids.contains(&44_001));
     assert!(!peer_snapshot.snapshot_payload.is_empty());
 
-    let mount_dir = tempdir().expect("mount tempdir");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("test-");
     let mount_db = mount_dir.path().join("snapshot-mount.redb");
     let mount_engine = RedbMetaEngine::open(&mount_db).expect("open mount redb");
     let mut mount_info = info.clone();
@@ -449,7 +449,7 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-command-pool-reuse");
     seed_local(&db, &volume.format_info());
@@ -498,7 +498,7 @@ fn command_pool_discards_client_after_application_error() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-command-pool-app-error");
     seed_local(&db, &volume.format_info());

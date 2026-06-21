@@ -183,7 +183,6 @@ pub(super) fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn write_mount_pid_json(
         dir: &Path,
@@ -240,7 +239,7 @@ mod tests {
 
     #[test]
     fn cleanup_stale_mounts_removes_only_dead_process_entries() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         write_mount_pid_json(
             temp.path(),
             "dead.json",
@@ -276,7 +275,7 @@ mod tests {
 
     #[test]
     fn active_mounts_filters_dead_processes_and_preserves_runtime_metadata() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         write_mount_pid_json(
             temp.path(),
             "live.json",

@@ -121,11 +121,7 @@ fn make_test_vfs_with_config(
 }
 
 fn runtime_stats_test_tempdir() -> TempDir {
-    std::fs::create_dir_all("target").expect("create target dir");
-    tempfile::Builder::new()
-        .prefix("runtime-stats-")
-        .tempdir_in("target")
-        .expect("runtime stats tempdir in target")
+    studiofs_test_support::workspace_target_tempdir("runtime-stats-")
 }
 
 #[test]
@@ -712,7 +708,7 @@ fn install_fragmented_overlay_block(
 
 #[test]
 fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending_upload() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-stale-pending");
 
     let created = vfs
@@ -752,7 +748,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
 
 #[test]
 fn startup_replay_cancels_ready_inode_stale_pending_upload() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-ready-stale-pending");
 
     let created = vfs
@@ -808,7 +804,7 @@ fn startup_replay_cancels_ready_inode_stale_pending_upload() {
 
 #[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-upload");
 
     let created = vfs
@@ -855,7 +851,7 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
 
 #[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cleanup() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-orphan");
 
     let created = vfs
@@ -1001,7 +997,7 @@ fn s3_upload_problem_detector_drain_emits_one_recovery_event() {
 
 #[test]
 fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-same-epoch");
 
     let created = vfs
@@ -1041,7 +1037,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
 
 #[test]
 fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");
 
     let created = vfs
@@ -1102,7 +1098,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
 
 #[test]
 fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-runtime-queue");
 
     let created = vfs
@@ -1158,7 +1154,7 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
 
 #[test]
 fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-runtime-uploads");
 
     let created = vfs
@@ -1211,7 +1207,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
 
 #[test]
 fn startup_replay_summary_reports_recovered_bytes_and_queued_uploads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-summary-bytes");
 
     let created = vfs
@@ -1256,7 +1252,7 @@ fn startup_replay_summary_reports_recovered_bytes_and_queued_uploads() {
 
 #[test]
 fn startup_replay_restores_live_extents_for_duplicate_dirty_object_references() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-duplicate-object");
 
     let first = vfs
@@ -1314,7 +1310,7 @@ fn startup_replay_restores_live_extents_for_duplicate_dirty_object_references() 
 
 #[test]
 fn startup_replay_restores_all_block_extents_when_one_file_reuses_dirty_object_id() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-duplicate-blocks");
 
     let created = vfs
@@ -1378,7 +1374,7 @@ fn startup_replay_restores_all_block_extents_when_one_file_reuses_dirty_object_i
 
 #[test]
 fn flush_queues_runtime_upload_immediately_after_local_durability() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-queues-runtime-upload");
     let _guard = rt.enter();
 
@@ -1410,7 +1406,7 @@ fn flush_queues_runtime_upload_immediately_after_local_durability() {
 
 #[test]
 fn sfs312_write_is_visible_from_writer_state_before_local_durability_boundary() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-writer-state-visible");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1449,7 +1445,7 @@ fn sfs312_write_is_visible_from_writer_state_before_local_durability_boundary() 
 
 #[test]
 fn sfs312_flush_materializes_local_slice_boundary_without_remote_visibility() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-flush-boundary");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1495,7 +1491,7 @@ fn sfs312_flush_materializes_local_slice_boundary_without_remote_visibility() {
 
 #[test]
 fn sfs312_fsync_persists_local_state_without_remote_visibility() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-fsync-boundary");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1544,7 +1540,7 @@ fn sfs312_fsync_persists_local_state_without_remote_visibility() {
 
 #[test]
 fn sfs312_last_handle_release_drains_local_durability_boundary() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-release-boundary");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1592,7 +1588,7 @@ fn sfs312_last_handle_release_drains_local_durability_boundary() {
 
 #[test]
 fn buffered_partial_write_uses_fragmented_overlay_slice_graph_as_base() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "fragmented-overlay-buffered-base");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1633,7 +1629,7 @@ fn buffered_partial_write_uses_fragmented_overlay_slice_graph_as_base() {
 
 #[test]
 fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "fragmented-overlay-handle-base");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -1687,7 +1683,7 @@ fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
 
 #[test]
 fn wait_for_uploads_idle_observes_runtime_upload_queue() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "wait-for-runtime-upload-idle");
     let _guard = rt.enter();
 
@@ -1712,7 +1708,7 @@ fn wait_for_uploads_idle_observes_runtime_upload_queue() {
 
 #[test]
 fn upload_stats_report_backlog_bytes_age_retries_active_and_completion_rate() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-stats-backlog");
     let _guard = rt.enter();
 
@@ -1794,7 +1790,7 @@ fn upload_stats_deserializes_snapshots_without_new_backlog_fields() {
 
 #[test]
 fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");
 
     let created = vfs
@@ -1841,7 +1837,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
 
 #[test]
 fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");
     let object_id = 991_337;
 
@@ -1918,7 +1914,7 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
 
 #[test]
 fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-warm-cache-cleanup");
     let object_id = 991_338;
 
@@ -1976,7 +1972,7 @@ fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
 
 #[test]
 fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlog() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-snapshot-classes");
     let _guard = rt.enter();
 
@@ -2068,7 +2064,7 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
 
 #[test]
 fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-delete-before-publish");
     let _guard = rt.enter();
 
@@ -2134,7 +2130,7 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 
 #[test]
 fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-zero-length");
     let _guard = rt.enter();
 
@@ -2231,7 +2227,7 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_published_dirty_attr_was_visible() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-dirty-attr-invalidate");
     let _guard = rt.enter();
 
@@ -2307,7 +2303,7 @@ fn epoch_finalizer_invalidates_kernel_when_published_dirty_attr_was_visible() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_newer_dirty_attr_remains_visible() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "graph-finalizer-newer-dirty-attr-invalidate");
     let _guard = rt.enter();
@@ -2395,7 +2391,7 @@ fn epoch_finalizer_invalidates_kernel_when_newer_dirty_attr_remains_visible() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_publication_advances_visible_size() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-size-advance-invalidate");
     let _guard = rt.enter();
 
@@ -2451,7 +2447,7 @@ fn epoch_finalizer_invalidates_kernel_when_publication_advances_visible_size() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_publication_shrinks_visible_size() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-size-shrink-invalidate");
     let _guard = rt.enter();
 
@@ -2513,7 +2509,7 @@ fn epoch_finalizer_invalidates_kernel_when_publication_shrinks_visible_size() {
 
 #[test]
 fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-local-write-attr-only");
     let _guard = rt.enter();
 
@@ -2578,7 +2574,7 @@ fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-same-size-graph");
     let _guard = rt.enter();
 
@@ -2673,7 +2669,7 @@ fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
 
 #[test]
 fn epoch_finalizer_invalidates_kernel_when_local_matching_sparse_overlay_changes_same_size_graph() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "graph-finalizer-local-sparse-same-size-graph");
     let _guard = rt.enter();
@@ -2766,7 +2762,7 @@ fn epoch_finalizer_invalidates_kernel_when_local_matching_sparse_overlay_changes
 
 #[test]
 fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-supersede-kernel-inval");
     let _guard = rt.enter();
 
@@ -2824,7 +2820,7 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
 
 #[test]
 fn authoritative_ready_metadata_does_not_clear_newer_local_dirty_attr() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-keeps-newer-dirty-attr");
     let _guard = rt.enter();
 
@@ -2877,7 +2873,7 @@ fn authoritative_ready_metadata_does_not_clear_newer_local_dirty_attr() {
 
 #[test]
 fn authoritative_ready_metadata_does_not_clear_same_size_newer_dirty_attr() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-keeps-same-size-newer-dirty-attr");
     let _guard = rt.enter();
 
@@ -2926,7 +2922,7 @@ fn authoritative_ready_metadata_does_not_clear_same_size_newer_dirty_attr() {
 
 #[test]
 fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rename-invalidates-moved-inode");
 
     let attr = vfs
@@ -2961,7 +2957,7 @@ fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
 
 #[test]
 fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-local");
     let _guard = rt.enter();
 
@@ -3019,7 +3015,7 @@ fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
 
 #[test]
 fn remote_ready_attr_with_same_epoch_preserves_buffered_writer_stack_tail() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-writer");
     let _guard = rt.enter();
 
@@ -3096,7 +3092,7 @@ fn remote_ready_attr_with_same_epoch_preserves_buffered_writer_stack_tail() {
 
 #[test]
 fn same_size_strict_sparse_tail_write_advances_past_committed_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "same-size-strict-tail-publish");
     let _guard = rt.enter();
 
@@ -3137,7 +3133,7 @@ fn same_size_strict_sparse_tail_write_advances_past_committed_epoch() {
 
 #[test]
 fn size_change_after_unpublished_flush_advances_content_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "setattr-size-advances-epoch");
     let _guard = rt.enter();
 
@@ -3193,7 +3189,7 @@ fn size_change_after_unpublished_flush_advances_content_epoch() {
 
 #[test]
 fn handle_overwrite_after_truncate_publishes_recovered_payload_not_tombstone() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overwrite-truncate-publishes-payload");
     let _guard = rt.enter();
 
@@ -3268,7 +3264,7 @@ fn handle_overwrite_after_truncate_publishes_recovered_payload_not_tombstone() {
 
 #[test]
 fn zero_size_epoch_finalization_defers_while_overwrite_handle_is_open() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zero-finalize-defers-open-handle");
     let _guard = rt.enter();
 
@@ -3321,7 +3317,7 @@ fn zero_size_epoch_finalization_defers_while_overwrite_handle_is_open() {
 
 #[test]
 fn stale_zero_size_dirty_attr_after_recovered_publish_would_revert_to_tombstone() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-zero-dirty-attr-after-publish");
     let _guard = rt.enter();
 
@@ -3403,7 +3399,7 @@ fn stale_zero_size_dirty_attr_after_recovered_publish_would_revert_to_tombstone(
 
 #[test]
 fn stale_newer_zero_size_dirty_attr_after_recovered_publish_is_discarded() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "stale-newer-zero-dirty-attr-after-publish");
     let _guard = rt.enter();
@@ -3483,7 +3479,7 @@ fn stale_newer_zero_size_dirty_attr_after_recovered_publish_is_discarded() {
 
 #[test]
 fn stale_zero_dirty_attr_with_equal_committed_epoch_after_recovered_publish_is_discarded() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(
         &tmp,
         "stale-zero-equal-committed-epoch-dirty-attr-after-publish",
@@ -3570,7 +3566,7 @@ fn stale_zero_dirty_attr_with_equal_committed_epoch_after_recovered_publish_is_d
 
 #[test]
 fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_flush_fh() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "stale-zero-dirty-attr-not-persisted-by-flush-fh");
     let _guard = rt.enter();
@@ -3654,7 +3650,7 @@ fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_flush_fh() 
 
 #[test]
 fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_local_dirty_flush() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(
         &tmp,
         "stale-zero-dirty-attr-not-persisted-by-local-dirty-flush",
@@ -3740,7 +3736,7 @@ fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_local_dirty
 
 #[test]
 fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-after-write-through");
     let _guard = rt.enter();
 
@@ -3804,7 +3800,7 @@ fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch()
 
 #[test]
 fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "write-through-sparse-extend-retains");
     let _guard = rt.enter();
 
@@ -3927,7 +3923,7 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
 
 #[test]
 fn explicit_flush_sparse_extend_requeues_all_retained_overlay_uploads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-extend-retains");
     let _guard = rt.enter();
 
@@ -3997,7 +3993,7 @@ fn explicit_flush_sparse_extend_requeues_all_retained_overlay_uploads() {
 
 #[test]
 fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-after-head-publish");
     let _guard = rt.enter();
 
@@ -4123,7 +4119,7 @@ fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
 
 #[test]
 fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-rebases-after-size-growth");
     let _guard = rt.enter();
 
@@ -4179,7 +4175,7 @@ fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
 
 #[test]
 fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "deferred-sparse-tail-rebases-after-size-growth");
     let _guard = rt.enter();
@@ -4286,7 +4282,7 @@ fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
 
 #[test]
 fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-zero-filled-tail");
     let _guard = rt.enter();
 
@@ -4397,7 +4393,7 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
 
 #[test]
 fn sparse_extend_requeues_retained_overlay_when_runtime_upload_queue_is_empty() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-extend-retains-metadata-overlay");
     let _guard = rt.enter();
 
@@ -4462,7 +4458,7 @@ fn sparse_extend_requeues_retained_overlay_when_runtime_upload_queue_is_empty() 
 
 #[test]
 fn chunk_boundary_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_empty() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "chunk-boundary-sparse-extend-retains-overlay");
     let _guard = rt.enter();
@@ -4527,7 +4523,7 @@ fn chunk_boundary_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_
 
 #[test]
 fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_empty() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "zero-filled-sparse-extend-retains-overlay");
     let _guard = rt.enter();
@@ -4614,7 +4610,7 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
 
 #[test]
 fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-ready-keeps-overlay-finalize");
     let _guard = rt.enter();
 
@@ -4673,7 +4669,7 @@ fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
 
 #[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
     let _guard = rt.enter();
 
@@ -4725,7 +4721,7 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 
 #[test]
 fn handle_backed_nonzero_truncate_clears_drained_dirty_attr_before_fsync() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-truncate-clears-drained-attr");
     let _guard = rt.enter();
 
@@ -4764,7 +4760,7 @@ fn handle_backed_nonzero_truncate_clears_drained_dirty_attr_before_fsync() {
 
 #[test]
 fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flight() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
     let _guard = rt.enter();
 
@@ -4804,7 +4800,7 @@ fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flig
 
 #[test]
 fn size_change_requeue_cancels_superseded_upload_token_and_rotates_for_retained_uploads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-rotates-upload-token");
     let _guard = rt.enter();
 
@@ -4844,7 +4840,7 @@ fn size_change_requeue_cancels_superseded_upload_token_and_rotates_for_retained_
 
 #[test]
 fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "handle-extend-no-strict-sync");
     let _guard = rt.enter();
 
@@ -4916,7 +4912,7 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
 
 #[test]
 fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_active_uploads() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-active-upload");
     #[cfg(target_os = "macos")]
     let _ = &meta;
@@ -5015,7 +5011,7 @@ fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_act
 
 #[test]
 fn handle_backed_extend_with_mtime_and_dirty_writer_forces_strict_sync() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-mtime-strict-sync");
     let _guard = rt.enter();
 
@@ -5095,7 +5091,7 @@ fn handle_backed_extend_with_mtime_and_dirty_writer_forces_strict_sync() {
 
 #[test]
 fn handle_backed_shrink_with_dirty_writer_forces_strict_sync() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-shrink-dirty-writer-strict-sync");
     let _guard = rt.enter();
 
@@ -5178,7 +5174,7 @@ fn handle_backed_shrink_with_dirty_writer_forces_strict_sync() {
 
 #[test]
 fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");
     let _guard = rt.enter();
 
@@ -5260,7 +5256,7 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
 
 #[test]
 fn handle_backed_clean_growth_persistence_matches_platform_policy() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-growth-platform-policy");
     let _guard = rt.enter();
 
@@ -5316,7 +5312,7 @@ fn handle_backed_clean_growth_persistence_matches_platform_policy() {
 
 #[test]
 fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-sparse-extend-publish-size");
     let _guard = rt.enter();
 
@@ -5464,7 +5460,7 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
 
 #[test]
 fn epoch_finalizer_guard_observes_writer_stack_tail() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");
     let _guard = rt.enter();
 
@@ -5495,7 +5491,7 @@ fn epoch_finalizer_guard_observes_writer_stack_tail() {
 
 #[test]
 fn writer_stack_object_reservation_counts_only_current_write() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-object-reservation");
     let block_size = vfs.block_size as usize;
     let expected_dirty_limit_objects = vfs.max_dirty_bytes().div_ceil(block_size).saturating_add(1);
@@ -5514,7 +5510,7 @@ fn writer_stack_object_reservation_counts_only_current_write() {
 
 #[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-inflight");
     let _guard = rt.enter();
 
@@ -5594,7 +5590,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
 
 #[test]
 fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         publish_visibility_timeout_secs: 1,
         ..VfsConfig::default()
@@ -5643,7 +5639,7 @@ fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
 
 #[test]
 fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-repeated-replay");
     let _guard = rt.enter();
 
@@ -5708,7 +5704,7 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
 
 #[test]
 fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "zeroio-shutdown-persisted");
     let _guard = rt.enter();
 
@@ -5746,7 +5742,7 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
 
 #[test]
 fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-shutdown-writer-state");
     let _guard = rt.enter();
     let payload = b"sfs-312-memory-only-before-shutdown";
@@ -5824,7 +5820,7 @@ fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
 
 #[test]
 fn zeroio_snapshot_reports_replay_backlog_beyond_recent_event_sample_limit() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-replay-sample-limit");
     let _guard = rt.enter();
 
@@ -5965,7 +5961,7 @@ fn write_admission_pressure_includes_pending_upload_backlog() {
 
 #[test]
 fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-pending-upload");
     let mut writer = vfs
         .cached_store()
@@ -6010,7 +6006,7 @@ fn write_buffer_admission_paces_like_juicefs_memory_window() {
 
 #[test]
 fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-waits-hard-window");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6426,7 +6422,7 @@ async fn foreground_idle_notify_fires_when_last_read_finishes() {
 
 #[test]
 fn wait_for_foreground_reads_idle_honors_idle_grace() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         upload_user_idle_grace_ms: 20,
         ..VfsConfig::default()
@@ -6501,7 +6497,7 @@ fn foreground_read_scope_records_sample_and_clears_inflight() {
 
 #[test]
 fn release_fh_clears_per_stream_read_tracking() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-clears-stream-state");
     let _guard = rt.enter();
 
@@ -6565,7 +6561,7 @@ fn active_open_overlay_tracks_only_mutating_handles() {
 
 #[test]
 fn fallback_read_access_tracking_does_not_increment_active_handle_counts() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fallback-access-tracking");
     let _guard = rt.enter();
 
@@ -6611,7 +6607,7 @@ fn fallback_read_access_tracking_does_not_increment_active_handle_counts() {
 
 #[test]
 fn handle_read_access_tracking_promotes_active_class_counts() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "handle-access-tracking");
     let _guard = rt.enter();
 
@@ -6679,7 +6675,7 @@ fn handle_read_access_tracking_promotes_active_class_counts() {
 
 #[test]
 fn clear_access_tracking_clears_fallback_states_and_hints() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "clear-access-tracking");
     let _guard = rt.enter();
 
@@ -6809,7 +6805,7 @@ fn test_offset_within_block() {
 
 #[test]
 fn test_sticky_upload_error_is_deterministic_across_sync_points() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-upload-error");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6848,7 +6844,7 @@ fn test_sticky_upload_error_is_deterministic_across_sync_points() {
 
 #[test]
 fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-fsync-order");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6884,7 +6880,7 @@ fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
 
 #[test]
 fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-release-order");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6918,7 +6914,7 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
 
 #[test]
 fn test_release_fh_with_outcome_materializes_pending_inode_dirty_state_on_last_close() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6959,7 +6955,7 @@ fn test_release_fh_with_outcome_materializes_pending_inode_dirty_state_on_last_c
 
 #[test]
 fn test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-skip");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -6991,7 +6987,7 @@ fn test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush() {
 
 #[test]
 fn test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-sticky-skip");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7033,7 +7029,7 @@ fn test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier() {
 
 #[test]
 fn test_release_fh_clean_waits_for_file_session_gate() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-session-skip");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7086,7 +7082,7 @@ fn test_release_fh_clean_waits_for_file_session_gate() {
 
 #[test]
 fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-release-reopen-read");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7115,7 +7111,7 @@ fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
 
 #[test]
 fn ignored_entry_writes_preserve_synthetic_attr_size() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7186,7 +7182,7 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
 
 #[test]
 fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_clear() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-opportunistic-handle-read");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7226,7 +7222,7 @@ fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_cl
 
 #[test]
 fn same_mount_read_prefers_newer_opportunistic_writer_stack_spans() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-overlapping-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7256,7 +7252,7 @@ fn same_mount_read_prefers_newer_opportunistic_writer_stack_spans() {
 
 #[test]
 fn writer_stack_global_dirty_cap_drains_older_inodes_after_limit_drop() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-writer-stack-global-cap");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7320,7 +7316,7 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
 
 #[test]
 fn completed_block_materialization_respects_eager_batch_limit() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         write_eager_flush_batch_bytes: 8 * 1024 * 1024,
         ..VfsConfig::default()
@@ -7362,7 +7358,7 @@ fn completed_block_materialization_respects_eager_batch_limit() {
 
 #[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7411,7 +7407,7 @@ fn ingress_pressure_counts_buffered_writer_stack_bytes() {
 
 #[test]
 fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =
         make_unstarted_test_vfs(&tmp, "sfs-306-deferred-backpressure-nonblocking");
     let _guard = rt.enter();
@@ -7508,7 +7504,7 @@ fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback()
 
 #[test]
 fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-306-sustained-pre-drain-nonblocking");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7571,7 +7567,7 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
 
 #[test]
 fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-305-deferred-soft-writeback");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7642,7 +7638,7 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
 
 #[test]
 fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-write-invalidation");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7694,7 +7690,7 @@ fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
 
 #[test]
 fn namespace_invalidation_includes_runtime_only_inodes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-invalidation-runtime-inodes");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7731,7 +7727,7 @@ fn namespace_invalidation_includes_runtime_only_inodes() {
 
 #[test]
 fn inode_write_keeps_partial_state_buffered_until_flush() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7774,7 +7770,7 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
 
 #[test]
 fn write_fh_default_buffers_partial_state_until_flush() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-default-buffered");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7815,7 +7811,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
 
 #[test]
 fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7861,7 +7857,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
 
 #[test]
 fn write_fh_routes_mounted_write_through_writer_stack() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7887,7 +7883,7 @@ fn write_fh_routes_mounted_write_through_writer_stack() {
 
 #[test]
 fn write_through_writes_use_single_strict_materialization_stage() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-307-write-through-single-stage");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7956,7 +7952,7 @@ fn write_through_writes_use_single_strict_materialization_stage() {
 
 #[test]
 fn write_fh_does_not_allocate_object_ids_before_materialization() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-no-object-ids");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -7987,7 +7983,7 @@ fn write_fh_does_not_allocate_object_ids_before_materialization() {
 
 #[test]
 fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8029,7 +8025,7 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
 
 #[test]
 fn opportunistic_write_fh_uses_writer_cache_without_landing_journal() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-284-no-landing-zone");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8078,7 +8074,7 @@ fn opportunistic_write_fh_uses_writer_cache_without_landing_journal() {
 
 #[test]
 fn fsync_does_not_use_landing_journal_for_ordinary_writeback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-no-landing-fsync");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8110,7 +8106,7 @@ fn fsync_does_not_use_landing_journal_for_ordinary_writeback() {
 
 #[test]
 fn last_handle_release_does_not_use_landing_journal_for_ordinary_writeback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-no-landing-release");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8141,7 +8137,7 @@ fn last_handle_release_does_not_use_landing_journal_for_ordinary_writeback() {
 
 #[test]
 fn startup_replays_legacy_landed_write_after_restart() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let volume_suffix = "sfs-284-landing-restart";
     let payload = b"restart-visible-landed";
 
@@ -8225,7 +8221,7 @@ fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
 
 #[test]
 fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journal() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-drain-lag-observability");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8284,7 +8280,7 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
 
 #[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8330,7 +8326,7 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
 
 #[test]
 fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-sub-block-burst");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8389,7 +8385,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
 
 #[test]
 fn writer_page_size_override_reaches_mounted_writer_stack() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         writer_page_size: Some(64 * 1024),
         ..VfsConfig::default()
@@ -8402,7 +8398,7 @@ fn writer_page_size_override_reaches_mounted_writer_stack() {
 
 #[test]
 fn writer_page_size_override_is_capped_to_block_size() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         writer_page_size: Some(8 * 1024 * 1024),
         ..VfsConfig::default()
@@ -8433,7 +8429,7 @@ fn writer_page_size_override_falls_back_to_block_size_when_not_divisor() {
 
 #[test]
 fn small_writer_pages_preserve_sparse_read_flush_and_accounting() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         writer_page_size: Some(64 * 1024),
         ..VfsConfig::default()
@@ -8489,7 +8485,7 @@ fn small_writer_pages_preserve_sparse_read_flush_and_accounting() {
 
 #[test]
 fn small_writer_pages_materialize_completed_block_once() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
         writer_page_size: Some(64 * 1024),
         ..VfsConfig::default()
@@ -8538,7 +8534,7 @@ fn small_writer_pages_materialize_completed_block_once() {
 
 #[test]
 fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8590,7 +8586,7 @@ fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
 
 #[test]
 fn ready_inode_refresh_prunes_stale_live_extents_like_remount() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-refresh-prunes-live-extents");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8629,7 +8625,7 @@ fn ready_inode_refresh_prunes_stale_live_extents_like_remount() {
 
 #[test]
 fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8660,7 +8656,7 @@ fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
 
 #[test]
 fn test_open_unlink_handle_accepts_followup_write_until_release() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "open-unlink-followup-write");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8704,7 +8700,7 @@ fn test_open_unlink_handle_accepts_followup_write_until_release() {
 
 #[test]
 fn kernel_invalidation_skips_unresolved_active_open_overlay() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "active-open-unlinked-kernel-inval");
     let _guard = rt.enter();
 
@@ -8735,7 +8731,7 @@ fn kernel_invalidation_skips_unresolved_active_open_overlay() {
 
 #[test]
 fn test_release_fh_orphan_cleanup_clears_live_extents() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8768,7 +8764,7 @@ fn test_release_fh_orphan_cleanup_clears_live_extents() {
 
 #[test]
 fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_extents() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-final-handle-live-extents");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8803,7 +8799,7 @@ fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_ex
 
 #[test]
 fn test_unlink_immediate_cleanup_clears_pending_inode_dirty_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-immediate-cleanup");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -8833,7 +8829,7 @@ fn test_unlink_immediate_cleanup_clears_pending_inode_dirty_state() {
 
 #[test]
 fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unlink-pending-upload-cleanup");
     let _guard = rt.enter();
 
@@ -8911,7 +8907,7 @@ fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
 
 #[test]
 fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "foreign-delete-lazy-evict");
     let _guard = rt.enter();
 
@@ -8964,7 +8960,7 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
 
 #[test]
 fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retained-inode-payload-evict");
     let _guard = rt.enter();
 
@@ -9050,7 +9046,7 @@ fn metadata_payload_diff_marks_inodes_when_graph_object_set_changes() {
 
 #[test]
 fn test_rename_over_existing_target_discards_pending_local_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9080,7 +9076,7 @@ fn test_rename_over_existing_target_discards_pending_local_state() {
 
 #[test]
 fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "rename-displaced-cache-invalidation");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9123,7 +9119,7 @@ fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
 
 #[test]
 fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-writer-stack-cleanup");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9158,7 +9154,7 @@ fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
 
 #[test]
 fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9200,7 +9196,7 @@ fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
 
 #[test]
 fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-clean-waits-release");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9252,7 +9248,7 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
 
 #[test]
 fn test_flush_with_outcome_materializes_pending_inode_dirty_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9291,7 +9287,7 @@ fn test_flush_with_outcome_materializes_pending_inode_dirty_state() {
 
 #[test]
 fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9331,7 +9327,7 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 
 #[test]
 fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9363,7 +9359,7 @@ fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
 
 #[test]
 fn test_flush_fh_retries_inline_dirty_attr_persist_after_transient_failure() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-fh-inline-dirty-attr-retry");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9417,7 +9413,7 @@ fn test_flush_fh_retries_inline_dirty_attr_persist_after_transient_failure() {
 
 #[test]
 fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "datasync-outcome-persisted-metadata");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9459,7 +9455,7 @@ fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
 
 #[test]
 fn test_file_session_wait_reasons_and_transitions_are_observable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-observability");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9524,7 +9520,7 @@ fn test_file_session_wait_reasons_and_transitions_are_observable() {
 
 #[test]
 fn test_size_changing_setattr_waits_on_file_session_gate() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-setattr-size-gate");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9565,7 +9561,7 @@ fn test_size_changing_setattr_waits_on_file_session_gate() {
 
 #[test]
 fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-size-rollback");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9619,7 +9615,7 @@ fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
 
 #[test]
 fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-truncate-mutation-rollback");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9669,7 +9665,7 @@ fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
 
 #[test]
 fn test_file_session_read_lock_allows_parallel_readers() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-read-parallel");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9702,7 +9698,7 @@ fn test_file_session_read_lock_allows_parallel_readers() {
 
 #[test]
 fn test_file_session_finalize_allows_parallel_readers() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-read-parallel");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9735,7 +9731,7 @@ fn test_file_session_finalize_allows_parallel_readers() {
 
 #[test]
 fn test_file_session_finalize_still_blocks_writers() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-write-gate");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9776,7 +9772,7 @@ fn test_file_session_finalize_still_blocks_writers() {
 
 #[test]
 fn test_file_session_finalize_serializes_other_finalizers() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-finalize-gate");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9817,7 +9813,7 @@ fn test_file_session_finalize_serializes_other_finalizers() {
 
 #[test]
 fn test_file_session_open_handle_stats_track_release_lifecycle() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-stats");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9870,7 +9866,7 @@ fn test_file_session_open_handle_stats_track_release_lifecycle() {
 
 #[test]
 fn test_file_session_gc_keeps_session_while_handle_is_open() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-gc");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9899,7 +9895,7 @@ fn test_file_session_gc_keeps_session_while_handle_is_open() {
 
 #[test]
 fn test_file_session_background_complete_gc_removes_idle_session() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-gc");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9932,7 +9928,7 @@ fn test_file_session_background_complete_gc_removes_idle_session() {
 
 #[test]
 fn test_file_session_gc_removes_idle_read_only_session() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-gc");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9949,7 +9945,7 @@ fn test_file_session_gc_removes_idle_read_only_session() {
 
 #[test]
 fn test_file_session_gc_reports_only_real_removals() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-gc-idempotent");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -9974,7 +9970,7 @@ fn test_file_session_gc_reports_only_real_removals() {
 
 #[test]
 fn test_file_session_background_transition_does_not_recreate_collected_session() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-transition-gc");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10147,7 +10143,7 @@ fn test_probable_trash_component_names() {
 
 #[test]
 fn root_readdir_hides_trash_like_directories() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "root-readdir-hides-trash-like");
 
     for name in [
@@ -10175,7 +10171,7 @@ fn root_readdir_hides_trash_like_directories() {
 
 #[test]
 fn trash_rename_deletes_file_entry() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "trash-rename-deletes-file");
 
     vfs.create(ROOT_INO, b"recover-me.txt", 1000, 1000, 0o644)
@@ -10204,7 +10200,7 @@ fn trash_rename_deletes_file_entry() {
 
 #[test]
 fn linux_trash_rename_deletes_directory_subtree() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-trash-directory-delete");
 
     let source = vfs
@@ -10234,7 +10230,7 @@ fn linux_trash_rename_deletes_directory_subtree() {
 
 #[test]
 fn windows_recycle_bin_rename_deletes_directory_subtree() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-recycle-bin-directory-delete");
 
     let source = vfs
@@ -10261,7 +10257,7 @@ fn windows_recycle_bin_rename_deletes_directory_subtree() {
 
 #[test]
 fn strict_local_sync_flushes_pending_group_commit_bytes() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "strict-local-sync-group");
     rt.block_on(async {
         let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
@@ -10312,7 +10308,7 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
 
 #[test]
 fn write_through_local_sync_flushes_pending_group_commit_bytes() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-through-local-sync-group");
     rt.block_on(async {
         let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
@@ -10363,7 +10359,7 @@ fn write_through_local_sync_flushes_pending_group_commit_bytes() {
 
 #[test]
 fn opportunistic_local_sync_defers_when_threshold_not_reached() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-group");
     rt.block_on(async {
         let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
@@ -10410,7 +10406,7 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
 
 #[test]
 fn opportunistic_local_sync_tracks_unsynced_bytes_until_group_sync() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-unsynced");
 
     rt.block_on(async {
@@ -10444,7 +10440,7 @@ fn opportunistic_local_sync_tracks_unsynced_bytes_until_group_sync() {
 
 #[test]
 fn opportunistic_local_sync_flushes_when_threshold_reached() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-threshold");
     rt.block_on(async {
         let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
@@ -10495,7 +10491,7 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
 
 #[test]
 fn opportunistic_local_sync_does_not_queue_behind_inflight_sync() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-inflight");
 
     rt.block_on(async {
@@ -10531,7 +10527,7 @@ fn opportunistic_local_sync_does_not_queue_behind_inflight_sync() {
 
 #[test]
 fn flush_fh_enforces_strict_local_durability_in_single_mode() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-fh-fast-local-sync");
     let attr = vfs
         .create(1, b"flush-fh-fast-local-sync.txt", 0, 0, 0o644)
@@ -10609,7 +10605,7 @@ fn flush_fh_enforces_strict_local_durability_in_single_mode() {
 
 #[test]
 fn flush_fh_default_config_enforces_strict_local_durability() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "flush-fh-durable-local-sync", cfg);
     let attr = vfs
@@ -10688,7 +10684,7 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
 
 #[test]
 fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10728,7 +10724,7 @@ fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() 
 
 #[test]
 fn size_changing_setattr_syncs_materialized_writer_stack_payloads() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "setattr-syncs-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10784,7 +10780,7 @@ fn size_changing_setattr_syncs_materialized_writer_stack_payloads() {
 
 #[test]
 fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10829,7 +10825,7 @@ fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
 
 #[test]
 fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10860,7 +10856,7 @@ fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
 
 #[test]
 fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-write-nanos");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -10912,7 +10908,7 @@ fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
 
 #[test]
 fn release_fh_enforces_strict_local_durability_on_last_handle() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");
     let attr = vfs
         .create(1, b"release-fh-fast-local-sync.txt", 0, 0, 0o644)
@@ -10997,7 +10993,7 @@ fn release_fh_enforces_strict_local_durability_on_last_handle() {
 
 #[test]
 fn release_fh_default_config_enforces_strict_local_durability() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "release-fh-durable-local-sync", cfg);
     let attr = vfs
@@ -11083,7 +11079,7 @@ fn release_fh_default_config_enforces_strict_local_durability() {
 
 #[test]
 fn release_fh_materializes_opportunistic_writer_stack_state() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-release-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11129,7 +11125,7 @@ fn release_fh_materializes_opportunistic_writer_stack_state() {
 
 #[test]
 fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-301-release-deferred-tail");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11199,7 +11195,7 @@ fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
 
 #[test]
 fn release_fh_materializes_sparse_cross_chunk_tail_before_size_extend() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-cross-chunk-tail-before-extend");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11249,7 +11245,7 @@ fn release_fh_materializes_sparse_cross_chunk_tail_before_size_extend() {
 
 #[test]
 fn deferred_materialization_drains_idle_tail_before_close() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11304,7 +11300,7 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 
 #[test]
 fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finishes() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-inflight-reschedule-tail");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11506,7 +11502,7 @@ fn deferred_inode_gate_wait_returns_when_guard_released_before_entry_cleanup() {
 
 #[test]
 fn strict_deferred_write_waits_for_inflight_materialization() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11552,7 +11548,7 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
 
 #[test]
 fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-flush-waits-release");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11593,7 +11589,7 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 
 #[test]
 fn deferred_release_barrier_replaces_older_inflight_marker() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11634,7 +11630,7 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
 
 #[test]
 fn deferred_release_ignored_entry_skips_release_barrier() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "ignored-release-skips-barrier");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11655,7 +11651,7 @@ fn deferred_release_ignored_entry_skips_release_barrier() {
 
 #[test]
 fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11684,7 +11680,7 @@ fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
 
 #[test]
 fn deferred_materialization_wait_tracks_rescheduled_marker() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-wait-reschedule");
     let _guard = rt.enter();
     rt.block_on(async {
@@ -11733,7 +11729,7 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
 
 #[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");
     let block_size = meta.get_format_info().expect("get format info").block_size as usize;
 
@@ -11813,7 +11809,7 @@ fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
 
 #[test]
 fn write_path_observability_reports_active_tuning_knobs() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-tuning");
     let block_size = meta.get_format_info().expect("get format info").block_size as usize;
 
@@ -11852,7 +11848,7 @@ fn write_path_observability_reports_active_tuning_knobs() {
 
 #[test]
 fn write_path_observability_reports_fetch_counters() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fetch");
 
     vfs.fetch_scheduler
@@ -11882,7 +11878,7 @@ fn write_path_observability_reports_fetch_counters() {
 
 #[test]
 fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-callbacks");
 
     rt.block_on(async {
@@ -11923,7 +11919,7 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
 
 #[test]
 fn write_path_observability_reports_fuse_async_write_snapshot() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-async-write");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -11967,7 +11963,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
 
 #[test]
 fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-async-write-stale-snapshot");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -12019,7 +12015,7 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
 
 #[test]
 fn write_path_observability_reports_winfsp_write_callback_breakdown() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-winfsp-breakdown");
 
     vfs.note_winfsp_write_callback();
@@ -12079,7 +12075,7 @@ fn write_path_observability_reports_winfsp_write_callback_breakdown() {
 
 #[test]
 fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-winfsp-write-policy-breakdown");
 
     vfs.record_winfsp_write_callback_observability(
@@ -12125,7 +12121,7 @@ fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
 
 #[test]
 fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-snapshot");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -12168,7 +12164,7 @@ fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
 
 #[test]
 fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-baseline");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -12247,7 +12243,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
 
 #[test]
 fn write_path_observability_reports_vfs_write_stage_breakdown() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-vfs-breakdown");
 
     vfs.note_vfs_write_call(4 * 1024 * 1024);
@@ -12267,7 +12263,7 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
 
 #[test]
 fn winfsp_observability_snapshot_tracks_callback_and_barrier_paths() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "winfsp-observability-snapshot");
 
     vfs.note_winfsp_write_callback();
@@ -12299,7 +12295,7 @@ fn winfsp_observability_snapshot_tracks_callback_and_barrier_paths() {
 
 #[test]
 fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-failed-burst");
 
     vfs.record_payload_persist_observability(4, 16 * 1024, Duration::from_millis(3), false);
@@ -12325,7 +12321,7 @@ fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
 
 #[test]
 fn local_cache_io_stats_track_handoff_and_backend_time_separately() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-io-stats");
     let calls_before = vfs
         .state
@@ -12393,7 +12389,7 @@ fn local_cache_io_stats_track_handoff_and_backend_time_separately() {
 
 #[test]
 fn local_cache_io_stats_track_direct_partial_read_into() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-stats");
     let calls_before = vfs
         .state
@@ -12470,7 +12466,7 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
 
 #[test]
 fn local_cache_read_into_returns_none_for_missing_block() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-missing");
     rt.block_on(async {
         let mut out = [0_u8; 8];
@@ -12484,7 +12480,7 @@ fn local_cache_read_into_returns_none_for_missing_block() {
 
 #[test]
 fn payload_store_get_prefers_hot_upload_buffer_before_disk() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-get-hot-upload");
     rt.block_on(async {
         vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
@@ -12504,7 +12500,7 @@ fn payload_store_get_prefers_hot_upload_buffer_before_disk() {
 
 #[test]
 fn payload_store_read_into_prefers_hot_upload_buffer_before_disk() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-hot-upload");
     rt.block_on(async {
         vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
@@ -12525,7 +12521,7 @@ fn payload_store_read_into_prefers_hot_upload_buffer_before_disk() {
 
 #[test]
 fn committed_copy_rejects_short_payload() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "committed-copy-short-payload");
     let block = PayloadRef::new_full(42, vfs.block_size);
     let mut dst = [0_u8; 8];
@@ -12598,7 +12594,7 @@ fn foreign_exclusive_lock(ino: Ino) -> FileLockLease {
 
 #[test]
 fn foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-open");
     let attr = vfs
         .create(ROOT_INO, b"foreign-lock-open.txt", 0, 0, 0o644)
@@ -12620,7 +12616,7 @@ fn foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open() {
 
 #[test]
 fn existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-grandfather");
     let attr = vfs
         .create(ROOT_INO, b"foreign-lock-grandfather.txt", 0, 0, 0o644)
@@ -12642,7 +12638,7 @@ fn existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known()
 
 #[test]
 fn foreign_hard_lock_blocks_size_change_setattr_without_handle() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-setattr");
     let attr = vfs
         .create(ROOT_INO, b"foreign-lock-setattr.txt", 0, 0, 0o644)
@@ -12658,7 +12654,7 @@ fn foreign_hard_lock_blocks_size_change_setattr_without_handle() {
 
 #[test]
 fn foreign_hard_lock_blocks_unlink_and_rename() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-namespace");
     let attr = vfs
         .create(ROOT_INO, b"foreign-lock-namespace.txt", 0, 0, 0o644)
@@ -12685,7 +12681,7 @@ fn foreign_hard_lock_blocks_unlink_and_rename() {
 
 #[test]
 fn read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "offline-read-only-authority");
     let attr = vfs
         .create(ROOT_INO, b"offline-read-only-authority.txt", 0, 0, 0o644)

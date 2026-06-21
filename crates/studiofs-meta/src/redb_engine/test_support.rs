@@ -18,7 +18,7 @@ pub(super) fn test_format_info(name: &str) -> FormatInfo {
 }
 
 pub(super) fn temp_engine() -> RedbMetaEngine {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("test.db");
     let engine = RedbMetaEngine::open(&path).unwrap();
     engine.init_root(1000, 1000).unwrap();

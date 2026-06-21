@@ -486,11 +486,9 @@ mod imp {
 
         #[test]
         fn force_kill_terminates_child_process_group() {
-            let pid_file = std::env::temp_dir().join(format!(
-                "studiofs-e2e-process-group-{}-{}.pid",
-                std::process::id(),
-                unique_suffix()
-            ));
+            let pid_file =
+                studiofs_test_support::workspace_target_temp_path("studiofs-e2e-process-group-")
+                    .with_extension("pid");
             let mut command = Command::new("sh");
             command
                 .args(["-c", "sleep 30 & echo $! > \"$PID_FILE\"; wait"])

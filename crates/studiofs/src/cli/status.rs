@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn scan_pending_uploads_supports_current_local_payload_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().unwrap();
         let volume_uuid = Uuid::new_v4();
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn scan_pending_uploads_or_warn_returns_zero_when_cache_index_is_locked() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let volume_uuid = Uuid::new_v4();
         let _mounted_backend =
             studiofs_cache::open_local_payload_backend(tmp.path(), &volume_uuid.to_string())
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn scan_cache_usage_reads_runtime_written_index() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let volume_uuid = Uuid::new_v4();
         {
             let backend =
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn scan_cache_usage_skips_incomplete_runtime_without_creating_index() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn detect_cache_backends_with_fallback_returns_none_on_error() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let detection = detect_backends_or_warn(tmp.path(), |_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -953,20 +953,20 @@ mod tests {
 
     #[test]
     fn detect_backends_returns_detection_when_probe_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let detection = detect_backends(tmp.path());
         assert!(detection.is_some());
     }
 
     #[test]
     fn read_write_path_observability_returns_none_when_file_missing() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         assert!(read_write_path_observability(tmp.path()).is_none());
     }
 
     #[test]
     fn read_write_path_observability_reads_snapshot_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let metrics_path = tmp.path().join(WRITE_PATH_OBSERVABILITY_FILE);
         let snapshot = VfsWritePathObservabilitySnapshot {
             publisher_pid: 42,
@@ -1104,7 +1104,7 @@ mod tests {
 
     #[test]
     fn read_write_path_observability_from_cache_root_finds_uuid_child_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let older_dir = tmp.path().join(Uuid::new_v4().to_string());
         let newer_dir = tmp.path().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&older_dir).unwrap();

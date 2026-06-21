@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_complete_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(100, 0, 42, 7);
@@ -393,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_does_not_recover_from_filesystem_artifacts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let upload_dir = dir.path().join("upload");
         std::fs::create_dir_all(&upload_dir).unwrap();
         std::fs::write(upload_dir.join("abc.pending"), b"legacy").unwrap();
@@ -405,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_submit_deduplicates_object_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(1, 0, 77, 1);
@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_submit_updates_pending_upload_to_newer_epoch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(1, 1_048_569, 77, 2);
@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_complete_does_not_undercount_other_pending() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cancel_does_not_remove_newer_epoch_for_same_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
@@ -491,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn requeue_updates_pending_snapshot_retry_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
@@ -510,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_requeue_does_not_mutate_pending_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
@@ -530,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_pending() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, _rx) = UploadQueue::new(dir.path());
 
         queue.submit(1, 0, 100, 1);
@@ -542,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_idle() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, _rx) = UploadQueue::new(dir.path());
 
         // No pending ops — should return immediately.
@@ -551,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn has_pending_for_ino_tracks_inserts_and_removals() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         assert!(!queue.has_pending_for_ino(1));

@@ -157,7 +157,7 @@ fn isolated_sparse_ranges_fit_each_phase_logical_size() {
 
 #[test]
 fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     std::fs::create_dir_all(&mount).unwrap();
     let progress = temp.path().join("sparse-progress.jsonl");
@@ -244,7 +244,7 @@ fn sparse_helper_payload_mismatch_detail_reports_checksums_and_first_diff() {
 
 #[test]
 fn sparse_observation_uses_range_probes_instead_of_full_file_reads() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -317,7 +317,7 @@ fn sparse_observation_uses_range_probes_instead_of_full_file_reads() {
 
 #[test]
 fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     std::fs::create_dir_all(&mount).unwrap();
     let progress = temp.path().join("hotspot-progress.jsonl");
@@ -400,7 +400,7 @@ fn readonly_helper_skip_does_not_accept_windows_error_gen_failure() {
 
 #[test]
 fn sparse_wait_timeout_writes_diagnostics_artifacts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -477,7 +477,7 @@ fn sparse_wait_timeout_writes_diagnostics_artifacts() {
 
 #[test]
 fn mounted_smoke_writes_file_converges_three_mounts_and_unmounts() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -542,7 +542,7 @@ fn mounted_smoke_writes_file_converges_three_mounts_and_unmounts() {
 
 #[test]
 fn mounted_smoke_validation_reads_legacy_summary_shape() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let summary_path = temp.path().join("smoke-summary.json");
     let legacy = LegacyMountedSmokeRunSummary {
         bootstrap: VolumeBootstrapSummary {

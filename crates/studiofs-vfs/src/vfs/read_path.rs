@@ -2171,7 +2171,7 @@ mod tests {
 
     #[test]
     fn metadata_refresh_decision_separates_drained_attrs_from_active_local_state() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "metadata-refresh-decision");
         let _guard = rt.enter();
         let created = vfs
@@ -2193,7 +2193,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_prefers_dirty_attr_over_cached_attr() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-over-cache");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2231,7 +2231,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_reuses_published_read_plan_cache_for_hot_window() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2267,7 +2267,7 @@ mod tests {
 
     #[test]
     fn metadata_invalidation_clears_published_read_plan_cache_without_attr_change() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-invalidate");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2336,7 +2336,7 @@ mod tests {
 
     #[test]
     fn local_write_clears_stale_published_read_plan_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-write");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2402,7 +2402,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2450,7 +2450,7 @@ mod tests {
 
     #[test]
     fn ready_remote_attr_supersedes_matching_local_dirty_read_state() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "ready-remote-supersedes-local-read-state");
         let _guard = rt.enter();
@@ -2543,7 +2543,7 @@ mod tests {
 
     #[test]
     fn ready_remote_attr_preserves_newer_local_dirty_read_state() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "ready-remote-preserves-newer-local-read-state");
         let _guard = rt.enter();
@@ -2625,7 +2625,7 @@ mod tests {
 
     #[test]
     fn ready_remote_attr_supersedes_newer_dirty_attr_after_local_payloads_drain() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "ready-remote-supersedes-drained-dirty-attr");
         let _guard = rt.enter();
@@ -2709,7 +2709,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_refreshes_drained_dirty_attr_from_ready_meta() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "resolve-refreshes-drained-dirty-attr");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2776,7 +2776,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_refreshes_drained_cached_pending_attr_from_ready_meta() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "resolve-refreshes-drained-cached-pending-attr");
         let _guard = rt.enter();
@@ -2846,7 +2846,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_local_dirty_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache-bypass");
         let _guard = rt.enter();
@@ -2919,7 +2919,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_writer_stack_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-writer-stack-plan-cache-bypass");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -2991,7 +2991,7 @@ mod tests {
 
     #[test]
     fn getattr_unchecked_prefers_dirty_attr_over_cached_attr() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "getattr-dirty-over-cache");
         let created = vfs
             .create(ROOT_INO, b"getattr-dirty-over-cache.txt", 1000, 1000, 0o644)
@@ -3021,7 +3021,7 @@ mod tests {
 
     #[test]
     fn resolve_read_metadata_async_clears_stale_runtime_state_when_inode_is_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-metadata-stale-cache-missing-ino");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -3082,7 +3082,7 @@ mod tests {
 
     #[test]
     fn getattr_unchecked_clears_stale_runtime_state_when_inode_is_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "getattr-stale-runtime-missing-ino");
         let ino = 9_101;
         let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
@@ -3139,7 +3139,7 @@ mod tests {
 
     #[test]
     fn prefetch_read_context_from_attr_uses_pending_content_epoch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "prefetch-read-context-pending-epoch");
         let _guard = rt.enter();
         rt.block_on(async {
@@ -3166,7 +3166,7 @@ mod tests {
 
     #[test]
     fn committed_local_cache_hit_uses_direct_backend_read_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-read-plan-written");
         let inner = vfs.local_payload_backend.clone();
         let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
@@ -3207,7 +3207,7 @@ mod tests {
 
     #[test]
     fn data_reader_prefers_local_unpublished_bytes_over_published_base() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "data-reader-dirty-over-base");
         rt.block_on(async {
             let attr = vfs
@@ -3255,7 +3255,7 @@ mod tests {
 
     #[test]
     fn data_reader_zero_fills_sparse_gaps() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "data-reader-zero-fill");
         rt.block_on(async {
             let created = vfs
@@ -3292,7 +3292,7 @@ mod tests {
 
     #[test]
     fn data_reader_resolution_prefers_local_unpublished_span_over_committed_base_coverage() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "build-read-plan-dirty-over-base");
         rt.block_on(async {
             let attr = vfs
@@ -3345,7 +3345,7 @@ mod tests {
 
     #[test]
     fn data_reader_excludes_writer_stack_claims_from_fallback_segments() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "writer-stack-direct-read-plan");
         rt.block_on(async {
             let attr = vfs
@@ -3391,7 +3391,7 @@ mod tests {
 
     #[test]
     fn data_reader_missing_pending_extent_falls_back_to_committed_base() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "missing-pending-extent-fallback");
         rt.block_on(async {
             let attr = vfs
@@ -3438,7 +3438,7 @@ mod tests {
 
     #[test]
     fn materialized_pending_local_read_uses_direct_backend_read_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-fast-path");
         let inner = vfs.local_payload_backend.clone();
         let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
@@ -3505,7 +3505,7 @@ mod tests {
 
     #[test]
     fn materialized_pending_local_read_uses_live_extent_records_without_queue_snapshot() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-no-snapshot");
 
         rt.block_on(async {
@@ -3556,7 +3556,7 @@ mod tests {
 
     #[test]
     fn published_read_clears_stale_live_extents_without_queue_snapshot() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "published-read-no-snapshot");
 
         rt.block_on(async {
@@ -3621,7 +3621,7 @@ mod tests {
 
     #[test]
     fn foreground_cold_read_starts_multiple_missing_remote_fetches_before_first_completes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "foreground-cold-read-parallel");
         rt.block_on(async {
             let created = vfs
@@ -3700,7 +3700,7 @@ mod tests {
 
     #[test]
     fn sequential_single_block_read_starts_next_prefetch_before_current_fetch_completes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "sequential-single-block-prefetch-ahead");
         rt.block_on(async {
             let created = vfs
@@ -3787,7 +3787,7 @@ mod tests {
 
     #[test]
     fn sequential_prefetch_warms_existing_local_payloads() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, mut vfs, meta) =
             make_unstarted_test_vfs(&tmp, "sequential-prefetch-warms-local-payloads");
         let inner = vfs.local_payload_backend.clone();

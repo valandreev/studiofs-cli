@@ -2987,7 +2987,7 @@ mod tests {
 
     #[test]
     fn scenario_lifecycle_runs_cleanup_after_validate_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let events_path = temp.path().join("events.ndjson");
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
@@ -3134,7 +3134,7 @@ plain child stderr\n",
 
     #[test]
     fn normalize_relative_path_rejects_paths_outside_sandbox() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("run-1");
         let outside = temp.path().join("outside.log");
 
@@ -3148,7 +3148,7 @@ plain child stderr\n",
 
     #[test]
     fn normalize_relative_path_rejects_parent_components() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("run-1");
         let traversal = sandbox.join("artifacts").join("..").join("outside.log");
 
@@ -3163,7 +3163,7 @@ plain child stderr\n",
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("run-1");
         let invalid = OsString::from_vec(b"invalid-\xFF.log".to_vec());
         let artifact = sandbox.join("artifacts").join(invalid);
@@ -3175,7 +3175,7 @@ plain child stderr\n",
 
     #[test]
     fn record_event_requires_existing_parent_directory() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let missing_parent_event = temp.path().join("missing").join("events.ndjson");
 
         let err = record_event(&missing_parent_event, "run-1", None, "run", "started")
@@ -3190,7 +3190,7 @@ plain child stderr\n",
     fn report_artifact_discovery_includes_symlink_entries() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("run-1");
         let artifact_dir = sandbox.join("artifacts/scenarios/smoke");
         std::fs::create_dir_all(&artifact_dir).unwrap();
@@ -3208,7 +3208,7 @@ plain child stderr\n",
 
     #[test]
     fn report_artifact_discovery_skips_client_mount_trees() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("run-1");
         let mount_dir = sandbox.join("artifacts/clients/client-a/mount/volume");
         let log_dir = sandbox.join("artifacts/clients/client-a");
@@ -3233,7 +3233,7 @@ plain child stderr\n",
 
     #[test]
     fn run_writes_report_when_scenario_fails() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let outcome = run(RunRequest {
             root: temp.path().join("e2e-runs"),
             run_id: Some("failed-run".to_string()),
@@ -3268,7 +3268,7 @@ plain child stderr\n",
 
     #[test]
     fn run_preserves_primary_scenario_error_when_cleanup_also_fails() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let outcome = run(RunRequest {
             root: temp.path().join("e2e-runs"),
             run_id: Some("failed-with-cleanup-run".to_string()),
@@ -3305,7 +3305,7 @@ plain child stderr\n",
 
     #[test]
     fn compose_basic_smoke_requires_product_binary() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor::default();
 
         let err = run_with_executor(
@@ -3332,7 +3332,7 @@ plain child stderr\n",
 
     #[test]
     fn run_with_compose_infra_waits_collects_logs_and_tears_down() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor::default();
 
         let outcome = run_with_executor(
@@ -3442,7 +3442,7 @@ plain child stderr\n",
 
     #[test]
     fn multi_scenario_run_uses_supervised_run_one_children() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor::default();
 
         let outcome = run_with_executor(
@@ -3502,7 +3502,7 @@ plain child stderr\n",
 
     #[test]
     fn multi_scenario_run_bounds_supervised_children_without_user_timeout() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor::default();
 
         let outcome = run_with_executor(
@@ -3543,7 +3543,7 @@ plain child stderr\n",
 
     #[test]
     fn clean_discovers_recorded_client_mount_points_before_removal() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("e2e-runs").join("dead-mount-run");
         let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
         let mount_b = sandbox.join("artifacts/clients/client-b/mount/projectfs");
@@ -3577,7 +3577,7 @@ plain child stderr\n",
 
     #[test]
     fn clean_skips_corrupt_client_mount_metadata() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("e2e-runs").join("corrupt-metadata-run");
         let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
         let client_b_mount_dir = sandbox.join("artifacts/clients/client-b/mount");
@@ -3602,7 +3602,7 @@ plain child stderr\n",
 
     #[test]
     fn clean_infers_layout_mount_points_when_client_mount_metadata_is_unreadable() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("e2e-runs").join("unreadable-metadata-run");
         let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
         let client_a_mount_dir = mount_a.parent().unwrap();
@@ -3616,7 +3616,7 @@ plain child stderr\n",
 
     #[test]
     fn supervised_child_timeout_records_executor_cleanup_detail() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             time_out_first_child: Cell::new(true),
             ..RecordingExecutor::default()
@@ -3670,7 +3670,7 @@ plain child stderr\n",
 
     #[test]
     fn mounted_child_timeout_blocks_later_mounted_children() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             time_out_first_child: Cell::new(true),
             ..RecordingExecutor::default()
@@ -3727,7 +3727,7 @@ plain child stderr\n",
 
     #[test]
     fn mounted_child_failure_blocks_later_mounted_children() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             fail_first_child_report: Cell::new(true),
             ..RecordingExecutor::default()
@@ -3776,7 +3776,7 @@ plain child stderr\n",
 
     #[test]
     fn mounted_supervision_error_writes_report_without_post_scenario_cleanup_verifier() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             fail_child_supervision_io: Cell::new(true),
             ..RecordingExecutor::default()
@@ -3834,7 +3834,7 @@ plain child stderr\n",
 
     #[test]
     fn stale_process_cleanup_command_selects_platform_helper() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
 
         let linux = stale_process_cleanup_command(&root, PlatformSelection::LinuxFuse).unwrap();
@@ -3902,7 +3902,7 @@ plain child stderr\n",
 
     #[test]
     fn runner_run_cleans_stale_runner_processes_before_preflight() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor::default();
 
         let outcome = run_with_executor(
@@ -3962,7 +3962,7 @@ plain child stderr\n",
 
     #[test]
     fn runner_run_cleans_stale_compose_projects_before_port_preflight() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let stale_sandbox = root.join("stale-run");
         std::fs::create_dir_all(&stale_sandbox).unwrap();
@@ -4080,7 +4080,7 @@ plain child stderr\n",
 
     #[test]
     fn runner_run_refuses_to_clean_active_compose_owner() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let active_sandbox = root.join("active-run");
         std::fs::create_dir_all(&active_sandbox).unwrap();
@@ -4212,7 +4212,7 @@ plain child stderr\n",
 
     #[test]
     fn run_with_compose_infra_tears_down_when_post_start_io_fails() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let run_id = "compose-post-start-error";
         let sandbox = root.join(run_id);
@@ -4257,7 +4257,7 @@ plain child stderr\n",
     #[test]
     fn compose_start_failure_records_cleanup_boundary_artifact()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             fail_up: Cell::new(true),
             ..RecordingExecutor::default()
@@ -4337,7 +4337,7 @@ plain child stderr\n",
     #[test]
     fn compose_partial_launch_failure_writes_adversarial_cleanup_proof()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             fail_up: Cell::new(true),
             ..RecordingExecutor::default()
@@ -4412,7 +4412,7 @@ plain child stderr\n",
     #[test]
     fn preflight_failure_cleanup_failure_keeps_primary_exit_code_in_cleanup_proof()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
             fail_up: Cell::new(true),
             fail_logs: Cell::new(true),
@@ -4458,7 +4458,7 @@ plain child stderr\n",
     #[test]
     fn adversarial_cleanup_proof_write_error_does_not_shadow_report()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let run_id = "proof-write-error-report-run";
         std::fs::create_dir_all(
@@ -4494,7 +4494,7 @@ plain child stderr\n",
     #[test]
     fn post_start_runner_failure_writes_best_effort_report()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let run_id = "post-start-best-effort-report";
         let sandbox = root.join(run_id);
@@ -4562,7 +4562,7 @@ plain child stderr\n",
     #[test]
     fn post_start_cleanup_report_errors_do_not_shadow_primary_error()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let root = temp.path().join("e2e-runs");
         let run_id = "post-start-cleanup-report-error";
         let sandbox = root.join(run_id);

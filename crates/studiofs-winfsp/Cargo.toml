@@ -21,6 +21,7 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 dotenvy.workspace = true
+studiofs-test-support.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winfsp = { version = "0.12", features = ["windows-62", "notify", "async-io"] }

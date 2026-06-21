@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_with_trace_reports_hit_and_miss() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let cache =
             BenchmarkCache::open(BenchmarkCacheConfig::new(dir.path(), 1024)).expect("open");
 
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn evicts_oldest_entry_when_over_limit() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let cache = BenchmarkCache::open(BenchmarkCacheConfig::new(dir.path(), 4)).expect("open");
 
         cache
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_clears_visibility() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let cache =
             BenchmarkCache::open(BenchmarkCacheConfig::new(dir.path(), 1024)).expect("open");
 

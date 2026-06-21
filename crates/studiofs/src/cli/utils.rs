@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn client_root_env_scopes_metadata_mounts_and_logs() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let configured_root = temp.path().join("client-a");
         let root = get_client_root_with(|_| Some(configured_root.clone().into_os_string()))
             .expect("client root");
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn pid_file_write_read_remove() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let mp = "T:";
         write_pid_file_in(tmp.path(), mp, "testvol", 12345).unwrap();
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn pid_file_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let mp = "/mnt/x";
         write_pid_file_in(tmp.path(), mp, "vol1", 100).unwrap();
         write_pid_file_in(tmp.path(), mp, "vol2", 200).unwrap();
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn read_missing_pid_file_errors() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let result = read_pid_file_in(tmp.path(), "X:");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -612,14 +612,14 @@ mod tests {
 
     #[test]
     fn remove_nonexistent_pid_file_is_ok() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         // Should not error even though no file exists
         remove_pid_file_in(tmp.path(), "Q:").unwrap();
     }
 
     #[test]
     fn try_acquire_mount_lock_file_reports_contention() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let lock_path = tmp.path().join("mount.lock");
         let first = OpenOptions::new()
             .read(true)

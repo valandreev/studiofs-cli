@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn shared_unlock_requires_matching_owner() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "shared-unlock-owner");
         let file = vfs
             .create(1, b"shared.txt", 1000, 1000, 0o644)
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn exclusive_upgrade_requires_sole_shared_owner() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "shared-upgrade-owner");
         let file = vfs
             .create(1, b"upgrade.txt", 1000, 1000, 0o644)
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn blocking_flock_rechecks_after_pending_acquire_resolves() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "pending-recheck");
         let file = vfs
             .create(1, b"pending.txt", 1000, 1000, 0o644)

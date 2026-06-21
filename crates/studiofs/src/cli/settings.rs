@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn settings_run_rewrites_legacy_removed_fields_without_explicit_changes() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let config_path = temp.path().join("config.toml");
         std::fs::write(
             &config_path,

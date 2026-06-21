@@ -148,11 +148,10 @@ mod tests {
         MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, sample_report,
     };
     use chrono::TimeZone;
-    use tempfile::tempdir;
 
     #[test]
     fn default_report_path_uses_current_dir_and_avoids_collisions() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
             .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
@@ -176,7 +175,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_writes_pretty_json_to_requested_path() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
             .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
@@ -201,7 +200,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_includes_sfs299_mounted_observability_surface() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let report = sample_report();
         let now = Utc
             .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
@@ -248,7 +247,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_includes_mounted_write_diagnostics_surface() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let mut report = sample_report();
         report.mode = "e2e".to_string();
         report.mounted_write_diagnostics = Some(MountedWriteDiagnosticsReport {
@@ -306,7 +305,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_includes_sfs306_writeback_timeline_surface() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let mut report = sample_report();
         report.mode = "e2e".to_string();
         report.mounted_writeback_timeline = Some(MountedWritebackTimelineReport {
@@ -368,7 +367,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_includes_portable_profile_surface() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let mut report = sample_report();
         report.mode = "e2e".to_string();
         report.mounted_portable_profile = Some(MountedPortableProfileReport {
@@ -440,7 +439,7 @@ mod tests {
 
     #[test]
     fn save_benchmark_report_omits_unavailable_dirty_pressure_fields() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let mut report = sample_report();
         report.mode = "e2e".to_string();
         report.mounted_memory = Some(MountedMemoryReport {

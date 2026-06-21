@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_start_requires_active_tokio_runtime() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-requires-runtime");
 
         let error = vfs
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_start_rejects_when_shutdown_is_already_requested() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-after-shutdown");
         vfs.state
             .shutdown
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_start_failure_marks_failed_and_rejects_retry() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-missing-channels");
         vfs.startup.lifecycle.lock().channels = None;
 
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn studio_vfs_start_is_idempotent_once_running() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-idempotent");
 
         let _guard = rt.enter();

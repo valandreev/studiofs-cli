@@ -760,7 +760,6 @@ impl MetaInodes for RedbMetaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn test_format_info(name: &str) -> FormatInfo {
         FormatInfo::new(
@@ -780,7 +779,7 @@ mod tests {
 
     #[test]
     fn ensure_inode_lifecycle_table_recovers_empty_table_with_current_version() {
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("inode-lifecycle-empty.redb");
 
         let file_ino = {

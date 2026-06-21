@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_lightweight_repairs_temp_and_dirty_index_payload_mismatches() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_lightweight_resolves_incomplete_batch_payload_intent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_lightweight_removes_payload_shard_temp_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_batch_intent_preserves_payloads_that_reached_index() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_skips_unsupported_batch_intent_version() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -688,7 +688,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn startup_reconcile_batch_intent_accepts_hex_encoded_paths_with_delimiters() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -731,11 +731,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn startup_reconcile_batch_intent_rejects_rooted_paths() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let outside = tempfile::tempdir().unwrap();
+        let outside = studiofs_test_support::workspace_target_tempdir("test-");
         let outside_path = outside.path().join("outside.object");
         std::fs::write(&outside_path, b"outside-runtime").unwrap();
 
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_full_removes_orphan_payload_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn startup_reconcile_never_touches_unrelated_cache_root_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
         std::fs::create_dir_all(&layout.payload_objects_dir).unwrap();

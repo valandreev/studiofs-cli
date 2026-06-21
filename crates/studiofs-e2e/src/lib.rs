@@ -15,12 +15,11 @@ pub mod scenario;
 
 #[cfg(test)]
 mod process_diagnostics_tests {
-    use tempfile::tempdir;
 
     #[test]
     fn process_diagnostics_captures_current_process_metadata() {
         let _guard = crate::process_job::child_job_test_lock();
-        let temp = tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         crate::process_diagnostics::set_process_diagnostics_dir(temp.path().join("diagnostics"))
             .unwrap();
 

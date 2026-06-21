@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn enqueue_prefetch_hint_merges_adjacent_ranges_and_suppresses_covered_ranges() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-hint-range-merge");
         let ino = 9_301;
         let stream_id = 77;
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn plan_prefetch_batches_from_hint_clears_stale_hint_for_missing_inode() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-reader-missing-inode");
         let ino = 9_302;
         let stream_id = 88;
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn plan_prefetch_batches_from_hint_yields_primary_batch_for_sequential_read() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-reader-primary-batch");
 
         let created = vfs
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn plan_prefetch_batches_from_hint_yields_frame_sequence_batch_after_readdir() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-frame-sequence-batch");
 
         let first = vfs

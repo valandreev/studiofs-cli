@@ -1306,7 +1306,7 @@ mod tests {
     #[test]
     fn system_command_executor_returns_timed_out_for_hung_command() {
         let _guard = crate::process_job::child_job_test_lock();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let diagnostics_dir = temp.path().join("process-diagnostics");
         crate::process_diagnostics::set_process_diagnostics_dir(diagnostics_dir.clone()).unwrap();
         let command = hung_command(Duration::from_millis(250));

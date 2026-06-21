@@ -1553,7 +1553,7 @@ mod tests {
 
     #[test]
     fn write_and_cold_reopen_roundtrip() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         store.put(42, b"payload").unwrap();
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[test]
     fn payload_store_uses_one_shared_state_arc() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
 
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn payload_store_shared_state_count_reflects_live_store_clones() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         let _clone = store.clone();
@@ -1603,7 +1603,7 @@ mod tests {
 
     #[test]
     fn unbuffered_fast_mode_roundtrips_aligned_payload() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_sync_and_write_mode(
             layout,
@@ -1631,7 +1631,7 @@ mod tests {
 
     #[test]
     fn unbuffered_fast_mode_falls_back_for_unaligned_payload() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_sync_and_write_mode(
             layout,
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn unbuffered_read_mode_roundtrips_aligned_read_into() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_modes(
             layout,
@@ -1682,7 +1682,7 @@ mod tests {
 
     #[test]
     fn unbuffered_read_mode_falls_back_for_unaligned_range() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_modes(
             layout,
@@ -1710,7 +1710,7 @@ mod tests {
 
     #[test]
     fn read_into_supports_partial_ranges() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(7, b"abcdef").unwrap();
@@ -1723,7 +1723,7 @@ mod tests {
 
     #[test]
     fn staged_temp_file_does_not_override_committed_payload_without_rename() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         store.put(9001, b"committed").unwrap();
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn hot_read_into_reuses_cached_descriptors() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(700, b"abcdef").unwrap();
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn overwrite_invalidates_cached_descriptor() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(1337, b"old").unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn descriptor_cache_is_bounded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         let capacity_to_fill = READ_FD_CACHE_CAPACITY.saturating_add(4);
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[test]
     fn durable_mode_keeps_per_put_sync_barriers() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Durable).unwrap();
@@ -1818,7 +1818,7 @@ mod tests {
 
     #[test]
     fn fast_mode_defers_put_barriers_until_grouped_sync_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -1853,7 +1853,7 @@ mod tests {
 
     #[test]
     fn fast_mode_requeues_only_unsynced_grouped_file_targets_after_grouped_sync_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[test]
     fn fast_mode_requeues_only_unsynced_grouped_dirs_after_grouped_dir_sync_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -1932,7 +1932,7 @@ mod tests {
 
     #[test]
     fn fast_mode_put_batch_defers_barriers_until_grouped_sync_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -1976,7 +1976,7 @@ mod tests {
 
     #[test]
     fn fast_mode_put_batch_stages_payload_files_concurrently() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -2013,7 +2013,7 @@ mod tests {
 
     #[test]
     fn fast_mode_put_batch_uses_bounded_staging_workers_for_large_batches() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
@@ -2049,7 +2049,7 @@ mod tests {
 
     #[test]
     fn fast_mode_put_batch_stages_temp_files_in_payload_shards() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
             FilePayloadStore::open_with_sync_mode(layout.clone(), LocalPayloadSyncMode::Fast)

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn namespace_collision_records_operations_and_validates_three_client_convergence() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -64,7 +64,7 @@ fn namespace_collision_records_operations_and_validates_three_client_convergence
 
 #[test]
 fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -100,7 +100,7 @@ fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
 
 #[test]
 fn namespace_collision_recording_replication_collects_errors_after_all_clients() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let source_mount = temp.path().join("mounts").join("client-a");
     let bad_mount = temp.path().join("mounts").join("client-b");
@@ -139,7 +139,7 @@ fn namespace_collision_operation_timestamps_are_portable_u64_values() {
 
 #[test]
 fn namespace_collision_operation_timeout_reports_pending_without_waiting_forever() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-collision-timeout");
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
@@ -178,7 +178,7 @@ fn namespace_collision_operation_timeout_reports_pending_without_waiting_forever
 
 #[test]
 fn namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-collision-timeout-cleanup");
     let clients = COLLISION_CLIENT_NAMES
         .iter()
@@ -219,7 +219,7 @@ fn namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill() {
 
 #[test]
 fn namespace_collision_mounted_io_timeout_uses_emergency_cleanup() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-collision-mounted-io-timeout");
     let clients = COLLISION_CLIENT_NAMES
         .iter()
@@ -251,7 +251,7 @@ fn namespace_collision_mounted_io_timeout_uses_emergency_cleanup() {
 
 #[test]
 fn namespace_collision_mounted_tree_snapshot_timeout_uses_emergency_cleanup() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-collision-mounted-tree-timeout");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -288,7 +288,7 @@ fn namespace_collision_mounted_tree_snapshot_timeout_uses_emergency_cleanup() {
 
 #[test]
 fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-collision-helper-grace");
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
@@ -318,7 +318,7 @@ fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
 
 #[test]
 fn namespace_collision_initial_tree_writes_directly() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
     let sandbox = temp.path().join("run-collision-seed-direct");
@@ -375,7 +375,7 @@ fn open_handle_sync_retry_preserves_non_not_found_error() {
 
 #[test]
 fn open_handle_helper_records_progress_for_old_handle_sequence() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let client_a_mount = temp.path().join("mounts").join("client-a");
     let client_b_mount = temp.path().join("mounts").join("client-b");
     let unlink_path = "open-handles/unlink-target.txt";
@@ -458,7 +458,7 @@ fn hotspot_churn_operation_timeout_reports_pending_without_waiting_forever() {
 
 #[test]
 fn hotspot_rename_source_barrier_accepts_visible_source() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-hotspot-source-visible");
     let mount = temp.path().join("mounts").join("client-a");
     let source = mount.join("hotspot").join("slot-0.txt");
@@ -478,7 +478,7 @@ fn hotspot_rename_source_barrier_accepts_visible_source() {
 
 #[test]
 fn hotspot_rename_source_barrier_rejects_missing_source_before_rename() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-hotspot-source-missing");
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
@@ -618,7 +618,7 @@ fn timed_out_hotspot_helper_child_wait_policy_matches_platform() {
 
 #[test]
 fn hotspot_helper_io_failure_is_recorded_as_rejected_operation() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-helper-reject");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -668,7 +668,7 @@ fn hotspot_unmount_after_timeout_is_fatal_not_rejected_operation() {
 
 #[test]
 fn required_hotspot_churn_operation_is_logged_before_failing() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-required-helper-reject");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -705,7 +705,7 @@ fn required_hotspot_churn_operation_is_logged_before_failing() {
 
 #[test]
 fn hotspot_overwrite_can_use_barrier_helper_while_recording_overwrite() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-helper-barrier");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -758,7 +758,7 @@ fn hotspot_overwrite_can_use_barrier_helper_while_recording_overwrite() {
 
 #[test]
 fn hotspot_helper_stat_records_exact_metadata_probe() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     let progress = temp.path().join("progress.jsonl");
     std::fs::create_dir_all(mount.join("hotspot")).unwrap();
@@ -783,7 +783,7 @@ fn hotspot_helper_stat_records_exact_metadata_probe() {
 #[cfg(unix)]
 #[test]
 fn hotspot_helper_timeout_is_enforced_before_parent_kill_on_unix() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     let payload = temp.path().join("blocked-payload.fifo");
     let progress = temp.path().join("progress.jsonl");
@@ -828,7 +828,7 @@ fn hotspot_helper_timeout_is_enforced_before_parent_kill_on_unix() {
 
 #[test]
 fn hotspot_helper_unlink_removes_file_and_records_progress() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     let progress = temp.path().join("progress.jsonl");
     let target = mount.join("hotspot").join("unlink-target.txt");
@@ -854,7 +854,7 @@ fn hotspot_helper_unlink_removes_file_and_records_progress() {
 
 #[test]
 fn hotspot_helper_records_progress_for_sync_barrier_phases() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     let payload = temp.path().join("payload.bin");
     let progress = temp.path().join("progress.jsonl");
@@ -881,7 +881,7 @@ fn hotspot_helper_records_progress_for_sync_barrier_phases() {
 
 #[test]
 fn hotspot_helper_progress_records_complete_ndjson_lines() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let progress = temp.path().join("progress.jsonl");
     let path = temp.path().join("mount").join("hotspot").join("slot.txt");
 
@@ -920,7 +920,7 @@ fn hotspot_helper_progress_records_complete_ndjson_lines() {
 
 #[test]
 fn overwrite_vs_read_collision_records_repeated_read_loop() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -963,7 +963,7 @@ fn overwrite_vs_read_collision_records_repeated_read_loop() {
 
 #[test]
 fn readdir_stat_collision_uses_scoped_final_validation() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-readdir-stat-final");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -1010,7 +1010,7 @@ fn readdir_stat_collision_uses_scoped_final_validation() {
 
 #[test]
 fn namespace_collision_initial_validation_skips_seed_writer_payload_probe() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-initial-skip");
     let scenario_dir = sandbox
         .join("artifacts")
@@ -1055,7 +1055,7 @@ fn namespace_collision_initial_validation_skips_seed_writer_payload_probe() {
 
 #[test]
 fn mounted_smoke_reports_expected_and_actual_client_count() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
         .join("artifacts")

@@ -381,7 +381,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
     };
 
     let disk_name = random_name("dump-load-a");
-    let home_a = tempfile::tempdir().expect("home_a");
+    let home_a = studiofs_test_support::workspace_target_tempdir("home-a-");
     let dump_path = home_a.path().join(format!("{disk_name}.dump.json"));
     let payload = b"studiofs-dump-load-payload-a";
 
@@ -442,7 +442,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
         "volume must be restored"
     );
 
-    let home_b = tempfile::tempdir().expect("home_b");
+    let home_b = studiofs_test_support::workspace_target_tempdir("home-b-");
     let discover = run_studiofs(home_b.path(), &["discover", &disk_name, "--meta", &raw_pg]);
     assert_ok(&discover, "discover after load");
     verify_payload_from_discovered(home_b.path(), &disk_name, payload).await;
@@ -463,7 +463,7 @@ async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     let target = random_name("dump-load-target");
     let extra1 = random_name("dump-load-extra1");
     let extra2 = random_name("dump-load-extra2");
-    let home = tempfile::tempdir().expect("home");
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
     let dump_path = home.path().join(format!("{target}.dump.json"));
     let payload = b"studiofs-dump-load-payload-b";
 
@@ -538,7 +538,7 @@ async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     );
     assert_ok(&load, "load target");
 
-    let verify_home = tempfile::tempdir().expect("verify home");
+    let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
     let discover_target = run_studiofs(
         verify_home.path(),
         &["discover", &target, "--meta", &raw_pg],

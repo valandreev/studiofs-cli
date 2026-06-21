@@ -12,7 +12,6 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
 use studiofs_vfs::{StudioVfs, VfsConfig};
-use tempfile::tempdir;
 
 /// Resolves the workspace root directory from the current crate manifest path.
 fn workspace_root() -> std::path::PathBuf {
@@ -78,7 +77,7 @@ fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
 /// Smoke test for virtual mount behavior through the VFS layer.
 #[test]
 fn test_virtual_mount_vfs_smoke() {
-    let tmp = tempdir().expect("tempdir");
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     load_test_env();
 

@@ -2367,8 +2367,8 @@ fn test_pg_remote_client_reads_committed_blocks_without_local_staged_mirror() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-committed-block-read");
@@ -2418,8 +2418,8 @@ fn test_pg_remote_uploading_marker_replication() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-remote-uploading-marker");
@@ -2454,8 +2454,8 @@ fn test_pg_nested_base_graph_publish_visible_on_remote_peer() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-nested-base-graph-publish");
@@ -2526,8 +2526,8 @@ fn test_pg_nested_temp_rename_then_publish_visible_on_remote_peer() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-nested-temp-rename-publish");
@@ -2614,8 +2614,8 @@ fn test_pg_remote_update_keeps_old_committed_version_until_switch() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-old-committed-until-switch");
@@ -2687,8 +2687,8 @@ fn test_pg_publish_switch_is_atomic_across_peers() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-atomic-publish-switch");
@@ -2777,9 +2777,9 @@ fn test_pg_foreign_events_do_not_block_local_accepted_reads() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
-    let dir_c = tempdir().expect("tempdir c");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_c = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let db_c = dir_c.path().join("meta-c.redb");
@@ -2846,8 +2846,8 @@ fn test_pg_overlay_allows_unrelated_remote_batches_to_apply() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-overlay-prefix");
@@ -2895,8 +2895,8 @@ fn test_pg_committed_block_applies_despite_local_attr_overlay() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-committed-block-vs-attr-overlay");
@@ -2970,7 +2970,7 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-conflict-gap");
     let info = volume.format_info();
@@ -3071,8 +3071,8 @@ fn test_pg_checkpoint_excludes_uncommitted_local_payloads() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-checkpoint-projection");
@@ -3108,8 +3108,8 @@ fn test_pg_remote_unlink_removes_file_from_namespace_immediately() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-remote-unlink");
@@ -3147,8 +3147,8 @@ fn test_pg_peer_can_unlink_foreign_visible_uploading_entry() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-peer-unlink-uploading");
@@ -3234,8 +3234,8 @@ fn test_pg_peer_can_rename_foreign_visible_base_entry() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-peer-rename-base");
@@ -3275,8 +3275,8 @@ fn test_pg_peer_can_unlink_foreign_visible_base_entry() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-peer-unlink-base");
@@ -3312,8 +3312,8 @@ fn test_pg_reopen_after_peer_unlink_base_recovers_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-peer-unlink-base");
@@ -3356,8 +3356,8 @@ fn test_pg_own_flush_does_not_skip_earlier_foreign_batch() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-own-flush-gap");
@@ -3393,8 +3393,8 @@ fn test_pg_reopen_after_earlier_foreign_batch_gap_recovers_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-gap");
@@ -3436,8 +3436,8 @@ fn test_pg_two_clients_different_dirs_no_loss() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-dirs");
@@ -3519,8 +3519,8 @@ fn test_pg_reopen_after_same_dir_concurrent_writes_recovers_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-samedir");
@@ -3598,8 +3598,8 @@ fn test_pg_same_dir_different_files_no_loss() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-samedir");
@@ -3662,8 +3662,8 @@ fn test_pg_concurrent_create_same_name_single_winner() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-concurrent-create");
@@ -3725,8 +3725,8 @@ fn test_pg_concurrent_file_vs_dir_same_name_single_winner() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-file-vs-dir-race");
@@ -3824,8 +3824,8 @@ fn test_pg_reopen_after_file_dir_race_recovers_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-file-dir-race");
@@ -3941,8 +3941,8 @@ fn test_pg_concurrent_rename_single_winner() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-concurrent-rename");
@@ -4009,8 +4009,8 @@ fn test_pg_reopen_after_remote_rename_overwrite_recovers_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-rename-overwrite");
@@ -4069,7 +4069,7 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
     };
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-crash-after-publish");
     let info = volume.format_info();
@@ -4105,8 +4105,8 @@ fn test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover() {
     };
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-crash-publish-then-unlink");
@@ -4153,8 +4153,8 @@ fn test_pg_reopen_after_unpublished_local_create_flushes_without_discover() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-unpublished-create");
@@ -4194,8 +4194,8 @@ fn test_pg_reopen_after_claimed_batch_crash_flushes_without_discover() {
     };
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-claimed-batch-crash");
@@ -4235,8 +4235,8 @@ fn test_pg_reopen_after_claimed_multi_event_batch_preserves_sequence_without_dis
     };
     let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-reopen-claimed-multievent");
@@ -4285,8 +4285,8 @@ fn test_pg_delete_and_recreate() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-delete-recreate");
@@ -4327,7 +4327,7 @@ fn test_pg_rapid_create_delete() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-rapid-cd");
     seed_local(&db, &volume.format_info());
@@ -4354,8 +4354,8 @@ fn test_pg_hardlinks_cross_client() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-hardlink");
@@ -4394,8 +4394,8 @@ fn test_pg_symlinks_cross_client() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-symlink");
@@ -4429,8 +4429,8 @@ fn test_pg_peer_can_update_foreign_visible_symlink_target() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-peer-symlink-update");
@@ -4472,8 +4472,8 @@ fn test_pg_local_xattr_overlay_masks_foreign_update_until_flush() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-xattr-overlay-precedence");
@@ -4535,7 +4535,7 @@ fn test_pg_basic_crud() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-basic-crud");
     seed_local(&db, &volume.format_info());
@@ -4568,7 +4568,7 @@ fn test_pg_deep_path() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-deep-path");
     seed_local(&db, &volume.format_info());
@@ -4593,7 +4593,7 @@ fn test_pg_large_directory() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-large-dir");
     seed_local(&db, &volume.format_info());
@@ -4615,7 +4615,7 @@ fn test_pg_special_filenames() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-special-names");
     seed_local(&db, &volume.format_info());
@@ -4647,8 +4647,8 @@ fn test_pg_readdir_during_modifications() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-readdir-race");
@@ -4689,8 +4689,8 @@ fn test_pg_visibility_timing() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-vis-timing");

@@ -332,7 +332,7 @@ mod tests {
         let definition = scenario::resolve_scenario(scenario::TEST_PASSING)
             .unwrap()
             .definition();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let events_path = temp.path().join("events.ndjson");
         let executor = crate::infra::SystemCommandExecutor;
 

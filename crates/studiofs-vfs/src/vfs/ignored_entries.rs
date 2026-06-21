@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn ignored_create_invalidates_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-create-invalidates-parent-attr-cache");
         let dir = vfs
             .mkdir(ROOT_INO, b"dir", 1000, 1000, 0o755)
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn ignored_link_invalidates_new_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-link-invalidates-parent-attr-cache");
         let source = vfs
             .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn rename_between_ignored_names_invalidates_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-rename-invalidates-parent-attr-cache");
         vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
             .expect("create ignored dir");
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn rename_into_ignored_trash_invalidates_destination_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) =
             make_test_vfs(&tmp, "ignored-trash-rename-invalidates-parent-attr-cache");
         vfs.create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn rename_ignored_source_into_ignored_trash_does_not_create_target() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-source-trash-rename-deletes");
         vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
             .expect("create ignored source");
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn unlink_ignored_subtree_removes_nested_children() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-subtree-unlink");
 
         let trash =
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn detached_ignored_entries_keep_inode_temporarily_but_prune_overflow() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-detached-overflow");
         let first = vfs.create_ignored_entry(
             ROOT_INO,

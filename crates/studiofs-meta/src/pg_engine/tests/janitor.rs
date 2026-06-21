@@ -7,8 +7,8 @@ fn test_pg_janitor_lock_is_exclusive() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-janitor-lock");
@@ -48,8 +48,8 @@ fn test_pg_janitor_reads_snapshot_pins_from_postgres() {
         return;
     };
 
-    let dir_a = tempdir().expect("tempdir a");
-    let dir_b = tempdir().expect("tempdir b");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
     let db_a = dir_a.path().join("meta-a.redb");
     let db_b = dir_b.path().join("meta-b.redb");
     let volume = PgTestVolume::new(&dsn, "pg-janitor-snapshot-pins");
@@ -85,7 +85,7 @@ fn test_pg_uuid_mismatch_blocks_consistency_check() {
         return;
     };
 
-    let dir = tempdir().expect("tempdir");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-uuid-mismatch");
     let info = volume.format_info();

@@ -2608,7 +2608,7 @@ mod tests {
 
     #[test]
     fn vfs_upload_meta_reattaches_newer_stale_upload_when_latest_range_is_hole() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-newer-stale-upload");
         let created = vfs
             .create(1, b"reattach-newer-stale-upload.bin", 0, 0, 0o644)
@@ -2652,7 +2652,7 @@ mod tests {
 
     #[test]
     fn vfs_upload_meta_reattaches_materialized_sparse_upload_over_uncovered_tail() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-materialized-sparse-upload");
         let created = vfs
             .create(1, b"reattach-materialized-sparse-upload.bin", 0, 0, 0o644)
@@ -2796,7 +2796,7 @@ mod tests {
 
     #[test]
     fn vfs_upload_meta_reattaches_newer_stale_upload_when_same_object_is_still_overlay() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-retained-stale-upload");
         let created = vfs
             .create(1, b"reattach-retained-stale-upload.bin", 0, 0, 0o644)
@@ -2851,7 +2851,7 @@ mod tests {
 
     #[test]
     fn vfs_upload_meta_reattaches_stale_sparse_growth_over_older_short_attr() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-stale-sparse-growth");
         let created = vfs
             .create(1, b"reattach-stale-sparse-growth.bin", 0, 0, 0o644)
@@ -3196,7 +3196,7 @@ mod tests {
 
     #[test]
     fn vfs_policy_queues_finalization_only_after_last_pending_inode_upload() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "finalize-last-pending");
         let ino = vfs
             .create(1, b"multi-block-upload.bin", 0, 0, 0o644)

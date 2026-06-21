@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use studiofs_e2e::infra::{
     CommandExecutor, CommandOutput, ComposeConfig, DockerComposeStack, InfraError,
 };
-use tempfile::tempdir;
 
 #[test]
 fn compose_file_defines_required_services_healthchecks_and_project_ports() {
@@ -59,7 +58,7 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
 
 #[test]
 fn compose_preflight_reports_baseline_image_contract() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stack = DockerComposeStack::new(ComposeConfig {
         run_id: "compose-baseline-contract".to_string(),
         sandbox: temp.path().join("compose-baseline-contract"),
@@ -81,7 +80,7 @@ fn compose_preflight_reports_baseline_image_contract() {
 
 #[test]
 fn compose_preflight_accepts_quoted_baseline_images() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let compose_file = temp.path().join("compose.e2e.yml");
     std::fs::write(
         &compose_file,
@@ -114,7 +113,7 @@ services:
 
 #[test]
 fn compose_preflight_accepts_yaml_aliases_for_baseline_images() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let compose_file = temp.path().join("compose.e2e.yml");
     std::fs::write(
         &compose_file,
@@ -151,7 +150,7 @@ services:
 
 #[test]
 fn compose_preflight_accepts_escaped_yaml_strings_for_baseline_images() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let compose_file = temp.path().join("compose.e2e.yml");
     std::fs::write(
         &compose_file,
@@ -184,7 +183,7 @@ services:
 
 #[test]
 fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stack = DockerComposeStack::new(ComposeConfig {
         run_id: "Compose.Run".to_string(),
         sandbox: temp.path().join("compose-infra-run"),
@@ -235,7 +234,7 @@ fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() 
 
 #[test]
 fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stack = DockerComposeStack::new(ComposeConfig {
         run_id: "compose-lifecycle".to_string(),
         sandbox: temp.path().join("compose-lifecycle"),
@@ -360,7 +359,7 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
 
 #[test]
 fn optional_diagnostics_preserve_stdout_when_command_fails() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stack = DockerComposeStack::new(ComposeConfig {
         run_id: "compose-diagnostic-failure".to_string(),
         sandbox: temp.path().join("compose-diagnostic-failure"),
@@ -393,7 +392,7 @@ fn optional_diagnostics_preserve_stdout_when_command_fails() {
 
 #[test]
 fn compose_stack_rejects_port_ranges_smaller_than_required_service_ports() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let err = DockerComposeStack::new(ComposeConfig {
         run_id: "compose-small-range".to_string(),
         sandbox: temp.path().join("compose-small-range"),
@@ -416,7 +415,7 @@ fn compose_stack_rejects_port_ranges_smaller_than_required_service_ports() {
 
 #[test]
 fn compose_stack_accepts_whitespace_around_port_range_bounds() {
-    let temp = tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let stack = DockerComposeStack::new(ComposeConfig {
         run_id: "compose-whitespace-range".to_string(),
         sandbox: temp.path().join("compose-whitespace-range"),

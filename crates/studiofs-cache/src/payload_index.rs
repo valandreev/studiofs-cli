@@ -1612,7 +1612,7 @@ mod tests {
 
     #[test]
     fn accounting_is_exact_across_lifecycle_transitions() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1649,7 +1649,7 @@ mod tests {
 
     #[test]
     fn upsert_many_batches_accounting_and_lifecycle_updates() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[test]
     fn reopening_restores_deterministic_dirty_upload_order() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
 
         {
@@ -1740,7 +1740,7 @@ mod tests {
 
     #[test]
     fn touch_access_updates_lru_order_without_changing_accounting() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1757,7 +1757,7 @@ mod tests {
 
     #[test]
     fn remove_batch_updates_counters_in_single_pass() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1782,7 +1782,7 @@ mod tests {
 
     #[test]
     fn failed_upload_requeues_to_dirty_tail_with_expected_state_accounting() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1834,7 +1834,7 @@ mod tests {
 
     #[test]
     fn remove_while_uploading_clears_entry_and_prevents_requeue() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1858,7 +1858,7 @@ mod tests {
 
     #[test]
     fn dirty_and_access_page_apis_allow_chunked_iteration() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1899,7 +1899,7 @@ mod tests {
 
     #[test]
     fn touch_access_if_stale_skips_hot_retouches() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1924,7 +1924,7 @@ mod tests {
 
     #[test]
     fn index_persists_origin_upload_state_and_last_access_across_reopen() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1966,7 +1966,7 @@ mod tests {
 
     #[test]
     fn allocate_sequence_recovers_missing_sequence_counter() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn touch_access_if_stale_many_batches_unique_ids() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -2010,7 +2010,7 @@ mod tests {
 
     #[test]
     fn touch_tracking_lru_is_bounded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn eviction_candidates_filter_to_uploaded_evictable_rows() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 
@@ -2061,7 +2061,7 @@ mod tests {
 
     #[test]
     fn eviction_candidates_support_cursor_paging() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
         let index = open_index(&db_path);
 

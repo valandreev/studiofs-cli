@@ -1540,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) =
             make_encrypted_fetch_scheduler(&tmp, "foreground");
         let object_id = 0x3531;
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_read_does_not_touch_encrypted_remote_object() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) = make_encrypted_fetch_scheduler(&tmp, "cache");
         let object_id = 0x3532;
         let key = fragment_key(&config, object_id, 0);
@@ -1589,7 +1589,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_uses_same_decrypt_path_and_caches_plaintext_payload() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) =
             make_encrypted_fetch_scheduler(&tmp, "prefetch");
         let object_id = 0x3533;
@@ -1612,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn random_block_fetch_only_decrypts_requested_remote_object() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) = make_encrypted_fetch_scheduler(&tmp, "random");
         let object_id = 0x3534;
         let requested_key = fragment_key(&config, object_id, 0);
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_or_swapped_encrypted_objects_fail_before_cache_population() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) =
             make_encrypted_fetch_scheduler(&tmp, "integrity");
         let corrupt_object_id = 0x3535;
@@ -1708,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn crypto_fetch_failures_are_observed_without_retrying() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, cached_store, config) =
             make_encrypted_fetch_scheduler_with_attempts(&tmp, "crypto-non-retry", 3);
         let object_id = 0x3540;
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_fetch_records_encrypted_remote_read_counters() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, raw, _cached_store, config) =
             make_encrypted_fetch_scheduler(&tmp, "encrypted-counters");
         let object_id = 0x3541;
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[test]
     fn singleflight_waiter_uses_handoff_payload_without_cache_reread() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "singleflight-handoff-payload");
 
         rt.block_on(async {
@@ -1849,7 +1849,7 @@ mod tests {
 
     #[test]
     fn fetch_block_after_local_miss_rechecks_cache_when_becoming_fetcher() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recheck-cache-before-fetch");
 
         rt.block_on(async {
@@ -1907,7 +1907,7 @@ mod tests {
 
     #[test]
     fn default_prefetch_admission_keeps_several_background_slots_available() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "default-prefetch-admission-slots");
         let scheduler = vfs.fetch_scheduler().clone();
 
