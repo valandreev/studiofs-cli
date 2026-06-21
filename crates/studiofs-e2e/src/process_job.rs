@@ -515,13 +515,6 @@ mod imp {
             let _ = fs::remove_file(pid_file);
         }
 
-        fn unique_suffix() -> u128 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
-        }
-
         fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> Option<libc::pid_t> {
             let deadline = Instant::now() + timeout;
             loop {

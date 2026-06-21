@@ -1,4 +1,4 @@
-#include <fuse_lowlevel.h>
+#include "fuse_lowlevel_compat.h"
 #include <stdint.h>
 #include <string.h>
 
