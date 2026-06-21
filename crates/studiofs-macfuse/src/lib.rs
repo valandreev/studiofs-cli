@@ -292,7 +292,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use studiofs_meta::MetaFsOps;
@@ -1139,6 +1139,85 @@ mod tests {
         );
         assert!(inner.data.load(Ordering::Acquire));
         assert!(inner.attrs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn kernel_data_invalidation_waits_until_async_reads_drain() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+
+            fn inval_inode_attrs(&self, _ino: u64) {}
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-kernel-invalidation-read-drain",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"deferred-invalidation.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"0123456789abcdef"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        let held_capacity = adapter.hold_read_capacity_for_test(8);
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue read behind held admission capacity");
+        fixture.runtime().block_on(async {
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if adapter.pending_async_read_count_for_test() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                observed.is_ok(),
+                "queued read should become visible before invalidation"
+            );
+        });
+
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+        invalidator.inval_inode(attr.ino);
+
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            0,
+            "kernel FFI invalidation must not run while a macFUSE async read is active"
+        );
+        drop(held_capacity);
+        assert_eq!(
+            &queued.wait().expect("queued read should complete")[..],
+            b"01234567"
+        );
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            1,
+            "deferred kernel invalidation must flush after active reads drain"
+        );
     }
 
     #[test]

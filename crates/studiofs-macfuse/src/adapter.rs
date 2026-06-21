@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
 use std::ffi::{CStr, CString, OsStr};
+use std::fmt;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
@@ -92,6 +93,7 @@ struct AdapterSharedState {
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: AsyncReadDiagnostics,
+    kernel_invalidations: Arc<KernelInvalidationGate>,
 }
 
 #[derive(Debug)]
@@ -425,6 +427,7 @@ impl ReadWindowStore {
 struct ReadWindowKernelInvalidator {
     read_windows: Arc<ReadWindowStore>,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
 }
 
@@ -432,11 +435,124 @@ impl KernelInvalidator for ReadWindowKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         self.read_windows.invalidate_inode(ino);
         self.open_cache_snapshots.lock().pop(&ino);
+        if self.kernel_invalidations.defer_data_if_reads_active(ino) {
+            debug!(
+                ino,
+                "macFUSE kernel data invalidation deferred until async reads drain"
+            );
+            return;
+        }
         self.inner.inval_inode(ino);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
+        if self.kernel_invalidations.defer_attrs_if_reads_active(ino) {
+            debug!(
+                ino,
+                "macFUSE kernel attr invalidation deferred until async reads drain"
+            );
+            return;
+        }
         self.inner.inval_inode_attrs(ino);
+    }
+}
+
+#[derive(Debug, Default)]
+struct KernelInvalidationState {
+    active_reads: usize,
+    pending_data_inodes: HashSet<u64>,
+    pending_attr_inodes: HashSet<u64>,
+}
+
+struct KernelInvalidationGate {
+    inner: ParkingMutex<Option<Arc<dyn KernelInvalidator>>>,
+    state: ParkingMutex<KernelInvalidationState>,
+}
+
+impl fmt::Debug for KernelInvalidationGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("KernelInvalidationGate").finish()
+    }
+}
+
+impl KernelInvalidationGate {
+    fn new() -> Self {
+        Self {
+            inner: ParkingMutex::new(None),
+            state: ParkingMutex::new(KernelInvalidationState::default()),
+        }
+    }
+
+    fn set_inner(&self, inner: Arc<dyn KernelInvalidator>) {
+        *self.inner.lock() = Some(inner);
+    }
+
+    fn begin_read(&self) {
+        self.state.lock().active_reads += 1;
+    }
+
+    fn finish_read(&self) -> Option<DeferredKernelInvalidationFlush> {
+        let inner = self.inner.lock().clone();
+        let mut state = self.state.lock();
+        state.active_reads = state.active_reads.saturating_sub(1);
+        if state.active_reads > 0 {
+            return None;
+        }
+        let inner = inner?;
+        if state.pending_data_inodes.is_empty() && state.pending_attr_inodes.is_empty() {
+            return None;
+        }
+        let data_inodes = state.pending_data_inodes.drain().collect::<Vec<_>>();
+        let attr_inodes = state.pending_attr_inodes.drain().collect::<Vec<_>>();
+        Some(DeferredKernelInvalidationFlush {
+            inner,
+            data_inodes,
+            attr_inodes,
+        })
+    }
+
+    fn defer_data_if_reads_active(&self, ino: u64) -> bool {
+        let mut state = self.state.lock();
+        if state.active_reads == 0 {
+            return false;
+        }
+        state.pending_data_inodes.insert(ino);
+        state.pending_attr_inodes.remove(&ino);
+        true
+    }
+
+    fn defer_attrs_if_reads_active(&self, ino: u64) -> bool {
+        let mut state = self.state.lock();
+        if state.active_reads == 0 {
+            return false;
+        }
+        if !state.pending_data_inodes.contains(&ino) {
+            state.pending_attr_inodes.insert(ino);
+        }
+        true
+    }
+}
+
+impl Default for KernelInvalidationGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct DeferredKernelInvalidationFlush {
+    inner: Arc<dyn KernelInvalidator>,
+    data_inodes: Vec<u64>,
+    attr_inodes: Vec<u64>,
+}
+
+impl DeferredKernelInvalidationFlush {
+    fn flush(self) {
+        for ino in self.data_inodes {
+            self.inner.inval_inode(ino);
+        }
+        for ino in self.attr_inodes {
+            self.inner.inval_inode_attrs(ino);
+        }
     }
 }
 
@@ -766,6 +882,7 @@ struct AsyncReadTaskGuard<'a> {
 impl<'a> AsyncReadTaskGuard<'a> {
     fn new(size: u32, shared: &'a AdapterSharedState, vfs: &'a StudioVfs) -> Self {
         shared.read_diagnostics.on_queued(size);
+        shared.kernel_invalidations.begin_read();
         Self {
             size,
             shared,
@@ -788,6 +905,9 @@ impl Drop for AsyncReadTaskGuard<'_> {
         self.shared
             .read_diagnostics
             .publish_snapshot_after_finish(self.vfs, pending_reads);
+        if let Some(flush) = self.shared.kernel_invalidations.finish_read() {
+            flush.flush();
+        }
     }
 }
 
@@ -889,6 +1009,7 @@ impl StudioVfsAdapter {
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
+                kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
             write_capable_state: WriteCapableState::default(),
             file_flags: ParkingMutex::new(HashMap::new()),
@@ -967,9 +1088,13 @@ impl StudioVfsAdapter {
         &self,
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
+        self.shared
+            .kernel_invalidations
+            .set_inner(Arc::clone(&inner));
         Arc::new(ReadWindowKernelInvalidator {
             read_windows: Arc::clone(&self.shared.read_windows),
             open_cache_snapshots: Arc::clone(&self.shared.open_cache_snapshots),
+            kernel_invalidations: Arc::clone(&self.shared.kernel_invalidations),
             inner,
         })
     }
