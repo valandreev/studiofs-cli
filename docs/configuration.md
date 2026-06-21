@@ -302,8 +302,25 @@ Notes:
 ### Benchmark Profiling Environment
 
 Benchmark and statistics tooling is being consolidated under the mounted
-filesystem benchmark path. The profiling environment below is retained for the
-benchmark engine and future `studiofs bench` implementation.
+filesystem benchmark path. `studiofs bench <mountpoint>` runs the public
+mounted filesystem benchmark and accepts JuiceFS-style workload controls such
+as `--block-size`, `--big-file-size`, `--small-file-size`,
+`--small-file-count`, and `--threads`.
+
+Example:
+
+```bash
+studiofs bench /mnt/studio/myvolume \
+  --block-size 4MB \
+  --big-file-size 1GB \
+  --small-file-size 128KB \
+  --small-file-count 1000 \
+  --threads 4 \
+  --json-output reports/studiofs-bench.json
+```
+
+The command requires an active StudioFS mount and does not silently run the
+legacy direct cache path outside a mount.
 
 Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL`: endpoint base URL for Grafana
@@ -320,7 +337,7 @@ Notes:
 - Benchmark reports should include a stable `run_id` for correlating output
   with tracing/profile hooks.
 - Mounted benchmark reports should include `local_first_read_comparison` with
-  `baseline-read`, `during-upload-read`, and `post-upload-read` rows plus the
+  `during-upload-read`, upload drain, and `post-upload-read` rows plus the
   pending-upload observations used to gate each phase.
 - When the mounted runtime exposes process and write-path observability,
   benchmark JSON output should include `mounted_memory` with `mount_pid`,

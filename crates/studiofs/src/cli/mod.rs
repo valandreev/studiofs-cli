@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 pub(crate) const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 
+pub mod bench;
 pub(crate) mod benchmark_engine;
 pub mod cache_layout;
 pub mod destroy;
@@ -124,6 +125,7 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Bench(bench::BenchArgs),
     Init(init::InitArgs),
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
@@ -146,6 +148,7 @@ enum Commands {
 impl Commands {
     fn dispatch(self) -> anyhow::Result<()> {
         match self {
+            Self::Bench(args) => args.dispatch(),
             Self::Init(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
@@ -218,6 +221,51 @@ mod tests {
                 );
             }
             other => panic!("expected Test command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_command_parses_juicefs_style_workload_flags() {
+        let cli = parse_for_test(&[
+            "bench",
+            "Z:\\",
+            "--block-size",
+            "4MB",
+            "--big-file-size",
+            "2GB",
+            "--small-file-size",
+            "128KB",
+            "--small-file-count",
+            "2000",
+            "--threads",
+            "8",
+            "--json-output",
+            "reports\\bench.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Bench(bench::BenchArgs {
+                mountpoint,
+                block_size,
+                big_file_size,
+                small_file_size,
+                small_file_count,
+                threads,
+                json_output,
+            }) => {
+                assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
+                assert_eq!(block_size, "4MB");
+                assert_eq!(big_file_size, "2GB");
+                assert_eq!(small_file_size, "128KB");
+                assert_eq!(small_file_count, 2000);
+                assert_eq!(threads, 8);
+                assert_eq!(
+                    json_output,
+                    Some(std::path::PathBuf::from("reports\\bench.json"))
+                );
+            }
+            other => panic!("expected Bench command, got {other:?}"),
         }
     }
 

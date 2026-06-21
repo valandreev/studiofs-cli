@@ -175,8 +175,25 @@ Repair mode currently:
 
 ## 9. Benchmarks
 
-Benchmark and statistics tooling is being consolidated around mounted
-filesystem workloads. Use the mounted validation recipes in
-[docs/local-first-validation-matrix.md](./local-first-validation-matrix.md)
-until the public `studiofs bench` command is available.
+Run a JuiceFS-style mounted filesystem benchmark against an already mounted
+StudioFS path:
+
+```bash
+studiofs bench /mnt/studio/myvolume \
+  --block-size 4MB \
+  --big-file-size 1GB \
+  --small-file-size 128KB \
+  --small-file-count 1000 \
+  --threads 4 \
+  --json-output reports/studiofs-bench.json
+```
+
+On Windows, pass the mounted drive or directory:
+
+```powershell
+studiofs bench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
+```
+
+The command must run inside an active StudioFS mount. It does not fall back to
+the legacy direct cache benchmark.
 

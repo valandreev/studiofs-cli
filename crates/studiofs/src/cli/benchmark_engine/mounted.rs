@@ -34,7 +34,7 @@ use super::telemetry::{
     stream_reports_from_telemetry,
 };
 use super::workload::{
-    SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
+    SizeClass, SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
     build_work_sizes, classify_size, deterministic_bytes, split_stream_segments,
 };
 use studiofs_vfs::VfsPortableAllocatorStats;
@@ -86,6 +86,8 @@ struct MeasuredMountedPhaseResult {
     reads_by_stream: Vec<PhaseTelemetry>,
     reads_wall: Duration,
     reads_cpu: Duration,
+    stats: PhaseTelemetry,
+    stats_wall: Duration,
     total_wall: Duration,
     total_cpu: Duration,
     during_upload_observation: Option<PendingUploadObservation>,
@@ -1501,6 +1503,72 @@ async fn run_mounted_read_phase(
     }
 }
 
+async fn run_mounted_stat_phase(
+    files: &[WorkFile],
+    order: &[usize],
+    size_class_bounds: SizeClassBounds,
+) -> Result<PhaseTelemetry> {
+    let stat_order: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|work_index| {
+            classify_size(
+                files[*work_index].size,
+                size_class_bounds.small_max,
+                size_class_bounds.medium_max,
+            ) == SizeClass::Small
+        })
+        .collect();
+    let progress = ProgressBar::start("StudioFS test stat", stat_order.len());
+    let counter = progress.counter();
+    let mut telemetry = PhaseTelemetry::default();
+    for (op_index, work_index) in stat_order.into_iter().enumerate() {
+        let item = &files[work_index];
+        let start = Instant::now();
+        let metadata = fs::metadata(&item.path)
+            .await
+            .with_context(|| format!("stat {}", item.path.display()))?;
+        let elapsed = start.elapsed();
+        if metadata.len() != item.size {
+            bail!(
+                "stat {} reported size {}, expected {}",
+                item.path.display(),
+                metadata.len(),
+                item.size
+            );
+        }
+        telemetry.record_operation(PhaseOperationLog {
+            operation_index: op_index as u64,
+            work_index,
+            worker_id: 0,
+            target: item.path.display().to_string().into(),
+            size_class: classify_size(
+                item.size,
+                size_class_bounds.small_max,
+                size_class_bounds.medium_max,
+            ),
+            bytes: 0,
+            elapsed,
+        });
+        counter.inc();
+    }
+    progress.finish();
+    Ok(telemetry)
+}
+
+async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
+    let mut telemetry = PhaseTelemetry::default();
+    let started = Instant::now();
+    match fs::remove_dir_all(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+    let elapsed = started.elapsed();
+    telemetry.record(SizeClass::Small, elapsed, 0);
+    Ok(phase_telemetry_to_report(&telemetry, elapsed))
+}
+
 async fn run_filesystem_writes(
     files: &[WorkFile],
     order: &[usize],
@@ -1950,6 +2018,18 @@ pub(crate) async fn run_mounted_end_to_end(
                         })
                         .unwrap_or_default();
 
+                    tracing::info!(
+                        target: "studiofs.cache.profile",
+                        run_id = %params.run_id,
+                        phase = "e2e-stat",
+                        "cache benchmark phase start"
+                    );
+                    portable_profile.set_phase("stat");
+                    let stats_wall_start = Instant::now();
+                    let stats =
+                        run_mounted_stat_phase(files_ref, order_ref, size_class_bounds).await?;
+                    let stats_wall = stats_wall_start.elapsed();
+
                     let total_wall = Instant::now() - started;
                     let total_cpu = started_cpu
                         .and_then(|cpu_start| {
@@ -1968,6 +2048,8 @@ pub(crate) async fn run_mounted_end_to_end(
                         reads_by_stream,
                         reads_wall,
                         reads_cpu,
+                        stats,
+                        stats_wall,
                         total_wall,
                         total_cpu,
                         during_upload_observation,
@@ -2197,7 +2279,7 @@ pub(crate) async fn run_mounted_end_to_end(
             measured_write_path_after_for_report.as_ref(),
         ));
 
-        let _ = fs::remove_dir_all(work_root).await;
+        let cleanup = Some(cleanup_mount_artifacts_report(work_root).await?);
         let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
         let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -2238,6 +2320,11 @@ pub(crate) async fn run_mounted_end_to_end(
             mounted_writeback_timeline,
             mounted_portable_profile,
             local_first_read_comparison,
+            small_file_stats: Some(phase_telemetry_to_report(
+                &measured.stats,
+                measured.stats_wall,
+            )),
+            cleanup,
             writes: writes_report,
             reads: reads_report,
         })
@@ -2245,7 +2332,10 @@ pub(crate) async fn run_mounted_end_to_end(
     .await;
     match benchmark_result {
         Ok(report) => Ok(report),
-        Err(err) => Err(err),
+        Err(err) => {
+            let _ = fs::remove_dir_all(work_root).await;
+            Err(err)
+        }
     }
 }
 
