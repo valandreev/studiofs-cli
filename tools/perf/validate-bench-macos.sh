@@ -62,6 +62,25 @@ if [[ ! "$runs" =~ ^[0-9]+$ ]] || [[ "$runs" -lt 1 ]]; then
   echo "Error: --runs must be a positive integer" >&2
   exit 2
 fi
+if [[ ! "$small_file_count" =~ ^[0-9]+$ ]] || [[ "$small_file_count" -lt 1 ]]; then
+  echo "Error: --small-file-count must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$threads" =~ ^[0-9]+$ ]] || [[ "$threads" -lt 1 ]]; then
+  echo "Error: --threads must be a positive integer" >&2
+  exit 2
+fi
+
+if ! command -v "$studiofs_path" >/dev/null 2>&1; then
+  if [[ "$studiofs_path" == "studiofs" ]]; then
+    repo_root_for_fallback="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    if [[ -x "$repo_root_for_fallback/target/release/studiofs" ]]; then
+      studiofs_path="$repo_root_for_fallback/target/release/studiofs"
+    elif [[ -x "$repo_root_for_fallback/target/debug/studiofs" ]]; then
+      studiofs_path="$repo_root_for_fallback/target/debug/studiofs"
+    fi
+  fi
+fi
 
 if ! command -v "$studiofs_path" >/dev/null 2>&1; then
   echo "Error: studiofs binary not found or not executable at: $studiofs_path" >&2
@@ -78,30 +97,40 @@ timestamp="$(date -u +%Y%m%d-%H%M%S)"
 base_name="macos-bench-validation-$timestamp"
 validation_dir="$output_root/$base_name"
 suffix=2
-while [[ -e "$validation_dir" ]]; do
+max_attempts=100
+while ! mkdir "$validation_dir" 2>/dev/null; do
+  if (( suffix > max_attempts )); then
+    echo "Error: Failed to create validation directory under $output_root after $max_attempts attempts." >&2
+    exit 1
+  fi
   validation_dir="$output_root/$base_name-$suffix"
   suffix=$((suffix + 1))
 done
-mkdir "$validation_dir"
 
 git_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
 studiofs_version="$("$studiofs_path" --version 2>/dev/null || true)"
 os_name="$(uname -a)"
 escaped_os="$(json_escape "$os_name")"
 escaped_mount_point="$(json_escape "$mount_point")"
-escaped_git_commit="$(json_escape "$git_commit")"
-escaped_studiofs_version="$(json_escape "$studiofs_version")"
 escaped_block_size="$(json_escape "$block_size")"
 escaped_big_file_size="$(json_escape "$big_file_size")"
 escaped_small_file_size="$(json_escape "$small_file_size")"
+escaped_git_commit_json="null"
+if [[ -n "$git_commit" ]]; then
+  escaped_git_commit_json="\"$(json_escape "$git_commit")\""
+fi
+escaped_studiofs_version_json="null"
+if [[ -n "$studiofs_version" ]]; then
+  escaped_studiofs_version_json="\"$(json_escape "$studiofs_version")\""
+fi
 
 cat > "$validation_dir/environment.json" <<JSON
 {
   "platform": "macOS",
   "os": "$escaped_os",
   "mount_point": "$escaped_mount_point",
-  "git_commit": "$escaped_git_commit",
-  "studiofs_version": "$escaped_studiofs_version",
+  "git_commit": $escaped_git_commit_json,
+  "studiofs_version": $escaped_studiofs_version_json,
   "benchmark_settings": {
     "block_size": "$escaped_block_size",
     "big_file_size": "$escaped_big_file_size",
@@ -132,6 +161,7 @@ for ((run=1; run<=runs; run++)); do
   )
   printf '%q ' "${cmd[@]}" > "$command_path"
   printf '\n' >> "$command_path"
+  echo "Starting benchmark run $run of $runs..."
   if ! "${cmd[@]}" > "$stdout_path" 2>&1; then
     echo "studiofs bench failed on $run_name. See $stdout_path" >&2
     exit 1

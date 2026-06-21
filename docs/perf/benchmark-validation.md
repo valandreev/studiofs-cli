@@ -16,23 +16,31 @@ Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\perf\validate-bench-windows.ps1 -MountPoint Z:\
+powershell -ExecutionPolicy Bypass -File .\tools\perf\validate-bench-windows.ps1 -MountPoint Z:\ -StudioFsPath .\target\release\studiofs.exe
 ```
 
 macOS:
 
 ```bash
 bash ./tools/perf/validate-bench-macos.sh --mount-point /Volumes/studiofs
+bash ./tools/perf/validate-bench-macos.sh --mount-point /Volumes/studiofs --studiofs target/release/studiofs
 ```
 
 Linux:
 
 ```bash
 bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume
+bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --studiofs target/release/studiofs
 ```
 
 The only required platform-specific private path is the mount point. All other
 benchmark settings have explicit defaults and can be overridden through script
 arguments.
+
+If `studiofs` is not available in `PATH`, the scripts automatically try the
+workspace `target/release/studiofs` and `target/debug/studiofs` build outputs
+for the default `studiofs` command name. You can also pass an explicit binary
+with `-StudioFsPath` on Windows or `--studiofs` on macOS/Linux.
 
 ## Artifact Layout
 

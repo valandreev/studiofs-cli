@@ -2,6 +2,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use proc_macro2::LineColumn;
 use syn::spanned::Spanned;
@@ -24,7 +25,7 @@ fn workspace_line_count(path: &str) -> usize {
     read_workspace_file(path).lines().count()
 }
 
-fn workspace_path_exists(path: &str) -> bool {
+fn workspace_path_exists<P: AsRef<Path>>(path: P) -> bool {
     repo_root().join(path).exists()
 }
 
@@ -1132,13 +1133,16 @@ fn benchmark_validation_required_files() -> [&'static str; 4] {
     ]
 }
 
-fn benchmark_validation_combined_text() -> String {
-    let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
-    let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
-    let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
-    let docs = read_workspace_file("docs/perf/benchmark-validation.md");
+fn benchmark_validation_combined_text() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let windows_script = read_workspace_file("tools/perf/validate-bench-windows.ps1");
+        let macos_script = read_workspace_file("tools/perf/validate-bench-macos.sh");
+        let linux_script = read_workspace_file("tools/perf/validate-bench-linux.sh");
+        let docs = read_workspace_file("docs/perf/benchmark-validation.md");
 
-    format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}")
+        format!("{windows_script}\n{macos_script}\n{linux_script}\n{docs}")
+    })
 }
 
 #[test]
@@ -1163,7 +1167,6 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
         "target/perf",
         "studiofs bench",
         "--json-output",
-        "Test-StudioFsCommand",
         "Write-Utf8NoBom",
         "Invoke-OptionalCommand",
         "git_success",
@@ -1174,9 +1177,25 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
         "\\r",
         "\\t",
         "studiofs bench failed",
+        "$oldEap",
+        "$ErrorActionPreference = \"Continue\"",
+        "$ErrorActionPreference = $oldEap",
+        "Resolve-StudioFsCommand",
+        "target\\release\\studiofs.exe",
+        "target\\debug\\studiofs.exe",
+        "> $stdoutPath 2>&1",
         "exitCode = 1",
         "--runs must be a positive integer",
+        "--threads must be a positive integer",
+        "--small-file-count must be a positive integer",
         "command -v",
+        "target/release/studiofs",
+        "target/debug/studiofs",
+        "max_attempts=100",
+        "escaped_git_commit_json",
+        "escaped_studiofs_version_json",
+        "while ! mkdir \"$validation_dir\"",
+        "Starting benchmark run",
         "for ((run=1; run<=runs; run++))",
         "command.txt",
         "stdout.txt",
@@ -1215,7 +1234,11 @@ fn benchmark_validation_scripts_avoid_review_blocked_terms() {
     let combined = benchmark_validation_combined_text();
     let normalized_combined = normalize_doc_whitespace(&combined);
 
-    let forbidden_terms = ["$args = @(", "for run in $(seq"];
+    let forbidden_terms = [
+        "$args = @(",
+        "for run in $(seq",
+        "while [[ -e \"$validation_dir\"",
+    ];
     let forbidden_hits: Vec<_> = forbidden_terms
         .iter()
         .copied()

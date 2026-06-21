@@ -61,12 +61,31 @@ function Quote-CommandPart {
     return $Value
 }
 
-function Test-StudioFsCommand {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Resolve-StudioFsCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
 
-    if (-not (Get-Command $Path -ErrorAction SilentlyContinue)) {
-        throw "Error: studiofs binary not found or not executable at: $Path"
+    $command = Get-Command $Path -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
     }
+
+    if ($Path -eq "studiofs") {
+        foreach ($candidate in @(
+            (Join-Path $RepoRoot "target\release\studiofs.exe"),
+            (Join-Path $RepoRoot "target\debug\studiofs.exe")
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return (Resolve-Path -LiteralPath $candidate).Path
+            }
+        }
+    }
+
+    throw "Error: studiofs binary not found or not executable at: $Path"
 }
 
 function Invoke-OptionalCommand {
@@ -96,10 +115,15 @@ function Invoke-OptionalCommand {
 if ($Runs -lt 1) {
     throw "-Runs must be >= 1"
 }
-
-Test-StudioFsCommand -Path $StudioFsPath
+if ($SmallFileCount -lt 1) {
+    throw "-SmallFileCount must be >= 1"
+}
+if ($Threads -lt 1) {
+    throw "-Threads must be >= 1"
+}
 
 $repoRoot = Get-RepoRoot
+$StudioFsPath = Resolve-StudioFsCommand -Path $StudioFsPath -RepoRoot $repoRoot
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repoRoot "target\perf"
 }
@@ -153,15 +177,20 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     $commandLine = (Quote-CommandPart $StudioFsPath) + " " + (($benchArgs | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " ")
     Write-Utf8NoBom -Path $commandPath -Value $commandLine
 
+    Write-Host "Starting benchmark run $run of $Runs..."
+    $oldEap = $ErrorActionPreference
     try {
-        $output = & $StudioFsPath @benchArgs 2>&1
+        $ErrorActionPreference = "Continue"
+        & $StudioFsPath @benchArgs > $stdoutPath 2>&1
         $exitCode = $LASTEXITCODE
     }
     catch {
-        $output = $_ | Out-String
+        Write-Utf8NoBom -Path $stdoutPath -Value ($_ | Out-String)
         $exitCode = 1
     }
-    Write-Utf8NoBom -Path $stdoutPath -Value ($output | Out-String)
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
     if ($exitCode -ne 0) {
         throw "studiofs bench failed with exit code $exitCode. See $stdoutPath"
     }
