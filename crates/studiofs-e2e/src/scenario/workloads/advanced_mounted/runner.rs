@@ -1270,28 +1270,21 @@ pub(in crate::scenario) fn write_mounted_initial_file_sync_only(
     payload: &[u8],
     label: &str,
 ) -> Result<(), ScenarioError> {
-    let write_path = path.clone();
     let write_payload = payload.to_vec();
     let write_label = label.to_string();
-    run_bounded_mounted_io(
-        format!("{label}: write {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || {
-            if let Some(parent) = write_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut options = mounted_write_barrier_open_options();
-            let mut file = options
-                .create_new(true)
-                .open(&write_path)
-                .map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("{write_label}: open {}: {error}", write_path.display()),
-                    )
-                })?;
-            file.write_all(&write_payload)?;
-            file.sync_all()
-        },
-    )
+    let io_label = format!("{label}: write {}", path.display());
+    run_bounded_mounted_io(io_label, MOUNTED_WRITE_READBACK_TIMEOUT, move || {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut options = mounted_write_barrier_open_options();
+        let mut file = options.create_new(true).open(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{write_label}: open {}: {error}", path.display()),
+            )
+        })?;
+        file.write_all(&write_payload)?;
+        file.sync_all()
+    })
 }

@@ -2622,6 +2622,18 @@ mod open_cache_snapshot_tests {
         adapter
             .write(attr.ino, writer.file_handle(), 0, payload)
             .expect("write payload");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "test setup must make the file dirty before fsync"
+        );
+        fixture
+            .runtime()
+            .block_on(vfs.fsync(attr.ino, false))
+            .expect("fsync payload before deferred release");
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "fsync must clean local dirty state so release uses the deferred barrier path"
+        );
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release writer");
