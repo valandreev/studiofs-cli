@@ -1558,8 +1558,12 @@ fn mounted_read_plan_for_operation(
     plan
 }
 
-fn mounted_read_worker_count(concurrency: usize, operation_count: usize) -> usize {
-    concurrency.max(1).min(operation_count)
+fn mounted_queued_read_worker_count(
+    concurrency: usize,
+    io_depth: usize,
+    operation_count: usize,
+) -> usize {
+    concurrency.max(io_depth.max(1)).min(operation_count)
 }
 
 fn public_bench_read_operations(
@@ -1714,6 +1718,25 @@ fn validate_deterministic_read_chunk(
     Ok(())
 }
 
+#[derive(Default)]
+struct MountedReadValidationCache {
+    seed: Option<u64>,
+    write_chunk_size: usize,
+    expected_cycle: Vec<u8>,
+}
+
+impl MountedReadValidationCache {
+    fn expected_cycle(&mut self, validation: MountedReadValidation) -> &[u8] {
+        let write_chunk_size = validation.write_chunk_size.max(1);
+        if self.seed != Some(validation.seed) || self.write_chunk_size != write_chunk_size {
+            fill_deterministic_bytes(&mut self.expected_cycle, write_chunk_size, validation.seed);
+            self.seed = Some(validation.seed);
+            self.write_chunk_size = write_chunk_size;
+        }
+        &self.expected_cycle
+    }
+}
+
 #[cfg(test)]
 async fn read_file_with_plan(
     path: &Path,
@@ -1722,14 +1745,14 @@ async fn read_file_with_plan(
     start_offset: u64,
 ) -> Result<u64> {
     let mut buffer = Vec::new();
-    let mut expected_cycle = Vec::new();
+    let mut validation_cache = MountedReadValidationCache::default();
     read_file_with_plan_using_buffer(
         path,
         plan,
         validation,
         start_offset,
         &mut buffer,
-        &mut expected_cycle,
+        &mut validation_cache,
     )
     .await
 }
@@ -1740,7 +1763,7 @@ async fn read_file_with_plan_using_buffer(
     validation: MountedReadValidation,
     start_offset: u64,
     buffer: &mut Vec<u8>,
-    expected_cycle: &mut Vec<u8>,
+    validation_cache: &mut MountedReadValidationCache,
 ) -> Result<u64> {
     let mut input = fs::File::open(path)
         .await
@@ -1756,11 +1779,7 @@ async fn read_file_with_plan_using_buffer(
     }
 
     buffer.resize(plan.chunk_size, 0);
-    fill_deterministic_bytes(
-        expected_cycle,
-        validation.write_chunk_size.max(1),
-        validation.seed,
-    );
+    let expected_cycle = validation_cache.expected_cycle(validation);
     let mut remaining = plan.bytes_to_read;
     let mut offset = start_offset;
     while remaining > 0 {
@@ -2192,7 +2211,7 @@ async fn run_filesystem_reads(
             let mut telemetry = PhaseTelemetry::default();
             let mut read_buffer =
                 Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
-            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
+            let mut validation_cache = MountedReadValidationCache::default();
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
@@ -2223,7 +2242,7 @@ async fn run_filesystem_reads(
                     validation,
                     0,
                     &mut read_buffer,
-                    &mut expected_cycle,
+                    &mut validation_cache,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2269,7 +2288,7 @@ async fn run_filesystem_read_operations(
         return Ok(PhaseTelemetry::default());
     }
     let queue_depth = io_depth.max(1);
-    let worker_count = mounted_read_worker_count(concurrency, operations.len());
+    let worker_count = mounted_queued_read_worker_count(concurrency, queue_depth, operations.len());
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let operations: Arc<[MountedReadOperation]> = Arc::from(operations);
@@ -2287,7 +2306,7 @@ async fn run_filesystem_read_operations(
             let mut telemetry = PhaseTelemetry::default();
             let mut read_buffer =
                 Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
-            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
+            let mut validation_cache = MountedReadValidationCache::default();
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 let Some(operation) = operations.get(op_index) else {
@@ -2318,7 +2337,7 @@ async fn run_filesystem_read_operations(
                     validation,
                     operation.offset,
                     &mut read_buffer,
-                    &mut expected_cycle,
+                    &mut validation_cache,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2443,7 +2462,7 @@ async fn run_filesystem_reads_sequential_streams(
             let mut telemetry = PhaseTelemetry::default();
             let mut read_buffer =
                 Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
-            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
+            let mut validation_cache = MountedReadValidationCache::default();
             for work_index in segment {
                 let item = &files[work_index];
                 let read_plan = mounted_read_plan(
@@ -2467,7 +2486,7 @@ async fn run_filesystem_reads_sequential_streams(
                     validation,
                     0,
                     &mut read_buffer,
-                    &mut expected_cycle,
+                    &mut validation_cache,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -3583,10 +3602,32 @@ mod tests {
     }
 
     #[test]
-    fn mounted_read_worker_count_honors_concurrency_below_io_depth() {
-        let workers = mounted_read_worker_count(1, 32);
+    fn mounted_queued_read_worker_count_honors_io_depth_above_concurrency() {
+        let workers = mounted_queued_read_worker_count(1, 32, 64);
 
-        assert_eq!(workers, 1);
+        assert_eq!(workers, 32);
+    }
+
+    #[test]
+    fn mounted_read_validation_cache_reuses_cycle_for_same_seed_and_chunk_size() {
+        let mut cache = MountedReadValidationCache::default();
+        let validation = MountedReadValidation {
+            seed: 7,
+            write_chunk_size: 16,
+        };
+
+        let first = cache.expected_cycle(validation).to_vec();
+        let second = cache.expected_cycle(validation);
+
+        assert_eq!(second, first.as_slice());
+        assert_eq!(cache.seed, Some(7));
+        assert_eq!(cache.write_chunk_size, 16);
+
+        let different = cache.expected_cycle(MountedReadValidation {
+            seed: 8,
+            write_chunk_size: 16,
+        });
+        assert_ne!(different, first.as_slice());
     }
 
     #[test]
