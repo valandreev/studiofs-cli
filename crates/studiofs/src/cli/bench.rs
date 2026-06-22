@@ -31,8 +31,8 @@ pub(crate) struct BenchArgs {
     pub(crate) mountpoint: PathBuf,
 
     /// JSON report output path.
-    #[arg(long)]
-    pub(crate) report: Option<PathBuf>,
+    #[arg(long = "report")]
+    pub(crate) json_output: Option<PathBuf>,
 }
 
 impl BenchArgs {
@@ -203,19 +203,22 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
-    run_config(args.mountpoint, args.report, config)
+    let report = run_config(args.mountpoint, config)?;
+    print_benchmark_report(&report);
+    save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))
 }
 
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
-    run_config(args.mountpoint, args.json_output, config)
+    let report = run_config(args.mountpoint, config)?;
+    print_benchmark_report(&report);
+    save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))
 }
 
 fn run_config(
     mountpoint: PathBuf,
-    json_output: Option<PathBuf>,
     config: BenchmarkConfig,
-) -> Result<()> {
+) -> Result<crate::cli::benchmark_engine::BenchmarkReport> {
     let runtime = resolve_mounted_runtime(&mountpoint)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
@@ -251,21 +254,45 @@ fn run_config(
             return Err(anyhow!("benchmark interrupted by Ctrl+C"));
         }
     };
-    print!("{}", render_human_summary(&report));
+    work_root_cleanup.disarm();
+    Ok(report)
+}
+
+fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) {
+    print!("{}", render_human_summary(report));
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
-    if should_save_benchmark_report(json_output.as_deref()) {
-        let report_path = save_benchmark_report(&report, json_output.as_deref())
-            .context("save benchmark JSON report")?;
-        println!("JSON report: {}", report_path.display());
-    }
-    work_root_cleanup.disarm();
-    Ok(())
 }
 
-fn should_save_benchmark_report(json_output: Option<&Path>) -> bool {
-    json_output.is_some()
+#[derive(Debug, PartialEq, Eq)]
+enum ReportOutput<'a> {
+    Skip,
+    Save(Option<&'a Path>),
+}
+
+fn public_report_output(json_output: Option<&Path>) -> ReportOutput<'_> {
+    match json_output {
+        Some(path) => ReportOutput::Save(Some(path)),
+        None => ReportOutput::Skip,
+    }
+}
+
+fn devbench_report_output(json_output: Option<&Path>) -> ReportOutput<'_> {
+    ReportOutput::Save(json_output)
+}
+
+fn save_report_for_policy(
+    report: &crate::cli::benchmark_engine::BenchmarkReport,
+    output: ReportOutput<'_>,
+) -> Result<()> {
+    let ReportOutput::Save(json_output) = output else {
+        return Ok(());
+    };
+    let report_path =
+        save_benchmark_report(report, json_output).context("save benchmark JSON report")?;
+    println!("JSON report: {}", report_path.display());
+    Ok(())
 }
 
 struct BenchWorkRootCleanup {
@@ -362,7 +389,7 @@ mod tests {
     fn public_bench_config_uses_fixed_pseudo_random_workload() {
         let args = BenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
-            report: None,
+            json_output: None,
         };
 
         let config = build_public_bench_config(&args, "run-1".to_string());
@@ -561,7 +588,22 @@ mod tests {
     }
 
     #[test]
-    fn report_saving_is_skipped_when_no_report_path_is_requested() {
-        assert!(!should_save_benchmark_report(None));
+    fn public_bench_skips_report_saving_when_no_report_path_is_requested() {
+        assert_eq!(public_report_output(None), ReportOutput::Skip);
+    }
+
+    #[test]
+    fn public_bench_saves_report_when_report_path_is_requested() {
+        let report_path = Path::new("reports\\bench.json");
+
+        assert_eq!(
+            public_report_output(Some(report_path)),
+            ReportOutput::Save(Some(report_path))
+        );
+    }
+
+    #[test]
+    fn devbench_keeps_default_report_saving_when_no_output_path_is_requested() {
+        assert_eq!(devbench_report_output(None), ReportOutput::Save(None));
     }
 }

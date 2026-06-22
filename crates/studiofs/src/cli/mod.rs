@@ -276,9 +276,12 @@ mod tests {
         let cli = parse_for_test(&["bench", "Z:\\"]).unwrap();
 
         match cli.command {
-            Commands::Bench(bench::BenchArgs { mountpoint, report }) => {
+            Commands::Bench(bench::BenchArgs {
+                mountpoint,
+                json_output,
+            }) => {
                 assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
-                assert!(report.is_none());
+                assert!(json_output.is_none());
             }
             other => panic!("expected Bench command, got {other:?}"),
         }
@@ -289,10 +292,13 @@ mod tests {
         let cli = parse_for_test(&["bench", "Z:\\", "--report", "reports\\bench.json"]).unwrap();
 
         match cli.command {
-            Commands::Bench(bench::BenchArgs { mountpoint, report }) => {
+            Commands::Bench(bench::BenchArgs {
+                mountpoint,
+                json_output,
+            }) => {
                 assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
                 assert_eq!(
-                    report,
+                    json_output,
                     Some(std::path::PathBuf::from("reports\\bench.json"))
                 );
             }
