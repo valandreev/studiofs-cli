@@ -557,6 +557,7 @@ pub(crate) struct PublicBenchReport {
     pub(crate) workload: PublicBenchWorkloadReport,
     pub(crate) write_metrics: PublicBenchWriteMetricsReport,
     pub(crate) during_upload_read: PublicBenchDuringUploadReadReport,
+    pub(crate) read_metrics: PublicBenchReadMetricsReport,
     pub(crate) upload_drain: PublicBenchUploadDrainReport,
 }
 
@@ -587,6 +588,14 @@ pub(crate) struct PublicBenchDuringUploadReadReport {
     pub(crate) pending_uploads_after: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) validation_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchReadMetricsReport {
+    pub(crate) first_read: OpReport,
+    pub(crate) hot_read: OpReport,
+    pub(crate) pseudo_random_read: OpReport,
+    pub(crate) sequential_medium_read: OpReport,
 }
 
 #[derive(Debug, Serialize)]

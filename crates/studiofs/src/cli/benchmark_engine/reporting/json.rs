@@ -227,8 +227,9 @@ mod tests {
         MountedPortablePhaseProfileReport, MountedPortableProcessReport,
         MountedPortableProfileReport, MountedWriteDiagnosticsReport,
         MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, OpReport,
-        PublicBenchDuringUploadReadReport, PublicBenchReport, PublicBenchUploadDrainReport,
-        PublicBenchWorkloadReport, PublicBenchWriteMetricsReport, SizeClassOpReport, sample_report,
+        PublicBenchDuringUploadReadReport, PublicBenchReadMetricsReport, PublicBenchReport,
+        PublicBenchUploadDrainReport, PublicBenchWorkloadReport, PublicBenchWriteMetricsReport,
+        SizeClassOpReport, sample_report,
     };
     use chrono::TimeZone;
 
@@ -592,6 +593,68 @@ mod tests {
                 pending_uploads_after: 1,
                 validation_message: None,
             },
+            read_metrics: PublicBenchReadMetricsReport {
+                first_read: OpReport {
+                    operations: 1081,
+                    bytes: 720 * 1024 * 1024,
+                    elapsed_ms: 1400.0,
+                    avg_latency_ms: 1.2,
+                    p50_ms: 0.9,
+                    p95_ms: 3.0,
+                    p99_ms: 4.5,
+                    throughput_bytes_per_sec: 514.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 1081],
+                    },
+                    operations_log: Vec::new(),
+                },
+                hot_read: OpReport {
+                    operations: 1081,
+                    bytes: 720 * 1024 * 1024,
+                    elapsed_ms: 900.0,
+                    avg_latency_ms: 0.8,
+                    p50_ms: 0.6,
+                    p95_ms: 2.0,
+                    p99_ms: 3.5,
+                    throughput_bytes_per_sec: 800.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 1081],
+                    },
+                    operations_log: Vec::new(),
+                },
+                pseudo_random_read: OpReport {
+                    operations: 1081,
+                    bytes: 716 * 1024 * 1024,
+                    elapsed_ms: 1000.0,
+                    avg_latency_ms: 0.9,
+                    p50_ms: 0.7,
+                    p95_ms: 2.3,
+                    p99_ms: 3.8,
+                    throughput_bytes_per_sec: 716.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 1081],
+                    },
+                    operations_log: Vec::new(),
+                },
+                sequential_medium_read: OpReport {
+                    operations: 80,
+                    bytes: 512 * 1024 * 1024,
+                    elapsed_ms: 600.0,
+                    avg_latency_ms: 4.0,
+                    p50_ms: 3.8,
+                    p95_ms: 6.2,
+                    p99_ms: 6.8,
+                    throughput_bytes_per_sec: 853.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 80],
+                    },
+                    operations_log: Vec::new(),
+                },
+            },
             upload_drain: PublicBenchUploadDrainReport {
                 observed_idle: true,
                 timed_out: false,
@@ -645,6 +708,19 @@ mod tests {
             "during-upload-read"
         );
         assert_eq!(public_bench["during_upload_read"]["wait_target"], "active");
+        assert_eq!(
+            public_bench["read_metrics"]["first_read"]["operations"],
+            1081
+        );
+        assert_eq!(public_bench["read_metrics"]["hot_read"]["operations"], 1081);
+        assert_eq!(
+            public_bench["read_metrics"]["pseudo_random_read"]["operations"],
+            1081
+        );
+        assert_eq!(
+            public_bench["read_metrics"]["sequential_medium_read"]["operations"],
+            80
+        );
         assert_eq!(
             public_bench["during_upload_read"]["target_state_observed"],
             true
