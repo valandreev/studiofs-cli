@@ -1,4 +1,4 @@
-name: Sync repository files to Google Drive
+name: Sync Google Drive
 
 on:
   push:
@@ -28,25 +28,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Prepare Google Drive service account
+      - name: Restore rclone config
         env:
-          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
-        run: |
-          echo "$GDRIVE_SA_JSON_B64" | base64 -d > "$HOME/gdrive-service-account.json"
-
-      - name: Configure rclone
-        env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
         run: |
           mkdir -p "$HOME/.config/rclone"
-
-          cat > "$HOME/.config/rclone/rclone.conf" <<EOF
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = $HOME/gdrive-service-account.json
-          root_folder_id = $GDRIVE_FOLDER_ID
-          EOF
+          echo "$RCLONE_CONFIG_B64" | base64 -d > "$HOME/.config/rclone/rclone.conf"
 
       - name: Create repo snapshot info
         run: |
@@ -72,6 +59,6 @@ jobs:
             --exclude ".DS_Store" \
             --delete-excluded \
             --drive-chunk-size 64M \
-            --transfers 8 \
-            --checkers 16 \
+            --transfers 4 \
+            --checkers 8 \
             --progress
