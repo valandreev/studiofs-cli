@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
-    BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
-    PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg,
-    public_bench_workload, render_human_summary, run_mounted, save_benchmark_report,
+    BenchmarkAccessPattern, BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY,
+    DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
+    PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg, public_bench_workload,
+    render_human_summary, run_mounted, save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -322,9 +323,6 @@ impl Drop for BenchWorkRootCleanup {
 }
 
 fn cleanup_bench_work_root(work_root: &Path) {
-    const CLEANUP_ATTEMPTS: usize = 5;
-    const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
-
     for attempt in 1..=CLEANUP_ATTEMPTS {
         match std::fs::remove_dir_all(work_root) {
             Ok(()) => return,
@@ -594,7 +592,7 @@ mod tests {
 
     #[test]
     fn public_bench_saves_report_when_report_path_is_requested() {
-        let report_path = Path::new("reports\\bench.json");
+        let report_path = Path::new("reports/bench.json");
 
         assert_eq!(
             public_report_output(Some(report_path)),

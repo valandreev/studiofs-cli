@@ -16,7 +16,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use super::BenchmarkConfig;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
@@ -41,6 +40,7 @@ use super::workload::{
     build_work_sizes, classify_size, deterministic_bytes, fill_deterministic_bytes,
     split_stream_segments,
 };
+use super::{BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY};
 use studiofs_vfs::{RUNTIME_STATS_FILE_NAME_STR, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
 
 #[derive(Clone, Copy)]
@@ -1675,9 +1675,6 @@ async fn run_mounted_stat_phase(
 }
 
 async fn cleanup_mount_artifacts_report(path: &Path) -> Result<OpReport> {
-    const CLEANUP_ATTEMPTS: usize = 5;
-    const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
-
     let mut telemetry = PhaseTelemetry::default();
     let started = Instant::now();
     for attempt in 1..=CLEANUP_ATTEMPTS {

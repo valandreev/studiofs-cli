@@ -242,7 +242,7 @@ mod tests {
             "--threads",
             "8",
             "--json-output",
-            "reports\\bench.json",
+            "reports/bench.json",
         ])
         .unwrap();
 
@@ -264,7 +264,7 @@ mod tests {
                 assert_eq!(threads, 8);
                 assert_eq!(
                     json_output,
-                    Some(std::path::PathBuf::from("reports\\bench.json"))
+                    Some(std::path::PathBuf::from("reports/bench.json"))
                 );
             }
             other => panic!("expected Devbench command, got {other:?}"),
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn bench_command_parses_public_mountpoint_and_optional_report() {
-        let cli = parse_for_test(&["bench", "Z:\\", "--report", "reports\\bench.json"]).unwrap();
+        let cli = parse_for_test(&["bench", "Z:\\", "--report", "reports/bench.json"]).unwrap();
 
         match cli.command {
             Commands::Bench(bench::BenchArgs {
@@ -299,7 +299,7 @@ mod tests {
                 assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
                 assert_eq!(
                     json_output,
-                    Some(std::path::PathBuf::from("reports\\bench.json"))
+                    Some(std::path::PathBuf::from("reports/bench.json"))
                 );
             }
             other => panic!("expected Bench command, got {other:?}"),
