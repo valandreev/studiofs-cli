@@ -23,6 +23,31 @@ enum BenchRunOutcome {
 pub(crate) struct BenchArgs {
     /// Mounted StudioFS path to benchmark.
     pub(crate) mountpoint: PathBuf,
+}
+
+impl BenchArgs {
+    pub(crate) fn dispatch(self) -> Result<()> {
+        run(self.into_devbench_args(), "studiofs bench")
+    }
+
+    fn into_devbench_args(self) -> DevbenchArgs {
+        DevbenchArgs {
+            mountpoint: self.mountpoint,
+            block_size: "4MB".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: 1,
+            json_output: None,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Run a configurable mounted StudioFS developer benchmark")]
+pub(crate) struct DevbenchArgs {
+    /// Mounted StudioFS path to benchmark.
+    pub(crate) mountpoint: PathBuf,
 
     /// I/O block size used for large sequential file chunks.
     #[arg(long, default_value = "4MB")]
@@ -51,13 +76,17 @@ pub(crate) struct BenchArgs {
     pub(crate) json_output: Option<PathBuf>,
 }
 
-impl BenchArgs {
+impl DevbenchArgs {
     pub(crate) fn dispatch(self) -> Result<()> {
-        run(self)
+        run(self, "studiofs devbench")
     }
 }
 
-fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfig> {
+fn build_bench_config(
+    args: &DevbenchArgs,
+    command_name: &'static str,
+    run_id: String,
+) -> Result<BenchmarkConfig> {
     if args.threads == 0 {
         return Err(anyhow!("--threads must be >= 1"));
     }
@@ -90,7 +119,7 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
         .max(size_class_small_max.saturating_add(1));
 
     Ok(BenchmarkConfig {
-        command_name: "studiofs bench",
+        command_name,
         target: args.mountpoint.clone(),
         block_size,
         read_size: block_size,
@@ -112,14 +141,14 @@ fn build_bench_config(args: &BenchArgs, run_id: String) -> Result<BenchmarkConfi
     })
 }
 
-fn run(args: BenchArgs) -> Result<()> {
+fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let runtime = resolve_mounted_runtime(&args.mountpoint)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
             args.mountpoint.display()
         )
     })?;
-    let config = build_bench_config(&args, uuid::Uuid::new_v4().to_string())?;
+    let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
     let work_root = args.mountpoint.join(".studiofs-benchmark");
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
@@ -195,7 +224,7 @@ mod tests {
 
     #[test]
     fn bench_config_plans_one_large_file_and_requested_small_files() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "2GB".to_string(),
@@ -205,9 +234,9 @@ mod tests {
             json_output: None,
         };
 
-        let config = build_bench_config(&args, "run-1".to_string()).unwrap();
+        let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
 
-        assert_eq!(config.command_name, "studiofs bench");
+        assert_eq!(config.command_name, "studiofs devbench");
         assert_eq!(config.block_size, 4 * 1024 * 1024);
         assert_eq!(config.read_size, 4 * 1024 * 1024);
         assert_eq!(config.concurrency, 4);
@@ -226,7 +255,7 @@ mod tests {
 
     #[test]
     fn bench_config_keeps_medium_class_above_small_class_for_tiny_files() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4KB".to_string(),
             big_file_size: "1GB".to_string(),
@@ -236,7 +265,7 @@ mod tests {
             json_output: None,
         };
 
-        let config = build_bench_config(&args, "run-1".to_string()).unwrap();
+        let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
 
         assert_eq!(config.size_class_small_max, DEFAULT_SMALL_CLASS_MAX_BYTES);
         assert!(config.size_class_medium_max > config.size_class_small_max);
@@ -244,7 +273,7 @@ mod tests {
 
     #[test]
     fn bench_config_rejects_zero_threads() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
@@ -254,14 +283,14 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("--threads must be >= 1"));
     }
 
     #[test]
     fn bench_config_rejects_excessive_threads() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
@@ -271,14 +300,14 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("--threads must be <= 512"));
     }
 
     #[test]
     fn bench_config_rejects_zero_small_file_count() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
@@ -288,14 +317,14 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("--small-file-count must be >= 1"));
     }
 
     #[test]
     fn bench_config_rejects_big_file_size_not_greater_than_small_file_size() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "128KB".to_string(),
@@ -305,7 +334,7 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -315,7 +344,7 @@ mod tests {
 
     #[test]
     fn bench_config_rejects_excessive_small_file_count() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
@@ -325,7 +354,7 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -335,7 +364,7 @@ mod tests {
 
     #[test]
     fn bench_config_rejects_invalid_size_arg() {
-        let args = BenchArgs {
+        let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "4not-a-size".to_string(),
             big_file_size: "1GB".to_string(),
@@ -345,7 +374,7 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "run-1".to_string()).unwrap_err();
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("invalid block-size"));
     }

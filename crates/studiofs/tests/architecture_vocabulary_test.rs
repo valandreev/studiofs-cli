@@ -1062,6 +1062,7 @@ fn benchmark_methodology_covers_sfs558_operator_contract() {
         "observer only",
         ".studiofs-runtime-stats",
         "studiofs bench",
+        "studiofs devbench",
         "active StudioFS mount",
         "legacy test-cache",
         "developer diagnostic",
@@ -1213,10 +1214,10 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
     let normalized_combined = normalize_doc_whitespace(combined);
     let required_terms = [
         "target/perf",
-        "studiofs bench",
+        "studiofs devbench",
         "--json-output",
         "validate-bench-unix.sh",
-        "studiofs bench failed",
+        "studiofs devbench failed",
         "target\\release\\studiofs.exe",
         "target\\debug\\studiofs.exe",
         "target/release/studiofs",

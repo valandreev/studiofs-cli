@@ -232,7 +232,7 @@ for ((run=1; run<=runs; run++)); do
   stdout_path="$run_dir/stdout.txt"
   command_path="$run_dir/command.txt"
   cmd=(
-    "$studiofs_path" bench "$mount_point"
+    "$studiofs_path" devbench "$mount_point"
     --block-size "$block_size"
     --big-file-size "$big_file_size"
     --small-file-size "$small_file_size"
@@ -244,11 +244,11 @@ for ((run=1; run<=runs; run++)); do
   printf '\n' >> "$command_path"
   echo "Starting benchmark run $run of $runs..."
   if ! "${cmd[@]}" > "$stdout_path" 2>&1; then
-    echo "studiofs bench failed on $run_name. See $stdout_path" >&2
+    echo "studiofs devbench failed on $run_name. See $stdout_path" >&2
     exit 1
   fi
   if [[ ! -f "$report_path" ]]; then
-    echo "studiofs bench did not write report.json for $run_name" >&2
+    echo "studiofs devbench did not write report.json for $run_name" >&2
     exit 1
   fi
 done

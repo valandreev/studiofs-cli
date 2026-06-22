@@ -224,7 +224,7 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     $commandPath = Join-Path $runDir "command.txt"
 
     $benchArgs = @(
-        "bench",
+        "devbench",
         $MountPoint,
         "--block-size", $BlockSize,
         "--big-file-size", $BigFileSize,
@@ -239,10 +239,10 @@ for ($run = 1; $run -le $Runs; $run += 1) {
     Write-Host "Starting benchmark run $run of $Runs..."
     $exitCode = Invoke-BenchmarkCommand -FilePath $StudioFsPath -CommandArguments $benchArgs -StdoutPath $stdoutPath
     if ($exitCode -ne 0) {
-        throw "studiofs bench failed with exit code $exitCode. See $stdoutPath"
+        throw "studiofs devbench failed with exit code $exitCode. See $stdoutPath"
     }
     if (-not (Test-Path -LiteralPath $reportPath)) {
-        throw "studiofs bench did not write report.json for $runName"
+        throw "studiofs devbench did not write report.json for $runName"
     }
 
     $runDirs += $runDir

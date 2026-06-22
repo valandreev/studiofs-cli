@@ -302,15 +302,16 @@ Notes:
 ### Benchmark Profiling Environment
 
 Benchmark and statistics tooling is being consolidated under the mounted
-filesystem benchmark path. `studiofs bench <mountpoint>` runs the public
-mounted filesystem benchmark and accepts JuiceFS-style workload controls such
-as `--block-size`, `--big-file-size`, `--small-file-size`,
+filesystem benchmark path. `studiofs bench <mountpoint>` runs the fixed public
+mounted filesystem benchmark. `studiofs devbench <mountpoint>` preserves the
+developer benchmark surface and accepts JuiceFS-style workload controls such as
+`--block-size`, `--big-file-size`, `--small-file-size`,
 `--small-file-count`, and `--threads`.
 
 Example:
 
 ```bash
-studiofs bench /mnt/studio/myvolume \
+studiofs devbench /mnt/studio/myvolume \
   --block-size 4MB \
   --big-file-size 1GB \
   --small-file-size 128KB \
@@ -322,16 +323,17 @@ studiofs bench /mnt/studio/myvolume \
 The command requires an active StudioFS mount and does not silently run the
 legacy direct cache path outside a mount.
 
-By default, the command writes a pretty JSON report under `target/perf` with an
-auto-generated file name and prints `JSON report: <path>`. Passing
-`--json-output <file-or-dir>` overrides that location. Reports include command,
-platform, build, mount, and runtime-stats metadata. If the mounted
+By default, the benchmark command writes a pretty JSON report under
+`target/perf` with an auto-generated file name and prints
+`JSON report: <path>`. Passing `--json-output <file-or-dir>` to
+`studiofs devbench` overrides that location. Reports include command, platform,
+build, mount, and runtime-stats metadata. If the mounted
 `.studiofs-runtime-stats` surface is unavailable or malformed, the benchmark
 still completes, prints a warning, and records `runtime_stats.available: false`
 with the warning text in JSON.
 
-For repeatable Windows, macOS, and Linux evidence capture around `studiofs
-bench`, use the validation scripts documented in
+For repeatable Windows, macOS, and Linux developer evidence capture around
+`studiofs devbench`, use the validation scripts documented in
 [docs/perf/benchmark-validation.md](./perf/benchmark-validation.md). They
 standardize `target/perf` artifact directories, command capture, stdout
 capture, JSON reports, summary files, and before/after comparison guidance.

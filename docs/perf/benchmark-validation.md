@@ -1,8 +1,9 @@
 # Cross-Platform Benchmark Validation
 
-SFS-557 standardizes how StudioFS benchmark evidence is collected on Windows,
-macOS, and Linux. The scripts in `tools/perf` run `studiofs bench` against a
-user-provided mount point and write artifacts under `target/perf`.
+SFS-557 standardizes how StudioFS developer benchmark evidence is collected on
+Windows, macOS, and Linux. The scripts in `tools/perf` run
+`studiofs devbench` against a user-provided mount point and write artifacts
+under `target/perf`.
 
 The scripts are:
 
@@ -69,7 +70,7 @@ target/perf/<platform>-bench-validation-<timestamp>/
 
 `environment.json` records the OS, platform, mount point, git commit,
 StudioFS version, and benchmark settings. Each run directory records the exact
-command line, stdout capture, and JSON report written by `studiofs bench
+command line, stdout capture, and JSON report written by `studiofs devbench
 --json-output`.
 
 ## Run Counts And Comparison

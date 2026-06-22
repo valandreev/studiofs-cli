@@ -262,10 +262,10 @@ scripts in `tools/perf` and the layout described in
 command, stdout, JSON report, environment, and summary artifacts under
 `target/perf` without overwriting previous runs.
 
-For the public mounted benchmark surface, start with:
+For the configurable developer mounted benchmark surface, start with:
 
 ```bash
-studiofs bench /mnt/studio/myvolume \
+studiofs devbench /mnt/studio/myvolume \
   --block-size 4MB \
   --big-file-size 1GB \
   --small-file-size 128KB \
@@ -277,7 +277,7 @@ studiofs bench /mnt/studio/myvolume \
 On Windows:
 
 ```powershell
-studiofs bench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
+studiofs devbench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
 `studiofs bench` must target an active StudioFS mount; direct cache-only runs
@@ -333,11 +333,11 @@ Use a mounted path for this recipe because it exercises namespace lookups, VFS
 policy, cache behavior, and small-read amplification together. Record a random
 access pattern with small files such as 4 KiB, 16 KiB, and 64 KiB, a 4 KiB read
 size, and enough concurrency/queue depth to expose metadata-sensitive latency.
-For the public command, reduce `--small-file-size`, increase
+For the developer command, reduce `--small-file-size`, increase
 `--small-file-count`, and keep the target inside the mounted tree:
 
 ```bash
-studiofs bench /mnt/studio/myvolume \
+studiofs devbench /mnt/studio/myvolume \
   --block-size 4KB \
   --big-file-size 64MB \
   --small-file-size 4KB \

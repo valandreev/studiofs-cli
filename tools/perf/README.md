@@ -7,7 +7,7 @@ This directory contains the repeatable perf harness we use for the current pass:
 
 The harness is intentionally built on top of `studiofs test-cache` instead of a second benchmark framework. That keeps the workload generator, JSON schema, profile artifacts, and write-path observability aligned with the product code we are changing.
 
-For cross-platform `studiofs bench` evidence capture, use the SFS-557
+For cross-platform `studiofs devbench` evidence capture, use the SFS-557
 validation scripts:
 
 - Windows: `validate-bench-windows.ps1`

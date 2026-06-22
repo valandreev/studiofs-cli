@@ -126,6 +126,7 @@ impl Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Bench(bench::BenchArgs),
+    Devbench(bench::DevbenchArgs),
     Init(init::InitArgs),
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
@@ -149,6 +150,7 @@ impl Commands {
     fn dispatch(self) -> anyhow::Result<()> {
         match self {
             Self::Bench(args) => args.dispatch(),
+            Self::Devbench(args) => args.dispatch(),
             Self::Init(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
@@ -225,9 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn bench_command_parses_juicefs_style_workload_flags() {
+    fn devbench_command_parses_juicefs_style_workload_flags() {
         let cli = parse_for_test(&[
-            "bench",
+            "devbench",
             "Z:\\",
             "--block-size",
             "4MB",
@@ -245,7 +247,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Bench(bench::BenchArgs {
+            Commands::Devbench(bench::DevbenchArgs {
                 mountpoint,
                 block_size,
                 big_file_size,
@@ -265,8 +267,30 @@ mod tests {
                     Some(std::path::PathBuf::from("reports\\bench.json"))
                 );
             }
+            other => panic!("expected Devbench command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_command_parses_public_mountpoint_only() {
+        let cli = parse_for_test(&["bench", "Z:\\"]).unwrap();
+
+        match cli.command {
+            Commands::Bench(bench::BenchArgs { mountpoint }) => {
+                assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
+            }
             other => panic!("expected Bench command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bench_command_rejects_devbench_workload_flags() {
+        let err = match parse_for_test(&["bench", "Z:\\", "--block-size", "4MB"]) {
+            Ok(_) => panic!("expected bench to reject devbench workload flags"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
