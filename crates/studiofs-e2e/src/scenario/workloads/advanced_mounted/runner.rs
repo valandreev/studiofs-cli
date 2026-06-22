@@ -697,10 +697,10 @@ pub(in crate::scenario) fn run_stale_remount_warm_history(
             path.as_str()
         };
         let target = (operation == "rename").then_some(rename_dest.as_str());
-        let helper_operation = if operation == "overwrite" {
-            "overwrite-barrier"
-        } else {
-            operation
+        let helper_operation = match operation {
+            "create" => "create-barrier-sync",
+            "overwrite" => "overwrite-barrier-sync",
+            _ => operation,
         };
         let recorded = timed_cold_observer_helper_fs_op(
             context,
@@ -841,10 +841,10 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
             path.as_str()
         };
         let target = (operation == "rename").then_some(rename_dest.as_str());
-        let helper_operation = if operation == "overwrite" {
-            "overwrite-barrier"
-        } else {
-            operation
+        let helper_operation = match operation {
+            "create" => "create-barrier-sync",
+            "overwrite" => "overwrite-barrier-sync",
+            _ => operation,
         };
         let operation_record = timed_cold_observer_helper_fs_op(
             context,
@@ -862,9 +862,9 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
         operations.push(operation_record);
         match operation {
             "create" if path == delete_target || path == rename_source => {
-                wait_for_mounted_initial_payloads_until(
+                wait_for_required_paths_visible_until(
                     clients,
-                    &[(&path, action.as_deref().expect(EXPECT_ACTION_PAYLOAD_MSG))],
+                    &[&path],
                     Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                     ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
                     "cold observer warm history",
@@ -1233,7 +1233,7 @@ pub(in crate::scenario) fn seed_mounted_chaos_initial_tree(
             &mounted_path,
             &String::from_utf8_lossy(payload),
         );
-        write_mounted_initial_file(
+        write_mounted_initial_file_sync_only(
             writer.mount_point.join(mounted_path),
             &payload,
             "mounted chaos initial tree",
@@ -1247,30 +1247,7 @@ pub(in crate::scenario) fn write_mounted_initial_file(
     payload: &[u8],
     label: &str,
 ) -> Result<(), ScenarioError> {
-    let write_path = path.clone();
-    let write_payload = payload.to_vec();
-    let write_label = label.to_string();
-    run_bounded_mounted_io(
-        format!("{label}: write {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || {
-            if let Some(parent) = write_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut options = mounted_write_barrier_open_options();
-            let mut file = options
-                .create_new(true)
-                .open(&write_path)
-                .map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("{write_label}: open {}: {error}", write_path.display()),
-                    )
-                })?;
-            file.write_all(&write_payload)?;
-            file.sync_all()
-        },
-    )?;
+    write_mounted_initial_file_sync_only(path.clone(), payload, label)?;
     let readback = wait_for_mounted_payload_readback(
         &path,
         payload,
@@ -1286,4 +1263,28 @@ pub(in crate::scenario) fn write_mounted_initial_file(
         ))));
     }
     Ok(())
+}
+
+pub(in crate::scenario) fn write_mounted_initial_file_sync_only(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    let write_payload = payload.to_vec();
+    let write_label = label.to_string();
+    let io_label = format!("{label}: write {}", path.display());
+    run_bounded_mounted_io(io_label, MOUNTED_WRITE_READBACK_TIMEOUT, move || {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut options = mounted_write_barrier_open_options();
+        let mut file = options.create_new(true).open(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{write_label}: open {}: {error}", path.display()),
+            )
+        })?;
+        file.write_all(&write_payload)?;
+        file.sync_all()
+    })
 }

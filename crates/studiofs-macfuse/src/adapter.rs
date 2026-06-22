@@ -22,6 +22,7 @@ use studiofs_bridge::posix::{
 use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::ResolvedSliceSource;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
+use studiofs_vfs::vfs::ReleaseFhOutcome;
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision,
@@ -1930,7 +1931,7 @@ impl StudioVfsAdapter {
     }
 
     /// Release a file handle opened through this adapter.
-    pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+    pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
         if self
             .runtime_stats_handles
             .lock()
@@ -1940,14 +1941,31 @@ impl StudioVfsAdapter {
             return Ok(());
         }
         let released_write_handle = self.write_capable_state.release_handle(file_handle);
-        let result = self
-            .runtime_handle
-            .block_on(self.vfs.release_fh_with_outcome(file_handle))
-            .map_err(|error| vfs_err_to_errno(&error));
+        let outcome_result = if self.vfs.inode_has_local_dirty_state(ino) {
+            self.runtime_handle
+                .block_on(self.vfs.release_fh_with_outcome(file_handle))
+                .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            Ok(self
+                .vfs
+                .release_fh_with_deferred_last_handle_barrier(file_handle, &self.runtime_handle))
+        };
+        self.finish_release(file_handle, released_write_handle, outcome_result)
+    }
+
+    fn finish_release(
+        &self,
+        file_handle: u64,
+        released_write_handle: Option<ReleasedWriteCapableHandle>,
+        outcome_result: Result<ReleaseFhOutcome, i32>,
+    ) -> Result<(), i32> {
         self.shared.read_windows.invalidate_handle(file_handle);
-        result?;
-        if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
-            self.clear_open_cache_snapshot(released.ino, "clean_write_release");
+        let outcome = outcome_result?;
+        if outcome.closed_last_handle {
+            if let Some(released) = released_write_handle.filter(|released| released.last_for_inode)
+            {
+                self.clear_open_cache_snapshot(released.ino, "clean_write_release");
+            }
         }
         Ok(())
     }
@@ -2451,6 +2469,7 @@ mod open_cache_snapshot_tests {
         MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
         StudioVfsAdapter,
     };
+    use std::sync::Arc;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
 
@@ -2513,6 +2532,121 @@ mod open_cache_snapshot_tests {
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
             "the first read-only open after a write must drop kernel pages before cache can be kept"
         );
+    }
+
+    #[test]
+    fn dirty_write_release_drains_last_handle_barrier_before_returning() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-deferred-release").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"deferred-release.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let opened = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open write-capable file");
+        let fh = opened.file_handle();
+        adapter
+            .write(attr.ino, fh, 0, b"deferred release payload")
+            .expect("write payload");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "test setup should leave unpublished local dirty state before release"
+        );
+
+        adapter.release(attr.ino, fh).expect("release writer");
+
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "dirty macFUSE release must drain the last-handle barrier before returning"
+        );
+    }
+
+    #[test]
+    fn failed_release_still_invalidates_read_window_handle() {
+        let fixture = ContractVfsFixture::new("macfuse-failed-release-read-window")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let ino = 42;
+        let file_handle = 7;
+        let generation = adapter.shared.read_windows.invalidation_generation(ino);
+        let mut window = Arc::clone(&adapter.shared.read_buffers).acquire(5);
+        window.copy_from_slice(b"stale");
+        assert!(adapter.shared.read_windows.remember_if_current(
+            file_handle,
+            ino,
+            0,
+            0,
+            window,
+            generation
+        ));
+        let mut out = [0_u8; 5];
+        assert_eq!(
+            adapter
+                .shared
+                .read_windows
+                .try_read(file_handle, ino, 0, &mut out),
+            Some(5)
+        );
+
+        let err = adapter
+            .finish_release(file_handle, None, Err(libc::EIO))
+            .expect_err("simulated release failure should propagate");
+
+        assert_eq!(err, libc::EIO);
+        assert_eq!(
+            adapter
+                .shared
+                .read_windows
+                .try_read(file_handle, ino, 0, &mut out),
+            None,
+            "release cleanup must invalidate read-window state even when VFS release fails"
+        );
+    }
+
+    #[test]
+    fn read_after_deferred_release_waits_for_last_handle_barrier() {
+        let fixture = ContractVfsFixture::new("macfuse-read-after-deferred-release")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"read-after-release.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let payload = b"read after deferred release";
+
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open write-capable file");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, payload)
+            .expect("write payload");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "test setup must make the file dirty before fsync"
+        );
+        fixture
+            .runtime()
+            .block_on(vfs.fsync(attr.ino, false))
+            .expect("fsync payload before deferred release");
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "fsync must clean local dirty state so release uses the deferred barrier path"
+        );
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer");
+
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader after deferred release");
+        let read = adapter
+            .read(attr.ino, reader.file_handle(), 0, payload.len() as u32)
+            .expect("read should wait for deferred release barrier");
+
+        assert_eq!(read, payload);
     }
 }
 

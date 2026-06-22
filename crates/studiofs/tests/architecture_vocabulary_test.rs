@@ -1164,7 +1164,7 @@ fn benchmark_validation_files_exist() {
 #[test]
 fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
     let combined = benchmark_validation_combined_text();
-    let normalized_combined = normalize_doc_whitespace(&combined);
+    let normalized_combined = normalize_doc_whitespace(combined);
     let required_terms = [
         "target/perf",
         "studiofs bench",
@@ -1207,7 +1207,7 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
     let missing_terms: Vec<_> = required_terms
         .iter()
         .copied()
-        .filter(|term| !contains_doc_term(&combined, &normalized_combined, term))
+        .filter(|term| !contains_doc_term(combined, &normalized_combined, term))
         .collect();
 
     assert!(
@@ -1220,7 +1220,7 @@ fn benchmark_validation_required_terms_cover_sfs557_cross_platform_contract() {
 #[test]
 fn benchmark_validation_scripts_avoid_review_blocked_terms() {
     let combined = benchmark_validation_combined_text();
-    let normalized_combined = normalize_doc_whitespace(&combined);
+    let normalized_combined = normalize_doc_whitespace(combined);
 
     let forbidden_terms = [
         "$args = @(",
@@ -1244,7 +1244,7 @@ fn benchmark_validation_scripts_avoid_review_blocked_terms() {
     let forbidden_hits: Vec<_> = forbidden_terms
         .iter()
         .copied()
-        .filter(|term| contains_doc_term(&combined, &normalized_combined, term))
+        .filter(|term| contains_doc_term(combined, &normalized_combined, term))
         .collect();
 
     assert!(

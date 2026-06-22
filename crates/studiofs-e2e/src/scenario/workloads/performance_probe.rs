@@ -428,6 +428,16 @@ fn seed_performance_probe_payload(
     runtime
         .block_on(vfs.flush(file_attr.ino))
         .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    let uploads_drained = runtime.block_on(vfs.wait_for_uploads_idle(config.upload_drain_timeout));
+    if !uploads_drained {
+        return Err(ScenarioError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "seeded performance probe uploads did not drain within {}ms",
+                config.upload_drain_timeout.as_millis()
+            ),
+        )));
+    }
     vfs_guard.shutdown();
     Ok(())
 }

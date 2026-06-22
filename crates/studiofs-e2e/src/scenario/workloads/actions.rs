@@ -639,6 +639,34 @@ pub fn run_hotspot_op_helper(
                 BarrierWriteMode::CreateNew,
             )?;
         }
+        "create-barrier-sync" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let payload = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            write_parented_with_barrier_sync_progress(
+                &path,
+                &payload,
+                progress,
+                operation,
+                target,
+                BarrierWriteMode::CreateNew,
+            )?;
+        }
         "overwrite-barrier" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
             record_hotspot_helper_progress(
@@ -659,6 +687,34 @@ pub fn run_hotspot_op_helper(
                 Some(payload.len()),
             )?;
             write_parented_with_barrier_progress(
+                &path,
+                &payload,
+                progress,
+                operation,
+                target,
+                BarrierWriteMode::Overwrite,
+            )?;
+        }
+        "overwrite-barrier-sync" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let payload = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            write_parented_with_barrier_sync_progress(
                 &path,
                 &payload,
                 progress,
@@ -1381,7 +1437,7 @@ pub(in crate::scenario) enum BarrierWriteMode {
     Overwrite,
 }
 
-pub(in crate::scenario) fn write_parented_with_barrier_progress(
+pub(in crate::scenario) fn write_parented_with_barrier_sync_progress(
     path: &Path,
     payload: &[u8],
     progress: Option<&Path>,
@@ -1453,8 +1509,18 @@ pub(in crate::scenario) fn write_parented_with_barrier_progress(
     )?;
     record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
     file.sync_all()?;
-    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)?;
-    drop(file);
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
+}
+
+pub(in crate::scenario) fn write_parented_with_barrier_progress(
+    path: &Path,
+    payload: &[u8],
+    progress: Option<&Path>,
+    operation: &str,
+    target: Option<&str>,
+    mode: BarrierWriteMode,
+) -> io::Result<()> {
+    write_parented_with_barrier_sync_progress(path, payload, progress, operation, target, mode)?;
     record_hotspot_helper_progress(progress, "before_readback", operation, path, target, None)?;
     let readback = wait_for_mounted_payload_readback(
         path,

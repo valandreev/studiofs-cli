@@ -685,10 +685,6 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
-            // Drop the registry entry before releasing the async guard so waiters cannot
-            // wake up and observe an unlocked but still-registered barrier.
-            let _guard = guard;
-            let _barrier = barrier;
             tokio::time::sleep(Duration::from_millis(1)).await;
             let session = vfs
                 .state
@@ -705,6 +701,10 @@ impl StudioVfs {
                     "deferred last-handle release barrier failed"
                 );
             }
+            // Drop the registry entry before releasing the async guard so waiters cannot
+            // wake up and observe an unlocked but still-registered barrier.
+            drop(barrier);
+            drop(guard);
         }));
         ReleaseFhOutcome {
             closed_last_handle: true,
@@ -1147,6 +1147,7 @@ impl StudioVfs {
                 "debug target read_into_fh before file-session gate"
             );
         }
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session

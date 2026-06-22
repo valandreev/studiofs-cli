@@ -49,6 +49,12 @@ S3-compatible backend.
 cargo build --release
 ```
 
+On macOS, `crates/studiofs-macfuse` still requires real macFUSE headers for
+Cargo builds and tests. The C shim includes an editor-only compatibility header
+so workspace diagnostics stay usable when `fuse_lowlevel.h` is absent, but the
+actual build continues to fail fast unless the system headers are discoverable
+via `pkg-config fuse` or standard Homebrew include locations.
+
 ## Checks
 
 ```bash

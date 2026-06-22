@@ -2161,6 +2161,14 @@ mod tests {
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release write-capable handle");
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "locally stable unpublished release should not seed a kernel cache observation"
+        );
+        fixture
+            .runtime()
+            .block_on(vfs.fsync(attr.ino, false))
+            .expect("follow-up sync should wait for deferred release materialization");
         let local_attr = vfs
             .getattr(attr.ino)
             .expect("read locally materialized file attr");
@@ -2174,10 +2182,6 @@ mod tests {
             "final release should drain dirty local state before a read-only cache observation"
         );
 
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "locally stable unpublished release should not seed a kernel cache observation"
-        );
         let read_after_local_release = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after local-stable write release");
