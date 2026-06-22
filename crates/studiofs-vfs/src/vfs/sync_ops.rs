@@ -674,8 +674,12 @@ impl StudioVfs {
             return ReleaseFhOutcome::default();
         };
         let ino = context.ino;
-        let flushed_local_dirty_state = self.inode_has_local_dirty_state(ino);
-        if self.take_ignored_entry_release_action(ino).is_some() {
+        let action = self.take_last_handle_release_action(&context);
+        let flushed_local_dirty_state = matches!(action, LastHandleReleaseAction::LocalSync { .. });
+        if matches!(
+            action,
+            LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
+        ) {
             self.state.file_session.gc_if_idle(ino);
             return ReleaseFhOutcome {
                 closed_last_handle: true,
@@ -691,7 +695,7 @@ impl StudioVfs {
                 .file_session
                 .enter_op(ino, FileSessionOperation::Release)
                 .await;
-            let result = vfs.release_last_handle_with_outcome(context).await;
+            let result = vfs.execute_last_handle_release_action(ino, action).await;
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
             if let Err(error) = result {

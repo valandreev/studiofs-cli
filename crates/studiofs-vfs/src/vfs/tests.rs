@@ -11650,6 +11650,36 @@ fn deferred_release_ignored_entry_skips_release_barrier() {
 }
 
 #[test]
+fn deferred_release_clean_entry_skips_release_barrier() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "clean-release-skips-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"clean-release-skips-barrier.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, ino, 0, b"clean release").await.unwrap();
+        vfs.fsync(ino, false).await.unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "fsync should make the release action clean"
+        );
+
+        let outcome = vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &tokio::runtime::Handle::current());
+
+        assert!(outcome.closed_last_handle);
+        assert!(!outcome.flushed_local_dirty_state);
+        assert!(
+            !vfs.state.deferred_release_inflight.contains(ino),
+            "clean last-handle release should not block follow-up reads on a no-op barrier"
+        );
+    });
+}
+
+#[test]
 fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");
