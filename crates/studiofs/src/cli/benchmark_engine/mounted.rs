@@ -80,6 +80,14 @@ const OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC: f64 = 1_000.0 * 1024.0 * 1
 const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET: f64 = 1.20;
 const MAX_TEST_WRITE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const SIZE_CLASS_SMALL: &str = "small";
+const SIZE_CLASS_MEDIUM: &str = "medium";
+const SIZE_CLASS_LARGE: &str = "large";
+const PHASE_DURING_UPLOAD_READ: &str = "during-upload-read";
+const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
+const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
+const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
+    "upload-drain-wait phase missing; using legacy post-upload-read fallback";
 
 struct MeasuredMountedPhaseResult {
     started: Instant,
@@ -1163,26 +1171,21 @@ fn mounted_post_upload_idle_report(
     let (phase, fallback_reason) = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "upload-drain-wait")
+        .find(|phase| phase.phase == PHASE_UPLOAD_DRAIN_WAIT)
         .map(|phase| (phase, None))
         .or_else(|| {
             comparison
                 .phases
                 .iter()
-                .find(|phase| phase.phase == "post-upload-read")
-                .map(|phase| {
-                    (
-                        phase,
-                        Some(
-                            "upload-drain-wait phase missing; using legacy post-upload-read fallback",
-                        ),
-                    )
-                })
+                .find(|phase| phase.phase == PHASE_POST_UPLOAD_READ)
+                .map(|phase| (phase, Some(LEGACY_POST_UPLOAD_READ_FALLBACK_REASON)))
         })?;
-    let reason = phase
-        .validation_message
-        .clone()
-        .or_else(|| fallback_reason.map(str::to_string));
+    let reason = match (phase.validation_message.as_deref(), fallback_reason) {
+        (Some(validation), Some(fallback)) => Some(format!("{validation} ({fallback})")),
+        (Some(validation), None) => Some(validation.to_string()),
+        (None, Some(fallback)) => Some(fallback.to_string()),
+        (None, None) => None,
+    };
     Some(MountedPostUploadIdleReport {
         observed: phase.target_state_observed,
         timed_out: !phase.target_state_observed,
@@ -1224,16 +1227,16 @@ fn log_skipped_public_bench_report(reason: &str) {
 }
 
 fn public_bench_large_file_size_bytes(workload: &WorkloadPlan, medium_max: u64) -> u64 {
-    let max_large_size = workload
-        .sizes
-        .iter()
-        .copied()
-        .filter(|size| *size > medium_max)
-        .max();
+    let mut max_overall = 0;
+    let mut max_large_size = None;
+    for &size in &workload.sizes {
+        max_overall = max_overall.max(size);
+        if size > medium_max {
+            max_large_size = Some(max_large_size.map_or(size, |max: u64| max.max(size)));
+        }
+    }
     max_large_size
-        .or_else(|| {
-            (workload.large_files > 0).then(|| workload.sizes.iter().copied().max().unwrap_or(0))
-        })
+        .or_else(|| (workload.large_files > 0).then_some(max_overall))
         .unwrap_or_default()
 }
 
@@ -1248,17 +1251,20 @@ fn build_public_bench_report(
 ) -> Option<PublicBenchReport> {
     debug_assert_eq!(params.command_name, "studiofs bench");
 
-    let Some(small_files) = size_class_report(&advanced_metrics.size_class_stats.writes, "small")
+    let Some(small_files) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_SMALL)
     else {
         log_skipped_public_bench_report("small write metrics missing");
         return None;
     };
-    let Some(medium_files) = size_class_report(&advanced_metrics.size_class_stats.writes, "medium")
+    let Some(medium_files) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_MEDIUM)
     else {
         log_skipped_public_bench_report("medium write metrics missing");
         return None;
     };
-    let Some(large_file) = size_class_report(&advanced_metrics.size_class_stats.writes, "large")
+    let Some(large_file) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_LARGE)
     else {
         log_skipped_public_bench_report("large write metrics missing");
         return None;
@@ -1275,7 +1281,7 @@ fn build_public_bench_report(
     let Some(during_upload) = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "during-upload-read")
+        .find(|phase| phase.phase == PHASE_DURING_UPLOAD_READ)
     else {
         log_skipped_public_bench_report("during-upload-read phase missing");
         return None;
@@ -2954,7 +2960,7 @@ mod tests {
                 wait_ms: 20.0,
                 pending_uploads_before: 2,
                 pending_uploads_after: 1,
-                validation_message: None,
+                validation_message: Some("idle observation came from fallback phase".to_string()),
                 results: test_op_report_with_operations_log(),
             }],
         };
@@ -3632,7 +3638,7 @@ mod tests {
                 wait_ms: 0.0,
                 pending_uploads_before: 0,
                 pending_uploads_after: 0,
-                validation_message: None,
+                validation_message: Some("idle observation came from fallback phase".to_string()),
                 results: super::super::result::OpReport {
                     operations: 1,
                     bytes: 8 * 1024 * 1024,
@@ -3656,7 +3662,9 @@ mod tests {
         assert_eq!(report.wait_ms, 0.0);
         assert_eq!(
             report.reason.as_deref(),
-            Some("upload-drain-wait phase missing; using legacy post-upload-read fallback")
+            Some(
+                "idle observation came from fallback phase (upload-drain-wait phase missing; using legacy post-upload-read fallback)"
+            )
         );
     }
 
