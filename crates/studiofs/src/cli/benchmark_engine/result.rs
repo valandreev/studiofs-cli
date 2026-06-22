@@ -8,7 +8,7 @@ use studiofs_vfs::{
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
 };
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct OpReport {
     pub(crate) operations: u64,
     pub(crate) bytes: u64,
@@ -23,7 +23,7 @@ pub(crate) struct OpReport {
     pub(crate) operations_log: Vec<OperationLogReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct OperationLogReport {
     pub(crate) operation_index: u64,
     pub(crate) work_index: usize,

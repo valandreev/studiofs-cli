@@ -1180,14 +1180,26 @@ fn mounted_post_upload_idle_report(
     })
 }
 
-fn size_class_report(reports: &[SizeClassOpReport], class: &str) -> Option<SizeClassOpReport> {
-    reports.iter().find(|report| report.class == class).cloned()
+fn size_class_report<'a>(
+    reports: &'a [SizeClassOpReport],
+    class: &str,
+) -> Option<&'a SizeClassOpReport> {
+    reports.iter().find(|report| report.class == class)
 }
 
 fn compact_op_report(report: &OpReport) -> OpReport {
-    let mut report = report.clone();
-    report.operations_log.clear();
-    report
+    OpReport {
+        operations: report.operations,
+        bytes: report.bytes,
+        elapsed_ms: report.elapsed_ms,
+        avg_latency_ms: report.avg_latency_ms,
+        p50_ms: report.p50_ms,
+        p95_ms: report.p95_ms,
+        p99_ms: report.p99_ms,
+        throughput_bytes_per_sec: report.throughput_bytes_per_sec,
+        latency_histogram: report.latency_histogram.clone(),
+        operations_log: Vec::new(),
+    }
 }
 
 fn log_skipped_public_bench_report(reason: &str) {
@@ -1198,8 +1210,8 @@ fn log_skipped_public_bench_report(reason: &str) {
     );
 }
 
-// Builds the compact public `studiofs bench` summary. Missing mounted upload
-// evidence is non-fatal, but the omission is logged for report debugging.
+// Builds the compact public `studiofs bench` summary. The caller gates this to
+// the public command; missing mounted upload evidence is logged for debugging.
 fn build_public_bench_report(
     params: &BenchmarkConfig,
     workload: &WorkloadPlan,
@@ -1207,9 +1219,7 @@ fn build_public_bench_report(
     comparison: Option<&MountedLocalFirstReadComparisonReport>,
     post_upload_idle: Option<&MountedPostUploadIdleReport>,
 ) -> Option<PublicBenchReport> {
-    if params.command_name != "studiofs bench" {
-        return None;
-    }
+    debug_assert_eq!(params.command_name, "studiofs bench");
 
     let Some(small_files) = size_class_report(&advanced_metrics.size_class_stats.writes, "small")
     else {
@@ -1227,9 +1237,9 @@ fn build_public_bench_report(
         return None;
     };
     let write_metrics = PublicBenchWriteMetricsReport {
-        small_files,
-        medium_files,
-        large_file,
+        small_files: small_files.clone(),
+        medium_files: medium_files.clone(),
+        large_file: large_file.clone(),
     };
     let Some(comparison) = comparison else {
         log_skipped_public_bench_report("local-first read comparison missing");
