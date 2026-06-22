@@ -149,9 +149,6 @@ fn build_bench_config(
             "--big-file-size must be greater than --small-file-size"
         ));
     }
-    if block_size > big_file_size {
-        return Err(anyhow!("--block-size must be <= --big-file-size"));
-    }
     let mut sizes = Vec::with_capacity(args.small_file_count.saturating_add(1));
     sizes.push(big_file_size);
     sizes.extend(std::iter::repeat_n(small_file_size, args.small_file_count));
@@ -411,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn bench_config_rejects_block_size_larger_than_big_file_size() {
+    fn bench_config_allows_block_size_larger_than_big_file_size() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
             block_size: "2GB".to_string(),
@@ -422,12 +419,9 @@ mod tests {
             json_output: None,
         };
 
-        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
+        let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("--block-size must be <= --big-file-size")
-        );
+        assert_eq!(config.block_size, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
