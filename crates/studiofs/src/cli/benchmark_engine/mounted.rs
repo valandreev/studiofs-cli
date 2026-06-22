@@ -39,8 +39,8 @@ use super::telemetry::{
 };
 use super::workload::{
     SizeClass, SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
-    build_work_sizes, classify_size, deterministic_bytes, fill_deterministic_bytes,
-    public_bench_workload, split_stream_segments,
+    build_work_sizes, classify_size, fill_deterministic_bytes, public_bench_workload,
+    split_stream_segments,
 };
 use super::{BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY};
 use studiofs_vfs::{RUNTIME_STATS_FILE_NAME_STR, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
@@ -80,6 +80,7 @@ const OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC: f64 = 1_000.0 * 1024.0 * 1
 const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET: f64 = 1.20;
 const MAX_TEST_WRITE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const PUBLIC_BENCH_LARGE_READ_LIMIT_BYTES: u64 = 1024 * 1024;
 const SIZE_CLASS_SMALL: &str = "small";
 const SIZE_CLASS_MEDIUM: &str = "medium";
 const SIZE_CLASS_LARGE: &str = "large";
@@ -1615,7 +1616,7 @@ fn public_bench_read_operations(
                     } else {
                         0
                     },
-                    bytes_to_read: is_large.then_some(1024 * 1024),
+                    bytes_to_read: is_large.then_some(PUBLIC_BENCH_LARGE_READ_LIMIT_BYTES),
                 });
             }
             operations
@@ -1713,6 +1714,7 @@ fn validate_deterministic_read_chunk(
     Ok(())
 }
 
+#[cfg(test)]
 async fn read_file_with_plan(
     path: &Path,
     plan: MountedReadPlan,
@@ -1720,7 +1722,16 @@ async fn read_file_with_plan(
     start_offset: u64,
 ) -> Result<u64> {
     let mut buffer = Vec::new();
-    read_file_with_plan_using_buffer(path, plan, validation, start_offset, &mut buffer).await
+    let mut expected_cycle = Vec::new();
+    read_file_with_plan_using_buffer(
+        path,
+        plan,
+        validation,
+        start_offset,
+        &mut buffer,
+        &mut expected_cycle,
+    )
+    .await
 }
 
 async fn read_file_with_plan_using_buffer(
@@ -1729,6 +1740,7 @@ async fn read_file_with_plan_using_buffer(
     validation: MountedReadValidation,
     start_offset: u64,
     buffer: &mut Vec<u8>,
+    expected_cycle: &mut Vec<u8>,
 ) -> Result<u64> {
     let mut input = fs::File::open(path)
         .await
@@ -1744,7 +1756,11 @@ async fn read_file_with_plan_using_buffer(
     }
 
     buffer.resize(plan.chunk_size, 0);
-    let expected_cycle = deterministic_bytes(validation.write_chunk_size.max(1), validation.seed);
+    fill_deterministic_bytes(
+        expected_cycle,
+        validation.write_chunk_size.max(1),
+        validation.seed,
+    );
     let mut remaining = plan.bytes_to_read;
     let mut offset = start_offset;
     while remaining > 0 {
@@ -1753,7 +1769,7 @@ async fn read_file_with_plan_using_buffer(
             .read_exact(&mut buffer[..len])
             .await
             .with_context(|| format!("read {}", path.display()))?;
-        validate_deterministic_read_chunk(path, &buffer[..len], offset, &expected_cycle)?;
+        validate_deterministic_read_chunk(path, &buffer[..len], offset, expected_cycle)?;
         remaining -= len as u64;
         offset = offset.saturating_add(len as u64);
     }
@@ -2176,6 +2192,7 @@ async fn run_filesystem_reads(
             let mut telemetry = PhaseTelemetry::default();
             let mut read_buffer =
                 Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
+            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
@@ -2206,6 +2223,7 @@ async fn run_filesystem_reads(
                     validation,
                     0,
                     &mut read_buffer,
+                    &mut expected_cycle,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2269,6 +2287,7 @@ async fn run_filesystem_read_operations(
             let mut telemetry = PhaseTelemetry::default();
             let mut read_buffer =
                 Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
+            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 let Some(operation) = operations.get(op_index) else {
@@ -2299,6 +2318,7 @@ async fn run_filesystem_read_operations(
                     validation,
                     operation.offset,
                     &mut read_buffer,
+                    &mut expected_cycle,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2421,6 +2441,9 @@ async fn run_filesystem_reads_sequential_streams(
         let progress = progress.clone();
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
+            let mut read_buffer =
+                Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
+            let mut expected_cycle = Vec::with_capacity(read_options.write_chunk_size);
             for work_index in segment {
                 let item = &files[work_index];
                 let read_plan = mounted_read_plan(
@@ -2438,9 +2461,16 @@ async fn run_filesystem_reads_sequential_streams(
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
-                let bytes_read = read_file_with_plan(&item.path, read_plan, validation, 0)
-                    .await
-                    .with_context(|| format!("read {}", item.path.display()))?;
+                let bytes_read = read_file_with_plan_using_buffer(
+                    &item.path,
+                    read_plan,
+                    validation,
+                    0,
+                    &mut read_buffer,
+                    &mut expected_cycle,
+                )
+                .await
+                .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     item.size,
