@@ -757,6 +757,116 @@ fn hotspot_overwrite_can_use_barrier_helper_while_recording_overwrite() {
 }
 
 #[test]
+fn hotspot_overwrite_barrier_sync_skips_inline_readback() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let sandbox = temp.path().join("run-helper-barrier-sync");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    let client = client_spec_for(&sandbox, "projectfs", "client-a", mount.clone());
+    let context = ScenarioContext {
+        run_id: "run-helper-barrier-sync".to_string(),
+        seed: 415,
+        sandbox,
+        scenario_dir: scenario_dir.clone(),
+        client_controller_config: None,
+    };
+
+    let record = timed_hotspot_helper_fs_op_with_helper(
+        &context,
+        Instant::now(),
+        1,
+        &client,
+        "overwrite",
+        "overwrite-barrier-sync",
+        "hotspot/slot-1.txt",
+        Duration::from_secs(5),
+        Some(b"barrier sync payload"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(record.operation, "overwrite");
+    assert_eq!(record.result, "accepted");
+    assert_eq!(
+        std::fs::read(mount.join("hotspot").join("slot-1.txt")).unwrap(),
+        b"barrier sync payload"
+    );
+
+    let progress_dir = scenario_dir.join("hotspot-helper-progress");
+    let progress_file = std::fs::read_dir(progress_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("overwrite-barrier-sync"))
+        .expect("barrier sync helper progress file");
+    let progress_log = std::fs::read_to_string(progress_file).unwrap();
+    assert!(progress_log.contains("\"phase\":\"before_open_barrier_write\""));
+    assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+    assert!(!progress_log.contains("\"phase\":\"before_readback\""));
+    assert!(!progress_log.contains("\"phase\":\"after_readback\""));
+    assert!(progress_log.contains("\"phase\":\"completed\""));
+}
+
+#[test]
+fn hotspot_create_barrier_sync_skips_inline_readback() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let sandbox = temp.path().join("run-helper-create-barrier-sync");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    let client = client_spec_for(&sandbox, "projectfs", "client-a", mount.clone());
+    let context = ScenarioContext {
+        run_id: "run-helper-create-barrier-sync".to_string(),
+        seed: 416,
+        sandbox,
+        scenario_dir: scenario_dir.clone(),
+        client_controller_config: None,
+    };
+
+    let record = timed_hotspot_helper_fs_op_with_helper(
+        &context,
+        Instant::now(),
+        1,
+        &client,
+        "create",
+        "create-barrier-sync",
+        "hotspot/created.txt",
+        Duration::from_secs(5),
+        Some(b"barrier sync create payload"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(record.operation, "create");
+    assert_eq!(record.result, "accepted");
+    assert_eq!(
+        std::fs::read(mount.join("hotspot").join("created.txt")).unwrap(),
+        b"barrier sync create payload"
+    );
+
+    let progress_dir = scenario_dir.join("hotspot-helper-progress");
+    let progress_file = std::fs::read_dir(progress_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("create-barrier-sync"))
+        .expect("barrier sync create helper progress file");
+    let progress_log = std::fs::read_to_string(progress_file).unwrap();
+    assert!(progress_log.contains("\"phase\":\"before_open_barrier_write\""));
+    assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+    assert!(!progress_log.contains("\"phase\":\"before_readback\""));
+    assert!(!progress_log.contains("\"phase\":\"after_readback\""));
+    assert!(progress_log.contains("\"phase\":\"completed\""));
+}
+
+#[test]
 fn hotspot_helper_stat_records_exact_metadata_probe() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");

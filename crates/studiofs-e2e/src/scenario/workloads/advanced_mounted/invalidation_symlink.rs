@@ -123,7 +123,7 @@ pub(in crate::scenario) fn run_invalidation_dropout_fallback_operations(
             context,
             MOUNTED_WRITE_READBACK_TIMEOUT,
             writer_b,
-            "overwrite-barrier",
+            "overwrite-barrier-sync",
             &target_path,
             None,
             Some(&final_payload),

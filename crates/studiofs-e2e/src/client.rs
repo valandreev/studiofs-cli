@@ -173,12 +173,20 @@ impl ClientControllerConfig {
                 region: "us-east-1".to_string(),
             },
             mount_ready_timeout: Duration::from_secs(30),
-            mount_exit_timeout: Duration::from_secs(15),
+            mount_exit_timeout: default_compose_mount_exit_timeout(),
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
         })
+    }
+}
+
+fn default_compose_mount_exit_timeout() -> Duration {
+    if cfg!(target_os = "macos") {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(15)
     }
 }
 
@@ -2358,6 +2366,17 @@ mod tests {
         ));
         assert!(message.contains("client-a"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn compose_mount_exit_timeout_matches_platform_policy() {
+        let timeout = default_compose_mount_exit_timeout();
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(timeout, Duration::from_secs(60));
+        } else {
+            assert_eq!(timeout, Duration::from_secs(15));
+        }
     }
 
     #[cfg(target_os = "macos")]

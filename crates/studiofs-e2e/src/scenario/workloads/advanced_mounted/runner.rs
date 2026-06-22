@@ -697,10 +697,10 @@ pub(in crate::scenario) fn run_stale_remount_warm_history(
             path.as_str()
         };
         let target = (operation == "rename").then_some(rename_dest.as_str());
-        let helper_operation = if operation == "overwrite" {
-            "overwrite-barrier"
-        } else {
-            operation
+        let helper_operation = match operation {
+            "create" => "create-barrier-sync",
+            "overwrite" => "overwrite-barrier-sync",
+            _ => operation,
         };
         let recorded = timed_cold_observer_helper_fs_op(
             context,
@@ -841,10 +841,10 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
             path.as_str()
         };
         let target = (operation == "rename").then_some(rename_dest.as_str());
-        let helper_operation = if operation == "overwrite" {
-            "overwrite-barrier"
-        } else {
-            operation
+        let helper_operation = match operation {
+            "create" => "create-barrier-sync",
+            "overwrite" => "overwrite-barrier-sync",
+            _ => operation,
         };
         let operation_record = timed_cold_observer_helper_fs_op(
             context,
@@ -862,9 +862,9 @@ pub(in crate::scenario) fn run_cold_observer_warm_history(
         operations.push(operation_record);
         match operation {
             "create" if path == delete_target || path == rename_source => {
-                wait_for_mounted_initial_payloads_until(
+                wait_for_required_paths_visible_until(
                     clients,
-                    &[(&path, action.as_deref().expect(EXPECT_ACTION_PAYLOAD_MSG))],
+                    &[&path],
                     Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                     ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
                     "cold observer warm history",
@@ -1233,7 +1233,7 @@ pub(in crate::scenario) fn seed_mounted_chaos_initial_tree(
             &mounted_path,
             &String::from_utf8_lossy(payload),
         );
-        write_mounted_initial_file(
+        write_mounted_initial_file_sync_only(
             writer.mount_point.join(mounted_path),
             &payload,
             "mounted chaos initial tree",
@@ -1243,6 +1243,29 @@ pub(in crate::scenario) fn seed_mounted_chaos_initial_tree(
 }
 
 pub(in crate::scenario) fn write_mounted_initial_file(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    write_mounted_initial_file_sync_only(path.clone(), payload, label)?;
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
+pub(in crate::scenario) fn write_mounted_initial_file_sync_only(
     path: PathBuf,
     payload: &[u8],
     label: &str,
@@ -1270,20 +1293,5 @@ pub(in crate::scenario) fn write_mounted_initial_file(
             file.write_all(&write_payload)?;
             file.sync_all()
         },
-    )?;
-    let readback = wait_for_mounted_payload_readback(
-        &path,
-        payload,
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )?;
-    if readback != payload {
-        return Err(ScenarioError::Io(io::Error::other(format!(
-            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
-            path.display(),
-            payload.len(),
-            readback.len()
-        ))));
-    }
-    Ok(())
+    )
 }
