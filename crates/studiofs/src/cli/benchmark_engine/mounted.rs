@@ -1552,9 +1552,13 @@ fn mounted_read_plan_for_operation(
 ) -> MountedReadPlan {
     let mut plan = mounted_read_plan(file_size, read_size, full_file_read);
     if let Some(bytes_to_read) = bytes_to_read {
-        plan.bytes_to_read = bytes_to_read.min(file_size).max(1);
+        plan.bytes_to_read = bytes_to_read.min(file_size);
     }
     plan
+}
+
+fn mounted_read_worker_count(concurrency: usize, operation_count: usize) -> usize {
+    concurrency.max(1).min(operation_count)
 }
 
 fn public_bench_read_operations(
@@ -1595,15 +1599,15 @@ fn public_bench_read_operations(
                 let Some(file) = workload_files.get(work_index) else {
                     continue;
                 };
-                let is_large = work_index == large_work_index
-                    || classify_size(
-                        file.size,
-                        size_class_bounds.small_max,
-                        size_class_bounds.medium_max,
-                    ) == SizeClass::Large;
+                let is_large = classify_size(
+                    file.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                ) == SizeClass::Large;
+                let is_designated_large = work_index == large_work_index;
                 operations.push(MountedReadOperation {
                     work_index,
-                    offset: if is_large {
+                    offset: if is_designated_large {
                         large_offsets
                             .next()
                             .unwrap_or(0)
@@ -1681,7 +1685,8 @@ fn validate_deterministic_read_chunk(
 
     let mut checked = 0usize;
     while checked < actual.len() {
-        let cycle_offset = ((file_offset as usize).wrapping_add(checked)) % expected_cycle.len();
+        let cycle_offset =
+            (file_offset.saturating_add(checked as u64) % expected_cycle.len() as u64) as usize;
         let take = (actual.len() - checked).min(expected_cycle.len() - cycle_offset);
         let actual_part = &actual[checked..checked + take];
         let expected_part = &expected_cycle[cycle_offset..cycle_offset + take];
@@ -1714,6 +1719,17 @@ async fn read_file_with_plan(
     validation: MountedReadValidation,
     start_offset: u64,
 ) -> Result<u64> {
+    let mut buffer = Vec::new();
+    read_file_with_plan_using_buffer(path, plan, validation, start_offset, &mut buffer).await
+}
+
+async fn read_file_with_plan_using_buffer(
+    path: &Path,
+    plan: MountedReadPlan,
+    validation: MountedReadValidation,
+    start_offset: u64,
+    buffer: &mut Vec<u8>,
+) -> Result<u64> {
     let mut input = fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
@@ -1727,7 +1743,7 @@ async fn read_file_with_plan(
             .with_context(|| format!("seek {}", path.display()))?;
     }
 
-    let mut buffer = vec![0u8; plan.chunk_size];
+    buffer.resize(plan.chunk_size, 0);
     let expected_cycle = deterministic_bytes(validation.write_chunk_size.max(1), validation.seed);
     let mut remaining = plan.bytes_to_read;
     let mut offset = start_offset;
@@ -2158,6 +2174,8 @@ async fn run_filesystem_reads(
 
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
+            let mut read_buffer =
+                Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 if op_index >= order.len() {
@@ -2182,9 +2200,15 @@ async fn run_filesystem_reads(
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
-                let bytes_read = read_file_with_plan(&item.path, read_plan, validation, 0)
-                    .await
-                    .with_context(|| format!("read {}", item.path.display()))?;
+                let bytes_read = read_file_with_plan_using_buffer(
+                    &item.path,
+                    read_plan,
+                    validation,
+                    0,
+                    &mut read_buffer,
+                )
+                .await
+                .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     item.size,
@@ -2227,7 +2251,7 @@ async fn run_filesystem_read_operations(
         return Ok(PhaseTelemetry::default());
     }
     let queue_depth = io_depth.max(1);
-    let worker_count = concurrency.max(queue_depth).min(operations.len());
+    let worker_count = mounted_read_worker_count(concurrency, operations.len());
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let operations: Arc<[MountedReadOperation]> = Arc::from(operations);
@@ -2243,6 +2267,8 @@ async fn run_filesystem_read_operations(
 
         join_set.spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
+            let mut read_buffer =
+                Vec::with_capacity(mounted_read_chunk_size(read_options.read_size));
             loop {
                 let op_index = counter.fetch_add(1, Ordering::Relaxed);
                 let Some(operation) = operations.get(op_index) else {
@@ -2267,10 +2293,15 @@ async fn run_filesystem_read_operations(
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
-                let bytes_read =
-                    read_file_with_plan(&item.path, read_plan, validation, operation.offset)
-                        .await
-                        .with_context(|| format!("read {}", item.path.display()))?;
+                let bytes_read = read_file_with_plan_using_buffer(
+                    &item.path,
+                    read_plan,
+                    validation,
+                    operation.offset,
+                    &mut read_buffer,
+                )
+                .await
+                .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     item.size,
@@ -3512,6 +3543,67 @@ mod tests {
             vec![1000, 1001, 1002, 1003]
         );
         assert!(medium.iter().all(|op| op.offset == 0));
+    }
+
+    #[test]
+    fn mounted_read_plan_for_operation_allows_zero_remaining_bytes() {
+        let plan = mounted_read_plan_for_operation(0, 1024, false, Some(1024));
+
+        assert_eq!(plan.bytes_to_read, 0);
+    }
+
+    #[test]
+    fn mounted_read_worker_count_honors_concurrency_below_io_depth() {
+        let workers = mounted_read_worker_count(1, 32);
+
+        assert_eq!(workers, 1);
+    }
+
+    #[test]
+    fn public_bench_large_offsets_do_not_drift_when_custom_bounds_classify_all_files_large() {
+        let workload = public_bench_workload();
+        let files = build_file_worklist(&workload.file_sizes(), Path::new("Z:/bench"));
+        let operations = public_bench_read_operations(
+            PublicBenchReadPhaseKind::PseudoRandom,
+            &files,
+            SizeClassBounds {
+                small_max: 0,
+                medium_max: 0,
+            },
+        );
+
+        let designated_large = operations
+            .iter()
+            .find(|operation| operation.work_index == workload.large_file.index)
+            .expect("designated large operation");
+
+        assert_eq!(designated_large.offset, workload.large_file_read_offsets[0]);
+        assert!(
+            operations
+                .iter()
+                .take_while(|operation| operation.work_index != workload.large_file.index)
+                .all(|operation| operation.offset == 0)
+        );
+    }
+
+    #[test]
+    fn validate_deterministic_read_chunk_uses_full_u64_offset_before_modulo() {
+        let expected_cycle = [0u8, 1, 2, 3, 4, 5, 6];
+        let file_offset = u64::from(u32::MAX) + 2;
+        let actual: Vec<u8> = (0..3)
+            .map(|checked| {
+                let offset = (file_offset + checked) % expected_cycle.len() as u64;
+                expected_cycle[offset as usize]
+            })
+            .collect();
+
+        validate_deterministic_read_chunk(
+            Path::new("Z:/bench/large.bin"),
+            &actual,
+            file_offset,
+            &expected_cycle,
+        )
+        .expect("u64-offset validation should not truncate on 32-bit-sized offsets");
     }
 
     #[test]
