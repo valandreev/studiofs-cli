@@ -187,13 +187,13 @@ fn sparse_payload_corpus_runs_multiple_orderings() {
 #[test]
 fn sparse_payload_counterexample_artifact_replays_with_range_operations() {
     let artifact_root = unique_temp_dir("sfs396-sparse-payload-counterexample");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::SparsePayloadChaos),
         seed: Some(2),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("sparse payload corpus writes counterexample");
@@ -231,6 +231,6 @@ fn sparse_payload_counterexample_artifact_replays_with_range_operations() {
     assert_eq!(replay.violated_invariant, "injected_counterexample");
 }
 
-fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-    studiofs_test_support::workspace_target_temp_path(&format!("{name}-"))
+fn unique_temp_dir(name: &str) -> tempfile::TempDir {
+    studiofs_test_support::workspace_target_tempdir(&format!("{name}-"))
 }

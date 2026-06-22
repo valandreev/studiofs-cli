@@ -123,10 +123,11 @@ foreground read path.
   parameters, and returns the existing benchmark report schema.
 - The hidden legacy `test-cache` command delegates mounted end-to-end runs to
   this engine while keeping direct-shim behavior private to the legacy command.
-- Future `studiofs bench` commands should call the mounted engine instead of
-  reimplementing workload planning, latency sampling, phase aggregation,
+- `studiofs bench` and `studiofs devbench` both call the mounted engine instead
+  of reimplementing workload planning, latency sampling, phase aggregation,
   profiling artifact collection, JSON reporting, or mounted observability
-  capture.
+  capture. `bench` keeps the public workload fixed; `devbench` keeps the
+  developer tuning flags.
 
 ## Concurrency Model
 

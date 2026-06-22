@@ -16,10 +16,11 @@ mounted StudioFS volume. It is observer only: it reads the mounted
 `.studiofs-runtime-stats` file, computes rates and gauge values, and does not
 create files or run workloads.
 
-Use `studiofs bench` when you need a mounted filesystem benchmark report. The
-target must be inside an active StudioFS mount so the run includes bridge
-callbacks, namespace lookup, VFS policy, cache behavior, object IO, upload
-drain behavior, and runtime stats capture.
+Use `studiofs bench` when you need the fixed public mounted filesystem
+benchmark report. Use `studiofs devbench` when you need to tune the developer
+workload shape. The target must be inside an active StudioFS mount so the run
+includes bridge callbacks, namespace lookup, VFS policy, cache behavior, object
+IO, upload drain behavior, and runtime stats capture.
 
 Treat the legacy test-cache path as an internal developer diagnostic. It may
 still help isolate direct cache behavior during development, but it is not the
@@ -35,7 +36,7 @@ user-facing benchmark workflow and should not be used as parity evidence.
    producer compatibility.
 4. Run a short `studiofs perf <mountpoint> --json-lines --count 5` sample when
    you need live counters around a manual workload.
-5. Run `studiofs bench <mountpoint>` for reproducible mounted workload
+5. Run `studiofs bench <mountpoint>` for fixed public mounted workload
    evidence.
 6. Collect at least three runs for each workload shape before making a parity
    claim.
@@ -45,10 +46,11 @@ user-facing benchmark workflow and should not be used as parity evidence.
 8. Archive the JSON report, terminal output, command line, git revision, and
    any manual notes needed to explain cache warm-up or platform differences.
 
-By default `studiofs bench` writes a JSON report under `target/perf` and prints
-the final report path. Passing `--json-output <file-or-dir>` selects a specific
-file or output directory. Keep generated artifacts under `target/` so they stay
-outside source control and are easy to clean after the investigation.
+By default the benchmark command writes a JSON report under `target/perf` and
+prints the final report path. Passing `--json-output <file-or-dir>` to
+`studiofs devbench` selects a specific file or output directory. Keep generated
+artifacts under `target/` so they stay outside source control and are easy to
+clean after the investigation.
 
 ## Report Interpretation
 
@@ -78,15 +80,15 @@ Do not treat missing runtime stats as zero activity.
 Platform examples:
 
 ```powershell
-studiofs bench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
+studiofs devbench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
 ```sh
-studiofs bench /Volumes/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
+studiofs devbench /Volumes/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
 ```sh
-studiofs bench /mnt/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
+studiofs devbench /mnt/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
 Compare StudioFS runs only when the same workload shape is preserved:
@@ -143,7 +145,7 @@ changed area, for example:
 
 ```bash
 cargo test -p studiofs perf -- --nocapture
-cargo test -p studiofs bench_command_parses_juicefs_style_workload_flags -- --nocapture
+cargo test -p studiofs devbench_command_parses_juicefs_style_workload_flags -- --nocapture
 cargo test -p studiofs-vfs runtime_stats_ --lib
 ```
 

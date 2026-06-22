@@ -5006,6 +5006,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studiofs-test-support",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

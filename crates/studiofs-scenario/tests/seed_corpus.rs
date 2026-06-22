@@ -134,12 +134,12 @@ fn cold_observer_long_history_corpus_runs_seed_variants_and_replays_counterexamp
     );
 
     let artifact_root = unique_temp_dir("sfs397-cold-observer-counterexample");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::ColdObserverLongHistory),
         seed: Some(13),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("cold observer corpus writes failure artifact");
@@ -195,12 +195,12 @@ fn invalidation_dropout_fallback_sync_corpus_models_lossy_hints_and_replays_coun
     );
 
     let artifact_root = unique_temp_dir("sfs398-invalidation-dropout-counterexample");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::InvalidationDropoutFallbackSync),
         seed: Some(12),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("invalidation dropout corpus writes failure artifact");
@@ -261,12 +261,12 @@ fn auxiliary_metadata_corpus_models_symlink_xattr_capability_gates_and_replays_c
     );
 
     let artifact_root = unique_temp_dir("sfs399-auxiliary-metadata-counterexample");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::AuxiliaryMetadataConvergence),
         seed: Some(14),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("auxiliary metadata corpus writes failure artifact");
@@ -316,13 +316,13 @@ fn auxiliary_metadata_corpus_models_symlink_xattr_capability_gates_and_replays_c
 #[test]
 fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
     let artifact_root = unique_temp_dir("sfs340-corpus-counterexamples");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::CrashRestartReplay),
         seed: Some(13),
-        artifact_root: Some(artifact_root.clone()),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("corpus runs and writes artifacts");
@@ -353,13 +353,13 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
         SimulationScenarioGroup::AuxiliaryMetadataConvergence,
     ] {
         let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
-        std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+        std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
         let report = run_simulation_corpus(SimulationCorpusOptions {
             kind: SimulationCorpusKind::Fast,
             group: Some(group),
             seed: Some(13),
-            artifact_root: Some(artifact_root),
+            artifact_root: Some(artifact_root.path().to_path_buf()),
             inject_failure: true,
         })
         .expect("corpus writes failure artifacts");
@@ -382,13 +382,13 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
 #[test]
 fn namespace_corpus_counterexample_replays_exactly_from_artifact_path() {
     let artifact_root = unique_temp_dir("sfs359-namespace-counterexample-replay");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::NamespaceCollisions),
         seed: Some(13),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("corpus writes failure artifacts");
@@ -427,8 +427,8 @@ fn namespace_corpus_counterexample_replays_exactly_from_artifact_path() {
 #[test]
 fn legacy_v1_simulation_counterexample_artifact_is_rejected_by_schema_before_full_parse() {
     let artifact_root = unique_temp_dir("sfs359-v1-artifact-rejection");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
-    let artifact_path = artifact_root.join("legacy-v1.json");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
+    let artifact_path = artifact_root.path().join("legacy-v1.json");
     std::fs::write(
         &artifact_path,
         serde_json::json!({
@@ -459,13 +459,13 @@ fn legacy_v1_simulation_counterexample_artifact_is_rejected_by_schema_before_ful
 #[test]
 fn simulation_counterexample_replay_rejects_trace_drift() {
     let artifact_root = unique_temp_dir("sfs359-namespace-counterexample-drift");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::NamespaceCollisions),
         seed: Some(13),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("corpus writes failure artifacts");
@@ -495,13 +495,13 @@ fn simulation_counterexample_replay_rejects_trace_drift() {
 #[test]
 fn object_store_counterexample_artifact_includes_snapshot() {
     let artifact_root = unique_temp_dir("sfs359-object-store-counterexample-snapshot");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::ObjectStoreOutage),
         seed: Some(13),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("corpus writes failure artifacts");
@@ -531,7 +531,7 @@ fn cli_runs_one_seed_and_reports_group_seed_and_artifact_root() {
             "2",
             "--artifact-root",
         ])
-        .arg(&artifact_root)
+        .arg(artifact_root.path())
         .output()
         .expect("run studiofs-scenario CLI");
 
@@ -550,13 +550,13 @@ fn cli_runs_one_seed_and_reports_group_seed_and_artifact_root() {
 #[test]
 fn cli_replays_saved_simulation_counterexample_artifact() {
     let artifact_root = unique_temp_dir("sfs359-cli-replay-artifacts");
-    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    std::fs::create_dir_all(artifact_root.path()).expect("create artifact root");
 
     let report = run_simulation_corpus(SimulationCorpusOptions {
         kind: SimulationCorpusKind::Fast,
         group: Some(SimulationScenarioGroup::NamespaceCollisions),
         seed: Some(13),
-        artifact_root: Some(artifact_root),
+        artifact_root: Some(artifact_root.path().to_path_buf()),
         inject_failure: true,
     })
     .expect("corpus writes failure artifacts");
@@ -582,6 +582,6 @@ fn cli_replays_saved_simulation_counterexample_artifact() {
     assert!(stdout.contains("group namespace-collisions seed 13"));
 }
 
-fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-    studiofs_test_support::workspace_target_temp_path(&format!("{name}-"))
+fn unique_temp_dir(name: &str) -> tempfile::TempDir {
+    studiofs_test_support::workspace_target_tempdir(&format!("{name}-"))
 }

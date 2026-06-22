@@ -611,16 +611,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
     use studiofs_meta::engine::MetaFsOps;
     use studiofs_meta::{MetaNamespace, RedbMetaEngine};
 
-    fn temp_engine() -> RedbMetaEngine {
+    struct TestEngine {
+        engine: RedbMetaEngine,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Deref for TestEngine {
+        type Target = RedbMetaEngine;
+
+        fn deref(&self) -> &Self::Target {
+            &self.engine
+        }
+    }
+
+    fn temp_engine() -> TestEngine {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let path = dir.path().join("fsck-test.db");
         let engine = RedbMetaEngine::open(&path).expect("open redb");
         engine.init_root(1000, 1000).expect("init root");
-        std::mem::forget(dir);
-        engine
+        TestEngine { engine, _dir: dir }
     }
 
     #[test]
@@ -640,12 +653,12 @@ mod tests {
             .remove_entry(ROOT_INO, b"orphan-root")
             .expect("detach orphan subtree");
 
-        let report = collect_report(&engine).expect("collect pre-repair report");
+        let report = collect_report(&*engine).expect("collect pre-repair report");
         assert_eq!(report.orphan_inodes.len(), 3);
 
-        repair(&engine, &report).expect("repair orphan subtree");
+        repair(&*engine, &report).expect("repair orphan subtree");
 
-        let post = collect_report(&engine).expect("collect post-repair report");
+        let post = collect_report(&*engine).expect("collect post-repair report");
         assert!(post.orphan_inodes.is_empty());
         assert!(post.nlink_mismatches.is_empty());
     }

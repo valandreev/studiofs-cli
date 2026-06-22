@@ -385,6 +385,17 @@ on the correct host — cross-compilation does not count.
    add new env-mutating tests, ensure they acquire `ENV_LOCK` and consider
    whether `temp_env` or `serial_test` would be cleaner than a manual mutex.
 
+### Temporary test artifacts
+
+Test-owned temporary files should live under `target/`. Prefer
+`studiofs_test_support::workspace_target_tempdir(...)` because it returns a
+RAII `TempDir` and removes artifacts when the test exits.
+
+Use `workspace_target_temp_path(...)` only when the code under test must create
+the artifact root itself. The test that receives that path is responsible for
+explicit cleanup or for keeping a separate cleanup guard alive until the
+artifact is no longer needed.
+
 ### CI coverage per platform
 
 | Crate | CI step | Runner |

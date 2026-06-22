@@ -135,7 +135,7 @@ fn crash_replay_failures_include_replayable_counterexample_trace() {
 #[test]
 fn crash_replay_failure_writes_replayable_counterexample_artifact() {
     let artifact_dir = unique_temp_dir("sfs339-counterexample-artifacts");
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::create_dir_all(artifact_dir.path()).expect("create artifact dir");
 
     let report = run_crash_replay_suite_with_artifacts(
         CrashReplaySuiteConfig {
@@ -143,7 +143,7 @@ fn crash_replay_failure_writes_replayable_counterexample_artifact() {
             seeds: vec![13],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_dir,
+        artifact_dir.path(),
     )
     .expect("counterexample artifacts are written");
 
@@ -195,7 +195,7 @@ fn crash_replay_failure_writes_replayable_counterexample_artifact() {
 #[test]
 fn crash_replay_rejects_unknown_planned_trace_operations() {
     let artifact_dir = unique_temp_dir("sfs501-crash-replay-unknown-op");
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::create_dir_all(artifact_dir.path()).expect("create artifact dir");
 
     let report = run_crash_replay_suite_with_artifacts(
         CrashReplaySuiteConfig {
@@ -203,7 +203,7 @@ fn crash_replay_rejects_unknown_planned_trace_operations() {
             seeds: vec![13],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_dir,
+        artifact_dir.path(),
     )
     .expect("counterexample artifacts are written");
 
@@ -241,7 +241,7 @@ fn crash_replay_rejects_unknown_planned_trace_operations() {
 #[test]
 fn crash_replay_rejects_missing_planned_trace_operations() {
     let artifact_dir = unique_temp_dir("sfs501-crash-replay-missing-op");
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::create_dir_all(artifact_dir.path()).expect("create artifact dir");
 
     let report = run_crash_replay_suite_with_artifacts(
         CrashReplaySuiteConfig {
@@ -249,7 +249,7 @@ fn crash_replay_rejects_missing_planned_trace_operations() {
             seeds: vec![13],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_dir,
+        artifact_dir.path(),
     )
     .expect("counterexample artifacts are written");
 
@@ -287,7 +287,7 @@ fn crash_replay_rejects_missing_planned_trace_operations() {
 #[test]
 fn crash_replay_reports_artifact_operation_log_inconsistency() {
     let artifact_dir = unique_temp_dir("sfs501-crash-replay-log-inconsistency");
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::create_dir_all(artifact_dir.path()).expect("create artifact dir");
 
     let report = run_crash_replay_suite_with_artifacts(
         CrashReplaySuiteConfig {
@@ -295,7 +295,7 @@ fn crash_replay_reports_artifact_operation_log_inconsistency() {
             seeds: vec![13],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_dir,
+        artifact_dir.path(),
     )
     .expect("counterexample artifacts are written");
 
@@ -327,7 +327,7 @@ fn crash_replay_reports_artifact_operation_log_inconsistency() {
 #[test]
 fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
     let artifact_dir = unique_temp_dir("sfs339-empty-scenario-artifact");
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::create_dir_all(artifact_dir.path()).expect("create artifact dir");
 
     let report = run_crash_replay_suite_with_artifacts(
         CrashReplaySuiteConfig {
@@ -335,7 +335,7 @@ fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
             seeds: vec![13],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_dir,
+        artifact_dir.path(),
     )
     .expect("counterexample artifacts are written");
 
@@ -349,7 +349,8 @@ fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
 
 #[test]
 fn artifact_write_failures_are_collected_across_all_failing_seeds() {
-    let artifact_root_file = unique_temp_dir("sfs339-artifact-root-file");
+    let artifact_root_dir = unique_temp_dir("sfs339-artifact-root-file");
+    let artifact_root_file = artifact_root_dir.path().join("not-a-directory");
     std::fs::write(&artifact_root_file, b"not a directory").expect("create artifact root file");
 
     let error = run_crash_replay_suite_with_artifacts(
@@ -358,7 +359,7 @@ fn artifact_write_failures_are_collected_across_all_failing_seeds() {
             seeds: vec![13, 14],
             families: vec![CrashReplayFamily::InjectedInvariantFailure],
         },
-        &artifact_root_file,
+        artifact_root_file.as_path(),
     )
     .expect_err("artifact writes fail after all failing seeds are attempted");
 
@@ -392,6 +393,6 @@ fn replay_idempotence_does_not_treat_memory_only_dirty_loss_as_failure() {
     );
 }
 
-fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-    studiofs_test_support::workspace_target_temp_path(&format!("{name}-"))
+fn unique_temp_dir(name: &str) -> tempfile::TempDir {
+    studiofs_test_support::workspace_target_tempdir(&format!("{name}-"))
 }
