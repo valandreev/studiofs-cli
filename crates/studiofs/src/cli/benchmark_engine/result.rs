@@ -8,7 +8,7 @@ use studiofs_vfs::{
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct OpReport {
     pub(crate) operations: u64,
     pub(crate) bytes: u64,
@@ -23,7 +23,7 @@ pub(crate) struct OpReport {
     pub(crate) operations_log: Vec<OperationLogReport>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct OperationLogReport {
     pub(crate) operation_index: u64,
     pub(crate) work_index: usize,
@@ -75,6 +75,8 @@ pub(crate) struct BenchmarkReport {
     pub(crate) profile: Option<BenchmarkProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) advanced_metrics: Option<AdvancedMetricsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) public_bench: Option<PublicBenchReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -538,7 +540,7 @@ pub(crate) struct SizeClassStatsReport {
     pub(crate) reads: Vec<SizeClassOpReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct SizeClassOpReport {
     pub(crate) class: String,
     pub(crate) operations: u64,
@@ -548,6 +550,54 @@ pub(crate) struct SizeClassOpReport {
     pub(crate) p95_ms: f64,
     pub(crate) p99_ms: f64,
     pub(crate) throughput_bytes_per_sec: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchReport {
+    pub(crate) workload: PublicBenchWorkloadReport,
+    pub(crate) write_metrics: PublicBenchWriteMetricsReport,
+    pub(crate) during_upload_read: PublicBenchDuringUploadReadReport,
+    pub(crate) upload_drain: PublicBenchUploadDrainReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchWorkloadReport {
+    pub(crate) small_files: usize,
+    pub(crate) medium_files: usize,
+    pub(crate) large_files: usize,
+    pub(crate) large_file_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchWriteMetricsReport {
+    pub(crate) small_files: SizeClassOpReport,
+    pub(crate) medium_files: SizeClassOpReport,
+    pub(crate) large_file: SizeClassOpReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchDuringUploadReadReport {
+    pub(crate) phase: String,
+    pub(crate) metrics: OpReport,
+    pub(crate) wait_target: String,
+    pub(crate) target_state_observed: bool,
+    pub(crate) valid_for_target: bool,
+    pub(crate) wait_ms: f64,
+    pub(crate) pending_uploads_before: usize,
+    pub(crate) pending_uploads_after: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) validation_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PublicBenchUploadDrainReport {
+    pub(crate) observed_idle: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) wait_ms: f64,
+    pub(crate) pending_uploads_before: usize,
+    pub(crate) pending_uploads_after: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -568,7 +618,7 @@ pub(crate) struct CacheLevelReport {
     pub(crate) latency_histogram: LatencyHistogramReport,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct LatencyHistogramReport {
     pub(crate) bucket_upper_bounds_ns: Vec<u64>,
     pub(crate) bucket_counts: Vec<u64>,
@@ -1267,6 +1317,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                 },
             }),
         }),
+        public_bench: None,
         local_first_read_comparison: None,
         stream_results: None,
         mounted_memory: None,

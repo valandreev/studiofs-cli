@@ -19,15 +19,17 @@ use tokio::task::JoinSet;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
-    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBarrierReport,
-    MountedCachedStoreReport, MountedFetchReport, MountedLocalFirstReadComparisonReport,
-    MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedObservabilityReport,
-    MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
+    AdvancedMetricsReport, BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
+    MountedBarrierReport, MountedCachedStoreReport, MountedFetchReport,
+    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
+    MountedObservabilityReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
     MountedPortableProcessReport, MountedPortableProfileReport, MountedPostUploadIdleReport,
     MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
     MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
     MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
-    OpReport, RuntimeStatsPhaseDeltaReport, benchmark_build_metadata, benchmark_command_metadata,
+    OpReport, PublicBenchDuringUploadReadReport, PublicBenchReport, PublicBenchUploadDrainReport,
+    PublicBenchWorkloadReport, PublicBenchWriteMetricsReport, RuntimeStatsPhaseDeltaReport,
+    SizeClassOpReport, benchmark_build_metadata, benchmark_command_metadata,
     benchmark_platform_metadata, missing_runtime_stats_report, runtime_stats_delta,
     runtime_stats_report,
 };
@@ -1161,7 +1163,7 @@ fn mounted_post_upload_idle_report(
     let phase = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "upload-drain-read")
+        .find(|phase| phase.phase == "upload-drain-wait")
         .or_else(|| {
             comparison
                 .phases
@@ -1175,6 +1177,69 @@ fn mounted_post_upload_idle_report(
         pending_uploads_before: phase.pending_uploads_before,
         pending_uploads_after: phase.pending_uploads_after,
         reason: phase.validation_message.clone(),
+    })
+}
+
+fn size_class_report(reports: &[SizeClassOpReport], class: &str) -> Option<SizeClassOpReport> {
+    reports.iter().find(|report| report.class == class).cloned()
+}
+
+fn build_public_bench_report(
+    params: &BenchmarkConfig,
+    workload: &WorkloadPlan,
+    advanced_metrics: &AdvancedMetricsReport,
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+    post_upload_idle: Option<&MountedPostUploadIdleReport>,
+) -> Option<PublicBenchReport> {
+    if params.command_name != "studiofs bench" {
+        return None;
+    }
+
+    let write_metrics = PublicBenchWriteMetricsReport {
+        small_files: size_class_report(&advanced_metrics.size_class_stats.writes, "small")?,
+        medium_files: size_class_report(&advanced_metrics.size_class_stats.writes, "medium")?,
+        large_file: size_class_report(&advanced_metrics.size_class_stats.writes, "large")?,
+    };
+    let during_upload = comparison?
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "during-upload-read")?;
+    let upload_drain = post_upload_idle?;
+    let large_file_size_bytes = workload
+        .sizes
+        .iter()
+        .copied()
+        .filter(|size| *size > params.size_class_medium_max)
+        .max()
+        .unwrap_or_default();
+
+    Some(PublicBenchReport {
+        workload: PublicBenchWorkloadReport {
+            small_files: workload.small_files,
+            medium_files: workload.medium_files,
+            large_files: workload.large_files,
+            large_file_size_bytes,
+        },
+        write_metrics,
+        during_upload_read: PublicBenchDuringUploadReadReport {
+            phase: during_upload.phase.clone(),
+            metrics: during_upload.results.clone(),
+            wait_target: during_upload.wait_target.clone(),
+            target_state_observed: during_upload.target_state_observed,
+            valid_for_target: during_upload.valid_for_target,
+            wait_ms: during_upload.wait_ms,
+            pending_uploads_before: during_upload.pending_uploads_before,
+            pending_uploads_after: during_upload.pending_uploads_after,
+            validation_message: during_upload.validation_message.clone(),
+        },
+        upload_drain: PublicBenchUploadDrainReport {
+            observed_idle: upload_drain.observed,
+            timed_out: upload_drain.timed_out,
+            wait_ms: upload_drain.wait_ms,
+            pending_uploads_before: upload_drain.pending_uploads_before,
+            pending_uploads_after: upload_drain.pending_uploads_after,
+            reason: upload_drain.reason.clone(),
+        },
     })
 }
 
@@ -2523,6 +2588,15 @@ pub(crate) async fn run_mounted_end_to_end(
             measured.writes_wall.as_secs_f64() * 1000.0,
             measured.reads_wall.as_secs_f64() * 1000.0,
         );
+        let post_upload_idle =
+            mounted_post_upload_idle_report(local_first_read_comparison.as_ref());
+        let public_bench = build_public_bench_report(
+            params,
+            &workload,
+            &advanced_metrics,
+            local_first_read_comparison.as_ref(),
+            post_upload_idle.as_ref(),
+        );
         let mounted_runtime = Some(build_mounted_runtime_report(
             params,
             mount_point,
@@ -2613,6 +2687,7 @@ pub(crate) async fn run_mounted_end_to_end(
             cache_pipeline: None,
             profile,
             advanced_metrics: Some(advanced_metrics),
+            public_bench,
             stream_results,
             mounted_memory,
             mounted_runtime,
@@ -3266,13 +3341,13 @@ mod tests {
     }
 
     #[test]
-    fn post_upload_idle_report_uses_visible_upload_drain_read_phase() {
+    fn post_upload_idle_report_uses_visible_upload_drain_wait_phase() {
         let comparison = MountedLocalFirstReadComparisonReport {
             cache_path: r"D:\cache".to_string(),
             upload_dir: r"D:\cache\upload".to_string(),
             phases: vec![
                 MountedLocalFirstReadPhaseReport {
-                    phase: "upload-drain-read".to_string(),
+                    phase: "upload-drain-wait".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
                     valid_for_target: true,
