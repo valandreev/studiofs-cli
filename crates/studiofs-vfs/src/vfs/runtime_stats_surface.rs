@@ -284,6 +284,12 @@ impl StudioVfs {
             "bytes",
             write_path.fetch.cache_hit_bytes,
         );
+        insert_counter(
+            &mut snapshot.cache,
+            "prefetch_skips",
+            "count",
+            write_path.fetch.prefetch_skips,
+        );
         insert_gauge(
             &mut snapshot.upload_queue,
             "pending_depth",

@@ -158,7 +158,71 @@ pub(crate) struct RuntimeStatsDeltaReport {
     pub(crate) interval_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) warnings: Vec<String>,
+    pub(crate) efficiency: RuntimeStatsEfficiencyReport,
     pub(crate) sections: BTreeMap<String, RuntimeStatsSectionDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsEfficiencyReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
+    pub(crate) read: RuntimeStatsReadEfficiencyReport,
+    pub(crate) s3_refill: RuntimeStatsTransferEfficiencyReport,
+    pub(crate) upload: RuntimeStatsTransferEfficiencyReport,
+    pub(crate) readahead: RuntimeStatsReadaheadEfficiencyReport,
+    pub(crate) prefetch: RuntimeStatsPrefetchEfficiencyReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsReadEfficiencyReport {
+    pub(crate) requested_bytes: RuntimeStatsEfficiencyU64Report,
+    pub(crate) cache_served_ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) cache_served_bytes: RuntimeStatsEfficiencyU64Report,
+    pub(crate) cache_read_ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) cache_read_bytes: RuntimeStatsEfficiencyU64Report,
+    pub(crate) cache_hit_ratio_ops: RuntimeStatsEfficiencyF64Report,
+    pub(crate) cache_hit_ratio_bytes: RuntimeStatsEfficiencyF64Report,
+    pub(crate) os_cache_miss_read_ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) os_cache_miss_read_bytes: RuntimeStatsEfficiencyU64Report,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsTransferEfficiencyReport {
+    pub(crate) ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) bytes: RuntimeStatsEfficiencyU64Report,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsReadaheadEfficiencyReport {
+    pub(crate) queue_depth_after: RuntimeStatsEfficiencyU64Report,
+    pub(crate) scheduled_ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) useful_bytes: RuntimeStatsEfficiencyU64Report,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsPrefetchEfficiencyReport {
+    pub(crate) skipped_ops: RuntimeStatsEfficiencyU64Report,
+    pub(crate) useful_bytes: RuntimeStatsEfficiencyU64Report,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsEfficiencyU64Report {
+    pub(crate) available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value: Option<u64>,
+    pub(crate) unit: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeStatsEfficiencyF64Report {
+    pub(crate) available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value: Option<f64>,
+    pub(crate) unit: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warning: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -824,7 +888,283 @@ pub(crate) fn runtime_stats_delta(
             .generated_unix_ms
             .saturating_sub(before.generated_unix_ms),
         warnings,
+        efficiency: runtime_stats_efficiency(label, &sections),
         sections,
+    }
+}
+
+fn runtime_stats_efficiency(
+    label: &str,
+    sections: &BTreeMap<String, RuntimeStatsSectionDeltaReport>,
+) -> RuntimeStatsEfficiencyReport {
+    let mut warnings = Vec::new();
+    let requested_bytes = efficiency_counter(
+        sections,
+        "vfs_read",
+        "requested_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let cache_served_ops = efficiency_counter(
+        sections,
+        "cache",
+        "hit_calls",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let cache_served_bytes = efficiency_counter(
+        sections,
+        "cache",
+        "hit_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let cache_read_ops = efficiency_counter(
+        sections,
+        "cache",
+        "read_calls",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let cache_read_bytes = efficiency_counter(
+        sections,
+        "cache",
+        "read_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let cache_hit_ratio_ops = efficiency_ratio(
+        cache_served_ops.value,
+        cache_read_ops.value,
+        "cache hit ops ratio",
+        label,
+        &mut warnings,
+    );
+    let cache_hit_ratio_bytes = efficiency_ratio(
+        cache_served_bytes.value,
+        cache_read_bytes.value,
+        "cache hit bytes ratio",
+        label,
+        &mut warnings,
+    );
+    let os_cache_miss_read_ops = efficiency_counter(
+        sections,
+        "bridge",
+        "os_cache_miss_read_callbacks",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let os_cache_miss_read_bytes = efficiency_counter(
+        sections,
+        "bridge",
+        "os_cache_miss_read_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let s3_refill_ops = efficiency_counter(
+        sections,
+        "object_io",
+        "get_calls",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let s3_refill_bytes = efficiency_counter(
+        sections,
+        "object_io",
+        "get_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let upload_ops = efficiency_counter(
+        sections,
+        "upload_queue",
+        "completed",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let upload_bytes = efficiency_counter(
+        sections,
+        "upload_queue",
+        "completed_bytes",
+        "bytes",
+        label,
+        &mut warnings,
+    );
+    let readahead_queue_depth_after = efficiency_gauge_after(
+        sections,
+        "cache",
+        "prefetch_queue_depth",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let readahead_scheduled_ops = efficiency_unavailable(
+        "count",
+        format!(
+            "runtime stats do not expose readahead scheduled operation counters during {label}"
+        ),
+        &mut warnings,
+    );
+    let readahead_useful_bytes = efficiency_unavailable(
+        "bytes",
+        format!("runtime stats cannot attribute later cache hits to readahead during {label}"),
+        &mut warnings,
+    );
+    let prefetch_skipped_ops = efficiency_counter(
+        sections,
+        "cache",
+        "prefetch_skips",
+        "count",
+        label,
+        &mut warnings,
+    );
+    let prefetch_useful_bytes = efficiency_unavailable(
+        "bytes",
+        format!(
+            "runtime stats cannot attribute cache-served bytes specifically to prefetch during {label}"
+        ),
+        &mut warnings,
+    );
+
+    RuntimeStatsEfficiencyReport {
+        warnings,
+        read: RuntimeStatsReadEfficiencyReport {
+            requested_bytes,
+            cache_served_ops,
+            cache_served_bytes,
+            cache_read_ops,
+            cache_read_bytes,
+            cache_hit_ratio_ops,
+            cache_hit_ratio_bytes,
+            os_cache_miss_read_ops,
+            os_cache_miss_read_bytes,
+        },
+        s3_refill: RuntimeStatsTransferEfficiencyReport {
+            ops: s3_refill_ops,
+            bytes: s3_refill_bytes,
+        },
+        upload: RuntimeStatsTransferEfficiencyReport {
+            ops: upload_ops,
+            bytes: upload_bytes,
+        },
+        readahead: RuntimeStatsReadaheadEfficiencyReport {
+            queue_depth_after: readahead_queue_depth_after,
+            scheduled_ops: readahead_scheduled_ops,
+            useful_bytes: readahead_useful_bytes,
+        },
+        prefetch: RuntimeStatsPrefetchEfficiencyReport {
+            skipped_ops: prefetch_skipped_ops,
+            useful_bytes: prefetch_useful_bytes,
+        },
+    }
+}
+
+fn efficiency_counter(
+    sections: &BTreeMap<String, RuntimeStatsSectionDeltaReport>,
+    section: &str,
+    metric: &str,
+    unit: &'static str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> RuntimeStatsEfficiencyU64Report {
+    match sections
+        .get(section)
+        .and_then(|section| section.counters.get(metric))
+    {
+        Some(counter) => RuntimeStatsEfficiencyU64Report {
+            available: true,
+            value: Some(counter.delta),
+            unit,
+            warning: None,
+        },
+        None => efficiency_unavailable(
+            unit,
+            format!("runtime stats counter {section}.{metric} unavailable during {label}"),
+            warnings,
+        ),
+    }
+}
+
+fn efficiency_gauge_after(
+    sections: &BTreeMap<String, RuntimeStatsSectionDeltaReport>,
+    section: &str,
+    metric: &str,
+    unit: &'static str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> RuntimeStatsEfficiencyU64Report {
+    match sections
+        .get(section)
+        .and_then(|section| section.gauges.get(metric))
+    {
+        Some(gauge) => RuntimeStatsEfficiencyU64Report {
+            available: true,
+            value: Some(gauge.after),
+            unit,
+            warning: None,
+        },
+        None => efficiency_unavailable(
+            unit,
+            format!("runtime stats gauge {section}.{metric} unavailable during {label}"),
+            warnings,
+        ),
+    }
+}
+
+fn efficiency_ratio(
+    numerator: Option<u64>,
+    denominator: Option<u64>,
+    name: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> RuntimeStatsEfficiencyF64Report {
+    match (numerator, denominator) {
+        (Some(numerator), Some(denominator)) => RuntimeStatsEfficiencyF64Report {
+            available: true,
+            value: Some(if denominator == 0 {
+                0.0
+            } else {
+                numerator as f64 / denominator as f64
+            }),
+            unit: "ratio",
+            warning: None,
+        },
+        _ => {
+            let warning = format!(
+                "runtime stats cannot compute {name} during {label} because one or more source counters are unavailable"
+            );
+            warnings.push(warning.clone());
+            RuntimeStatsEfficiencyF64Report {
+                available: false,
+                value: None,
+                unit: "ratio",
+                warning: Some(warning),
+            }
+        }
+    }
+}
+
+fn efficiency_unavailable(
+    unit: &'static str,
+    warning: String,
+    warnings: &mut Vec<String>,
+) -> RuntimeStatsEfficiencyU64Report {
+    warnings.push(warning.clone());
+    RuntimeStatsEfficiencyU64Report {
+        available: false,
+        value: None,
+        unit,
+        warning: Some(warning),
     }
 }
 
@@ -1493,6 +1833,13 @@ mod tests {
     use super::*;
     use studiofs_vfs::{RuntimeLatencyHistogram, RuntimeScalarMetric};
 
+    fn scalar(value: u64, unit: &'static str) -> RuntimeScalarMetric {
+        RuntimeScalarMetric {
+            value,
+            unit: unit.into(),
+        }
+    }
+
     #[test]
     fn runtime_stats_report_computes_units_and_reset_aware_deltas() {
         let mut before = RuntimeStatsSnapshot {
@@ -1664,5 +2011,176 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("schema version changed"))
         );
+    }
+
+    #[test]
+    fn runtime_stats_efficiency_maps_existing_counters() {
+        let mut before = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        before
+            .vfs_read
+            .counters
+            .insert("requested_bytes".to_string(), scalar(1_000, "bytes"));
+        before
+            .cache
+            .counters
+            .insert("hit_calls".to_string(), scalar(2, "count"));
+        before
+            .cache
+            .counters
+            .insert("hit_bytes".to_string(), scalar(400, "bytes"));
+        before
+            .cache
+            .counters
+            .insert("read_calls".to_string(), scalar(4, "count"));
+        before
+            .cache
+            .counters
+            .insert("read_bytes".to_string(), scalar(800, "bytes"));
+        before
+            .cache
+            .counters
+            .insert("prefetch_skips".to_string(), scalar(1, "count"));
+        before
+            .cache
+            .gauges
+            .insert("prefetch_queue_depth".to_string(), scalar(0, "count"));
+        before.bridge.counters.insert(
+            "os_cache_miss_read_callbacks".to_string(),
+            scalar(1, "count"),
+        );
+        before
+            .bridge
+            .counters
+            .insert("os_cache_miss_read_bytes".to_string(), scalar(256, "bytes"));
+        before
+            .object_io
+            .counters
+            .insert("get_calls".to_string(), scalar(3, "count"));
+        before
+            .object_io
+            .counters
+            .insert("get_bytes".to_string(), scalar(600, "bytes"));
+        before
+            .upload_queue
+            .counters
+            .insert("completed".to_string(), scalar(5, "count"));
+        before
+            .upload_queue
+            .counters
+            .insert("completed_bytes".to_string(), scalar(900, "bytes"));
+
+        let mut after = before.clone();
+        after.generated_unix_ms = 1_250;
+        after
+            .vfs_read
+            .counters
+            .get_mut("requested_bytes")
+            .unwrap()
+            .value = 3_000;
+        after.cache.counters.get_mut("hit_calls").unwrap().value = 8;
+        after.cache.counters.get_mut("hit_bytes").unwrap().value = 1_600;
+        after.cache.counters.get_mut("read_calls").unwrap().value = 12;
+        after.cache.counters.get_mut("read_bytes").unwrap().value = 2_400;
+        after
+            .cache
+            .counters
+            .get_mut("prefetch_skips")
+            .unwrap()
+            .value = 4;
+        after
+            .cache
+            .gauges
+            .get_mut("prefetch_queue_depth")
+            .unwrap()
+            .value = 7;
+        after
+            .bridge
+            .counters
+            .get_mut("os_cache_miss_read_callbacks")
+            .unwrap()
+            .value = 3;
+        after
+            .bridge
+            .counters
+            .get_mut("os_cache_miss_read_bytes")
+            .unwrap()
+            .value = 1024;
+        after.object_io.counters.get_mut("get_calls").unwrap().value = 5;
+        after.object_io.counters.get_mut("get_bytes").unwrap().value = 4_600;
+        after
+            .upload_queue
+            .counters
+            .get_mut("completed")
+            .unwrap()
+            .value = 9;
+        after
+            .upload_queue
+            .counters
+            .get_mut("completed_bytes")
+            .unwrap()
+            .value = 2_900;
+
+        let delta = runtime_stats_delta("read-phase", &before, &after);
+
+        assert_eq!(delta.efficiency.read.requested_bytes.value, Some(2_000));
+        assert_eq!(delta.efficiency.read.cache_served_ops.value, Some(6));
+        assert_eq!(delta.efficiency.read.cache_served_bytes.value, Some(1_200));
+        assert_eq!(delta.efficiency.read.cache_read_ops.value, Some(8));
+        assert_eq!(delta.efficiency.read.cache_read_bytes.value, Some(1_600));
+        assert_eq!(delta.efficiency.read.cache_hit_ratio_ops.value, Some(0.75));
+        assert_eq!(
+            delta.efficiency.read.cache_hit_ratio_bytes.value,
+            Some(0.75)
+        );
+        assert_eq!(delta.efficiency.read.os_cache_miss_read_ops.value, Some(2));
+        assert_eq!(
+            delta.efficiency.read.os_cache_miss_read_bytes.value,
+            Some(768)
+        );
+        assert_eq!(delta.efficiency.s3_refill.ops.value, Some(2));
+        assert_eq!(delta.efficiency.s3_refill.bytes.value, Some(4_000));
+        assert_eq!(delta.efficiency.upload.ops.value, Some(4));
+        assert_eq!(delta.efficiency.upload.bytes.value, Some(2_000));
+        assert_eq!(delta.efficiency.readahead.queue_depth_after.value, Some(7));
+        assert_eq!(delta.efficiency.prefetch.skipped_ops.value, Some(3));
+        assert!(!delta.efficiency.prefetch.useful_bytes.available);
+    }
+
+    #[test]
+    fn runtime_stats_efficiency_marks_missing_counters_unavailable() {
+        let before = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        let after = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_250,
+            ..RuntimeStatsSnapshot::default()
+        };
+
+        let delta = runtime_stats_delta("missing-counters", &before, &after);
+
+        assert!(!delta.efficiency.read.cache_served_bytes.available);
+        assert_eq!(delta.efficiency.read.cache_served_bytes.value, None);
+        assert!(
+            delta
+                .efficiency
+                .read
+                .cache_served_bytes
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("cache.hit_bytes"))
+        );
+        assert!(
+            delta
+                .efficiency
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cache.hit_bytes"))
+        );
+        assert!(!delta.efficiency.s3_refill.bytes.available);
+        assert_eq!(delta.efficiency.s3_refill.bytes.value, None);
     }
 }

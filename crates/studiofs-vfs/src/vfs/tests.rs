@@ -170,6 +170,7 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     assert!(parsed.generated_unix_ms > 0);
     assert!(parsed.bridge.counters.contains_key("read_callbacks"));
     assert!(parsed.vfs_read.counters.contains_key("calls"));
+    assert!(parsed.cache.counters.contains_key("prefetch_skips"));
     assert!(parsed.upload_queue.gauges.contains_key("pending_depth"));
 }
 
