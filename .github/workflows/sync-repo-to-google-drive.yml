@@ -1,0 +1,77 @@
+name: Sync repository files to Google Drive
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-drive-repo-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Prepare Google Drive service account
+        env:
+          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
+        run: |
+          echo "$GDRIVE_SA_JSON_B64" | base64 -d > "$HOME/gdrive-service-account.json"
+
+      - name: Configure rclone
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          mkdir -p "$HOME/.config/rclone"
+
+          cat > "$HOME/.config/rclone/rclone.conf" <<EOF
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = $HOME/gdrive-service-account.json
+          root_folder_id = $GDRIVE_FOLDER_ID
+          EOF
+
+      - name: Create repo snapshot info
+        run: |
+          cat > _REPO_SNAPSHOT_INFO.md <<EOF
+          # Repository snapshot
+
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Commit URL: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+          Synced at UTC: $(date -u +"%Y-%m-%d %H:%M:%S")
+          EOF
+
+      - name: Sync repository files to Google Drive
+        run: |
+          rclone sync . gdrive:/current \
+            --exclude ".git/**" \
+            --exclude "target/**" \
+            --exclude "node_modules/**" \
+            --exclude "dist/**" \
+            --exclude "build/**" \
+            --exclude ".cache/**" \
+            --exclude ".DS_Store" \
+            --delete-excluded \
+            --drive-chunk-size 64M \
+            --transfers 8 \
+            --checkers 16 \
+            --progress
