@@ -26,9 +26,10 @@ pub(crate) use telemetry::{
     phase_telemetry_to_report, stream_reports_from_telemetry,
 };
 pub(crate) use workload::{
-    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, SizeClassBounds,
-    WorkloadSizeInput, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
-    parse_size_arg, parse_sizes_arg, public_bench_workload, split_stream_segments,
+    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
+    PUBLIC_BENCH_SMALL_MAX_BYTES, SizeClassBounds, WorkloadSizeInput, build_access_sequence,
+    build_work_sizes, classify_size, deterministic_bytes, parse_size_arg, parse_sizes_arg,
+    public_bench_workload, split_stream_segments,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

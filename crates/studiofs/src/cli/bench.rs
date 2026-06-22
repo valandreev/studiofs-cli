@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
     BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
-    WorkloadSizeInput, parse_size_arg, public_bench_workload, render_human_summary, run_mounted,
-    save_benchmark_report,
+    PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg,
+    public_bench_workload, render_human_summary, run_mounted, save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -177,8 +177,8 @@ fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfi
         target: args.mountpoint.clone(),
         block_size: PUBLIC_BENCH_BLOCK_SIZE,
         read_size: PUBLIC_BENCH_BLOCK_SIZE,
-        size_class_small_max: 250 * 1024,
-        size_class_medium_max: 8 * 1024 * 1024,
+        size_class_small_max: PUBLIC_BENCH_SMALL_MAX_BYTES,
+        size_class_medium_max: PUBLIC_BENCH_MEDIUM_MAX_BYTES,
         workload_repeat: 1,
         concurrency: DEFAULT_BENCH_THREADS,
         sequential_streams: false,
