@@ -514,6 +514,9 @@ cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --tes
 
 Run the sequential, random, and writeback-heavy mounted benchmark shapes above
 against the same mounted volume and archive the JSON reports.
+Use [benchmark-methodology.md](./perf/benchmark-methodology.md) for the
+operator-facing command choice, artifact handling, cross-platform comparison
+rules, and known limits.
 
 ### Optional JuiceFS Reference Sweep
 
