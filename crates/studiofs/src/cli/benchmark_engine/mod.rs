@@ -32,6 +32,9 @@ pub(crate) use workload::{
     public_bench_workload, split_stream_segments,
 };
 
+pub(crate) const CLEANUP_ATTEMPTS: usize = 5;
+pub(crate) const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum BenchmarkAccessPattern {

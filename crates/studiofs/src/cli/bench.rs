@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
-    BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
-    PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg,
-    public_bench_workload, render_human_summary, run_mounted, save_benchmark_report,
+    BenchmarkAccessPattern, BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY,
+    DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
+    PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg, public_bench_workload,
+    render_human_summary, run_mounted, save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -29,6 +30,10 @@ enum BenchRunOutcome {
 pub(crate) struct BenchArgs {
     /// Mounted StudioFS path to benchmark.
     pub(crate) mountpoint: PathBuf,
+
+    /// JSON report output path.
+    #[arg(long = "report")]
+    pub(crate) json_output: Option<PathBuf>,
 }
 
 impl BenchArgs {
@@ -199,26 +204,28 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
-    run_config(args.mountpoint, None, config)
+    let report = run_config(config)?;
+    print_benchmark_report(&report);
+    save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))?;
+    Ok(())
 }
 
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
-    run_config(args.mountpoint, args.json_output, config)
+    let report = run_config(config)?;
+    print_benchmark_report(&report);
+    save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))?;
+    Ok(())
 }
 
-fn run_config(
-    mountpoint: PathBuf,
-    json_output: Option<PathBuf>,
-    config: BenchmarkConfig,
-) -> Result<()> {
-    let runtime = resolve_mounted_runtime(&mountpoint)?.ok_or_else(|| {
+fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::BenchmarkReport> {
+    let runtime = resolve_mounted_runtime(&config.target)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
-            mountpoint.display()
+            config.target.display()
         )
     })?;
-    let work_root = mountpoint.join(".studiofs-benchmark");
+    let work_root = config.target.join(".studiofs-benchmark");
     let mut work_root_cleanup = BenchWorkRootCleanup::new(work_root.clone());
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
@@ -247,14 +254,44 @@ fn run_config(
             return Err(anyhow!("benchmark interrupted by Ctrl+C"));
         }
     };
-    print!("{}", render_human_summary(&report));
+    work_root_cleanup.disarm();
+    Ok(report)
+}
+
+fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) {
+    print!("{}", render_human_summary(report));
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
-    let report_path = save_benchmark_report(&report, json_output.as_deref())
-        .context("save benchmark JSON report")?;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReportOutput<'a> {
+    Skip,
+    Save(Option<&'a Path>),
+}
+
+fn public_report_output(json_output: Option<&Path>) -> ReportOutput<'_> {
+    match json_output {
+        Some(path) => ReportOutput::Save(Some(path)),
+        None => ReportOutput::Skip,
+    }
+}
+
+fn devbench_report_output(json_output: Option<&Path>) -> ReportOutput<'_> {
+    ReportOutput::Save(json_output)
+}
+
+fn save_report_for_policy(
+    report: &crate::cli::benchmark_engine::BenchmarkReport,
+    output: ReportOutput<'_>,
+) -> Result<()> {
+    let ReportOutput::Save(json_output) = output else {
+        return Ok(());
+    };
+    let report_path =
+        save_benchmark_report(report, json_output).context("save benchmark JSON report")?;
     println!("JSON report: {}", report_path.display());
-    work_root_cleanup.disarm();
     Ok(())
 }
 
@@ -285,9 +322,6 @@ impl Drop for BenchWorkRootCleanup {
 }
 
 fn cleanup_bench_work_root(work_root: &Path) {
-    const CLEANUP_ATTEMPTS: usize = 5;
-    const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
-
     for attempt in 1..=CLEANUP_ATTEMPTS {
         match std::fs::remove_dir_all(work_root) {
             Ok(()) => return,
@@ -352,6 +386,7 @@ mod tests {
     fn public_bench_config_uses_fixed_pseudo_random_workload() {
         let args = BenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            json_output: None,
         };
 
         let config = build_public_bench_config(&args, "run-1".to_string());
@@ -547,5 +582,25 @@ mod tests {
         }
 
         assert!(work_root.exists());
+    }
+
+    #[test]
+    fn public_bench_skips_report_saving_when_no_report_path_is_requested() {
+        assert_eq!(public_report_output(None), ReportOutput::Skip);
+    }
+
+    #[test]
+    fn public_bench_saves_report_when_report_path_is_requested() {
+        let report_path = Path::new("reports/bench.json");
+
+        assert_eq!(
+            public_report_output(Some(report_path)),
+            ReportOutput::Save(Some(report_path))
+        );
+    }
+
+    #[test]
+    fn devbench_keeps_default_report_saving_when_no_output_path_is_requested() {
+        assert_eq!(devbench_report_output(None), ReportOutput::Save(None));
     }
 }
