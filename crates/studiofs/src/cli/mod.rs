@@ -301,6 +301,9 @@ mod tests {
         };
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let message = err.to_string();
+        assert!(message.contains("invalid value '0' for '--threads"));
+        assert!(!message.contains("--threads must be"));
     }
 
     #[test]

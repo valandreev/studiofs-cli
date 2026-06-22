@@ -96,27 +96,26 @@ impl DevbenchArgs {
 }
 
 fn parse_small_file_count_arg(raw: &str) -> std::result::Result<usize, String> {
-    parse_bounded_usize_arg("--small-file-count", raw, 1, MAX_BENCH_SMALL_FILE_COUNT)
+    parse_bounded_usize_arg(raw, 1, MAX_BENCH_SMALL_FILE_COUNT)
 }
 
 fn parse_threads_arg(raw: &str) -> std::result::Result<usize, String> {
-    parse_bounded_usize_arg("--threads", raw, 1, MAX_BENCH_THREADS)
+    parse_bounded_usize_arg(raw, 1, MAX_BENCH_THREADS)
 }
 
 fn parse_bounded_usize_arg(
-    label: &str,
     raw: &str,
     min: usize,
     max: usize,
 ) -> std::result::Result<usize, String> {
     let value = raw
         .parse::<usize>()
-        .map_err(|error| format!("invalid {label}: {error}"))?;
+        .map_err(|error| format!("invalid integer: {error}"))?;
     if value < min {
-        return Err(format!("{label} must be >= {min}"));
+        return Err(format!("must be >= {min}"));
     }
     if value > max {
-        return Err(format!("{label} must be <= {max}"));
+        return Err(format!("must be <= {max}"));
     }
     Ok(value)
 }
@@ -126,6 +125,7 @@ fn build_bench_config(
     command_name: &'static str,
     run_id: String,
 ) -> Result<BenchmarkConfig> {
+    // Clap enforces these for CLI input; keep the checks here for direct callers.
     if args.threads == 0 {
         return Err(anyhow!("--threads must be >= 1"));
     }
