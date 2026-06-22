@@ -276,8 +276,25 @@ mod tests {
         let cli = parse_for_test(&["bench", "Z:\\"]).unwrap();
 
         match cli.command {
-            Commands::Bench(bench::BenchArgs { mountpoint }) => {
+            Commands::Bench(bench::BenchArgs { mountpoint, report }) => {
                 assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
+                assert!(report.is_none());
+            }
+            other => panic!("expected Bench command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_command_parses_public_mountpoint_and_optional_report() {
+        let cli = parse_for_test(&["bench", "Z:\\", "--report", "reports\\bench.json"]).unwrap();
+
+        match cli.command {
+            Commands::Bench(bench::BenchArgs { mountpoint, report }) => {
+                assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
+                assert_eq!(
+                    report,
+                    Some(std::path::PathBuf::from("reports\\bench.json"))
+                );
             }
             other => panic!("expected Bench command, got {other:?}"),
         }

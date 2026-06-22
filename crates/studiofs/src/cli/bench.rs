@@ -29,6 +29,10 @@ enum BenchRunOutcome {
 pub(crate) struct BenchArgs {
     /// Mounted StudioFS path to benchmark.
     pub(crate) mountpoint: PathBuf,
+
+    /// JSON report output path.
+    #[arg(long)]
+    pub(crate) report: Option<PathBuf>,
 }
 
 impl BenchArgs {
@@ -199,7 +203,7 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
-    run_config(args.mountpoint, None, config)
+    run_config(args.mountpoint, args.report, config)
 }
 
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
@@ -251,11 +255,17 @@ fn run_config(
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
-    let report_path = save_benchmark_report(&report, json_output.as_deref())
-        .context("save benchmark JSON report")?;
-    println!("JSON report: {}", report_path.display());
+    if should_save_benchmark_report(json_output.as_deref()) {
+        let report_path = save_benchmark_report(&report, json_output.as_deref())
+            .context("save benchmark JSON report")?;
+        println!("JSON report: {}", report_path.display());
+    }
     work_root_cleanup.disarm();
     Ok(())
+}
+
+fn should_save_benchmark_report(json_output: Option<&Path>) -> bool {
+    json_output.is_some()
 }
 
 struct BenchWorkRootCleanup {
@@ -352,6 +362,7 @@ mod tests {
     fn public_bench_config_uses_fixed_pseudo_random_workload() {
         let args = BenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            report: None,
         };
 
         let config = build_public_bench_config(&args, "run-1".to_string());
@@ -547,5 +558,10 @@ mod tests {
         }
 
         assert!(work_root.exists());
+    }
+
+    #[test]
+    fn report_saving_is_skipped_when_no_report_path_is_requested() {
+        assert!(!should_save_benchmark_report(None));
     }
 }
