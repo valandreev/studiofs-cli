@@ -12,6 +12,11 @@ use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 
 const MAX_BENCH_SMALL_FILE_COUNT: usize = 1_000_000;
 const MAX_BENCH_THREADS: usize = 512;
+const DEFAULT_BENCH_BLOCK_SIZE: &str = "4MB";
+const DEFAULT_BENCH_BIG_FILE_SIZE: &str = "1GB";
+const DEFAULT_BENCH_SMALL_FILE_SIZE: &str = "128KB";
+const DEFAULT_BENCH_SMALL_FILE_COUNT: usize = 100;
+const DEFAULT_BENCH_THREADS: usize = 1;
 
 enum BenchRunOutcome {
     Completed(Box<crate::cli::benchmark_engine::BenchmarkReport>),
@@ -33,11 +38,11 @@ impl BenchArgs {
     fn into_devbench_args(self) -> DevbenchArgs {
         DevbenchArgs {
             mountpoint: self.mountpoint,
-            block_size: "4MB".to_string(),
-            big_file_size: "1GB".to_string(),
-            small_file_size: "128KB".to_string(),
-            small_file_count: 100,
-            threads: 1,
+            block_size: DEFAULT_BENCH_BLOCK_SIZE.to_string(),
+            big_file_size: DEFAULT_BENCH_BIG_FILE_SIZE.to_string(),
+            small_file_size: DEFAULT_BENCH_SMALL_FILE_SIZE.to_string(),
+            small_file_count: DEFAULT_BENCH_SMALL_FILE_COUNT,
+            threads: DEFAULT_BENCH_THREADS,
             json_output: None,
         }
     }
@@ -50,23 +55,31 @@ pub(crate) struct DevbenchArgs {
     pub(crate) mountpoint: PathBuf,
 
     /// I/O block size used for large sequential file chunks.
-    #[arg(long, default_value = "4MB")]
+    #[arg(long, default_value = DEFAULT_BENCH_BLOCK_SIZE)]
     pub(crate) block_size: String,
 
     /// Large sequential file size.
-    #[arg(long, default_value = "1GB")]
+    #[arg(long, default_value = DEFAULT_BENCH_BIG_FILE_SIZE)]
     pub(crate) big_file_size: String,
 
     /// Size of each small file.
-    #[arg(long, default_value = "128KB")]
+    #[arg(long, default_value = DEFAULT_BENCH_SMALL_FILE_SIZE)]
     pub(crate) small_file_size: String,
 
     /// Number of small files.
-    #[arg(long, default_value_t = 100)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BENCH_SMALL_FILE_COUNT,
+        value_parser = parse_small_file_count_arg
+    )]
     pub(crate) small_file_count: usize,
 
     /// Number of concurrent worker streams.
-    #[arg(long, default_value_t = 1)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BENCH_THREADS,
+        value_parser = parse_threads_arg
+    )]
     pub(crate) threads: usize,
 
     /// JSON report output path. Defaults to an auto-named file under target/perf/.
@@ -80,6 +93,32 @@ impl DevbenchArgs {
     pub(crate) fn dispatch(self) -> Result<()> {
         run(self, "studiofs devbench")
     }
+}
+
+fn parse_small_file_count_arg(raw: &str) -> std::result::Result<usize, String> {
+    parse_bounded_usize_arg("--small-file-count", raw, 1, MAX_BENCH_SMALL_FILE_COUNT)
+}
+
+fn parse_threads_arg(raw: &str) -> std::result::Result<usize, String> {
+    parse_bounded_usize_arg("--threads", raw, 1, MAX_BENCH_THREADS)
+}
+
+fn parse_bounded_usize_arg(
+    label: &str,
+    raw: &str,
+    min: usize,
+    max: usize,
+) -> std::result::Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {label}: {error}"))?;
+    if value < min {
+        return Err(format!("{label} must be >= {min}"));
+    }
+    if value > max {
+        return Err(format!("{label} must be <= {max}"));
+    }
+    Ok(value)
 }
 
 fn build_bench_config(
@@ -109,6 +148,9 @@ fn build_bench_config(
         return Err(anyhow!(
             "--big-file-size must be greater than --small-file-size"
         ));
+    }
+    if block_size > big_file_size {
+        return Err(anyhow!("--block-size must be <= --big-file-size"));
     }
     let mut sizes = Vec::with_capacity(args.small_file_count.saturating_add(1));
     sizes.push(big_file_size);
@@ -150,6 +192,7 @@ fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     })?;
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
     let work_root = args.mountpoint.join(".studiofs-benchmark");
+    let mut work_root_cleanup = BenchWorkRootCleanup::new(work_root.clone());
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
     let mounted_target = MountedBenchmarkTarget {
@@ -174,11 +217,9 @@ fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let report = match outcome {
         BenchRunOutcome::Completed(report) => *report,
         BenchRunOutcome::Interrupted => {
-            cleanup_bench_work_root_after_interrupt(&work_root);
             return Err(anyhow!("benchmark interrupted by Ctrl+C"));
         }
     };
-
     print!("{}", render_human_summary(&report));
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
@@ -186,10 +227,37 @@ fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let report_path = save_benchmark_report(&report, args.json_output.as_deref())
         .context("save benchmark JSON report")?;
     println!("JSON report: {}", report_path.display());
+    work_root_cleanup.disarm();
     Ok(())
 }
 
-fn cleanup_bench_work_root_after_interrupt(work_root: &Path) {
+struct BenchWorkRootCleanup {
+    work_root: PathBuf,
+    armed: bool,
+}
+
+impl BenchWorkRootCleanup {
+    fn new(work_root: PathBuf) -> Self {
+        Self {
+            work_root,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BenchWorkRootCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_bench_work_root(&self.work_root);
+        }
+    }
+}
+
+fn cleanup_bench_work_root(work_root: &Path) {
     const CLEANUP_ATTEMPTS: usize = 5;
     const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
 
@@ -202,7 +270,7 @@ fn cleanup_bench_work_root_after_interrupt(work_root: &Path) {
                     error = %error,
                     work_root = %work_root.display(),
                     attempt,
-                    "bench interrupt cleanup retrying"
+                    "bench work root cleanup retrying"
                 );
                 std::thread::sleep(CLEANUP_RETRY_DELAY);
             }
@@ -210,7 +278,7 @@ fn cleanup_bench_work_root_after_interrupt(work_root: &Path) {
                 tracing::warn!(
                     error = %error,
                     work_root = %work_root.display(),
-                    "bench interrupt cleanup failed"
+                    "bench work root cleanup failed"
                 );
                 return;
             }
@@ -343,6 +411,26 @@ mod tests {
     }
 
     #[test]
+    fn bench_config_rejects_block_size_larger_than_big_file_size() {
+        let args = DevbenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            block_size: "2GB".to_string(),
+            big_file_size: "1GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: 1,
+            json_output: None,
+        };
+
+        let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--block-size must be <= --big-file-size")
+        );
+    }
+
+    #[test]
     fn bench_config_rejects_excessive_small_file_count() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
@@ -377,5 +465,32 @@ mod tests {
         let err = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap_err();
 
         assert!(err.to_string().contains("invalid block-size"));
+    }
+
+    #[test]
+    fn cleanup_guard_removes_work_root_when_not_disarmed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let work_root = temp_dir.path().join(".studiofs-benchmark");
+        std::fs::create_dir(&work_root).unwrap();
+
+        {
+            let _guard = BenchWorkRootCleanup::new(work_root.clone());
+        }
+
+        assert!(!work_root.exists());
+    }
+
+    #[test]
+    fn cleanup_guard_preserves_work_root_when_disarmed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let work_root = temp_dir.path().join(".studiofs-benchmark");
+        std::fs::create_dir(&work_root).unwrap();
+
+        {
+            let mut guard = BenchWorkRootCleanup::new(work_root.clone());
+            guard.disarm();
+        }
+
+        assert!(work_root.exists());
     }
 }

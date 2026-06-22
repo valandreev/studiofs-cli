@@ -294,6 +294,26 @@ mod tests {
     }
 
     #[test]
+    fn devbench_command_rejects_zero_threads_during_parse() {
+        let err = match parse_for_test(&["devbench", "Z:\\", "--threads", "0"]) {
+            Ok(_) => panic!("expected devbench to reject zero threads"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn devbench_command_rejects_zero_small_file_count_during_parse() {
+        let err = match parse_for_test(&["devbench", "Z:\\", "--small-file-count", "0"]) {
+            Ok(_) => panic!("expected devbench to reject zero small-file count"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn perf_command_parses_sampling_and_output_flags() {
         let cli = parse_for_test(&[
             "perf",
