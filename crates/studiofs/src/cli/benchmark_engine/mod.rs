@@ -28,7 +28,7 @@ pub(crate) use telemetry::{
 pub(crate) use workload::{
     DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, SizeClassBounds,
     WorkloadSizeInput, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
-    parse_size_arg, parse_sizes_arg, split_stream_segments,
+    parse_size_arg, parse_sizes_arg, public_bench_workload, split_stream_segments,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

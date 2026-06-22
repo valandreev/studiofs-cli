@@ -11,6 +11,17 @@ pub(crate) const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 pub(crate) const LARGE_FILE_MULTIPLIER: u64 = 8;
 pub(crate) const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 pub(crate) const DEFAULT_BENCHMARK_BLOCK_SIZE_STR: &str = "16MB";
+pub(crate) const PUBLIC_BENCH_SEED: u64 = 0x005f_5b01_1202_6561;
+pub(crate) const PUBLIC_BENCH_SMALL_FILES: usize = 1000;
+pub(crate) const PUBLIC_BENCH_MEDIUM_FILES: usize = 80;
+pub(crate) const PUBLIC_BENCH_SMALL_MIN_BYTES: u64 = 1024;
+pub(crate) const PUBLIC_BENCH_SMALL_MAX_BYTES: u64 = 250 * 1024;
+pub(crate) const PUBLIC_BENCH_MEDIUM_MIN_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const PUBLIC_BENCH_MEDIUM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const PUBLIC_BENCH_MEDIUM_GRANULARITY_BYTES: u64 = 1024;
+pub(crate) const PUBLIC_BENCH_LARGE_BASE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const PUBLIC_BENCH_LARGE_DELTA_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const PUBLIC_BENCH_LARGE_GRANULARITY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SizeClass {
@@ -63,6 +74,36 @@ pub(crate) struct WorkloadPlan {
 pub(crate) struct SizeClassBounds {
     pub(crate) small_max: u64,
     pub(crate) medium_max: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicBenchFileSpec {
+    pub(crate) index: usize,
+    pub(crate) size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicBenchWorkload {
+    pub(crate) small_files: Vec<PublicBenchFileSpec>,
+    pub(crate) medium_files: Vec<PublicBenchFileSpec>,
+    pub(crate) large_file: PublicBenchFileSpec,
+    pub(crate) read_order: Vec<usize>,
+    pub(crate) large_file_read_offsets: Vec<u64>,
+}
+
+impl PublicBenchWorkload {
+    pub(crate) fn file_sizes(&self) -> Vec<u64> {
+        let mut sizes = Vec::with_capacity(
+            self.small_files
+                .len()
+                .saturating_add(self.medium_files.len())
+                .saturating_add(1),
+        );
+        sizes.extend(self.small_files.iter().map(|file| file.size));
+        sizes.extend(self.medium_files.iter().map(|file| file.size));
+        sizes.push(self.large_file.size);
+        sizes
+    }
 }
 
 pub(crate) fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
@@ -367,6 +408,120 @@ pub(crate) fn build_work_sizes(
     }
 }
 
+pub(crate) fn public_bench_workload() -> PublicBenchWorkload {
+    let mut rng = XorShift64::new(PUBLIC_BENCH_SEED);
+    let small_files = generate_public_bench_files(
+        0,
+        PUBLIC_BENCH_SMALL_FILES,
+        PUBLIC_BENCH_SMALL_MIN_BYTES,
+        PUBLIC_BENCH_SMALL_MAX_BYTES,
+        PUBLIC_BENCH_MEDIUM_GRANULARITY_BYTES,
+        &mut rng,
+    );
+    let medium_files = generate_public_bench_files(
+        PUBLIC_BENCH_SMALL_FILES,
+        PUBLIC_BENCH_MEDIUM_FILES,
+        PUBLIC_BENCH_MEDIUM_MIN_BYTES,
+        PUBLIC_BENCH_MEDIUM_MAX_BYTES,
+        PUBLIC_BENCH_MEDIUM_GRANULARITY_BYTES,
+        &mut rng,
+    );
+    let large_file = PublicBenchFileSpec {
+        index: PUBLIC_BENCH_SMALL_FILES + PUBLIC_BENCH_MEDIUM_FILES,
+        size: generate_public_bench_large_size(&mut rng),
+    };
+    let read_order = shuffled_indices(large_file.index + 1, rng.next_u64());
+    let large_file_read_offsets = shuffled_large_file_offsets(large_file.size, rng.next_u64());
+
+    PublicBenchWorkload {
+        small_files,
+        medium_files,
+        large_file,
+        read_order,
+        large_file_read_offsets,
+    }
+}
+
+fn generate_public_bench_files(
+    start_index: usize,
+    count: usize,
+    min_bytes: u64,
+    max_bytes: u64,
+    granularity_bytes: u64,
+    rng: &mut XorShift64,
+) -> Vec<PublicBenchFileSpec> {
+    let steps = (max_bytes - min_bytes) / granularity_bytes;
+    (0..count)
+        .map(|offset| {
+            let size = min_bytes + (rng.next_u64() % (steps + 1)) * granularity_bytes;
+            PublicBenchFileSpec {
+                index: start_index + offset,
+                size,
+            }
+        })
+        .collect()
+}
+
+fn generate_public_bench_large_size(rng: &mut XorShift64) -> u64 {
+    let span_steps = (PUBLIC_BENCH_LARGE_DELTA_BYTES * 2) / PUBLIC_BENCH_LARGE_GRANULARITY_BYTES;
+    let mut offset_steps = (rng.next_u64() % (span_steps + 1)) as i64
+        - (PUBLIC_BENCH_LARGE_DELTA_BYTES / PUBLIC_BENCH_LARGE_GRANULARITY_BYTES) as i64;
+    if offset_steps == 0 {
+        offset_steps = 1;
+    }
+    (PUBLIC_BENCH_LARGE_BASE_BYTES as i64
+        + offset_steps * PUBLIC_BENCH_LARGE_GRANULARITY_BYTES as i64) as u64
+}
+
+fn shuffled_indices(len: usize, seed: u64) -> Vec<usize> {
+    build_access_sequence(len, BenchmarkAccessPattern::Random, seed)
+}
+
+fn shuffled_large_file_offsets(size: u64, seed: u64) -> Vec<u64> {
+    let chunk_count = (size / PUBLIC_BENCH_LARGE_GRANULARITY_BYTES) as usize;
+    shuffled_indices(chunk_count, seed)
+        .into_iter()
+        .map(|index| index as u64 * PUBLIC_BENCH_LARGE_GRANULARITY_BYTES)
+        .collect()
+}
+
+#[cfg(test)]
+fn is_monotonic_non_decreasing(sizes: impl IntoIterator<Item = u64>) -> bool {
+    let mut iter = sizes.into_iter();
+    let Some(mut previous) = iter.next() else {
+        return true;
+    };
+    for size in iter {
+        if size < previous {
+            return false;
+        }
+        previous = size;
+    }
+    true
+}
+
+#[cfg(test)]
+fn is_constant_step_ladder(sizes: impl IntoIterator<Item = u64>) -> bool {
+    let mut iter = sizes.into_iter();
+    let Some(first) = iter.next() else {
+        return true;
+    };
+    let Some(second) = iter.next() else {
+        return true;
+    };
+    let Some(step) = second.checked_sub(first) else {
+        return false;
+    };
+    let mut previous = second;
+    for size in iter {
+        if size.checked_sub(previous) != Some(step) {
+            return false;
+        }
+        previous = size;
+    }
+    true
+}
+
 fn repeat_workload_plan(plan: WorkloadPlan, workload_repeat: usize) -> WorkloadPlan {
     let repeat = workload_repeat.max(1);
     if repeat == 1 {
@@ -608,5 +763,94 @@ mod tests {
 
         assert_eq!(buffer.capacity(), capacity);
         assert_eq!(buffer.len(), 16);
+    }
+
+    #[test]
+    fn public_bench_workload_has_fixed_counts_bounds_and_granularity() {
+        let workload = public_bench_workload();
+
+        assert_eq!(workload.small_files.len(), 1000);
+        assert_eq!(workload.medium_files.len(), 80);
+        assert_eq!(workload.large_file.size, 4_215_275_520);
+        assert_ne!(workload.large_file.size, 4 * 1024 * 1024 * 1024);
+        assert_eq!(workload.file_sizes().len(), 1081);
+
+        assert!(
+            workload
+                .small_files
+                .iter()
+                .all(|file| file.size >= 1024 && file.size <= 250 * 1024)
+        );
+        assert!(workload.medium_files.iter().all(|file| {
+            file.size >= 5 * 1024 * 1024 && file.size <= 8 * 1024 * 1024 && file.size % 1024 == 0
+        }));
+        assert_eq!(workload.large_file.size % (1024 * 1024), 0);
+    }
+
+    #[test]
+    fn public_bench_workload_exact_values_are_stable_for_fixed_seed() {
+        let workload = public_bench_workload();
+
+        let small_head: Vec<u64> = workload
+            .small_files
+            .iter()
+            .take(8)
+            .map(|file| file.size)
+            .collect();
+        let medium_head: Vec<u64> = workload
+            .medium_files
+            .iter()
+            .take(8)
+            .map(|file| file.size)
+            .collect();
+
+        assert_eq!(
+            small_head,
+            vec![
+                139_264, 89_088, 6_144, 11_264, 49_152, 38_912, 232_448, 102_400
+            ]
+        );
+        assert_eq!(
+            medium_head,
+            vec![
+                7_809_024, 5_628_928, 7_109_632, 6_328_320, 6_029_312, 8_283_136, 6_051_840,
+                5_682_176,
+            ]
+        );
+        assert_eq!(
+            &workload.read_order[..12],
+            &[932, 794, 647, 604, 531, 905, 481, 589, 851, 365, 142, 395]
+        );
+        assert_eq!(
+            &workload.large_file_read_offsets[..8],
+            &[
+                2_819_620_864,
+                1_937_768_448,
+                3_212_836_864,
+                2_472_542_208,
+                1_170_210_816,
+                1_756_364_800,
+                2_302_672_896,
+                3_596_615_680,
+            ]
+        );
+    }
+
+    #[test]
+    fn public_bench_workload_is_not_monotonic_or_stepwise() {
+        let workload = public_bench_workload();
+
+        assert!(!is_monotonic_non_decreasing(
+            workload.small_files.iter().map(|file| file.size)
+        ));
+        assert!(!is_monotonic_non_decreasing(
+            workload.medium_files.iter().map(|file| file.size)
+        ));
+        assert!(!is_constant_step_ladder(
+            workload.small_files.iter().map(|file| file.size)
+        ));
+        assert!(!is_constant_step_ladder(
+            workload.medium_files.iter().map(|file| file.size)
+        ));
     }
 }
