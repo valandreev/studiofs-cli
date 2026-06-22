@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
     BenchmarkAccessPattern, BenchmarkConfig, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
-    WorkloadSizeInput, parse_size_arg, render_human_summary, run_mounted, save_benchmark_report,
+    PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg,
+    public_bench_workload, render_human_summary, run_mounted, save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -32,19 +33,7 @@ pub(crate) struct BenchArgs {
 
 impl BenchArgs {
     pub(crate) fn dispatch(self) -> Result<()> {
-        run(self.into_devbench_args(), "studiofs bench")
-    }
-
-    fn into_devbench_args(self) -> DevbenchArgs {
-        DevbenchArgs {
-            mountpoint: self.mountpoint,
-            block_size: DEFAULT_BENCH_BLOCK_SIZE.to_string(),
-            big_file_size: DEFAULT_BENCH_BIG_FILE_SIZE.to_string(),
-            small_file_size: DEFAULT_BENCH_SMALL_FILE_SIZE.to_string(),
-            small_file_count: DEFAULT_BENCH_SMALL_FILE_COUNT,
-            threads: DEFAULT_BENCH_THREADS,
-            json_output: None,
-        }
+        run_bench(self)
     }
 }
 
@@ -180,15 +169,56 @@ fn build_bench_config(
     })
 }
 
+fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfig {
+    let workload = public_bench_workload();
+    let sizes = workload.file_sizes();
+    BenchmarkConfig {
+        command_name: "studiofs bench",
+        target: args.mountpoint.clone(),
+        block_size: PUBLIC_BENCH_BLOCK_SIZE,
+        read_size: PUBLIC_BENCH_BLOCK_SIZE,
+        size_class_small_max: PUBLIC_BENCH_SMALL_MAX_BYTES,
+        size_class_medium_max: PUBLIC_BENCH_MEDIUM_MAX_BYTES,
+        workload_repeat: 1,
+        concurrency: DEFAULT_BENCH_THREADS,
+        sequential_streams: false,
+        io_depth: DEFAULT_BENCH_THREADS,
+        warmup_runs: 0,
+        sizes: WorkloadSizeInput::ExplicitList(sizes),
+        access_pattern: BenchmarkAccessPattern::Random,
+        during_upload_min_pending: 1,
+        during_upload_timeout: Duration::from_secs(10),
+        l1_limit: DEFAULT_MEMORY_CACHE_SIZE,
+        profile: false,
+        full_file_reads: false,
+        run_id,
+    }
+}
+
+const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
+
+fn run_bench(args: BenchArgs) -> Result<()> {
+    let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
+    run_config(args.mountpoint, None, config)
+}
+
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
-    let runtime = resolve_mounted_runtime(&args.mountpoint)?.ok_or_else(|| {
+    let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
+    run_config(args.mountpoint, args.json_output, config)
+}
+
+fn run_config(
+    mountpoint: PathBuf,
+    json_output: Option<PathBuf>,
+    config: BenchmarkConfig,
+) -> Result<()> {
+    let runtime = resolve_mounted_runtime(&mountpoint)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
-            args.mountpoint.display()
+            mountpoint.display()
         )
     })?;
-    let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
-    let work_root = args.mountpoint.join(".studiofs-benchmark");
+    let work_root = mountpoint.join(".studiofs-benchmark");
     let mut work_root_cleanup = BenchWorkRootCleanup::new(work_root.clone());
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
@@ -221,7 +251,7 @@ fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
-    let report_path = save_benchmark_report(&report, args.json_output.as_deref())
+    let report_path = save_benchmark_report(&report, json_output.as_deref())
         .context("save benchmark JSON report")?;
     println!("JSON report: {}", report_path.display());
     work_root_cleanup.disarm();
@@ -315,6 +345,37 @@ mod tests {
                 );
             }
             other => panic!("expected explicit bench workload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn public_bench_config_uses_fixed_pseudo_random_workload() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+        };
+
+        let config = build_public_bench_config(&args, "run-1".to_string());
+
+        assert_eq!(config.command_name, "studiofs bench");
+        assert_eq!(config.block_size, 1024 * 1024);
+        assert_eq!(config.read_size, 1024 * 1024);
+        assert_eq!(config.workload_repeat, 1);
+        assert_eq!(config.concurrency, 1);
+        assert!(!config.sequential_streams);
+        assert_eq!(config.access_pattern, BenchmarkAccessPattern::Random);
+        assert!(!config.full_file_reads);
+        match config.sizes {
+            WorkloadSizeInput::ExplicitList(sizes) => {
+                assert_eq!(sizes.len(), 1081);
+                assert_eq!(
+                    &sizes[..8],
+                    &[
+                        139_264, 89_088, 6_144, 11_264, 49_152, 38_912, 232_448, 102_400
+                    ]
+                );
+                assert_eq!(sizes[1080], 4_215_275_520);
+            }
+            other => panic!("expected fixed public bench workload, got {other:?}"),
         }
     }
 
