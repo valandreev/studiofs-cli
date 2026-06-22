@@ -1160,23 +1160,36 @@ fn mounted_post_upload_idle_report(
     comparison: Option<&MountedLocalFirstReadComparisonReport>,
 ) -> Option<MountedPostUploadIdleReport> {
     let comparison = comparison?;
-    let phase = comparison
+    let (phase, fallback_reason) = comparison
         .phases
         .iter()
         .find(|phase| phase.phase == "upload-drain-wait")
+        .map(|phase| (phase, None))
         .or_else(|| {
             comparison
                 .phases
                 .iter()
                 .find(|phase| phase.phase == "post-upload-read")
+                .map(|phase| {
+                    (
+                        phase,
+                        Some(
+                            "upload-drain-wait phase missing; using legacy post-upload-read fallback",
+                        ),
+                    )
+                })
         })?;
+    let reason = phase
+        .validation_message
+        .clone()
+        .or_else(|| fallback_reason.map(str::to_string));
     Some(MountedPostUploadIdleReport {
         observed: phase.target_state_observed,
         timed_out: !phase.target_state_observed,
         wait_ms: phase.wait_ms,
         pending_uploads_before: phase.pending_uploads_before,
         pending_uploads_after: phase.pending_uploads_after,
-        reason: phase.validation_message.clone(),
+        reason,
     })
 }
 
@@ -1203,11 +1216,25 @@ fn compact_op_report(report: &OpReport) -> OpReport {
 }
 
 fn log_skipped_public_bench_report(reason: &str) {
-    tracing::info!(
+    tracing::warn!(
         target: "studiofs.bench",
         reason,
         "skipping public benchmark summary report"
     );
+}
+
+fn public_bench_large_file_size_bytes(workload: &WorkloadPlan, medium_max: u64) -> u64 {
+    let max_large_size = workload
+        .sizes
+        .iter()
+        .copied()
+        .filter(|size| *size > medium_max)
+        .max();
+    max_large_size
+        .or_else(|| {
+            (workload.large_files > 0).then(|| workload.sizes.iter().copied().max().unwrap_or(0))
+        })
+        .unwrap_or_default()
 }
 
 // Builds the compact public `studiofs bench` summary. The caller gates this to
@@ -1257,13 +1284,8 @@ fn build_public_bench_report(
         log_skipped_public_bench_report("upload drain observation missing");
         return None;
     };
-    let large_file_size_bytes = workload
-        .sizes
-        .iter()
-        .copied()
-        .filter(|size| *size > params.size_class_medium_max)
-        .max()
-        .unwrap_or_default();
+    let large_file_size_bytes =
+        public_bench_large_file_size_bytes(workload, params.size_class_medium_max);
 
     Some(PublicBenchReport {
         workload: PublicBenchWorkloadReport {
@@ -2968,6 +2990,21 @@ mod tests {
     }
 
     #[test]
+    fn public_bench_large_file_size_falls_back_to_max_workload_size_when_bounds_are_custom() {
+        let workload = WorkloadPlan {
+            sizes: vec![1024, 5 * 1024 * 1024, 4 * 1024 * 1024 * 1024],
+            source: "fixed-public-bench".to_string(),
+            small_files: 1,
+            medium_files: 1,
+            large_files: 1,
+        };
+
+        let large_size = public_bench_large_file_size_bytes(&workload, 8 * 1024 * 1024 * 1024);
+
+        assert_eq!(large_size, 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
     fn runtime_stats_phase_deltas_start_read_after_transition_wait() {
         let whole_run_before = runtime_snapshot_at(100);
         let after_write = runtime_snapshot_at(200);
@@ -3579,6 +3616,48 @@ mod tests {
         assert_eq!(report.wait_ms, 1234.0);
         assert_eq!(report.pending_uploads_before, 9);
         assert_eq!(report.pending_uploads_after, 0);
+    }
+
+    #[test]
+    fn post_upload_idle_report_marks_legacy_post_upload_read_fallback() {
+        let comparison = MountedLocalFirstReadComparisonReport {
+            cache_path: r"D:\cache".to_string(),
+            upload_dir: r"D:\cache\upload".to_string(),
+            phases: vec![MountedLocalFirstReadPhaseReport {
+                phase: "post-upload-read".to_string(),
+                wait_target: "idle".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                required_pending_uploads: 0,
+                wait_ms: 0.0,
+                pending_uploads_before: 0,
+                pending_uploads_after: 0,
+                validation_message: None,
+                results: super::super::result::OpReport {
+                    operations: 1,
+                    bytes: 8 * 1024 * 1024,
+                    elapsed_ms: 50.0,
+                    avg_latency_ms: 50.0,
+                    p50_ms: 50.0,
+                    p95_ms: 50.0,
+                    p99_ms: 50.0,
+                    throughput_bytes_per_sec: 160.0 * 1024.0 * 1024.0,
+                    latency_histogram: super::super::result::LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![1, 0],
+                    },
+                    operations_log: Vec::new(),
+                },
+            }],
+        };
+
+        let report = mounted_post_upload_idle_report(Some(&comparison)).expect("idle report");
+
+        assert_eq!(report.wait_ms, 0.0);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("upload-drain-wait phase missing; using legacy post-upload-read fallback")
+        );
     }
 
     #[test]
