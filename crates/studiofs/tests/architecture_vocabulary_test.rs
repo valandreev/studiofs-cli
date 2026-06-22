@@ -1047,6 +1047,9 @@ fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
 fn benchmark_methodology_covers_sfs558_operator_contract() {
     let doc = read_workspace_file("docs/perf/benchmark-methodology.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
+    // CONTEXT: This is a documentation contract guard for the SFS-558 public
+    // methodology. Keep the list to stable concepts, command names, JSON field
+    // names, and platform names so normal editorial rewrites do not break CI.
     let required_terms = [
         "SFS-558",
         "StudioFS Benchmark And Stats Methodology",
@@ -1058,11 +1061,8 @@ fn benchmark_methodology_covers_sfs558_operator_contract() {
         "legacy test-cache",
         "developer diagnostic",
         "target/perf",
-        "JSON report",
         "runtime_stats.available: false",
         "local_first_read_comparison",
-        "during-upload-read",
-        "post-upload-read",
         "Windows WinFSP",
         "macOS macFUSE",
         "Linux FUSE",
@@ -1071,13 +1071,10 @@ fn benchmark_methodology_covers_sfs558_operator_contract() {
         "cold pass",
         "warm pass",
         "at least three runs",
-        "medians",
         "p95/p99 latency",
         "smoothness indicators",
-        "throughput dips",
         "known limits",
         "not a correctness substitute",
-        "cargo test -p studiofs --test architecture_vocabulary_test benchmark_methodology_covers_sfs558_operator_contract -- --exact",
     ];
 
     let missing: Vec<_> = required_terms

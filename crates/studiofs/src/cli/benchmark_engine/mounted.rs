@@ -41,12 +41,7 @@ use super::workload::{
     build_work_sizes, classify_size, deterministic_bytes, fill_deterministic_bytes,
     split_stream_segments,
 };
-use studiofs_vfs::{RUNTIME_STATS_FILE_NAME, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
-
-const RUNTIME_STATS_FILE_NAME_STR: &str = match std::str::from_utf8(RUNTIME_STATS_FILE_NAME) {
-    Ok(value) => value,
-    Err(_) => panic!("StudioFS runtime stats file name must be UTF-8"),
-};
+use studiofs_vfs::{RUNTIME_STATS_FILE_NAME_STR, RuntimeStatsSnapshot, VfsPortableAllocatorStats};
 
 #[derive(Clone, Copy)]
 enum PendingUploadTarget {

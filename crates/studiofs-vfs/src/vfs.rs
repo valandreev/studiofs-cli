@@ -91,8 +91,8 @@ pub use metrics::{
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 pub use runtime_stats_surface::{
-    RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_REPORTED_SIZE,
-    read_runtime_stats_buffer,
+    RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
+    RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
 };
 
 use acl::AclState;
