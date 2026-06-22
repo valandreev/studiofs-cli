@@ -19,15 +19,17 @@ use tokio::task::JoinSet;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
-    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBarrierReport,
-    MountedCachedStoreReport, MountedFetchReport, MountedLocalFirstReadComparisonReport,
-    MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedObservabilityReport,
-    MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
+    AdvancedMetricsReport, BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
+    MountedBarrierReport, MountedCachedStoreReport, MountedFetchReport,
+    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
+    MountedObservabilityReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
     MountedPortableProcessReport, MountedPortableProfileReport, MountedPostUploadIdleReport,
     MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
     MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
     MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
-    OpReport, RuntimeStatsPhaseDeltaReport, benchmark_build_metadata, benchmark_command_metadata,
+    OpReport, PublicBenchDuringUploadReadReport, PublicBenchReport, PublicBenchUploadDrainReport,
+    PublicBenchWorkloadReport, PublicBenchWriteMetricsReport, RuntimeStatsPhaseDeltaReport,
+    SizeClassOpReport, benchmark_build_metadata, benchmark_command_metadata,
     benchmark_platform_metadata, missing_runtime_stats_report, runtime_stats_delta,
     runtime_stats_report,
 };
@@ -78,6 +80,14 @@ const OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC: f64 = 1_000.0 * 1024.0 * 1
 const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET: f64 = 1.20;
 const MAX_TEST_WRITE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const SIZE_CLASS_SMALL: &str = "small";
+const SIZE_CLASS_MEDIUM: &str = "medium";
+const SIZE_CLASS_LARGE: &str = "large";
+const PHASE_DURING_UPLOAD_READ: &str = "during-upload-read";
+const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
+const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
+const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
+    "upload-drain-wait phase missing; using legacy post-upload-read fallback";
 
 struct MeasuredMountedPhaseResult {
     started: Instant,
@@ -1158,23 +1168,162 @@ fn mounted_post_upload_idle_report(
     comparison: Option<&MountedLocalFirstReadComparisonReport>,
 ) -> Option<MountedPostUploadIdleReport> {
     let comparison = comparison?;
-    let phase = comparison
+    let (phase, fallback_reason) = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "upload-drain-read")
+        .find(|phase| phase.phase == PHASE_UPLOAD_DRAIN_WAIT)
+        .map(|phase| (phase, None))
         .or_else(|| {
             comparison
                 .phases
                 .iter()
-                .find(|phase| phase.phase == "post-upload-read")
+                .find(|phase| phase.phase == PHASE_POST_UPLOAD_READ)
+                .map(|phase| (phase, Some(LEGACY_POST_UPLOAD_READ_FALLBACK_REASON)))
         })?;
+    let reason = match (phase.validation_message.as_deref(), fallback_reason) {
+        (Some(validation), Some(fallback)) => Some(format!("{validation} ({fallback})")),
+        (Some(validation), None) => Some(validation.to_string()),
+        (None, Some(fallback)) => Some(fallback.to_string()),
+        (None, None) => None,
+    };
     Some(MountedPostUploadIdleReport {
         observed: phase.target_state_observed,
         timed_out: !phase.target_state_observed,
         wait_ms: phase.wait_ms,
         pending_uploads_before: phase.pending_uploads_before,
         pending_uploads_after: phase.pending_uploads_after,
-        reason: phase.validation_message.clone(),
+        reason,
+    })
+}
+
+fn size_class_report<'a>(
+    reports: &'a [SizeClassOpReport],
+    class: &str,
+) -> Option<&'a SizeClassOpReport> {
+    reports.iter().find(|report| report.class == class)
+}
+
+fn compact_op_report(report: &OpReport) -> OpReport {
+    OpReport {
+        operations: report.operations,
+        bytes: report.bytes,
+        elapsed_ms: report.elapsed_ms,
+        avg_latency_ms: report.avg_latency_ms,
+        p50_ms: report.p50_ms,
+        p95_ms: report.p95_ms,
+        p99_ms: report.p99_ms,
+        throughput_bytes_per_sec: report.throughput_bytes_per_sec,
+        latency_histogram: report.latency_histogram.clone(),
+        operations_log: Vec::new(),
+    }
+}
+
+fn log_skipped_public_bench_report(reason: &str) {
+    tracing::warn!(
+        target: "studiofs.bench",
+        reason,
+        "skipping public benchmark summary report"
+    );
+}
+
+fn public_bench_large_file_size_bytes(workload: &WorkloadPlan, medium_max: u64) -> u64 {
+    let mut max_overall = 0;
+    let mut max_large_size = 0;
+    for &size in &workload.sizes {
+        max_overall = max_overall.max(size);
+        if size > medium_max {
+            max_large_size = max_large_size.max(size);
+        }
+    }
+    if max_large_size > 0 {
+        max_large_size
+    } else if workload.large_files > 0 {
+        max_overall
+    } else {
+        0
+    }
+}
+
+// Builds the compact public `studiofs bench` summary. The caller gates this to
+// the public command; missing mounted upload evidence is logged for debugging.
+fn build_public_bench_report(
+    params: &BenchmarkConfig,
+    workload: &WorkloadPlan,
+    advanced_metrics: &AdvancedMetricsReport,
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+    post_upload_idle: Option<&MountedPostUploadIdleReport>,
+) -> Option<PublicBenchReport> {
+    debug_assert_eq!(params.command_name, "studiofs bench");
+
+    let Some(small_files) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_SMALL)
+    else {
+        log_skipped_public_bench_report("small write metrics missing");
+        return None;
+    };
+    let Some(medium_files) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_MEDIUM)
+    else {
+        log_skipped_public_bench_report("medium write metrics missing");
+        return None;
+    };
+    let Some(large_file) =
+        size_class_report(&advanced_metrics.size_class_stats.writes, SIZE_CLASS_LARGE)
+    else {
+        log_skipped_public_bench_report("large write metrics missing");
+        return None;
+    };
+    let write_metrics = PublicBenchWriteMetricsReport {
+        small_files: small_files.clone(),
+        medium_files: medium_files.clone(),
+        large_file: large_file.clone(),
+    };
+    let Some(comparison) = comparison else {
+        log_skipped_public_bench_report("local-first read comparison missing");
+        return None;
+    };
+    let Some(during_upload) = comparison
+        .phases
+        .iter()
+        .find(|phase| phase.phase == PHASE_DURING_UPLOAD_READ)
+    else {
+        log_skipped_public_bench_report("during-upload-read phase missing");
+        return None;
+    };
+    let Some(upload_drain) = post_upload_idle else {
+        log_skipped_public_bench_report("upload drain observation missing");
+        return None;
+    };
+    let large_file_size_bytes =
+        public_bench_large_file_size_bytes(workload, params.size_class_medium_max);
+
+    Some(PublicBenchReport {
+        workload: PublicBenchWorkloadReport {
+            small_files: workload.small_files,
+            medium_files: workload.medium_files,
+            large_files: workload.large_files,
+            large_file_size_bytes,
+        },
+        write_metrics,
+        during_upload_read: PublicBenchDuringUploadReadReport {
+            phase: during_upload.phase.clone(),
+            metrics: compact_op_report(&during_upload.results),
+            wait_target: during_upload.wait_target.clone(),
+            target_state_observed: during_upload.target_state_observed,
+            valid_for_target: during_upload.valid_for_target,
+            wait_ms: during_upload.wait_ms,
+            pending_uploads_before: during_upload.pending_uploads_before,
+            pending_uploads_after: during_upload.pending_uploads_after,
+            validation_message: during_upload.validation_message.clone(),
+        },
+        upload_drain: PublicBenchUploadDrainReport {
+            observed_idle: upload_drain.observed,
+            timed_out: upload_drain.timed_out,
+            wait_ms: upload_drain.wait_ms,
+            pending_uploads_before: upload_drain.pending_uploads_before,
+            pending_uploads_after: upload_drain.pending_uploads_after,
+            reason: upload_drain.reason.clone(),
+        },
     })
 }
 
@@ -2523,6 +2672,19 @@ pub(crate) async fn run_mounted_end_to_end(
             measured.writes_wall.as_secs_f64() * 1000.0,
             measured.reads_wall.as_secs_f64() * 1000.0,
         );
+        let public_bench = if params.command_name == "studiofs bench" {
+            let post_upload_idle =
+                mounted_post_upload_idle_report(local_first_read_comparison.as_ref());
+            build_public_bench_report(
+                params,
+                &workload,
+                &advanced_metrics,
+                local_first_read_comparison.as_ref(),
+                post_upload_idle.as_ref(),
+            )
+        } else {
+            None
+        };
         let mounted_runtime = Some(build_mounted_runtime_report(
             params,
             mount_point,
@@ -2613,6 +2775,7 @@ pub(crate) async fn run_mounted_end_to_end(
             cache_pipeline: None,
             profile,
             advanced_metrics: Some(advanced_metrics),
+            public_bench,
             stream_results,
             mounted_memory,
             mounted_runtime,
@@ -2643,6 +2806,9 @@ pub(crate) async fn run_mounted_end_to_end(
 
 #[cfg(test)]
 mod tests {
+    use super::super::result::{
+        LatencyHistogramReport, OperationLogReport, SizeClassBoundaryReport, SizeClassStatsReport,
+    };
     use super::*;
     use std::path::PathBuf;
     use studiofs_vfs::vfs::{VfsWritePathVfsWriteStats, VfsWritePathWinfspWritePathStats};
@@ -2717,6 +2883,135 @@ mod tests {
             generated_unix_ms,
             ..RuntimeStatsSnapshot::default()
         }
+    }
+
+    fn test_op_report_with_operations_log() -> OpReport {
+        OpReport {
+            operations: 1,
+            bytes: 64 * 1024 * 1024,
+            elapsed_ms: 120.0,
+            avg_latency_ms: 120.0,
+            p50_ms: 120.0,
+            p95_ms: 120.0,
+            p99_ms: 120.0,
+            throughput_bytes_per_sec: 533.0 * 1024.0 * 1024.0,
+            latency_histogram: LatencyHistogramReport {
+                bucket_upper_bounds_ns: vec![50_000],
+                bucket_counts: vec![0, 1],
+            },
+            operations_log: vec![OperationLogReport {
+                operation_index: 7,
+                work_index: 0,
+                worker_id: 0,
+                target: "/mnt/studiofs-benchmark/large.bin".to_string(),
+                size_class: "large".to_string(),
+                bytes: 64 * 1024 * 1024,
+                elapsed_ms: 120.0,
+                throughput_bytes_per_sec: 533.0 * 1024.0 * 1024.0,
+            }],
+        }
+    }
+
+    fn test_size_class_report(class: &str, operations: u64, bytes: u64) -> SizeClassOpReport {
+        SizeClassOpReport {
+            class: class.to_string(),
+            operations,
+            bytes,
+            avg_latency_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            throughput_bytes_per_sec: bytes as f64,
+        }
+    }
+
+    #[test]
+    fn public_bench_report_keeps_summary_metrics_without_duplicate_operation_log() {
+        let mut params = benchmark_config_with_block_size(16 * 1024 * 1024);
+        params.command_name = "studiofs bench";
+        params.size_class_medium_max = 8 * 1024 * 1024;
+        let workload = WorkloadPlan {
+            sizes: vec![1024, 5 * 1024 * 1024, 4 * 1024 * 1024 * 1024],
+            source: "fixed-public-bench".to_string(),
+            small_files: 1,
+            medium_files: 1,
+            large_files: 1,
+        };
+        let advanced_metrics = AdvancedMetricsReport {
+            size_class_boundaries: SizeClassBoundaryReport {
+                small_max_bytes: 256 * 1024,
+                medium_max_bytes: 8 * 1024 * 1024,
+            },
+            size_class_stats: SizeClassStatsReport {
+                writes: vec![
+                    test_size_class_report("small", 1, 1024),
+                    test_size_class_report("medium", 1, 5 * 1024 * 1024),
+                    test_size_class_report("large", 1, 4 * 1024 * 1024 * 1024),
+                ],
+                reads: Vec::new(),
+            },
+            cache_levels: None,
+        };
+        let comparison = MountedLocalFirstReadComparisonReport {
+            cache_path: r"D:\cache".to_string(),
+            upload_dir: r"D:\cache\upload".to_string(),
+            phases: vec![MountedLocalFirstReadPhaseReport {
+                phase: "during-upload-read".to_string(),
+                wait_target: "active".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                required_pending_uploads: 1,
+                wait_ms: 20.0,
+                pending_uploads_before: 2,
+                pending_uploads_after: 1,
+                validation_message: Some("idle observation came from fallback phase".to_string()),
+                results: test_op_report_with_operations_log(),
+            }],
+        };
+        let post_upload_idle = MountedPostUploadIdleReport {
+            observed: true,
+            timed_out: false,
+            wait_ms: 240.0,
+            pending_uploads_before: 1,
+            pending_uploads_after: 0,
+            reason: None,
+        };
+
+        let report = build_public_bench_report(
+            &params,
+            &workload,
+            &advanced_metrics,
+            Some(&comparison),
+            Some(&post_upload_idle),
+        )
+        .expect("public bench report");
+
+        assert!(report.during_upload_read.metrics.operations_log.is_empty());
+        assert_eq!(comparison.phases[0].results.operations_log.len(), 1);
+        assert_eq!(report.during_upload_read.metrics.operations, 1);
+        assert_eq!(
+            report.write_metrics.large_file.bytes,
+            4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            report.workload.large_file_size_bytes,
+            4 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn public_bench_large_file_size_falls_back_to_max_workload_size_when_bounds_are_custom() {
+        let workload = WorkloadPlan {
+            sizes: vec![1024, 5 * 1024 * 1024, 4 * 1024 * 1024 * 1024],
+            source: "fixed-public-bench".to_string(),
+            small_files: 1,
+            medium_files: 1,
+            large_files: 1,
+        };
+
+        let large_size = public_bench_large_file_size_bytes(&workload, 8 * 1024 * 1024 * 1024);
+
+        assert_eq!(large_size, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -3266,13 +3561,13 @@ mod tests {
     }
 
     #[test]
-    fn post_upload_idle_report_uses_visible_upload_drain_read_phase() {
+    fn post_upload_idle_report_uses_visible_upload_drain_wait_phase() {
         let comparison = MountedLocalFirstReadComparisonReport {
             cache_path: r"D:\cache".to_string(),
             upload_dir: r"D:\cache\upload".to_string(),
             phases: vec![
                 MountedLocalFirstReadPhaseReport {
-                    phase: "upload-drain-read".to_string(),
+                    phase: "upload-drain-wait".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
                     valid_for_target: true,
@@ -3331,6 +3626,50 @@ mod tests {
         assert_eq!(report.wait_ms, 1234.0);
         assert_eq!(report.pending_uploads_before, 9);
         assert_eq!(report.pending_uploads_after, 0);
+    }
+
+    #[test]
+    fn post_upload_idle_report_marks_legacy_post_upload_read_fallback() {
+        let comparison = MountedLocalFirstReadComparisonReport {
+            cache_path: r"D:\cache".to_string(),
+            upload_dir: r"D:\cache\upload".to_string(),
+            phases: vec![MountedLocalFirstReadPhaseReport {
+                phase: "post-upload-read".to_string(),
+                wait_target: "idle".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                required_pending_uploads: 0,
+                wait_ms: 0.0,
+                pending_uploads_before: 0,
+                pending_uploads_after: 0,
+                validation_message: Some("idle observation came from fallback phase".to_string()),
+                results: super::super::result::OpReport {
+                    operations: 1,
+                    bytes: 8 * 1024 * 1024,
+                    elapsed_ms: 50.0,
+                    avg_latency_ms: 50.0,
+                    p50_ms: 50.0,
+                    p95_ms: 50.0,
+                    p99_ms: 50.0,
+                    throughput_bytes_per_sec: 160.0 * 1024.0 * 1024.0,
+                    latency_histogram: super::super::result::LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![1, 0],
+                    },
+                    operations_log: Vec::new(),
+                },
+            }],
+        };
+
+        let report = mounted_post_upload_idle_report(Some(&comparison)).expect("idle report");
+
+        assert_eq!(report.wait_ms, 0.0);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some(
+                "idle observation came from fallback phase (upload-drain-wait phase missing; using legacy post-upload-read fallback)"
+            )
+        );
     }
 
     #[test]

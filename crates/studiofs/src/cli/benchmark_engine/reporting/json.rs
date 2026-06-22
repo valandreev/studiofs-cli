@@ -223,9 +223,12 @@ pub(crate) fn save_benchmark_report(
 mod tests {
     use super::*;
     use crate::cli::benchmark_engine::result::{
-        MountedMemoryReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
-        MountedPortableProcessReport, MountedPortableProfileReport, MountedWriteDiagnosticsReport,
-        MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, sample_report,
+        LatencyHistogramReport, MountedMemoryReport, MountedPortableAllocatorReport,
+        MountedPortablePhaseProfileReport, MountedPortableProcessReport,
+        MountedPortableProfileReport, MountedWriteDiagnosticsReport,
+        MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, OpReport,
+        PublicBenchDuringUploadReadReport, PublicBenchReport, PublicBenchUploadDrainReport,
+        PublicBenchWorkloadReport, PublicBenchWriteMetricsReport, SizeClassOpReport, sample_report,
     };
     use chrono::TimeZone;
 
@@ -517,6 +520,137 @@ mod tests {
         assert_eq!(diagnostics["payload_persisted_bytes_delta"], 1024);
         assert_eq!(diagnostics["landing_accepted_bytes_delta"], 0);
         assert_eq!(diagnostics["total_accounted_bytes_after"], 512);
+    }
+
+    #[test]
+    fn save_benchmark_report_includes_public_bench_write_and_upload_drain_surface() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.command.name = "studiofs bench".to_string();
+        report.public_bench = Some(PublicBenchReport {
+            workload: PublicBenchWorkloadReport {
+                small_files: 1000,
+                medium_files: 80,
+                large_files: 1,
+                large_file_size_bytes: 4 * 1024 * 1024 * 1024 + 37 * 1024 * 1024,
+            },
+            write_metrics: PublicBenchWriteMetricsReport {
+                small_files: SizeClassOpReport {
+                    class: "small".to_string(),
+                    operations: 1000,
+                    bytes: 140 * 1024 * 1024,
+                    avg_latency_ms: 0.8,
+                    p50_ms: 0.7,
+                    p95_ms: 1.1,
+                    p99_ms: 1.3,
+                    throughput_bytes_per_sec: 200.0 * 1024.0 * 1024.0,
+                },
+                medium_files: SizeClassOpReport {
+                    class: "medium".to_string(),
+                    operations: 80,
+                    bytes: 512 * 1024 * 1024,
+                    avg_latency_ms: 4.0,
+                    p50_ms: 3.8,
+                    p95_ms: 6.2,
+                    p99_ms: 6.8,
+                    throughput_bytes_per_sec: 512.0 * 1024.0 * 1024.0,
+                },
+                large_file: SizeClassOpReport {
+                    class: "large".to_string(),
+                    operations: 1,
+                    bytes: 4 * 1024 * 1024 * 1024 + 37 * 1024 * 1024,
+                    avg_latency_ms: 8000.0,
+                    p50_ms: 8000.0,
+                    p95_ms: 8000.0,
+                    p99_ms: 8000.0,
+                    throughput_bytes_per_sec: 768.0 * 1024.0 * 1024.0,
+                },
+            },
+            during_upload_read: PublicBenchDuringUploadReadReport {
+                phase: "during-upload-read".to_string(),
+                metrics: OpReport {
+                    operations: 1,
+                    bytes: 64 * 1024 * 1024,
+                    elapsed_ms: 120.0,
+                    avg_latency_ms: 120.0,
+                    p50_ms: 120.0,
+                    p95_ms: 120.0,
+                    p99_ms: 120.0,
+                    throughput_bytes_per_sec: 533.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 1],
+                    },
+                    operations_log: Vec::new(),
+                },
+                wait_target: "active".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                wait_ms: 20.0,
+                pending_uploads_before: 2,
+                pending_uploads_after: 1,
+                validation_message: None,
+            },
+            upload_drain: PublicBenchUploadDrainReport {
+                observed_idle: true,
+                timed_out: false,
+                wait_ms: 240.0,
+                pending_uploads_before: 1,
+                pending_uploads_after: 0,
+                reason: None,
+            },
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("bench-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let public_bench = &parsed["public_bench"];
+        assert_eq!(public_bench["workload"]["small_files"], 1000);
+        assert_eq!(public_bench["workload"]["medium_files"], 80);
+        assert_eq!(public_bench["workload"]["large_files"], 1);
+        assert!(
+            public_bench["workload"]["large_file_size_bytes"]
+                .as_u64()
+                .unwrap()
+                >= 4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            public_bench["write_metrics"]["small_files"]["class"],
+            "small"
+        );
+        assert_eq!(
+            public_bench["write_metrics"]["medium_files"]["class"],
+            "medium"
+        );
+        assert_eq!(
+            public_bench["write_metrics"]["large_file"]["class"],
+            "large"
+        );
+        assert!(
+            public_bench["write_metrics"]["large_file"]["bytes"]
+                .as_u64()
+                .unwrap()
+                >= 4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            public_bench["during_upload_read"]["phase"],
+            "during-upload-read"
+        );
+        assert_eq!(public_bench["during_upload_read"]["wait_target"], "active");
+        assert_eq!(
+            public_bench["during_upload_read"]["target_state_observed"],
+            true
+        );
+        assert_eq!(public_bench["upload_drain"]["observed_idle"], true);
+        assert_eq!(public_bench["upload_drain"]["pending_uploads_after"], 0);
     }
 
     #[test]

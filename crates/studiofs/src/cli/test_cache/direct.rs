@@ -618,6 +618,7 @@ pub(super) async fn run_direct(
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
+        public_bench: None,
         local_first_read_comparison: None,
         stream_results,
         mounted_memory: None,
