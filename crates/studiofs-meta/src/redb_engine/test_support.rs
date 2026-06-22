@@ -1,4 +1,18 @@
 use super::*;
+use std::ops::Deref;
+
+pub(super) struct TestEngine {
+    engine: RedbMetaEngine,
+    _dir: tempfile::TempDir,
+}
+
+impl Deref for TestEngine {
+    type Target = RedbMetaEngine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
 
 pub(super) fn test_format_info(name: &str) -> FormatInfo {
     FormatInfo {
@@ -17,7 +31,7 @@ pub(super) fn test_format_info(name: &str) -> FormatInfo {
     }
 }
 
-pub(super) fn temp_engine() -> RedbMetaEngine {
+pub(super) fn temp_engine() -> TestEngine {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("test.db");
     let engine = RedbMetaEngine::open(&path).unwrap();
@@ -25,9 +39,7 @@ pub(super) fn temp_engine() -> RedbMetaEngine {
     engine
         .set_format_info(&test_format_info("test-vol"))
         .unwrap();
-    // Leak dir so it isn't dropped
-    std::mem::forget(dir);
-    engine
+    TestEngine { engine, _dir: dir }
 }
 
 pub(super) fn set_regular_file_chunk_rows(

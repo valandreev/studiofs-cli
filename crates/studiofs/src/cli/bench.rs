@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn cleanup_guard_removes_work_root_when_not_disarmed() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = studiofs_test_support::workspace_target_tempdir("bench-cleanup-");
         let work_root = temp_dir.path().join(".studiofs-benchmark");
         std::fs::create_dir(&work_root).unwrap();
 
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn cleanup_guard_preserves_work_root_when_disarmed() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = studiofs_test_support::workspace_target_tempdir("bench-cleanup-");
         let work_root = temp_dir.path().join(".studiofs-benchmark");
         std::fs::create_dir(&work_root).unwrap();
 

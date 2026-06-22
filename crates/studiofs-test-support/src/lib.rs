@@ -1,4 +1,5 @@
 //! Shared test helpers for StudioFS workspace crates.
+#![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

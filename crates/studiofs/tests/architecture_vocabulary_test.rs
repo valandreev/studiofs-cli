@@ -348,8 +348,20 @@ fn line_column_to_offset(contents: &str, line_starts: &[usize], location: LineCo
     (line_start + byte_in_line).min(contents.len())
 }
 
-fn write_temp_source(contents: &str) -> tempfile::NamedTempFile {
-    let mut file = tempfile::NamedTempFile::new().unwrap_or_else(|error| {
+struct TempSource {
+    _dir: tempfile::TempDir,
+    file: tempfile::NamedTempFile,
+}
+
+impl TempSource {
+    fn path(&self) -> &std::path::Path {
+        self.file.path()
+    }
+}
+
+fn write_temp_source(contents: &str) -> TempSource {
+    let dir = studiofs_test_support::workspace_target_tempdir("architecture-source-");
+    let mut file = tempfile::NamedTempFile::new_in(dir.path()).unwrap_or_else(|error| {
         panic!("failed to create temp source file: {error}");
     });
     file.write_all(contents.as_bytes()).unwrap_or_else(|error| {
@@ -358,7 +370,7 @@ fn write_temp_source(contents: &str) -> tempfile::NamedTempFile {
             file.path().display()
         );
     });
-    file
+    TempSource { _dir: dir, file }
 }
 
 fn collect_term_hits_from_contents(path: &str, contents: &str, terms: &[&str]) -> Vec<String> {
