@@ -204,29 +204,28 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
-    let report = run_config(args.mountpoint, config)?;
+    let report = run_config(config)?;
     print_benchmark_report(&report);
-    save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))
+    save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))?;
+    Ok(())
 }
 
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
-    let report = run_config(args.mountpoint, config)?;
+    let report = run_config(config)?;
     print_benchmark_report(&report);
-    save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))
+    save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))?;
+    Ok(())
 }
 
-fn run_config(
-    mountpoint: PathBuf,
-    config: BenchmarkConfig,
-) -> Result<crate::cli::benchmark_engine::BenchmarkReport> {
-    let runtime = resolve_mounted_runtime(&mountpoint)?.ok_or_else(|| {
+fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::BenchmarkReport> {
+    let runtime = resolve_mounted_runtime(&config.target)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
-            mountpoint.display()
+            config.target.display()
         )
     })?;
-    let work_root = mountpoint.join(".studiofs-benchmark");
+    let work_root = config.target.join(".studiofs-benchmark");
     let mut work_root_cleanup = BenchWorkRootCleanup::new(work_root.clone());
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
