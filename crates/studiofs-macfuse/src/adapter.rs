@@ -1961,11 +1961,10 @@ impl StudioVfsAdapter {
     ) -> Result<(), i32> {
         self.shared.read_windows.invalidate_handle(file_handle);
         let outcome = outcome_result?;
-        if outcome.closed_last_handle {
-            if let Some(released) = released_write_handle.filter(|released| released.last_for_inode)
-            {
-                self.clear_open_cache_snapshot(released.ino, "clean_write_release");
-            }
+        if outcome.closed_last_handle
+            && let Some(released) = released_write_handle.filter(|released| released.last_for_inode)
+        {
+            self.clear_open_cache_snapshot(released.ino, "clean_write_release");
         }
         Ok(())
     }
