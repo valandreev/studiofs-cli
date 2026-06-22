@@ -183,6 +183,8 @@ studiofs mount myvolume Y:
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
 | `snapshot` | Create/list immutable metadata snapshots |
+| `perf` | Watch live runtime stats from a mounted StudioFS volume |
+| `bench` | Run a mounted filesystem benchmark and write a JSON report |
 | `destroy` | Remove a volume locally or locally + remotely |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
@@ -192,10 +194,11 @@ variables accept `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` suffixes (binary
 units, `1KB = 1024B`) and fractional values like `1.5GB` (rounded down to
 bytes).
 
-Benchmark and statistics tooling is being consolidated under the mounted
-filesystem benchmark path. Prefer mounted validation recipes from
-`docs/local-first-validation-matrix.md` until the public `studiofs bench`
-command is available.
+Benchmark and statistics tooling uses the mounted filesystem path. Use
+`studiofs perf` for live runtime counters and `studiofs bench` for reproducible
+mounted benchmark reports. See
+[`docs/perf/benchmark-methodology.md`](docs/perf/benchmark-methodology.md) for
+the comparison methodology and known limits.
 
 ## Development
 

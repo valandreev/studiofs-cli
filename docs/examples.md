@@ -201,3 +201,6 @@ Without `--json-output`, reports are saved under `target/perf` with an
 auto-generated file name. Each report includes command, platform, build, mount,
 and runtime-stats sections. Missing runtime stats are warnings, not benchmark
 failures, and are represented as `runtime_stats.available: false` in JSON.
+
+See [benchmark-methodology.md](./perf/benchmark-methodology.md) for command
+selection, cross-platform comparison rules, artifact handling, and known limits.

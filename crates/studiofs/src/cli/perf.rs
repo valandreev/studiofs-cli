@@ -13,8 +13,8 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use studiofs_vfs::RuntimeScalarMetric;
 use studiofs_vfs::{
-    RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_SECTIONS, RuntimeLatencyHistogram, RuntimeStatsSection,
-    RuntimeStatsSnapshot,
+    RUNTIME_STATS_FILE_NAME_STR, RUNTIME_STATS_SECTIONS, RuntimeLatencyHistogram,
+    RuntimeStatsSection, RuntimeStatsSnapshot,
 };
 
 use crate::diagnostics;
@@ -78,7 +78,8 @@ impl PerfArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
         let options = self.into_options()?;
         let mut stdout = io::stdout().lock();
-        run_perf(&options, &mut stdout)
+        let mut stderr = io::stderr().lock();
+        run_perf(&options, &mut stdout, &mut stderr)
     }
 
     fn into_options(self) -> anyhow::Result<PerfOptions> {
@@ -177,7 +178,11 @@ struct TableOutputState {
     printed_warnings: BTreeSet<String>,
 }
 
-fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
+fn run_perf(
+    options: &PerfOptions,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> anyhow::Result<()> {
     if options.schema {
         write_schema(out, options)?;
         return Ok(());
@@ -187,22 +192,40 @@ fn run_perf(options: &PerfOptions, out: &mut impl Write) -> anyhow::Result<()> {
         .mountpoint
         .as_deref()
         .context("<mountpoint> is required unless --schema is passed")?;
-    if let Some(client) = diagnostics_client_for_mount(mountpoint)? {
+    let diagnostics_client = match diagnostics_client_for_mount(mountpoint) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "local diagnostics session discovery failed; falling back to runtime stats file"
+            );
+            None
+        }
+    };
+    if let Some(client) = diagnostics_client {
         return run_perf_with_sampler(
             options,
             out,
+            err,
             || read_diagnostics_snapshot(&client),
             thread::sleep,
         );
     }
 
     let stats_path = stats_path(mountpoint);
-    run_perf_with_sampler(options, out, || read_snapshot(&stats_path), thread::sleep)
+    run_perf_with_sampler(
+        options,
+        out,
+        err,
+        || read_snapshot(&stats_path),
+        thread::sleep,
+    )
 }
 
 fn run_perf_with_sampler(
     options: &PerfOptions,
     out: &mut impl Write,
+    err: &mut impl Write,
     mut read_next: impl FnMut() -> anyhow::Result<RuntimeStatsSnapshot>,
     mut sleep: impl FnMut(Duration),
 ) -> anyhow::Result<()> {
@@ -227,7 +250,7 @@ fn run_perf_with_sampler(
         sleep_until_next_deadline(&mut next_deadline, options.interval, &mut sleep);
         let current = read_next()?;
         let sample = build_sample(&previous, &current, options);
-        write_sample(out, &sample, options, &mut table_state)?;
+        write_sample(out, err, &sample, options, &mut table_state)?;
         out.flush()?;
         previous = current;
 
@@ -291,19 +314,14 @@ fn stats_path(mountpoint: &Path) -> PathBuf {
                 return PathBuf::from(format!(
                     "{}\\{}",
                     mountpoint.display(),
-                    runtime_stats_file_name()
+                    RUNTIME_STATS_FILE_NAME_STR
                 ));
             }
             _ => {}
         }
     }
 
-    mountpoint.join(runtime_stats_file_name())
-}
-
-fn runtime_stats_file_name() -> &'static str {
-    std::str::from_utf8(RUNTIME_STATS_FILE_NAME)
-        .expect("StudioFS runtime stats file name must be UTF-8")
+    mountpoint.join(RUNTIME_STATS_FILE_NAME_STR)
 }
 
 fn read_snapshot(path: &Path) -> anyhow::Result<RuntimeStatsSnapshot> {
@@ -900,12 +918,13 @@ fn rate(delta: u64, seconds: f64) -> f64 {
 
 fn write_sample(
     out: &mut impl Write,
+    err: &mut impl Write,
     sample: &PerfSample,
     options: &PerfOptions,
     table_state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
     match options.output {
-        PerfOutput::Table => write_table_sample(out, sample, table_state),
+        PerfOutput::Table => write_table_sample(out, err, sample, table_state),
         PerfOutput::Json => bail!("finite JSON output must be written as a sample array"),
         PerfOutput::JsonLines => {
             let mut buffer = serde_json::to_vec(sample)?;
@@ -924,13 +943,13 @@ fn write_json_samples(out: &mut impl Write, samples: &[PerfSample]) -> anyhow::R
 
 fn write_table_sample(
     out: &mut impl Write,
+    err: &mut impl Write,
     sample: &PerfSample,
     state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
     for warning in &sample.warnings {
-        if !state.printed_warnings.contains(warning) {
-            state.printed_warnings.insert(warning.clone());
-            writeln!(out, "warning: {warning}")?;
+        if state.printed_warnings.insert(warning.clone()) {
+            writeln!(err, "warning: {warning}")?;
         }
     }
 
@@ -1141,7 +1160,7 @@ fn format_bytes(value: u64) -> String {
 fn write_schema(out: &mut impl Write, options: &PerfOptions) -> anyhow::Result<()> {
     let payload = serde_json::json!({
         "schema_version": studiofs_vfs::RUNTIME_STATS_SCHEMA_VERSION,
-        "stats_file": runtime_stats_file_name(),
+        "stats_file": RUNTIME_STATS_FILE_NAME_STR,
         "sections": &options.sections,
         "line_kinds": ["counter", "gauge", "histogram_count", "histogram_sum", "histogram_bucket"],
         "units": ["count", "bytes", "ns", "ms", "percent"],
@@ -1770,12 +1789,15 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
+        let error_output = String::from_utf8(err).expect("warnings are utf8");
 
-        assert!(output.contains("warning: missing stats for section 'metadata'"));
+        assert!(!output.contains("warning:"));
+        assert!(error_output.contains("warning: missing stats for section 'metadata'"));
     }
 
     #[test]
@@ -1795,16 +1817,19 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state)
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state)
             .expect("write first table sample");
-        write_sample(&mut out, &sample, &options, &mut table_state)
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state)
             .expect("write second table sample");
         let output = String::from_utf8(out).expect("table is utf8");
+        let error_output = String::from_utf8(err).expect("warnings are utf8");
 
+        assert!(!output.contains("missing stats for section 'metadata'"));
         assert_eq!(
-            output
+            error_output
                 .matches("missing stats for section 'metadata'")
                 .count(),
             1
@@ -1828,10 +1853,11 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
         for _ in 0..=TABLE_HEADER_REPEAT_SAMPLES {
-            write_sample(&mut out, &sample, &options, &mut table_state)
+            write_sample(&mut out, &mut err, &sample, &options, &mut table_state)
                 .expect("write table sample");
         }
         let output = String::from_utf8(out).expect("table is utf8");
@@ -1856,9 +1882,10 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("------usage------"));
@@ -1900,9 +1927,10 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state).expect("write table");
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state).expect("write table");
         let output = String::from_utf8(out).expect("table is utf8");
 
         assert!(output.contains("0.0%"));
@@ -1934,9 +1962,11 @@ mod tests {
             &options,
         );
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state).expect("write json lines");
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state)
+            .expect("write json lines");
         let output = String::from_utf8(out).expect("json lines is utf8");
 
         assert_eq!(output.lines().count(), 1);
@@ -1959,9 +1989,11 @@ mod tests {
             &options,
         );
         let mut out = FlushingBuffer::default();
+        let mut err = Vec::new();
         let mut table_state = TableOutputState::default();
 
-        write_sample(&mut out, &sample, &options, &mut table_state).expect("write json line");
+        write_sample(&mut out, &mut err, &sample, &options, &mut table_state)
+            .expect("write json line");
 
         assert_eq!(out.writes, 1);
         assert!(out.bytes.ends_with(b"\n"));
@@ -1986,10 +2018,12 @@ mod tests {
         let mut next_snapshot = 0;
         let mut sleeps = Vec::new();
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_perf_with_sampler(
             &options,
             &mut out,
+            &mut err,
             || {
                 let snapshot = snapshots[next_snapshot].clone();
                 next_snapshot += 1;
@@ -2023,10 +2057,12 @@ mod tests {
         };
         let mut reads = 0;
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_perf_with_sampler(
             &options,
             &mut out,
+            &mut err,
             || {
                 reads += 1;
                 Ok(snapshot_at(1_000, 100, 0))
@@ -2054,10 +2090,12 @@ mod tests {
         let mut reads = 0;
         let mut sleeps = 0;
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_perf_with_sampler(
             &options,
             &mut out,
+            &mut err,
             || {
                 reads += 1;
                 Ok(snapshot_at(1_000, 100, 0))
@@ -2088,10 +2126,12 @@ mod tests {
         let mut next_snapshot = 0;
         let mut sleeps = Vec::new();
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_perf_with_sampler(
             &options,
             &mut out,
+            &mut err,
             || {
                 let snapshot = snapshots[next_snapshot].clone();
                 next_snapshot += 1;
@@ -2126,10 +2166,12 @@ mod tests {
         ];
         let mut next_snapshot = 0;
         let mut out = FlushingBuffer::default();
+        let mut err = Vec::new();
 
         run_perf_with_sampler(
             &options,
             &mut out,
+            &mut err,
             || {
                 let snapshot = snapshots[next_snapshot].clone();
                 next_snapshot += 1;

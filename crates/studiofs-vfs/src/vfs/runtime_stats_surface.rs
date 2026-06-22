@@ -7,7 +7,9 @@ use super::{
 use crate::utils::now_unix_millis;
 
 /// Root-local hidden file that exposes the cross-platform runtime stats text surface.
-pub const RUNTIME_STATS_FILE_NAME: &[u8] = b".studiofs-runtime-stats";
+pub const RUNTIME_STATS_FILE_NAME_STR: &str = ".studiofs-runtime-stats";
+/// Byte representation of [`RUNTIME_STATS_FILE_NAME_STR`] used by VFS and bridge callbacks.
+pub const RUNTIME_STATS_FILE_NAME: &[u8] = RUNTIME_STATS_FILE_NAME_STR.as_bytes();
 /// Synthetic inode reserved for the runtime stats surface.
 pub const RUNTIME_STATS_FILE_INO: Ino = Ino::MAX - 1;
 /// Stable reported size for the synthetic stats file.

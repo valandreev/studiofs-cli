@@ -1049,6 +1049,52 @@ fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
 }
 
 #[test]
+fn benchmark_methodology_covers_sfs558_operator_contract() {
+    let doc = read_workspace_file("docs/perf/benchmark-methodology.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    // CONTEXT: This is a documentation contract guard for the SFS-558 public
+    // methodology. Keep the list to stable concepts, command names, JSON field
+    // names, and platform names so normal editorial rewrites do not break CI.
+    let required_terms = [
+        "SFS-558",
+        "StudioFS Benchmark And Stats Methodology",
+        "studiofs perf",
+        "observer only",
+        ".studiofs-runtime-stats",
+        "studiofs bench",
+        "active StudioFS mount",
+        "legacy test-cache",
+        "developer diagnostic",
+        "target/perf",
+        "runtime_stats.available: false",
+        "local_first_read_comparison",
+        "Windows WinFSP",
+        "macOS macFUSE",
+        "Linux FUSE",
+        "JuiceFS",
+        "same workload shape",
+        "cold pass",
+        "warm pass",
+        "at least three runs",
+        "p95/p99 latency",
+        "smoothness indicators",
+        "known limits",
+        "not a correctness substitute",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-558 benchmark methodology doc is missing required operator contract terms:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn macos_native_bridge_split_note_covers_sfs475_boundary() {
     let doc = read_workspace_file("docs/macos-native-bridge-split.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

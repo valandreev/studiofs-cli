@@ -372,6 +372,9 @@ Notes:
 - For the focused mounted benchmark recipes and the surrounding Local-First
   validation matrix, see
   [docs/local-first-validation-matrix.md](./local-first-validation-matrix.md).
+- For the operator methodology that explains when to use `studiofs perf`,
+  `studiofs bench`, and legacy developer diagnostics, see
+  [benchmark-methodology.md](./perf/benchmark-methodology.md).
 
 ### `destroy`
 
