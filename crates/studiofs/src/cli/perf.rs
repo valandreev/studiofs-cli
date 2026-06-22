@@ -948,8 +948,7 @@ fn write_table_sample(
     state: &mut TableOutputState,
 ) -> anyhow::Result<()> {
     for warning in &sample.warnings {
-        if !state.printed_warnings.contains(warning) {
-            state.printed_warnings.insert(warning.clone());
+        if state.printed_warnings.insert(warning.clone()) {
             writeln!(err, "warning: {warning}")?;
         }
     }
