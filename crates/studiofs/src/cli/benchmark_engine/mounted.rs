@@ -1184,6 +1184,22 @@ fn size_class_report(reports: &[SizeClassOpReport], class: &str) -> Option<SizeC
     reports.iter().find(|report| report.class == class).cloned()
 }
 
+fn compact_op_report(report: &OpReport) -> OpReport {
+    let mut report = report.clone();
+    report.operations_log.clear();
+    report
+}
+
+fn log_skipped_public_bench_report(reason: &str) {
+    tracing::info!(
+        target: "studiofs.bench",
+        reason,
+        "skipping public benchmark summary report"
+    );
+}
+
+// Builds the compact public `studiofs bench` summary. Missing mounted upload
+// evidence is non-fatal, but the omission is logged for report debugging.
 fn build_public_bench_report(
     params: &BenchmarkConfig,
     workload: &WorkloadPlan,
@@ -1195,16 +1211,42 @@ fn build_public_bench_report(
         return None;
     }
 
-    let write_metrics = PublicBenchWriteMetricsReport {
-        small_files: size_class_report(&advanced_metrics.size_class_stats.writes, "small")?,
-        medium_files: size_class_report(&advanced_metrics.size_class_stats.writes, "medium")?,
-        large_file: size_class_report(&advanced_metrics.size_class_stats.writes, "large")?,
+    let Some(small_files) = size_class_report(&advanced_metrics.size_class_stats.writes, "small")
+    else {
+        log_skipped_public_bench_report("small write metrics missing");
+        return None;
     };
-    let during_upload = comparison?
+    let Some(medium_files) = size_class_report(&advanced_metrics.size_class_stats.writes, "medium")
+    else {
+        log_skipped_public_bench_report("medium write metrics missing");
+        return None;
+    };
+    let Some(large_file) = size_class_report(&advanced_metrics.size_class_stats.writes, "large")
+    else {
+        log_skipped_public_bench_report("large write metrics missing");
+        return None;
+    };
+    let write_metrics = PublicBenchWriteMetricsReport {
+        small_files,
+        medium_files,
+        large_file,
+    };
+    let Some(comparison) = comparison else {
+        log_skipped_public_bench_report("local-first read comparison missing");
+        return None;
+    };
+    let Some(during_upload) = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "during-upload-read")?;
-    let upload_drain = post_upload_idle?;
+        .find(|phase| phase.phase == "during-upload-read")
+    else {
+        log_skipped_public_bench_report("during-upload-read phase missing");
+        return None;
+    };
+    let Some(upload_drain) = post_upload_idle else {
+        log_skipped_public_bench_report("upload drain observation missing");
+        return None;
+    };
     let large_file_size_bytes = workload
         .sizes
         .iter()
@@ -1223,7 +1265,7 @@ fn build_public_bench_report(
         write_metrics,
         during_upload_read: PublicBenchDuringUploadReadReport {
             phase: during_upload.phase.clone(),
-            metrics: during_upload.results.clone(),
+            metrics: compact_op_report(&during_upload.results),
             wait_target: during_upload.wait_target.clone(),
             target_state_observed: during_upload.target_state_observed,
             valid_for_target: during_upload.valid_for_target,
@@ -2588,15 +2630,19 @@ pub(crate) async fn run_mounted_end_to_end(
             measured.writes_wall.as_secs_f64() * 1000.0,
             measured.reads_wall.as_secs_f64() * 1000.0,
         );
-        let post_upload_idle =
-            mounted_post_upload_idle_report(local_first_read_comparison.as_ref());
-        let public_bench = build_public_bench_report(
-            params,
-            &workload,
-            &advanced_metrics,
-            local_first_read_comparison.as_ref(),
-            post_upload_idle.as_ref(),
-        );
+        let public_bench = if params.command_name == "studiofs bench" {
+            let post_upload_idle =
+                mounted_post_upload_idle_report(local_first_read_comparison.as_ref());
+            build_public_bench_report(
+                params,
+                &workload,
+                &advanced_metrics,
+                local_first_read_comparison.as_ref(),
+                post_upload_idle.as_ref(),
+            )
+        } else {
+            None
+        };
         let mounted_runtime = Some(build_mounted_runtime_report(
             params,
             mount_point,
@@ -2718,6 +2764,9 @@ pub(crate) async fn run_mounted_end_to_end(
 
 #[cfg(test)]
 mod tests {
+    use super::super::result::{
+        LatencyHistogramReport, OperationLogReport, SizeClassBoundaryReport, SizeClassStatsReport,
+    };
     use super::*;
     use std::path::PathBuf;
     use studiofs_vfs::vfs::{VfsWritePathVfsWriteStats, VfsWritePathWinfspWritePathStats};
@@ -2792,6 +2841,120 @@ mod tests {
             generated_unix_ms,
             ..RuntimeStatsSnapshot::default()
         }
+    }
+
+    fn test_op_report_with_operations_log() -> OpReport {
+        OpReport {
+            operations: 1,
+            bytes: 64 * 1024 * 1024,
+            elapsed_ms: 120.0,
+            avg_latency_ms: 120.0,
+            p50_ms: 120.0,
+            p95_ms: 120.0,
+            p99_ms: 120.0,
+            throughput_bytes_per_sec: 533.0 * 1024.0 * 1024.0,
+            latency_histogram: LatencyHistogramReport {
+                bucket_upper_bounds_ns: vec![50_000],
+                bucket_counts: vec![0, 1],
+            },
+            operations_log: vec![OperationLogReport {
+                operation_index: 7,
+                work_index: 0,
+                worker_id: 0,
+                target: "/mnt/studiofs-benchmark/large.bin".to_string(),
+                size_class: "large".to_string(),
+                bytes: 64 * 1024 * 1024,
+                elapsed_ms: 120.0,
+                throughput_bytes_per_sec: 533.0 * 1024.0 * 1024.0,
+            }],
+        }
+    }
+
+    fn test_size_class_report(class: &str, operations: u64, bytes: u64) -> SizeClassOpReport {
+        SizeClassOpReport {
+            class: class.to_string(),
+            operations,
+            bytes,
+            avg_latency_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            throughput_bytes_per_sec: bytes as f64,
+        }
+    }
+
+    #[test]
+    fn public_bench_report_keeps_summary_metrics_without_duplicate_operation_log() {
+        let mut params = benchmark_config_with_block_size(16 * 1024 * 1024);
+        params.command_name = "studiofs bench";
+        params.size_class_medium_max = 8 * 1024 * 1024;
+        let workload = WorkloadPlan {
+            sizes: vec![1024, 5 * 1024 * 1024, 4 * 1024 * 1024 * 1024],
+            source: "fixed-public-bench".to_string(),
+            small_files: 1,
+            medium_files: 1,
+            large_files: 1,
+        };
+        let advanced_metrics = AdvancedMetricsReport {
+            size_class_boundaries: SizeClassBoundaryReport {
+                small_max_bytes: 256 * 1024,
+                medium_max_bytes: 8 * 1024 * 1024,
+            },
+            size_class_stats: SizeClassStatsReport {
+                writes: vec![
+                    test_size_class_report("small", 1, 1024),
+                    test_size_class_report("medium", 1, 5 * 1024 * 1024),
+                    test_size_class_report("large", 1, 4 * 1024 * 1024 * 1024),
+                ],
+                reads: Vec::new(),
+            },
+            cache_levels: None,
+        };
+        let comparison = MountedLocalFirstReadComparisonReport {
+            cache_path: r"D:\cache".to_string(),
+            upload_dir: r"D:\cache\upload".to_string(),
+            phases: vec![MountedLocalFirstReadPhaseReport {
+                phase: "during-upload-read".to_string(),
+                wait_target: "active".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                required_pending_uploads: 1,
+                wait_ms: 20.0,
+                pending_uploads_before: 2,
+                pending_uploads_after: 1,
+                validation_message: None,
+                results: test_op_report_with_operations_log(),
+            }],
+        };
+        let post_upload_idle = MountedPostUploadIdleReport {
+            observed: true,
+            timed_out: false,
+            wait_ms: 240.0,
+            pending_uploads_before: 1,
+            pending_uploads_after: 0,
+            reason: None,
+        };
+
+        let report = build_public_bench_report(
+            &params,
+            &workload,
+            &advanced_metrics,
+            Some(&comparison),
+            Some(&post_upload_idle),
+        )
+        .expect("public bench report");
+
+        assert!(report.during_upload_read.metrics.operations_log.is_empty());
+        assert_eq!(comparison.phases[0].results.operations_log.len(), 1);
+        assert_eq!(report.during_upload_read.metrics.operations, 1);
+        assert_eq!(
+            report.write_metrics.large_file.bytes,
+            4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            report.workload.large_file_size_bytes,
+            4 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
