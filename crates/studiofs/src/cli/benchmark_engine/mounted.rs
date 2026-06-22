@@ -1228,16 +1228,20 @@ fn log_skipped_public_bench_report(reason: &str) {
 
 fn public_bench_large_file_size_bytes(workload: &WorkloadPlan, medium_max: u64) -> u64 {
     let mut max_overall = 0;
-    let mut max_large_size = None;
+    let mut max_large_size = 0;
     for &size in &workload.sizes {
         max_overall = max_overall.max(size);
         if size > medium_max {
-            max_large_size = Some(max_large_size.map_or(size, |max: u64| max.max(size)));
+            max_large_size = max_large_size.max(size);
         }
     }
-    max_large_size
-        .or_else(|| (workload.large_files > 0).then_some(max_overall))
-        .unwrap_or_default()
+    if max_large_size > 0 {
+        max_large_size
+    } else if workload.large_files > 0 {
+        max_overall
+    } else {
+        0
+    }
 }
 
 // Builds the compact public `studiofs bench` summary. The caller gates this to
