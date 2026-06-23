@@ -352,7 +352,7 @@ fn save_report_for_policy(report: &BenchmarkReport, output: ReportOutput<'_>) ->
     };
     let report_path =
         save_benchmark_report(report, json_output).context("save benchmark JSON report")?;
-    println!("JSON report: {}", report_path.display());
+    write_stdout(&format!("JSON report: {}\n", report_path.display()))?;
     Ok(())
 }
 
