@@ -1119,13 +1119,12 @@ fn efficiency_ratio(
     warnings: &mut Vec<String>,
 ) -> RuntimeStatsEfficiencyF64Report {
     match (numerator, denominator) {
+        (Some(_), Some(0)) => efficiency_ratio_undefined(format!(
+            "runtime stats cannot compute {name} during {label} because the denominator is zero"
+        )),
         (Some(numerator), Some(denominator)) => RuntimeStatsEfficiencyF64Report {
             available: true,
-            value: Some(if denominator == 0 {
-                0.0
-            } else {
-                numerator as f64 / denominator as f64
-            }),
+            value: Some(numerator as f64 / denominator as f64),
             unit: "ratio",
             warning: None,
         },
@@ -1141,6 +1140,15 @@ fn efficiency_ratio(
                 warning: Some(warning),
             }
         }
+    }
+}
+
+fn efficiency_ratio_undefined(warning: String) -> RuntimeStatsEfficiencyF64Report {
+    RuntimeStatsEfficiencyF64Report {
+        available: false,
+        value: None,
+        unit: "ratio",
+        warning: Some(warning),
     }
 }
 
@@ -2179,5 +2187,59 @@ mod tests {
         );
         assert!(!delta.efficiency.s3_refill.bytes.available);
         assert_eq!(delta.efficiency.s3_refill.bytes.value, None);
+    }
+
+    #[test]
+    fn runtime_stats_efficiency_marks_zero_denominator_ratios_unavailable() {
+        let mut before = RuntimeStatsSnapshot {
+            generated_unix_ms: 1_000,
+            ..RuntimeStatsSnapshot::default()
+        };
+        before
+            .vfs_read
+            .counters
+            .insert("requested_bytes".to_string(), scalar(0, "bytes"));
+        before
+            .cache
+            .counters
+            .insert("hit_calls".to_string(), scalar(0, "count"));
+        before
+            .cache
+            .counters
+            .insert("hit_bytes".to_string(), scalar(0, "bytes"));
+        before
+            .cache
+            .counters
+            .insert("read_calls".to_string(), scalar(0, "count"));
+        before
+            .cache
+            .counters
+            .insert("read_bytes".to_string(), scalar(0, "bytes"));
+
+        let mut after = before.clone();
+        after.generated_unix_ms = 1_250;
+
+        let delta = runtime_stats_delta("idle-phase", &before, &after);
+
+        assert!(!delta.efficiency.read.cache_hit_ratio_ops.available);
+        assert_eq!(delta.efficiency.read.cache_hit_ratio_ops.value, None);
+        assert!(
+            delta
+                .efficiency
+                .read
+                .cache_hit_ratio_ops
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("denominator is zero"))
+        );
+        assert!(!delta.efficiency.read.cache_hit_ratio_bytes.available);
+        assert_eq!(delta.efficiency.read.cache_hit_ratio_bytes.value, None);
+        assert!(
+            !delta
+                .efficiency
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("denominator is zero"))
+        );
     }
 }

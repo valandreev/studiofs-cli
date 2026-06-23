@@ -621,6 +621,8 @@ fn runtime_stats_from_diagnostics(
         &mut snapshot.cache,
         "read_bytes",
         "bytes",
+        // `FetchMetrics` currently tracks local cache I/O calls but not total
+        // local-cache bytes, so this mirrors hit bytes until that counter exists.
         write_path.fetch.cache_hit_bytes,
     );
     insert_counter(
