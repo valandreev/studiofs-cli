@@ -7,7 +7,7 @@ use crate::cli::benchmark_engine::{
     BenchmarkAccessPattern, BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY,
     DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
     PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg, public_bench_workload,
-    render_human_summary, run_mounted, save_benchmark_report,
+    render_human_summary, render_public_bench_summary, run_mounted, save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -205,7 +205,7 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
     let report = run_config(config)?;
-    print_benchmark_report(&report);
+    print_public_bench_report(&report);
     save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))?;
     Ok(())
 }
@@ -263,6 +263,10 @@ fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
+}
+
+fn print_public_bench_report(report: &crate::cli::benchmark_engine::BenchmarkReport) {
+    print!("{}", render_public_bench_summary(report));
 }
 
 #[derive(Debug, PartialEq, Eq)]
