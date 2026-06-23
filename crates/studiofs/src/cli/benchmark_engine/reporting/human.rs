@@ -1,4 +1,5 @@
 use crate::cli::utils::{format_bytes, format_throughput};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use super::super::result::{
@@ -14,14 +15,17 @@ fn format_duration_ms(ms: f64) -> String {
     }
 }
 
-fn format_optional_bytes(value: Option<u64>) -> String {
-    value.map(format_bytes).unwrap_or_else(|| "n/a".to_string())
+fn format_optional_bytes(value: Option<u64>) -> Cow<'static, str> {
+    value
+        .map(format_bytes)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed("n/a"))
 }
 
-fn format_optional_percent(value: Option<f64>) -> String {
+fn format_optional_percent(value: Option<f64>) -> Cow<'static, str> {
     value
-        .map(|value| format!("{value:.1}%"))
-        .unwrap_or_else(|| "n/a".to_string())
+        .map(|value| Cow::Owned(format!("{value:.1}%")))
+        .unwrap_or(Cow::Borrowed("n/a"))
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -85,6 +89,7 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
             &mut out,
             "Warning: public bench metrics are unavailable; run `studiofs devbench` for the detailed developer report."
         );
+        write_public_bench_notes(&mut out, report);
         return out;
     };
 
@@ -114,18 +119,20 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
         "Pseudo-random read latency: {} p95",
         format_duration_ms(public_bench.read_metrics.pseudo_random_read.p95_ms)
     );
-    let upload_drain = if public_bench.upload_drain.observed_idle {
-        format!(
+    let _ = write!(&mut out, "Upload drain: ");
+    if public_bench.upload_drain.observed_idle {
+        let _ = writeln!(
+            &mut out,
             "idle after {}",
             format_duration_ms(public_bench.upload_drain.wait_ms)
-        )
+        );
     } else {
-        format!(
+        let _ = writeln!(
+            &mut out,
             "not observed after {}",
             format_duration_ms(public_bench.upload_drain.wait_ms)
-        )
-    };
-    let _ = writeln!(&mut out, "Upload drain: {upload_drain}");
+        );
+    }
 
     let process = report
         .mounted_portable_profile
@@ -151,23 +158,36 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     );
 
     out.push('\n');
+    let large_file_label = if public_bench.workload.large_files == 1 {
+        "file"
+    } else {
+        "files"
+    };
     let _ = writeln!(
         &mut out,
-        "Workload: {} small files, {} medium files, {} large file ({})",
+        "Workload: {} small files, {} medium files, {} large {} ({})",
         public_bench.workload.small_files,
         public_bench.workload.medium_files,
         public_bench.workload.large_files,
+        large_file_label,
         format_bytes(public_bench.workload.large_file_size_bytes),
     );
-    let _ = writeln!(
-        &mut out,
-        "Read checks: during-upload {}, sequential-medium {}",
+    let during_upload_read = if public_bench.during_upload_read.valid_for_target
+        && public_bench.during_upload_read.target_state_observed
+    {
         format_throughput(
             public_bench
                 .during_upload_read
                 .metrics
-                .throughput_bytes_per_sec
-        ),
+                .throughput_bytes_per_sec,
+        )
+    } else {
+        "n/a".to_string()
+    };
+    let _ = writeln!(
+        &mut out,
+        "Read checks: during-upload {}, sequential-medium {}",
+        during_upload_read,
         format_throughput(
             public_bench
                 .read_metrics
@@ -178,50 +198,46 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
 
     out.push('\n');
     let _ = writeln!(&mut out, "Bottleneck notes:");
-    let notes = public_bench_notes(report);
-    if notes.is_empty() {
-        let _ = writeln!(&mut out, "- No benchmark warnings were reported.");
-    } else {
-        for note in notes {
-            let _ = writeln!(&mut out, "- {note}");
-        }
-    }
+    write_public_bench_notes(&mut out, report);
 
     out
 }
 
-fn public_bench_notes(report: &BenchmarkReport) -> Vec<String> {
-    let mut notes = Vec::new();
-    let Some(public_bench) = &report.public_bench else {
-        return notes;
-    };
-    if !public_bench.during_upload_read.valid_for_target
-        || !public_bench.during_upload_read.target_state_observed
-    {
-        let message = public_bench
-            .during_upload_read
-            .validation_message
-            .as_deref()
-            .unwrap_or("target state was not observed");
-        notes.push(format!(
-            "Warning: {} did not observe {} ({message})",
-            public_bench.during_upload_read.phase, public_bench.during_upload_read.wait_target
-        ));
-    }
-    if !public_bench.upload_drain.observed_idle {
-        let reason = public_bench
-            .upload_drain
-            .reason
-            .as_deref()
-            .unwrap_or("idle target state was not observed");
-        notes.push(format!(
-            "Warning: upload drain did not reach idle ({reason})"
-        ));
+fn write_public_bench_notes(out: &mut String, report: &BenchmarkReport) {
+    let mut has_notes = false;
+    if let Some(public_bench) = &report.public_bench {
+        if !public_bench.during_upload_read.valid_for_target
+            || !public_bench.during_upload_read.target_state_observed
+        {
+            let message = public_bench
+                .during_upload_read
+                .validation_message
+                .as_deref()
+                .unwrap_or("target state was not observed");
+            let _ = writeln!(
+                out,
+                "- Warning: {} did not observe {} ({message})",
+                public_bench.during_upload_read.phase, public_bench.during_upload_read.wait_target
+            );
+            has_notes = true;
+        }
+        if !public_bench.upload_drain.observed_idle {
+            let reason = public_bench
+                .upload_drain
+                .reason
+                .as_deref()
+                .unwrap_or("idle target state was not observed");
+            let _ = writeln!(out, "- Warning: upload drain did not reach idle ({reason})");
+            has_notes = true;
+        }
     }
     for warning in &report.runtime_stats.warnings {
-        notes.push(format!("Warning: {warning}"));
+        let _ = writeln!(out, "- Warning: {warning}");
+        has_notes = true;
     }
-    notes
+    if !has_notes {
+        let _ = writeln!(out, "- No benchmark warnings were reported.");
+    }
 }
 
 fn render_mounted_runtime(out: &mut String, runtime: &MountedRuntimeReport) {
@@ -488,7 +504,7 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
                 vec![
                     phase.phase.clone(),
                     phase.process.sample_count.to_string(),
-                    format_optional_bytes(phase.process.rss_bytes_peak),
+                    format_optional_bytes(phase.process.rss_bytes_peak).into_owned(),
                     phase
                         .process
                         .cpu_usage_percent_avg
@@ -499,7 +515,7 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
                         .as_ref()
                         .map(|allocator| format_bytes(allocator.peak_bytes))
                         .unwrap_or_else(|| "n/a".to_string()),
-                    format_optional_bytes(phase.process.disk_write_bytes_delta),
+                    format_optional_bytes(phase.process.disk_write_bytes_delta).into_owned(),
                 ]
             })
             .collect();
@@ -749,12 +765,12 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         let _ = writeln!(&mut out, "Mounted memory");
         let rows = vec![vec![
             memory.mount_pid.to_string(),
-            format_optional_bytes(memory.rss_bytes_steady_state),
-            format_optional_bytes(memory.rss_bytes_peak),
-            format_optional_bytes(memory.dirty_bytes_steady_state),
-            format_optional_bytes(memory.dirty_bytes_peak),
-            format_optional_bytes(memory.staged_bytes_peak),
-            format_optional_bytes(memory.dirty_limit_bytes),
+            format_optional_bytes(memory.rss_bytes_steady_state).into_owned(),
+            format_optional_bytes(memory.rss_bytes_peak).into_owned(),
+            format_optional_bytes(memory.dirty_bytes_steady_state).into_owned(),
+            format_optional_bytes(memory.dirty_bytes_peak).into_owned(),
+            format_optional_bytes(memory.staged_bytes_peak).into_owned(),
+            format_optional_bytes(memory.dirty_limit_bytes).into_owned(),
         ]];
         let _ = write!(
             &mut out,
@@ -1076,12 +1092,28 @@ mod tests {
         assert!(summary.contains("Upload drain: not observed after 10.00 s"));
         assert!(summary.contains("CPU: avg n/a, peak n/a"));
         assert!(summary.contains("Memory: peak n/a"));
+        assert!(summary.contains("Workload: 1000 small files, 80 medium files, 1 large file"));
+        assert!(summary.contains("Read checks: during-upload n/a, sequential-medium"));
         assert!(summary.contains("Bottleneck notes:"));
         assert!(summary.contains("- Warning: runtime stats counter cache.hit_bytes missing"));
         assert!(summary.contains("- Warning: during-upload-read did not observe active"));
         assert!(summary.contains("- Warning: upload drain did not reach idle"));
         assert!(!summary.contains("Operation results"));
         assert!(!summary.contains("Cache pipeline"));
+    }
+
+    #[test]
+    fn render_public_bench_summary_keeps_runtime_warnings_when_public_metrics_missing() {
+        let mut report = sample_report();
+        report.command.name = "studiofs bench".to_string();
+        report.public_bench = None;
+        report.runtime_stats.warnings = vec!["runtime stats file was unreadable".to_string()];
+
+        let summary = render_public_bench_summary(&report);
+
+        assert!(summary.contains("Warning: public bench metrics are unavailable"));
+        assert!(summary.contains("- Warning: runtime stats file was unreadable"));
+        assert!(!summary.contains("- No benchmark warnings were reported."));
     }
 
     fn size_class(class: &str, operations: u64, bytes: u64, mib_per_sec: f64) -> SizeClassOpReport {

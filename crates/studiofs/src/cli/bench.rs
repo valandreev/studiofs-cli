@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -205,7 +206,7 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
     let report = run_config(config)?;
-    print_public_bench_report(&report);
+    print_public_bench_report(&report)?;
     save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))?;
     Ok(())
 }
@@ -213,7 +214,7 @@ fn run_bench(args: BenchArgs) -> Result<()> {
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
     let report = run_config(config)?;
-    print_benchmark_report(&report);
+    print_benchmark_report(&report)?;
     save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))?;
     Ok(())
 }
@@ -258,15 +259,30 @@ fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::B
     Ok(report)
 }
 
-fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) {
-    print!("{}", render_human_summary(report));
+fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
+    write_stdout(render_human_summary(report))?;
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
+    Ok(())
 }
 
-fn print_public_bench_report(report: &crate::cli::benchmark_engine::BenchmarkReport) {
-    print!("{}", render_public_bench_summary(report));
+fn print_public_bench_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
+    write_stdout(render_public_bench_summary(report))
+}
+
+fn write_stdout(output: String) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_output(output.as_bytes(), &mut stdout)
+}
+
+fn write_output(output: &[u8], writer: &mut dyn Write) -> Result<()> {
+    match writer.write_all(output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("write benchmark summary to stdout"),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -354,6 +370,19 @@ fn cleanup_bench_work_root(work_root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn bench_config_plans_one_large_file_and_requested_small_files() {
@@ -606,5 +635,12 @@ mod tests {
     #[test]
     fn devbench_keeps_default_report_saving_when_no_output_path_is_requested() {
         assert_eq!(devbench_report_output(None), ReportOutput::Save(None));
+    }
+
+    #[test]
+    fn benchmark_summary_write_treats_broken_pipe_as_clean_exit() {
+        let mut writer = BrokenPipeWriter;
+
+        write_output(b"StudioFS bench result\n", &mut writer).unwrap();
     }
 }
