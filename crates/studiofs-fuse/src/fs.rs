@@ -840,15 +840,8 @@ impl StudioFuseFs {
         })
     }
 
-    fn write_callback<R>(
-        &mut self,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        data: &[u8],
-        flags: i32,
-        reply: R,
-    ) where
+    fn write_callback<R>(&self, ino: u64, fh: u64, offset: i64, data: &[u8], flags: i32, reply: R)
+    where
         R: FuseWriteReply + Send + 'static,
     {
         let offset = match to_u64_offset(offset) {
@@ -2571,7 +2564,7 @@ mod tests {
 
     #[test]
     fn default_linux_write_callback_leaves_async_queue_idle() {
-        let (_tmp, _rt, vfs, mut fs) = make_test_fuse_fs("default-write-no-queue");
+        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("default-write-no-queue");
         let attr = vfs
             .create(1, b"default-write-no-queue.txt", 0, 0, 0o644)
             .expect("create test file");
