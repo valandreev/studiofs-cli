@@ -280,14 +280,19 @@ fn finish_report_with_save(
 ) -> Result<()> {
     let print_result = print_report(report);
     let save_result = save_report(report, output);
-    save_result?;
-    print_result
+    match (print_result, save_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(print_error), Ok(())) => Err(print_error),
+        (Ok(()), Err(save_error)) => Err(save_error),
+        (Err(print_error), Err(save_error)) => Err(save_error)
+            .with_context(|| format!("printing benchmark summary also failed: {print_error:#}")),
+    }
 }
 
 fn print_benchmark_report(report: &BenchmarkReport) -> Result<()> {
     write_stdout(&render_human_summary(report))?;
     for warning in &report.runtime_stats.warnings {
-        eprintln!("Warning: {warning}");
+        write_stderr(&format!("Warning: {warning}\n"))?;
     }
     Ok(())
 }
@@ -299,14 +304,28 @@ fn print_public_bench_report(report: &BenchmarkReport) -> Result<()> {
 fn write_stdout(output: &str) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    write_output(output.as_bytes(), &mut stdout)
+    write_output(
+        output.as_bytes(),
+        &mut stdout,
+        "write benchmark summary to stdout",
+    )
 }
 
-fn write_output(output: &[u8], writer: &mut impl Write) -> Result<()> {
+fn write_stderr(output: &str) -> Result<()> {
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    write_output(
+        output.as_bytes(),
+        &mut stderr,
+        "write benchmark warning to stderr",
+    )
+}
+
+fn write_output(output: &[u8], writer: &mut impl Write, context: &'static str) -> Result<()> {
     match writer.write_all(output).and_then(|()| writer.flush()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(error).context("write benchmark summary to stdout"),
+        Err(error) => Err(error).context(context),
     }
 }
 
@@ -679,16 +698,38 @@ mod tests {
     fn benchmark_summary_write_treats_broken_pipe_as_clean_exit() {
         let mut writer = BrokenPipeWriter;
 
-        write_output(b"StudioFS bench result\n", &mut writer).unwrap();
+        write_output(
+            b"StudioFS bench result\n",
+            &mut writer,
+            "write benchmark summary to stdout",
+        )
+        .unwrap();
     }
 
     #[test]
     fn benchmark_summary_write_treats_flush_broken_pipe_as_clean_exit() {
         let mut writer = FlushBrokenPipeWriter { wrote: false };
 
-        write_output(b"StudioFS bench result\n", &mut writer).unwrap();
+        write_output(
+            b"StudioFS bench result\n",
+            &mut writer,
+            "write benchmark summary to stdout",
+        )
+        .unwrap();
 
         assert!(writer.wrote);
+    }
+
+    #[test]
+    fn benchmark_warning_write_treats_broken_pipe_as_clean_exit() {
+        let mut writer = BrokenPipeWriter;
+
+        write_output(
+            b"Warning: runtime stats missing\n",
+            &mut writer,
+            "write benchmark warning to stderr",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -709,5 +750,23 @@ mod tests {
 
         assert!(saved);
         assert!(err.to_string().contains("stdout failed"));
+    }
+
+    #[test]
+    fn finish_report_preserves_print_context_when_save_also_fails() {
+        let report = sample_report();
+
+        let err = finish_report_with_save(
+            &report,
+            ReportOutput::Skip,
+            |_| Err(anyhow!("stdout failed")),
+            |_, _| Err(anyhow!("save failed")),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("save failed"));
+        assert!(message.contains("printing benchmark summary also failed"));
+        assert!(message.contains("stdout failed"));
     }
 }
