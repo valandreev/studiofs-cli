@@ -24,6 +24,13 @@ shape. The target must be inside an active StudioFS mount so the run includes
 bridge callbacks, namespace lookup, VFS policy, cache behavior, object IO,
 upload drain behavior, and runtime stats capture.
 
+The public summary is optimized for stand throughput comparison. `Write speed`
+reports the observed large-file write operation when that operation log is
+available; `Mixed-write speed` keeps the full fixed-workload average so small
+and medium file overhead remains visible. Public read throughput phases read
+full files with the fixed public chunk size, while the pseudo-random read line
+remains a latency-oriented access-order check.
+
 Treat the legacy test-cache path as an internal developer diagnostic. It may
 still help isolate direct cache behavior during development, but it is not the
 user-facing benchmark workflow and should not be used as parity evidence.

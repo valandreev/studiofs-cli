@@ -197,12 +197,12 @@ fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfi
         during_upload_timeout: Duration::from_secs(10),
         l1_limit: DEFAULT_MEMORY_CACHE_SIZE,
         profile: false,
-        full_file_reads: false,
+        full_file_reads: true,
         run_id,
     }
 }
 
-const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
+const PUBLIC_BENCH_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
@@ -482,13 +482,13 @@ mod tests {
         let config = build_public_bench_config(&args, "run-1".to_string());
 
         assert_eq!(config.command_name, "studiofs bench");
-        assert_eq!(config.block_size, 1024 * 1024);
-        assert_eq!(config.read_size, 1024 * 1024);
+        assert_eq!(config.block_size, 16 * 1024 * 1024);
+        assert_eq!(config.read_size, 16 * 1024 * 1024);
         assert_eq!(config.workload_repeat, 1);
         assert_eq!(config.concurrency, 1);
         assert!(!config.sequential_streams);
         assert_eq!(config.access_pattern, BenchmarkAccessPattern::Random);
-        assert!(!config.full_file_reads);
+        assert!(config.full_file_reads);
         match config.sizes {
             WorkloadSizeInput::ExplicitList(sizes) => {
                 assert_eq!(sizes.len(), 1081);

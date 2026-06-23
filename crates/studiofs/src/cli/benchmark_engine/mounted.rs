@@ -1577,7 +1577,7 @@ fn public_bench_read_operations(
             .map(|file| MountedReadOperation {
                 work_index: file.index,
                 offset: 0,
-                bytes_to_read: None,
+                bytes_to_read: Some(file.size),
             })
             .collect(),
         PublicBenchReadPhaseKind::SequentialMedium => workload_files
@@ -1592,7 +1592,7 @@ fn public_bench_read_operations(
             .map(|file| MountedReadOperation {
                 work_index: file.index,
                 offset: 0,
-                bytes_to_read: None,
+                bytes_to_read: Some(file.size),
             })
             .collect(),
         PublicBenchReadPhaseKind::PseudoRandom => {
@@ -3563,6 +3563,8 @@ mod tests {
 
         let random =
             public_bench_read_operations(PublicBenchReadPhaseKind::PseudoRandom, &files, bounds);
+        let first = public_bench_read_operations(PublicBenchReadPhaseKind::First, &files, bounds);
+        let hot = public_bench_read_operations(PublicBenchReadPhaseKind::Hot, &files, bounds);
         let medium = public_bench_read_operations(
             PublicBenchReadPhaseKind::SequentialMedium,
             &files,
@@ -3576,6 +3578,14 @@ mod tests {
                 .map(|op| op.work_index)
                 .collect::<Vec<_>>(),
             vec![932, 794, 647, 604, 531, 905, 481, 589, 851, 365, 142, 395]
+        );
+        assert_eq!(
+            first[workload.large_file.index].bytes_to_read,
+            Some(workload.large_file.size)
+        );
+        assert_eq!(
+            hot[workload.large_file.index].bytes_to_read,
+            Some(workload.large_file.size)
         );
         let large = random
             .iter()
@@ -3592,6 +3602,7 @@ mod tests {
             vec![1000, 1001, 1002, 1003]
         );
         assert!(medium.iter().all(|op| op.offset == 0));
+        assert_eq!(medium[0].bytes_to_read, Some(files[1000].size));
     }
 
     #[test]

@@ -19,6 +19,20 @@ fn format_optional_bytes(value: Option<u64>) -> String {
     value.map(format_bytes).unwrap_or_else(|| "n/a".to_string())
 }
 
+fn public_bench_large_write_throughput(report: &BenchmarkReport) -> Option<f64> {
+    report
+        .writes
+        .operations_log
+        .iter()
+        .filter(|operation| operation.size_class == "large")
+        .filter(|operation| operation.throughput_bytes_per_sec.is_finite())
+        .max_by(|left, right| {
+            left.throughput_bytes_per_sec
+                .total_cmp(&right.throughput_bytes_per_sec)
+        })
+        .map(|operation| operation.throughput_bytes_per_sec)
+}
+
 fn format_optional_percent(value: Option<f64>, precision: usize) -> Cow<'static, str> {
     value
         .map(|value| Cow::Owned(format!("{value:.precision$}%")))
@@ -91,11 +105,18 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     };
 
     out.push('\n');
-    let _ = writeln!(
-        &mut out,
-        "Write speed: {}",
-        format_throughput(report.writes.throughput_bytes_per_sec)
-    );
+    let large_write_throughput = public_bench_large_write_throughput(report);
+    let write_speed = large_write_throughput
+        .map(|throughput| format!("{} (large file)", format_throughput(throughput)))
+        .unwrap_or_else(|| format_throughput(report.writes.throughput_bytes_per_sec));
+    let _ = writeln!(&mut out, "Write speed: {}", write_speed);
+    if large_write_throughput.is_some() {
+        let _ = writeln!(
+            &mut out,
+            "Mixed-write speed: {}",
+            format_throughput(report.writes.throughput_bytes_per_sec)
+        );
+    }
     let _ = writeln!(
         &mut out,
         "First-read speed: {}",
@@ -1008,9 +1029,10 @@ mod tests {
     use crate::cli::benchmark_engine::result::{
         LatencyHistogramReport, MountedLocalFirstReadComparisonReport,
         MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedWritebackTimelineReport,
-        MountedWritebackTimelineSampleReport, OpReport, PublicBenchDuringUploadReadReport,
-        PublicBenchReadMetricsReport, PublicBenchReport, PublicBenchUploadDrainReport,
-        PublicBenchWorkloadReport, PublicBenchWriteMetricsReport, SizeClassOpReport, sample_report,
+        MountedWritebackTimelineSampleReport, OpReport, OperationLogReport,
+        PublicBenchDuringUploadReadReport, PublicBenchReadMetricsReport, PublicBenchReport,
+        PublicBenchUploadDrainReport, PublicBenchWorkloadReport, PublicBenchWriteMetricsReport,
+        SizeClassOpReport, sample_report,
     };
 
     fn test_latency_histogram() -> LatencyHistogramReport {
@@ -1081,11 +1103,23 @@ mod tests {
         });
         report.runtime_stats.warnings =
             vec!["runtime stats counter cache.hit_bytes missing".to_string()];
+        report.writes = op_report(1081, 4 * 1024 * 1024 * 1024, 52.0, 8.0);
+        report.writes.operations_log = vec![OperationLogReport {
+            operation_index: 1080,
+            work_index: 1080,
+            worker_id: 0,
+            target: "bench-large.dat".to_string(),
+            size_class: "large".to_string(),
+            bytes: 4 * 1024 * 1024 * 1024,
+            elapsed_ms: 2925.714285714286,
+            throughput_bytes_per_sec: 1400.0 * 1024.0 * 1024.0,
+        }];
 
         let summary = render_public_bench_summary(&report);
 
         assert!(summary.starts_with("StudioFS bench result\n"));
-        assert!(summary.contains("Write speed:"));
+        assert!(summary.contains("Write speed: 1.37GiB/s (large file)"));
+        assert!(summary.contains("Mixed-write speed: 52.00MiB/s"));
         assert!(summary.contains("First-read speed:"));
         assert!(summary.contains("Hot-read speed:"));
         assert!(summary.contains("Pseudo-random read latency: 3.20 ms p95"));
