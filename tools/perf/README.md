@@ -1,13 +1,29 @@
-# StudioFS Perf Methodology
+# StudioFS Perf Tools
 
-This directory contains the repeatable perf harness we use for the current pass:
+This directory contains focused performance and benchmark evidence helpers.
+For public benchmark notes, use the fixed command:
+
+```powershell
+studiofs bench <mountpoint> --report <path>
+```
+
+`studiofs bench` runs the fixed pseudo-random workload, is repeatable across
+machines, and exposes only the mount point plus optional `--report`. Use
+`studiofs devbench` when an investigation needs developer workload flags such
+as `--block-size`, `--big-file-size`, `--small-file-count`, or `--threads`.
+First-read output from the public benchmark is not a guaranteed fully cold
+OS-cache measurement unless host cache state is controlled outside StudioFS.
+
+The older PowerShell harnesses in this directory are repeatable loops for:
 
 - smooth out jagged write throughput
 - improve sequential read throughput where possible
 
-The harness is intentionally built on top of `studiofs test-cache` instead of a second benchmark framework. That keeps the workload generator, JSON schema, profile artifacts, and write-path observability aligned with the product code we are changing.
+Those harnesses intentionally use the legacy `studiofs test-cache` diagnostic
+surface to isolate direct cache behavior. They are not the public mounted
+benchmark contract.
 
-For cross-platform `studiofs devbench` evidence capture, use the SFS-557
+For cross-platform `studiofs devbench` evidence capture, use the SFS-557/SFS-567
 validation scripts:
 
 - Windows: `validate-bench-windows.ps1`
@@ -17,7 +33,8 @@ validation scripts:
 The macOS and Linux entrypoints call the shared `validate-bench-unix.sh`
 implementation to keep Unix argument handling and artifact generation aligned.
 
-Those scripts write non-overwriting run directories under `target/perf`; see
+Those scripts write non-overwriting run directories under `target/perf` by
+calling `studiofs devbench --json-output`; see
 [`docs/perf/benchmark-validation.md`](../../docs/perf/benchmark-validation.md).
 
 ## Scope

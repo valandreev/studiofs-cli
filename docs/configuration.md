@@ -308,7 +308,18 @@ developer benchmark surface and accepts JuiceFS-style workload controls such as
 `--block-size`, `--big-file-size`, `--small-file-size`,
 `--small-file-count`, and `--threads`.
 
-Example:
+Public example:
+
+```bash
+studiofs bench /mnt/studio/myvolume --report reports/studiofs-bench.json
+```
+
+`studiofs bench` uses a fixed pseudo-random workload that is repeatable across
+machines: the file mix, access order, and large-file offsets are part of the
+public benchmark contract. The optional `--report <path>` flag saves the JSON
+report; without it the public command prints the console summary only.
+
+Developer example:
 
 ```bash
 studiofs devbench /mnt/studio/myvolume \
@@ -323,11 +334,10 @@ studiofs devbench /mnt/studio/myvolume \
 The command requires an active StudioFS mount and does not silently run the
 legacy direct cache path outside a mount.
 
-By default, the benchmark command writes a pretty JSON report under
-`target/perf` with an auto-generated file name and prints
-`JSON report: <path>`. Passing `--json-output <file-or-dir>` to
-`studiofs devbench` overrides that location. Reports include command, platform,
-build, mount, and runtime-stats metadata. If the mounted
+By default, `studiofs devbench` writes a pretty JSON report under `target/perf`
+with an auto-generated file name and prints `JSON report: <path>`. Passing
+`--json-output <file-or-dir>` overrides that location. Reports include command,
+platform, build, mount, and runtime-stats metadata. If the mounted
 `.studiofs-runtime-stats` surface is unavailable or malformed, the benchmark
 still completes, prints a warning, and records `runtime_stats.available: false`
 with the warning text in JSON.
