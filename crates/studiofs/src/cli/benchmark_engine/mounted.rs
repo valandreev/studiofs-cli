@@ -1511,12 +1511,19 @@ struct MountedReadValidation {
     write_chunk_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountedReadValidationMode {
+    Full,
+    FirstChunk,
+}
+
 #[derive(Clone, Copy)]
 struct MountedReadOptions {
     read_size: u64,
     full_file_reads: bool,
     write_chunk_size: usize,
     run_seed: u64,
+    validation_mode: MountedReadValidationMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1753,8 +1760,32 @@ async fn read_file_with_plan(
         start_offset,
         &mut buffer,
         &mut validation_cache,
+        MountedReadValidationMode::Full,
     )
     .await
+}
+
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN_BITS: u32 = 0x0800_0000;
+
+async fn open_read_file_for_plan(path: &Path, plan: MountedReadPlan) -> Result<fs::File> {
+    let sequential_hint = plan.bytes_to_read > plan.chunk_size as u64;
+    #[cfg(windows)]
+    if sequential_hint {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN_BITS)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        return Ok(fs::File::from_std(file));
+    }
+    let _ = sequential_hint;
+
+    fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))
 }
 
 async fn read_file_with_plan_using_buffer(
@@ -1764,10 +1795,9 @@ async fn read_file_with_plan_using_buffer(
     start_offset: u64,
     buffer: &mut Vec<u8>,
     validation_cache: &mut MountedReadValidationCache,
+    validation_mode: MountedReadValidationMode,
 ) -> Result<u64> {
-    let mut input = fs::File::open(path)
-        .await
-        .with_context(|| format!("open {}", path.display()))?;
+    let mut input = open_read_file_for_plan(path, plan).await?;
     if plan.bytes_to_read == 0 {
         return Ok(0);
     }
@@ -1788,7 +1818,13 @@ async fn read_file_with_plan_using_buffer(
             .read_exact(&mut buffer[..len])
             .await
             .with_context(|| format!("read {}", path.display()))?;
-        validate_deterministic_read_chunk(path, &buffer[..len], offset, expected_cycle)?;
+        let should_validate = match validation_mode {
+            MountedReadValidationMode::Full => true,
+            MountedReadValidationMode::FirstChunk => offset == start_offset,
+        };
+        if should_validate {
+            validate_deterministic_read_chunk(path, &buffer[..len], offset, expected_cycle)?;
+        }
         remaining -= len as u64;
         offset = offset.saturating_add(len as u64);
     }
@@ -1854,6 +1890,7 @@ async fn run_mounted_read_phase(
         full_file_reads: params.full_file_reads,
         write_chunk_size: mounted_write_chunk_size(params.block_size),
         run_seed: deterministic_run_seed(&params.run_id),
+        validation_mode: MountedReadValidationMode::Full,
     };
     if params.sequential_streams {
         let reads_by_stream = run_filesystem_reads_sequential_streams(
@@ -1909,6 +1946,7 @@ async fn run_mounted_read_operations(
             full_file_reads: params.full_file_reads,
             write_chunk_size: mounted_write_chunk_size(params.block_size),
             run_seed: deterministic_run_seed(&params.run_id),
+            validation_mode: MountedReadValidationMode::FirstChunk,
         },
         size_class_bounds,
         counter,
@@ -2243,6 +2281,7 @@ async fn run_filesystem_reads(
                     0,
                     &mut read_buffer,
                     &mut validation_cache,
+                    read_options.validation_mode,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2338,6 +2377,7 @@ async fn run_filesystem_read_operations(
                     operation.offset,
                     &mut read_buffer,
                     &mut validation_cache,
+                    read_options.validation_mode,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -2487,6 +2527,7 @@ async fn run_filesystem_reads_sequential_streams(
                     0,
                     &mut read_buffer,
                     &mut validation_cache,
+                    read_options.validation_mode,
                 )
                 .await
                 .with_context(|| format!("read {}", item.path.display()))?;
@@ -3923,6 +3964,38 @@ mod tests {
         .expect("read deterministic test payload");
 
         assert_eq!(bytes_read, 4096 + 257);
+    }
+
+    #[tokio::test]
+    async fn sampled_read_validation_does_not_scan_later_chunks_for_throughput_phase() {
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-");
+        let path = temp.path().join("benchmark_file_000000.bin");
+        let mut scratch = Vec::new();
+        write_deterministic_file_with_buffer(&path, 4096, 123, 1024, &mut scratch)
+            .await
+            .expect("write deterministic test payload");
+        let mut bytes = fs::read(&path).await.expect("read deterministic payload");
+        bytes[2048] ^= 0xFF;
+        fs::write(&path, bytes).await.expect("write corrupt tail");
+        let mut buffer = Vec::new();
+        let mut validation_cache = MountedReadValidationCache::default();
+
+        let bytes_read = read_file_with_plan_using_buffer(
+            &path,
+            mounted_read_plan(4096, 1024, true),
+            MountedReadValidation {
+                seed: 123,
+                write_chunk_size: 1024,
+            },
+            0,
+            &mut buffer,
+            &mut validation_cache,
+            MountedReadValidationMode::FirstChunk,
+        )
+        .await
+        .expect("sampled validation should only check the first chunk");
+
+        assert_eq!(bytes_read, 4096);
     }
 
     #[tokio::test]

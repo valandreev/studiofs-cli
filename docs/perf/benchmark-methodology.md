@@ -27,9 +27,12 @@ upload drain behavior, and runtime stats capture.
 The public summary is optimized for stand throughput comparison. `Write speed`
 reports the observed large-file write operation when that operation log is
 available; `Mixed-write speed` keeps the full fixed-workload average so small
-and medium file overhead remains visible. Public read throughput phases read
-full files with the fixed public chunk size, while the pseudo-random read line
-remains a latency-oriented access-order check.
+and medium file overhead remains visible. Public first/hot/sequential-medium
+read throughput phases read full files with the fixed public chunk size and
+sample payload validation so the reported speed is dominated by the mounted
+read path rather than by verifier CPU. The during-upload and pseudo-random read
+lines remain latency-oriented checks so they do not pre-warm the full workload
+before the post-upload read phases.
 
 Treat the legacy test-cache path as an internal developer diagnostic. It may
 still help isolate direct cache behavior during development, but it is not the

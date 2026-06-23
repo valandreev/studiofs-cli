@@ -197,7 +197,7 @@ fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfi
         during_upload_timeout: Duration::from_secs(10),
         l1_limit: DEFAULT_MEMORY_CACHE_SIZE,
         profile: false,
-        full_file_reads: true,
+        full_file_reads: false,
         run_id,
     }
 }
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(config.concurrency, 1);
         assert!(!config.sequential_streams);
         assert_eq!(config.access_pattern, BenchmarkAccessPattern::Random);
-        assert!(config.full_file_reads);
+        assert!(!config.full_file_reads);
         match config.sizes {
             WorkloadSizeInput::ExplicitList(sizes) => {
                 assert_eq!(sizes.len(), 1081);
