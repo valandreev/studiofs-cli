@@ -202,6 +202,49 @@ pub fn is_cross_device_link_error(error: &io::Error) -> bool {
     }
 }
 
+/// Returns `true` when the process has exhausted open file descriptors.
+pub fn is_too_many_open_files_error(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EMFILE))
+    }
+
+    #[cfg(windows)]
+    {
+        // ERROR_TOO_MANY_OPEN_FILES
+        matches!(error.raw_os_error(), Some(4))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Returns the current per-process open file descriptor limit when available.
+pub fn open_file_descriptor_limit() -> Option<usize> {
+    open_file_descriptor_limit_impl()
+}
+
+#[cfg(test)]
+pub fn too_many_open_files_error_for_test() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::EMFILE)
+    }
+
+    #[cfg(windows)]
+    {
+        io::Error::from_raw_os_error(4)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        io::Error::other("too many open files")
+    }
+}
+
 /// Best-effort sync for directory metadata after rename.
 pub fn sync_directory(path: &Path) -> io::Result<()> {
     sync_directory_impl(path)
@@ -237,6 +280,27 @@ fn sync_directory_impl(_path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn open_read_only_impl(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(unix)]
+fn open_file_descriptor_limit_impl() -> Option<usize> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the provided rlimit on success.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: rc == 0 means getrlimit wrote a valid rlimit.
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+#[cfg(not(unix))]
+fn open_file_descriptor_limit_impl() -> Option<usize> {
+    None
 }
 
 #[cfg(windows)]
