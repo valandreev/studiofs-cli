@@ -194,36 +194,29 @@ pub(crate) struct RuntimeStatsTransferEfficiencyReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RuntimeStatsReadaheadEfficiencyReport {
-    pub(crate) queue_depth_after: RuntimeStatsEfficiencyU64Report,
     pub(crate) scheduled_ops: RuntimeStatsEfficiencyU64Report,
     pub(crate) useful_bytes: RuntimeStatsEfficiencyU64Report,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RuntimeStatsPrefetchEfficiencyReport {
+    pub(crate) queue_depth_after: RuntimeStatsEfficiencyU64Report,
     pub(crate) skipped_ops: RuntimeStatsEfficiencyU64Report,
     pub(crate) useful_bytes: RuntimeStatsEfficiencyU64Report,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct RuntimeStatsEfficiencyU64Report {
+pub(crate) struct RuntimeStatsEfficiencyValueReport<T> {
     pub(crate) available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) value: Option<u64>,
+    pub(crate) value: Option<T>,
     pub(crate) unit: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) warning: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct RuntimeStatsEfficiencyF64Report {
-    pub(crate) available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) value: Option<f64>,
-    pub(crate) unit: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) warning: Option<String>,
-}
+pub(crate) type RuntimeStatsEfficiencyU64Report = RuntimeStatsEfficiencyValueReport<u64>;
+pub(crate) type RuntimeStatsEfficiencyF64Report = RuntimeStatsEfficiencyValueReport<f64>;
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct RuntimeStatsSectionDeltaReport {
@@ -947,7 +940,7 @@ fn runtime_stats_efficiency(
     );
     let cache_hit_ratio_bytes = efficiency_ratio(
         cache_served_bytes.value,
-        cache_read_bytes.value,
+        requested_bytes.value,
         "cache hit bytes ratio",
         label,
         &mut warnings,
@@ -1000,7 +993,7 @@ fn runtime_stats_efficiency(
         label,
         &mut warnings,
     );
-    let readahead_queue_depth_after = efficiency_gauge_after(
+    let prefetch_queue_depth_after = efficiency_gauge_after(
         sections,
         "cache",
         "prefetch_queue_depth",
@@ -1008,17 +1001,15 @@ fn runtime_stats_efficiency(
         label,
         &mut warnings,
     );
-    let readahead_scheduled_ops = efficiency_unavailable(
+    let readahead_scheduled_ops = efficiency_unsupported(
         "count",
         format!(
             "runtime stats do not expose readahead scheduled operation counters during {label}"
         ),
-        &mut warnings,
     );
-    let readahead_useful_bytes = efficiency_unavailable(
+    let readahead_useful_bytes = efficiency_unsupported(
         "bytes",
         format!("runtime stats cannot attribute later cache hits to readahead during {label}"),
-        &mut warnings,
     );
     let prefetch_skipped_ops = efficiency_counter(
         sections,
@@ -1028,12 +1019,11 @@ fn runtime_stats_efficiency(
         label,
         &mut warnings,
     );
-    let prefetch_useful_bytes = efficiency_unavailable(
+    let prefetch_useful_bytes = efficiency_unsupported(
         "bytes",
         format!(
             "runtime stats cannot attribute cache-served bytes specifically to prefetch during {label}"
         ),
-        &mut warnings,
     );
 
     RuntimeStatsEfficiencyReport {
@@ -1058,11 +1048,11 @@ fn runtime_stats_efficiency(
             bytes: upload_bytes,
         },
         readahead: RuntimeStatsReadaheadEfficiencyReport {
-            queue_depth_after: readahead_queue_depth_after,
             scheduled_ops: readahead_scheduled_ops,
             useful_bytes: readahead_useful_bytes,
         },
         prefetch: RuntimeStatsPrefetchEfficiencyReport {
+            queue_depth_after: prefetch_queue_depth_after,
             skipped_ops: prefetch_skipped_ops,
             useful_bytes: prefetch_useful_bytes,
         },
@@ -1160,6 +1150,15 @@ fn efficiency_unavailable(
     warnings: &mut Vec<String>,
 ) -> RuntimeStatsEfficiencyU64Report {
     warnings.push(warning.clone());
+    RuntimeStatsEfficiencyU64Report {
+        available: false,
+        value: None,
+        unit,
+        warning: Some(warning),
+    }
+}
+
+fn efficiency_unsupported(unit: &'static str, warning: String) -> RuntimeStatsEfficiencyU64Report {
     RuntimeStatsEfficiencyU64Report {
         available: false,
         value: None,
@@ -2131,10 +2130,7 @@ mod tests {
         assert_eq!(delta.efficiency.read.cache_read_ops.value, Some(8));
         assert_eq!(delta.efficiency.read.cache_read_bytes.value, Some(1_600));
         assert_eq!(delta.efficiency.read.cache_hit_ratio_ops.value, Some(0.75));
-        assert_eq!(
-            delta.efficiency.read.cache_hit_ratio_bytes.value,
-            Some(0.75)
-        );
+        assert_eq!(delta.efficiency.read.cache_hit_ratio_bytes.value, Some(0.6));
         assert_eq!(delta.efficiency.read.os_cache_miss_read_ops.value, Some(2));
         assert_eq!(
             delta.efficiency.read.os_cache_miss_read_bytes.value,
@@ -2144,9 +2140,10 @@ mod tests {
         assert_eq!(delta.efficiency.s3_refill.bytes.value, Some(4_000));
         assert_eq!(delta.efficiency.upload.ops.value, Some(4));
         assert_eq!(delta.efficiency.upload.bytes.value, Some(2_000));
-        assert_eq!(delta.efficiency.readahead.queue_depth_after.value, Some(7));
+        assert_eq!(delta.efficiency.prefetch.queue_depth_after.value, Some(7));
         assert_eq!(delta.efficiency.prefetch.skipped_ops.value, Some(3));
         assert!(!delta.efficiency.prefetch.useful_bytes.available);
+        assert!(delta.efficiency.warnings.is_empty());
     }
 
     #[test]
