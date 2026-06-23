@@ -1,9 +1,10 @@
 # Cross-Platform Benchmark Validation
 
-SFS-557 standardizes how StudioFS developer benchmark evidence is collected on
-Windows, macOS, and Linux. The scripts in `tools/perf` run
-`studiofs devbench` against a user-provided mount point and write artifacts
-under `target/perf`.
+SFS-557 standardized how StudioFS developer benchmark evidence is collected on
+Windows, macOS, and Linux. SFS-567 keeps that script surface on
+`studiofs devbench`, while public examples use the fixed `studiofs bench`
+contract. The scripts in `tools/perf` run `studiofs devbench` against a
+user-provided mount point and write artifacts under `target/perf`.
 
 The scripts are:
 
@@ -48,6 +49,24 @@ for the default `studiofs` command name. You can also pass an explicit binary
 with `-StudioFsPath` on Windows or `--studiofs` on macOS/Linux.
 On Windows, `-StudioFsPath target\release\studiofs` also resolves the matching
 `.exe` file when it exists.
+
+## Public Benchmark Example
+
+For user-facing validation notes, prefer the fixed public command:
+
+```bash
+studiofs bench <mountpoint> --report <path>
+```
+
+`studiofs bench` has no public workload tuning flags. It runs the fixed
+pseudo-random workload, is repeatable across machines, and saves JSON only when
+the optional `--report <path>` flag is present. Use `studiofs devbench` and the
+scripts below only when the evidence needs developer knobs such as
+`--block-size`, `--big-file-size`, `--small-file-count`, or `--threads`.
+
+The public report includes first-read phases, but those reads are not a
+guaranteed fully cold OS-cache measurement unless the operator separately
+controls host cache state before each run.
 
 ## Artifact Layout
 

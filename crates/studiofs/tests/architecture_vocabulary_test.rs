@@ -1108,6 +1108,65 @@ fn benchmark_methodology_covers_sfs558_operator_contract() {
 }
 
 #[test]
+fn benchmark_docs_cover_sfs567_bench_devbench_split() {
+    let docs = [
+        read_workspace_file("docs/configuration.md"),
+        read_workspace_file("docs/perf/benchmark-methodology.md"),
+        read_workspace_file("docs/perf/benchmark-validation.md"),
+        read_workspace_file("tools/perf/README.md"),
+    ]
+    .join("\n");
+    let normalized_docs = normalize_doc_whitespace(&docs);
+    let required_terms = [
+        "SFS-567",
+        "studiofs bench <mountpoint> --report <path>",
+        "fixed pseudo-random workload",
+        "repeatable across machines",
+        "optional --report",
+        "studiofs devbench",
+        "--json-output",
+        "--block-size",
+        "--big-file-size",
+        "--small-file-count",
+        "--threads",
+        "first-read",
+        "not a guaranteed fully cold OS-cache measurement",
+        "tools/perf",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&docs, &normalized_docs, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-567 benchmark docs are missing bench/devbench split terms:\n{}",
+        missing.join("\n")
+    );
+
+    let forbidden_public_examples = [
+        "studiofs bench <mountpoint> --block-size",
+        "studiofs bench <mountpoint> --big-file-size",
+        "studiofs bench <mountpoint> --small-file-count",
+        "studiofs bench <mountpoint> --threads",
+        "studiofs bench /mnt/studio/myvolume --block-size",
+        "studiofs bench /Volumes/studio/myvolume --block-size",
+        "studiofs bench Z:\\ --block-size",
+    ];
+    let leaked: Vec<_> = forbidden_public_examples
+        .into_iter()
+        .filter(|term| contains_doc_term(&docs, &normalized_docs, term))
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "SFS-567 docs must not show developer flags on public studiofs bench examples:\n{}",
+        leaked.join("\n")
+    );
+}
+
+#[test]
 fn macos_native_bridge_split_note_covers_sfs475_boundary() {
     let doc = read_workspace_file("docs/macos-native-bridge-split.md");
     let normalized_doc = normalize_doc_whitespace(&doc);

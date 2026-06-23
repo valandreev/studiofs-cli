@@ -17,10 +17,12 @@ mounted StudioFS volume. It is observer only: it reads the mounted
 create files or run workloads.
 
 Use `studiofs bench` when you need the fixed public mounted filesystem
-benchmark report. Use `studiofs devbench` when you need to tune the developer
-workload shape. The target must be inside an active StudioFS mount so the run
-includes bridge callbacks, namespace lookup, VFS policy, cache behavior, object
-IO, upload drain behavior, and runtime stats capture.
+benchmark. Its workload is fixed pseudo-random and repeatable across machines:
+the file mix, access order, and large-file offsets are part of the public
+contract. Use `studiofs devbench` when you need to tune the developer workload
+shape. The target must be inside an active StudioFS mount so the run includes
+bridge callbacks, namespace lookup, VFS policy, cache behavior, object IO,
+upload drain behavior, and runtime stats capture.
 
 Treat the legacy test-cache path as an internal developer diagnostic. It may
 still help isolate direct cache behavior during development, but it is not the
@@ -36,8 +38,8 @@ user-facing benchmark workflow and should not be used as parity evidence.
    producer compatibility.
 4. Run a short `studiofs perf <mountpoint> --json-lines --count 5` sample when
    you need live counters around a manual workload.
-5. Run `studiofs bench <mountpoint>` for fixed public mounted workload
-   evidence.
+5. Run `studiofs bench <mountpoint> --report <path>` for fixed public mounted
+   workload evidence when you need to archive JSON.
 6. Collect at least three runs for each workload shape before making a parity
    claim.
 7. Compare medians, p95/p99 latency, and smoothness indicators such as
@@ -46,7 +48,9 @@ user-facing benchmark workflow and should not be used as parity evidence.
 8. Archive the JSON report, terminal output, command line, git revision, and
    any manual notes needed to explain cache warm-up or platform differences.
 
-By default the benchmark command writes a JSON report under `target/perf` and
+The public command saves JSON only when optional --report is provided as
+`--report <path>`.
+`studiofs devbench` writes a JSON report under `target/perf` by default and
 prints the final report path. Passing `--json-output <file-or-dir>` to
 `studiofs devbench` selects a specific file or output directory. Keep generated
 artifacts under `target/` so they stay outside source control and are easy to
@@ -65,6 +69,9 @@ Every benchmark JSON report should be read from the workload metadata outward:
 - `local_first_read_comparison` explains the `during-upload-read` and
   `post-upload-read` phases. A post-upload read is valid only after upload idle
   was observed.
+- Public `first-read` phases are the first reads issued by the benchmark for
+  that workload and mount state. They are not a guaranteed fully cold OS-cache
+  measurement unless the operator separately controls host cache state.
 - `mounted_memory`, `mounted_observability`, and profile sections are
   diagnostics for RSS, dirty bytes, staged bytes, upload backlog, barrier
   latency, CPU, disk IO, and allocator pressure when those signals are
@@ -80,18 +87,25 @@ Do not treat missing runtime stats as zero activity.
 Platform examples:
 
 ```powershell
-studiofs devbench Z:\ --block-size 4MB --big-file-size 1GB --threads 4
+studiofs bench Z:\ --report reports\studiofs-bench.json
 ```
 
 ```sh
-studiofs devbench /Volumes/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
+studiofs bench /Volumes/studio/myvolume --report reports/studiofs-bench.json
 ```
+
+```sh
+studiofs bench /mnt/studio/myvolume --report reports/studiofs-bench.json
+```
+
+Use `studiofs devbench` for developer parity or tuning runs that require
+explicit workload knobs:
 
 ```sh
 studiofs devbench /mnt/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
-Compare StudioFS runs only when the same workload shape is preserved:
+Compare developer runs only when the same workload shape is preserved:
 
 - block size and read size
 - big-file size, small-file size, and small-file count
