@@ -621,7 +621,15 @@ fn runtime_stats_from_diagnostics(
         &mut snapshot.cache,
         "read_bytes",
         "bytes",
+        // `FetchMetrics` currently tracks local cache I/O calls but not total
+        // local-cache bytes, so this mirrors hit bytes until that counter exists.
         write_path.fetch.cache_hit_bytes,
+    );
+    insert_counter(
+        &mut snapshot.cache,
+        "prefetch_skips",
+        "count",
+        write_path.fetch.prefetch_skips,
     );
     insert_gauge(
         &mut snapshot.upload_queue,
@@ -1429,6 +1437,7 @@ mod tests {
         diagnostics.write_path.fetch.cache_hits = 31;
         diagnostics.write_path.fetch.cache_hit_bytes = 37 * 1024 * 1024;
         diagnostics.write_path.fetch.local_cache_io_calls = 41;
+        diagnostics.write_path.fetch.prefetch_skips = 42;
         diagnostics.write_path.fetch.s3_get_calls = 43;
         diagnostics.write_path.fetch.bytes_downloaded = 47 * 1024 * 1024;
         diagnostics.write_path.fetch.encrypted_bytes_read = 53 * 1024 * 1024;
@@ -1488,6 +1497,7 @@ mod tests {
             snapshot.cache.counters["read_bytes"].value,
             37 * 1024 * 1024
         );
+        assert_eq!(snapshot.cache.counters["prefetch_skips"].value, 42);
         assert_eq!(snapshot.upload_queue.gauges["pending_depth"].value, 29);
         assert_eq!(snapshot.upload_queue.gauges["pending_bytes"].value, 31);
         assert_eq!(snapshot.upload_queue.counters["completed"].value, 37);
