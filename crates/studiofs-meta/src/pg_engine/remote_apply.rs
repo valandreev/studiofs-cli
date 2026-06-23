@@ -1342,7 +1342,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let mut overlay = context.initial_overlay.clone();
-        let initial_overlay = overlay.clone();
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -1353,6 +1352,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
+            let mut advance_replay_position = true;
             Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
             Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
@@ -1367,6 +1367,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq = next_flushed_event_seq;
                     acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
                     overlay_is_dirty = true;
+                    if next_flushed_event_seq < context.next_event_seq {
+                        advance_replay_position = false;
+                    }
+                } else if context.next_event_seq > context.flushed_event_seq {
+                    advance_replay_position = false;
                 }
             } else {
                 let effective_overlay =
@@ -1384,10 +1389,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &outcome.protected_overlay,
                 );
             }
-            if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+            if advance_replay_position && batch.events.iter().any(MetaEvent::is_namespace_mutation)
+            {
                 max_namespace_version = max_namespace_version.max(batch.batch_version);
             }
-            max_version = batch.batch_version;
+            if advance_replay_position {
+                max_version = batch.batch_version;
+            }
             if overlay_is_dirty {
                 overlay = Self::overlay_conflicts_for_local_range(
                     self.local,
@@ -1398,15 +1406,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
-        let final_dentry_overlay =
-            Self::merge_overlay_conflicts(&initial_overlay, &replay_protected_overlay);
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
             &reconcile_inodes,
             &final_overlay,
         )?;
         applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
             &reconcile_dentry_keys,
-            &final_dentry_overlay,
+            &final_overlay,
         )?;
         Ok(RemoteReplayApplyOutcome {
             changed: applied_any,

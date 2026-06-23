@@ -380,6 +380,113 @@ fn self_batch_namespace_mutation_advances_namespace_version_token() {
 }
 
 #[test]
+fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let entry = pg
+        .create_dir(ROOT_INO, b"self-visible-dir", 0, 0, 0o755)
+        .expect("create local dir");
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    let dentry_key = encode_dentry_key(ROOT_INO, b"self-visible-dir");
+    pg.local
+        .apply_replica_serving_state(&[MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"self-visible-dir".to_vec(),
+            entry: DirEntryValue {
+                ino: ROOT_INO,
+                kind: FileType::Directory,
+            },
+        }])
+        .expect("simulate stale serving dentry before self replay");
+    let initial_overlay = pg.local_overlay_conflicts().expect("initial overlay");
+    assert!(
+        initial_overlay.dentry_keys.contains(&dentry_key),
+        "unacknowledged local dentry must be protected before self-batch replay"
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"self-visible-dir")
+            .expect("stale serving dentry visible before self replay")
+            .ino,
+        ROOT_INO,
+        "test setup should leave a stale serving overlay for the self dentry"
+    );
+
+    let outcome = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: projected.events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: start,
+                next_event_seq: end,
+                initial_overlay,
+            },
+        )
+        .expect("apply self batch");
+
+    assert_eq!(outcome.flushed_event_seq, Some(end));
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"self-visible-dir")
+            .expect("self dentry restored from base after ack")
+            .ino,
+        entry.ino
+    );
+}
+
+#[test]
+fn partial_self_batch_does_not_advance_replay_position_past_missing_tail() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    for i in 0..4 {
+        let name = format!("partial-self-{i}.dir");
+        pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+            .expect("create local dir");
+    }
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        projected.events.len() > 3,
+        "test setup should produce enough events to trim a self-batch tail"
+    );
+    let partial_events = projected.events[..projected.events.len() - 3].to_vec();
+
+    let outcome = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 7,
+                events: partial_events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: start,
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().expect("initial overlay"),
+            },
+        )
+        .expect("apply partial self batch");
+
+    assert_eq!(
+        outcome.max_version, 0,
+        "partial self-batch replay must not mark the batch_version consumed"
+    );
+    assert!(
+        outcome.flushed_event_seq.is_some_and(|seq| seq < end),
+        "partial self-batch may acknowledge only the local prefix it actually matched"
+    );
+}
+
+#[test]
 fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

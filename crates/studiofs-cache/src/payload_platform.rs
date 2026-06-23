@@ -228,6 +228,7 @@ pub fn open_file_descriptor_limit() -> Option<usize> {
 }
 
 #[cfg(test)]
+/// Builds a platform-specific "too many open files" error for cache fallback tests.
 pub fn too_many_open_files_error_for_test() -> io::Error {
     #[cfg(unix)]
     {
