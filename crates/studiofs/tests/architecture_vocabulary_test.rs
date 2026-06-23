@@ -1129,7 +1129,7 @@ fn benchmark_docs_cover_sfs567_split_terms() {
         "studiofs bench <mountpoint> --report <path>",
         "fixed pseudo-random workload",
         "repeatable across machines",
-        "optional --report",
+        "optional `--report`",
         "studiofs devbench",
         "--json-output",
         "--block-size",

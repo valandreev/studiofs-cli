@@ -48,7 +48,7 @@ user-facing benchmark workflow and should not be used as parity evidence.
 8. Archive the JSON report, terminal output, command line, git revision, and
    any manual notes needed to explain cache warm-up or platform differences.
 
-The public command saves JSON only when optional --report is provided as
+The public command saves JSON only when the optional `--report` flag is provided as
 `--report <path>`.
 `studiofs devbench` writes a JSON report under `target/perf` by default and
 prints the final report path. Passing `--json-output <file-or-dir>` to
