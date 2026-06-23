@@ -208,9 +208,19 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
 fn write_public_bench_notes(out: &mut String, report: &BenchmarkReport) {
     let mut has_notes = false;
     if let Some(public_bench) = &report.public_bench {
-        if !public_bench.during_upload_read.valid_for_target
-            || !public_bench.during_upload_read.target_state_observed
-        {
+        if !public_bench.during_upload_read.valid_for_target {
+            let message = public_bench
+                .during_upload_read
+                .validation_message
+                .as_deref()
+                .unwrap_or("not applicable for target");
+            let _ = writeln!(
+                out,
+                "- Warning: {} was not valid for target: {message}",
+                public_bench.during_upload_read.phase
+            );
+            has_notes = true;
+        } else if !public_bench.during_upload_read.target_state_observed {
             let message = public_bench
                 .during_upload_read
                 .validation_message
@@ -472,16 +482,8 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
         profile.process.sample_count,
         format_optional_bytes(profile.process.rss_bytes_peak),
         format_optional_bytes(profile.process.virtual_memory_bytes_peak),
-        profile
-            .process
-            .cpu_usage_percent_avg
-            .map(|value| format_optional_percent(Some(value), 2))
-            .unwrap_or(Cow::Borrowed("n/a")),
-        profile
-            .process
-            .cpu_usage_percent_peak
-            .map(|value| format_optional_percent(Some(value), 2))
-            .unwrap_or(Cow::Borrowed("n/a")),
+        format_optional_percent(profile.process.cpu_usage_percent_avg, 2),
+        format_optional_percent(profile.process.cpu_usage_percent_peak, 2),
         format_optional_bytes(profile.process.disk_read_bytes_delta),
         format_optional_bytes(profile.process.disk_write_bytes_delta),
     );
@@ -507,11 +509,7 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
                     phase.phase.clone(),
                     phase.process.sample_count.to_string(),
                     format_optional_bytes(phase.process.rss_bytes_peak),
-                    phase
-                        .process
-                        .cpu_usage_percent_avg
-                        .map(|value| format_optional_percent(Some(value), 2).into_owned())
-                        .unwrap_or_else(|| "n/a".to_string()),
+                    format_optional_percent(phase.process.cpu_usage_percent_avg, 2).into_owned(),
                     phase
                         .allocator
                         .as_ref()
@@ -1098,7 +1096,11 @@ mod tests {
         assert!(summary.contains("Read checks: during-upload n/a, sequential-medium"));
         assert!(summary.contains("Bottleneck notes:"));
         assert!(summary.contains("- Warning: runtime stats counter cache.hit_bytes missing"));
-        assert!(summary.contains("- Warning: during-upload-read did not observe active"));
+        assert!(
+            summary.contains(
+                "- Warning: during-upload-read was not valid for target: active uploads were not observed"
+            )
+        );
         assert!(summary.contains("- Warning: upload drain did not reach idle"));
         assert!(!summary.contains("Operation results"));
         assert!(!summary.contains("Cache pipeline"));

@@ -18,6 +18,8 @@ pub(crate) use profiling::{cpu_utilization_percent, process_cpu_time};
 pub(crate) use reporting::{
     render_human_summary, render_public_bench_summary, save_benchmark_report,
 };
+#[cfg(test)]
+pub(crate) use result::sample_report;
 pub(crate) use result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
     benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,

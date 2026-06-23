@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::benchmark_engine::{
-    BenchmarkAccessPattern, BenchmarkConfig, CLEANUP_ATTEMPTS, CLEANUP_RETRY_DELAY,
-    DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
-    PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg, public_bench_workload,
-    render_human_summary, render_public_bench_summary, run_mounted, save_benchmark_report,
+    BenchmarkAccessPattern, BenchmarkConfig, BenchmarkReport, CLEANUP_ATTEMPTS,
+    CLEANUP_RETRY_DELAY, DEFAULT_SMALL_CLASS_MAX_BYTES, MountedBenchmarkTarget,
+    PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES, WorkloadSizeInput, parse_size_arg,
+    public_bench_workload, render_human_summary, render_public_bench_summary, run_mounted,
+    save_benchmark_report,
 };
 use crate::cli::test_cache::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
@@ -22,7 +23,7 @@ const DEFAULT_BENCH_SMALL_FILE_COUNT: usize = 100;
 const DEFAULT_BENCH_THREADS: usize = 1;
 
 enum BenchRunOutcome {
-    Completed(Box<crate::cli::benchmark_engine::BenchmarkReport>),
+    Completed(Box<BenchmarkReport>),
     Interrupted,
 }
 
@@ -206,20 +207,24 @@ const PUBLIC_BENCH_BLOCK_SIZE: u64 = 1024 * 1024;
 fn run_bench(args: BenchArgs) -> Result<()> {
     let config = build_public_bench_config(&args, uuid::Uuid::new_v4().to_string());
     let report = run_config(config)?;
-    print_public_bench_report(&report)?;
-    save_report_for_policy(&report, public_report_output(args.json_output.as_deref()))?;
-    Ok(())
+    finish_report(
+        &report,
+        public_report_output(args.json_output.as_deref()),
+        print_public_bench_report,
+    )
 }
 
 fn run(args: DevbenchArgs, command_name: &'static str) -> Result<()> {
     let config = build_bench_config(&args, command_name, uuid::Uuid::new_v4().to_string())?;
     let report = run_config(config)?;
-    print_benchmark_report(&report)?;
-    save_report_for_policy(&report, devbench_report_output(args.json_output.as_deref()))?;
-    Ok(())
+    finish_report(
+        &report,
+        devbench_report_output(args.json_output.as_deref()),
+        print_benchmark_report,
+    )
 }
 
-fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::BenchmarkReport> {
+fn run_config(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     let runtime = resolve_mounted_runtime(&config.target)?.ok_or_else(|| {
         anyhow!(
             "'{}' is not inside an active StudioFS mount",
@@ -259,7 +264,27 @@ fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::B
     Ok(report)
 }
 
-fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
+fn finish_report(
+    report: &BenchmarkReport,
+    output: ReportOutput<'_>,
+    print_report: impl FnOnce(&BenchmarkReport) -> Result<()>,
+) -> Result<()> {
+    finish_report_with_save(report, output, print_report, save_report_for_policy)
+}
+
+fn finish_report_with_save(
+    report: &BenchmarkReport,
+    output: ReportOutput<'_>,
+    print_report: impl FnOnce(&BenchmarkReport) -> Result<()>,
+    save_report: impl FnOnce(&BenchmarkReport, ReportOutput<'_>) -> Result<()>,
+) -> Result<()> {
+    let print_result = print_report(report);
+    let save_result = save_report(report, output);
+    save_result?;
+    print_result
+}
+
+fn print_benchmark_report(report: &BenchmarkReport) -> Result<()> {
     write_stdout(&render_human_summary(report))?;
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
@@ -267,7 +292,7 @@ fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport
     Ok(())
 }
 
-fn print_public_bench_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
+fn print_public_bench_report(report: &BenchmarkReport) -> Result<()> {
     write_stdout(&render_public_bench_summary(report))
 }
 
@@ -278,7 +303,7 @@ fn write_stdout(output: &str) -> Result<()> {
 }
 
 fn write_output(output: &[u8], writer: &mut impl Write) -> Result<()> {
-    match writer.write_all(output) {
+    match writer.write_all(output).and_then(|()| writer.flush()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(error).context("write benchmark summary to stdout"),
@@ -302,10 +327,7 @@ fn devbench_report_output(json_output: Option<&Path>) -> ReportOutput<'_> {
     ReportOutput::Save(json_output)
 }
 
-fn save_report_for_policy(
-    report: &crate::cli::benchmark_engine::BenchmarkReport,
-    output: ReportOutput<'_>,
-) -> Result<()> {
+fn save_report_for_policy(report: &BenchmarkReport, output: ReportOutput<'_>) -> Result<()> {
     let ReportOutput::Save(json_output) = output else {
         return Ok(());
     };
@@ -370,9 +392,14 @@ fn cleanup_bench_work_root(work_root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::benchmark_engine::sample_report;
     use std::io;
 
     struct BrokenPipeWriter;
+
+    struct FlushBrokenPipeWriter {
+        wrote: bool,
+    }
 
     impl Write for BrokenPipeWriter {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
@@ -381,6 +408,17 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl Write for FlushBrokenPipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.wrote = true;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
         }
     }
 
@@ -642,5 +680,34 @@ mod tests {
         let mut writer = BrokenPipeWriter;
 
         write_output(b"StudioFS bench result\n", &mut writer).unwrap();
+    }
+
+    #[test]
+    fn benchmark_summary_write_treats_flush_broken_pipe_as_clean_exit() {
+        let mut writer = FlushBrokenPipeWriter { wrote: false };
+
+        write_output(b"StudioFS bench result\n", &mut writer).unwrap();
+
+        assert!(writer.wrote);
+    }
+
+    #[test]
+    fn finish_report_attempts_save_even_when_printing_fails() {
+        let report = sample_report();
+        let mut saved = false;
+
+        let err = finish_report_with_save(
+            &report,
+            ReportOutput::Skip,
+            |_| Err(anyhow!("stdout failed")),
+            |_, _| {
+                saved = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(saved);
+        assert!(err.to_string().contains("stdout failed"));
     }
 }
