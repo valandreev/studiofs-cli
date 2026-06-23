@@ -747,6 +747,10 @@ impl StudioFuseFs {
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
+            warn!(
+                platform_policy = fs.async_write_platform_policy_label(),
+                "experimental async FUSE write bridge queue enabled"
+            );
             fs.async_write_diagnostics_task = Some(fs.spawn_async_write_diagnostics_publisher());
         }
         debug!(
@@ -762,6 +766,10 @@ impl StudioFuseFs {
 
     fn handle_drain(&self) -> FuseHandleDrainFacade<'_> {
         FuseHandleDrainFacade::new(self)
+    }
+
+    fn uses_async_bridge_write_queue(&self) -> bool {
+        self.async_write_enabled
     }
 
     fn wait_pending_writes_for_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -1426,7 +1434,7 @@ impl Filesystem for StudioFuseFs {
             }
         };
         let callback_started = Instant::now();
-        if self.async_write_enabled {
+        if self.uses_async_bridge_write_queue() {
             // TODO(SFS-465): Async writes must own the FUSE callback buffer.
             // If this path graduates from experimental, replace per-write Vec
             // allocation with a reusable buffer pool to reduce allocator churn.
@@ -1656,26 +1664,8 @@ impl Filesystem for StudioFuseFs {
             });
             return;
         }
-        let pending_result = if self.async_write_enabled {
-            match self.pending_writes.begin_close(ino, fh) {
-                Ok(barrier) => barrier.wait(),
-                Err(e) => Err(write_registration_error_to_errno(e)),
-            }
-        } else {
-            Ok(())
-        };
-        let release_result = self.handle_drain().release(ino, fh);
-        if self.async_write_enabled {
-            self.pending_writes.finish_close(ino, fh);
-        }
-        match (pending_result, release_result) {
-            (Err(errno), Err(e)) => {
-                error!(
-                    "release({ino}, fh={fh}) observed pending write error: {errno}; local release error: {e}"
-                );
-                reply.error(errno);
-            }
-            (Ok(()), Ok(())) => {
+        match self.handle_drain().release(ino, fh) {
+            Ok(()) => {
                 debug!(
                     ino,
                     fh,
@@ -1684,11 +1674,7 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            (Err(errno), Ok(())) => {
-                error!("release({ino}, fh={fh}) observed pending write error: {errno}");
-                reply.error(errno);
-            }
-            (_, Err(e)) => {
+            Err(e) => {
                 error!("release({ino}, fh={fh}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
@@ -2522,6 +2508,28 @@ mod tests {
         let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
         assert!(snapshot.enabled);
         assert_eq!(snapshot.platform_policy, "sentinel");
+    }
+
+    #[test]
+    fn default_linux_write_callback_routes_directly_to_vfs() {
+        let (_tmp, _rt, _vfs, fs) = make_test_fuse_fs("default-write-route");
+
+        assert!(!fs.uses_async_bridge_write_queue());
+    }
+
+    #[test]
+    fn opt_in_async_write_callback_routes_to_bridge_queue() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("opt-in-write-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs,
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+
+        assert!(fs.uses_async_bridge_write_queue());
     }
 
     #[test]
