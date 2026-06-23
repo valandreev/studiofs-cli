@@ -185,7 +185,7 @@ Current signature includes additional policy controls:
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
-| FUSE async write replies | macOS: enabled by default. Linux: disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
+| FUSE async write replies | macOS: enabled by default. Linux: production/default writes use a thin VFS handoff; `STUDIOFS_FUSE_ASYNC_WRITE=1` enables the experimental bridge-owned async queue for targeted A/B or profiling only |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
@@ -222,6 +222,10 @@ metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
 turn on global direct I/O and does not change the buffered read cache policy.
+
+`STUDIOFS_FUSE_ASYNC_WRITE=1` is a Linux-only experimental bridge queue. The
+default Linux write callback passes caller bytes directly into the shared VFS
+writer stack and leaves staging, barriers, and upload lifecycle there.
 
 ### macOS cache and I/O policy
 
