@@ -244,13 +244,14 @@ for ((run=1; run<=runs; run++)); do
     "$studiofs_path" devbench "$mount_point"
     --block-size "$block_size"
     --big-file-size "$big_file_size"
-    --small-file-size "$small_file_size"
-    --small-file-count "$small_file_count"
     --threads "$threads"
     --json-output "$report_path"
   )
   if [[ -n "$profile" ]]; then
     cmd+=(--profile "$profile")
+  else
+    cmd+=(--small-file-size "$small_file_size")
+    cmd+=(--small-file-count "$small_file_count")
   fi
   printf '%q ' "${cmd[@]}" > "$command_path"
   printf '\n' >> "$command_path"

@@ -1228,7 +1228,7 @@ fn build_write_path_gate_report(
     WritePathGateReport {
         profile: "write-path-gate".to_string(),
         workload_kind: "single_file_sequential".to_string(),
-        payload_file_count: workload.large_files,
+        payload_file_count: workload.sizes.len(),
         payload_file_bytes: workload.sizes.iter().copied().max().unwrap_or_default(),
         write_mib_per_sec: mib_per_sec(writes),
         repeated_read_mib_per_sec: mib_per_sec(reads),
@@ -3546,6 +3546,43 @@ mod tests {
             write_path_gate: false,
             run_id: "test-run".to_string(),
         }
+    }
+
+    #[test]
+    fn write_path_gate_report_counts_actual_payload_files_not_size_class() {
+        fn op_report(throughput_bytes_per_sec: f64) -> OpReport {
+            OpReport {
+                operations: 1,
+                bytes: 64 * 1024,
+                elapsed_ms: 1.0,
+                avg_latency_ms: 1.0,
+                p50_ms: 1.0,
+                p95_ms: 1.0,
+                p99_ms: 1.0,
+                throughput_bytes_per_sec,
+                latency_histogram: LatencyHistogramReport {
+                    bucket_upper_bounds_ns: Vec::new(),
+                    bucket_counts: Vec::new(),
+                },
+                operations_log: Vec::new(),
+            }
+        }
+
+        let workload = WorkloadPlan {
+            sizes: vec![64 * 1024],
+            source: "explicit".to_string(),
+            small_files: 1,
+            medium_files: 0,
+            large_files: 0,
+        };
+        let writes = op_report(64.0 * 1024.0 * 1024.0);
+        let reads = op_report(32.0 * 1024.0 * 1024.0);
+
+        let report =
+            build_write_path_gate_report(&workload, &writes, &reads, None, None, None, None);
+
+        assert_eq!(report.payload_file_count, 1);
+        assert_eq!(report.payload_file_bytes, 64 * 1024);
     }
 
     fn runtime_snapshot_at(generated_unix_ms: u64) -> RuntimeStatsSnapshot {
