@@ -15,16 +15,13 @@ fn format_duration_ms(ms: f64) -> String {
     }
 }
 
-fn format_optional_bytes(value: Option<u64>) -> Cow<'static, str> {
-    value
-        .map(format_bytes)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed("n/a"))
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "n/a".to_string())
 }
 
-fn format_optional_percent(value: Option<f64>) -> Cow<'static, str> {
+fn format_optional_percent(value: Option<f64>, precision: usize) -> Cow<'static, str> {
     value
-        .map(|value| Cow::Owned(format!("{value:.1}%")))
+        .map(|value| Cow::Owned(format!("{value:.precision$}%")))
         .unwrap_or(Cow::Borrowed("n/a"))
 }
 
@@ -141,8 +138,11 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     let _ = writeln!(
         &mut out,
         "CPU: avg {}, peak {}",
-        format_optional_percent(process.and_then(|process| process.cpu_usage_percent_avg)),
-        format_optional_percent(process.and_then(|process| process.cpu_usage_percent_peak))
+        format_optional_percent(process.and_then(|process| process.cpu_usage_percent_avg), 1),
+        format_optional_percent(
+            process.and_then(|process| process.cpu_usage_percent_peak),
+            1
+        )
     );
     let _ = writeln!(
         &mut out,
@@ -175,14 +175,14 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     let during_upload_read = if public_bench.during_upload_read.valid_for_target
         && public_bench.during_upload_read.target_state_observed
     {
-        format_throughput(
+        Cow::Owned(format_throughput(
             public_bench
                 .during_upload_read
                 .metrics
                 .throughput_bytes_per_sec,
-        )
+        ))
     } else {
-        "n/a".to_string()
+        Cow::Borrowed("n/a")
     };
     let _ = writeln!(
         &mut out,
@@ -198,6 +198,8 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
 
     out.push('\n');
     let _ = writeln!(&mut out, "Bottleneck notes:");
+    // Public bench keeps warnings in stdout because they are part of the concise
+    // user-facing result; devbench keeps its developer warnings on stderr.
     write_public_bench_notes(&mut out, report);
 
     out
@@ -473,13 +475,13 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
         profile
             .process
             .cpu_usage_percent_avg
-            .map(|value| format!("{value:.2}%"))
-            .unwrap_or_else(|| "n/a".to_string()),
+            .map(|value| format_optional_percent(Some(value), 2))
+            .unwrap_or(Cow::Borrowed("n/a")),
         profile
             .process
             .cpu_usage_percent_peak
-            .map(|value| format!("{value:.2}%"))
-            .unwrap_or_else(|| "n/a".to_string()),
+            .map(|value| format_optional_percent(Some(value), 2))
+            .unwrap_or(Cow::Borrowed("n/a")),
         format_optional_bytes(profile.process.disk_read_bytes_delta),
         format_optional_bytes(profile.process.disk_write_bytes_delta),
     );
@@ -504,18 +506,18 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
                 vec![
                     phase.phase.clone(),
                     phase.process.sample_count.to_string(),
-                    format_optional_bytes(phase.process.rss_bytes_peak).into_owned(),
+                    format_optional_bytes(phase.process.rss_bytes_peak),
                     phase
                         .process
                         .cpu_usage_percent_avg
-                        .map(|value| format!("{value:.2}%"))
+                        .map(|value| format_optional_percent(Some(value), 2).into_owned())
                         .unwrap_or_else(|| "n/a".to_string()),
                     phase
                         .allocator
                         .as_ref()
                         .map(|allocator| format_bytes(allocator.peak_bytes))
                         .unwrap_or_else(|| "n/a".to_string()),
-                    format_optional_bytes(phase.process.disk_write_bytes_delta).into_owned(),
+                    format_optional_bytes(phase.process.disk_write_bytes_delta),
                 ]
             })
             .collect();
@@ -765,12 +767,12 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         let _ = writeln!(&mut out, "Mounted memory");
         let rows = vec![vec![
             memory.mount_pid.to_string(),
-            format_optional_bytes(memory.rss_bytes_steady_state).into_owned(),
-            format_optional_bytes(memory.rss_bytes_peak).into_owned(),
-            format_optional_bytes(memory.dirty_bytes_steady_state).into_owned(),
-            format_optional_bytes(memory.dirty_bytes_peak).into_owned(),
-            format_optional_bytes(memory.staged_bytes_peak).into_owned(),
-            format_optional_bytes(memory.dirty_limit_bytes).into_owned(),
+            format_optional_bytes(memory.rss_bytes_steady_state),
+            format_optional_bytes(memory.rss_bytes_peak),
+            format_optional_bytes(memory.dirty_bytes_steady_state),
+            format_optional_bytes(memory.dirty_bytes_peak),
+            format_optional_bytes(memory.staged_bytes_peak),
+            format_optional_bytes(memory.dirty_limit_bytes),
         ]];
         let _ = write!(
             &mut out,

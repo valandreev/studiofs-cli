@@ -260,7 +260,7 @@ fn run_config(config: BenchmarkConfig) -> Result<crate::cli::benchmark_engine::B
 }
 
 fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
-    write_stdout(render_human_summary(report))?;
+    write_stdout(&render_human_summary(report))?;
     for warning in &report.runtime_stats.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -268,16 +268,16 @@ fn print_benchmark_report(report: &crate::cli::benchmark_engine::BenchmarkReport
 }
 
 fn print_public_bench_report(report: &crate::cli::benchmark_engine::BenchmarkReport) -> Result<()> {
-    write_stdout(render_public_bench_summary(report))
+    write_stdout(&render_public_bench_summary(report))
 }
 
-fn write_stdout(output: String) -> Result<()> {
+fn write_stdout(output: &str) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     write_output(output.as_bytes(), &mut stdout)
 }
 
-fn write_output(output: &[u8], writer: &mut dyn Write) -> Result<()> {
+fn write_output(output: &[u8], writer: &mut impl Write) -> Result<()> {
     match writer.write_all(output) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
