@@ -768,10 +768,6 @@ impl StudioFuseFs {
         FuseHandleDrainFacade::new(self)
     }
 
-    fn uses_async_bridge_write_queue(&self) -> bool {
-        self.async_write_enabled
-    }
-
     fn wait_pending_writes_for_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
         if !self.async_write_enabled {
             return Ok(());
@@ -1434,7 +1430,7 @@ impl Filesystem for StudioFuseFs {
             }
         };
         let callback_started = Instant::now();
-        if self.uses_async_bridge_write_queue() {
+        if self.async_write_enabled {
             // TODO(SFS-465): Async writes must own the FUSE callback buffer.
             // If this path graduates from experimental, replace per-write Vec
             // allocation with a reusable buffer pool to reduce allocator churn.
@@ -2514,7 +2510,7 @@ mod tests {
     fn default_linux_write_callback_routes_directly_to_vfs() {
         let (_tmp, _rt, _vfs, fs) = make_test_fuse_fs("default-write-route");
 
-        assert!(!fs.uses_async_bridge_write_queue());
+        assert!(!fs.async_write_enabled);
     }
 
     #[test]
@@ -2529,7 +2525,7 @@ mod tests {
             },
         );
 
-        assert!(fs.uses_async_bridge_write_queue());
+        assert!(fs.async_write_enabled);
     }
 
     #[test]
