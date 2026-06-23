@@ -34,15 +34,10 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
     INSERT INTO metadata_state (vol, version, snapshot)
     VALUES ($1, $2, $3)
     ON CONFLICT (vol) DO UPDATE
-    SET version = GREATEST(metadata_state.version, EXCLUDED.version),
-        snapshot = CASE
-            WHEN EXCLUDED.version >= metadata_state.version THEN EXCLUDED.snapshot
-            ELSE metadata_state.snapshot
-        END,
-        updated_at = CASE
-            WHEN EXCLUDED.version >= metadata_state.version THEN now()
-            ELSE metadata_state.updated_at
-        END
+    SET version = EXCLUDED.version,
+        snapshot = EXCLUDED.snapshot,
+        updated_at = now()
+    WHERE EXCLUDED.version >= metadata_state.version
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
