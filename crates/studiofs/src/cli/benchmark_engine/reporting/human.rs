@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use super::super::result::{
     BenchmarkReport, MountedObservabilityReport, MountedPortableProfileReport,
-    MountedRuntimeReport, MountedWriteDiagnosticsReport, MountedWritebackTimelineReport,
+    MountedRuntimeReport, MountedWriteDiagnosticsReport, MountedWritebackTimelineReport, OpReport,
 };
 
 fn format_duration_ms(ms: f64) -> String {
@@ -31,6 +31,57 @@ fn public_bench_large_write_throughput(report: &BenchmarkReport) -> Option<f64> 
                 .total_cmp(&right.throughput_bytes_per_sec)
         })
         .map(|operation| operation.throughput_bytes_per_sec)
+}
+
+fn op_report_size_class_throughput(report: &OpReport, size_class: &str) -> Option<f64> {
+    let mut bytes = 0u64;
+    let mut elapsed_ms = 0.0f64;
+    for operation in &report.operations_log {
+        if operation.size_class == size_class
+            && operation.elapsed_ms.is_finite()
+            && operation.elapsed_ms > f64::EPSILON
+        {
+            bytes = bytes.saturating_add(operation.bytes);
+            elapsed_ms += operation.elapsed_ms;
+        }
+    }
+    if bytes == 0 || elapsed_ms <= f64::EPSILON {
+        return None;
+    }
+    Some(bytes as f64 / (elapsed_ms / 1000.0))
+}
+
+fn format_public_read_speed(report: &OpReport) -> String {
+    let parts: Vec<String> = ["small", "medium", "large"]
+        .into_iter()
+        .filter_map(|size_class| {
+            op_report_size_class_throughput(report, size_class)
+                .map(|throughput| format!("{size_class} {}", format_throughput(throughput)))
+        })
+        .collect();
+
+    if parts.is_empty() {
+        format_throughput(report.throughput_bytes_per_sec)
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn public_runtime_stats_unavailable_note(report: &BenchmarkReport) -> Option<String> {
+    if report.runtime_stats.available {
+        return None;
+    }
+    let stats_path = report.runtime_stats.stats_path.as_deref()?;
+    let missing_runtime_stats = report.runtime_stats.warnings.iter().any(|warning| {
+        warning.contains("runtime stats unavailable at ") && warning.contains("os error 2")
+    });
+    if missing_runtime_stats {
+        Some(format!(
+            "runtime stats unavailable at {stats_path}; mount runtime telemetry will be omitted"
+        ))
+    } else {
+        None
+    }
 }
 
 fn format_optional_percent(value: Option<f64>, precision: usize) -> Cow<'static, str> {
@@ -120,21 +171,22 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     let _ = writeln!(
         &mut out,
         "First-read speed: {}",
-        format_throughput(
-            public_bench
-                .read_metrics
-                .first_read
-                .throughput_bytes_per_sec
-        )
+        format_public_read_speed(&public_bench.read_metrics.first_read)
     );
     let _ = writeln!(
         &mut out,
         "Hot-read speed: {}",
-        format_throughput(public_bench.read_metrics.hot_read.throughput_bytes_per_sec)
+        format_public_read_speed(&public_bench.read_metrics.hot_read)
     );
     let _ = writeln!(
         &mut out,
-        "Pseudo-random read latency: {} p95",
+        "Pseudo-random read: {}, {} p95",
+        format_throughput(
+            public_bench
+                .read_metrics
+                .pseudo_random_read
+                .throughput_bytes_per_sec
+        ),
         format_duration_ms(public_bench.read_metrics.pseudo_random_read.p95_ms)
     );
     let _ = write!(&mut out, "Upload drain: ");
@@ -235,11 +287,22 @@ fn write_public_bench_notes(out: &mut String, report: &BenchmarkReport) {
                 .validation_message
                 .as_deref()
                 .unwrap_or("not applicable for target");
-            let _ = writeln!(
-                out,
-                "- Warning: {} was not valid for target: {message}",
-                public_bench.during_upload_read.phase
-            );
+            if public_bench.during_upload_read.wait_target == "active"
+                && public_bench.during_upload_read.pending_uploads_before == 0
+                && public_bench.during_upload_read.pending_uploads_after == 0
+            {
+                let _ = writeln!(
+                    out,
+                    "- Note: {} was not measured during active upload: {message}",
+                    public_bench.during_upload_read.phase
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "- Warning: {} was not valid for target: {message}",
+                    public_bench.during_upload_read.phase
+                );
+            }
             has_notes = true;
         } else if !public_bench.during_upload_read.target_state_observed {
             let message = public_bench
@@ -264,9 +327,14 @@ fn write_public_bench_notes(out: &mut String, report: &BenchmarkReport) {
             has_notes = true;
         }
     }
-    for warning in &report.runtime_stats.warnings {
-        let _ = writeln!(out, "- Warning: {warning}");
+    if let Some(note) = public_runtime_stats_unavailable_note(report) {
+        let _ = writeln!(out, "- Note: {note}");
         has_notes = true;
+    } else {
+        for warning in &report.runtime_stats.warnings {
+            let _ = writeln!(out, "- Warning: {warning}");
+            has_notes = true;
+        }
     }
     if !has_notes {
         let _ = writeln!(out, "- No benchmark warnings were reported.");
@@ -1122,7 +1190,7 @@ mod tests {
         assert!(summary.contains("Mixed-write speed: 52.00MiB/s"));
         assert!(summary.contains("First-read speed:"));
         assert!(summary.contains("Hot-read speed:"));
-        assert!(summary.contains("Pseudo-random read latency: 3.20 ms p95"));
+        assert!(summary.contains("Pseudo-random read: 240.00MiB/s, 3.20 ms p95"));
         assert!(summary.contains("Upload drain: not observed after 10.00 s"));
         assert!(summary.contains("CPU: avg n/a, peak n/a"));
         assert!(summary.contains("Memory: peak n/a"));
@@ -1130,11 +1198,9 @@ mod tests {
         assert!(summary.contains("Read checks: during-upload n/a, sequential-medium"));
         assert!(summary.contains("Bottleneck notes:"));
         assert!(summary.contains("- Warning: runtime stats counter cache.hit_bytes missing"));
-        assert!(
-            summary.contains(
-                "- Warning: during-upload-read was not valid for target: active uploads were not observed"
-            )
-        );
+        assert!(summary.contains(
+            "- Note: during-upload-read was not measured during active upload: active uploads were not observed"
+        ));
         assert!(summary.contains("- Warning: upload drain did not reach idle"));
         assert!(!summary.contains("Operation results"));
         assert!(!summary.contains("Cache pipeline"));
@@ -1152,6 +1218,134 @@ mod tests {
         assert!(summary.contains("Warning: public bench metrics are unavailable"));
         assert!(summary.contains("- Warning: runtime stats file was unreadable"));
         assert!(!summary.contains("- No benchmark warnings were reported."));
+    }
+
+    #[test]
+    fn render_public_bench_summary_collapses_missing_runtime_stats_warning() {
+        let mut report = sample_report();
+        report.command.name = "studiofs bench".to_string();
+        report.public_bench = Some(PublicBenchReport {
+            workload: PublicBenchWorkloadReport {
+                small_files: 1000,
+                medium_files: 80,
+                large_files: 1,
+                large_file_size_bytes: 4 * 1024 * 1024 * 1024,
+            },
+            write_metrics: PublicBenchWriteMetricsReport {
+                small_files: size_class("small", 1000, 128 * 1024 * 1024, 210.0),
+                medium_files: size_class("medium", 80, 2 * 1024 * 1024 * 1024, 640.0),
+                large_file: size_class("large", 1, 4 * 1024 * 1024 * 1024, 925.0),
+            },
+            during_upload_read: PublicBenchDuringUploadReadReport {
+                phase: "during-upload-read".to_string(),
+                metrics: op_report(32, 128 * 1024 * 1024, 180.0, 7.5),
+                wait_target: "active".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                wait_ms: 20.0,
+                pending_uploads_before: 2,
+                pending_uploads_after: 1,
+                validation_message: None,
+            },
+            read_metrics: PublicBenchReadMetricsReport {
+                first_read: op_report(1081, 4 * 1024 * 1024 * 1024, 510.0, 12.0),
+                hot_read: op_report(1081, 4 * 1024 * 1024 * 1024, 1800.0, 2.4),
+                pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
+                sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
+            },
+            upload_drain: PublicBenchUploadDrainReport {
+                observed_idle: true,
+                timed_out: false,
+                wait_ms: 1.0,
+                pending_uploads_before: 0,
+                pending_uploads_after: 0,
+                reason: None,
+            },
+        });
+        report.runtime_stats.available = false;
+        report.runtime_stats.stats_path = Some(r"Z:\.studiofs-runtime-stats".to_string());
+        report.runtime_stats.warnings = vec![concat!(
+            r"runtime stats unavailable at Z:\.studiofs-runtime-stats for benchmark start: The system cannot find the file specified. (os error 2); ",
+            r"runtime stats unavailable at Z:\.studiofs-runtime-stats for write phase: The system cannot find the file specified. (os error 2)"
+        )
+        .to_string()];
+
+        let summary = render_public_bench_summary(&report);
+
+        assert!(summary.contains(
+            r"- Note: runtime stats unavailable at Z:\.studiofs-runtime-stats; mount runtime telemetry will be omitted"
+        ));
+        assert!(!summary.contains("for benchmark start"));
+        assert!(!summary.contains("for write phase"));
+    }
+
+    #[test]
+    fn render_public_bench_summary_splits_read_speed_by_size_class() {
+        let mut report = sample_report();
+        report.command.name = "studiofs bench".to_string();
+        let mut first_read = op_report(3, 7 * 1024 * 1024, 100.0, 6.0);
+        first_read.operations_log = vec![
+            read_operation("small", 1 * 1024 * 1024, 100.0),
+            read_operation("medium", 2 * 1024 * 1024, 100.0),
+            read_operation("large", 4 * 1024 * 1024, 100.0),
+        ];
+        let mut hot_read = op_report(3, 14 * 1024 * 1024, 200.0, 3.0);
+        hot_read.operations_log = vec![
+            read_operation("small", 1 * 1024 * 1024, 50.0),
+            read_operation("medium", 4 * 1024 * 1024, 50.0),
+            read_operation("large", 9 * 1024 * 1024, 50.0),
+        ];
+        report.public_bench = Some(PublicBenchReport {
+            workload: PublicBenchWorkloadReport {
+                small_files: 1000,
+                medium_files: 80,
+                large_files: 1,
+                large_file_size_bytes: 4 * 1024 * 1024 * 1024,
+            },
+            write_metrics: PublicBenchWriteMetricsReport {
+                small_files: size_class("small", 1000, 128 * 1024 * 1024, 210.0),
+                medium_files: size_class("medium", 80, 2 * 1024 * 1024 * 1024, 640.0),
+                large_file: size_class("large", 1, 4 * 1024 * 1024 * 1024, 925.0),
+            },
+            during_upload_read: PublicBenchDuringUploadReadReport {
+                phase: "during-upload-read".to_string(),
+                metrics: op_report(32, 128 * 1024 * 1024, 180.0, 7.5),
+                wait_target: "active".to_string(),
+                target_state_observed: true,
+                valid_for_target: true,
+                wait_ms: 20.0,
+                pending_uploads_before: 2,
+                pending_uploads_after: 1,
+                validation_message: None,
+            },
+            read_metrics: PublicBenchReadMetricsReport {
+                first_read,
+                hot_read,
+                pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
+                sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
+            },
+            upload_drain: PublicBenchUploadDrainReport {
+                observed_idle: true,
+                timed_out: false,
+                wait_ms: 2.0,
+                pending_uploads_before: 0,
+                pending_uploads_after: 0,
+                reason: None,
+            },
+        });
+
+        let summary = render_public_bench_summary(&report);
+
+        assert!(
+            summary.contains(
+                "First-read speed: small 10.00MiB/s, medium 20.00MiB/s, large 40.00MiB/s"
+            )
+        );
+        assert!(
+            summary
+                .contains("Hot-read speed: small 20.00MiB/s, medium 80.00MiB/s, large 180.00MiB/s")
+        );
+        assert!(summary.contains("Pseudo-random read: 240.00MiB/s, 3.20 ms p95"));
     }
 
     fn size_class(class: &str, operations: u64, bytes: u64, mib_per_sec: f64) -> SizeClassOpReport {
@@ -1179,6 +1373,19 @@ mod tests {
             throughput_bytes_per_sec: mib_per_sec * 1024.0 * 1024.0,
             latency_histogram: test_latency_histogram(),
             operations_log: Vec::new(),
+        }
+    }
+
+    fn read_operation(size_class: &str, bytes: u64, elapsed_ms: f64) -> OperationLogReport {
+        OperationLogReport {
+            operation_index: 0,
+            work_index: 0,
+            worker_id: 0,
+            target: format!("{size_class}.dat"),
+            size_class: size_class.to_string(),
+            bytes,
+            elapsed_ms,
+            throughput_bytes_per_sec: bytes as f64 / (elapsed_ms / 1000.0),
         }
     }
 

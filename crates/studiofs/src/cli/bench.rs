@@ -116,6 +116,31 @@ fn parse_bounded_usize_arg(
     Ok(value)
 }
 
+#[cfg(windows)]
+fn benchmark_filesystem_root(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    if path.has_root() || components.next().is_some() {
+        return path.to_path_buf();
+    }
+
+    match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+            PathBuf::from(format!("{}:\\", char::from(drive)))
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(not(windows))]
+fn benchmark_filesystem_root(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn build_bench_config(
     args: &DevbenchArgs,
     command_name: &'static str,
@@ -155,7 +180,7 @@ fn build_bench_config(
 
     Ok(BenchmarkConfig {
         command_name,
-        target: args.mountpoint.clone(),
+        target: benchmark_filesystem_root(&args.mountpoint),
         block_size,
         read_size: block_size,
         size_class_small_max,
@@ -181,7 +206,7 @@ fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfi
     let sizes = workload.file_sizes();
     BenchmarkConfig {
         command_name: "studiofs bench",
-        target: args.mountpoint.clone(),
+        target: benchmark_filesystem_root(&args.mountpoint),
         block_size: PUBLIC_BENCH_BLOCK_SIZE,
         read_size: PUBLIC_BENCH_BLOCK_SIZE,
         size_class_small_max: PUBLIC_BENCH_SMALL_MAX_BYTES,
@@ -232,13 +257,14 @@ fn run_config(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         )
     })?;
     let work_root = config.target.join(".studiofs-benchmark");
+    let mount_point = benchmark_filesystem_root(&runtime.mount_point);
     let mut work_root_cleanup = BenchWorkRootCleanup::new(work_root.clone());
     let async_runtime =
         tokio::runtime::Runtime::new().map_err(|error| anyhow!("create tokio runtime: {error}"))?;
     let mounted_target = MountedBenchmarkTarget {
         pid: runtime.pid,
         volume: runtime.volume.as_str(),
-        mount_point: runtime.mount_point.as_path(),
+        mount_point: mount_point.as_path(),
         work_root: work_root.as_path(),
         cache_path: runtime.cache_path.as_deref(),
     };
@@ -502,6 +528,19 @@ mod tests {
             }
             other => panic!("expected fixed public bench workload, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_bench_config_expands_drive_relative_mount_root_for_filesystem_paths() {
+        let args = BenchArgs {
+            mountpoint: PathBuf::from("Z:"),
+            json_output: None,
+        };
+
+        let config = build_public_bench_config(&args, "run-1".to_string());
+
+        assert_eq!(config.target, PathBuf::from("Z:\\"));
     }
 
     #[test]
