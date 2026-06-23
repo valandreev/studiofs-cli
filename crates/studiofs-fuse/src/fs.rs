@@ -2542,31 +2542,9 @@ mod tests {
 
     #[test]
     fn default_linux_write_callback_routes_directly_to_vfs() {
-        let (_tmp, _rt, _vfs, fs) = make_test_fuse_fs("default-write-route");
-
-        assert!(!fs.async_write_enabled);
-    }
-
-    #[test]
-    fn opt_in_async_write_callback_routes_to_bridge_queue() {
-        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("opt-in-write-route");
-        let fs = StudioFuseFs::new_with_runtime_options(
-            vfs,
-            rt.handle().clone(),
-            super::StudioFuseRuntimeOptions {
-                async_write_enabled: true,
-                ..super::StudioFuseRuntimeOptions::default()
-            },
-        );
-
-        assert!(fs.async_write_enabled);
-    }
-
-    #[test]
-    fn default_linux_write_callback_leaves_async_queue_idle() {
-        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("default-write-no-queue");
+        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("default-write-route");
         let attr = vfs
-            .create(1, b"default-write-no-queue.txt", 0, 0, 0o644)
+            .create(1, b"default-write-route.txt", 0, 0, 0o644)
             .expect("create test file");
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -2576,10 +2554,36 @@ mod tests {
         fs.write_callback(attr.ino, fh, 0, b"abc", 0, reply.clone());
 
         let snapshot = fs.pending_writes.snapshot();
+        assert_eq!(reply.written_size(), Some(3));
         assert_eq!(snapshot.pending_writes, 0);
         assert_eq!(snapshot.pending_bytes, 0);
         assert_eq!(snapshot.completed_writes, 0);
-        assert_eq!(reply.written_size(), Some(3));
+    }
+
+    #[test]
+    fn opt_in_async_write_callback_routes_to_bridge_queue() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("opt-in-write-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let attr = vfs
+            .create(1, b"opt-in-write-route.txt", 0, 0, 0o644)
+            .expect("create test file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open test file");
+        let reply = TestWriteReply::default();
+
+        fs.write_callback(attr.ino, fh, 0, b"abc", 0, reply.clone());
+
+        let snapshot = fs.pending_writes.snapshot();
+        assert!(fs.async_write_enabled);
+        assert!(snapshot.pending_writes > 0 || snapshot.completed_writes > 0);
     }
 
     #[test]
