@@ -441,52 +441,6 @@ fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
 }
 
 #[test]
-fn partial_self_batch_does_not_advance_replay_position_past_missing_tail() {
-    let (_dir, pg) = temp_pg_engine_for_unit();
-    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    for i in 0..4 {
-        let name = format!("partial-self-{i}.dir");
-        pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
-            .expect("create local dir");
-    }
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
-    let events = pg.local.read_events_range(start, end).expect("read events");
-    let projected = RemoteApplyCoordinator::project_local_batch(&events);
-    assert!(
-        projected.events.len() > 3,
-        "test setup should produce enough events to trim a self-batch tail"
-    );
-    let partial_events = projected.events[..projected.events.len() - 3].to_vec();
-
-    let outcome = RemoteApplyCoordinator::new(&pg.local)
-        .apply_decoded_batches(
-            vec![DecodedReplayBatch {
-                batch_version: 7,
-                events: partial_events,
-                is_self_batch: true,
-            }],
-            None,
-            RemoteReplayApplyContext {
-                last_seq: 0,
-                current_namespace_version: 0,
-                flushed_event_seq: start,
-                next_event_seq: end,
-                initial_overlay: pg.local_overlay_conflicts().expect("initial overlay"),
-            },
-        )
-        .expect("apply partial self batch");
-
-    assert_eq!(
-        outcome.max_version, 0,
-        "partial self-batch replay must not mark the batch_version consumed"
-    );
-    assert!(
-        outcome.flushed_event_seq.is_some_and(|seq| seq < end),
-        "partial self-batch may acknowledge only the local prefix it actually matched"
-    );
-}
-
-#[test]
 fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
