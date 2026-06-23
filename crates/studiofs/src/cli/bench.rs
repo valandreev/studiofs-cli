@@ -191,9 +191,7 @@ fn build_bench_config(
             (sizes, small_file_size.max(DEFAULT_SMALL_CLASS_MAX_BYTES))
         }
     };
-    let size_class_medium_max = block_size
-        .max(size_class_small_max.saturating_add(1))
-        .max(size_class_small_max.saturating_add(1));
+    let size_class_medium_max = block_size.max(size_class_small_max.saturating_add(1));
 
     Ok(BenchmarkConfig {
         command_name,

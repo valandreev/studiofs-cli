@@ -85,10 +85,15 @@ const PUBLIC_BENCH_LARGE_READ_LIMIT_BYTES: u64 = 1024 * 1024;
 const SIZE_CLASS_SMALL: &str = "small";
 const SIZE_CLASS_MEDIUM: &str = "medium";
 const SIZE_CLASS_LARGE: &str = "large";
+const PHASE_WRITE: &str = "write";
 const PHASE_DURING_UPLOAD_READ: &str = "during-upload-read";
 const PHASE_FIRST_READ: &str = "first-read";
 const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
 const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
+const PHASE_STAT: &str = "stat";
+const PHASE_HOT_READ: &str = "hot-read";
+const PHASE_PSEUDO_RANDOM_READ: &str = "pseudo-random-read";
+const PHASE_SEQUENTIAL_MEDIUM_READ: &str = "sequential-medium-read";
 const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
     "upload-drain-wait phase missing; using legacy post-upload-read fallback";
 
@@ -1163,6 +1168,19 @@ fn first_read_phase_mib_per_sec(
         .map(|phase| mib_per_sec(&phase.results))
 }
 
+fn portable_phase_cpu_percent(
+    portable_profile: Option<&MountedPortableProfileReport>,
+    phase_name: &str,
+) -> Option<f64> {
+    portable_profile.and_then(|profile| {
+        profile
+            .phases
+            .iter()
+            .find(|phase| phase.phase == phase_name)
+            .and_then(|phase| phase.process.cpu_usage_percent_avg)
+    })
+}
+
 fn build_write_path_gate_report(
     workload: &WorkloadPlan,
     writes: &OpReport,
@@ -1175,9 +1193,11 @@ fn build_write_path_gate_report(
     let cpu_percent = portable_profile
         .and_then(|profile| profile.process.cpu_usage_percent_avg)
         .or_else(|| profile.map(|profile| profile.cpu_profile.cpu_utilization_percent));
-    let write_phase_cpu_percent =
-        profile.map(|profile| profile.cpu_profile.write_phase_cpu_percent);
-    let read_phase_cpu_percent = profile.map(|profile| profile.cpu_profile.read_phase_cpu_percent);
+    let write_phase_cpu_percent = portable_phase_cpu_percent(portable_profile, PHASE_WRITE)
+        .or_else(|| profile.map(|profile| profile.cpu_profile.write_phase_cpu_percent));
+    let read_phase_cpu_percent =
+        portable_phase_cpu_percent(portable_profile, PHASE_DURING_UPLOAD_READ)
+            .or_else(|| profile.map(|profile| profile.cpu_profile.read_phase_cpu_percent));
     let dirty_backlog = WritePathGateBacklogReport {
         dirty_bytes_peak: diagnostics.and_then(|report| report.dirty_bytes_peak),
         staged_bytes_peak: diagnostics.and_then(|report| report.staged_bytes_peak),
@@ -2703,7 +2723,7 @@ fn build_runtime_stats_phase_deltas(
     if let Some(after_write) = snapshots.after_write.as_ref() {
         push_runtime_stats_phase_delta(
             &mut phases,
-            "write",
+            PHASE_WRITE,
             snapshots.whole_run_before,
             after_write,
         );
@@ -2721,7 +2741,12 @@ fn build_runtime_stats_phase_deltas(
         snapshots.before_read.as_ref(),
         snapshots.after_read.as_ref(),
     ) {
-        push_runtime_stats_phase_delta(&mut phases, "during-upload-read", before_read, after_read);
+        push_runtime_stats_phase_delta(
+            &mut phases,
+            PHASE_DURING_UPLOAD_READ,
+            before_read,
+            after_read,
+        );
     }
 
     let mut previous_read_snapshot = snapshots
@@ -2729,14 +2754,14 @@ fn build_runtime_stats_phase_deltas(
         .as_ref()
         .or(snapshots.before_read.as_ref());
     for (phase, snapshot) in [
-        ("first-read", snapshots.after_first_read.as_ref()),
-        ("hot-read", snapshots.after_hot_read.as_ref()),
+        (PHASE_FIRST_READ, snapshots.after_first_read.as_ref()),
+        (PHASE_HOT_READ, snapshots.after_hot_read.as_ref()),
         (
-            "pseudo-random-read",
+            PHASE_PSEUDO_RANDOM_READ,
             snapshots.after_pseudo_random_read.as_ref(),
         ),
         (
-            "sequential-medium-read",
+            PHASE_SEQUENTIAL_MEDIUM_READ,
             snapshots.after_sequential_medium_read.as_ref(),
         ),
     ] {
@@ -2759,7 +2784,7 @@ fn build_runtime_stats_phase_deltas(
         .or(snapshots.after_write.as_ref())
         .unwrap_or(snapshots.whole_run_before);
     if let Some(after_stat) = snapshots.after_stat.as_ref() {
-        push_runtime_stats_phase_delta(&mut phases, "stat", stat_before, after_stat);
+        push_runtime_stats_phase_delta(&mut phases, PHASE_STAT, stat_before, after_stat);
     }
 
     phases
@@ -2866,7 +2891,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         phase = "e2e-write",
                         "cache benchmark phase start"
                     );
-                    portable_profile.set_phase("write");
+                    portable_profile.set_phase(PHASE_WRITE);
                     let writes_wall_start = Instant::now();
                     let writes_cpu_start = process_cpu_time();
                     let (writes, writes_by_stream) = run_mounted_write_phase(
@@ -2918,7 +2943,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         phase = "e2e-read",
                         "cache benchmark phase start"
                     );
-                    portable_profile.set_phase("during-upload-read");
+                    portable_profile.set_phase(PHASE_DURING_UPLOAD_READ);
                     let reads_wall_start = Instant::now();
                     let reads_cpu_start = process_cpu_time();
                     let (reads, reads_by_stream) = run_mounted_read_phase(
@@ -2947,7 +2972,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         phase = "e2e-stat",
                         "cache benchmark phase start"
                     );
-                    portable_profile.set_phase("stat");
+                    portable_profile.set_phase(PHASE_STAT);
                     let stats_wall_start = Instant::now();
                     let stats = run_mounted_stat_phase(
                         workload_files_ref.clone(),
@@ -3035,7 +3060,7 @@ pub(crate) async fn run_mounted_end_to_end(
         let local_first_read_comparison = match (cache_path, cache_upload_dir.as_deref()) {
             (Some(cache_path), Some(upload_dir)) => {
                 let during_phase = MountedLocalFirstReadPhaseReport {
-                    phase: "during-upload-read".to_string(),
+                    phase: PHASE_DURING_UPLOAD_READ.to_string(),
                     wait_target: measured
                         .during_upload_observation
                         .as_ref()
@@ -3097,7 +3122,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 pending_uploads_before,
                                 "cache benchmark waiting for upload idle"
                             );
-                            portable_profile.set_phase("upload-drain-wait");
+                            portable_profile.set_phase(PHASE_UPLOAD_DRAIN_WAIT);
                             let idle_observation = wait_for_pending_upload_target(
                                 metrics_path,
                                 mount_pid,
@@ -3108,7 +3133,7 @@ pub(crate) async fn run_mounted_end_to_end(
                             )
                             .await?;
                             let drain_phase = MountedLocalFirstReadPhaseReport {
-                                phase: "upload-drain-wait".to_string(),
+                                phase: PHASE_UPLOAD_DRAIN_WAIT.to_string(),
                                 wait_target: idle_observation.target.label().to_string(),
                                 target_state_observed: idle_observation.observed,
                                 valid_for_target: idle_observation.observed,
@@ -3133,7 +3158,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 upload_dir = %upload_dir.display(),
                                 "cache benchmark phase start"
                             );
-                            portable_profile.set_phase("first-read");
+                            portable_profile.set_phase(PHASE_FIRST_READ);
                             let first_read = run_mounted_read_operations(
                                 "StudioFS bench first read",
                                 params,
@@ -3153,7 +3178,7 @@ pub(crate) async fn run_mounted_end_to_end(
                             )
                             .await;
                             let first_phase = MountedLocalFirstReadPhaseReport {
-                                phase: "first-read".to_string(),
+                                phase: PHASE_FIRST_READ.to_string(),
                                 wait_target: idle_observation.target.label().to_string(),
                                 target_state_observed: idle_observation.observed,
                                 valid_for_target: idle_observation.observed,
@@ -3181,7 +3206,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 phase = "e2e-hot-read",
                                 "cache benchmark phase start"
                             );
-                            portable_profile.set_phase("hot-read");
+                            portable_profile.set_phase(PHASE_HOT_READ);
                             let hot_read = run_mounted_read_operations(
                                 "StudioFS bench hot read",
                                 params,
@@ -3207,7 +3232,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 phase = "e2e-pseudo-random-read",
                                 "cache benchmark phase start"
                             );
-                            portable_profile.set_phase("pseudo-random-read");
+                            portable_profile.set_phase(PHASE_PSEUDO_RANDOM_READ);
                             let pseudo_random_read = run_mounted_read_operations(
                                 "StudioFS bench pseudo-random read",
                                 params,
@@ -3234,7 +3259,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 phase = "e2e-sequential-medium-read",
                                 "cache benchmark phase start"
                             );
-                            portable_profile.set_phase("sequential-medium-read");
+                            portable_profile.set_phase(PHASE_SEQUENTIAL_MEDIUM_READ);
                             let sequential_medium_read = run_mounted_read_operations(
                                 "StudioFS bench sequential medium read",
                                 params,
@@ -3585,6 +3610,80 @@ mod tests {
         assert_eq!(report.payload_file_bytes, 64 * 1024);
     }
 
+    #[test]
+    fn write_path_gate_report_uses_portable_phase_cpu_when_pyroscope_profile_absent() {
+        fn process_report(cpu_usage_percent_avg: Option<f64>) -> MountedPortableProcessReport {
+            MountedPortableProcessReport {
+                mount_pid: 42,
+                sample_count: 3,
+                rss_bytes_steady_state: None,
+                rss_bytes_peak: None,
+                virtual_memory_bytes_peak: None,
+                cpu_usage_percent_avg,
+                cpu_usage_percent_peak: None,
+                cpu_time_ms_delta: None,
+                disk_read_bytes_delta: None,
+                disk_write_bytes_delta: None,
+            }
+        }
+
+        fn op_report(throughput_bytes_per_sec: f64) -> OpReport {
+            OpReport {
+                operations: 1,
+                bytes: 8 * 1024 * 1024,
+                elapsed_ms: 1.0,
+                avg_latency_ms: 1.0,
+                p50_ms: 1.0,
+                p95_ms: 1.0,
+                p99_ms: 1.0,
+                throughput_bytes_per_sec,
+                latency_histogram: LatencyHistogramReport {
+                    bucket_upper_bounds_ns: Vec::new(),
+                    bucket_counts: Vec::new(),
+                },
+                operations_log: Vec::new(),
+            }
+        }
+
+        let workload = WorkloadPlan {
+            sizes: vec![8 * 1024 * 1024],
+            source: "explicit".to_string(),
+            small_files: 0,
+            medium_files: 0,
+            large_files: 1,
+        };
+        let portable_profile = MountedPortableProfileReport {
+            process: process_report(Some(55.0)),
+            allocator: None,
+            phases: vec![
+                MountedPortablePhaseProfileReport {
+                    phase: PHASE_WRITE.to_string(),
+                    process: process_report(Some(61.0)),
+                    allocator: None,
+                },
+                MountedPortablePhaseProfileReport {
+                    phase: PHASE_DURING_UPLOAD_READ.to_string(),
+                    process: process_report(Some(47.0)),
+                    allocator: None,
+                },
+            ],
+        };
+
+        let report = build_write_path_gate_report(
+            &workload,
+            &op_report(128.0 * 1024.0 * 1024.0),
+            &op_report(96.0 * 1024.0 * 1024.0),
+            None,
+            Some(&portable_profile),
+            None,
+            None,
+        );
+
+        assert_eq!(report.cpu_percent, Some(55.0));
+        assert_eq!(report.write_phase_cpu_percent, Some(61.0));
+        assert_eq!(report.read_phase_cpu_percent, Some(47.0));
+    }
+
     fn runtime_snapshot_at(generated_unix_ms: u64) -> RuntimeStatsSnapshot {
         RuntimeStatsSnapshot {
             generated_unix_ms,
@@ -3681,7 +3780,7 @@ mod tests {
             cache_path: r"D:\cache".to_string(),
             upload_dir: r"D:\cache\upload".to_string(),
             phases: vec![MountedLocalFirstReadPhaseReport {
-                phase: "during-upload-read".to_string(),
+                phase: PHASE_DURING_UPLOAD_READ.to_string(),
                 wait_target: "active".to_string(),
                 target_state_observed: true,
                 valid_for_target: true,
@@ -3896,13 +3995,13 @@ mod tests {
             after_stat: &Some(after_stat),
         });
 
-        assert_eq!(phases[0].phase, "write");
+        assert_eq!(phases[0].phase, PHASE_WRITE);
         assert_eq!(phases[0].delta.interval_ms, 100);
         assert_eq!(phases[1].phase, "upload-transition");
         assert_eq!(phases[1].delta.interval_ms, 150);
-        assert_eq!(phases[2].phase, "during-upload-read");
+        assert_eq!(phases[2].phase, PHASE_DURING_UPLOAD_READ);
         assert_eq!(phases[2].delta.interval_ms, 100);
-        assert_eq!(phases[3].phase, "stat");
+        assert_eq!(phases[3].phase, PHASE_STAT);
         assert_eq!(phases[3].delta.interval_ms, 50);
     }
 
@@ -3925,9 +4024,9 @@ mod tests {
             after_stat: &Some(after_stat),
         });
 
-        assert_eq!(phases[0].phase, "write");
+        assert_eq!(phases[0].phase, PHASE_WRITE);
         assert_eq!(phases[1].phase, "upload-transition");
-        assert_eq!(phases[2].phase, "stat");
+        assert_eq!(phases[2].phase, PHASE_STAT);
         assert_eq!(phases[2].delta.interval_ms, 150);
     }
 
@@ -3948,7 +4047,7 @@ mod tests {
             after_stat: &Some(after_stat),
         });
 
-        assert_eq!(phases[0].phase, "stat");
+        assert_eq!(phases[0].phase, PHASE_STAT);
         assert_eq!(phases[0].delta.interval_ms, 400);
     }
 
@@ -4215,10 +4314,10 @@ mod tests {
             mount_pid,
             Some(&metrics_path),
             move |profile| async move {
-                profile.set_phase("write");
+                profile.set_phase(PHASE_WRITE);
                 write_snapshot_with_allocator(metrics_path_ref, mount_pid, 256, 512).await;
                 tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
-                profile.set_phase("during-upload-read");
+                profile.set_phase(PHASE_DURING_UPLOAD_READ);
                 write_snapshot_with_allocator(metrics_path_ref, mount_pid, 128, 1024).await;
                 tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
                 Ok::<_, anyhow::Error>(())
@@ -4237,14 +4336,14 @@ mod tests {
             portable_profile
                 .phases
                 .iter()
-                .any(|phase| phase.phase == "write"
+                .any(|phase| phase.phase == PHASE_WRITE
                     && phase.allocator.as_ref().unwrap().peak_bytes == 512)
         );
         assert!(
             portable_profile
                 .phases
                 .iter()
-                .any(|phase| phase.phase == "during-upload-read"
+                .any(|phase| phase.phase == PHASE_DURING_UPLOAD_READ
                     && phase.allocator.as_ref().unwrap().peak_bytes == 1024)
         );
     }
@@ -4436,15 +4535,15 @@ mod tests {
             ..Default::default()
         };
 
-        timeline.observe("write", &before);
-        timeline.observe("write", &after);
+        timeline.observe(PHASE_WRITE, &before);
+        timeline.observe(PHASE_WRITE, &after);
         let report = timeline.into_report().expect("timeline report");
 
         assert_eq!(report.bucket_ms, 1000);
         assert_eq!(report.samples.len(), 1);
         let sample = &report.samples[0];
         assert_eq!(sample.elapsed_ms, 1000);
-        assert_eq!(sample.phase, "write");
+        assert_eq!(sample.phase, PHASE_WRITE);
         assert_eq!(
             sample.foreground_write_bytes_per_sec,
             64.0 * 1024.0 * 1024.0
@@ -4475,7 +4574,7 @@ mod tests {
             upload_dir: r"D:\cache\upload".to_string(),
             phases: vec![
                 MountedLocalFirstReadPhaseReport {
-                    phase: "upload-drain-wait".to_string(),
+                    phase: PHASE_UPLOAD_DRAIN_WAIT.to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
                     valid_for_target: true,

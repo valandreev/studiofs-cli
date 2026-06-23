@@ -1324,6 +1324,9 @@ fn benchmark_docs_cover_sfs549_write_path_gate() {
         "dirty_backlog",
         "top_wait_counter_deltas",
         "fio is not required for the StudioFS side",
+        "default to `1`",
+        "threads_was_set",
+        "$PSBoundParameters.ContainsKey(\"Threads\")",
         "validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate",
     ];
     let missing_terms: Vec<_> = required_terms

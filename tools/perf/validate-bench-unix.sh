@@ -10,6 +10,7 @@ big_file_size="1GB"
 small_file_size="128KB"
 small_file_count=1000
 threads=4
+threads_was_set=false
 profile=""
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,6 +140,7 @@ while [[ $# -gt 0 ]]; do
     --threads)
       require_value "$1" "${2:-}" "a positive integer"
       threads="$2"
+      threads_was_set=true
       shift 2
       ;;
     --profile)
@@ -155,6 +157,9 @@ if [[ -z "$mount_point" ]]; then
   echo "--mount-point is required" >&2
   usage >&2
   exit 2
+fi
+if [[ "$profile" == "write-path-gate" && "$threads_was_set" == false ]]; then
+  threads=1
 fi
 runs="$(normalize_positive_int "--runs" "$runs")"
 small_file_count="$(normalize_positive_int "--small-file-count" "$small_file_count")"

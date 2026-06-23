@@ -85,9 +85,11 @@ Example Linux command:
 bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate --big-file-size 8GB --block-size 4MB --threads 1
 ```
 
-Use `--threads 1` for this profile. The gate intentionally issues one
-sequential payload operation; larger thread counts may start extra workers, but
-only one worker can consume the single-file operation while the rest exit idle.
+Use `--threads 1` for this profile. The validation scripts default to `1` when
+`--profile write-path-gate` is provided and `--threads` is omitted. The gate
+intentionally issues one sequential payload operation; larger explicit thread
+counts may start extra workers, but only one worker can consume the single-file
+operation while the rest exit idle.
 
 Each `report.json` from this profile includes a parsed `write_path_gate`
 section with `write_mib_per_sec`, `repeated_read_mib_per_sec`,

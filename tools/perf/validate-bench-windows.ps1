@@ -181,6 +181,9 @@ if ($SmallFileCount -lt 1) {
 if ($Threads -lt 1) {
     throw "-Threads must be >= 1"
 }
+if ($Profile -eq "write-path-gate" -and -not $PSBoundParameters.ContainsKey("Threads")) {
+    $Threads = 1
+}
 
 $repoRoot = Get-RepoRoot
 $StudioFsPath = Resolve-StudioFsCommand -Path $StudioFsPath -RepoRoot $repoRoot
