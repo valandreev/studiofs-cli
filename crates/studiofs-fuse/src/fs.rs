@@ -840,6 +840,102 @@ impl StudioFuseFs {
         })
     }
 
+    fn write_callback<R>(
+        &mut self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        flags: i32,
+        reply: R,
+    ) where
+        R: FuseWriteReply + Send + 'static,
+    {
+        let offset = match to_u64_offset(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let callback_started = Instant::now();
+        if self.async_write_enabled {
+            // TODO(SFS-465): Async writes must own the FUSE callback buffer.
+            // If this path graduates from experimental, replace per-write Vec
+            // allocation with a reusable buffer pool to reduce allocator churn.
+            let data_len = data.len();
+            let registration = match self.pending_writes.register_with_admission(
+                ino,
+                fh,
+                data_len,
+                self.async_write_admission_policy.limits,
+            ) {
+                Ok(registration) => registration,
+                Err(e) => {
+                    debug!(
+                        ino,
+                        fh,
+                        offset,
+                        bytes = data_len,
+                        error = ?e,
+                        "async FUSE write admission rejected"
+                    );
+                    reply.error(write_registration_error_to_errno(e));
+                    return;
+                }
+            };
+            trace!(
+                ino,
+                fh,
+                offset,
+                bytes = data_len,
+                sequence = registration.sequence(),
+                "async FUSE write scheduled"
+            );
+            let data = data.to_vec();
+            let vfs = Arc::clone(&self.vfs);
+            let local_sync_policy = fuse_write_local_sync_policy(flags);
+            let reply = FuseWriteReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                let mut registration = registration;
+                let turn = registration.turn_waiter();
+                turn.wait().await;
+                let result = vfs
+                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
+                    .await;
+                vfs.record_fuse_write_callback(
+                    data_len,
+                    callback_started.elapsed(),
+                    result.is_err(),
+                );
+                complete_fuse_write_reply(reply, result, &registration, ino, offset);
+            });
+            return;
+        }
+
+        let result = self
+            .rt
+            .block_on(self.vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                offset,
+                data,
+                fuse_write_local_sync_policy(flags),
+            ));
+        self.vfs.record_fuse_write_callback(
+            data.len(),
+            callback_started.elapsed(),
+            result.is_err(),
+        );
+        match result {
+            Ok(written) => reply.written(written),
+            Err(e) => {
+                error!("write({ino}, off={offset}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     fn publish_async_write_diagnostics_snapshot(
         vfs: &StudioVfs,
         enabled: bool,
@@ -1422,89 +1518,7 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
-        let callback_started = Instant::now();
-        if self.async_write_enabled {
-            // TODO(SFS-465): Async writes must own the FUSE callback buffer.
-            // If this path graduates from experimental, replace per-write Vec
-            // allocation with a reusable buffer pool to reduce allocator churn.
-            let data_len = data.len();
-            let registration = match self.pending_writes.register_with_admission(
-                ino,
-                fh,
-                data_len,
-                self.async_write_admission_policy.limits,
-            ) {
-                Ok(registration) => registration,
-                Err(e) => {
-                    debug!(
-                        ino,
-                        fh,
-                        offset,
-                        bytes = data_len,
-                        error = ?e,
-                        "async FUSE write admission rejected"
-                    );
-                    reply.error(write_registration_error_to_errno(e));
-                    return;
-                }
-            };
-            trace!(
-                ino,
-                fh,
-                offset,
-                bytes = data_len,
-                sequence = registration.sequence(),
-                "async FUSE write scheduled"
-            );
-            let data = data.to_vec();
-            let vfs = Arc::clone(&self.vfs);
-            let local_sync_policy = fuse_write_local_sync_policy(flags);
-            let reply = FuseWriteReplyGuard::new(reply);
-            self.rt.spawn(async move {
-                let mut registration = registration;
-                let turn = registration.turn_waiter();
-                turn.wait().await;
-                let result = vfs
-                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
-                    .await;
-                vfs.record_fuse_write_callback(
-                    data_len,
-                    callback_started.elapsed(),
-                    result.is_err(),
-                );
-                complete_fuse_write_reply(reply, result, &registration, ino, offset);
-            });
-            return;
-        }
-
-        let result = self
-            .rt
-            .block_on(self.vfs.write_fh_with_deferred_materialize(
-                fh,
-                ino,
-                offset,
-                data,
-                fuse_write_local_sync_policy(flags),
-            ));
-        self.vfs.record_fuse_write_callback(
-            data.len(),
-            callback_started.elapsed(),
-            result.is_err(),
-        );
-        match result {
-            Ok(written) => reply.written(written),
-            Err(e) => {
-                error!("write({ino}, off={offset}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-            }
-        }
+        self.write_callback(ino, fh, offset, data, flags, reply);
     }
 
     fn flush(
@@ -2340,7 +2354,7 @@ mod tests {
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
@@ -2349,6 +2363,33 @@ mod tests {
     use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+
+    #[derive(Clone, Default)]
+    struct TestWriteReply {
+        state: Arc<Mutex<TestWriteReplyState>>,
+    }
+
+    #[derive(Default)]
+    struct TestWriteReplyState {
+        written: Option<u32>,
+        error: Option<i32>,
+    }
+
+    impl TestWriteReply {
+        fn written_size(&self) -> Option<u32> {
+            self.state.lock().expect("test reply lock").written
+        }
+    }
+
+    impl super::FuseWriteReply for TestWriteReply {
+        fn written(self, size: u32) {
+            self.state.lock().expect("test reply lock").written = Some(size);
+        }
+
+        fn error(self, errno: i32) {
+            self.state.lock().expect("test reply lock").error = Some(errno);
+        }
+    }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("fuse-barrier-{volume_suffix}-{}", std::process::id());
@@ -2526,6 +2567,26 @@ mod tests {
         );
 
         assert!(fs.async_write_enabled);
+    }
+
+    #[test]
+    fn default_linux_write_callback_leaves_async_queue_idle() {
+        let (_tmp, _rt, vfs, mut fs) = make_test_fuse_fs("default-write-no-queue");
+        let attr = vfs
+            .create(1, b"default-write-no-queue.txt", 0, 0, 0o644)
+            .expect("create test file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open test file");
+        let reply = TestWriteReply::default();
+
+        fs.write_callback(attr.ino, fh, 0, b"abc", 0, reply.clone());
+
+        let snapshot = fs.pending_writes.snapshot();
+        assert_eq!(snapshot.pending_writes, 0);
+        assert_eq!(snapshot.pending_bytes, 0);
+        assert_eq!(snapshot.completed_writes, 0);
+        assert_eq!(reply.written_size(), Some(3));
     }
 
     #[test]
