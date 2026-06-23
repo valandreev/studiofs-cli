@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use lru::LruCache;
 use parking_lot::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::layout::{
@@ -26,10 +26,10 @@ use super::{LocalPayloadReadMode, LocalPayloadSyncMode, LocalPayloadWriteMode};
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
-#[cfg(not(test))]
-const READ_FD_CACHE_CAPACITY: usize = 2_048;
-#[cfg(test)]
-const READ_FD_CACHE_CAPACITY: usize = 16;
+const READ_FD_CACHE_MAX_CAPACITY: usize = 2_048;
+const READ_FD_CACHE_MIN_CAPACITY: usize = READ_FD_CACHE_SHARDS;
+const READ_FD_CACHE_FAMILIES: usize = 2;
+const READ_FD_CACHE_RESERVED_MIN: usize = 256;
 const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
 #[cfg(windows)]
@@ -138,28 +138,21 @@ impl FilePayloadStore {
     ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_objects_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
+        let read_fd_family_capacity = read_fd_cache_capacity();
+        let total_read_fd_capacity = read_fd_family_capacity * READ_FD_CACHE_FAMILIES;
+        debug!(
+            total_read_fd_capacity,
+            read_fd_family_capacity,
+            "local payload runtime read descriptor cache capacity selected"
+        );
         Ok(Self {
             layout,
             sync_mode,
             write_mode,
             read_mode,
             shared: Arc::new(PayloadStoreSharedState {
-                read_handles: ReadHandleCache {
-                    shards: array::from_fn(|_| {
-                        Mutex::new(LruCache::new(read_fd_cache_shard_cap()))
-                    }),
-                    hits: CachePaddedAtomicU64::new(0),
-                    misses: CachePaddedAtomicU64::new(0),
-                    evictions: CachePaddedAtomicU64::new(0),
-                },
-                buffered_read_fallback_handles: ReadHandleCache {
-                    shards: array::from_fn(|_| {
-                        Mutex::new(LruCache::new(read_fd_cache_shard_cap()))
-                    }),
-                    hits: CachePaddedAtomicU64::new(0),
-                    misses: CachePaddedAtomicU64::new(0),
-                    evictions: CachePaddedAtomicU64::new(0),
-                },
+                read_handles: ReadHandleCache::new(read_fd_family_capacity),
+                buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
                 unbuffered_read_scratch: Mutex::new(platform::UnbufferedReadBuffer::new()),
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
@@ -1177,7 +1170,28 @@ impl FilePayloadStore {
         }
 
         cache.misses.fetch_add(1, Ordering::Relaxed);
-        let file = Arc::new(opener(self, path)?);
+        let file = match opener(self, path) {
+            Ok(file) => file,
+            Err(first_error) if platform::is_too_many_open_files_error(&first_error) => {
+                let evicted = self.evict_cached_read_handles_under_pressure();
+                debug!(
+                    object_id,
+                    path = %path.display(),
+                    evicted,
+                    error = ?first_error,
+                    "local payload runtime read descriptor cache evicted entries after descriptor exhaustion"
+                );
+                if evicted == 0 {
+                    return Err(first_error);
+                }
+                match opener(self, path) {
+                    Ok(file) => file,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let file = Arc::new(file);
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
                 object_id,
@@ -1198,6 +1212,14 @@ impl FilePayloadStore {
             cache.evictions.fetch_add(1, Ordering::Relaxed);
         }
         Ok(file)
+    }
+
+    fn evict_cached_read_handles_under_pressure(&self) -> usize {
+        self.shared.read_handles.evict_under_pressure()
+            + self
+                .shared
+                .buffered_read_fallback_handles
+                .evict_under_pressure()
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
@@ -1356,6 +1378,11 @@ impl FilePayloadStore {
     }
 
     #[cfg(test)]
+    fn read_handle_family_capacity_for_test(&self) -> usize {
+        self.shared.read_handles.capacity()
+    }
+
+    #[cfg(test)]
     fn shared_state_arc_count_for_test(&self) -> usize {
         Arc::strong_count(&self.shared)
     }
@@ -1368,6 +1395,52 @@ struct ReadHandleCache {
     hits: CachePaddedAtomicU64,
     misses: CachePaddedAtomicU64,
     evictions: CachePaddedAtomicU64,
+}
+
+impl ReadHandleCache {
+    fn new(capacity: usize) -> Self {
+        let shard_cap = read_fd_cache_shard_cap(capacity);
+        Self {
+            shards: array::from_fn(|_| Mutex::new(LruCache::new(shard_cap))),
+            hits: CachePaddedAtomicU64::new(0),
+            misses: CachePaddedAtomicU64::new(0),
+            evictions: CachePaddedAtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().cap().get())
+            .sum()
+    }
+
+    fn evict_under_pressure(&self) -> usize {
+        let mut evicted = 0usize;
+        for shard in &self.shards {
+            let mut evicted_handles = Vec::new();
+            let mut handles = shard.lock();
+            if handles.is_empty() {
+                continue;
+            }
+            let target = (handles.len() / 2).max(1);
+            for _ in 0..target {
+                if let Some((_object_id, file)) = handles.pop_lru() {
+                    evicted_handles.push(file);
+                    evicted += 1;
+                } else {
+                    break;
+                }
+            }
+            drop(handles);
+            drop(evicted_handles);
+        }
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+        evicted
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1494,9 +1567,43 @@ struct ReadHandleStats {
     cached: usize,
 }
 
-fn read_fd_cache_shard_cap() -> NonZeroUsize {
-    let capacity = READ_FD_CACHE_CAPACITY.div_ceil(READ_FD_CACHE_SHARDS);
-    NonZeroUsize::new(capacity.max(1)).expect("READ_FD_CACHE_CAPACITY must be non-zero")
+fn read_fd_cache_capacity() -> usize {
+    #[cfg(test)]
+    {
+        READ_FD_CACHE_MIN_CAPACITY
+    }
+
+    #[cfg(all(not(test), windows))]
+    {
+        READ_FD_CACHE_MAX_CAPACITY
+    }
+
+    #[cfg(all(not(test), not(windows)))]
+    {
+        read_fd_cache_capacity_for_limit(platform::open_file_descriptor_limit())
+    }
+}
+
+fn read_fd_cache_capacity_for_limit(limit: Option<usize>) -> usize {
+    let raw_capacity = match limit {
+        Some(limit) => {
+            let reserve = READ_FD_CACHE_RESERVED_MIN.max(limit / 4);
+            limit.saturating_sub(reserve) / READ_FD_CACHE_FAMILIES
+        }
+        None => READ_FD_CACHE_MAX_CAPACITY,
+    }
+    .clamp(READ_FD_CACHE_MIN_CAPACITY, READ_FD_CACHE_MAX_CAPACITY);
+    read_fd_cache_round_family_capacity(raw_capacity)
+}
+
+fn read_fd_cache_round_family_capacity(family_capacity: usize) -> usize {
+    let shard_units = family_capacity / READ_FD_CACHE_SHARDS;
+    shard_units.max(1) * READ_FD_CACHE_SHARDS
+}
+
+fn read_fd_cache_shard_cap(family_capacity: usize) -> NonZeroUsize {
+    let capacity = family_capacity / READ_FD_CACHE_SHARDS;
+    NonZeroUsize::new(capacity.max(1)).expect("read FD cache shard capacity must be non-zero")
 }
 
 fn read_fd_shard_idx(object_id: u64) -> usize {
@@ -1599,6 +1706,30 @@ mod tests {
         *counter.get_mut() = 11;
 
         assert_eq!(counter.load(Ordering::Relaxed), 11);
+    }
+
+    #[test]
+    fn read_fd_cache_capacity_leaves_reserved_descriptors_at_default_unix_limit() {
+        let capacity = read_fd_cache_capacity_for_limit(Some(1024));
+
+        assert!(capacity <= 768);
+        assert_eq!(capacity % READ_FD_CACHE_SHARDS, 0);
+    }
+
+    #[test]
+    fn read_fd_cache_capacity_caps_high_limits() {
+        assert_eq!(
+            read_fd_cache_capacity_for_limit(Some(65_536)),
+            READ_FD_CACHE_MAX_CAPACITY
+        );
+    }
+
+    #[test]
+    fn read_fd_cache_capacity_keeps_minimum_for_low_limits() {
+        assert_eq!(
+            read_fd_cache_capacity_for_limit(Some(64)),
+            READ_FD_CACHE_MIN_CAPACITY
+        );
     }
 
     #[test]
@@ -1826,7 +1957,8 @@ mod tests {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
-        let capacity_to_fill = READ_FD_CACHE_CAPACITY.saturating_add(4);
+        let capacity = store.read_handle_family_capacity_for_test();
+        let capacity_to_fill = capacity.saturating_add(4);
 
         for object_id in 0..u64::try_from(capacity_to_fill).expect("cache capacity fits u64") {
             store.put(object_id, b"x").unwrap();
@@ -1835,8 +1967,89 @@ mod tests {
         }
 
         let stats = store.read_handle_stats();
-        assert_eq!(stats.cached, READ_FD_CACHE_CAPACITY);
+        assert_eq!(stats.cached, capacity);
         assert!(stats.evictions >= 1);
+    }
+
+    #[test]
+    fn emfile_retry_evicts_cached_descriptors_before_reopening() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        for object_id in 0..4 {
+            store.put(object_id, b"x").unwrap();
+            let mut out = [0_u8; 1];
+            assert_eq!(store.read_into(object_id, 0, &mut out), Some(1));
+        }
+        let cached_before = store.read_handle_stats().cached;
+        assert!(cached_before >= 4);
+
+        store.put(99, b"y").unwrap();
+        let path = store.layout.payload_object_path(99);
+        let mut attempts = 0usize;
+        let file = store
+            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, path| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(platform::too_many_open_files_error_for_test());
+                }
+                platform::open_read_only(path)
+            })
+            .unwrap();
+        drop(file);
+
+        assert_eq!(attempts, 2);
+        assert!(store.read_handle_stats().cached < cached_before + 1);
+    }
+
+    #[test]
+    fn descriptor_pressure_retry_skips_reopen_when_cache_is_empty() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        store.put(99, b"y").unwrap();
+        let path = store.layout.payload_object_path(99);
+        let mut attempts = 0usize;
+        let error = store
+            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
+                attempts += 1;
+                Err(platform::too_many_open_files_error_for_test())
+            })
+            .unwrap_err();
+
+        assert!(platform::is_too_many_open_files_error(&error));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn descriptor_pressure_retry_returns_second_open_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        for object_id in 0..4 {
+            store.put(object_id, b"x").unwrap();
+            let mut out = [0_u8; 1];
+            assert_eq!(store.read_into(object_id, 0, &mut out), Some(1));
+        }
+
+        store.put(99, b"y").unwrap();
+        let path = store.layout.payload_object_path(99);
+        let mut attempts = 0usize;
+        let error = store
+            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(platform::too_many_open_files_error_for_test());
+                }
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

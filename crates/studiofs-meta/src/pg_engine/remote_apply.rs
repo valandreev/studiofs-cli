@@ -1342,7 +1342,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let mut overlay = context.initial_overlay.clone();
-        let initial_overlay = overlay.clone();
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -1398,15 +1397,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
-        let final_dentry_overlay =
-            Self::merge_overlay_conflicts(&initial_overlay, &replay_protected_overlay);
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
             &reconcile_inodes,
             &final_overlay,
         )?;
         applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
             &reconcile_dentry_keys,
-            &final_dentry_overlay,
+            &final_overlay,
         )?;
         Ok(RemoteReplayApplyOutcome {
             changed: applied_any,

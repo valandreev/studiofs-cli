@@ -381,6 +381,51 @@ fn test_pg_flush_advances_checkpoint_version() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-monotonic");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open(&db).expect("open pg");
+    pg.local_version.store(10, Ordering::SeqCst);
+    pg.write_checkpoint_locked()
+        .expect("write newer checkpoint");
+    pg.local_version.store(5, Ordering::SeqCst);
+    pg.write_checkpoint_locked()
+        .expect("write stale checkpoint");
+
+    let version = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let row = client
+            .query_one(
+                "SELECT version FROM metadata_state WHERE vol=$1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        conn_task.abort();
+        Ok::<i64, MetaError>(row.get(0))
+    })
+    .expect("query checkpoint version");
+
+    assert_eq!(
+        version, 10,
+        "stale checkpoint writes must not move the remote metadata head backwards"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
     let Some(dsn) = pg_dsn() else {
         return;

@@ -1285,13 +1285,13 @@ mod tests {
         report.command.name = "studiofs bench".to_string();
         let mut first_read = op_report(3, 7 * 1024 * 1024, 100.0, 6.0);
         first_read.operations_log = vec![
-            read_operation("small", 1 * 1024 * 1024, 100.0),
+            read_operation("small", 1024 * 1024, 100.0),
             read_operation("medium", 2 * 1024 * 1024, 100.0),
             read_operation("large", 4 * 1024 * 1024, 100.0),
         ];
         let mut hot_read = op_report(3, 14 * 1024 * 1024, 200.0, 3.0);
         hot_read.operations_log = vec![
-            read_operation("small", 1 * 1024 * 1024, 50.0),
+            read_operation("small", 1024 * 1024, 50.0),
             read_operation("medium", 4 * 1024 * 1024, 50.0),
             read_operation("large", 9 * 1024 * 1024, 50.0),
         ];
