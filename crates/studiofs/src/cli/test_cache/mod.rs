@@ -238,6 +238,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         l1_limit,
         profile: profile.is_some(),
         full_file_reads,
+        write_path_gate: false,
         run_id: run_id.clone(),
     };
 

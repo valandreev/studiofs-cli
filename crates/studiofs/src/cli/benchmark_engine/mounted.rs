@@ -29,7 +29,8 @@ use super::result::{
     MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
     OpReport, PublicBenchDuringUploadReadReport, PublicBenchReadMetricsReport, PublicBenchReport,
     PublicBenchUploadDrainReport, PublicBenchWorkloadReport, PublicBenchWriteMetricsReport,
-    RuntimeStatsPhaseDeltaReport, SizeClassOpReport, benchmark_build_metadata,
+    RuntimeStatsPhaseDeltaReport, SizeClassOpReport, WritePathGateBacklogReport,
+    WritePathGateCounterDeltaReport, WritePathGateReport, benchmark_build_metadata,
     benchmark_command_metadata, benchmark_platform_metadata, missing_runtime_stats_report,
     runtime_stats_delta, runtime_stats_report,
 };
@@ -85,6 +86,7 @@ const SIZE_CLASS_SMALL: &str = "small";
 const SIZE_CLASS_MEDIUM: &str = "medium";
 const SIZE_CLASS_LARGE: &str = "large";
 const PHASE_DURING_UPLOAD_READ: &str = "during-upload-read";
+const PHASE_FIRST_READ: &str = "first-read";
 const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
 const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
 const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
@@ -1141,6 +1143,101 @@ fn build_mounted_write_diagnostics_report(
         local_cache_backend_io_total_ms_delta,
         hard_backpressure_events_delta,
         soft_throttle_events_delta,
+    }
+}
+
+fn mib_per_sec(report: &OpReport) -> f64 {
+    report.throughput_bytes_per_sec / (1024.0 * 1024.0)
+}
+
+fn first_read_phase_mib_per_sec(
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+) -> Option<f64> {
+    comparison
+        .and_then(|comparison| {
+            comparison
+                .phases
+                .iter()
+                .find(|phase| phase.phase == PHASE_FIRST_READ)
+        })
+        .map(|phase| mib_per_sec(&phase.results))
+}
+
+fn build_write_path_gate_report(
+    workload: &WorkloadPlan,
+    writes: &OpReport,
+    reads: &OpReport,
+    profile: Option<&BenchmarkProfileReport>,
+    portable_profile: Option<&MountedPortableProfileReport>,
+    diagnostics: Option<&MountedWriteDiagnosticsReport>,
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+) -> WritePathGateReport {
+    let cpu_percent = portable_profile
+        .and_then(|profile| profile.process.cpu_usage_percent_avg)
+        .or_else(|| profile.map(|profile| profile.cpu_profile.cpu_utilization_percent));
+    let write_phase_cpu_percent =
+        profile.map(|profile| profile.cpu_profile.write_phase_cpu_percent);
+    let read_phase_cpu_percent = profile.map(|profile| profile.cpu_profile.read_phase_cpu_percent);
+    let dirty_backlog = WritePathGateBacklogReport {
+        dirty_bytes_peak: diagnostics.and_then(|report| report.dirty_bytes_peak),
+        staged_bytes_peak: diagnostics.and_then(|report| report.staged_bytes_peak),
+        dirty_limit_bytes: diagnostics.and_then(|report| report.dirty_limit_bytes),
+        writer_stack_dirty_bytes_after: diagnostics
+            .and_then(|report| report.writer_stack_dirty_bytes_after),
+        pending_persisted_slice_bytes_after: diagnostics
+            .and_then(|report| report.pending_persisted_slice_bytes_after),
+        pending_upload_bytes_after: diagnostics
+            .and_then(|report| report.pending_upload_bytes_after),
+        cache_pressure_bytes_after: diagnostics
+            .and_then(|report| report.cache_pressure_bytes_after),
+        total_accounted_bytes_after: diagnostics
+            .and_then(|report| report.total_accounted_bytes_after),
+    };
+    let top_wait_counter_deltas = diagnostics
+        .map(|report| {
+            vec![
+                WritePathGateCounterDeltaReport {
+                    name: "hard_backpressure_events".to_string(),
+                    value: report.hard_backpressure_events_delta as f64,
+                    unit: "events".to_string(),
+                },
+                WritePathGateCounterDeltaReport {
+                    name: "soft_throttle_events".to_string(),
+                    value: report.soft_throttle_events_delta as f64,
+                    unit: "events".to_string(),
+                },
+                WritePathGateCounterDeltaReport {
+                    name: "payload_persist_calls".to_string(),
+                    value: report.payload_persist_calls_delta as f64,
+                    unit: "calls".to_string(),
+                },
+                WritePathGateCounterDeltaReport {
+                    name: "local_cache_io_calls".to_string(),
+                    value: report.local_cache_io_calls_delta as f64,
+                    unit: "calls".to_string(),
+                },
+                WritePathGateCounterDeltaReport {
+                    name: "local_cache_backend_io_total_ms".to_string(),
+                    value: report.local_cache_backend_io_total_ms_delta,
+                    unit: "ms".to_string(),
+                },
+            ]
+        })
+        .unwrap_or_default();
+
+    WritePathGateReport {
+        profile: "write-path-gate".to_string(),
+        workload_kind: "single_file_sequential".to_string(),
+        payload_file_count: workload.large_files,
+        payload_file_bytes: workload.sizes.iter().copied().max().unwrap_or_default(),
+        write_mib_per_sec: mib_per_sec(writes),
+        repeated_read_mib_per_sec: mib_per_sec(reads),
+        post_drain_warm_read_mib_per_sec: first_read_phase_mib_per_sec(comparison),
+        cpu_percent,
+        write_phase_cpu_percent,
+        read_phase_cpu_percent,
+        dirty_backlog,
+        top_wait_counter_deltas,
     }
 }
 
@@ -3259,6 +3356,17 @@ pub(crate) async fn run_mounted_end_to_end(
             measured_write_path_before_for_report.as_ref(),
             measured_write_path_after_for_report.as_ref(),
         ));
+        let write_path_gate = params.write_path_gate.then(|| {
+            build_write_path_gate_report(
+                &workload,
+                &writes_report,
+                &reads_report,
+                profile.as_ref(),
+                mounted_portable_profile.as_ref(),
+                mounted_write_diagnostics.as_ref(),
+                local_first_read_comparison.as_ref(),
+            )
+        });
         runtime_stats_warnings.extend(measured.runtime_stats_warnings);
         let runtime_stats_after = capture_runtime_stats_snapshot(
             &runtime_stats_path,
@@ -3336,6 +3444,7 @@ pub(crate) async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             public_bench,
+            write_path_gate,
             stream_results,
             mounted_memory,
             mounted_runtime,
@@ -3434,6 +3543,7 @@ mod tests {
             l1_limit: 64 * 1024 * 1024,
             profile: false,
             full_file_reads: false,
+            write_path_gate: false,
             run_id: "test-run".to_string(),
         }
     }

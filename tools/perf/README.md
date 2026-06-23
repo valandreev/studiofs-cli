@@ -11,6 +11,9 @@ studiofs bench <mountpoint> --report <path>
 machines, and exposes only the mount point plus optional `--report`. Use
 `studiofs devbench` when an investigation needs developer workload flags such
 as `--block-size`, `--big-file-size`, `--small-file-count`, or `--threads`.
+For SFS-549 Linux write-path evidence, use
+`studiofs devbench --profile write-path-gate`; the validation scripts pass the
+same profile through with `--profile write-path-gate`.
 First-read output from the public benchmark is not a guaranteed fully cold
 OS-cache measurement unless host cache state is controlled outside StudioFS.
 
@@ -36,6 +39,18 @@ implementation to keep Unix argument handling and artifact generation aligned.
 Those scripts write non-overwriting run directories under `target/perf` by
 calling `studiofs devbench --json-output`; see
 [`docs/perf/benchmark-validation.md`](../../docs/perf/benchmark-validation.md).
+
+Linux SFS-549 example:
+
+```bash
+bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate --big-file-size 8GB --block-size 4MB --threads 1
+```
+
+The generated `report.json` contains `write_path_gate` with
+`single_file_sequential`, `payload_file_count`, `write_mib_per_sec`,
+`repeated_read_mib_per_sec`, `post_drain_warm_read_mib_per_sec`, `cpu_percent`,
+`dirty_backlog`, and `top_wait_counter_deltas`. `fio is not required for the
+StudioFS side`.
 
 ## Scope
 

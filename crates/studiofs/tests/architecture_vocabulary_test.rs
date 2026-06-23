@@ -1277,6 +1277,21 @@ fn benchmark_validation_combined_text() -> &'static str {
     })
 }
 
+fn sfs549_write_path_gate_docs() -> &'static str {
+    static DOCS: OnceLock<String> = OnceLock::new();
+    DOCS.get_or_init(|| {
+        [
+            read_workspace_file("docs/perf/benchmark-validation.md"),
+            read_workspace_file("docs/perf/benchmark-methodology.md"),
+            read_workspace_file("docs/local-first-validation-matrix.md"),
+            read_workspace_file("tools/perf/README.md"),
+            read_workspace_file("tools/perf/validate-bench-unix.sh"),
+            read_workspace_file("tools/perf/validate-bench-windows.ps1"),
+        ]
+        .join("\n")
+    })
+}
+
 #[test]
 fn benchmark_validation_files_exist() {
     let missing_files: Vec<_> = benchmark_validation_required_files()
@@ -1288,6 +1303,38 @@ fn benchmark_validation_files_exist() {
         missing_files.is_empty(),
         "SFS-557 benchmark validation is missing files:\n{}",
         missing_files.join("\n")
+    );
+}
+
+#[test]
+fn benchmark_docs_cover_sfs549_write_path_gate() {
+    let docs = sfs549_write_path_gate_docs();
+    let normalized_docs = normalize_doc_whitespace(docs);
+    let required_terms = [
+        "SFS-549",
+        "studiofs devbench --profile write-path-gate",
+        "--profile write-path-gate",
+        "write_path_gate",
+        "single_file_sequential",
+        "payload_file_count",
+        "write_mib_per_sec",
+        "repeated_read_mib_per_sec",
+        "post_drain_warm_read_mib_per_sec",
+        "cpu_percent",
+        "dirty_backlog",
+        "top_wait_counter_deltas",
+        "fio is not required for the StudioFS side",
+        "validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate",
+    ];
+    let missing_terms: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(docs, &normalized_docs, term))
+        .collect();
+
+    assert!(
+        missing_terms.is_empty(),
+        "SFS-549 write-path gate docs are missing terms:\n{}",
+        missing_terms.join("\n")
     );
 }
 

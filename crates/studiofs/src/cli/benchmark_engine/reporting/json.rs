@@ -229,7 +229,8 @@ mod tests {
         MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, OpReport,
         PublicBenchDuringUploadReadReport, PublicBenchReadMetricsReport, PublicBenchReport,
         PublicBenchUploadDrainReport, PublicBenchWorkloadReport, PublicBenchWriteMetricsReport,
-        SizeClassOpReport, sample_report,
+        SizeClassOpReport, WritePathGateBacklogReport, WritePathGateCounterDeltaReport,
+        WritePathGateReport, sample_report,
     };
     use chrono::TimeZone;
 
@@ -727,6 +728,79 @@ mod tests {
         );
         assert_eq!(public_bench["upload_drain"]["observed_idle"], true);
         assert_eq!(public_bench["upload_drain"]["pending_uploads_after"], 0);
+    }
+
+    #[test]
+    fn save_benchmark_report_includes_write_path_gate_summary() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let mut report = sample_report();
+        report.command.name = "studiofs devbench".to_string();
+        report.workload_files = 1;
+        report.workload_small_files = 0;
+        report.workload_medium_files = 0;
+        report.workload_large_files = 1;
+        report.write_path_gate = Some(WritePathGateReport {
+            profile: "write-path-gate".to_string(),
+            workload_kind: "single_file_sequential".to_string(),
+            payload_file_count: 1,
+            payload_file_bytes: 8 * 1024 * 1024 * 1024,
+            write_mib_per_sec: 1024.0,
+            repeated_read_mib_per_sec: 900.0,
+            post_drain_warm_read_mib_per_sec: Some(950.0),
+            cpu_percent: Some(72.0),
+            write_phase_cpu_percent: Some(70.0),
+            read_phase_cpu_percent: Some(64.0),
+            dirty_backlog: WritePathGateBacklogReport {
+                dirty_bytes_peak: Some(256 * 1024 * 1024),
+                staged_bytes_peak: Some(128 * 1024 * 1024),
+                dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+                writer_stack_dirty_bytes_after: Some(0),
+                pending_persisted_slice_bytes_after: Some(0),
+                pending_upload_bytes_after: Some(0),
+                cache_pressure_bytes_after: Some(0),
+                total_accounted_bytes_after: Some(0),
+            },
+            top_wait_counter_deltas: vec![
+                WritePathGateCounterDeltaReport {
+                    name: "hard_backpressure_events".to_string(),
+                    value: 0.0,
+                    unit: "events".to_string(),
+                },
+                WritePathGateCounterDeltaReport {
+                    name: "local_cache_backend_io_total_ms".to_string(),
+                    value: 12.5,
+                    unit: "ms".to_string(),
+                },
+            ],
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 23, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("devbench-run.json")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let gate = &parsed["write_path_gate"];
+        assert_eq!(gate["profile"], "write-path-gate");
+        assert_eq!(gate["workload_kind"], "single_file_sequential");
+        assert_eq!(gate["payload_file_count"], 1);
+        assert_eq!(gate["write_mib_per_sec"], 1024.0);
+        assert_eq!(gate["repeated_read_mib_per_sec"], 900.0);
+        assert_eq!(gate["post_drain_warm_read_mib_per_sec"], 950.0);
+        assert_eq!(gate["cpu_percent"], 72.0);
+        assert_eq!(gate["dirty_backlog"]["pending_upload_bytes_after"], 0);
+        assert_eq!(
+            gate["top_wait_counter_deltas"][0]["name"],
+            "hard_backpressure_events"
+        );
     }
 
     #[test]

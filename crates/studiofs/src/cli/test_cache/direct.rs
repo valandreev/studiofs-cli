@@ -619,6 +619,7 @@ pub(super) async fn run_direct(
         profile,
         advanced_metrics: Some(advanced_metrics),
         public_bench: None,
+        write_path_gate: None,
         local_first_read_comparison: None,
         stream_results,
         mounted_memory: None,
