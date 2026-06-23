@@ -202,11 +202,11 @@ pub fn is_cross_device_link_error(error: &io::Error) -> bool {
     }
 }
 
-/// Returns `true` when the process has exhausted open file descriptors.
+/// Returns `true` when opening files failed due to descriptor exhaustion.
 pub fn is_too_many_open_files_error(error: &io::Error) -> bool {
     #[cfg(unix)]
     {
-        matches!(error.raw_os_error(), Some(libc::EMFILE))
+        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
     }
 
     #[cfg(windows)]
@@ -753,6 +753,18 @@ mod tests {
 
         let not_exdev = io::Error::from_raw_os_error(libc::EINVAL);
         assert!(!is_cross_device_link_error(&not_exdev));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_pressure_detection_matches_emfile_and_enfile() {
+        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        let enfile = io::Error::from_raw_os_error(libc::ENFILE);
+        let other = io::Error::from_raw_os_error(libc::EINVAL);
+
+        assert!(is_too_many_open_files_error(&emfile));
+        assert!(is_too_many_open_files_error(&enfile));
+        assert!(!is_too_many_open_files_error(&other));
     }
 
     #[cfg(windows)]

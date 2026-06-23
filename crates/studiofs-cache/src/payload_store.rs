@@ -1179,8 +1179,11 @@ impl FilePayloadStore {
                     path = %path.display(),
                     evicted,
                     error = ?first_error,
-                    "local payload runtime read descriptor cache evicted entries after EMFILE"
+                    "local payload runtime read descriptor cache evicted entries after descriptor exhaustion"
                 );
+                if evicted == 0 {
+                    return Err(first_error);
+                }
                 match opener(self, path) {
                     Ok(file) => file,
                     Err(_) => return Err(first_error),
@@ -1994,6 +1997,26 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert!(store.read_handle_stats().cached < cached_before + 1);
+    }
+
+    #[test]
+    fn descriptor_pressure_retry_skips_reopen_when_cache_is_empty() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        store.put(99, b"y").unwrap();
+        let path = store.layout.payload_object_path(99);
+        let mut attempts = 0usize;
+        let error = store
+            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
+                attempts += 1;
+                Err(platform::too_many_open_files_error_for_test())
+            })
+            .unwrap_err();
+
+        assert!(platform::is_too_many_open_files_error(&error));
+        assert_eq!(attempts, 1);
     }
 
     #[test]

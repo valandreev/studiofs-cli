@@ -39,7 +39,10 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
             WHEN EXCLUDED.version >= metadata_state.version THEN EXCLUDED.snapshot
             ELSE metadata_state.snapshot
         END,
-        updated_at = now()
+        updated_at = CASE
+            WHEN EXCLUDED.version >= metadata_state.version THEN now()
+            ELSE metadata_state.updated_at
+        END
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
