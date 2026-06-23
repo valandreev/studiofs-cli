@@ -1960,12 +1960,10 @@ impl StudioVfsAdapter {
         outcome_result: Result<ReleaseFhOutcome, i32>,
     ) -> Result<(), i32> {
         self.shared.read_windows.invalidate_handle(file_handle);
-        let outcome = outcome_result?;
-        if outcome.closed_last_handle
-            && let Some(released) = released_write_handle.filter(|released| released.last_for_inode)
-        {
+        if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
             self.clear_open_cache_snapshot(released.ino, "clean_write_release");
         }
+        outcome_result?;
         Ok(())
     }
 
@@ -2466,11 +2464,12 @@ fn current_gid() -> u32 {
 mod open_cache_snapshot_tests {
     use super::{
         MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        StudioVfsAdapter,
+        ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
     use std::sync::Arc;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
+    use studiofs_vfs::vfs::ReleaseFhOutcome;
 
     #[test]
     fn open_cache_snapshot_identity_includes_publication_state() {
@@ -2530,6 +2529,51 @@ mod open_cache_snapshot_tests {
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
             "the first read-only open after a write must drop kernel pages before cache can be kept"
+        );
+    }
+
+    #[test]
+    fn last_write_release_clears_snapshot_even_when_read_handle_remains_open() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-write-before-read-release")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                CONTRACT_ROOT_INO,
+                b"write-before-read-release.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, Vec::new());
+        let file_handle = 7;
+
+        adapter
+            .shared
+            .open_cache_snapshots
+            .lock()
+            .put(attr.ino, snapshot);
+        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+
+        adapter
+            .finish_release(
+                file_handle,
+                Some(ReleasedWriteCapableHandle {
+                    ino: attr.ino,
+                    last_for_inode: true,
+                }),
+                Ok(ReleaseFhOutcome {
+                    closed_last_handle: false,
+                    flushed_local_dirty_state: false,
+                }),
+            )
+            .expect("release should succeed");
+
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "last writer close must invalidate open-cache snapshots even while readers remain open"
         );
     }
 

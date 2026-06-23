@@ -938,14 +938,12 @@ fn runtime_stats_efficiency(
         cache_read_ops.value,
         "cache hit ops ratio",
         label,
-        &mut warnings,
     );
     let cache_hit_ratio_bytes = efficiency_ratio(
         cache_served_bytes.value,
         requested_bytes.value,
         "cache hit bytes ratio",
         label,
-        &mut warnings,
     );
     let os_cache_miss_read_ops = efficiency_counter(
         sections,
@@ -1118,7 +1116,6 @@ fn efficiency_ratio(
     denominator: Option<u64>,
     name: &str,
     label: &str,
-    _warnings: &mut Vec<String>,
 ) -> RuntimeStatsEfficiencyF64Report {
     match (numerator, denominator) {
         (Some(_), Some(0)) => efficiency_ratio_undefined(format!(
