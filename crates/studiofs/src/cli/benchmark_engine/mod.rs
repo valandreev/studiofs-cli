@@ -68,6 +68,7 @@ pub(crate) struct BenchmarkConfig {
     pub(crate) l1_limit: u64,
     pub(crate) profile: bool,
     pub(crate) full_file_reads: bool,
+    pub(crate) write_path_gate: bool,
     pub(crate) run_id: String,
 }
 

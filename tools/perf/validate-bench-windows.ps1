@@ -8,7 +8,8 @@ param(
     [string]$BigFileSize = "1GB",
     [string]$SmallFileSize = "128KB",
     [int]$SmallFileCount = 1000,
-    [int]$Threads = 4
+    [int]$Threads = 4,
+    [string]$Profile = ""
 )
 
 Set-StrictMode -Version Latest
@@ -180,6 +181,9 @@ if ($SmallFileCount -lt 1) {
 if ($Threads -lt 1) {
     throw "-Threads must be >= 1"
 }
+if ($Profile -eq "write-path-gate" -and -not $PSBoundParameters.ContainsKey("Threads")) {
+    $Threads = 1
+}
 
 $repoRoot = Get-RepoRoot
 $StudioFsPath = Resolve-StudioFsCommand -Path $StudioFsPath -RepoRoot $repoRoot
@@ -195,6 +199,7 @@ $settings = [ordered]@{
     small_file_size  = $SmallFileSize
     small_file_count = $SmallFileCount
     threads          = $Threads
+    profile          = $Profile
     run_count        = $Runs
 }
 $gitCommitResult = Invoke-OptionalCommand -FilePath "git" -CommandArguments @("-C", $repoRoot, "rev-parse", "HEAD")
@@ -228,11 +233,16 @@ for ($run = 1; $run -le $Runs; $run += 1) {
         $MountPoint,
         "--block-size", $BlockSize,
         "--big-file-size", $BigFileSize,
-        "--small-file-size", $SmallFileSize,
-        "--small-file-count", $SmallFileCount.ToString(),
         "--threads", $Threads.ToString(),
         "--json-output", $reportPath
     )
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+        $benchArgs += @("--profile", $Profile)
+    }
+    else {
+        $benchArgs += @("--small-file-size", $SmallFileSize)
+        $benchArgs += @("--small-file-count", $SmallFileCount.ToString())
+    }
     $commandLine = (Quote-CommandPart $StudioFsPath) + " " + (($benchArgs | ForEach-Object { Quote-CommandPart ([string]$_) }) -join " ")
     Write-Utf8NoBom -Path $commandPath -Value $commandLine
 

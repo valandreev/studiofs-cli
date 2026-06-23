@@ -1184,10 +1184,7 @@ impl FilePayloadStore {
                 if evicted == 0 {
                     return Err(first_error);
                 }
-                match opener(self, path) {
-                    Ok(file) => file,
-                    Err(error) => return Err(error),
-                }
+                opener(self, path)?
             }
             Err(error) => return Err(error),
         };

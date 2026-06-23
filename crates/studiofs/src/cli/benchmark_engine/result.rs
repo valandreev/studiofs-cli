@@ -78,6 +78,8 @@ pub(crate) struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) public_bench: Option<PublicBenchReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) write_path_gate: Option<WritePathGateReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_results: Option<Vec<StreamResultReport>>,
@@ -101,6 +103,53 @@ pub(crate) struct BenchmarkReport {
     pub(crate) cleanup: Option<OpReport>,
     pub(crate) writes: OpReport,
     pub(crate) reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WritePathGateReport {
+    pub(crate) profile: String,
+    pub(crate) workload_kind: String,
+    pub(crate) payload_file_count: usize,
+    pub(crate) payload_file_bytes: u64,
+    pub(crate) write_mib_per_sec: f64,
+    pub(crate) repeated_read_mib_per_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) post_drain_warm_read_mib_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) write_phase_cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_phase_cpu_percent: Option<f64>,
+    pub(crate) dirty_backlog: WritePathGateBacklogReport,
+    pub(crate) top_wait_counter_deltas: Vec<WritePathGateCounterDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WritePathGateBacklogReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dirty_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) staged_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dirty_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) writer_stack_dirty_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_persisted_slice_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_upload_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_pressure_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) total_accounted_bytes_after: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WritePathGateCounterDeltaReport {
+    pub(crate) name: String,
+    pub(crate) value: f64,
+    pub(crate) unit: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1672,6 +1721,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             }),
         }),
         public_bench: None,
+        write_path_gate: None,
         local_first_read_comparison: None,
         stream_results: None,
         mounted_memory: None,

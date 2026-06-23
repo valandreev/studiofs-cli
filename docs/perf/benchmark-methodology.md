@@ -117,6 +117,17 @@ explicit workload knobs:
 studiofs devbench /mnt/studio/myvolume --block-size 4MB --big-file-size 1GB --threads 4
 ```
 
+For SFS-549 Linux write-path changes, use the dedicated one-file gate instead
+of making fio mandatory for the StudioFS side:
+
+```sh
+studiofs devbench --profile write-path-gate /mnt/studio/myvolume --block-size 4MB --big-file-size 8GB --threads 1
+```
+
+The `write_path_gate` JSON summary records the `single_file_sequential`
+workload, `payload_file_count`, write and repeated-read MiB/s, post-drain warm
+read MiB/s, CPU percent, dirty backlog, and top wait/counter deltas.
+
 Compare developer runs only when the same workload shape is preserved:
 
 - block size and read size

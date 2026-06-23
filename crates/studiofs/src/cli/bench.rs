@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,6 +50,10 @@ pub(crate) struct DevbenchArgs {
     /// Mounted StudioFS path to benchmark.
     pub(crate) mountpoint: PathBuf,
 
+    /// Developer benchmark workload profile.
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<DevbenchProfile>,
+
     /// I/O block size used for large sequential file chunks.
     #[arg(long, default_value = DEFAULT_BENCH_BLOCK_SIZE)]
     pub(crate) block_size: String,
@@ -83,6 +87,12 @@ pub(crate) struct DevbenchArgs {
     /// other paths are treated as explicit files.
     #[arg(long)]
     pub(crate) json_output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum DevbenchProfile {
+    /// SFS-549 one-large-file Linux write-path evidence gate.
+    WritePathGate,
 }
 
 impl DevbenchArgs {
@@ -153,30 +163,35 @@ fn build_bench_config(
     if args.threads > MAX_BENCH_THREADS {
         return Err(anyhow!("--threads must be <= {MAX_BENCH_THREADS}"));
     }
-    if args.small_file_count == 0 {
-        return Err(anyhow!("--small-file-count must be >= 1"));
-    }
-    if args.small_file_count > MAX_BENCH_SMALL_FILE_COUNT {
-        return Err(anyhow!(
-            "--small-file-count must be <= {MAX_BENCH_SMALL_FILE_COUNT}"
-        ));
-    }
 
     let block_size = parse_size_arg("block-size", &args.block_size)?;
     let big_file_size = parse_size_arg("big-file-size", &args.big_file_size)?;
-    let small_file_size = parse_size_arg("small-file-size", &args.small_file_size)?;
-    if big_file_size <= small_file_size {
-        return Err(anyhow!(
-            "--big-file-size must be greater than --small-file-size"
-        ));
-    }
-    let mut sizes = Vec::with_capacity(args.small_file_count.saturating_add(1));
-    sizes.push(big_file_size);
-    sizes.extend(std::iter::repeat_n(small_file_size, args.small_file_count));
-    let size_class_small_max = small_file_size.max(DEFAULT_SMALL_CLASS_MAX_BYTES);
-    let size_class_medium_max = block_size
-        .max(small_file_size.saturating_add(1))
-        .max(size_class_small_max.saturating_add(1));
+    let (sizes, size_class_small_max) = match args.profile {
+        Some(DevbenchProfile::WritePathGate) => {
+            (vec![big_file_size], DEFAULT_SMALL_CLASS_MAX_BYTES)
+        }
+        None => {
+            if args.small_file_count == 0 {
+                return Err(anyhow!("--small-file-count must be >= 1"));
+            }
+            if args.small_file_count > MAX_BENCH_SMALL_FILE_COUNT {
+                return Err(anyhow!(
+                    "--small-file-count must be <= {MAX_BENCH_SMALL_FILE_COUNT}"
+                ));
+            }
+            let small_file_size = parse_size_arg("small-file-size", &args.small_file_size)?;
+            if big_file_size <= small_file_size {
+                return Err(anyhow!(
+                    "--big-file-size must be greater than --small-file-size"
+                ));
+            }
+            let mut sizes = Vec::with_capacity(args.small_file_count.saturating_add(1));
+            sizes.push(big_file_size);
+            sizes.extend(std::iter::repeat_n(small_file_size, args.small_file_count));
+            (sizes, small_file_size.max(DEFAULT_SMALL_CLASS_MAX_BYTES))
+        }
+    };
+    let size_class_medium_max = block_size.max(size_class_small_max.saturating_add(1));
 
     Ok(BenchmarkConfig {
         command_name,
@@ -197,6 +212,7 @@ fn build_bench_config(
         l1_limit: DEFAULT_MEMORY_CACHE_SIZE,
         profile: false,
         full_file_reads: true,
+        write_path_gate: args.profile == Some(DevbenchProfile::WritePathGate),
         run_id,
     })
 }
@@ -223,6 +239,7 @@ fn build_public_bench_config(args: &BenchArgs, run_id: String) -> BenchmarkConfi
         l1_limit: DEFAULT_MEMORY_CACHE_SIZE,
         profile: false,
         full_file_reads: false,
+        write_path_gate: false,
         run_id,
     }
 }
@@ -471,6 +488,7 @@ mod tests {
     fn bench_config_plans_one_large_file_and_requested_small_files() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "2GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -495,6 +513,60 @@ mod tests {
                 );
             }
             other => panic!("expected explicit bench workload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_config_write_path_gate_plans_single_large_file_workload() {
+        let args = DevbenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            profile: Some(DevbenchProfile::WritePathGate),
+            block_size: "4MB".to_string(),
+            big_file_size: "8GB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 100,
+            threads: 1,
+            json_output: None,
+        };
+
+        let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
+
+        assert_eq!(config.command_name, "studiofs devbench");
+        assert_eq!(config.block_size, 4 * 1024 * 1024);
+        assert_eq!(config.read_size, 4 * 1024 * 1024);
+        assert_eq!(config.concurrency, 1);
+        assert_eq!(config.io_depth, 1);
+        assert!(config.sequential_streams);
+        assert!(config.full_file_reads);
+        assert_eq!(config.access_pattern, BenchmarkAccessPattern::Sequential);
+        match config.sizes {
+            WorkloadSizeInput::ExplicitList(sizes) => {
+                assert_eq!(sizes, vec![8 * 1024 * 1024 * 1024]);
+            }
+            other => panic!("expected single-file write-path gate workload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_config_write_path_gate_ignores_small_file_shape_options() {
+        let args = DevbenchArgs {
+            mountpoint: PathBuf::from("Z:\\"),
+            profile: Some(DevbenchProfile::WritePathGate),
+            block_size: "4MB".to_string(),
+            big_file_size: "64KB".to_string(),
+            small_file_size: "128KB".to_string(),
+            small_file_count: 0,
+            threads: 1,
+            json_output: None,
+        };
+
+        let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
+
+        match config.sizes {
+            WorkloadSizeInput::ExplicitList(sizes) => {
+                assert_eq!(sizes, vec![64 * 1024]);
+            }
+            other => panic!("expected single-file write-path gate workload, got {other:?}"),
         }
     }
 
@@ -547,6 +619,7 @@ mod tests {
     fn bench_config_keeps_medium_class_above_small_class_for_tiny_files() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4KB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "2KB".to_string(),
@@ -565,6 +638,7 @@ mod tests {
     fn bench_config_rejects_zero_threads() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -582,6 +656,7 @@ mod tests {
     fn bench_config_rejects_excessive_threads() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -599,6 +674,7 @@ mod tests {
     fn bench_config_rejects_zero_small_file_count() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -616,6 +692,7 @@ mod tests {
     fn bench_config_rejects_big_file_size_not_greater_than_small_file_size() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "128KB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -636,6 +713,7 @@ mod tests {
     fn bench_config_allows_block_size_larger_than_big_file_size() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "2GB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -653,6 +731,7 @@ mod tests {
     fn bench_config_rejects_excessive_small_file_count() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4MB".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),
@@ -673,6 +752,7 @@ mod tests {
     fn bench_config_rejects_invalid_size_arg() {
         let args = DevbenchArgs {
             mountpoint: PathBuf::from("Z:\\"),
+            profile: None,
             block_size: "4not-a-size".to_string(),
             big_file_size: "1GB".to_string(),
             small_file_size: "128KB".to_string(),

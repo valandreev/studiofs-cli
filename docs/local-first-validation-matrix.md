@@ -429,6 +429,24 @@ post-drain warm-read throughput when upload-drain waiting is enabled,
 dirty/staged/upload backlog, and CPU sampling. Treat missing JuiceFS numbers as
 an incomplete performance report rather than a pass.
 
+### SFS-549 Linux Write-Path Evidence Gate
+
+For each Linux write-path implementation change, collect StudioFS evidence with
+`studiofs devbench --profile write-path-gate` and archive it under `target/perf`
+with the validation script:
+
+```bash
+bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate --big-file-size 8GB --block-size 4MB --threads 1
+```
+
+The gate uses the `single_file_sequential` workload with `payload_file_count`
+set to `1`. The parsed `write_path_gate` JSON section must include
+`write_mib_per_sec`, `repeated_read_mib_per_sec`,
+`post_drain_warm_read_mib_per_sec`, `cpu_percent`, `dirty_backlog`, and
+`top_wait_counter_deltas`. `fio is not required for the StudioFS side`; keep it
+only as an optional external comparator for JuiceFS or raw filesystem baselines
+when those mounts cannot be measured with StudioFS tooling.
+
 ### SFS-301 Final Mounted Parity Notes
 
 For `SFS-301`, initialize a fresh StudioFS validation volume with the current

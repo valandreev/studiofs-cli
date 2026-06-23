@@ -249,6 +249,7 @@ mod tests {
         match cli.command {
             Commands::Devbench(bench::DevbenchArgs {
                 mountpoint,
+                profile,
                 block_size,
                 big_file_size,
                 small_file_size,
@@ -257,6 +258,7 @@ mod tests {
                 json_output,
             }) => {
                 assert_eq!(mountpoint, std::path::PathBuf::from("Z:\\"));
+                assert_eq!(profile, None);
                 assert_eq!(block_size, "4MB");
                 assert_eq!(big_file_size, "2GB");
                 assert_eq!(small_file_size, "128KB");
@@ -266,6 +268,18 @@ mod tests {
                     json_output,
                     Some(std::path::PathBuf::from("reports/bench.json"))
                 );
+            }
+            other => panic!("expected Devbench command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn devbench_command_parses_write_path_gate_profile() {
+        let cli = parse_for_test(&["devbench", "Z:\\", "--profile", "write-path-gate"]).unwrap();
+
+        match cli.command {
+            Commands::Devbench(bench::DevbenchArgs { profile, .. }) => {
+                assert_eq!(profile, Some(bench::DevbenchProfile::WritePathGate));
             }
             other => panic!("expected Devbench command, got {other:?}"),
         }

@@ -10,6 +10,8 @@ big_file_size="1GB"
 small_file_size="128KB"
 small_file_count=1000
 threads=4
+threads_was_set=false
+profile=""
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
@@ -43,6 +45,7 @@ Options:
   --small-file-size <size> Defaults to 128KB.
   --small-file-count <n>  Defaults to 1000.
   --threads <n>           Defaults to 4.
+  --profile <name>        Optional devbench profile, for example write-path-gate.
 USAGE
 }
 
@@ -137,6 +140,12 @@ while [[ $# -gt 0 ]]; do
     --threads)
       require_value "$1" "${2:-}" "a positive integer"
       threads="$2"
+      threads_was_set=true
+      shift 2
+      ;;
+    --profile)
+      require_value "$1" "${2:-}" "a profile name"
+      profile="$2"
       shift 2
       ;;
     -h|--help) usage; exit 0 ;;
@@ -148,6 +157,9 @@ if [[ -z "$mount_point" ]]; then
   echo "--mount-point is required" >&2
   usage >&2
   exit 2
+fi
+if [[ "$profile" == "write-path-gate" && "$threads_was_set" == false ]]; then
+  threads=1
 fi
 runs="$(normalize_positive_int "--runs" "$runs")"
 small_file_count="$(normalize_positive_int "--small-file-count" "$small_file_count")"
@@ -195,6 +207,7 @@ escaped_mount_point="$(json_escape "$mount_point")"
 escaped_block_size="$(json_escape "$block_size")"
 escaped_big_file_size="$(json_escape "$big_file_size")"
 escaped_small_file_size="$(json_escape "$small_file_size")"
+escaped_profile="$(json_escape "$profile")"
 escaped_platform="$(json_escape "$platform")"
 escaped_git_commit_json="null"
 if [[ -n "$git_commit" ]]; then
@@ -218,6 +231,7 @@ cat > "$validation_dir/environment.json" <<JSON
     "small_file_size": "$escaped_small_file_size",
     "small_file_count": $small_file_count,
     "threads": $threads,
+    "profile": "$escaped_profile",
     "run_count": $runs
   },
   "artifact_layout_note": "Do not overwrite previous benchmark artifacts"
@@ -235,11 +249,15 @@ for ((run=1; run<=runs; run++)); do
     "$studiofs_path" devbench "$mount_point"
     --block-size "$block_size"
     --big-file-size "$big_file_size"
-    --small-file-size "$small_file_size"
-    --small-file-count "$small_file_count"
     --threads "$threads"
     --json-output "$report_path"
   )
+  if [[ -n "$profile" ]]; then
+    cmd+=(--profile "$profile")
+  else
+    cmd+=(--small-file-size "$small_file_size")
+    cmd+=(--small-file-count "$small_file_count")
+  fi
   printf '%q ' "${cmd[@]}" > "$command_path"
   printf '\n' >> "$command_path"
   echo "Starting benchmark run $run of $runs..."
