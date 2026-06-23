@@ -874,6 +874,8 @@ pub(crate) fn runtime_stats_delta(
             runtime_stats_section_delta(label, name, before_section, after_section, &mut warnings),
         );
     }
+    let efficiency = runtime_stats_efficiency(label, &sections);
+    warnings.extend(efficiency.warnings.iter().cloned());
     RuntimeStatsDeltaReport {
         schema_version_before: before.schema_version,
         schema_version_after: after.schema_version,
@@ -881,7 +883,7 @@ pub(crate) fn runtime_stats_delta(
             .generated_unix_ms
             .saturating_sub(before.generated_unix_ms),
         warnings,
-        efficiency: runtime_stats_efficiency(label, &sections),
+        efficiency,
         sections,
     }
 }
@@ -1116,7 +1118,7 @@ fn efficiency_ratio(
     denominator: Option<u64>,
     name: &str,
     label: &str,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> RuntimeStatsEfficiencyF64Report {
     match (numerator, denominator) {
         (Some(_), Some(0)) => efficiency_ratio_undefined(format!(
@@ -1132,7 +1134,6 @@ fn efficiency_ratio(
             let warning = format!(
                 "runtime stats cannot compute {name} during {label} because one or more source counters are unavailable"
             );
-            warnings.push(warning.clone());
             RuntimeStatsEfficiencyF64Report {
                 available: false,
                 value: None,
@@ -2184,6 +2185,25 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("cache.hit_bytes"))
+        );
+        assert!(
+            delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cache.hit_bytes"))
+        );
+        assert!(
+            !delta
+                .efficiency
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cache hit bytes ratio"))
+        );
+        assert!(
+            !delta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cache hit bytes ratio"))
         );
         assert!(!delta.efficiency.s3_refill.bytes.available);
         assert_eq!(delta.efficiency.s3_refill.bytes.value, None);
