@@ -1186,7 +1186,7 @@ impl FilePayloadStore {
                 }
                 match opener(self, path) {
                     Ok(file) => file,
-                    Err(_) => return Err(first_error),
+                    Err(error) => return Err(error),
                 }
             }
             Err(error) => return Err(error),
@@ -1419,18 +1419,22 @@ impl ReadHandleCache {
     fn evict_under_pressure(&self) -> usize {
         let mut evicted = 0usize;
         for shard in &self.shards {
+            let mut evicted_handles = Vec::new();
             let mut handles = shard.lock();
             if handles.is_empty() {
                 continue;
             }
             let target = (handles.len() / 2).max(1);
             for _ in 0..target {
-                if handles.pop_lru().is_some() {
+                if let Some((_object_id, file)) = handles.pop_lru() {
+                    evicted_handles.push(file);
                     evicted += 1;
                 } else {
                     break;
                 }
             }
+            drop(handles);
+            drop(evicted_handles);
         }
         if evicted > 0 {
             self.evictions.fetch_add(evicted as u64, Ordering::Relaxed);
@@ -2017,6 +2021,35 @@ mod tests {
 
         assert!(platform::is_too_many_open_files_error(&error));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn descriptor_pressure_retry_returns_second_open_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        for object_id in 0..4 {
+            store.put(object_id, b"x").unwrap();
+            let mut out = [0_u8; 1];
+            assert_eq!(store.read_into(object_id, 0, &mut out), Some(1));
+        }
+
+        store.put(99, b"y").unwrap();
+        let path = store.layout.payload_object_path(99);
+        let mut attempts = 0usize;
+        let error = store
+            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(platform::too_many_open_files_error_for_test());
+                }
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
