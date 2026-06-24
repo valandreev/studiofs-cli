@@ -5993,20 +5993,70 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 }
 
 #[test]
-fn write_buffer_admission_paces_like_juicefs_memory_window() {
-    assert_eq!(write_buffer_admission_delay_ms(300, 300), None);
-    assert_eq!(
-        write_buffer_admission_delay_ms(800 * 1024 * 1024 + 1, 800 * 1024 * 1024),
-        Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
-    );
-    assert_eq!(
-        write_buffer_admission_delay_ms(1600 * 1024 * 1024 + 1, 800 * 1024 * 1024),
-        Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)
-    );
+fn write_admission_admits_until_hard_window_without_pacing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-buffer-window");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-admits-buffer-window.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; buffer_budget_bytes + 1]),
+            )
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            vfs.maybe_throttle_write_admission(1),
+        )
+        .await
+        .expect("admission should not sleep below the hard window");
+        assert_eq!(
+            vfs.state
+                .metrics
+                .drain_lag_pacing_events
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
 }
 
 #[test]
-fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
+fn write_admission_admits_oversized_write_when_pressure_is_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-oversized-write");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
+        )
+        .await
+        .expect("empty pressure should admit a single oversized write");
+    });
+}
+
+#[test]
+fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-waits-hard-window");
     let _guard = rt.enter();
@@ -6035,17 +6085,31 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
         let admission_vfs = Arc::clone(&vfs);
         let wait_task =
             tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
-        tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_DELAY_MS + 20)).await;
+        tokio::time::sleep(Duration::from_millis(
+            WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
+        ))
+        .await;
         assert!(
             !wait_task.is_finished(),
-            "admission should keep waiting while writer-stack pressure remains above 2x the buffer budget"
+            "admission should keep waiting while total pressure remains above the hard window"
         );
 
         vfs.state.writer_stack.clear_inode(attr.ino);
-        tokio::time::timeout(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2), wait_task)
-            .await
-            .expect("admission should unblock after writer-stack pressure drops")
-            .expect("admission task should not panic");
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
+            wait_task,
+        )
+        .await
+        .expect("admission should unblock after writer-stack pressure drops")
+        .expect("admission task should not panic");
+        assert_eq!(
+            vfs.state
+                .metrics
+                .drain_lag_pacing_events
+                .load(Ordering::Relaxed),
+            1,
+            "hard admission wait should be recorded as one stall event"
+        );
 
         vfs.release_fh(fh).await.unwrap();
     });

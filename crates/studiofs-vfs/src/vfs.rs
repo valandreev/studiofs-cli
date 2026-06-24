@@ -206,12 +206,9 @@ const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 4_000;
-const WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER: usize = 16;
-const WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER: usize = 64;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 20;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
-const WRITE_ADMISSION_BUFFER_DELAY_MS: u64 = 10;
-const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 100;
+const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
 const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
@@ -2826,19 +2823,6 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
         .max(1)
 }
 
-fn write_buffer_admission_delay_ms(
-    writer_stack_dirty_bytes: usize,
-    buffer_budget_bytes: usize,
-) -> Option<u64> {
-    if buffer_budget_bytes == 0 || writer_stack_dirty_bytes <= buffer_budget_bytes {
-        return None;
-    }
-    if writer_stack_dirty_bytes > buffer_budget_bytes.saturating_mul(2) {
-        return Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS);
-    }
-    Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
-}
-
 #[cfg(test)]
 fn soft_dirty_budget_pacing_delay_ms(
     total_dirty_bytes: usize,
@@ -3220,6 +3204,11 @@ impl StudioVfs {
         {
             let _ = writeln!(file, "{payload}");
         }
+    }
+
+    fn write_debug_enabled(&self) -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some())
     }
     // #endregion debug log
 
@@ -6143,18 +6132,6 @@ impl StudioVfs {
             });
     }
 
-    fn write_admission_budget_bytes(&self) -> usize {
-        let dirty_window = self
-            .max_dirty_bytes()
-            .saturating_mul(WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER);
-        let eager_window = self
-            .write_eager_flush_batch_bytes
-            .saturating_mul(WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER);
-        dirty_window
-            .max(eager_window)
-            .max(self.block_size.max(1) as usize)
-    }
-
     fn write_admission_buffer_budget_bytes(&self) -> usize {
         self.max_dirty_bytes().max(self.block_size.max(1) as usize)
     }
@@ -6189,70 +6166,53 @@ impl StudioVfs {
     }
 
     async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
-        if next_bytes == 0 {
+        if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
 
-        let pressure = self.write_admission_pressure();
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let writer_stack_dirty_with_next =
-            pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);
-        if write_buffer_admission_delay_ms(writer_stack_dirty_with_next, buffer_budget_bytes)
-            .is_some()
-        {
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                concat!(file!(), ":", line!()),
-                "write admission buffer pacing",
-                serde_json::json!({
-                    "delay_ms": WRITE_ADMISSION_BUFFER_DELAY_MS,
-                    "writer_stack_dirty_bytes": pressure.writer_stack_dirty_bytes,
-                    "buffer_budget_bytes": buffer_budget_bytes,
-                    "next_bytes": next_bytes,
-                }),
-            );
-            // #endregion debug log
-
-            let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_DELAY_MS)).await;
-            self.record_write_admission_wait(started.elapsed());
+        let mut pressure_bytes = self.total_write_admission_pressure_bytes();
+        if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
+            return;
         }
-        while self
-            .state
-            .writer_stack
-            .total_dirty_bytes()
-            .saturating_add(next_bytes)
-            > buffer_budget_bytes.saturating_mul(2)
-            && !self.shutdown_requested()
-        {
+
+        let hard_window_bytes =
+            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
+        let mut hard_wait_started = None;
+        while pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
+            hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
-            self.debug_write_probe(
-                "H1",
-                concat!(file!(), ":", line!()),
-                "write admission buffer hard pacing",
-                serde_json::json!({
-                    "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
-                    "writer_stack_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                    "buffer_budget_bytes": buffer_budget_bytes,
-                    "next_bytes": next_bytes,
-                }),
-            );
+            if self.write_debug_enabled() {
+                self.debug_write_probe(
+                    "H1",
+                    concat!(file!(), ":", line!()),
+                    "write admission buffer hard pacing",
+                    serde_json::json!({
+                        "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
+                        "pressure_bytes": pressure_bytes,
+                        "buffer_budget_bytes": buffer_budget_bytes,
+                        "hard_window_bytes": hard_window_bytes,
+                        "next_bytes": next_bytes,
+                    }),
+                );
+            }
             // #endregion debug log
 
-            let started = Instant::now();
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
+            pressure_bytes = self.total_write_admission_pressure_bytes();
+        }
+        if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
+            self.state.write_admission_governor.lock().reset_stats();
+            return;
         }
 
-        let pressure_bytes = self.total_write_admission_pressure_bytes();
-        let budget_bytes = self.write_admission_budget_bytes();
         let decision = {
             let mut governor = self.state.write_admission_governor.lock();
             governor.plan(WriteAdmissionSample {
                 now_ms: now_unix_millis(),
                 pressure_bytes,
-                budget_bytes,
+                budget_bytes: buffer_budget_bytes,
                 next_bytes,
             })
         };
@@ -6260,22 +6220,27 @@ impl StudioVfs {
             return;
         }
         // #region debug log
-        self.debug_write_probe(
-            "H2",
-            concat!(file!(), ":", line!()),
-            "write admission governor pacing",
-            serde_json::json!({
-                "delay_ms": decision.delay_ms,
-                "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
-                "drain_bytes_per_sec": decision.drain_bytes_per_sec,
-                "runway_ms": decision.runway_ms,
-                "pressure_bytes": pressure_bytes,
-                "budget_bytes": budget_bytes,
-                "next_bytes": next_bytes,
-            }),
-        );
+        if self.write_debug_enabled() {
+            self.debug_write_probe(
+                "H2",
+                concat!(file!(), ":", line!()),
+                "write admission governor pacing",
+                serde_json::json!({
+                    "delay_ms": decision.delay_ms,
+                    "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
+                    "drain_bytes_per_sec": decision.drain_bytes_per_sec,
+                    "runway_ms": decision.runway_ms,
+                    "pressure_bytes": pressure_bytes,
+                    "budget_bytes": buffer_budget_bytes,
+                    "next_bytes": next_bytes,
+                }),
+            );
+        }
         // #endregion debug log
 
+        if self.shutdown_requested() {
+            return;
+        }
         let started = Instant::now();
         tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
         self.record_write_admission_wait(started.elapsed());
