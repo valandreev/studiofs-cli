@@ -6,16 +6,20 @@ use studiofs_meta::types::{Ino, InodeAttr};
 
 use super::{OpenFile, OpenFlags};
 
+#[derive(Debug, Default)]
+struct HandleCounts {
+    open: u32,
+    write: u32,
+}
+
 /// Per-VFS handle table tracking all open file descriptors.
 pub(super) struct HandleTable {
     /// Monotonically increasing file handle counter.
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
     handles: RwLock<HashMap<u64, OpenFile>>,
-    /// Inode -> number of currently open file descriptors.
-    open_counts: Mutex<HashMap<Ino, u32>>,
-    /// Inode -> number of currently open write-capable file descriptors.
-    write_open_counts: Mutex<HashMap<Ino, u32>>,
+    /// Inode -> currently open file descriptor counters.
+    counts: Mutex<HashMap<Ino, HandleCounts>>,
     /// Inodes that were unlinked while still open (deferred deletion).
     orphans: Mutex<HashSet<Ino>>,
 }
@@ -25,8 +29,7 @@ impl HandleTable {
         Self {
             next_fh: AtomicU64::new(1),
             handles: RwLock::new(HashMap::new()),
-            open_counts: Mutex::new(HashMap::new()),
-            write_open_counts: Mutex::new(HashMap::new()),
+            counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
     }
@@ -46,9 +49,11 @@ impl HandleTable {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         self.handles.write().insert(fh, open_file.clone());
-        *self.open_counts.lock().entry(ino).or_insert(0) += 1;
+        let mut counts = self.counts.lock();
+        let counts = counts.entry(ino).or_default();
+        counts.open = counts.open.saturating_add(1);
         if Self::flags_allow_write(flags) {
-            *self.write_open_counts.lock().entry(ino).or_insert(0) += 1;
+            counts.write = counts.write.saturating_add(1);
         }
         open_file
     }
@@ -61,37 +66,38 @@ impl HandleTable {
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
         let open_file = self.handles.write().remove(&fh)?;
-        let mut counts = self.open_counts.lock();
-        let count = counts.get_mut(&open_file.ino)?;
-        *count = count.saturating_sub(1);
-        let remaining = *count;
-        if remaining == 0 {
-            counts.remove(&open_file.ino);
-        }
+        let mut counts = self.counts.lock();
+        let counts_for_inode = counts.get_mut(&open_file.ino)?;
+        counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
         if Self::flags_allow_write(open_file.flags) {
-            let mut write_counts = self.write_open_counts.lock();
-            let Some(write_count) = write_counts.get_mut(&open_file.ino) else {
-                return Some((open_file, remaining));
-            };
-            *write_count = write_count.saturating_sub(1);
-            if *write_count == 0 {
-                write_counts.remove(&open_file.ino);
-            }
+            debug_assert!(
+                counts_for_inode.write > 0,
+                "write-capable handle closed without write-open count"
+            );
+            counts_for_inode.write = counts_for_inode.write.saturating_sub(1);
+        }
+        let remaining = counts_for_inode.open;
+        if counts_for_inode.open == 0 {
+            counts.remove(&open_file.ino);
         }
         Some((open_file, remaining))
     }
 
     /// Get the number of open handles for an inode.
     pub(super) fn open_count(&self, ino: Ino) -> u32 {
-        self.open_counts.lock().get(&ino).copied().unwrap_or(0)
+        self.counts
+            .lock()
+            .get(&ino)
+            .map(|counts| counts.open)
+            .unwrap_or(0)
     }
 
     /// Get the number of write-capable open handles for an inode.
     pub(super) fn write_open_count(&self, ino: Ino) -> u32 {
-        self.write_open_counts
+        self.counts
             .lock()
             .get(&ino)
-            .copied()
+            .map(|counts| counts.write)
             .unwrap_or(0)
     }
 
