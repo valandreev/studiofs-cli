@@ -203,6 +203,7 @@ const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
 const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
+const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 4_000;
@@ -2568,6 +2569,7 @@ impl VfsState {
                     max_buffer_bytes: Some(cfg.max_dirty_bytes),
                 },
             ),
+            writer_stack_prefetched_object_ids: Mutex::new(VecDeque::new()),
             local_dirty: LocalDirtyState::new(),
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
@@ -2594,6 +2596,31 @@ fn resolve_writer_page_size(block_size: u32, writer_page_size: Option<usize>) ->
         .unwrap_or(block_size)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefetchedWriterStackObjectIds {
+    ino: Ino,
+    start: u64,
+    end: u64,
+}
+
+impl PrefetchedWriterStackObjectIds {
+    fn new(ino: Ino, start: u64, len: u64) -> Option<Self> {
+        Some(Self {
+            ino,
+            start,
+            end: start.checked_add(len)?,
+        })
+    }
+
+    fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
 struct VfsState {
     upload: UploadState,
     file_session: FileSessionState,
@@ -2601,6 +2628,7 @@ struct VfsState {
     acl: AclState,
     incarnation: IncarnationState,
     writer_stack: MountedWriterStack,
+    writer_stack_prefetched_object_ids: Mutex<VecDeque<PrefetchedWriterStackObjectIds>>,
     local_dirty: LocalDirtyState,
     read: ReadState,
     file_lock: FileLockState,

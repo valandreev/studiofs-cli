@@ -7422,6 +7422,162 @@ fn completed_block_materialization_respects_eager_batch_limit() {
 }
 
 #[test]
+fn completed_block_materialization_uses_prefetched_object_ids() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-completed-prefetch-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-completed-prefetch-ids.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x45u8; block_size];
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+        let after_prefetch = meta.next_object_ids(1).unwrap()[0];
+
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+        let after_materialize = meta.next_object_ids(1).unwrap()[0];
+
+        assert_eq!(materialized, block_size);
+        assert_eq!(after_prefetch, before + 2);
+        assert_eq!(
+            after_materialize,
+            after_prefetch + 1,
+            "completed-block materialization should consume prefetched IDs without reserving more"
+        );
+    });
+}
+
+#[test]
+fn completed_block_materialization_does_not_join_gapped_prefetch_batches() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-gapped-prefetch-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-gapped-prefetch-ids.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let block = vec![0x46u8; block_size];
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &block)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+        let externally_reserved = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, block_size as u64, &block)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+        let mut object_ids = vfs.local_payload_backend().object_ids();
+        object_ids.sort_unstable();
+
+        assert_eq!(materialized, block_size * 2);
+        assert_eq!(externally_reserved, before + 2);
+        assert!(
+            !object_ids.contains(&externally_reserved),
+            "gapped prefetched batches must not be exposed as one contiguous object ID range"
+        );
+        assert_eq!(object_ids[1], object_ids[0] + 1);
+    });
+}
+
+#[test]
+fn completed_block_prefetch_caps_skipped_range_queue() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-545-prefetch-queue-cap");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-prefetch-queue-cap.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x47u8; block_size * 2];
+
+        {
+            let mut queue = vfs.state.writer_stack_prefetched_object_ids.lock();
+            for index in 0..WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT {
+                let start = 10_000 + u64::try_from(index).unwrap() * 10;
+                queue.push_back(PrefetchedWriterStackObjectIds::new(attr.ino, start, 1).unwrap());
+            }
+        }
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.state.writer_stack_prefetched_object_ids.lock().len()
+                <= WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT,
+            "prefetched object ID range queue should stay bounded"
+        );
+    });
+}
+
+#[test]
+fn completed_block_prefetch_does_not_skip_due_to_other_inode_range() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-545-prefetch-inode-affinity");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr_a = vfs
+            .create(1, b"sfs-545-prefetch-inode-affinity-a.bin", 0, 0, 0o644)
+            .unwrap();
+        let attr_b = vfs
+            .create(1, b"sfs-545-prefetch-inode-affinity-b.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh_a = vfs.open_file(attr_a.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x48u8; block_size];
+
+        vfs.state
+            .writer_stack_prefetched_object_ids
+            .lock()
+            .push_back(PrefetchedWriterStackObjectIds::new(attr_b.ino, 50_000, 32).unwrap());
+
+        vfs.record_writer_stack_state_bytes(fh_a, attr_a.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr_a.ino)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vfs.state.writer_stack_prefetched_object_ids.lock().len(),
+            2,
+            "one inode should not skip prefetch because another inode owns a large range"
+        );
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
