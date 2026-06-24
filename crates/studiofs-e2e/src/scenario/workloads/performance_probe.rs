@@ -1302,12 +1302,6 @@ struct PerformanceProbeReadObservations {
     post_drain_fuse_read_bytes: Option<u64>,
     post_drain_foreground_local_payload_reads: Option<u64>,
     post_drain_foreground_local_payload_read_bytes: Option<u64>,
-    same_handle_read_mib_per_sec: Option<f64>,
-    same_handle_read_interpretation: Option<String>,
-    same_handle_fuse_read_calls: Option<u64>,
-    same_handle_fuse_read_bytes: Option<u64>,
-    same_handle_foreground_local_payload_reads: Option<u64>,
-    same_handle_foreground_local_payload_read_bytes: Option<u64>,
 }
 
 impl PerformanceProbeReadObservations {
@@ -1382,16 +1376,6 @@ impl PerformanceProbeReadObservations {
             observations.post_drain_foreground_local_payload_read_bytes =
                 Some(post_drain.delta.foreground_local_payload_read_bytes);
         }
-        if let Some(same_handle) = phases.iter().find(|phase| phase.kind == "same-handle-read") {
-            observations.same_handle_read_mib_per_sec = Some(same_handle.mib_per_sec);
-            observations.same_handle_read_interpretation = Some(same_handle.interpretation.clone());
-            observations.same_handle_fuse_read_calls = Some(same_handle.delta.fuse_read_calls);
-            observations.same_handle_fuse_read_bytes = Some(same_handle.delta.fuse_read_bytes);
-            observations.same_handle_foreground_local_payload_reads =
-                Some(same_handle.delta.foreground_local_payload_reads);
-            observations.same_handle_foreground_local_payload_read_bytes =
-                Some(same_handle.delta.foreground_local_payload_read_bytes);
-        }
         observations
     }
 }
@@ -1428,6 +1412,18 @@ mod tests {
         let artifact = serde_json::to_value(&summary).expect("summary should serialize");
         assert_eq!(artifact["workload_kind"], "single_file_sequential");
         assert_eq!(artifact["payload_file_count"], 1);
+    }
+
+    #[test]
+    fn performance_probe_summary_does_not_duplicate_same_handle_phase_observations() {
+        let summary = test_performance_probe_summary();
+        let artifact = serde_json::to_value(&summary).expect("summary should serialize");
+        let read_observations = artifact["read_observations"]
+            .as_object()
+            .expect("read observations should be a JSON object");
+
+        assert!(!read_observations.contains_key("same_handle_read_mib_per_sec"));
+        assert!(!read_observations.contains_key("same_handle_fuse_read_calls"));
     }
 
     #[test]
@@ -1632,9 +1628,11 @@ mod tests {
             observations.post_drain_foreground_local_payload_read_bytes,
             Some(2 * 1024 * 1024)
         );
-        assert_eq!(observations.same_handle_fuse_read_calls, Some(1));
         assert_eq!(
-            observations.same_handle_foreground_local_payload_reads,
+            phases
+                .iter()
+                .find(|phase| phase.kind == "same-handle-read")
+                .map(|phase| phase.delta.fuse_read_calls),
             Some(1)
         );
     }
