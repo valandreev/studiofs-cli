@@ -3205,6 +3205,10 @@ impl StudioVfs {
             let _ = writeln!(file, "{payload}");
         }
     }
+
+    fn write_debug_enabled(&self) -> bool {
+        std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some()
+    }
     // #endregion debug log
 
     fn aggressive_materialization_should_run(&self) -> bool {
@@ -6161,7 +6165,7 @@ impl StudioVfs {
     }
 
     async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
-        if next_bytes == 0 {
+        if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
 
@@ -6177,18 +6181,20 @@ impl StudioVfs {
         while pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
             hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
-            self.debug_write_probe(
-                "H1",
-                concat!(file!(), ":", line!()),
-                "write admission buffer hard pacing",
-                serde_json::json!({
-                    "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
-                    "pressure_bytes": pressure_bytes,
-                    "buffer_budget_bytes": buffer_budget_bytes,
-                    "hard_window_bytes": hard_window_bytes,
-                    "next_bytes": next_bytes,
-                }),
-            );
+            if self.write_debug_enabled() {
+                self.debug_write_probe(
+                    "H1",
+                    concat!(file!(), ":", line!()),
+                    "write admission buffer hard pacing",
+                    serde_json::json!({
+                        "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
+                        "pressure_bytes": pressure_bytes,
+                        "buffer_budget_bytes": buffer_budget_bytes,
+                        "hard_window_bytes": hard_window_bytes,
+                        "next_bytes": next_bytes,
+                    }),
+                );
+            }
             // #endregion debug log
 
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
@@ -6196,6 +6202,7 @@ impl StudioVfs {
         }
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
+            return;
         }
 
         let decision = {
@@ -6211,22 +6218,27 @@ impl StudioVfs {
             return;
         }
         // #region debug log
-        self.debug_write_probe(
-            "H2",
-            concat!(file!(), ":", line!()),
-            "write admission governor pacing",
-            serde_json::json!({
-                "delay_ms": decision.delay_ms,
-                "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
-                "drain_bytes_per_sec": decision.drain_bytes_per_sec,
-                "runway_ms": decision.runway_ms,
-                "pressure_bytes": pressure_bytes,
-                "budget_bytes": buffer_budget_bytes,
-                "next_bytes": next_bytes,
-            }),
-        );
+        if self.write_debug_enabled() {
+            self.debug_write_probe(
+                "H2",
+                concat!(file!(), ":", line!()),
+                "write admission governor pacing",
+                serde_json::json!({
+                    "delay_ms": decision.delay_ms,
+                    "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
+                    "drain_bytes_per_sec": decision.drain_bytes_per_sec,
+                    "runway_ms": decision.runway_ms,
+                    "pressure_bytes": pressure_bytes,
+                    "budget_bytes": buffer_budget_bytes,
+                    "next_bytes": next_bytes,
+                }),
+            );
+        }
         // #endregion debug log
 
+        if self.shutdown_requested() {
+            return;
+        }
         let started = Instant::now();
         tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
         self.record_write_admission_wait(started.elapsed());
