@@ -8296,6 +8296,7 @@ fn opportunistic_write_fh_uses_writer_cache_without_landing_journal() {
 #[test]
 fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    // Keep upload workers stopped so this observes the foreground boundary, not uploader timing.
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-547-foreground-boundary");
     let _guard = rt.enter();
     rt.block_on(async {
