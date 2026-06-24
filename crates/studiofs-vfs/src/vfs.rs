@@ -3207,7 +3207,8 @@ impl StudioVfs {
     }
 
     fn write_debug_enabled(&self) -> bool {
-        std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some()
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some())
     }
     // #endregion debug log
 
@@ -6202,6 +6203,7 @@ impl StudioVfs {
         }
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
+            self.state.write_admission_governor.lock().reset_stats();
             return;
         }
 
