@@ -261,8 +261,9 @@ The `mounted-performance-probe` summary and validation artifacts must make the
 Linux scenario 24 workload shape explicit: `workload_kind` is
 `single_file_sequential`, `payload_file_count` is `1`, and the payload is the
 single path `performance-probe/probe-data.bin` sized by
-`STUDIOFS_E2E_PERF_FILE_BYTES` with a 4 GiB default. Every repeated read pass
-opens and sequentially reads that same file.
+`STUDIOFS_E2E_PERF_FILE_BYTES` with a 4 GiB default. Reopen read passes open
+and sequentially read that same file; the summary also records a warmed
+same-handle reread phase.
 
 For Linux StudioFS/JuiceFS comparisons, place the StudioFS scenario 24
 artifacts, the local JuiceFS fio result over `/home/val/mnt/jfs`, optional raw

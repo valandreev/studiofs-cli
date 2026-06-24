@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -288,7 +288,11 @@ fn run_mounted_performance_probe(
             &metrics_path,
         )?;
         let read_io = read_probe_file(&probe_path, config.chunk_bytes, config.file_bytes)?;
-        verify_probe_checksum(pass, read_io.checksum, expected_checksum)?;
+        verify_probe_checksum(
+            &format!("read-pass-{pass}"),
+            read_io.checksum,
+            expected_checksum,
+        )?;
         let after = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
         append_sample(
             &samples_path,
@@ -301,6 +305,55 @@ fn run_mounted_performance_probe(
             "read".to_string(),
             Some(pass),
             read_io,
+            &before,
+            &after,
+        ));
+    }
+
+    {
+        let mut same_handle_file = File::open(&probe_path)?;
+        let same_handle_warmup = read_probe_open_file(
+            &mut same_handle_file,
+            config.chunk_bytes,
+            config.file_bytes,
+            Instant::now(),
+        )?;
+        verify_probe_checksum(
+            "same-handle-warmup",
+            same_handle_warmup.checksum,
+            expected_checksum,
+        )?;
+        same_handle_file.seek(SeekFrom::Start(0))?;
+        let before = sample_metrics(&metrics_path)?;
+        append_sample(
+            &samples_path,
+            "before-same-handle-read",
+            before.as_ref(),
+            &metrics_path,
+        )?;
+        let same_handle_read = read_probe_open_file(
+            &mut same_handle_file,
+            config.chunk_bytes,
+            config.file_bytes,
+            Instant::now(),
+        )?;
+        verify_probe_checksum(
+            "same-handle-read",
+            same_handle_read.checksum,
+            expected_checksum,
+        )?;
+        let after = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
+        append_sample(
+            &samples_path,
+            "after-same-handle-read",
+            after.as_ref(),
+            &metrics_path,
+        )?;
+        phases.push(PerformanceProbePhase::new(
+            "same-handle-read".to_string(),
+            "same-handle-read".to_string(),
+            None,
+            same_handle_read,
             &before,
             &after,
         ));
@@ -320,7 +373,7 @@ fn run_mounted_performance_probe(
         )?;
         let before = drain.after.clone();
         let post_drain_io = read_probe_file(&probe_path, config.chunk_bytes, config.file_bytes)?;
-        verify_probe_checksum(0, post_drain_io.checksum, expected_checksum)?;
+        verify_probe_checksum("post-drain-read", post_drain_io.checksum, expected_checksum)?;
         let after = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
         append_sample(
             &samples_path,
@@ -518,22 +571,31 @@ fn read_probe_file(
 ) -> Result<PhaseIoResult, ScenarioError> {
     let started = Instant::now();
     let mut file = File::open(path)?;
+    read_probe_open_file(&mut file, chunk_bytes, expected_bytes, started)
+}
+
+fn read_probe_open_file(
+    file: &mut impl std::io::Read,
+    chunk_bytes: usize,
+    expected_bytes: u64,
+    started: Instant,
+) -> Result<PhaseIoResult, ScenarioError> {
+    if chunk_bytes == 0 {
+        return Err(ScenarioError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "chunk_bytes must be greater than zero",
+        )));
+    }
     let mut buffer = vec![0u8; chunk_bytes];
     let mut read_total = 0u64;
     let mut checksum = 0u64;
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        checksum = update_probe_checksum(checksum, &buffer[..n], read_total);
-        read_total = read_total.saturating_add(n as u64);
-    }
-    if read_total != expected_bytes {
-        return Err(ScenarioError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("read {read_total} bytes, expected {expected_bytes}"),
-        )));
+    let mut remaining = expected_bytes;
+    while remaining > 0 {
+        let len = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..len])?;
+        checksum = update_probe_checksum(checksum, &buffer[..len], read_total);
+        read_total = read_total.saturating_add(len as u64);
+        remaining -= len as u64;
     }
     Ok(PhaseIoResult::new(read_total, started.elapsed(), checksum))
 }
@@ -555,13 +617,13 @@ fn update_probe_checksum(mut checksum: u64, bytes: &[u8], offset: u64) -> u64 {
     checksum.wrapping_add(bytes.len() as u64)
 }
 
-fn verify_probe_checksum(pass: u32, actual: u64, expected: u64) -> Result<(), ScenarioError> {
+fn verify_probe_checksum(phase: &str, actual: u64, expected: u64) -> Result<(), ScenarioError> {
     if actual == expected {
         return Ok(());
     }
     Err(ScenarioError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("read pass {pass} checksum {actual} did not match write checksum {expected}"),
+        format!("{phase} checksum {actual} did not match write checksum {expected}"),
     )))
 }
 
@@ -1367,6 +1429,68 @@ mod tests {
     }
 
     #[test]
+    fn performance_probe_summary_does_not_duplicate_same_handle_phase_observations() {
+        let summary = test_performance_probe_summary();
+        let artifact = serde_json::to_value(&summary).expect("summary should serialize");
+        let read_observations = artifact["read_observations"]
+            .as_object()
+            .expect("read observations should be a JSON object");
+
+        assert!(!read_observations.contains_key("same_handle_read_mib_per_sec"));
+        assert!(!read_observations.contains_key("same_handle_fuse_read_calls"));
+    }
+
+    #[test]
+    fn read_probe_open_file_checksums_fixed_blocks_across_short_reads() {
+        struct ShortReader {
+            inner: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl std::io::Read for ShortReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(3);
+                self.inner.read(&mut buf[..len])
+            }
+        }
+
+        let file_bytes = 10;
+        let chunk_bytes = 4;
+        let mut payload = vec![0u8; chunk_bytes];
+        fill_probe_buffer(&mut payload);
+        let mut reader = ShortReader {
+            inner: std::io::Cursor::new(
+                payload
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(file_bytes as usize)
+                    .collect(),
+            ),
+        };
+
+        let result =
+            read_probe_open_file(&mut reader, chunk_bytes, file_bytes, Instant::now()).unwrap();
+
+        assert_eq!(
+            result.checksum,
+            expected_probe_checksum(file_bytes, chunk_bytes)
+        );
+    }
+
+    #[test]
+    fn read_probe_open_file_rejects_zero_chunk_bytes() {
+        let mut reader = std::io::Cursor::new(vec![1, 2, 3]);
+        let error = read_probe_open_file(&mut reader, 0, 3, Instant::now()).unwrap_err();
+
+        match error {
+            ScenarioError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected invalid input error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn performance_probe_summary_accepts_legacy_artifact_without_workload_shape() {
         let summary = test_performance_probe_summary();
         let mut artifact = serde_json::to_value(&summary).expect("summary should serialize");
@@ -1492,6 +1616,30 @@ mod tests {
                 })),
             ),
             PerformanceProbePhase::new(
+                "same-handle-read".to_string(),
+                "same-handle-read".to_string(),
+                None,
+                PhaseIoResult::new(2 * 1024 * 1024, Duration::from_millis(100), 17),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 0, "bytes": 0 } },
+                    "vfs_read_path": {
+                        "calls": 0,
+                        "requested_bytes": 0,
+                        "foreground_local_payload_reads": 0,
+                        "foreground_local_payload_read_bytes": 0
+                    }
+                })),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 1, "bytes": 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 1,
+                        "requested_bytes": 1024 * 1024,
+                        "foreground_local_payload_reads": 1,
+                        "foreground_local_payload_read_bytes": 1024 * 1024
+                    }
+                })),
+            ),
+            PerformanceProbePhase::new(
                 "read-after-upload-drain-wait".to_string(),
                 "post-drain-read".to_string(),
                 None,
@@ -1543,6 +1691,13 @@ mod tests {
         assert_eq!(
             observations.post_drain_foreground_local_payload_read_bytes,
             Some(2 * 1024 * 1024)
+        );
+        assert_eq!(
+            phases
+                .iter()
+                .find(|phase| phase.kind == "same-handle-read")
+                .map(|phase| phase.delta.fuse_read_calls),
+            Some(1)
         );
     }
 
