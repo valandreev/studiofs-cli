@@ -14,6 +14,8 @@ pub(super) struct HandleTable {
     handles: RwLock<HashMap<u64, OpenFile>>,
     /// Inode -> number of currently open file descriptors.
     open_counts: Mutex<HashMap<Ino, u32>>,
+    /// Inode -> number of currently open write-capable file descriptors.
+    write_open_counts: Mutex<HashMap<Ino, u32>>,
     /// Inodes that were unlinked while still open (deferred deletion).
     orphans: Mutex<HashSet<Ino>>,
 }
@@ -24,8 +26,13 @@ impl HandleTable {
             next_fh: AtomicU64::new(1),
             handles: RwLock::new(HashMap::new()),
             open_counts: Mutex::new(HashMap::new()),
+            write_open_counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn flags_allow_write(flags: OpenFlags) -> bool {
+        flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
     }
 
     /// Allocate a new file handle and register it.
@@ -40,6 +47,9 @@ impl HandleTable {
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         self.handles.write().insert(fh, open_file.clone());
         *self.open_counts.lock().entry(ino).or_insert(0) += 1;
+        if Self::flags_allow_write(flags) {
+            *self.write_open_counts.lock().entry(ino).or_insert(0) += 1;
+        }
         open_file
     }
 
@@ -58,6 +68,16 @@ impl HandleTable {
         if remaining == 0 {
             counts.remove(&open_file.ino);
         }
+        if Self::flags_allow_write(open_file.flags) {
+            let mut write_counts = self.write_open_counts.lock();
+            let Some(write_count) = write_counts.get_mut(&open_file.ino) else {
+                return Some((open_file, remaining));
+            };
+            *write_count = write_count.saturating_sub(1);
+            if *write_count == 0 {
+                write_counts.remove(&open_file.ino);
+            }
+        }
         Some((open_file, remaining))
     }
 
@@ -68,17 +88,11 @@ impl HandleTable {
 
     /// Get the number of write-capable open handles for an inode.
     pub(super) fn write_open_count(&self, ino: Ino) -> u32 {
-        self.handles
-            .read()
-            .values()
-            .filter(|open_file| {
-                open_file.ino == ino
-                    && (open_file.flags.contains(OpenFlags::WRONLY)
-                        || open_file.flags.contains(OpenFlags::RDWR))
-            })
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX)
+        self.write_open_counts
+            .lock()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Returns true when an inode still has a mutating handle whose local view
@@ -159,6 +173,12 @@ mod tests {
         assert_eq!(ht.open_count(10), 0);
         assert_eq!(ht.write_open_count(10), 0);
         assert!(!ht.has_active_open_overlay(10));
+
+        let (closed3, remaining) = ht.close(fh3.fh).unwrap();
+        assert_eq!(closed3.ino, 20);
+        assert_eq!(remaining, 0);
+        assert_eq!(ht.open_count(20), 0);
+        assert_eq!(ht.write_open_count(20), 0);
 
         assert!(ht.close(fh1.fh).is_none());
     }
