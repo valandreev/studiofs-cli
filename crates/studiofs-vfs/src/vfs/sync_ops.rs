@@ -1607,10 +1607,11 @@ impl StudioVfs {
             .ok_or_else(|| VfsError::Other("writer stack object id prefetch was empty".into()))?;
         let range = PrefetchedWriterStackObjectIds::new(start, len)
             .ok_or_else(|| VfsError::Other("writer stack object id prefetch overflow".into()))?;
-        self.state
-            .writer_stack_prefetched_object_ids
-            .lock()
-            .push_back(range);
+        let mut ranges = self.state.writer_stack_prefetched_object_ids.lock();
+        if ranges.len() >= super::WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT {
+            ranges.pop_front();
+        }
+        ranges.push_back(range);
         Ok(())
     }
 

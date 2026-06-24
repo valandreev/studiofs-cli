@@ -7506,6 +7506,42 @@ fn completed_block_materialization_does_not_join_gapped_prefetch_batches() {
 }
 
 #[test]
+fn completed_block_prefetch_caps_skipped_range_queue() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-545-prefetch-queue-cap");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-prefetch-queue-cap.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x47u8; block_size * 2];
+
+        {
+            let mut queue = vfs.state.writer_stack_prefetched_object_ids.lock();
+            for index in 0..WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT {
+                let start = 10_000 + u64::try_from(index).unwrap() * 10;
+                queue.push_back(PrefetchedWriterStackObjectIds::new(start, 1).unwrap());
+            }
+        }
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.state.writer_stack_prefetched_object_ids.lock().len()
+                <= WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT,
+            "prefetched object ID range queue should stay bounded"
+        );
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
