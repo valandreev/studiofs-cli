@@ -6086,7 +6086,7 @@ fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
         let wait_task =
             tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
         tokio::time::sleep(Duration::from_millis(
-            WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS + 20,
+            WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
         ))
         .await;
         assert!(
@@ -6102,6 +6102,14 @@ fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
         .await
         .expect("admission should unblock after writer-stack pressure drops")
         .expect("admission task should not panic");
+        assert_eq!(
+            vfs.state
+                .metrics
+                .drain_lag_pacing_events
+                .load(Ordering::Relaxed),
+            1,
+            "hard admission wait should be recorded as one stall event"
+        );
 
         vfs.release_fh(fh).await.unwrap();
     });

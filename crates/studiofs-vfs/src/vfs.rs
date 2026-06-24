@@ -6173,7 +6173,9 @@ impl StudioVfs {
 
         let hard_window_bytes =
             buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
+        let mut hard_wait_started = None;
         while pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
+            hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
             self.debug_write_probe(
                 "H1",
@@ -6189,10 +6191,11 @@ impl StudioVfs {
             );
             // #endregion debug log
 
-            let started = Instant::now();
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
-            self.record_write_admission_wait(started.elapsed());
             pressure_bytes = self.total_write_admission_pressure_bytes();
+        }
+        if let Some(started) = hard_wait_started {
+            self.record_write_admission_wait(started.elapsed());
         }
 
         let decision = {
