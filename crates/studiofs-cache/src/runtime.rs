@@ -2221,7 +2221,7 @@ mod tests {
         let background_ready = std::sync::Arc::clone(&ready);
         let join = std::thread::spawn(move || {
             background_ready.wait();
-            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
+            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT + LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
             background.mark_uploaded(11);
         });
         ready.wait();
@@ -2236,6 +2236,10 @@ mod tests {
         assert!(
             backend.low_space_progress_wait_count() <= 2,
             "coalesced upload completions should not require more progress waits than completed uploads"
+        );
+        assert!(
+            backend.low_space_progress_wait_count() >= 1,
+            "test should exercise the progress-driven retry path"
         );
     }
 
