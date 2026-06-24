@@ -1,6 +1,7 @@
 # StudioFS
 
 StudioFS is a Rust 2024 workspace for a cross-platform local-first virtual filesystem over S3-compatible object storage with PostgreSQL-based shared metadata.
+We are building a file system for a world where computers are constantly connecting and disconnecting, operating from different cities and countries, have varying internet connections, and cannot view the same data in perfect synchronisation. Therefore, each computer must be sufficiently autonomous. It operates locally, synchronises with the overall system, but does not depend directly on any other computer.
 
 ## Always-on project rules
 
@@ -17,16 +18,6 @@ StudioFS is a Rust 2024 workspace for a cross-platform local-first virtual files
 This checkout uses codebase-memory-mcp. Prefer graph tools over grep/glob for
 code discovery; use grep only for string literals, logs, config values, and
 non-code files.
-
-Current project key:
-
-- `Volumes-Storage-dev-studiofs`
-
-Refresh and inspect the index:
-
-- `index_repository(repo_path="/Volumes/Storage/dev/studiofs", mode="fast", persistence=true)`
-- `index_status(project="Volumes-Storage-dev-studiofs")`
-- `get_graph_schema(project="Volumes-Storage-dev-studiofs")`
 
 Discovery order:
 

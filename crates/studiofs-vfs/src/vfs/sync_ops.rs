@@ -121,6 +121,10 @@ impl StudioVfs {
             && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0
     }
 
+    fn should_linger_clean_deferred_materialization(&self, ino: Ino) -> bool {
+        !self.shutdown_requested() && self.handle_table.write_open_count(ino) > 0
+    }
+
     fn deferred_materialization_linger_duration() -> Duration {
         Duration::from_millis(
             super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
@@ -303,6 +307,16 @@ impl StudioVfs {
                 let dirty_before = writer_stack_dirty_before;
                 let total_before = vfs.total_pending_write_buffer_bytes();
                 if dirty_before == 0 {
+                    if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+                        && vfs.should_linger_clean_deferred_materialization(ino)
+                    {
+                        no_progress_retries += 1;
+                        tokio::time::sleep(Duration::from_millis(
+                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                        ))
+                        .await;
+                        continue;
+                    }
                     break;
                 }
 
@@ -1426,7 +1440,7 @@ impl StudioVfs {
 
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
-            (Ok(_), LocalSyncPolicy::Opportunistic) => {
+            (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
             }
             (Ok(_), policy) if policy.requires_write_path_durability() => {

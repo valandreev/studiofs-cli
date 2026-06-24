@@ -9549,7 +9549,7 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 #[test]
 fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-writer-stack");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-outcome-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -11047,7 +11047,7 @@ fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
 #[test]
 fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-empty-handle-write");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -11057,11 +11057,15 @@ fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
         let written = vfs
-            .write_fh_with_local_sync_policy(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
+            .write_fh_with_deferred_materialize(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
 
         assert_eq!(written, 0);
+        assert!(
+            !vfs.state.deferred_materialize_inflight.contains(ino),
+            "empty handle writes should not schedule background materialization"
+        );
         assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "empty handle writes should not create dirty writer-stack state"
@@ -11514,6 +11518,79 @@ fn deferred_materialization_drains_idle_tail_before_close() {
             0,
             "background materialization should not wait for last-handle release"
         );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-546-hot-writer-drain");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-546-hot-writer-drain.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let first_block = vec![0x46; block_size];
+        let second_block = vec![0x47; block_size];
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &first_block,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.state.deferred_materialize_inflight.contains(ino)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(
+            "hot open writer should keep one materializer alive after a clean full-block drain",
+        );
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            block_size as u64,
+            &second_block,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.total_pending_persisted_local_dirty_slice_bytes() >= block_size * 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same hot materializer should drain the next completed full block");
+
+        let mut read = vec![0; block_size * 2];
+        let read_len = vfs.read_into_fh(fh, ino, 0, &mut read).await.unwrap();
+        assert_eq!(read_len as usize, read.len());
+        assert_eq!(&read[..block_size], first_block.as_slice());
+        assert_eq!(&read[block_size..], second_block.as_slice());
 
         vfs.release_fh(fh).await.unwrap();
     });
