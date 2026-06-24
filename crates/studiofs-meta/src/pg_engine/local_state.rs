@@ -1,6 +1,6 @@
 use super::{
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-    LOCAL_PG_VERSION_COUNTER, PgMetaEngine,
+    LOCAL_PG_VERSION_COUNTER, PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -90,20 +90,18 @@ impl PgMetaEngine {
             || !local.local_overlay_attr_inodes()?.is_empty()
             || !local.local_overlay_dentries()?.is_empty()
             || !local.local_overlay_symlink_inodes()?.is_empty()
-            || !local.local_overlay_xattr_keys()?.is_empty())
+            || !local.local_overlay_xattr_keys()?.is_empty()
+            || !local.local_overlay_acl_keys()?.is_empty())
     }
 
-    pub(super) fn should_pull_startup_snapshot(
+    pub(super) fn startup_snapshot_import_mode(
         local: &RedbMetaEngine,
         persisted_version: i64,
-    ) -> MetaResult<bool> {
-        if persisted_version > 0 {
-            return Ok(false);
+    ) -> MetaResult<StartupSnapshotImportMode> {
+        if persisted_version > 0 || Self::has_any_local_overlay_mutation(local)? {
+            return Ok(StartupSnapshotImportMode::PreserveLocalState);
         }
-        if Self::has_any_local_overlay_mutation(local)? {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(StartupSnapshotImportMode::ReplaceLocalState)
     }
 
     pub(super) fn snapshot_replay_start_version(

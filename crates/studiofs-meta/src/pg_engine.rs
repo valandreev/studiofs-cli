@@ -93,6 +93,12 @@ const LEGACY_PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
 const PG_INODE_WINDOW_SIZE: u64 = 250_000;
 const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StartupSnapshotImportMode {
+    ReplaceLocalState,
+    PreserveLocalState,
+}
+
 pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
     matches!(
         name,
@@ -571,9 +577,9 @@ impl PgMetaEngine {
 
         // Bootstrap from the last checkpoint if present, then catch up from
         // append-only event deltas.
-        if Self::should_pull_startup_snapshot(&engine.local, restored_local_version)? {
-            let _ = engine.pull_snapshot_locked();
-        }
+        let import_mode =
+            Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?;
+        let _ = engine.pull_snapshot_locked(import_mode);
         if let Err(error) = engine.sync_metadata_to_current_head() {
             warn!(
                 error = %error,

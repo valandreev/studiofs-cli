@@ -2,13 +2,16 @@
 
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
-use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, sql};
+use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
 use crate::engine::{MetaError, MetaResult};
 use crate::events::MetaEvent;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
-    pub(super) fn pull_snapshot_locked(&self) -> MetaResult<bool> {
+    pub(super) fn pull_snapshot_locked(
+        &self,
+        import_mode: StartupSnapshotImportMode,
+    ) -> MetaResult<bool> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
@@ -64,7 +67,15 @@ impl PgMetaEngine {
         let snapshot = Self::decode_snapshot(&bytes)?;
         let replay_start_version =
             Self::snapshot_replay_start_version(&snapshot, version, local_version);
-        self.local.import_remote_snapshot(&snapshot)?;
+        match import_mode {
+            StartupSnapshotImportMode::ReplaceLocalState => {
+                self.local.import_remote_snapshot(&snapshot)?;
+            }
+            StartupSnapshotImportMode::PreserveLocalState => {
+                self.local
+                    .import_remote_snapshot_preserving_local_state(&snapshot)?;
+            }
+        }
         self.reconcile_imported_snapshot_regular_files()?;
         self.persist_local_version(replay_start_version)?;
         Ok(true)
