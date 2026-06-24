@@ -305,6 +305,21 @@ impl StudioVfs {
                     break;
                 }
 
+                if let Err(error) = vfs
+                    .prefetch_writer_stack_object_ids_for_completed_blocks(ino)
+                    .await
+                {
+                    allow_reschedule_on_exit = false;
+                    if !vfs.suppress_deleted_inode_materialization_error(ino, &error) {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "deferred writer-stack object id prefetch failed; will retry at next strict barrier"
+                        );
+                    }
+                    break;
+                }
+
                 let materialize_writer_stack_started = Instant::now();
                 let writer_stack_materialized_bytes =
                     match vfs
@@ -1528,6 +1543,9 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
+        if let Some(first_object_id) = self.take_prefetched_writer_stack_object_ids(object_count) {
+            return Ok(first_object_id);
+        }
         let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.next_object_ids(object_count)
         })
@@ -1535,6 +1553,51 @@ impl StudioVfs {
         ids.first()
             .copied()
             .ok_or_else(|| VfsError::Other("writer stack object id reservation was empty".into()))
+    }
+
+    fn take_prefetched_writer_stack_object_ids(&self, object_count: u32) -> Option<u64> {
+        let object_count = object_count as usize;
+        let mut ids = self.state.writer_stack_prefetched_object_ids.lock();
+        if ids.len() < object_count {
+            return None;
+        }
+        let first_object_id = ids.front().copied()?;
+        for _ in 0..object_count {
+            ids.pop_front();
+        }
+        Some(first_object_id)
+    }
+
+    pub(super) async fn prefetch_writer_stack_object_ids_for_completed_blocks(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<()> {
+        let object_count = self
+            .state
+            .writer_stack
+            .completed_block_count_for_inode(ino)
+            .map_err(|err| {
+                VfsError::Other(format!("writer stack completed block count failed: {err}"))
+            })?;
+        let object_count = self.completed_block_materialization_batch_blocks(object_count);
+        if object_count == 0 {
+            return Ok(());
+        }
+        let needed = (object_count as usize)
+            .saturating_sub(self.state.writer_stack_prefetched_object_ids.lock().len());
+        if needed == 0 {
+            return Ok(());
+        }
+        let needed = needed as u32;
+        let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.next_object_ids(needed)
+        })
+        .await?;
+        self.state
+            .writer_stack_prefetched_object_ids
+            .lock()
+            .extend(ids);
+        Ok(())
     }
 
     #[cfg(test)]

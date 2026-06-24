@@ -7422,6 +7422,44 @@ fn completed_block_materialization_respects_eager_batch_limit() {
 }
 
 #[test]
+fn completed_block_materialization_uses_prefetched_object_ids() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-completed-prefetch-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-completed-prefetch-ids.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x45u8; block_size];
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+        let after_prefetch = meta.next_object_ids(1).unwrap()[0];
+
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+        let after_materialize = meta.next_object_ids(1).unwrap()[0];
+
+        assert_eq!(materialized, block_size);
+        assert_eq!(after_prefetch, before + 2);
+        assert_eq!(
+            after_materialize,
+            after_prefetch + 1,
+            "completed-block materialization should consume prefetched IDs without reserving more"
+        );
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
