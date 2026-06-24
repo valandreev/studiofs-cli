@@ -2,7 +2,8 @@ use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, OpenFile,
-    OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
+    OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1556,14 +1557,16 @@ impl StudioVfs {
     }
 
     fn take_prefetched_writer_stack_object_ids(&self, object_count: u32) -> Option<u64> {
-        let object_count = object_count as usize;
-        let mut ids = self.state.writer_stack_prefetched_object_ids.lock();
-        if ids.len() < object_count {
-            return None;
-        }
-        let first_object_id = ids.front().copied()?;
-        for _ in 0..object_count {
-            ids.pop_front();
+        let object_count = u64::from(object_count);
+        let mut ranges = self.state.writer_stack_prefetched_object_ids.lock();
+        let range_index = ranges
+            .iter()
+            .position(|range| range.len() >= object_count)?;
+        let range = ranges.get_mut(range_index)?;
+        let first_object_id = range.start;
+        range.start = range.start.saturating_add(object_count);
+        if range.is_empty() {
+            ranges.remove(range_index);
         }
         Some(first_object_id)
     }
@@ -1583,20 +1586,31 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(());
         }
-        let needed = (object_count as usize)
-            .saturating_sub(self.state.writer_stack_prefetched_object_ids.lock().len());
-        if needed == 0 {
+        if self
+            .state
+            .writer_stack_prefetched_object_ids
+            .lock()
+            .iter()
+            .any(|range| range.len() >= u64::from(object_count))
+        {
             return Ok(());
         }
-        let needed = needed as u32;
         let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.next_object_ids(needed)
+            engine.next_object_ids(object_count)
         })
         .await?;
+        let len = u64::try_from(ids.len())
+            .map_err(|_| VfsError::Other("writer stack object id prefetch overflow".into()))?;
+        let start = ids
+            .first()
+            .copied()
+            .ok_or_else(|| VfsError::Other("writer stack object id prefetch was empty".into()))?;
+        let range = PrefetchedWriterStackObjectIds::new(start, len)
+            .ok_or_else(|| VfsError::Other("writer stack object id prefetch overflow".into()))?;
         self.state
             .writer_stack_prefetched_object_ids
             .lock()
-            .extend(ids);
+            .push_back(range);
         Ok(())
     }
 

@@ -2595,6 +2595,29 @@ fn resolve_writer_page_size(block_size: u32, writer_page_size: Option<usize>) ->
         .unwrap_or(block_size)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefetchedWriterStackObjectIds {
+    start: u64,
+    end: u64,
+}
+
+impl PrefetchedWriterStackObjectIds {
+    fn new(start: u64, len: u64) -> Option<Self> {
+        Some(Self {
+            start,
+            end: start.checked_add(len)?,
+        })
+    }
+
+    fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
 struct VfsState {
     upload: UploadState,
     file_session: FileSessionState,
@@ -2602,7 +2625,7 @@ struct VfsState {
     acl: AclState,
     incarnation: IncarnationState,
     writer_stack: MountedWriterStack,
-    writer_stack_prefetched_object_ids: Mutex<VecDeque<u64>>,
+    writer_stack_prefetched_object_ids: Mutex<VecDeque<PrefetchedWriterStackObjectIds>>,
     local_dirty: LocalDirtyState,
     read: ReadState,
     file_lock: FileLockState,

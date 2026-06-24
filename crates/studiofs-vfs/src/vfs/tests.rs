@@ -7460,6 +7460,52 @@ fn completed_block_materialization_uses_prefetched_object_ids() {
 }
 
 #[test]
+fn completed_block_materialization_does_not_join_gapped_prefetch_batches() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-gapped-prefetch-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-545-gapped-prefetch-ids.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let block = vec![0x46u8; block_size];
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &block)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+        let externally_reserved = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, block_size as u64, &block)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+            .await
+            .unwrap();
+
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+        let mut object_ids = vfs.local_payload_backend().object_ids();
+        object_ids.sort_unstable();
+
+        assert_eq!(materialized, block_size * 2);
+        assert_eq!(externally_reserved, before + 2);
+        assert!(
+            !object_ids.contains(&externally_reserved),
+            "gapped prefetched batches must not be exposed as one contiguous object ID range"
+        );
+        assert_eq!(object_ids[1], object_ids[0] + 1);
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
