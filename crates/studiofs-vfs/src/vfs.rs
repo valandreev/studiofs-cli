@@ -2598,13 +2598,15 @@ fn resolve_writer_page_size(block_size: u32, writer_page_size: Option<usize>) ->
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrefetchedWriterStackObjectIds {
+    ino: Ino,
     start: u64,
     end: u64,
 }
 
 impl PrefetchedWriterStackObjectIds {
-    fn new(start: u64, len: u64) -> Option<Self> {
+    fn new(ino: Ino, start: u64, len: u64) -> Option<Self> {
         Some(Self {
+            ino,
             start,
             end: start.checked_add(len)?,
         })

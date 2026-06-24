@@ -1540,11 +1540,17 @@ impl StudioVfs {
         Ok(accepted.accepted_bytes)
     }
 
-    async fn reserve_writer_stack_object_ids_by_count(&self, object_count: u32) -> VfsResult<u64> {
+    async fn reserve_writer_stack_object_ids_by_count(
+        &self,
+        ino: Ino,
+        object_count: u32,
+    ) -> VfsResult<u64> {
         if object_count == 0 {
             return Ok(0);
         }
-        if let Some(first_object_id) = self.take_prefetched_writer_stack_object_ids(object_count) {
+        if let Some(first_object_id) =
+            self.take_prefetched_writer_stack_object_ids(ino, object_count)
+        {
             return Ok(first_object_id);
         }
         let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
@@ -1556,12 +1562,12 @@ impl StudioVfs {
             .ok_or_else(|| VfsError::Other("writer stack object id reservation was empty".into()))
     }
 
-    fn take_prefetched_writer_stack_object_ids(&self, object_count: u32) -> Option<u64> {
+    fn take_prefetched_writer_stack_object_ids(&self, ino: Ino, object_count: u32) -> Option<u64> {
         let object_count = u64::from(object_count);
         let mut ranges = self.state.writer_stack_prefetched_object_ids.lock();
         let range_index = ranges
             .iter()
-            .position(|range| range.len() >= object_count)?;
+            .position(|range| range.ino == ino && range.len() >= object_count)?;
         let range = ranges.get_mut(range_index)?;
         let first_object_id = range.start;
         range.start = range.start.saturating_add(object_count);
@@ -1591,7 +1597,7 @@ impl StudioVfs {
             .writer_stack_prefetched_object_ids
             .lock()
             .iter()
-            .any(|range| range.len() >= u64::from(object_count))
+            .any(|range| range.ino == ino && range.len() >= u64::from(object_count))
         {
             return Ok(());
         }
@@ -1605,7 +1611,7 @@ impl StudioVfs {
             .first()
             .copied()
             .ok_or_else(|| VfsError::Other("writer stack object id prefetch was empty".into()))?;
-        let range = PrefetchedWriterStackObjectIds::new(start, len)
+        let range = PrefetchedWriterStackObjectIds::new(ino, start, len)
             .ok_or_else(|| VfsError::Other("writer stack object id prefetch overflow".into()))?;
         let mut ranges = self.state.writer_stack_prefetched_object_ids.lock();
         if ranges.len() >= super::WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT {
@@ -1661,7 +1667,7 @@ impl StudioVfs {
             return Ok(0);
         }
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
         let finished = self
             .state
@@ -1699,7 +1705,7 @@ impl StudioVfs {
             return Ok(0);
         }
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
         let finished = self
             .state
@@ -1739,7 +1745,7 @@ impl StudioVfs {
         }
         let object_count = self.completed_block_materialization_batch_blocks(object_count);
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
         let finished = self
             .state

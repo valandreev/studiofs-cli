@@ -7522,7 +7522,7 @@ fn completed_block_prefetch_caps_skipped_range_queue() {
             let mut queue = vfs.state.writer_stack_prefetched_object_ids.lock();
             for index in 0..WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT {
                 let start = 10_000 + u64::try_from(index).unwrap() * 10;
-                queue.push_back(PrefetchedWriterStackObjectIds::new(start, 1).unwrap());
+                queue.push_back(PrefetchedWriterStackObjectIds::new(attr.ino, start, 1).unwrap());
             }
         }
 
@@ -7537,6 +7537,42 @@ fn completed_block_prefetch_caps_skipped_range_queue() {
             vfs.state.writer_stack_prefetched_object_ids.lock().len()
                 <= WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT,
             "prefetched object ID range queue should stay bounded"
+        );
+    });
+}
+
+#[test]
+fn completed_block_prefetch_does_not_skip_due_to_other_inode_range() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-545-prefetch-inode-affinity");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr_a = vfs
+            .create(1, b"sfs-545-prefetch-inode-affinity-a.bin", 0, 0, 0o644)
+            .unwrap();
+        let attr_b = vfs
+            .create(1, b"sfs-545-prefetch-inode-affinity-b.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh_a = vfs.open_file(attr_a.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x48u8; block_size];
+
+        vfs.state
+            .writer_stack_prefetched_object_ids
+            .lock()
+            .push_back(PrefetchedWriterStackObjectIds::new(attr_b.ino, 50_000, 32).unwrap());
+
+        vfs.record_writer_stack_state_bytes(fh_a, attr_a.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr_a.ino)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vfs.state.writer_stack_prefetched_object_ids.lock().len(),
+            2,
+            "one inode should not skip prefetch because another inode owns a large range"
         );
     });
 }
