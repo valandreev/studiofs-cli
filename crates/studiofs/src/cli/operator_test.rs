@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
@@ -13,8 +12,6 @@ use crate::cli::benchmark_profile::BenchmarkProfileSession;
 use crate::cli::benchmark_profile_types::{BenchmarkProfileMode, BenchmarkProfileResult};
 use crate::cli::mounted_runtime::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
-
-static OPERATOR_TEST_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
 
 const OPERATOR_TEST_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 const OPERATOR_TEST_SIZE: u64 = 8 * 1024 * 1024 * 1024;
@@ -68,11 +65,13 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         .cache_path
         .as_ref()
         .map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE));
-    let report_dir = report
+    let report_dir = match report
         .parent()
         .filter(|parent| parent.components().next().is_some())
-        .map(Path::to_path_buf)
-        .unwrap_or(std::env::current_dir().context("resolve current directory")?);
+    {
+        Some(parent) => parent.to_path_buf(),
+        None => std::env::current_dir().context("resolve current directory")?,
+    };
     let profile_session = BenchmarkProfileSession::start(
         Some(BenchmarkProfileMode::Pyroscope),
         &run_id,
@@ -87,7 +86,7 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         work_root: work_root.as_path(),
         cache_path: runtime.cache_path.as_deref(),
     };
-    let rt = operator_test_runtime()?;
+    let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report_data = rt.block_on(run_mounted(&config, mounted_target))?;
     let profile_report = match profile_session.map(|session| session.finish(&report_dir)) {
         Some(Ok(report)) => Some(report),
@@ -114,11 +113,4 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
     let report_path = save_benchmark_report(&report_data, Some(&report))?;
     println!("JSON report: {}", report_path.display());
     Ok(())
-}
-
-fn operator_test_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    OPERATOR_TEST_RUNTIME
-        .get_or_init(tokio::runtime::Runtime::new)
-        .as_ref()
-        .map_err(|error| anyhow!("create tokio runtime: {error}"))
 }
