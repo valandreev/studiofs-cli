@@ -210,7 +210,6 @@ const WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER: usize = 16;
 const WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER: usize = 64;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 20;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
-const WRITE_ADMISSION_BUFFER_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 100;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
@@ -2824,19 +2823,6 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes
         .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
         .max(1)
-}
-
-fn write_buffer_admission_delay_ms(
-    writer_stack_dirty_bytes: usize,
-    buffer_budget_bytes: usize,
-) -> Option<u64> {
-    if buffer_budget_bytes == 0 || writer_stack_dirty_bytes <= buffer_budget_bytes {
-        return None;
-    }
-    if writer_stack_dirty_bytes > buffer_budget_bytes.saturating_mul(2) {
-        return Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS);
-    }
-    Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
 }
 
 #[cfg(test)]
@@ -6193,37 +6179,18 @@ impl StudioVfs {
             return;
         }
 
-        let pressure = self.write_admission_pressure();
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let writer_stack_dirty_with_next =
-            pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);
-        if write_buffer_admission_delay_ms(writer_stack_dirty_with_next, buffer_budget_bytes)
-            .is_some()
-        {
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                concat!(file!(), ":", line!()),
-                "write admission buffer pacing",
-                serde_json::json!({
-                    "delay_ms": WRITE_ADMISSION_BUFFER_DELAY_MS,
-                    "writer_stack_dirty_bytes": pressure.writer_stack_dirty_bytes,
-                    "buffer_budget_bytes": buffer_budget_bytes,
-                    "next_bytes": next_bytes,
-                }),
-            );
-            // #endregion debug log
-
-            let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_DELAY_MS)).await;
-            self.record_write_admission_wait(started.elapsed());
+        let pressure_bytes = self.total_write_admission_pressure_bytes();
+        if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
+            return;
         }
+
+        let hard_window_bytes =
+            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
         while self
-            .state
-            .writer_stack
-            .total_dirty_bytes()
+            .total_write_admission_pressure_bytes()
             .saturating_add(next_bytes)
-            > buffer_budget_bytes.saturating_mul(2)
+            > hard_window_bytes
             && !self.shutdown_requested()
         {
             // #region debug log
@@ -6233,8 +6200,9 @@ impl StudioVfs {
                 "write admission buffer hard pacing",
                 serde_json::json!({
                     "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
-                    "writer_stack_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
+                    "pressure_bytes": self.total_write_admission_pressure_bytes(),
                     "buffer_budget_bytes": buffer_budget_bytes,
+                    "hard_window_bytes": hard_window_bytes,
                     "next_bytes": next_bytes,
                 }),
             );
