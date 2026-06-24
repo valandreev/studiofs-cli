@@ -1440,7 +1440,7 @@ impl StudioVfs {
 
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
-            (Ok(_), LocalSyncPolicy::Opportunistic) => {
+            (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
             }
             (Ok(_), policy) if policy.requires_write_path_durability() => {

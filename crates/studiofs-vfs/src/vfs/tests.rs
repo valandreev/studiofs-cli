@@ -11047,7 +11047,7 @@ fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
 #[test]
 fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-empty-handle-write");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -11057,11 +11057,15 @@ fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
         let written = vfs
-            .write_fh_with_local_sync_policy(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
+            .write_fh_with_deferred_materialize(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
 
         assert_eq!(written, 0);
+        assert!(
+            !vfs.state.deferred_materialize_inflight.contains(ino),
+            "empty handle writes should not schedule background materialization"
+        );
         assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "empty handle writes should not create dirty writer-stack state"
