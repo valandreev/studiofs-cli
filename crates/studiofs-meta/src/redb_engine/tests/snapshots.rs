@@ -89,14 +89,32 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     let draft = local
         .create_file(ROOT_INO, b"local-draft.bin", 0, 0, 0o644)
         .unwrap();
+    local
+        .set_xattr(draft.ino, b"user.color", b"local-blue", 0)
+        .unwrap();
+    local
+        .set_acl_rule(draft.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    let link = local
+        .create_symlink(ROOT_INO, b"local-link", b"/local/target", 0, 0)
+        .unwrap();
     local.set_counter("pgLastFlushedLocalEventSeq", local_event_start)
         .unwrap();
     local.set_counter("pgClientSlotPlusOne", 8).unwrap();
     let local_event_end = local.get_counter("nextEventSeq").unwrap();
 
     let source = temp_engine();
-    source
+    let remote_file = source
         .create_file(ROOT_INO, b"remote-file.bin", 0, 0, 0o644)
+        .unwrap();
+    source
+        .set_xattr(remote_file.ino, b"user.color", b"remote-red", 0)
+        .unwrap();
+    source
+        .set_acl_rule(remote_file.ino, "alice", AccessLevel::ReadOnly)
+        .unwrap();
+    source
+        .create_symlink(ROOT_INO, b"remote-link", b"/remote/target", 0, 0)
         .unwrap();
     source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
     source.set_counter("pgLastFlushedLocalEventSeq", 99).unwrap();
@@ -109,6 +127,15 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
 
     let local_draft = local.lookup(ROOT_INO, b"local-draft.bin").unwrap();
     assert_eq!(local_draft.ino, draft.ino);
+    assert_eq!(
+        local.get_xattr(draft.ino, b"user.color").unwrap(),
+        Some(b"local-blue".to_vec())
+    );
+    assert_eq!(
+        local.get_acl_rule(draft.ino, "alice").unwrap(),
+        Some(AccessLevel::ReadWrite)
+    );
+    assert_eq!(local.get_symlink_target(link.ino).unwrap(), b"/local/target");
     assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
     assert_eq!(
         local

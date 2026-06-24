@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::MetaAcl;
 
 #[test]
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
@@ -39,6 +40,33 @@ fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
             .expect("startup snapshot decision"),
         super::StartupSnapshotImportMode::PreserveLocalState,
         "startup snapshot must preserve a local overlay after crash/restart"
+    );
+}
+
+#[test]
+fn startup_snapshot_preserves_local_overlay_when_only_acl_changed() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .local
+        .create_file(ROOT_INO, b"acl-only.txt", 0, 0, 0o644)
+        .expect("create base file");
+    let snapshot = pg.local.export_snapshot().expect("export base snapshot");
+    pg.local
+        .import_snapshot(&snapshot)
+        .expect("seed imported base");
+
+    assert!(
+        !PgMetaEngine::has_any_local_overlay_mutation(&pg.local)
+            .expect("no local overlay mutation before ACL edit")
+    );
+
+    pg.local
+        .set_acl_rule(file.ino, "alice", AccessLevel::ReadOnly)
+        .expect("set local ACL overlay");
+
+    assert!(
+        PgMetaEngine::has_any_local_overlay_mutation(&pg.local).expect("ACL overlay mutation"),
+        "ACL-only local changes should require preserve-local-state startup import"
     );
 }
 

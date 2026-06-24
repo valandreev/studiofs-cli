@@ -90,7 +90,8 @@ impl PgMetaEngine {
             || !local.local_overlay_attr_inodes()?.is_empty()
             || !local.local_overlay_dentries()?.is_empty()
             || !local.local_overlay_symlink_inodes()?.is_empty()
-            || !local.local_overlay_xattr_keys()?.is_empty())
+            || !local.local_overlay_xattr_keys()?.is_empty()
+            || !local.local_overlay_acl_keys()?.is_empty())
     }
 
     pub(super) fn startup_snapshot_import_mode(
