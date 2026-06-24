@@ -1,6 +1,6 @@
 //! Mounted runtime test-report command and internal S3 SigV4 helpers used by CLI init flows.
 
-use crate::cli::test_cache::run_operator_test;
+use crate::cli::operator_test::run_operator_test;
 use anyhow::{Context, anyhow};
 use clap::Args;
 use hmac::{Hmac, Mac};

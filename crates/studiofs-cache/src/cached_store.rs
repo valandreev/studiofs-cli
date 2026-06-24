@@ -2,7 +2,6 @@
 //!
 //! This module owns the active local cache backend, pending writeback queue,
 //! object pinning, and cache-pipeline diagnostics used by the mount runtime.
-//! Benchmark-only cache helpers live in `benchmark_cache`.
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;

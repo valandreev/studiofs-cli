@@ -36,9 +36,9 @@ rather than by verifier CPU. The during-upload and pseudo-random read lines
 remain latency-oriented checks so they do not pre-warm the full workload before
 the post-upload read phases.
 
-Treat the legacy test-cache path as an internal developer diagnostic. It may
-still help isolate direct cache behavior during development, but it is not the
-user-facing benchmark workflow and should not be used as parity evidence.
+Use `studiofs devbench` for developer workload tuning. It is not the public
+parity workflow; use `studiofs bench` when evidence must match the fixed
+operator workload.
 
 ## Operator Workflow
 

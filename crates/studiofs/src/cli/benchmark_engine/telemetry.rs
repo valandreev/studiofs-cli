@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::result::{
-    AdvancedMetricsReport, CacheLevelReport, CacheLevelsReport, CachePipelineReport,
-    LatencyHistogramReport, OpReport, OperationLogReport, SizeClassBoundaryReport,
-    SizeClassOpReport, SizeClassStatsReport, StreamResultReport,
+    AdvancedMetricsReport, CachePipelineReport, LatencyHistogramReport, OpReport,
+    OperationLogReport, SizeClassBoundaryReport, SizeClassOpReport, SizeClassStatsReport,
+    StreamResultReport,
 };
 use super::workload::{SizeClass, SizeClassBounds};
 
@@ -281,65 +281,6 @@ impl AddAssign<&Self> for PhaseTelemetry {
     }
 }
 
-#[derive(Default, Clone)]
-pub(crate) struct CacheLevelTelemetryAccumulator {
-    l1_hits: u64,
-    l1_misses: u64,
-    l1_bytes_served: u64,
-    l1_lookup_latency: LatencySamples,
-}
-
-impl CacheLevelTelemetryAccumulator {
-    pub(crate) fn record_l1(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
-        self.l1_lookup_latency.record(elapsed, bytes_served);
-        if hit {
-            self.l1_hits = self.l1_hits.saturating_add(1);
-            self.l1_bytes_served = self.l1_bytes_served.saturating_add(bytes_served);
-        } else {
-            self.l1_misses = self.l1_misses.saturating_add(1);
-        }
-    }
-
-    fn to_report(&self, wall_elapsed_ms: f64) -> CacheLevelsReport {
-        let l1_report = self.l1_lookup_latency.to_report(wall_elapsed_ms);
-        CacheLevelsReport {
-            l1: CacheLevelReport {
-                hits: self.l1_hits,
-                misses: self.l1_misses,
-                bytes_served: self.l1_bytes_served,
-                throughput_bytes_per_sec: l1_report.throughput_bytes_per_sec,
-                avg_latency_ms: l1_report.avg_latency_ms,
-                p50_ms: l1_report.p50_ms,
-                p95_ms: l1_report.p95_ms,
-                p99_ms: l1_report.p99_ms,
-                latency_histogram: self.l1_lookup_latency.to_histogram_report(),
-            },
-        }
-    }
-}
-
-impl AddAssign<&Self> for CacheLevelTelemetryAccumulator {
-    fn add_assign(&mut self, other: &Self) {
-        self.l1_hits = self.l1_hits.saturating_add(other.l1_hits);
-        self.l1_misses = self.l1_misses.saturating_add(other.l1_misses);
-        self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
-        self.l1_lookup_latency += &other.l1_lookup_latency;
-    }
-}
-
-#[derive(Default, Clone)]
-pub(crate) struct DirectReadTelemetry {
-    pub(crate) phase: PhaseTelemetry,
-    pub(crate) cache_levels: CacheLevelTelemetryAccumulator,
-}
-
-impl AddAssign<&Self> for DirectReadTelemetry {
-    fn add_assign(&mut self, other: &Self) {
-        self.phase += &other.phase;
-        self.cache_levels += &other.cache_levels;
-    }
-}
-
 pub(crate) fn stream_reports_from_telemetry(
     writes_by_stream: &[PhaseTelemetry],
     reads_by_stream: &[PhaseTelemetry],
@@ -384,7 +325,6 @@ pub(crate) fn build_advanced_metrics(
     size_class_bounds: SizeClassBounds,
     writes: &PhaseTelemetry,
     reads: &PhaseTelemetry,
-    cache_levels: Option<&CacheLevelTelemetryAccumulator>,
     _cache_pipeline: Option<&CachePipelineReport>,
     writes_wall_elapsed_ms: f64,
     reads_wall_elapsed_ms: f64,
@@ -398,7 +338,7 @@ pub(crate) fn build_advanced_metrics(
             writes: writes.by_size.to_reports(writes_wall_elapsed_ms),
             reads: reads.by_size.to_reports(reads_wall_elapsed_ms),
         },
-        cache_levels: cache_levels.map(|levels| levels.to_report(reads_wall_elapsed_ms)),
+        cache_levels: None,
     }
 }
 

@@ -249,7 +249,7 @@ mod tests {
             temp.path()
                 .join("target")
                 .join("perf")
-                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
+                .join("studiofs-benchmark-e2e-20260319-151255.json")
         );
 
         let second = save_benchmark_report_in(&report, None, temp.path(), now).unwrap();
@@ -258,7 +258,7 @@ mod tests {
             temp.path()
                 .join("target")
                 .join("perf")
-                .join("studiofs-benchmark-direct-shim-20260319-151255-2.json")
+                .join("studiofs-benchmark-e2e-20260319-151255-2.json")
         );
     }
 
@@ -309,8 +309,8 @@ mod tests {
 
         let content = std::fs::read_to_string(saved).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["mode"], "direct-shim");
-        assert_eq!(parsed["command"]["name"], "studiofs test-cache");
+        assert_eq!(parsed["mode"], "e2e");
+        assert_eq!(parsed["command"]["name"], "studiofs devbench");
         assert!(parsed["platform"]["os"].is_string());
         assert!(parsed["build"]["package_version"].is_string());
         assert_eq!(parsed["runtime_stats"]["available"], false);
@@ -413,7 +413,7 @@ mod tests {
             temp.path()
                 .join("target")
                 .join("perf")
-                .join("studiofs-benchmark-direct-shim-20260319-151255.json")
+                .join("studiofs-benchmark-e2e-20260319-151255.json")
         );
         assert!(saved.is_file());
         assert!(temp.path().join("target").join("perf").is_dir());

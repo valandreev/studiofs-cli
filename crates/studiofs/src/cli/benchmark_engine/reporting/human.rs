@@ -628,15 +628,10 @@ fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortablePr
 
 pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     let mut out = String::new();
-    let target_label = if report.mode == "direct-shim" {
-        "Local path"
-    } else {
-        "Target"
-    };
 
     let _ = writeln!(&mut out, "StudioFS data-path benchmark");
     let _ = writeln!(&mut out, "Run ID:    {}", report.run_id);
-    let _ = writeln!(&mut out, "{target_label}: {}", report.cache_dir);
+    let _ = writeln!(&mut out, "Target:    {}", report.cache_dir);
     let _ = writeln!(&mut out, "Mode:      {}", report.mode);
     if let Some(volume) = &report.volume {
         let _ = writeln!(&mut out, "Volume:    {volume}");
@@ -1394,8 +1389,8 @@ mod tests {
         let mut report = sample_report();
         report.mode = "e2e".to_string();
         report.local_first_read_comparison = Some(MountedLocalFirstReadComparisonReport {
-            cache_path: r"D:\test-cache\vol-123".to_string(),
-            upload_dir: r"D:\test-cache\vol-123\upload".to_string(),
+            cache_path: r"D:\studiofs-bench\vol-123".to_string(),
+            upload_dir: r"D:\studiofs-bench\vol-123\upload".to_string(),
             phases: vec![
                 MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),

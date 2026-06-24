@@ -47,7 +47,7 @@ $scenario = @{
     PreviewOnly          = [bool]$PreviewOnly
 }
 
-$result = Invoke-TestCachePerfScenario -Scenario $scenario
+$result = Invoke-DevbenchPerfScenario -Scenario $scenario
 
 if ($PreviewOnly) {
     Write-Host ""

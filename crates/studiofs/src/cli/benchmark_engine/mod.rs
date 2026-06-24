@@ -1,4 +1,4 @@
-//! Internal benchmark engine entry points shared by legacy test-cache and bench.
+//! Internal benchmark engine entry points shared by mounted benchmark commands.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -14,26 +14,15 @@ mod telemetry;
 mod workload;
 
 pub(crate) use profiling::merge_profile_report;
-pub(crate) use profiling::{cpu_utilization_percent, process_cpu_time};
 pub(crate) use reporting::{
     render_human_summary, render_public_bench_summary, save_benchmark_report,
 };
+pub(crate) use result::BenchmarkReport;
 #[cfg(test)]
 pub(crate) use result::sample_report;
-pub(crate) use result::{
-    BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
-    benchmark_build_metadata, benchmark_command_metadata, benchmark_platform_metadata,
-    missing_runtime_stats_report,
-};
-pub(crate) use telemetry::{
-    DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
-    phase_telemetry_to_report, stream_reports_from_telemetry,
-};
 pub(crate) use workload::{
-    DEFAULT_BENCHMARK_BLOCK_SIZE_STR, DEFAULT_SMALL_CLASS_MAX_BYTES, PUBLIC_BENCH_MEDIUM_MAX_BYTES,
-    PUBLIC_BENCH_SMALL_MAX_BYTES, SizeClassBounds, WorkloadSizeInput, build_access_sequence,
-    build_work_sizes, classify_size, deterministic_bytes, parse_size_arg, parse_sizes_arg,
-    public_bench_workload, split_stream_segments,
+    DEFAULT_SMALL_CLASS_MAX_BYTES, PUBLIC_BENCH_MEDIUM_MAX_BYTES, PUBLIC_BENCH_SMALL_MAX_BYTES,
+    WorkloadSizeInput, parse_size_arg, public_bench_workload,
 };
 
 pub(crate) const CLEANUP_ATTEMPTS: usize = 5;
@@ -44,7 +33,6 @@ pub(crate) const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub(crate) enum BenchmarkAccessPattern {
     Sequential,
     Random,
-    Mixed,
 }
 
 /// Complete benchmark engine configuration after CLI/default validation.

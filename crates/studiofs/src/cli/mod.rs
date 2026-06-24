@@ -19,6 +19,7 @@ pub mod mount;
 pub mod mount_profile;
 #[cfg(not(unix))]
 pub mod mount_profile_stub;
+pub mod mounted_runtime;
 #[cfg(not(unix))]
 pub use self::mount_profile_stub as mount_profile;
 #[cfg(unix)]
@@ -26,13 +27,13 @@ pub mod benchmark_profile;
 #[cfg(not(unix))]
 pub mod benchmark_profile_stub;
 pub mod mount_profile_types;
+pub mod operator_test;
 pub mod perf;
 pub mod runtime_tuning;
 pub mod settings;
 pub mod snapshot;
 pub mod status;
 pub mod test;
-pub mod test_cache;
 #[cfg(not(unix))]
 pub use self::benchmark_profile_stub as benchmark_profile;
 pub mod benchmark_profile_common;
@@ -140,8 +141,6 @@ enum Commands {
     Dump(dump_load::DumpArgs),
     Load(dump_load::LoadArgs),
     Test(test::TestArgs),
-    #[command(hide = true)]
-    TestCache(test_cache::TestCacheArgs),
     Snapshot(snapshot::SnapshotArgs),
     Internal(internal::InternalArgs),
 }
@@ -164,7 +163,6 @@ impl Commands {
             Self::Dump(args) => args.dispatch(),
             Self::Load(args) => args.dispatch(),
             Self::Test(args) => args.dispatch(),
-            Self::TestCache(args) => args.dispatch(),
             Self::Snapshot(args) => args.dispatch(),
             Self::Internal(args) => args.dispatch(),
         }
@@ -331,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_command_is_removed() {
+        let err = match parse_for_test(&["test-cache", "target/studiofs-cache-bench"]) {
+            Ok(_) => panic!("expected removed test-cache command to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
     fn devbench_command_rejects_zero_threads_during_parse() {
         let err = match parse_for_test(&["devbench", "Z:\\", "--threads", "0"]) {
             Ok(_) => panic!("expected devbench to reject zero threads"),
@@ -415,29 +423,6 @@ mod tests {
             }
             other => panic!("expected Perf command, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn help_hides_legacy_test_cache_command() {
-        let command = Cli::command();
-        let cmd = command
-            .find_subcommand("test-cache")
-            .expect("hidden test-cache parser should exist for internal reuse");
-
-        assert!(
-            cmd.is_hide_set(),
-            "legacy test-cache command must stay out of the public help surface"
-        );
-    }
-
-    #[test]
-    fn legacy_test_cache_command_remains_parseable_for_internal_reuse() {
-        let cli = parse_for_test(&["test-cache", "target/studiofs-cache-bench"]).unwrap();
-
-        assert!(
-            matches!(cli.command, Commands::TestCache(_)),
-            "hidden test-cache parser should remain available until bench owns these internals"
-        );
     }
 
     #[test]
