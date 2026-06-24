@@ -1461,9 +1461,6 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub pending_uploads: usize,
     /// Active backend tag.
     pub backend_tag: String,
-    /// Foreground local-first boundary counters.
-    #[serde(default)]
-    pub foreground_boundary: VfsForegroundBoundaryStats,
     /// Total flush-barrier calls.
     pub flush_barrier_calls: u64,
     /// Flush-barrier call rate per second.
@@ -1537,24 +1534,6 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Optional allocator snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocator: Option<VfsPortableAllocatorStats>,
-}
-
-/// Foreground boundary counters for the mounted local-first write path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VfsForegroundBoundaryStats {
-    /// PostgreSQL calls made by foreground write/barrier callbacks.
-    pub pg_calls: u64,
-    /// Total foreground PostgreSQL callback time in milliseconds.
-    pub pg_total_ms: f64,
-    /// S3 upload-completion waits made by foreground write/barrier callbacks.
-    pub s3_upload_wait_calls: u64,
-    /// Total foreground S3 upload wait time in milliseconds.
-    pub s3_upload_wait_total_ms: f64,
-    /// Local barrier calls that finish writer/cache state.
-    pub local_barrier_calls: u64,
-    /// Total measured local barrier work in milliseconds.
-    pub local_barrier_total_ms: f64,
 }
 
 /// Pressure lane classification for ingress scheduling.

@@ -73,14 +73,14 @@ pub use metrics::{
     RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
-    VfsForegroundBoundaryStats, VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot,
-    VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane,
-    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheDecision,
-    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
-    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
+    VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
+    VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
+    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -7539,18 +7539,6 @@ impl StudioVfs {
             uptime_secs: elapsed.as_secs_f64(),
             pending_uploads: self.pending_upload_count(),
             backend_tag: self.write_path_backend_tag.clone(),
-            foreground_boundary: VfsForegroundBoundaryStats {
-                pg_calls: 0,
-                pg_total_ms: 0.0,
-                s3_upload_wait_calls: 0,
-                s3_upload_wait_total_ms: 0.0,
-                local_barrier_calls: flush_barrier_calls,
-                local_barrier_total_ms: (sync_total_ns
-                    .saturating_add(payload_persist_total_ns)
-                    .saturating_add(metadata_commit_total_ns))
-                    as f64
-                    / 1_000_000.0,
-            },
             flush_barrier_calls,
             flush_barrier_calls_per_sec: Self::per_second(flush_barrier_calls, elapsed),
             payload_store_sync_data: VfsWritePathSyncDataStats {

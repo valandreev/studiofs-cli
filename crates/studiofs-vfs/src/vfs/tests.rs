@@ -8316,19 +8316,15 @@ fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
         .unwrap();
 
         let accepted = vfs.write_path_observability_snapshot();
-        assert_eq!(accepted.foreground_boundary.pg_calls, 0);
-        assert_eq!(accepted.foreground_boundary.s3_upload_wait_calls, 0);
-        assert_eq!(accepted.foreground_boundary.local_barrier_calls, 0);
+        assert_eq!(accepted.flush_barrier_calls, 0);
         assert_eq!(accepted.metadata_commit.calls, 0);
         assert_eq!(accepted.upload.completed_uploads, 0);
 
         vfs.flush_fh(fh).await.unwrap();
 
         let flushed = vfs.write_path_observability_snapshot();
-        assert_eq!(flushed.foreground_boundary.pg_calls, 0);
-        assert_eq!(flushed.foreground_boundary.s3_upload_wait_calls, 0);
         assert!(
-            flushed.foreground_boundary.local_barrier_calls > 0,
+            flushed.flush_barrier_calls > 0,
             "flush_fh should surface local writer/cache barrier work"
         );
         assert!(
