@@ -9549,7 +9549,7 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 #[test]
 fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-writer-stack");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-outcome-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
