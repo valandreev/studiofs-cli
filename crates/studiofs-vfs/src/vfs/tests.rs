@@ -11520,6 +11520,79 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 }
 
 #[test]
+fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-546-hot-writer-drain");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-546-hot-writer-drain.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let first_block = vec![0x46; block_size];
+        let second_block = vec![0x47; block_size];
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &first_block,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.state.deferred_materialize_inflight.contains(ino)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(
+            "hot open writer should keep one materializer alive after a clean full-block drain",
+        );
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            block_size as u64,
+            &second_block,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.total_pending_persisted_local_dirty_slice_bytes() >= block_size * 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same hot materializer should drain the next completed full block");
+
+        let mut read = vec![0; block_size * 2];
+        let read_len = vfs.read_into_fh(fh, ino, 0, &mut read).await.unwrap();
+        assert_eq!(read_len as usize, read.len());
+        assert_eq!(&read[..block_size], first_block.as_slice());
+        assert_eq!(&read[block_size..], second_block.as_slice());
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finishes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-inflight-reschedule-tail");
