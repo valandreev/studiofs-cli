@@ -50,10 +50,10 @@ impl HandleTable {
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         self.handles.write().insert(fh, open_file.clone());
         let mut counts = self.counts.lock();
-        let counts = counts.entry(ino).or_default();
-        counts.open = counts.open.saturating_add(1);
+        let counts_for_inode = counts.entry(ino).or_default();
+        counts_for_inode.open = counts_for_inode.open.saturating_add(1);
         if Self::flags_allow_write(flags) {
-            counts.write = counts.write.saturating_add(1);
+            counts_for_inode.write = counts_for_inode.write.saturating_add(1);
         }
         open_file
     }
@@ -70,7 +70,7 @@ impl HandleTable {
         let counts_for_inode = counts.get_mut(&open_file.ino)?;
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
         if Self::flags_allow_write(open_file.flags) {
-            debug_assert!(
+            assert!(
                 counts_for_inode.write > 0,
                 "write-capable handle closed without write-open count"
             );
