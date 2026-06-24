@@ -9,6 +9,10 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+# cc is referenced from the macOS-only build.rs path; Windows machete cannot see it.
+ignored = ["cc"]
+
 [dependencies]
 dashmap.workspace = true
 serde.workspace = true
@@ -24,5 +28,5 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
-[build-dependencies]
+[target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
