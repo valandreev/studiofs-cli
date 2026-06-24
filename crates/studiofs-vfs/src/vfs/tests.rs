@@ -8294,6 +8294,54 @@ fn opportunistic_write_fh_uses_writer_cache_without_landing_journal() {
 }
 
 #[test]
+fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-547-foreground-boundary");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-547-foreground-boundary.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"accepted-locally",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let accepted = vfs.write_path_observability_snapshot();
+        assert_eq!(accepted.foreground_boundary.pg_calls, 0);
+        assert_eq!(accepted.foreground_boundary.s3_upload_wait_calls, 0);
+        assert_eq!(accepted.foreground_boundary.local_barrier_calls, 0);
+        assert_eq!(accepted.metadata_commit.calls, 0);
+        assert_eq!(accepted.upload.completed_uploads, 0);
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let flushed = vfs.write_path_observability_snapshot();
+        assert_eq!(flushed.foreground_boundary.pg_calls, 0);
+        assert_eq!(flushed.foreground_boundary.s3_upload_wait_calls, 0);
+        assert!(
+            flushed.foreground_boundary.local_barrier_calls > 0,
+            "flush_fh should surface local writer/cache barrier work"
+        );
+        assert!(
+            flushed.metadata_commit.calls > 0,
+            "flush_fh should commit local metadata without turning into foreground PG publication"
+        );
+        assert_eq!(flushed.upload.completed_uploads, 0);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn fsync_does_not_use_landing_journal_for_ordinary_writeback() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-no-landing-fsync");
