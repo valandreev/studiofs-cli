@@ -580,6 +580,12 @@ fn read_probe_open_file(
     expected_bytes: u64,
     started: Instant,
 ) -> Result<PhaseIoResult, ScenarioError> {
+    if chunk_bytes == 0 {
+        return Err(ScenarioError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "chunk_bytes must be greater than zero",
+        )));
+    }
     let mut buffer = vec![0u8; chunk_bytes];
     let mut read_total = 0u64;
     let mut checksum = 0u64;
@@ -1469,6 +1475,19 @@ mod tests {
             result.checksum,
             expected_probe_checksum(file_bytes, chunk_bytes)
         );
+    }
+
+    #[test]
+    fn read_probe_open_file_rejects_zero_chunk_bytes() {
+        let mut reader = std::io::Cursor::new(vec![1, 2, 3]);
+        let error = read_probe_open_file(&mut reader, 0, 3, Instant::now()).unwrap_err();
+
+        match error {
+            ScenarioError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected invalid input error, got {other:?}"),
+        }
     }
 
     #[test]
