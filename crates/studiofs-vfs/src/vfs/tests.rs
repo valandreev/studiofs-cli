@@ -8301,10 +8301,12 @@ fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-547-foreground-boundary.txt", 0, 0, 0o644)
+            .create(ROOT_INO, b"sfs-547-foreground-boundary.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.reset_diagnostics_observability();
 
         vfs.write_fh_with_deferred_materialize(
             fh,
