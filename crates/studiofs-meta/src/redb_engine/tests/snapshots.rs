@@ -83,6 +83,46 @@ fn remote_snapshot_hides_root_empty_regular_file_draft() {
 }
 
 #[test]
+fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_log() {
+    let local = temp_engine();
+    let local_event_start = local.get_counter("nextEventSeq").unwrap();
+    let draft = local
+        .create_file(ROOT_INO, b"local-draft.bin", 0, 0, 0o644)
+        .unwrap();
+    local.set_counter("pgLastFlushedLocalEventSeq", local_event_start)
+        .unwrap();
+    local.set_counter("pgClientSlotPlusOne", 8).unwrap();
+    let local_event_end = local.get_counter("nextEventSeq").unwrap();
+
+    let source = temp_engine();
+    source
+        .create_file(ROOT_INO, b"remote-file.bin", 0, 0, 0o644)
+        .unwrap();
+    source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
+    source.set_counter("pgLastFlushedLocalEventSeq", 99).unwrap();
+    source.set_counter("pgClientSlotPlusOne", 99).unwrap();
+    let snapshot = source.export_snapshot().unwrap();
+
+    local
+        .import_remote_snapshot_preserving_local_state(&snapshot)
+        .unwrap();
+
+    let local_draft = local.lookup(ROOT_INO, b"local-draft.bin").unwrap();
+    assert_eq!(local_draft.ino, draft.ino);
+    assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(
+        local
+            .read_events_range(local_event_start, local_event_end)
+            .unwrap()
+            .len(),
+        usize::try_from(local_event_end - local_event_start).unwrap()
+    );
+    assert_eq!(local.get_counter("pgLastFlushedLocalEventSeq").unwrap(), local_event_start);
+    assert_eq!(local.get_counter("pgClientSlotPlusOne").unwrap(), 8);
+    assert_eq!(local.get_counter("pgLastAppliedBatchVersion").unwrap(), 12);
+}
+
+#[test]
 fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
     let engine = temp_engine();
     let state = engine.export_snapshot().unwrap();

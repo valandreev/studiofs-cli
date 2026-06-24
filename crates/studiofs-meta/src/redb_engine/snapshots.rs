@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotImportMode {
+    Local,
+    RemoteReplace,
+    RemotePreserveLocalState,
+}
+
 impl RedbMetaEngine {
     /// Encode a [`RedbSnapshot`] into the canonical persisted snapshot payload format.
     pub fn encode_snapshot_payload(snapshot: &RedbSnapshot) -> MetaResult<Vec<u8>> {
@@ -231,25 +238,87 @@ impl RedbMetaEngine {
 
     /// Replace local redb state with a snapshot that should remain fully visible locally.
     pub fn import_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
-        self.import_snapshot_with_namespace_mode(snapshot, false)
+        self.import_snapshot_with_mode(snapshot, SnapshotImportMode::Local)
     }
 
     /// Replace local redb state with a snapshot imported from the remote authority.
     pub fn import_remote_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
-        self.import_snapshot_with_namespace_mode(snapshot, true)
+        self.import_snapshot_with_mode(snapshot, SnapshotImportMode::RemoteReplace)
     }
 
-    fn import_snapshot_with_namespace_mode(
+    /// Import a remote snapshot while preserving this client's local overlay and replay log.
+    pub fn import_remote_snapshot_preserving_local_state(
         &self,
         snapshot: &RedbSnapshot,
-        enable_remote_namespace_filter: bool,
     ) -> MetaResult<()> {
+        self.import_snapshot_with_mode(snapshot, SnapshotImportMode::RemotePreserveLocalState)
+    }
+
+    fn import_snapshot_with_mode(
+        &self,
+        snapshot: &RedbSnapshot,
+        mode: SnapshotImportMode,
+    ) -> MetaResult<()> {
+        let enable_remote_namespace_filter = mode != SnapshotImportMode::Local;
+        let preserve_local_state = mode == SnapshotImportMode::RemotePreserveLocalState;
+        let (preserved_inodes, preserved_dentries) = if preserve_local_state {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut overlay_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+            overlay_inodes.extend(Self::local_overlay_attr_inodes_from_txn(&txn)?);
+
+            let inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut preserved_inodes = Vec::new();
+            for ino in overlay_inodes {
+                if let Some(value) = inodes
+                    .get(ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    preserved_inodes.push((ino, value.value().to_vec()));
+                }
+            }
+            drop(inodes);
+
+            let current = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let base = txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let tombstones = txn
+                .open_table(DENTRY_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let overlay_dentries =
+                Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+            let mut preserved_dentries = Vec::new();
+            for key in overlay_dentries {
+                if let Some(value) = current
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    preserved_dentries.push((key, value.value().to_vec()));
+                }
+            }
+            drop(tombstones);
+            drop(base);
+            drop(current);
+
+            (preserved_inodes, preserved_dentries)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
+        if !preserve_local_state {
+            Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
+        }
         Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
 
         {
@@ -271,7 +340,7 @@ impl RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
-                .retain(|_, _| false)
+                .retain(|_, _| preserve_local_state)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {
                 if enable_remote_namespace_filter
@@ -297,6 +366,11 @@ impl RedbMetaEngine {
                     .insert(*k, v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+            for (k, v) in &preserved_inodes {
+                table
+                    .insert(*k, v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
         }
         {
             let mut table = txn
@@ -312,7 +386,9 @@ impl RedbMetaEngine {
             }
         }
         {
-            Self::clear_table_in_txn(&txn, INODE_TOMBSTONES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, INODE_TOMBSTONES_TABLE)?;
+            }
         }
         {
             let mut table = txn
@@ -326,10 +402,17 @@ impl RedbMetaEngine {
                     .insert(k.as_slice(), v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+            for (k, v) in &preserved_dentries {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
         }
         Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;
         {
-            Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
+            }
         }
         {
             let mut table = txn
@@ -357,16 +440,18 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         {
-            Self::replace_regular_file_chunk_rows_from_snapshot_rows(
-                &txn,
-                REGULAR_FILE_OVERLAY_TABLE,
-                snapshot.regular_file_overlay.as_slice(),
-                |bytes| {
-                    let state: RegularFileOverlayState = decode(bytes)?;
-                    Ok(state.chunks)
-                },
-                true,
-            )?;
+            if !preserve_local_state {
+                Self::replace_regular_file_chunk_rows_from_snapshot_rows(
+                    &txn,
+                    REGULAR_FILE_OVERLAY_TABLE,
+                    snapshot.regular_file_overlay.as_slice(),
+                    |bytes| {
+                        let state: RegularFileOverlayState = decode(bytes)?;
+                        Ok(state.chunks)
+                    },
+                    true,
+                )?;
+            }
         }
         {
             Self::replace_regular_file_chunk_rows_from_snapshot_rows(
@@ -381,20 +466,24 @@ impl RedbMetaEngine {
             )?;
         }
         {
-            let mut table = txn
-                .open_table(PENDING_DELETIONS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for (k, v) in &snapshot.pending_deletions {
-                table
-                    .insert(*k, *v)
+            if !preserve_local_state {
+                let mut table = txn
+                    .open_table(PENDING_DELETIONS_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                table
+                    .retain(|_, _| false)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for (k, v) in &snapshot.pending_deletions {
+                    table
+                        .insert(*k, *v)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
             }
         }
         {
-            Self::clear_table_in_txn(&txn, SYMLINKS_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, SYMLINKS_TABLE)?;
+            }
         }
         {
             let mut table = txn
@@ -410,10 +499,14 @@ impl RedbMetaEngine {
             }
         }
         {
-            Self::clear_table_in_txn(&txn, SYMLINK_TOMBSTONES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, SYMLINK_TOMBSTONES_TABLE)?;
+            }
         }
         {
-            Self::clear_table_in_txn(&txn, XATTRS_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, XATTRS_TABLE)?;
+            }
         }
         {
             let mut table = txn
@@ -431,10 +524,14 @@ impl RedbMetaEngine {
             }
         }
         {
-            Self::clear_table_in_txn(&txn, XATTR_TOMBSTONES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, XATTR_TOMBSTONES_TABLE)?;
+            }
         }
         {
-            Self::clear_table_in_txn(&txn, ACL_RULES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, ACL_RULES_TABLE)?;
+            }
         }
         {
             let mut table = txn
@@ -450,19 +547,23 @@ impl RedbMetaEngine {
             }
         }
         {
-            Self::clear_table_in_txn(&txn, ACL_RULE_TOMBSTONES_TABLE)?;
+            if !preserve_local_state {
+                Self::clear_table_in_txn(&txn, ACL_RULE_TOMBSTONES_TABLE)?;
+            }
         }
         {
-            let mut table = txn
-                .open_table(EVENT_LOG_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for (k, v) in &snapshot.event_log {
-                table
-                    .insert(*k, v.as_slice())
+            if !preserve_local_state {
+                let mut table = txn
+                    .open_table(EVENT_LOG_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                table
+                    .retain(|_, _| false)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for (k, v) in &snapshot.event_log {
+                    table
+                        .insert(*k, v.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
             }
         }
         {

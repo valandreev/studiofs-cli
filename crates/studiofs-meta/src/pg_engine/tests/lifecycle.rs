@@ -23,7 +23,7 @@ fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
 }
 
 #[test]
-fn startup_snapshot_is_skipped_when_local_overlay_exists() {
+fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     pg.local
@@ -34,10 +34,11 @@ fn startup_snapshot_is_skipped_when_local_overlay_exists() {
         PgMetaEngine::has_any_local_overlay_mutation(&pg.local).expect("local overlay mutation"),
         "local draft namespace should register as a local overlay mutation"
     );
-    assert!(
-        !PgMetaEngine::should_pull_startup_snapshot(&pg.local, 0)
+    assert_eq!(
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
             .expect("startup snapshot decision"),
-        "startup snapshot must not clobber a local overlay after crash/restart"
+        super::StartupSnapshotImportMode::PreserveLocalState,
+        "startup snapshot must preserve a local overlay after crash/restart"
     );
 }
 
@@ -52,10 +53,19 @@ fn persisted_pg_version_roundtrips_in_local_counter() {
         PgMetaEngine::load_persisted_local_version(&pg.local).expect("reload local version"),
         42
     );
-    assert!(
-        !PgMetaEngine::should_pull_startup_snapshot(&pg.local, 42)
+}
+
+#[test]
+fn startup_snapshot_uses_preserving_import_for_stale_persisted_version() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    pg.persist_local_version(42).expect("persist local version");
+
+    assert_eq!(
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 42)
             .expect("startup snapshot decision"),
-        "persisted PG version should suppress checkpoint bootstrap overwrite"
+        super::StartupSnapshotImportMode::PreserveLocalState,
+        "stale clients should fast-forward from a checkpoint while preserving local state"
     );
 }
 
@@ -147,7 +157,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
 }
 
 #[test]
-fn remote_snapshot_import_drops_legacy_local_pg_state() {
+fn import_remote_snapshot_drops_legacy_local_pg_state() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     let local = RedbMetaEngine::open(&path).expect("open local redb");
