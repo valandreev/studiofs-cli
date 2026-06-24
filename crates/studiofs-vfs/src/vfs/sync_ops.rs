@@ -122,7 +122,7 @@ impl StudioVfs {
     }
 
     fn should_linger_clean_deferred_materialization(&self, ino: Ino) -> bool {
-        !self.shutdown_requested() && self.handle_table.open_count(ino) > 0
+        !self.shutdown_requested() && self.handle_table.write_open_count(ino) > 0
     }
 
     fn deferred_materialization_linger_duration() -> Duration {

@@ -66,6 +66,21 @@ impl HandleTable {
         self.open_counts.lock().get(&ino).copied().unwrap_or(0)
     }
 
+    /// Get the number of write-capable open handles for an inode.
+    pub(super) fn write_open_count(&self, ino: Ino) -> u32 {
+        self.handles
+            .read()
+            .values()
+            .filter(|open_file| {
+                open_file.ino == ino
+                    && (open_file.flags.contains(OpenFlags::WRONLY)
+                        || open_file.flags.contains(OpenFlags::RDWR))
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
     /// Returns true when an inode still has a mutating handle whose local view
     /// must survive namespace removal until the handle is released.
     pub(super) fn has_active_open_overlay(&self, ino: Ino) -> bool {
@@ -114,8 +129,11 @@ mod tests {
         assert_ne!(fh2.fh, fh3.fh);
 
         assert_eq!(ht.open_count(10), 2);
+        assert_eq!(ht.write_open_count(10), 1);
         assert_eq!(ht.open_count(20), 1);
+        assert_eq!(ht.write_open_count(20), 1);
         assert_eq!(ht.open_count(99), 0);
+        assert_eq!(ht.write_open_count(99), 0);
         assert!(ht.has_active_open_overlay(10));
         assert!(ht.has_active_open_overlay(20));
         assert!(!ht.has_active_open_overlay(99));
@@ -133,11 +151,13 @@ mod tests {
         assert_eq!(closed1.ino, 10);
         assert_eq!(remaining, 1);
         assert_eq!(ht.open_count(10), 1);
+        assert_eq!(ht.write_open_count(10), 1);
 
         let (closed2, remaining) = ht.close(fh2.fh).unwrap();
         assert_eq!(closed2.ino, 10);
         assert_eq!(remaining, 0);
         assert_eq!(ht.open_count(10), 0);
+        assert_eq!(ht.write_open_count(10), 0);
         assert!(!ht.has_active_open_overlay(10));
 
         assert!(ht.close(fh1.fh).is_none());
