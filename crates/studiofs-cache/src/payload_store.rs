@@ -27,8 +27,10 @@ use super::{LocalPayloadReadMode, LocalPayloadSyncMode, LocalPayloadWriteMode};
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 const READ_FD_CACHE_MAX_CAPACITY: usize = 2_048;
+#[cfg(any(test, not(windows)))]
 const READ_FD_CACHE_MIN_CAPACITY: usize = READ_FD_CACHE_SHARDS;
 const READ_FD_CACHE_FAMILIES: usize = 2;
+#[cfg(any(test, not(windows)))]
 const READ_FD_CACHE_RESERVED_MIN: usize = 256;
 const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
@@ -1581,6 +1583,7 @@ fn read_fd_cache_capacity() -> usize {
     }
 }
 
+#[cfg(any(test, not(windows)))]
 fn read_fd_cache_capacity_for_limit(limit: Option<usize>) -> usize {
     let raw_capacity = match limit {
         Some(limit) => {
@@ -1593,6 +1596,7 @@ fn read_fd_cache_capacity_for_limit(limit: Option<usize>) -> usize {
     read_fd_cache_round_family_capacity(raw_capacity)
 }
 
+#[cfg(any(test, not(windows)))]
 fn read_fd_cache_round_family_capacity(family_capacity: usize) -> usize {
     let shard_units = family_capacity / READ_FD_CACHE_SHARDS;
     shard_units.max(1) * READ_FD_CACHE_SHARDS
