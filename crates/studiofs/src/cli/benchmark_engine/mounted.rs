@@ -3338,7 +3338,6 @@ pub(crate) async fn run_mounted_end_to_end(
             &measured.writes,
             &measured.reads,
             None,
-            None,
             measured.writes_wall.as_secs_f64() * 1000.0,
             measured.reads_wall.as_secs_f64() * 1000.0,
         );
@@ -3550,7 +3549,7 @@ mod tests {
 
     fn benchmark_config_with_block_size(block_size: u64) -> BenchmarkConfig {
         BenchmarkConfig {
-            command_name: "studiofs test-cache",
+            command_name: "studiofs devbench",
             target: PathBuf::from("/mnt/studiofs-benchmark"),
             block_size,
             read_size: 128 * 1024,
@@ -4696,7 +4695,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_test_cache_read_plan_keeps_single_sample_read() {
+    fn mounted_sampled_read_plan_keeps_single_sample_read() {
         let plan = mounted_read_plan(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024, false);
 
         assert_eq!(plan.bytes_to_read, 4 * 1024 * 1024);

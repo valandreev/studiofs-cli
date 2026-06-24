@@ -361,7 +361,7 @@ function New-SignalSummary {
     return [pscustomobject]$signals
 }
 
-function Build-TestCachePerfSummary {
+function Build-DevbenchPerfSummary {
     param(
         [Parameter(Mandatory = $true)]
         [hashtable]$Scenario,
@@ -414,7 +414,7 @@ function Build-TestCachePerfSummary {
     }
 }
 
-function Format-TestCachePerfMarkdown {
+function Format-DevbenchPerfMarkdown {
     param(
         [Parameter(Mandatory = $true)]
         [object]$Summary
@@ -483,7 +483,7 @@ function Format-TestCachePerfMarkdown {
     return ($lines -join [Environment]::NewLine)
 }
 
-function Invoke-TestCachePerfScenario {
+function Invoke-DevbenchPerfScenario {
     param(
         [Parameter(Mandatory = $true)]
         [hashtable]$Scenario
@@ -504,33 +504,18 @@ function Invoke-TestCachePerfScenario {
     $stdoutPath = Join-Path $runDirectory "stdout.txt"
     $commandPath = Join-Path $runDirectory "command.txt"
 
+    $operationCount = [Math]::Max([int]$Scenario.WorkloadRepeat, 1)
+    $smallFileCount = [Math]::Max($operationCount - 1, 1)
     $args = @(
-        "test-cache",
+        "devbench",
         [string]$Scenario.Target,
         "--block-size", [string]$Scenario.BlockSize,
-        "--read-size", [string]$Scenario.ReadSize,
-        "--sizes", [string]$Scenario.Sizes,
-        "--workload-repeat", ([int]$Scenario.WorkloadRepeat).ToString(),
-        "--concurrency", ([int]$Scenario.Concurrency).ToString(),
-        "--io-depth", ([int]$Scenario.IoDepth).ToString(),
-        "--warmup-runs", ([int]$Scenario.WarmupRuns).ToString(),
-        "--access-pattern", [string]$Scenario.AccessPattern,
-        "--l1-limit", [string]$Scenario.L1Limit,
+        "--big-file-size", [string]$Scenario.Sizes,
+        "--small-file-size", [string]$Scenario.Sizes,
+        "--small-file-count", $smallFileCount.ToString(),
+        "--threads", ([int]$Scenario.Concurrency).ToString(),
         "--json-output", $benchmarkJsonPath
     )
-
-    if ([bool]$Scenario.SequentialStreams) {
-        $args += "--sequential-streams"
-    }
-    if ([bool]$Scenario.Profile) {
-        $args += "--profile"
-    }
-    if ($Scenario.ContainsKey("DuringUploadMinPending") -and $null -ne $Scenario.DuringUploadMinPending) {
-        $args += @("--during-upload-min-pending", ([int]$Scenario.DuringUploadMinPending).ToString())
-    }
-    if ($Scenario.ContainsKey("DuringUploadTimeoutMs") -and $null -ne $Scenario.DuringUploadTimeoutMs) {
-        $args += @("--during-upload-timeout-ms", ([int]$Scenario.DuringUploadTimeoutMs).ToString())
-    }
 
     $displayArgs = @()
     foreach ($arg in $args) {
@@ -563,7 +548,7 @@ function Invoke-TestCachePerfScenario {
     $stdoutText = ($output | Out-String)
     Set-Content -LiteralPath $stdoutPath -Value $stdoutText -Encoding utf8
     if ($exitCode -ne 0) {
-        throw "studiofs test-cache failed with exit code ${exitCode}. See $stdoutPath"
+        throw "studiofs devbench failed with exit code ${exitCode}. See $stdoutPath"
     }
 
     if (-not (Test-Path -LiteralPath $benchmarkJsonPath)) {
@@ -572,7 +557,7 @@ function Invoke-TestCachePerfScenario {
 
     $benchmarkReport = Get-Content -LiteralPath $benchmarkJsonPath -Raw | ConvertFrom-Json
     $Scenario.StudioFsPath = $studiofsPath
-    $summary = Build-TestCachePerfSummary `
+    $summary = Build-DevbenchPerfSummary `
         -Scenario $Scenario `
         -BenchmarkReport $benchmarkReport `
         -RunDirectory $runDirectory `
@@ -580,7 +565,7 @@ function Invoke-TestCachePerfScenario {
         -StdoutPath $stdoutPath
 
     $summary | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $summaryJsonPath -Encoding utf8
-    $markdown = Format-TestCachePerfMarkdown -Summary $summary
+    $markdown = Format-DevbenchPerfMarkdown -Summary $summary
     Set-Content -LiteralPath $summaryMarkdownPath -Value $markdown -Encoding utf8
 
     return [pscustomobject]@{

@@ -22,9 +22,8 @@ The older PowerShell harnesses in this directory are repeatable loops for:
 - smooth out jagged write throughput
 - improve sequential read throughput where possible
 
-Those harnesses intentionally use the legacy `studiofs test-cache` diagnostic
-surface to isolate direct cache behavior. They are not the public mounted
-benchmark contract.
+Those harnesses use `studiofs devbench` with a fixed single-size mounted
+workload. They are not the public mounted benchmark contract.
 
 For cross-platform `studiofs devbench` evidence capture, use the SFS-557/SFS-567
 validation scripts:
@@ -61,8 +60,8 @@ For this pass we care about two focused scenarios:
 
 Both scripts:
 
-- run `studiofs test-cache`
-- force a reproducible single-size workload via `--sizes <item-size>` plus `--workload-repeat <count>`
+- run `studiofs devbench`
+- force a reproducible single-size workload via `--big-file-size <item-size>` plus matching small-file sizing
 - write raw benchmark output to `target/perf/<scenario>-<timestamp>/benchmark.json`
 - derive a second summary that emphasizes smoothness, not only average throughput
 
@@ -118,7 +117,7 @@ Read-focused run:
 powershell -ExecutionPolicy Bypass -File .\tools\perf\read-speed.ps1 -Target Z:\perf
 ```
 
-Preview the exact `studiofs test-cache` invocation without running it:
+Preview the exact `studiofs devbench` invocation without running it:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\perf\write-jitter.ps1 -Target Z:\perf -PreviewOnly
@@ -129,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\perf\write-jitter.ps1 -Target Z
 Each run creates a timestamped directory under `target/perf/` with:
 
 - `command.txt`: exact benchmark command
-- `stdout.txt`: human summary from `studiofs test-cache`
+- `stdout.txt`: human summary from `studiofs devbench`
 - `benchmark.json`: raw benchmark report
 - `summary.json`: derived perf summary for this methodology
 - `summary.md`: human-readable summary for review threads and notes

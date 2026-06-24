@@ -1514,8 +1514,8 @@ pub(crate) fn sample_report() -> BenchmarkReport {
 
     BenchmarkReport {
         run_id: "run-123".to_string(),
-        mode: "direct-shim".to_string(),
-        cache_dir: r"D:\test-cache".to_string(),
+        mode: "e2e".to_string(),
+        cache_dir: r"D:\studiofs-bench".to_string(),
         started_at: "2026-03-18T15:12:55Z".to_string(),
         completed_at: "2026-03-18T15:12:55Z".to_string(),
         total_elapsed_ms: 93.05,
@@ -1533,7 +1533,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         workload_large_files: WORKLOAD_FILES_PER_TIER,
         access_pattern: "sequential".to_string(),
         l1_limit: 2 * 1024 * 1024 * 1024,
-        command: benchmark_command_metadata("studiofs test-cache", "direct-shim", "run-123"),
+        command: benchmark_command_metadata("studiofs devbench", "e2e", "run-123"),
         platform: benchmark_platform_metadata(),
         build: benchmark_build_metadata(),
         runtime_stats: missing_runtime_stats_report(
@@ -1621,12 +1621,11 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             },
             endpoint: Some(ProfileEndpointReport {
                 url: "http://pyroscope:4040".to_string(),
-                application_name: "studiofs.test-cache.direct-shim".to_string(),
+                application_name: "studiofs.devbench.e2e".to_string(),
             }),
             artifacts: vec![ProfileArtifactSummary {
                 kind: ProfileArtifactKind::Cpu,
-                path: r"D:\test-cache\studiofs-benchmark-direct-shim-run-123-cpu.pprof.gz"
-                    .to_string(),
+                path: r"D:\studiofs-bench\studiofs-benchmark-e2e-run-123-cpu.pprof.gz".to_string(),
                 bytes: 2048,
                 sent_to_endpoint: true,
             }],
@@ -1728,8 +1727,8 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         mounted_portable_profile: None,
         mounted_runtime: Some(MountedRuntimeReport {
             mounted_path: "/mnt/studiofs-benchmark".to_string(),
-            cache_root: r"D:\test-cache\vol-123".to_string(),
-            metadata_root: Some(r"D:\test-cache".to_string()),
+            cache_root: r"D:\studiofs-bench\vol-123".to_string(),
+            metadata_root: Some(r"D:\studiofs-bench".to_string()),
             block_size: DEFAULT_BLOCK_SIZE as u64,
             chunk_size: DEFAULT_CHUNK_SIZE as u64,
             read_size: DEFAULT_BLOCK_SIZE as u64,

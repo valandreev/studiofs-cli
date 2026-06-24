@@ -2,25 +2,19 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
-pub(super) struct ActiveMount {
-    pub(super) pid: u32,
-    pub(super) mount_point: PathBuf,
-    pub(super) volume: String,
-    pub(super) cache_path: Option<PathBuf>,
+struct ActiveMount {
+    pid: u32,
+    mount_point: PathBuf,
+    volume: String,
+    cache_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum ResolvedRunMode {
-    DirectShim {
-        cache_dir: PathBuf,
-    },
-    MountedE2E {
-        pid: u32,
-        volume: String,
-        mount_point: PathBuf,
-        work_root: PathBuf,
-        cache_path: Option<PathBuf>,
-    },
+#[derive(Debug, Clone)]
+pub(crate) struct MountedRuntimeInfo {
+    pub(crate) pid: u32,
+    pub(crate) volume: String,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) cache_path: Option<PathBuf>,
 }
 
 fn normalize_path_for_compare(path: &Path) -> Option<String> {
@@ -28,7 +22,7 @@ fn normalize_path_for_compare(path: &Path) -> Option<String> {
     #[cfg(windows)]
     {
         Some(
-            super::super::utils::normalize_mount_point(raw)
+            super::utils::normalize_mount_point(raw)
                 .replace('/', "\\")
                 .trim_end_matches('\\')
                 .to_lowercase(),
@@ -41,11 +35,11 @@ fn normalize_path_for_compare(path: &Path) -> Option<String> {
 }
 
 fn cleanup_stale_mounts() -> Result<()> {
-    let mounts_dir = super::super::utils::get_mounts_dir()?;
+    let mounts_dir = super::utils::get_mounts_dir()?;
     cleanup_stale_mounts_in(
         &mounts_dir,
-        super::super::utils::mount_is_active,
-        super::super::utils::remove_pid_file,
+        super::utils::mount_is_active,
+        super::utils::remove_pid_file,
     )
 }
 
@@ -100,8 +94,8 @@ fn is_path_under_mount(target: &Path, mount_point: &Path) -> bool {
 }
 
 fn active_mounts() -> Result<Vec<ActiveMount>> {
-    let mounts_dir = super::super::utils::get_mounts_dir()?;
-    active_mounts_in(&mounts_dir, super::super::utils::mount_is_active)
+    let mounts_dir = super::utils::get_mounts_dir()?;
+    active_mounts_in(&mounts_dir, super::utils::mount_is_active)
 }
 
 fn active_mounts_in<F>(mounts_dir: &Path, is_mount_active: F) -> Result<Vec<ActiveMount>>
@@ -151,7 +145,7 @@ where
     Ok(mounts)
 }
 
-pub(super) fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
+pub(crate) fn resolve_mounted_runtime(target: &Path) -> Result<Option<MountedRuntimeInfo>> {
     cleanup_stale_mounts()?;
     let mut best: Option<ActiveMount> = None;
     for mount in active_mounts()? {
@@ -165,19 +159,12 @@ pub(super) fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
         }
     }
 
-    if let Some(active) = best {
-        Ok(ResolvedRunMode::MountedE2E {
-            pid: active.pid,
-            volume: active.volume,
-            mount_point: active.mount_point,
-            work_root: target.join(".studiofs-test-cache"),
-            cache_path: active.cache_path,
-        })
-    } else {
-        Ok(ResolvedRunMode::DirectShim {
-            cache_dir: target.to_path_buf(),
-        })
-    }
+    Ok(best.map(|active| MountedRuntimeInfo {
+        pid: active.pid,
+        volume: active.volume,
+        mount_point: active.mount_point,
+        cache_path: active.cache_path,
+    }))
 }
 
 #[cfg(test)]

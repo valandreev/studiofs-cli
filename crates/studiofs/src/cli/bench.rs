@@ -11,7 +11,7 @@ use crate::cli::benchmark_engine::{
     public_bench_workload, render_human_summary, render_public_bench_summary, run_mounted,
     save_benchmark_report,
 };
-use crate::cli::test_cache::resolve_mounted_runtime;
+use crate::cli::mounted_runtime::resolve_mounted_runtime;
 use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 
 const MAX_BENCH_SMALL_FILE_COUNT: usize = 1_000_000;
@@ -505,15 +505,11 @@ mod tests {
         assert_eq!(config.concurrency, 4);
         assert_eq!(config.io_depth, 4);
         assert!(config.sequential_streams);
-        match config.sizes {
-            WorkloadSizeInput::ExplicitList(sizes) => {
-                assert_eq!(
-                    sizes,
-                    vec![2 * 1024 * 1024 * 1024, 128 * 1024, 128 * 1024, 128 * 1024]
-                );
-            }
-            other => panic!("expected explicit bench workload, got {other:?}"),
-        }
+        let WorkloadSizeInput::ExplicitList(sizes) = config.sizes;
+        assert_eq!(
+            sizes,
+            vec![2 * 1024 * 1024 * 1024, 128 * 1024, 128 * 1024, 128 * 1024]
+        );
     }
 
     #[test]
@@ -539,12 +535,8 @@ mod tests {
         assert!(config.sequential_streams);
         assert!(config.full_file_reads);
         assert_eq!(config.access_pattern, BenchmarkAccessPattern::Sequential);
-        match config.sizes {
-            WorkloadSizeInput::ExplicitList(sizes) => {
-                assert_eq!(sizes, vec![8 * 1024 * 1024 * 1024]);
-            }
-            other => panic!("expected single-file write-path gate workload, got {other:?}"),
-        }
+        let WorkloadSizeInput::ExplicitList(sizes) = config.sizes;
+        assert_eq!(sizes, vec![8 * 1024 * 1024 * 1024]);
     }
 
     #[test]
@@ -562,12 +554,8 @@ mod tests {
 
         let config = build_bench_config(&args, "studiofs devbench", "run-1".to_string()).unwrap();
 
-        match config.sizes {
-            WorkloadSizeInput::ExplicitList(sizes) => {
-                assert_eq!(sizes, vec![64 * 1024]);
-            }
-            other => panic!("expected single-file write-path gate workload, got {other:?}"),
-        }
+        let WorkloadSizeInput::ExplicitList(sizes) = config.sizes;
+        assert_eq!(sizes, vec![64 * 1024]);
     }
 
     #[test]
@@ -587,19 +575,15 @@ mod tests {
         assert!(!config.sequential_streams);
         assert_eq!(config.access_pattern, BenchmarkAccessPattern::Random);
         assert!(!config.full_file_reads);
-        match config.sizes {
-            WorkloadSizeInput::ExplicitList(sizes) => {
-                assert_eq!(sizes.len(), 1081);
-                assert_eq!(
-                    &sizes[..8],
-                    &[
-                        139_264, 89_088, 6_144, 11_264, 49_152, 38_912, 232_448, 102_400
-                    ]
-                );
-                assert_eq!(sizes[1080], 4_215_275_520);
-            }
-            other => panic!("expected fixed public bench workload, got {other:?}"),
-        }
+        let WorkloadSizeInput::ExplicitList(sizes) = config.sizes;
+        assert_eq!(sizes.len(), 1081);
+        assert_eq!(
+            &sizes[..8],
+            &[
+                139_264, 89_088, 6_144, 11_264, 49_152, 38_912, 232_448, 102_400
+            ]
+        );
+        assert_eq!(sizes[1080], 4_215_275_520);
     }
 
     #[cfg(windows)]

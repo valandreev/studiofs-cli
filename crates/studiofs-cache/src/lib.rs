@@ -2,8 +2,6 @@
 //!
 //! `cached_store` provides the unified local cache + staged-writeback runtime
 //! used by the production mount path.
-//! `benchmark_cache` provides the lightweight in-memory benchmark surface used
-//! by `studiofs test-cache`.
 //! `runtime` provides the production local payload object backend.
 
 #![deny(unsafe_code)]
@@ -12,8 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Benchmark cache facade used only by local benchmark/test tooling.
-pub mod benchmark_cache;
 /// Production cache runtime backing VFS mount paths with staged writeback and local payload caching.
 pub mod cached_store;
 /// Local payload backends and object-store layout helpers.
@@ -27,11 +23,10 @@ pub mod upload_queue;
 /// Upload-stage cache layer and local upload backend staging types.
 pub mod upload_stage;
 
+/// Default in-memory cache size: 2 GiB.
+pub const DEFAULT_MEMORY_CACHE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 // --- Re-exports ---
-pub use benchmark_cache::{
-    BenchmarkCache, BenchmarkCacheConfig, BenchmarkCacheStats, CacheReadLevel, CacheReadTrace,
-    DEFAULT_MEMORY_CACHE_SIZE,
-};
 pub use cached_store::{
     CachedStore, CachedStoreConfig, CachedStoreWriterConfig, CachedStoreWriterCountersSnapshot,
     CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice,

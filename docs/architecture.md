@@ -121,8 +121,6 @@ foreground read path.
 - The internal `cli::benchmark_engine` module is the reusable entry point for
   mounted filesystem benchmarks. It accepts mounted runtime metadata, workload
   parameters, and returns the existing benchmark report schema.
-- The hidden legacy `test-cache` command delegates mounted end-to-end runs to
-  this engine while keeping direct-shim behavior private to the legacy command.
 - `studiofs bench` and `studiofs devbench` both call the mounted engine instead
   of reimplementing workload planning, latency sampling, phase aggregation,
   profiling artifact collection, JSON reporting, or mounted observability
