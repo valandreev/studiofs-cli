@@ -6038,6 +6038,24 @@ fn write_admission_admits_until_hard_window_without_pacing() {
 }
 
 #[test]
+fn write_admission_admits_oversized_write_when_pressure_is_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-oversized-write");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
+        )
+        .await
+        .expect("empty pressure should admit a single oversized write");
+    });
+}
+
+#[test]
 fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-waits-hard-window");

@@ -206,11 +206,9 @@ const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 4_000;
-const WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER: usize = 16;
-const WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER: usize = 64;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 20;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
-const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 100;
+const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
 const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
@@ -6129,18 +6127,6 @@ impl StudioVfs {
             });
     }
 
-    fn write_admission_budget_bytes(&self) -> usize {
-        let dirty_window = self
-            .max_dirty_bytes()
-            .saturating_mul(WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER);
-        let eager_window = self
-            .write_eager_flush_batch_bytes
-            .saturating_mul(WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER);
-        dirty_window
-            .max(eager_window)
-            .max(self.block_size.max(1) as usize)
-    }
-
     fn write_admission_buffer_budget_bytes(&self) -> usize {
         self.max_dirty_bytes().max(self.block_size.max(1) as usize)
     }
@@ -6180,19 +6166,14 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let pressure_bytes = self.total_write_admission_pressure_bytes();
+        let mut pressure_bytes = self.total_write_admission_pressure_bytes();
         if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
             return;
         }
 
         let hard_window_bytes =
             buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
-        while self
-            .total_write_admission_pressure_bytes()
-            .saturating_add(next_bytes)
-            > hard_window_bytes
-            && !self.shutdown_requested()
-        {
+        while pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
             // #region debug log
             self.debug_write_probe(
                 "H1",
@@ -6200,7 +6181,7 @@ impl StudioVfs {
                 "write admission buffer hard pacing",
                 serde_json::json!({
                     "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
-                    "pressure_bytes": self.total_write_admission_pressure_bytes(),
+                    "pressure_bytes": pressure_bytes,
                     "buffer_budget_bytes": buffer_budget_bytes,
                     "hard_window_bytes": hard_window_bytes,
                     "next_bytes": next_bytes,
@@ -6211,16 +6192,15 @@ impl StudioVfs {
             let started = Instant::now();
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
             self.record_write_admission_wait(started.elapsed());
+            pressure_bytes = self.total_write_admission_pressure_bytes();
         }
 
-        let pressure_bytes = self.total_write_admission_pressure_bytes();
-        let budget_bytes = self.write_admission_budget_bytes();
         let decision = {
             let mut governor = self.state.write_admission_governor.lock();
             governor.plan(WriteAdmissionSample {
                 now_ms: now_unix_millis(),
                 pressure_bytes,
-                budget_bytes,
+                budget_bytes: buffer_budget_bytes,
                 next_bytes,
             })
         };
@@ -6238,7 +6218,7 @@ impl StudioVfs {
                 "drain_bytes_per_sec": decision.drain_bytes_per_sec,
                 "runway_ms": decision.runway_ms,
                 "pressure_bytes": pressure_bytes,
-                "budget_bytes": budget_bytes,
+                "budget_bytes": buffer_budget_bytes,
                 "next_bytes": next_bytes,
             }),
         );
