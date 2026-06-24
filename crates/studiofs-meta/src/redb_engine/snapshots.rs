@@ -372,6 +372,20 @@ impl RedbMetaEngine {
                     .insert(*k, v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+            if preserve_local_state {
+                let tombstones = txn
+                    .open_table(INODE_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for row in tombstones
+                    .iter()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    let (k, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table
+                        .remove(k.value())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+            }
         }
         {
             let mut table = txn
@@ -407,6 +421,20 @@ impl RedbMetaEngine {
                 table
                     .insert(k.as_slice(), v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+            if preserve_local_state {
+                let tombstones = txn
+                    .open_table(DENTRY_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for row in tombstones
+                    .iter()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    let (k, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table
+                        .remove(k.value())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
             }
         }
         Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;

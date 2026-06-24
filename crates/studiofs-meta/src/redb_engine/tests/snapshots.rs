@@ -153,6 +153,27 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
 }
 
 #[test]
+fn import_remote_snapshot_preserving_local_state_keeps_local_deletes_hidden() {
+    let source = temp_engine();
+    let remote_file = source
+        .create_file(ROOT_INO, b"remote-delete-me.bin", 0, 0, 0o644)
+        .unwrap();
+    mark_empty_file_published(&source, remote_file.ino);
+    let snapshot = source.export_snapshot().unwrap();
+
+    let local = temp_engine();
+    local.import_snapshot(&snapshot).unwrap();
+    local.unlink(ROOT_INO, b"remote-delete-me.bin").unwrap();
+
+    local
+        .import_remote_snapshot_preserving_local_state(&snapshot)
+        .unwrap();
+
+    assert!(local.lookup(ROOT_INO, b"remote-delete-me.bin").is_err());
+    assert!(local.get_attr(remote_file.ino).is_err());
+}
+
+#[test]
 fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
     let engine = temp_engine();
     let state = engine.export_snapshot().unwrap();
