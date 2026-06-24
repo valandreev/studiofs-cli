@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -306,6 +306,45 @@ fn run_mounted_performance_probe(
         ));
     }
 
+    let mut same_handle_file = File::open(&probe_path)?;
+    let same_handle_warmup = read_probe_open_file(
+        &mut same_handle_file,
+        config.chunk_bytes,
+        config.file_bytes,
+        Instant::now(),
+    )?;
+    verify_probe_checksum(0, same_handle_warmup.checksum, expected_checksum)?;
+    same_handle_file.seek(SeekFrom::Start(0))?;
+    let before = sample_metrics(&metrics_path)?;
+    append_sample(
+        &samples_path,
+        "before-same-handle-read",
+        before.as_ref(),
+        &metrics_path,
+    )?;
+    let same_handle_read = read_probe_open_file(
+        &mut same_handle_file,
+        config.chunk_bytes,
+        config.file_bytes,
+        Instant::now(),
+    )?;
+    verify_probe_checksum(0, same_handle_read.checksum, expected_checksum)?;
+    let after = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
+    append_sample(
+        &samples_path,
+        "after-same-handle-read",
+        after.as_ref(),
+        &metrics_path,
+    )?;
+    phases.push(PerformanceProbePhase::new(
+        "same-handle-read".to_string(),
+        "same-handle-read".to_string(),
+        None,
+        same_handle_read,
+        &before,
+        &after,
+    ));
+
     let upload_drain = if config.wait_for_upload_drain {
         let drain = wait_for_upload_drain(
             &metrics_path,
@@ -518,6 +557,15 @@ fn read_probe_file(
 ) -> Result<PhaseIoResult, ScenarioError> {
     let started = Instant::now();
     let mut file = File::open(path)?;
+    read_probe_open_file(&mut file, chunk_bytes, expected_bytes, started)
+}
+
+fn read_probe_open_file(
+    file: &mut File,
+    chunk_bytes: usize,
+    expected_bytes: u64,
+    started: Instant,
+) -> Result<PhaseIoResult, ScenarioError> {
     let mut buffer = vec![0u8; chunk_bytes];
     let mut read_total = 0u64;
     let mut checksum = 0u64;
@@ -1254,6 +1302,12 @@ struct PerformanceProbeReadObservations {
     post_drain_fuse_read_bytes: Option<u64>,
     post_drain_foreground_local_payload_reads: Option<u64>,
     post_drain_foreground_local_payload_read_bytes: Option<u64>,
+    same_handle_read_mib_per_sec: Option<f64>,
+    same_handle_read_interpretation: Option<String>,
+    same_handle_fuse_read_calls: Option<u64>,
+    same_handle_fuse_read_bytes: Option<u64>,
+    same_handle_foreground_local_payload_reads: Option<u64>,
+    same_handle_foreground_local_payload_read_bytes: Option<u64>,
 }
 
 impl PerformanceProbeReadObservations {
@@ -1327,6 +1381,16 @@ impl PerformanceProbeReadObservations {
                 Some(post_drain.delta.foreground_local_payload_reads);
             observations.post_drain_foreground_local_payload_read_bytes =
                 Some(post_drain.delta.foreground_local_payload_read_bytes);
+        }
+        if let Some(same_handle) = phases.iter().find(|phase| phase.kind == "same-handle-read") {
+            observations.same_handle_read_mib_per_sec = Some(same_handle.mib_per_sec);
+            observations.same_handle_read_interpretation = Some(same_handle.interpretation.clone());
+            observations.same_handle_fuse_read_calls = Some(same_handle.delta.fuse_read_calls);
+            observations.same_handle_fuse_read_bytes = Some(same_handle.delta.fuse_read_bytes);
+            observations.same_handle_foreground_local_payload_reads =
+                Some(same_handle.delta.foreground_local_payload_reads);
+            observations.same_handle_foreground_local_payload_read_bytes =
+                Some(same_handle.delta.foreground_local_payload_read_bytes);
         }
         observations
     }
@@ -1492,6 +1556,30 @@ mod tests {
                 })),
             ),
             PerformanceProbePhase::new(
+                "same-handle-read".to_string(),
+                "same-handle-read".to_string(),
+                None,
+                PhaseIoResult::new(2 * 1024 * 1024, Duration::from_millis(100), 17),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 0, "bytes": 0 } },
+                    "vfs_read_path": {
+                        "calls": 0,
+                        "requested_bytes": 0,
+                        "foreground_local_payload_reads": 0,
+                        "foreground_local_payload_read_bytes": 0
+                    }
+                })),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 1, "bytes": 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 1,
+                        "requested_bytes": 1024 * 1024,
+                        "foreground_local_payload_reads": 1,
+                        "foreground_local_payload_read_bytes": 1024 * 1024
+                    }
+                })),
+            ),
+            PerformanceProbePhase::new(
                 "read-after-upload-drain-wait".to_string(),
                 "post-drain-read".to_string(),
                 None,
@@ -1543,6 +1631,11 @@ mod tests {
         assert_eq!(
             observations.post_drain_foreground_local_payload_read_bytes,
             Some(2 * 1024 * 1024)
+        );
+        assert_eq!(observations.same_handle_fuse_read_calls, Some(1));
+        assert_eq!(
+            observations.same_handle_foreground_local_payload_reads,
+            Some(1)
         );
     }
 

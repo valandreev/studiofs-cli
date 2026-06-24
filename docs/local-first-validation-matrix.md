@@ -425,7 +425,8 @@ block size. Include a raw cache-disk or raw filesystem fio baseline when it is
 available on the same Linux stand.
 
 Every report row must include write throughput, repeated-read throughput,
-post-drain warm-read throughput when upload-drain waiting is enabled,
+same-handle warm-read diagnostics, post-drain warm-read throughput when
+upload-drain waiting is enabled,
 dirty/staged/upload backlog, and CPU sampling. Treat missing JuiceFS numbers as
 an incomplete performance report rather than a pass.
 
