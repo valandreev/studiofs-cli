@@ -101,6 +101,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     local.set_counter("pgLastFlushedLocalEventSeq", local_event_start)
         .unwrap();
     local.set_counter("pgClientSlotPlusOne", 8).unwrap();
+    local.set_counter(counters::NEXT_INODE, 50_000).unwrap();
     let local_event_end = local.get_counter("nextEventSeq").unwrap();
 
     let source = temp_engine();
@@ -116,6 +117,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     source
         .create_symlink(ROOT_INO, b"remote-link", b"/remote/target", 0, 0)
         .unwrap();
+    source.set_counter(counters::NEXT_INODE, 7_000).unwrap();
     source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
     source.set_counter("pgLastFlushedLocalEventSeq", 99).unwrap();
     source.set_counter("pgClientSlotPlusOne", 99).unwrap();
@@ -137,6 +139,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     );
     assert_eq!(local.get_symlink_target(link.ino).unwrap(), b"/local/target");
     assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(local.get_counter(counters::NEXT_INODE).unwrap(), 50_000);
     assert_eq!(
         local
             .read_events_range(local_event_start, local_event_end)

@@ -345,6 +345,7 @@ impl RedbMetaEngine {
             for (k, v) in &snapshot.counters {
                 if enable_remote_namespace_filter
                     && (k.as_str() == "nextEventSeq"
+                        || preserve_local_state && k.as_str() == counters::NEXT_INODE
                         || crate::pg_engine::is_local_pg_snapshot_state_counter(k))
                 {
                     continue;
