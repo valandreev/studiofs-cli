@@ -664,14 +664,13 @@ impl MountedWritebackTimelineBucket {
         );
         self.materialization_total_ms_delta +=
             (after.payload_persist.total_ms - before.payload_persist.total_ms).max(0.0);
-        self.cache_materialize_batches_delta =
-            self.cache_materialize_batches_delta.saturating_add(
-                after
-                    .cache_pipeline
-                    .materialize
-                    .batches
-                    .saturating_sub(before.cache_pipeline.materialize.batches),
-            );
+        self.cache_materialize_batches_delta = self.cache_materialize_batches_delta.saturating_add(
+            after
+                .cache_pipeline
+                .materialize
+                .batches
+                .saturating_sub(before.cache_pipeline.materialize.batches),
+        );
         self.cache_materialize_payloads_delta =
             self.cache_materialize_payloads_delta.saturating_add(
                 after
@@ -1095,8 +1094,9 @@ fn build_mounted_write_diagnostics_report(
     let cache_materialize_payloads_delta = snapshot_delta_u64(before, after, |snapshot| {
         snapshot.cache_pipeline.materialize.payloads
     });
-    let cache_materialize_bytes_delta =
-        snapshot_delta_u64(before, after, |snapshot| snapshot.cache_pipeline.materialize.bytes);
+    let cache_materialize_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.cache_pipeline.materialize.bytes
+    });
     let upload_accounted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
         snapshot
             .upload
@@ -2144,11 +2144,14 @@ async fn run_mounted_read_operations(
 
 fn best_read_phases(mut phases: Vec<TimedPhaseTelemetry>, count: usize) -> TimedPhaseTelemetry {
     phases.sort_by(|left, right| {
-        let left_report = phase_telemetry_to_report(&left.telemetry, left.wall);
-        let right_report = phase_telemetry_to_report(&right.telemetry, right.wall);
-        right_report
-            .throughput_bytes_per_sec
-            .total_cmp(&left_report.throughput_bytes_per_sec)
+        let throughput = |phase: &TimedPhaseTelemetry| {
+            phase
+                .telemetry
+                .overall
+                .to_report(phase.wall.as_secs_f64() * 1000.0)
+                .throughput_bytes_per_sec
+        };
+        throughput(right).total_cmp(&throughput(left))
     });
 
     let mut telemetry = PhaseTelemetry::default();
@@ -2997,13 +3000,13 @@ pub(crate) async fn run_mounted_end_to_end(
                         &mut runtime_stats_warnings,
                     )
                     .await;
-                    let write_path_after_write =
-                        match write_path_observability_path_ref.as_deref() {
-                            Some(path) => {
-                                read_write_path_observability_snapshot(path, mount_pid).await?
-                            }
-                            None => None,
-                        };
+                    let write_path_after_write = match write_path_observability_path_ref.as_deref()
+                    {
+                        Some(path) => {
+                            read_write_path_observability_snapshot(path, mount_pid).await?
+                        }
+                        None => None,
+                    };
 
                     let during_upload_observation =
                         if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {

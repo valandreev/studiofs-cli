@@ -589,6 +589,9 @@ impl CachedStore {
     /// Populates the in-memory hot-upload buffer with payload bytes from `entries`.
     pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
         let mut upload_hot = self.upload_hot.lock();
+        if upload_hot.budget_bytes == 0 {
+            return;
+        }
         for entry in entries {
             upload_hot.insert(entry.object_id, entry.data.clone());
         }
@@ -1109,7 +1112,7 @@ impl CachedStoreWriterSlice {
             self.restore_staged_prefix(payload);
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
-        self.cache_hot_upload_if_enabled(object_id, payload.clone(), can_reuse_hot_payload);
+        self.cache_hot_upload_if_enabled(object_id, payload, can_reuse_hot_payload);
         self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
@@ -1761,7 +1764,7 @@ mod tests {
         assert_eq!(
             recorded[0].data.as_ptr(),
             hot.as_ptr(),
-            "hot upload cache should reuse an already detached full-block payload"
+            "hot upload cache should reuse an already detached staged slice"
         );
     }
 
@@ -2187,6 +2190,28 @@ mod tests {
             cached_store.get_hot_upload(3).as_deref(),
             Some(&b"cccc"[..])
         );
+    }
+
+    #[test]
+    fn hot_upload_batch_skips_work_when_disabled() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(0),
+            backend,
+        )
+        .expect("open cached store");
+
+        cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
+            object_id: 1,
+            data: Bytes::from_static(b"aaaa"),
+            evictable: false,
+        }]);
+
+        assert!(cached_store.get_hot_upload(1).is_none());
     }
 
     #[test]

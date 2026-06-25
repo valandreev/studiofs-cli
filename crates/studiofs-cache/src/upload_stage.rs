@@ -110,8 +110,9 @@ impl UploadStageStore {
                     stage_path.display()
                 ))
             })?;
-            if prepared_dirs.insert(stage_dir.to_path_buf()) {
+            if !prepared_dirs.contains(stage_dir) {
                 fs::create_dir_all(stage_dir)?;
+                prepared_dirs.insert(stage_dir.to_path_buf());
             }
             self.link_payload_prepared(object_id)?;
         }
