@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_write_spill_batches_preserve_cloud_object_boundaries() {
+    fn buffered_write_spill_batches_preserve_cloud_object_offsets() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "spill-object-boundaries");
         let block_size = vfs.block_size as usize;
@@ -695,15 +695,20 @@ mod tests {
 
         assert_eq!(
             batches.len(),
-            2,
-            "each full logical block needs its own uploadable cloud object"
+            1,
+            "steady drain may coalesce full logical blocks into one uploadable object"
         );
-        for (block_index, batch) in batches.iter().enumerate() {
-            assert_eq!(batch.payload.len(), block_size);
-            assert_eq!(batch.segments.len(), 1);
-            assert_eq!(batch.segments[0].block_index, block_index as u32);
-            assert_eq!(batch.segments[0].object_offset, 0);
-        }
+        let batch = &batches[0];
+        assert_eq!(batch.payload.len(), block_size * 2);
+        assert_eq!(&batch.payload[..block_size], vec![0xA1; block_size]);
+        assert_eq!(&batch.payload[block_size..], vec![0xB2; block_size]);
+        assert_eq!(batch.segments.len(), 2);
+        assert_eq!(batch.segments[0].block_index, 0);
+        assert_eq!(batch.segments[0].object_offset, 0);
+        assert_eq!(batch.segments[0].len, block_size);
+        assert_eq!(batch.segments[1].block_index, 1);
+        assert_eq!(batch.segments[1].object_offset, block_size as u32);
+        assert_eq!(batch.segments[1].len, block_size);
     }
 
     #[test]
