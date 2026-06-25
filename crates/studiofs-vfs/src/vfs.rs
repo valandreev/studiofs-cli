@@ -213,35 +213,35 @@ const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
 const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 9;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 20;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 3;
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 1;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 4;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 2;
+#[cfg(any(test, target_os = "macos"))]
 const SOFT_DIRTY_PACING_HIGH_DENOMINATOR: usize = 5;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 3;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 4;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_CRITICAL_NUMERATOR: usize = 17;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_CRITICAL_DENOMINATOR: usize = 20;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 1;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 3;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 6;
-#[cfg(test)]
-const SOFT_DIRTY_PACING_DELAY_CRITICAL_MS: u64 = 10;
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 11;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 20;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_CRITICAL_NUMERATOR: usize = 7;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_CRITICAL_DENOMINATOR: usize = 10;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 2;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 5;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 8;
+#[cfg(any(test, target_os = "macos"))]
+const SOFT_DIRTY_PACING_DELAY_CRITICAL_MS: u64 = 12;
+#[cfg(any(test, target_os = "macos"))]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 256;
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
@@ -2851,7 +2851,7 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
         .max(1)
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
 fn soft_dirty_budget_pacing_delay_ms(
     total_dirty_bytes: usize,
     max_dirty_bytes: usize,
@@ -6115,10 +6115,6 @@ impl StudioVfs {
         }
     }
 
-    fn total_write_admission_pressure_bytes(&self) -> usize {
-        self.write_admission_pressure().total_bytes()
-    }
-
     fn local_sync_unsynced_bytes(&self) -> usize {
         usize::try_from(
             self.state
@@ -6191,15 +6187,51 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let mut pressure_bytes = self.total_write_admission_pressure_bytes();
+        let mut pressure = self.write_admission_pressure();
+        let mut pressure_bytes = pressure.total_bytes();
+        #[cfg(target_os = "macos")]
+        {
+            let writer_stack_dirty_with_next =
+                pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);
+            if let Some(delay_ms) = soft_dirty_budget_pacing_delay_ms(
+                writer_stack_dirty_with_next,
+                buffer_budget_bytes,
+                0,
+            ) {
+                if self.write_debug_enabled() {
+                    self.debug_write_probe(
+                        "H2",
+                        concat!(file!(), ":", line!()),
+                        "write admission soft pacing",
+                        serde_json::json!({
+                            "delay_ms": delay_ms,
+                            "writer_stack_dirty_bytes": pressure.writer_stack_dirty_bytes,
+                            "writer_stack_dirty_with_next": writer_stack_dirty_with_next,
+                            "buffer_budget_bytes": buffer_budget_bytes,
+                            "next_bytes": next_bytes,
+                        }),
+                    );
+                }
+
+                let started = Instant::now();
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                self.record_write_admission_wait(started.elapsed());
+                pressure = self.write_admission_pressure();
+                pressure_bytes = pressure.total_bytes();
+                if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
+                    return;
+                }
+            }
+        }
         if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
             return;
         }
 
         let hard_window_bytes =
             buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
+        let mut writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
         let mut hard_wait_started = None;
-        while pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
+        while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
             hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
             if self.write_debug_enabled() {
@@ -6209,6 +6241,7 @@ impl StudioVfs {
                     "write admission buffer hard pacing",
                     serde_json::json!({
                         "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
+                        "writer_stack_dirty_bytes": writer_stack_pressure_bytes,
                         "pressure_bytes": pressure_bytes,
                         "buffer_budget_bytes": buffer_budget_bytes,
                         "hard_window_bytes": hard_window_bytes,
@@ -6219,7 +6252,9 @@ impl StudioVfs {
             // #endregion debug log
 
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
-            pressure_bytes = self.total_write_admission_pressure_bytes();
+            let pressure = self.write_admission_pressure();
+            pressure_bytes = pressure.total_bytes();
+            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
         }
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());

@@ -5937,15 +5937,69 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 #[test]
 fn soft_dirty_budget_pacing_starts_before_hard_limit() {
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(45, 100, 0), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(3));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(75, 100, 0), Some(6));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(85, 100, 0), Some(10));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(3));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(6));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(24, 100, 0), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(25, 100, 0), Some(2));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(40, 100, 0), Some(5));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(55, 100, 0), Some(8));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(70, 100, 0), Some(12));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(2));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(5));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(8));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(8));
+}
+
+#[test]
+fn write_admission_soft_paces_before_hard_window() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-soft-paces-before-hard-window");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"admission-soft-paces-before-hard-window.bin",
+                0,
+                0,
+                0o644,
+            )
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        let seeded_len = buffer_budget_bytes * SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR
+            / SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; seeded_len]),
+            )
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            vfs.maybe_throttle_write_admission(1),
+        )
+        .await
+        .expect("soft pacing should avoid the hard admission stall");
+        assert!(
+            vfs.state
+                .metrics
+                .drain_lag_pacing_events
+                .load(Ordering::Relaxed)
+                >= 1,
+            "soft admission pacing should be recorded"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
 }
 
 #[test]
@@ -5993,7 +6047,7 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 }
 
 #[test]
-fn write_admission_admits_until_hard_window_without_pacing() {
+fn write_admission_admits_below_soft_window_without_pacing() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-buffer-window");
     let _guard = rt.enter();
@@ -6004,6 +6058,8 @@ fn write_admission_admits_until_hard_window_without_pacing() {
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
         let buffer_budget_bytes = vfs.block_size as usize;
         vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        let seeded_len = buffer_budget_bytes * (SOFT_DIRTY_PACING_START_NUMERATOR - 1)
+            / SOFT_DIRTY_PACING_START_DENOMINATOR;
         vfs.state
             .writer_stack
             .write_bytes(
@@ -6015,7 +6071,7 @@ fn write_admission_admits_until_hard_window_without_pacing() {
                     first_object_id: 0,
                     offset: 0,
                 },
-                Bytes::from(vec![0xAB; buffer_budget_bytes + 1]),
+                Bytes::from(vec![0xAB; seeded_len]),
             )
             .unwrap();
 
@@ -6024,7 +6080,7 @@ fn write_admission_admits_until_hard_window_without_pacing() {
             vfs.maybe_throttle_write_admission(1),
         )
         .await
-        .expect("admission should not sleep below the hard window");
+        .expect("admission should not sleep below the soft window");
         assert_eq!(
             vfs.state
                 .metrics
@@ -6056,7 +6112,53 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
 }
 
 #[test]
-fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
+fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-ignores-upload-backlog");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        let mut writer = vfs
+            .cached_store()
+            .open_writer_slice(CachedStoreWriterConfig {
+                ino: 7,
+                base_offset: 0,
+                first_object_id: 10_000,
+                content_epoch: 1,
+                block_size: buffer_budget_bytes,
+                page_size: buffer_budget_bytes,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+                submit_upload: true,
+            });
+
+        writer
+            .write_at(0, &vec![0xAB; buffer_budget_bytes * 3])
+            .expect("write pending upload blocks");
+        let detached = writer
+            .detach_completed_blocks(usize::MAX)
+            .expect("detach pending upload blocks");
+        vfs.cached_store()
+            .persist_detached_staged_slices(detached)
+            .expect("persist pending upload backlog");
+        assert!(
+            vfs.write_admission_pressure().pending_upload_bytes
+                > (buffer_budget_bytes * HARD_BACKPRESSURE_DIRTY_MULTIPLIER) as usize,
+            "test should seed upload backlog above the hard window"
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            vfs.maybe_throttle_write_admission(1),
+        )
+        .await
+        .expect("pending upload backlog must not trigger hard admission wait");
+    });
+}
+
+#[test]
+fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-waits-hard-window");
     let _guard = rt.enter();
@@ -6091,7 +6193,7 @@ fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
         .await;
         assert!(
             !wait_task.is_finished(),
-            "admission should keep waiting while total pressure remains above the hard window"
+            "admission should keep waiting while writer-stack pressure remains above the hard window"
         );
 
         vfs.state.writer_stack.clear_inode(attr.ino);
@@ -6102,15 +6204,84 @@ fn write_admission_waits_until_total_pressure_drops_below_hard_window() {
         .await
         .expect("admission should unblock after writer-stack pressure drops")
         .expect("admission task should not panic");
-        assert_eq!(
+        assert!(
             vfs.state
                 .metrics
                 .drain_lag_pacing_events
-                .load(Ordering::Relaxed),
-            1,
-            "hard admission wait should be recorded as one stall event"
+                .load(Ordering::Relaxed)
+                >= 1,
+            "hard admission wait should be recorded"
         );
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sustained-pre-drain-under-pressure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sustained-pre-drain-under-pressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.set_max_dirty_bytes(64 * 1024 * 1024);
+
+        let seeded_len = 33 * 1024 * 1024;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; seeded_len]),
+            )
+            .unwrap();
+        let now = now_unix_millis();
+        vfs.state.sustained_write_streams.lock().insert(
+            ino,
+            SustainedWriteState {
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DECAY_START_MS),
+                last_write_ms: now.saturating_sub(1),
+                last_end_offset: seeded_len as u64,
+            },
+        );
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should reserve deferred materialization gate");
+
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.state
+                .deferred_materialize_reschedule_needed
+                .lock()
+                .contains(&ino),
+            "sustained pre-drain should request background materialization before admission pacing"
+        );
+        let _ = vfs
+            .state
+            .deferred_materialize_inflight
+            .replace_if_current_or_remove(&entry, || false);
+        drop(guard);
+        vfs.state.writer_stack.clear_inode(ino);
         vfs.release_fh(fh).await.unwrap();
     });
 }
