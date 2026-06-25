@@ -1649,17 +1649,6 @@ impl StudioVfs {
             }
             self.maybe_payload_store_sync_data_async(persisted_bytes, local_sync_policy)
                 .await?;
-            if !persisted_object_ids.is_empty()
-                && let Err(error) = self
-                    .upload_stage_link_batch_async(persisted_object_ids.clone())
-                    .await
-            {
-                warn!(
-                    persisted_object_count = persisted_object_ids.len(),
-                    error = %error,
-                    "failed to create zero-copy upload links for durable slice payloads"
-                );
-            }
             Ok(())
         }
         .await;

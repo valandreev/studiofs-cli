@@ -9098,8 +9098,8 @@ fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
             "setup should leave the flushed payload in the local backend"
         );
         assert!(
-            vfs.cached_store().has_staged_upload(object_id),
-            "setup should create the upload-stage hardlink"
+            !vfs.cached_store().has_staged_upload(object_id),
+            "flush should defer upload-stage hardlink creation to the uploader"
         );
         assert!(
             vfs.cached_store().is_pinned(object_id),
@@ -9172,7 +9172,7 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
             .object_id;
 
         assert!(vfs.local_payload_backend().contains(object_id));
-        assert!(vfs.cached_store().has_staged_upload(object_id));
+        assert!(!vfs.cached_store().has_staged_upload(object_id));
         assert!(vfs.cached_store().is_pinned(object_id));
 
         vfs.lazy_evict_removed_metadata_payloads(
