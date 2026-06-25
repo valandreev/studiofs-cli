@@ -929,7 +929,10 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let spill_bytes_cap = self.writer_stack_steady_drain_quota_bytes();
+        let spill_bytes_cap = self.writer_stack_steady_drain_quota_bytes().min(
+            studiofs_data::object::CLOUD_FRAGMENT_SIZE
+                * studiofs_data::object::CLOUD_FRAGMENT_COUNT,
+        );
         let mut ordered_blocks: Vec<&DirtyWriteSnapshot> = blocks.iter().collect();
         ordered_blocks.sort_unstable_by_key(|block| block.block_index);
 
