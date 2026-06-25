@@ -512,6 +512,13 @@ fn render_mounted_write_diagnostics(out: &mut String, diagnostics: &MountedWrite
     );
     let _ = writeln!(
         out,
+        "Materialize: {} batches, {} payloads, {}",
+        diagnostics.cache_materialize_batches_delta,
+        diagnostics.cache_materialize_payloads_delta,
+        format_bytes(diagnostics.cache_materialize_bytes_delta),
+    );
+    let _ = writeln!(
+        out,
         "Accounted after: writer {}, staged {}, pending upload {}, cache pressure {}, total {}",
         format_optional_bytes(diagnostics.writer_stack_dirty_bytes_after),
         format_optional_bytes(diagnostics.pending_persisted_slice_bytes_after),
@@ -562,10 +569,12 @@ fn render_mounted_writeback_timeline(out: &mut String, timeline: &MountedWriteba
     );
     let _ = writeln!(
         out,
-        "Backpressure: last events {} wait {}, worst wait {}; local cache IO last {} calls/{}, worst bucket {}",
+        "Backpressure: last events {} wait {}, worst wait {}; materialize last {} batches/{}; local cache IO last {} calls/{}, worst bucket {}",
         last.backpressure_events_delta,
         format_duration_ms(last.backpressure_wait_ms_delta as f64),
         format_duration_ms(max_backpressure_wait_ms as f64),
+        last.cache_materialize_batches_delta,
+        format_bytes(last.cache_materialize_bytes_delta),
         last.local_cache_io_calls_delta,
         format_duration_ms(last.local_cache_backend_io_total_ms_delta),
         format_duration_ms(max_local_cache_io_ms),
@@ -1546,6 +1555,9 @@ mod tests {
                 hard_backpressure_events_delta: 1,
                 materialization_calls_delta: 8,
                 materialization_total_ms_delta: 44.0,
+                cache_materialize_batches_delta: 4,
+                cache_materialize_payloads_delta: 8,
+                cache_materialize_bytes_delta: 32 * 1024 * 1024,
                 local_cache_io_calls_delta: 8,
                 local_cache_backend_io_total_ms_delta: 40.0,
                 local_cache_backend_io_cumulative_max_ms: 12.0,

@@ -1446,6 +1446,34 @@ pub struct VfsPortableAllocatorStats {
     pub reallocation_count: u64,
 }
 
+/// Local cache materialization counters exposed in the live write-path snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsCachePipelineMaterializeStats {
+    /// Completed materialization batches.
+    #[serde(default)]
+    pub batches: u64,
+    /// Payloads materialized by completed batches.
+    #[serde(default)]
+    pub payloads: u64,
+    /// Bytes materialized into the local payload cache.
+    #[serde(default)]
+    pub bytes: u64,
+    /// Current in-flight materialization batches.
+    #[serde(default)]
+    pub inflight_batches: usize,
+    /// Peak in-flight materialization batches.
+    #[serde(default)]
+    pub inflight_batches_peak: usize,
+}
+
+/// Local cache pipeline counters exposed in the live write-path snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsCachePipelineStats {
+    /// Materialization counters.
+    #[serde(default)]
+    pub materialize: VfsCachePipelineMaterializeStats,
+}
+
 /// Complete write-path observability snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
@@ -1513,6 +1541,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Fetch metrics.
     #[serde(default)]
     pub fetch: VfsFetchStats,
+    /// Local cache pipeline metrics.
+    #[serde(default)]
+    pub cache_pipeline: VfsCachePipelineStats,
     /// Payload burst metrics.
     #[serde(default)]
     pub payload_burst: VfsWritePathBurstStats,

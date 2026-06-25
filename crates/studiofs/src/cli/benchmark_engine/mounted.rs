@@ -112,6 +112,7 @@ struct MeasuredMountedPhaseResult {
     reads_cpu: Duration,
     stats: PhaseTelemetry,
     stats_wall: Duration,
+    write_path_after_write: Option<VfsWritePathObservabilitySnapshot>,
     runtime_stats_after_write: Option<RuntimeStatsSnapshot>,
     runtime_stats_before_read: Option<RuntimeStatsSnapshot>,
     runtime_stats_after_read: Option<RuntimeStatsSnapshot>,
@@ -561,6 +562,9 @@ struct MountedWritebackTimelineBucket {
     hard_backpressure_events_delta: u64,
     materialization_calls_delta: u64,
     materialization_total_ms_delta: f64,
+    cache_materialize_batches_delta: u64,
+    cache_materialize_payloads_delta: u64,
+    cache_materialize_bytes_delta: u64,
     local_cache_io_calls_delta: u64,
     local_cache_backend_io_total_ms_delta: f64,
     local_cache_backend_io_cumulative_max_ms: f64,
@@ -586,6 +590,9 @@ impl MountedWritebackTimelineBucket {
             hard_backpressure_events_delta: 0,
             materialization_calls_delta: 0,
             materialization_total_ms_delta: 0.0,
+            cache_materialize_batches_delta: 0,
+            cache_materialize_payloads_delta: 0,
+            cache_materialize_bytes_delta: 0,
             local_cache_io_calls_delta: 0,
             local_cache_backend_io_total_ms_delta: 0.0,
             local_cache_backend_io_cumulative_max_ms: 0.0,
@@ -657,6 +664,29 @@ impl MountedWritebackTimelineBucket {
         );
         self.materialization_total_ms_delta +=
             (after.payload_persist.total_ms - before.payload_persist.total_ms).max(0.0);
+        self.cache_materialize_batches_delta =
+            self.cache_materialize_batches_delta.saturating_add(
+                after
+                    .cache_pipeline
+                    .materialize
+                    .batches
+                    .saturating_sub(before.cache_pipeline.materialize.batches),
+            );
+        self.cache_materialize_payloads_delta =
+            self.cache_materialize_payloads_delta.saturating_add(
+                after
+                    .cache_pipeline
+                    .materialize
+                    .payloads
+                    .saturating_sub(before.cache_pipeline.materialize.payloads),
+            );
+        self.cache_materialize_bytes_delta = self.cache_materialize_bytes_delta.saturating_add(
+            after
+                .cache_pipeline
+                .materialize
+                .bytes
+                .saturating_sub(before.cache_pipeline.materialize.bytes),
+        );
         self.local_cache_io_calls_delta = self.local_cache_io_calls_delta.saturating_add(
             after
                 .local_cache_io
@@ -704,6 +734,9 @@ impl MountedWritebackTimelineBucket {
             hard_backpressure_events_delta: self.hard_backpressure_events_delta,
             materialization_calls_delta: self.materialization_calls_delta,
             materialization_total_ms_delta: self.materialization_total_ms_delta,
+            cache_materialize_batches_delta: self.cache_materialize_batches_delta,
+            cache_materialize_payloads_delta: self.cache_materialize_payloads_delta,
+            cache_materialize_bytes_delta: self.cache_materialize_bytes_delta,
             local_cache_io_calls_delta: self.local_cache_io_calls_delta,
             local_cache_backend_io_total_ms_delta: self.local_cache_backend_io_total_ms_delta,
             local_cache_backend_io_cumulative_max_ms: self.local_cache_backend_io_cumulative_max_ms,
@@ -1056,16 +1089,27 @@ fn build_mounted_write_diagnostics_report(
     });
     let payload_persisted_bytes_delta =
         snapshot_delta_u64(before, after, |snapshot| snapshot.payload_burst.total_bytes);
+    let cache_materialize_batches_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.cache_pipeline.materialize.batches
+    });
+    let cache_materialize_payloads_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.cache_pipeline.materialize.payloads
+    });
+    let cache_materialize_bytes_delta =
+        snapshot_delta_u64(before, after, |snapshot| snapshot.cache_pipeline.materialize.bytes);
     let upload_accounted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
         snapshot
             .upload
             .completed_upload_bytes
             .saturating_add(snapshot.upload.pending_upload_bytes)
     });
-    let payload_accounted_bytes_delta = if payload_persisted_bytes_delta > 0 {
-        payload_persisted_bytes_delta
+    let local_accounted_bytes_delta = payload_persisted_bytes_delta
+        .max(cache_materialize_bytes_delta)
+        .max(upload_accounted_bytes_delta);
+    let payload_accounted_bytes_delta = if vfs_write_bytes_delta >= writes.bytes {
+        local_accounted_bytes_delta.max(writes.bytes)
     } else {
-        upload_accounted_bytes_delta
+        local_accounted_bytes_delta
     };
     let landing_accepted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
         snapshot.landing_zone.accepted_bytes
@@ -1147,6 +1191,9 @@ fn build_mounted_write_diagnostics_report(
             pressure.total_accounted_bytes
         }),
         payload_persist_calls_delta,
+        cache_materialize_batches_delta,
+        cache_materialize_payloads_delta,
+        cache_materialize_bytes_delta,
         local_cache_io_calls_delta,
         local_cache_backend_io_total_ms_delta,
         hard_backpressure_events_delta,
@@ -2954,6 +3001,13 @@ pub(crate) async fn run_mounted_end_to_end(
                         &mut runtime_stats_warnings,
                     )
                     .await;
+                    let write_path_after_write =
+                        match write_path_observability_path_ref.as_deref() {
+                            Some(path) => {
+                                read_write_path_observability_snapshot(path, mount_pid).await?
+                            }
+                            None => None,
+                        };
 
                     let during_upload_observation =
                         if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {
@@ -3050,6 +3104,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         reads_cpu,
                         stats,
                         stats_wall,
+                        write_path_after_write,
                         runtime_stats_after_write,
                         runtime_stats_before_read,
                         runtime_stats_after_read,
@@ -3073,6 +3128,10 @@ pub(crate) async fn run_mounted_end_to_end(
                 Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
                 None => None,
             };
+        let measured_write_path_after_write_for_report = measured
+            .write_path_after_write
+            .clone()
+            .or_else(|| measured_write_path_after_for_report.clone());
         let mut mounted_writeback_timeline = mounted_writeback_timeline;
 
         let profile = params.profile.then_some(BenchmarkProfileReport {
@@ -3401,7 +3460,7 @@ pub(crate) async fn run_mounted_end_to_end(
         };
         let mounted_write_path_window = build_mounted_write_path_window(
             measured_write_path_before,
-            measured_write_path_after_for_report.clone(),
+            measured_write_path_after_write_for_report.clone(),
         );
         let advanced_metrics = build_advanced_metrics(
             size_class_bounds,
@@ -3448,7 +3507,7 @@ pub(crate) async fn run_mounted_end_to_end(
             &writes_report,
             mounted_memory.as_ref(),
             measured_write_path_before_for_report.as_ref(),
-            measured_write_path_after_for_report.as_ref(),
+            measured_write_path_after_write_for_report.as_ref(),
         ));
         let write_path_gate = params.write_path_gate.then(|| {
             build_write_path_gate_report(
@@ -4568,6 +4627,14 @@ mod tests {
                 completed_upload_bytes: 1024,
                 ..Default::default()
             },
+            cache_pipeline: studiofs_vfs::VfsCachePipelineStats {
+                materialize: studiofs_vfs::VfsCachePipelineMaterializeStats {
+                    batches: 3,
+                    payloads: 6,
+                    bytes: 24 * 1024 * 1024,
+                    ..Default::default()
+                },
+            },
             fetch: studiofs_vfs::VfsFetchStats {
                 ..Default::default()
             },
@@ -4613,6 +4680,15 @@ mod tests {
                 completed_upload_bytes: 17 * 1024 * 1024 + 1024,
                 ..Default::default()
             },
+            cache_pipeline: studiofs_vfs::VfsCachePipelineStats {
+                materialize: studiofs_vfs::VfsCachePipelineMaterializeStats {
+                    batches: 11,
+                    payloads: 22,
+                    bytes: 88 * 1024 * 1024,
+                    inflight_batches: 1,
+                    inflight_batches_peak: 2,
+                },
+            },
             fetch: studiofs_vfs::VfsFetchStats {
                 ..Default::default()
             },
@@ -4646,6 +4722,9 @@ mod tests {
         assert_eq!(sample.hard_backpressure_events_delta, 1);
         assert_eq!(sample.materialization_calls_delta, 8);
         assert_eq!(sample.materialization_total_ms_delta, 44.0);
+        assert_eq!(sample.cache_materialize_batches_delta, 8);
+        assert_eq!(sample.cache_materialize_payloads_delta, 16);
+        assert_eq!(sample.cache_materialize_bytes_delta, 64 * 1024 * 1024);
         assert_eq!(sample.local_cache_io_calls_delta, 9);
         assert_eq!(sample.local_cache_backend_io_total_ms_delta, 40.0);
         assert_eq!(sample.local_cache_backend_io_cumulative_max_ms, 12.0);
@@ -4857,6 +4936,14 @@ mod tests {
                 calls: 2,
                 ..Default::default()
             },
+            cache_pipeline: studiofs_vfs::VfsCachePipelineStats {
+                materialize: studiofs_vfs::VfsCachePipelineMaterializeStats {
+                    batches: 3,
+                    payloads: 6,
+                    bytes: 768,
+                    ..Default::default()
+                },
+            },
             local_cache_io: VfsWritePathLocalCacheIoStats {
                 calls: 4,
                 backend_io_total_ms: 11.0,
@@ -4889,6 +4976,14 @@ mod tests {
             payload_persist: VfsWritePathStageLatencyStats {
                 calls: 10,
                 ..Default::default()
+            },
+            cache_pipeline: studiofs_vfs::VfsCachePipelineStats {
+                materialize: studiofs_vfs::VfsCachePipelineMaterializeStats {
+                    batches: 11,
+                    payloads: 22,
+                    bytes: 1792,
+                    ..Default::default()
+                },
             },
             local_cache_io: VfsWritePathLocalCacheIoStats {
                 calls: 14,
@@ -4946,6 +5041,9 @@ mod tests {
         assert!(diagnostics.write_throughput_target_met);
         assert_eq!(diagnostics.rss_target_met, Some(true));
         assert_eq!(diagnostics.payload_persisted_bytes_delta, 1024);
+        assert_eq!(diagnostics.cache_materialize_batches_delta, 8);
+        assert_eq!(diagnostics.cache_materialize_payloads_delta, 16);
+        assert_eq!(diagnostics.cache_materialize_bytes_delta, 1024);
         assert_eq!(diagnostics.landing_accepted_bytes_delta, 0);
         assert_eq!(diagnostics.known_local_write_amplification, Some(1.0));
         assert!(!diagnostics.landing_journal_active);
@@ -4953,5 +5051,55 @@ mod tests {
         assert_eq!(diagnostics.hard_backpressure_events_delta, 2);
         assert_eq!(diagnostics.soft_throttle_events_delta, 5);
         assert!(diagnostics.blockers.is_empty());
+    }
+
+    #[test]
+    fn mounted_write_diagnostics_clamps_async_accounting_to_accepted_write_bytes() {
+        let gib = 1024 * 1024 * 1024;
+        let after = VfsWritePathObservabilitySnapshot {
+            vfs_write_path: VfsWritePathVfsWriteStats {
+                write_bytes: gib,
+                ..Default::default()
+            },
+            upload: studiofs_vfs::VfsUploadStats {
+                completed_upload_bytes: 652 * 1024 * 1024,
+                pending_upload_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+            cache_pipeline: studiofs_vfs::VfsCachePipelineStats {
+                materialize: studiofs_vfs::VfsCachePipelineMaterializeStats {
+                    bytes: 844 * 1024 * 1024,
+                    ..Default::default()
+                },
+            },
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                writer_stack_dirty_bytes: 116 * 1024 * 1024,
+                pending_persisted_slice_bytes: 128 * 1024 * 1024,
+                pending_upload_bytes: 64 * 1024 * 1024,
+                total_accounted_bytes: 308 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let writes = super::super::result::OpReport {
+            operations: 1,
+            bytes: gib,
+            elapsed_ms: 1.0,
+            avg_latency_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            throughput_bytes_per_sec: 1_200.0 * 1024.0 * 1024.0,
+            latency_histogram: super::super::result::LatencyHistogramReport {
+                bucket_upper_bounds_ns: vec![50_000],
+                bucket_counts: vec![1, 0],
+            },
+            operations_log: Vec::new(),
+        };
+
+        let diagnostics = build_mounted_write_diagnostics_report(&writes, None, None, Some(&after));
+
+        assert_eq!(diagnostics.payload_accounted_bytes_delta, gib);
+        assert_eq!(diagnostics.known_local_write_amplification, Some(1.0));
     }
 }
