@@ -38,6 +38,7 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
 const STUDIOFS_FUSE_WRITEBACK_CACHE_ENV: &str = "STUDIOFS_FUSE_WRITEBACK_CACHE";
@@ -162,15 +163,11 @@ impl FuseAsyncWriteAdmissionPolicy {
 }
 
 fn fuse_attr_blksize() -> u32 {
-    512
+    FUSE_ATTR_BLOCK_SIZE
 }
 
-fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
-    if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-        fuser::consts::FOPEN_KEEP_CACHE
-    } else {
-        0
-    }
+fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
+    fuser::consts::FOPEN_KEEP_CACHE
 }
 
 fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
@@ -2364,11 +2361,11 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
         FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
-        resolve_fuse_writeback_cache_enabled, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
-        vfs_err_to_errno,
+        fuse_attr_blksize, fuse_write_local_sync_policy, is_missing_xattr_error,
+        missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
+        resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
+        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
+        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -2711,19 +2708,24 @@ mod tests {
     }
 
     #[test]
+    fn fuse_attr_blksize_matches_large_sequential_io_policy() {
+        assert_eq!(fuse_attr_blksize(), 4 * 1024 * 1024);
+    }
+
+    #[test]
     fn fuse_open_reply_flags_match_platform_cache_policy() {
-        {
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY),
-                fuser::consts::FOPEN_KEEP_CACHE
-            );
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
-                fuser::consts::FOPEN_KEEP_CACHE
-            );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
-        }
+        assert_eq!(
+            fuse_open_reply_flags(OpenFlags::RDONLY),
+            fuser::consts::FOPEN_KEEP_CACHE
+        );
+        assert_eq!(
+            fuse_open_reply_flags(OpenFlags::WRONLY),
+            fuser::consts::FOPEN_KEEP_CACHE
+        );
+        assert_eq!(
+            fuse_open_reply_flags(OpenFlags::RDWR | OpenFlags::APPEND),
+            fuser::consts::FOPEN_KEEP_CACHE
+        );
     }
 
     #[test]

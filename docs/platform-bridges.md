@@ -209,11 +209,11 @@ On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 
 ### Linux cache and I/O policy
 
-Linux FUSE keeps buffered I/O as the default. Regular read-only opens return
-`FOPEN_KEEP_CACHE` so safe reopen and sequential-read paths can reuse the
-kernel page cache. Write-capable opens do not request `FOPEN_KEEP_CACHE` and do
-not request `FOPEN_DIRECT_IO`, which keeps write coherence explicit without
-globally disabling buffered reads.
+Linux FUSE keeps buffered I/O as the default. Regular file opens return
+`FOPEN_KEEP_CACHE`, including write-capable opens, so write-then-read paths can
+reuse the kernel page cache. Opens do not request `FOPEN_DIRECT_IO`.
+Regular file attributes report a 4 MiB preferred I/O size to match the bridge
+read/write sizing policy instead of advertising a 512-byte block size.
 
 The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote
