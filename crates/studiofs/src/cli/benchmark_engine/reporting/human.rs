@@ -180,6 +180,16 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
+        "Large hot-read: {} (best 4 of 10)",
+        format_throughput(
+            public_bench
+                .read_metrics
+                .large_hot_read_best4
+                .throughput_bytes_per_sec
+        )
+    );
+    let _ = writeln!(
+        &mut out,
         "Pseudo-random read: {}, {} p95",
         format_throughput(
             public_bench
@@ -1152,6 +1162,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read: op_report(1081, 4 * 1024 * 1024 * 1024, 510.0, 12.0),
                 hot_read: op_report(1081, 4 * 1024 * 1024 * 1024, 1800.0, 2.4),
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },
@@ -1185,6 +1196,7 @@ mod tests {
         assert!(summary.contains("Mixed-write speed: 52.00MiB/s"));
         assert!(summary.contains("First-read speed:"));
         assert!(summary.contains("Hot-read speed:"));
+        assert!(summary.contains("Large hot-read: 2.15GiB/s (best 4 of 10)"));
         assert!(summary.contains("Pseudo-random read: 240.00MiB/s, 3.20 ms p95"));
         assert!(summary.contains("Upload drain: not observed after 10.00 s"));
         assert!(summary.contains("CPU: avg n/a, peak n/a"));
@@ -1245,6 +1257,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read: op_report(1081, 4 * 1024 * 1024 * 1024, 510.0, 12.0),
                 hot_read: op_report(1081, 4 * 1024 * 1024 * 1024, 1800.0, 2.4),
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },
@@ -1316,6 +1329,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read,
                 hot_read,
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },

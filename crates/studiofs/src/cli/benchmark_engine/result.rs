@@ -700,6 +700,7 @@ pub(crate) struct PublicBenchDuringUploadReadReport {
 pub(crate) struct PublicBenchReadMetricsReport {
     pub(crate) first_read: OpReport,
     pub(crate) hot_read: OpReport,
+    pub(crate) large_hot_read_best4: OpReport,
     pub(crate) pseudo_random_read: OpReport,
     pub(crate) sequential_medium_read: OpReport,
 }

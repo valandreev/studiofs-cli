@@ -1099,6 +1099,7 @@ impl CachedStoreWriterSlice {
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
         let payload = self.take_prefix(len);
+        let can_reuse_hot_payload = self.dirty_bytes() == 0;
         let object_id = self.next_object_id;
 
         if let Err(source) = self.store.local_payload_backend.put_owned(LocalPayloadPut {
@@ -1113,7 +1114,7 @@ impl CachedStoreWriterSlice {
             self.restore_staged_prefix(payload);
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
-        self.cache_hot_upload_if_enabled(object_id, &payload);
+        self.cache_hot_upload_if_enabled(object_id, payload.clone(), can_reuse_hot_payload);
         self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
@@ -1196,10 +1197,19 @@ impl CachedStoreWriterSlice {
         self.dirty_len = self.dirty_len.saturating_add(payload.len());
     }
 
-    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: &Bytes) {
+    fn cache_hot_upload_if_enabled(
+        &self,
+        object_id: ObjectId,
+        payload: Bytes,
+        can_reuse_payload: bool,
+    ) {
         let mut upload_hot = self.store.upload_hot.lock();
         if upload_hot.budget_bytes > 0 {
-            let payload = Bytes::copy_from_slice(payload.as_ref());
+            let payload = if can_reuse_payload {
+                payload
+            } else {
+                Bytes::copy_from_slice(payload.as_ref())
+            };
             upload_hot.insert(object_id, payload);
         }
     }
@@ -1721,10 +1731,10 @@ mod tests {
             .get_hot_upload(staged[0].object_id)
             .expect("hot upload payload");
         assert_eq!(hot.as_ref(), b"abcdefgh");
-        assert_ne!(
+        assert_eq!(
             recorded[0].data.as_ptr(),
             hot.as_ptr(),
-            "hot upload cache should keep a compact payload instead of retaining writer backing memory"
+            "hot upload cache should reuse an already detached full-block payload"
         );
     }
 

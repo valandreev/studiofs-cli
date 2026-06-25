@@ -87,8 +87,8 @@ impl LatencySamples {
         }
     }
 
-    fn to_size_class_report(&self, class: SizeClass, wall_elapsed_ms: f64) -> SizeClassOpReport {
-        let report = self.to_report(wall_elapsed_ms);
+    fn to_size_class_report(&self, class: SizeClass) -> SizeClassOpReport {
+        let report = self.to_report(self.total_duration_ms());
         SizeClassOpReport {
             class: class.label().to_string(),
             operations: report.operations,
@@ -197,14 +197,11 @@ impl SizeClassLatencySamples {
         }
     }
 
-    fn to_reports(&self, wall_elapsed_ms: f64) -> Vec<SizeClassOpReport> {
+    fn to_reports(&self) -> Vec<SizeClassOpReport> {
         vec![
-            self.small
-                .to_size_class_report(SizeClass::Small, wall_elapsed_ms),
-            self.medium
-                .to_size_class_report(SizeClass::Medium, wall_elapsed_ms),
-            self.large
-                .to_size_class_report(SizeClass::Large, wall_elapsed_ms),
+            self.small.to_size_class_report(SizeClass::Small),
+            self.medium.to_size_class_report(SizeClass::Medium),
+            self.large.to_size_class_report(SizeClass::Large),
         ]
     }
 }
@@ -326,8 +323,8 @@ pub(crate) fn build_advanced_metrics(
     writes: &PhaseTelemetry,
     reads: &PhaseTelemetry,
     _cache_pipeline: Option<&CachePipelineReport>,
-    writes_wall_elapsed_ms: f64,
-    reads_wall_elapsed_ms: f64,
+    _writes_wall_elapsed_ms: f64,
+    _reads_wall_elapsed_ms: f64,
 ) -> AdvancedMetricsReport {
     AdvancedMetricsReport {
         size_class_boundaries: SizeClassBoundaryReport {
@@ -335,8 +332,8 @@ pub(crate) fn build_advanced_metrics(
             medium_max_bytes: size_class_bounds.medium_max,
         },
         size_class_stats: SizeClassStatsReport {
-            writes: writes.by_size.to_reports(writes_wall_elapsed_ms),
-            reads: reads.by_size.to_reports(reads_wall_elapsed_ms),
+            writes: writes.by_size.to_reports(),
+            reads: reads.by_size.to_reports(),
         },
         cache_levels: None,
     }
@@ -427,5 +424,35 @@ mod tests {
             "/mnt/studiofs-benchmark/0003.bin"
         );
         assert_eq!(report.operations_log[1].size_class, "medium");
+    }
+
+    #[test]
+    fn advanced_metrics_size_class_throughput_uses_class_latency() {
+        let mut writes = PhaseTelemetry::default();
+        writes.record(SizeClass::Small, Duration::from_millis(90), 9 * 1024 * 1024);
+        writes.record(SizeClass::Large, Duration::from_millis(10), 1024 * 1024);
+
+        let metrics = build_advanced_metrics(
+            SizeClassBounds {
+                small_max: 10 * 1024,
+                medium_max: 4 * 1024 * 1024,
+            },
+            &writes,
+            &PhaseTelemetry::default(),
+            None,
+            100.0,
+            0.0,
+        );
+        let large = metrics
+            .size_class_stats
+            .writes
+            .iter()
+            .find(|report| report.class == "large")
+            .expect("large write stats");
+
+        assert_eq!(
+            large.throughput_bytes_per_sec.round() as u64,
+            100 * 1024 * 1024
+        );
     }
 }

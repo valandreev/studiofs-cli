@@ -82,6 +82,8 @@ const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET: f64 = 1.20;
 const MAX_TEST_WRITE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const PUBLIC_BENCH_LARGE_READ_LIMIT_BYTES: u64 = 1024 * 1024;
+const PUBLIC_BENCH_LARGE_HOT_READ_RUNS: usize = 10;
+const PUBLIC_BENCH_LARGE_HOT_READ_BEST: usize = 4;
 const SIZE_CLASS_SMALL: &str = "small";
 const SIZE_CLASS_MEDIUM: &str = "medium";
 const SIZE_CLASS_LARGE: &str = "large";
@@ -133,6 +135,7 @@ struct TimedPhaseTelemetry {
 struct PublicBenchReadPhaseTelemetry {
     first_read: TimedPhaseTelemetry,
     hot_read: TimedPhaseTelemetry,
+    large_hot_read_best4: TimedPhaseTelemetry,
     pseudo_random_read: TimedPhaseTelemetry,
     sequential_medium_read: TimedPhaseTelemetry,
 }
@@ -1486,6 +1489,10 @@ fn build_public_bench_report(
                 &read_phases.hot_read.telemetry,
                 read_phases.hot_read.wall,
             ),
+            large_hot_read_best4: phase_telemetry_to_report(
+                &read_phases.large_hot_read_best4.telemetry,
+                read_phases.large_hot_read_best4.wall,
+            ),
             pseudo_random_read: phase_telemetry_to_report(
                 &read_phases.pseudo_random_read.telemetry,
                 read_phases.pseudo_random_read.wall,
@@ -1654,6 +1661,7 @@ struct MountedReadOperation {
 enum PublicBenchReadPhaseKind {
     First,
     Hot,
+    LargeHot,
     PseudoRandom,
     SequentialMedium,
 }
@@ -1712,6 +1720,21 @@ fn public_bench_read_operations(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 ) == SizeClass::Medium
+            })
+            .map(|file| MountedReadOperation {
+                work_index: file.index,
+                offset: 0,
+                bytes_to_read: Some(file.size),
+            })
+            .collect(),
+        PublicBenchReadPhaseKind::LargeHot => workload_files
+            .iter()
+            .filter(|file| {
+                classify_size(
+                    file.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                ) == SizeClass::Large
             })
             .map(|file| MountedReadOperation {
                 work_index: file.index,
@@ -2074,6 +2097,24 @@ async fn run_mounted_read_operations(
         telemetry: telemetry?,
         wall: started.elapsed(),
     })
+}
+
+fn best_read_phases(mut phases: Vec<TimedPhaseTelemetry>, count: usize) -> TimedPhaseTelemetry {
+    phases.sort_by(|left, right| {
+        let left_report = phase_telemetry_to_report(&left.telemetry, left.wall);
+        let right_report = phase_telemetry_to_report(&right.telemetry, right.wall);
+        right_report
+            .throughput_bytes_per_sec
+            .total_cmp(&left_report.throughput_bytes_per_sec)
+    });
+
+    let mut telemetry = PhaseTelemetry::default();
+    let mut wall = Duration::ZERO;
+    for phase in phases.into_iter().take(count) {
+        telemetry += &phase.telemetry;
+        wall += phase.wall;
+    }
+    TimedPhaseTelemetry { telemetry, wall }
 }
 
 fn operation_log_targets(files: &[WorkFile]) -> Arc<[Arc<str>]> {
@@ -3226,6 +3267,34 @@ pub(crate) async fn run_mounted_end_to_end(
                             )
                             .await;
 
+                            let mut large_hot_reads =
+                                Vec::with_capacity(PUBLIC_BENCH_LARGE_HOT_READ_RUNS);
+                            for run_index in 0..PUBLIC_BENCH_LARGE_HOT_READ_RUNS {
+                                tracing::info!(
+                                    target: "studiofs.cache.profile",
+                                    run_id = %params.run_id,
+                                    phase = "e2e-large-hot-read",
+                                    run = run_index + 1,
+                                    "cache benchmark phase start"
+                                );
+                                large_hot_reads.push(
+                                    run_mounted_read_operations(
+                                        "StudioFS bench large hot read",
+                                        params,
+                                        post_workload_files.clone(),
+                                        public_bench_read_operations(
+                                            PublicBenchReadPhaseKind::LargeHot,
+                                            &post_workload_files.files,
+                                            size_class_bounds,
+                                        ),
+                                        size_class_bounds,
+                                    )
+                                    .await?,
+                                );
+                            }
+                            let large_hot_read_best4 =
+                                best_read_phases(large_hot_reads, PUBLIC_BENCH_LARGE_HOT_READ_BEST);
+
                             tracing::info!(
                                 target: "studiofs.cache.profile",
                                 run_id = %params.run_id,
@@ -3298,6 +3367,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                     telemetry: PublicBenchReadPhaseTelemetry {
                                         first_read,
                                         hot_read,
+                                        large_hot_read_best4,
                                         pseudo_random_read,
                                         sequential_medium_read,
                                     },
@@ -3726,10 +3796,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn best_read_phases_uses_fastest_runs() {
+        let phases = [10, 40, 20, 50, 30]
+            .into_iter()
+            .map(|mib| test_timed_phase(SizeClass::Large, mib * 1024 * 1024))
+            .collect();
+
+        let best = best_read_phases(phases, 2);
+        let report = phase_telemetry_to_report(&best.telemetry, best.wall);
+
+        assert_eq!(report.operations, 2);
+        assert_eq!(report.bytes, 90 * 1024 * 1024);
+    }
+
     fn test_public_read_phases() -> PublicBenchReadPhaseTelemetry {
         PublicBenchReadPhaseTelemetry {
             first_read: test_timed_phase(SizeClass::Large, 1024 * 1024),
             hot_read: test_timed_phase(SizeClass::Large, 1024 * 1024),
+            large_hot_read_best4: test_timed_phase(SizeClass::Large, 4 * 1024 * 1024),
             pseudo_random_read: test_timed_phase(SizeClass::Large, 1024 * 1024),
             sequential_medium_read: test_timed_phase(SizeClass::Medium, 5 * 1024 * 1024),
         }

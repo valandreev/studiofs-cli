@@ -625,6 +625,21 @@ mod tests {
                     },
                     operations_log: Vec::new(),
                 },
+                large_hot_read_best4: OpReport {
+                    operations: 4,
+                    bytes: 16 * 1024 * 1024 * 1024,
+                    elapsed_ms: 7200.0,
+                    avg_latency_ms: 1800.0,
+                    p50_ms: 1800.0,
+                    p95_ms: 1800.0,
+                    p99_ms: 1800.0,
+                    throughput_bytes_per_sec: 2200.0 * 1024.0 * 1024.0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0, 4],
+                    },
+                    operations_log: Vec::new(),
+                },
                 pseudo_random_read: OpReport {
                     operations: 1081,
                     bytes: 716 * 1024 * 1024,
@@ -714,6 +729,10 @@ mod tests {
             1081
         );
         assert_eq!(public_bench["read_metrics"]["hot_read"]["operations"], 1081);
+        assert_eq!(
+            public_bench["read_metrics"]["large_hot_read_best4"]["operations"],
+            4
+        );
         assert_eq!(
             public_bench["read_metrics"]["pseudo_random_read"]["operations"],
             1081
