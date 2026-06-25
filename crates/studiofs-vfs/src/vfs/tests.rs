@@ -8205,16 +8205,7 @@ fn write_fh_does_not_allocate_object_ids_before_materialization() {
 #[test]
 fn write_path_steady_drain_quota_uses_configured_chunk() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-write-fh-multi-block-burst.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert_eq!(

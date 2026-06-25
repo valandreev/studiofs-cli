@@ -224,13 +224,8 @@ metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
 turn on global direct I/O and does not change the buffered read cache policy.
 
-`STUDIOFS_FUSE_WRITEBACK_CACHE=1` is a Linux-only benchmark/control knob. It
-requests `FUSE_WRITEBACK_CACHE` so the kernel can coalesce dirty pages before
-StudioFS receives writeback callbacks. On the current Linux benchmark host this
-did not reduce the 128 KiB callback geometry and regressed small-file writes, so
-the default remains disabled. In Fast local-cache mode this knob is explicitly
-throughput-first: after a successful user-visible write or fsync, a host crash
-can still lose bytes that had only reached the kernel page cache.
+`STUDIOFS_FUSE_WRITEBACK_CACHE=1` requests Linux writeback cache for A/B runs;
+the default is off.
 
 `STUDIOFS_FUSE_ASYNC_WRITE=1` is a Linux-only experimental bridge queue. The
 default Linux write callback passes caller bytes directly into the shared VFS

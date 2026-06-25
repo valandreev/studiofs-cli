@@ -295,12 +295,8 @@ fn should_request_fuse_async_dio_from_env() -> bool {
         .is_ok_and(|raw| should_request_fuse_async_dio_from_env_value(&raw))
 }
 
-fn should_enable_fuse_writeback_cache_from_env_value(raw: &str) -> bool {
-    parse_bridge_bool_env_value(raw)
-}
-
 fn resolve_fuse_writeback_cache_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(should_enable_fuse_writeback_cache_from_env_value)
+    raw.is_some_and(parse_bridge_bool_env_value)
 }
 
 fn should_enable_fuse_writeback_cache_from_env() -> bool {
