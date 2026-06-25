@@ -10707,7 +10707,7 @@ fn opportunistic_local_sync_tracks_unsynced_bytes_until_group_sync() {
 }
 
 #[test]
-fn opportunistic_local_sync_flushes_when_threshold_reached() {
+fn opportunistic_local_sync_defers_when_threshold_reached() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-threshold");
     rt.block_on(async {
@@ -10726,11 +10726,16 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
         .metrics
         .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
+    let deferred_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_deferred_calls
+        .load(Ordering::Relaxed);
 
     rt.block_on(async {
         vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
             .await
-            .expect("opportunistic threshold local sync");
+            .expect("opportunistic threshold local sync defers");
     });
 
     let calls_after = vfs
@@ -10743,17 +10748,26 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
         .metrics
         .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert!(
-        calls_after > calls_before,
-        "opportunistic sync should flush when grouped dirty bytes reach the threshold"
+    let deferred_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_deferred_calls
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        calls_after, calls_before,
+        "opportunistic threshold should not force backend sync_data"
+    );
+    assert_eq!(
+        synced_after, synced_before,
+        "opportunistic threshold should leave grouped dirty bytes unsynced"
     );
     assert!(
-        synced_after >= synced_before + vfs.local_sync_group_min_bytes,
-        "opportunistic threshold sync should account for grouped dirty bytes"
+        deferred_after > deferred_before,
+        "opportunistic threshold defer should be tracked"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
-        assert_eq!(group.pending_bytes, 0);
+        assert_eq!(group.pending_bytes, vfs.local_sync_group_min_bytes);
     });
 }
 

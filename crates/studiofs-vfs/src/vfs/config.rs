@@ -198,15 +198,12 @@ pub(super) fn write_path_sync_trigger(
     pending_bytes: u64,
     group_min_bytes: u64,
 ) -> Option<LocalSyncTrigger> {
-    // Durability-required writes always flush before returning.
-    // Opportunistic writes group sync_data so the OS page cache drains in bounded
-    // chunks instead of accumulating until a later explicit flush, fsync, or close.
+    // Barrier-required writes run the backend sync hook before returning.
+    // Opportunistic writes stay on the acceptance path.
     if local_sync_policy.requires_write_path_durability() {
         return Some(LocalSyncTrigger::Explicit);
     }
-    if pending_bytes >= group_min_bytes.max(1) {
-        return Some(LocalSyncTrigger::Explicit);
-    }
+    let _ = (pending_bytes, group_min_bytes);
     None
 }
 
@@ -1153,15 +1150,13 @@ mod tests {
     }
 
     #[test]
-    fn opportunistic_local_sync_triggers_after_group_threshold() {
-        // Opportunistic writes group sync_data so the OS page cache drains in
-        // bounded chunks instead of accumulating until a later strict barrier.
+    fn opportunistic_local_sync_defers_to_strict_barrier_after_group_threshold() {
         let above_threshold = write_path_sync_trigger(
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
             64 * 1024 * 1024,
         );
-        assert_eq!(above_threshold, Some(LocalSyncTrigger::Explicit));
+        assert_eq!(above_threshold, None);
 
         let below_threshold =
             write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);
