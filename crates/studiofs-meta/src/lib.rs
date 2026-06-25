@@ -130,6 +130,10 @@ pub fn open_meta_engine_with_options(
                 let redb = RedbMetaEngine::open(path)?;
                 let info = redb.get_format_info()?;
                 ensure_supported_format_version(&info)?;
+                if info.metadata.backend == MetadataBackend::Postgres {
+                    redb.set_counter("pgLastAppliedBatchVersion", 0)?;
+                    redb.set_counter("pgLastAppliedNamespaceBatchVersion", 0)?;
+                }
                 info
                 // redb dropped here — releases file lock
             };
@@ -170,5 +174,49 @@ mod tests {
 
         let info = engine.get_format_info();
         assert!(matches!(info, Err(MetaError::NotFormatted)));
+    }
+
+    #[test]
+    fn pg_repair_reset_preserves_client_slot_and_local_flush_position() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = dir.path().join("pg-repair-reset.db");
+        let redb = RedbMetaEngine::open(&path).expect("open redb");
+
+        redb.set_counter("pgLastAppliedBatchVersion", 42)
+            .expect("seed pg replay position");
+        redb.set_counter("pgLastAppliedNamespaceBatchVersion", 41)
+            .expect("seed pg namespace position");
+        redb.set_counter("pgLastFlushedLocalEventSeq", 7)
+            .expect("seed local flush position");
+        redb.set_counter("pgClientSlotPlusOne", 3)
+            .expect("seed client slot");
+
+        redb.set_counter("pgLastAppliedBatchVersion", 0)
+            .expect("reset pg replay position");
+        redb.set_counter("pgLastAppliedNamespaceBatchVersion", 0)
+            .expect("reset pg namespace position");
+
+        assert_eq!(
+            redb.get_counter("pgLastAppliedBatchVersion")
+                .expect("pg replay position"),
+            0
+        );
+        assert_eq!(
+            redb.get_counter("pgLastAppliedNamespaceBatchVersion")
+                .expect("pg namespace position"),
+            0
+        );
+        assert_eq!(
+            redb.get_counter("pgLastFlushedLocalEventSeq")
+                .expect("local flush position"),
+            7,
+            "repair reset must not make already-flushed local events publish again"
+        );
+        assert_eq!(
+            redb.get_counter("pgClientSlotPlusOne")
+                .expect("client slot"),
+            3,
+            "repair reset must keep the stable client identity for self-batch detection"
+        );
     }
 }
