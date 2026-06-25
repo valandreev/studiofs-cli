@@ -1106,11 +1106,7 @@ fn build_mounted_write_diagnostics_report(
     let local_accounted_bytes_delta = payload_persisted_bytes_delta
         .max(cache_materialize_bytes_delta)
         .max(upload_accounted_bytes_delta);
-    let payload_accounted_bytes_delta = if vfs_write_bytes_delta >= writes.bytes {
-        local_accounted_bytes_delta.max(writes.bytes)
-    } else {
-        local_accounted_bytes_delta
-    };
+    let payload_accounted_bytes_delta = local_accounted_bytes_delta.max(writes.bytes);
     let landing_accepted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
         snapshot.landing_zone.accepted_bytes
     });

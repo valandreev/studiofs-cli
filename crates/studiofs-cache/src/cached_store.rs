@@ -632,12 +632,7 @@ impl CachedStore {
                 source,
             });
         }
-        {
-            let mut upload_hot = self.upload_hot.lock();
-            for put in &puts {
-                upload_hot.insert(put.object_id, Bytes::copy_from_slice(put.data.as_ref()));
-            }
-        }
+        self.cache_hot_upload_batch(&puts);
         let mut total_bytes = 0u64;
         for entry in &entries {
             total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
@@ -1696,6 +1691,40 @@ mod tests {
         assert_eq!(counters.pending_upload_bytes, 8);
         let op = rx.try_recv().expect("pending upload");
         assert_eq!(op.object_id, 10_000);
+    }
+
+    #[test]
+    fn detached_persist_reuses_payload_for_hot_upload_cache() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner_backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let backend_for_store = Arc::clone(&backend);
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
+            backend_for_store,
+        )
+        .expect("open cached store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let recorded = backend.take_owned_puts();
+        assert_eq!(recorded.len(), 1);
+        let hot = cached_store
+            .get_hot_upload(recorded[0].object_id)
+            .expect("hot upload payload");
+        assert_eq!(recorded[0].data.as_ref(), b"abcdefgh");
+        assert_eq!(hot.as_ref(), b"abcdefgh");
+        assert_eq!(recorded[0].data.as_ptr(), hot.as_ptr());
     }
 
     #[test]
