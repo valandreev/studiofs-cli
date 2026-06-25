@@ -588,6 +588,9 @@ impl CachedStore {
 
     /// Populates the in-memory hot-upload buffer with payload bytes from `entries`.
     pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
+        if entries.is_empty() {
+            return;
+        }
         let mut upload_hot = self.upload_hot.lock();
         if upload_hot.budget_bytes == 0 {
             return;
