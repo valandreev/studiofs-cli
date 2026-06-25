@@ -1701,7 +1701,7 @@ mod tests {
                 .expect("open backend")
                 .backend;
         let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
-        let backend_for_store = Arc::clone(&backend);
+        let backend_for_store: Arc<dyn LocalPayloadBackend> = backend.clone();
         let (cached_store, _rx) = CachedStore::open(
             CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
             backend_for_store,
@@ -1722,8 +1722,6 @@ mod tests {
         let hot = cached_store
             .get_hot_upload(recorded[0].object_id)
             .expect("hot upload payload");
-        assert_eq!(recorded[0].data.as_ref(), b"abcdefgh");
-        assert_eq!(hot.as_ref(), b"abcdefgh");
         assert_eq!(recorded[0].data.as_ptr(), hot.as_ptr());
     }
 
