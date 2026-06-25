@@ -28,8 +28,8 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
+    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, StudioVfs, VfsError,
+    VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -166,7 +166,7 @@ fn fuse_attr_blksize() -> u32 {
     FUSE_ATTR_BLOCK_SIZE
 }
 
-fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
+fn fuse_open_reply_flags() -> u32 {
     fuser::consts::FOPEN_KEEP_CACHE
 }
 
@@ -1219,7 +1219,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags),
+                            fuse_open_reply_flags(),
                         );
                     }
                     Err(e) => {
@@ -1411,7 +1411,7 @@ impl Filesystem for StudioFuseFs {
         }
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags(open_flags);
+                let reply_flags = fuse_open_reply_flags();
                 debug!(
                     ino,
                     fh,
@@ -2714,18 +2714,7 @@ mod tests {
 
     #[test]
     fn fuse_open_reply_flags_match_platform_cache_policy() {
-        assert_eq!(
-            fuse_open_reply_flags(OpenFlags::RDONLY),
-            fuser::consts::FOPEN_KEEP_CACHE
-        );
-        assert_eq!(
-            fuse_open_reply_flags(OpenFlags::WRONLY),
-            fuser::consts::FOPEN_KEEP_CACHE
-        );
-        assert_eq!(
-            fuse_open_reply_flags(OpenFlags::RDWR | OpenFlags::APPEND),
-            fuser::consts::FOPEN_KEEP_CACHE
-        );
+        assert_eq!(fuse_open_reply_flags(), fuser::consts::FOPEN_KEEP_CACHE);
     }
 
     #[test]

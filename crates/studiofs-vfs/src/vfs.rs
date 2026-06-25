@@ -5409,11 +5409,7 @@ impl StudioVfs {
                 .pending_bytes
                 .saturating_add(persisted_bytes);
 
-            let trigger = write_path_sync_trigger(
-                local_sync_policy,
-                local_sync_group.pending_bytes,
-                self.local_sync_group_min_bytes,
-            );
+            let trigger = write_path_sync_trigger(local_sync_policy);
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
                     self.state
@@ -5443,11 +5439,7 @@ impl StudioVfs {
         self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
             let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
-            let trigger = write_path_sync_trigger(
-                local_sync_policy,
-                local_sync_group.pending_bytes,
-                self.local_sync_group_min_bytes,
-            );
+            let trigger = write_path_sync_trigger(local_sync_policy);
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
                     self.state

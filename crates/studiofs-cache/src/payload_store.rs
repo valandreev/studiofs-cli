@@ -646,7 +646,7 @@ impl FilePayloadStore {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {
             // ponytail: Fast mode is throughput-first; use Durable mode when
             // crash-safe payload fsync/dirsync is required.
-            let _ = self.take_grouped_sync_targets();
+            self.clear_grouped_sync_targets();
             return Ok(());
         }
 
@@ -1240,6 +1240,12 @@ impl FilePayloadStore {
         directories.insert(self.layout.runtime_root.clone());
     }
 
+    fn clear_grouped_sync_targets(&self) {
+        self.shared.pending_grouped_sync.object_ids.lock().clear();
+        self.shared.pending_grouped_sync.directories.lock().clear();
+    }
+
+    #[cfg(test)]
     fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
         let object_ids = {
             let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
@@ -2071,6 +2077,18 @@ mod tests {
             before_sync.pending_grouped_dir_syncs >= 1,
             "fast mode should queue directories for grouped sync_data barriers"
         );
+        let object_capacity_before_sync = store
+            .shared
+            .pending_grouped_sync
+            .object_ids
+            .lock()
+            .capacity();
+        let dir_capacity_before_sync = store
+            .shared
+            .pending_grouped_sync
+            .directories
+            .lock()
+            .capacity();
 
         store.sync_data().unwrap();
         let after_sync = store.sync_barrier_snapshot();
@@ -2078,6 +2096,24 @@ mod tests {
         assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
         assert_eq!(after_sync.grouped_file_sync_calls, 0);
         assert_eq!(after_sync.grouped_dir_sync_calls, 0);
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .object_ids
+                .lock()
+                .capacity()
+                >= object_capacity_before_sync
+        );
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .capacity()
+                >= dir_capacity_before_sync
+        );
     }
 
     #[test]
