@@ -202,7 +202,6 @@ const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
-const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
@@ -6279,8 +6278,8 @@ impl StudioVfs {
     }
 
     fn writer_stack_steady_drain_quota_bytes(&self) -> usize {
-        WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES
-            .min(self.block_size as usize)
+        self.write_eager_flush_drain_chunk_bytes
+            .max(self.block_size as usize)
             .max(1)
     }
 

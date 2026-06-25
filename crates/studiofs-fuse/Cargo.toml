@@ -16,7 +16,7 @@ studiofs-bridge.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies.fuser]
 workspace = true
-features = ["abi-7-22"]
+features = ["abi-7-23"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

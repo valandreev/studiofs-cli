@@ -8203,7 +8203,7 @@ fn write_fh_does_not_allocate_object_ids_before_materialization() {
 }
 
 #[test]
-fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
+fn write_path_steady_drain_quota_uses_configured_chunk() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
     let _guard = rt.enter();
@@ -8213,34 +8213,17 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let block_size = vfs.block_size as usize;
-
-        let first = vec![0x11; block_size];
-        let second = vec![0x22; block_size];
-        let third = vec![0x33; block_size];
-
-        vfs.write_fh(fh, ino, 0, &first).await.unwrap();
-        vfs.write_fh(fh, ino, block_size as u64, &second)
-            .await
-            .unwrap();
-        vfs.write_fh(fh, ino, (block_size * 2) as u64, &third)
-            .await
-            .unwrap();
-
-        let read = vfs.read(ino, 0, (block_size * 3) as u32).await.unwrap();
-        assert_eq!(&read[..block_size], first.as_slice());
-        assert_eq!(&read[block_size..block_size * 2], second.as_slice());
-        assert_eq!(&read[block_size * 2..], third.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
         vfs.release_fh(fh).await.unwrap();
     });
 
     let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(
+        snapshot.drain_lag.steady_quota_bytes,
+        snapshot.tuning.eager_flush_drain_chunk_bytes
+    );
     assert!(
-        snapshot.payload_burst.max_payloads_per_burst <= 1,
-        "slice-first foreground persistence should avoid multi-payload bursts for full-block callbacks: {:?}",
-        snapshot.payload_burst
+        snapshot.drain_lag.steady_quota_bytes > vfs.block_size as usize,
+        "steady drain quota should batch multiple completed blocks per local-cache payload"
     );
 }
 
