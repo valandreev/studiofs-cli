@@ -236,9 +236,9 @@ GitHub Actions remains available for hosted macOS and Windows lanes. See
 [`docs/contributing.md`](docs/contributing.md) for the full verification
 matrix (Quality Gates, Linux, macOS, Windows) and the contributor rules for
 platform-specific changes. Each platform job includes an explicit named
-step for its backend crate (`studiofs-fuse` on Linux/macOS,
-`studiofs-winfsp` on Windows) so regressions in platform-specific code are
-immediately attributable in the CI log.
+step for its backend crate (`studiofs-fuse` on Linux, `studiofs-macfuse`
+on macOS, `studiofs-winfsp` on Windows) so regressions in
+platform-specific code are immediately attributable in the CI log.
 
 Infra-heavy ignored suite:
 
