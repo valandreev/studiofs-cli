@@ -28,8 +28,8 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
+    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, StudioVfs, VfsError,
+    VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -38,8 +38,10 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
+const STUDIOFS_FUSE_WRITEBACK_CACHE_ENV: &str = "STUDIOFS_FUSE_WRITEBACK_CACHE";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
@@ -161,15 +163,11 @@ impl FuseAsyncWriteAdmissionPolicy {
 }
 
 fn fuse_attr_blksize() -> u32 {
-    512
+    FUSE_ATTR_BLOCK_SIZE
 }
 
-fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
-    if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-        fuser::consts::FOPEN_KEEP_CACHE
-    } else {
-        0
-    }
+fn fuse_open_reply_flags() -> u32 {
+    fuser::consts::FOPEN_KEEP_CACHE
 }
 
 fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
@@ -292,6 +290,15 @@ fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
 fn should_request_fuse_async_dio_from_env() -> bool {
     std::env::var("STUDIOFS_FUSE_ASYNC_DIO")
         .is_ok_and(|raw| should_request_fuse_async_dio_from_env_value(&raw))
+}
+
+fn resolve_fuse_writeback_cache_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(parse_bridge_bool_env_value)
+}
+
+fn should_enable_fuse_writeback_cache_from_env() -> bool {
+    let raw = std::env::var(STUDIOFS_FUSE_WRITEBACK_CACHE_ENV).ok();
+    resolve_fuse_writeback_cache_enabled(raw.as_deref())
 }
 
 fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
@@ -638,6 +645,7 @@ pub struct StudioFuseFs {
     pending_writes: PendingWriteTracker,
     async_write_enabled: bool,
     linux_async_dio_enabled: bool,
+    linux_writeback_cache_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
@@ -659,6 +667,8 @@ pub struct StudioFuseRuntimeOptions {
     /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
     /// Ignored on non-Linux platforms.
     pub linux_async_dio_enabled: bool,
+    /// Request Linux `FUSE_WRITEBACK_CACHE` during FUSE init when supported.
+    pub linux_writeback_cache_enabled: bool,
     /// Optional custom limits for async write admission control. When omitted,
     /// explicit-runtime construction uses the safe platform defaults.
     pub async_write_admission_limits: Option<StudioFuseAsyncWriteAdmissionLimits>,
@@ -701,6 +711,7 @@ impl StudioFuseRuntimeOptions {
         Self {
             async_write_enabled: should_enable_async_fuse_write_from_env(),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
+            linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
@@ -735,6 +746,7 @@ impl StudioFuseFs {
             pending_writes: PendingWriteTracker::default(),
             async_write_enabled: options.async_write_enabled,
             linux_async_dio_enabled: options.linux_async_dio_enabled,
+            linux_writeback_cache_enabled: options.linux_writeback_cache_enabled,
             async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
                 limits: async_write_admission_limits,
             },
@@ -1034,8 +1046,18 @@ impl Filesystem for StudioFuseFs {
             max_readahead = requested_readahead,
             max_background = ?background_queue_policy.max_background,
             congestion_threshold = ?background_queue_policy.congestion_threshold,
+            writeback_cache_enabled = self.linux_writeback_cache_enabled,
             "configured FUSE bridge I/O policy"
         );
+
+        if self.linux_writeback_cache_enabled
+            && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE)
+        {
+            warn!(
+                ?unsupported,
+                "Linux FUSE kernel did not advertise FUSE_WRITEBACK_CACHE; continuing without writeback cache"
+            );
+        }
 
         if self.linux_async_dio_enabled
             && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
@@ -1197,7 +1219,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags),
+                            fuse_open_reply_flags(),
                         );
                     }
                     Err(e) => {
@@ -1389,7 +1411,7 @@ impl Filesystem for StudioFuseFs {
         }
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags(open_flags);
+                let reply_flags = fuse_open_reply_flags();
                 debug!(
                     ino,
                     fh,
@@ -2339,8 +2361,9 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
         FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        fuse_attr_blksize, fuse_write_local_sync_policy, is_missing_xattr_error,
+        missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
+        resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
@@ -2444,6 +2467,7 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: true,
+                linux_writeback_cache_enabled: true,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -2472,6 +2496,7 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_writeback_cache_enabled: true,
                 async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
                     max_pending_bytes: Some(4096),
                     max_pending_writes: Some(7),
@@ -2521,6 +2546,7 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: false,
                 linux_async_dio_enabled: false,
+                linux_writeback_cache_enabled: false,
                 async_write_admission_limits: None,
             },
         );
@@ -2682,19 +2708,13 @@ mod tests {
     }
 
     #[test]
+    fn fuse_attr_blksize_matches_large_sequential_io_policy() {
+        assert_eq!(fuse_attr_blksize(), 4 * 1024 * 1024);
+    }
+
+    #[test]
     fn fuse_open_reply_flags_match_platform_cache_policy() {
-        {
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY),
-                fuser::consts::FOPEN_KEEP_CACHE
-            );
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
-                fuser::consts::FOPEN_KEEP_CACHE
-            );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
-        }
+        assert_eq!(fuse_open_reply_flags(), fuser::consts::FOPEN_KEEP_CACHE);
     }
 
     #[test]
@@ -2721,6 +2741,22 @@ mod tests {
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(should_request_fuse_async_dio_from_env_value(true_value));
+        }
+    }
+
+    #[test]
+    fn fuse_writeback_cache_default_profile_is_disabled_when_env_unset() {
+        assert!(!resolve_fuse_writeback_cache_enabled(None));
+    }
+
+    #[test]
+    fn fuse_writeback_cache_env_overrides_default_profile() {
+        for false_value in ["0", "false", "off", ""] {
+            assert!(!resolve_fuse_writeback_cache_enabled(Some(false_value)));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            assert!(resolve_fuse_writeback_cache_enabled(Some(true_value)));
         }
     }
 
@@ -2962,6 +2998,7 @@ mod tests {
             super::StudioFuseRuntimeOptions {
                 async_write_enabled: true,
                 linux_async_dio_enabled: false,
+                linux_writeback_cache_enabled: true,
                 async_write_admission_limits: None,
             },
         );

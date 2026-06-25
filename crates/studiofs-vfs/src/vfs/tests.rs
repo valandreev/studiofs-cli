@@ -8203,44 +8203,18 @@ fn write_fh_does_not_allocate_object_ids_before_materialization() {
 }
 
 #[test]
-fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
+fn write_path_steady_drain_quota_uses_configured_chunk() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-write-fh-multi-block-burst.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let block_size = vfs.block_size as usize;
-
-        let first = vec![0x11; block_size];
-        let second = vec![0x22; block_size];
-        let third = vec![0x33; block_size];
-
-        vfs.write_fh(fh, ino, 0, &first).await.unwrap();
-        vfs.write_fh(fh, ino, block_size as u64, &second)
-            .await
-            .unwrap();
-        vfs.write_fh(fh, ino, (block_size * 2) as u64, &third)
-            .await
-            .unwrap();
-
-        let read = vfs.read(ino, 0, (block_size * 3) as u32).await.unwrap();
-        assert_eq!(&read[..block_size], first.as_slice());
-        assert_eq!(&read[block_size..block_size * 2], second.as_slice());
-        assert_eq!(&read[block_size * 2..], third.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
 
     let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(
+        snapshot.drain_lag.steady_quota_bytes,
+        snapshot.tuning.eager_flush_drain_chunk_bytes
+    );
     assert!(
-        snapshot.payload_burst.max_payloads_per_burst <= 1,
-        "slice-first foreground persistence should avoid multi-payload bursts for full-block callbacks: {:?}",
-        snapshot.payload_burst
+        snapshot.drain_lag.steady_quota_bytes > vfs.block_size as usize,
+        "steady drain quota should batch multiple completed blocks per local-cache payload"
     );
 }
 
@@ -8500,8 +8474,13 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         let slice_bytes = 2 * 1024 * 1024usize;
+        let steady_quota_bytes = vfs
+            .write_path_observability_snapshot()
+            .drain_lag
+            .steady_quota_bytes;
+        let slice_count = steady_quota_bytes.div_ceil(slice_bytes) + 1;
 
-        for index in 0..3u64 {
+        for index in 0..slice_count as u64 {
             let payload = vec![0x60u8.saturating_add(index as u8); slice_bytes];
             vfs.write_fh_with_deferred_materialize(
                 fh,
@@ -8529,8 +8508,8 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
             "snapshot should expose the same lag signal used by soft pacing"
         );
         assert!(
-            snapshot.drain_lag.current_bytes >= snapshot.drain_lag.steady_quota_bytes,
-            "three writer-cache slices should exceed one steady drain quota"
+            snapshot.drain_lag.current_bytes > 0,
+            "writer-cache dirty bytes should be visible as drain lag before flush"
         );
         assert_eq!(
             snapshot.drain_lag.soft_pacing_events, 0,
@@ -9124,8 +9103,8 @@ fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
             "setup should leave the flushed payload in the local backend"
         );
         assert!(
-            vfs.cached_store().has_staged_upload(object_id),
-            "setup should create the upload-stage hardlink"
+            !vfs.cached_store().has_staged_upload(object_id),
+            "flush should defer upload-stage hardlink creation to the uploader"
         );
         assert!(
             vfs.cached_store().is_pinned(object_id),
@@ -9198,7 +9177,7 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
             .object_id;
 
         assert!(vfs.local_payload_backend().contains(object_id));
-        assert!(vfs.cached_store().has_staged_upload(object_id));
+        assert!(!vfs.cached_store().has_staged_upload(object_id));
         assert!(vfs.cached_store().is_pinned(object_id));
 
         vfs.lazy_evict_removed_metadata_payloads(
@@ -10707,7 +10686,7 @@ fn opportunistic_local_sync_tracks_unsynced_bytes_until_group_sync() {
 }
 
 #[test]
-fn opportunistic_local_sync_flushes_when_threshold_reached() {
+fn opportunistic_local_sync_defers_when_threshold_reached() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-threshold");
     rt.block_on(async {
@@ -10726,11 +10705,16 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
         .metrics
         .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
+    let deferred_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_deferred_calls
+        .load(Ordering::Relaxed);
 
     rt.block_on(async {
         vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
             .await
-            .expect("opportunistic threshold local sync");
+            .expect("opportunistic threshold local sync defers");
     });
 
     let calls_after = vfs
@@ -10743,17 +10727,26 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
         .metrics
         .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert!(
-        calls_after > calls_before,
-        "opportunistic sync should flush when grouped dirty bytes reach the threshold"
+    let deferred_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_deferred_calls
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        calls_after, calls_before,
+        "opportunistic threshold should not force backend sync_data"
+    );
+    assert_eq!(
+        synced_after, synced_before,
+        "opportunistic threshold should leave grouped dirty bytes unsynced"
     );
     assert!(
-        synced_after >= synced_before + vfs.local_sync_group_min_bytes,
-        "opportunistic threshold sync should account for grouped dirty bytes"
+        deferred_after > deferred_before,
+        "opportunistic threshold defer should be tracked"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
-        assert_eq!(group.pending_bytes, 0);
+        assert_eq!(group.pending_bytes, vfs.local_sync_group_min_bytes);
     });
 }
 

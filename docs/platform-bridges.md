@@ -186,6 +186,7 @@ Current signature includes additional policy controls:
 | Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
 | FUSE async write replies | macOS: enabled by default. Linux: production/default writes use a thin VFS handoff; `STUDIOFS_FUSE_ASYNC_WRITE=1` enables the experimental bridge-owned async queue for targeted A/B or profiling only |
+| Linux: `writeback_cache` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_WRITEBACK_CACHE=1`; requested only when the kernel advertises `FUSE_WRITEBACK_CACHE` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
@@ -208,11 +209,11 @@ On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 
 ### Linux cache and I/O policy
 
-Linux FUSE keeps buffered I/O as the default. Regular read-only opens return
-`FOPEN_KEEP_CACHE` so safe reopen and sequential-read paths can reuse the
-kernel page cache. Write-capable opens do not request `FOPEN_KEEP_CACHE` and do
-not request `FOPEN_DIRECT_IO`, which keeps write coherence explicit without
-globally disabling buffered reads.
+Linux FUSE keeps buffered I/O as the default. Regular file opens return
+`FOPEN_KEEP_CACHE`, including write-capable opens, so write-then-read paths can
+reuse the kernel page cache. Opens do not request `FOPEN_DIRECT_IO`.
+Regular file attributes report a 4 MiB preferred I/O size to match the bridge
+read/write sizing policy instead of advertising a 512-byte block size.
 
 The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote
@@ -222,6 +223,9 @@ metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
 turn on global direct I/O and does not change the buffered read cache policy.
+
+`STUDIOFS_FUSE_WRITEBACK_CACHE=1` requests Linux writeback cache for A/B runs;
+the default is off.
 
 `STUDIOFS_FUSE_ASYNC_WRITE=1` is a Linux-only experimental bridge queue. The
 default Linux write callback passes caller bytes directly into the shared VFS

@@ -113,14 +113,18 @@ mean peer visibility.
 | Operation | Contract |
 |---|---|
 | `flush` | Freeze and finish dirty slices needed for the handle/inode, commit the resulting local slice metadata, and surface local errors. It does not wait for peer publication. |
-| `fsync` | The strict caller-requested local crash-safety boundary. It must finish and sync the local cache/metadata state needed to recover the accepted data locally. It does not wait for peer publication. |
+| `fsync` | The strict caller-requested local boundary. Durable cache mode must finish and sync the local cache/metadata state needed to recover the accepted data locally. Throughput-first Fast cache mode drains StudioFS state but does not force payload file fsync/dirsync. It does not wait for peer publication. |
 | last-handle close / release | Drains remaining dirty writer state through the local slice/cache pipeline so later opens on the same mount see coherent local state. It does not wait for peer publication. |
 
 Crash behavior:
 
 - A crash before a local durability boundary may lose accepted bytes that lived
   only in memory.
-- A crash after `fsync` must recover the locally durable view.
+- In throughput-first Fast cache mode, a crash may also lose payload bytes that
+  reached local payload files but were still only in the OS page cache.
+- A crash after `fsync` must recover the locally durable view in Durable cache
+  mode. In Fast cache mode, payload bytes still only in the OS page cache may be
+  lost.
 - A crash after ordinary `flush` or close must recover whatever those operations
   explicitly made locally durable according to the platform callback contract.
 

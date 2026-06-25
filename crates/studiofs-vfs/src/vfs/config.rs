@@ -195,16 +195,10 @@ pub(super) enum LocalSyncTrigger {
 /// Determine whether local sync should be triggered for current write state.
 pub(super) fn write_path_sync_trigger(
     local_sync_policy: LocalSyncPolicy,
-    pending_bytes: u64,
-    group_min_bytes: u64,
 ) -> Option<LocalSyncTrigger> {
-    // Durability-required writes always flush before returning.
-    // Opportunistic writes group sync_data so the OS page cache drains in bounded
-    // chunks instead of accumulating until a later explicit flush, fsync, or close.
+    // Barrier-required writes run the backend sync hook before returning.
+    // Opportunistic writes stay on the acceptance path.
     if local_sync_policy.requires_write_path_durability() {
-        return Some(LocalSyncTrigger::Explicit);
-    }
-    if pending_bytes >= group_min_bytes.max(1) {
         return Some(LocalSyncTrigger::Explicit);
     }
     None
@@ -1142,29 +1136,19 @@ mod tests {
 
     #[test]
     fn local_sync_policy_strict_always_triggers_sync() {
-        let trigger = write_path_sync_trigger(LocalSyncPolicy::Strict, 1, 64 * 1024 * 1024);
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::Strict);
         assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
     }
 
     #[test]
     fn local_sync_policy_write_through_always_triggers_sync() {
-        let trigger = write_path_sync_trigger(LocalSyncPolicy::WriteThrough, 1, 64 * 1024 * 1024);
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::WriteThrough);
         assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
     }
 
     #[test]
-    fn opportunistic_local_sync_triggers_after_group_threshold() {
-        // Opportunistic writes group sync_data so the OS page cache drains in
-        // bounded chunks instead of accumulating until a later strict barrier.
-        let above_threshold = write_path_sync_trigger(
-            LocalSyncPolicy::Opportunistic,
-            64 * 1024 * 1024,
-            64 * 1024 * 1024,
-        );
-        assert_eq!(above_threshold, Some(LocalSyncTrigger::Explicit));
-
-        let below_threshold =
-            write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);
-        assert_eq!(below_threshold, None);
+    fn opportunistic_local_sync_defers_on_write_path() {
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::Opportunistic);
+        assert_eq!(trigger, None);
     }
 }

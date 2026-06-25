@@ -174,7 +174,7 @@ pub enum LocalPayloadSyncMode {
     /// Keep per-write file+directory barriers at payload commit time.
     #[default]
     Durable,
-    /// Defer payload-store barriers to grouped `sync_data()` calls.
+    /// Skip payload-store fsync/dirsync barriers; throughput-first and not crash-safe.
     Fast,
 }
 
@@ -1614,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn local_payload_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
+    fn local_payload_fast_sync_mode_skips_payload_store_barriers_on_sync_data() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
@@ -1641,8 +1641,8 @@ mod tests {
         let after_sync = backend.payload_store.sync_barrier_snapshot();
         assert_eq!(after_sync.pending_grouped_file_syncs, 0);
         assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
-        assert!(after_sync.grouped_file_sync_calls >= 2);
-        assert!(after_sync.grouped_dir_sync_calls >= 1);
+        assert_eq!(after_sync.grouped_file_sync_calls, 0);
+        assert_eq!(after_sync.grouped_dir_sync_calls, 0);
     }
 
     #[test]

@@ -5,9 +5,10 @@ name: Backend Smoke Tests
 #  Manual dispatch:       always runs all platforms
 #
 #  Smoke tests validate real mount/unmount + file I/O through the
-#  platform backends (FUSE, WinFSP). They are separate from the main
-#  rust.yml pipeline because they require kernel drivers and may be
-#  flaky on hosted runners. This workflow is intentionally manual-only.
+#  platform backends (Linux FUSE, macFUSE, WinFSP). They are separate
+#  from the main rust.yml pipeline because they require kernel drivers
+#  and may be flaky on hosted runners. This workflow is intentionally
+#  manual-only.
 #
 #  See docs/smoke-test-strategy.md for the full strategy rationale.
 
@@ -64,13 +65,13 @@ jobs:
           echo 'Test output is available in the "Run FUSE smoke tests" step log above.' >> $GITHUB_STEP_SUMMARY
           echo 'stdout/stderr from `--nocapture` is captured by GitHub Actions natively.' >> $GITHUB_STEP_SUMMARY
 
-  # ─── macOS FUSE ────────────────────────────────────────────────────
+  # ─── macOS macFUSE ─────────────────────────────────────────────────
   #
   # continue-on-error: macFUSE system extension may not be loadable on
   # hosted runners. This job provides best-effort signal; reliable
   # coverage requires a self-hosted runner. See docs/smoke-test-strategy.md.
-  macos-fuse:
-    name: macOS FUSE Smoke
+  macos-macfuse:
+    name: macOS macFUSE Smoke
     runs-on: macos-latest
     timeout-minutes: 20
     continue-on-error: true
@@ -107,33 +108,40 @@ jobs:
             echo "loaded=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build FUSE smoke tests
+      - name: Build macFUSE native bridge smoke tests
+        run: cargo test -p studiofs-macfuse --lib --no-run
+
+      - name: Run macFUSE native bridge smoke tests
+        run: cargo test -p studiofs-macfuse --lib -- --nocapture
+        timeout-minutes: 5
+
+      - name: Build legacy macOS FUSE compatibility smoke tests
         run: cargo test -p studiofs-fuse --test mount_sanity --no-run
 
-      - name: Run Virtualized macOS FUSE Logic Smoke
+      - name: Run legacy macOS FUSE compatibility logic smoke
         run: cargo test -p studiofs-fuse --test virtual_mount_test -- --nocapture
         timeout-minutes: 5
 
-      - name: Run optional Kernel FUSE smoke tests
+      - name: Run optional legacy Kernel FUSE smoke tests
         if: steps.macfuse-check.outputs.loaded == 'true'
         run: |
-          echo "Kernel extension loaded. Running system-level smoke test."
+          echo "Kernel extension loaded. Running legacy system-level FUSE smoke test."
           cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
         timeout-minutes: 5
 
       - name: Report macOS Kernel Limitation
         if: steps.macfuse-check.outputs.loaded == 'false'
         run: |
-          echo "### macOS FUSE CI Notice" >> $GITHUB_STEP_SUMMARY
+          echo "### macOS macFUSE CI Notice" >> $GITHUB_STEP_SUMMARY
           echo "Standard GitHub-hosted macOS runners do not support third-party kernel extensions (KEXTs)." >> $GITHUB_STEP_SUMMARY
-          echo "The **Virtualized FUSE Logic Smoke** was executed instead to verify all StudioFS bridge logic." >> $GITHUB_STEP_SUMMARY
+          echo "The **macFUSE native bridge smoke tests** and legacy compatibility logic smoke were executed instead." >> $GITHUB_STEP_SUMMARY
           echo "System-level mount tests are recommended for local or self-hosted environments." >> $GITHUB_STEP_SUMMARY
 
       - name: Capture test output on failure
         if: failure() && steps.macfuse-check.outputs.loaded == 'true'
         run: |
-          echo '### macOS FUSE Smoke Test Failure' >> $GITHUB_STEP_SUMMARY
-          echo 'Test output is available in the "Run FUSE smoke tests" step log above.' >> $GITHUB_STEP_SUMMARY
+          echo '### macOS macFUSE Smoke Test Failure' >> $GITHUB_STEP_SUMMARY
+          echo 'Test output is available in the macOS smoke step logs above.' >> $GITHUB_STEP_SUMMARY
           echo 'stdout/stderr from `--nocapture` is captured by GitHub Actions natively.' >> $GITHUB_STEP_SUMMARY
 
   # ─── Windows WinFSP ───────────────────────────────────────────────

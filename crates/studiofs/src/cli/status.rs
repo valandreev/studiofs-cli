@@ -993,6 +993,7 @@ mod tests {
             dirty_pressure: Default::default(),
             upload: Default::default(),
             fetch: Default::default(),
+            cache_pipeline: Default::default(),
             payload_burst: Default::default(),
             payload_persist: Default::default(),
             metadata_commit: Default::default(),

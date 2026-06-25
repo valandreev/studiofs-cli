@@ -588,6 +588,8 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 })
                 .collect();
             self.vfs.record_live_extents(&live_extents);
+            // submit_uploads_batch pins payloads before the uploader creates
+            // stage hardlinks, so cache eviction cannot remove them in between.
             self.vfs.cached_store.submit_uploads_batch(&upload_ops);
             self.vfs.state.file_session.note_background_transition(
                 self.ino,
@@ -927,7 +929,10 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let spill_bytes_cap = self.writer_stack_steady_drain_quota_bytes();
+        let spill_bytes_cap = self.writer_stack_steady_drain_quota_bytes().min(
+            studiofs_data::object::CLOUD_FRAGMENT_SIZE
+                * studiofs_data::object::CLOUD_FRAGMENT_COUNT,
+        );
         let mut ordered_blocks: Vec<&DirtyWriteSnapshot> = blocks.iter().collect();
         ordered_blocks.sort_unstable_by_key(|block| block.block_index);
 
@@ -1649,17 +1654,6 @@ impl StudioVfs {
             }
             self.maybe_payload_store_sync_data_async(persisted_bytes, local_sync_policy)
                 .await?;
-            if !persisted_object_ids.is_empty()
-                && let Err(error) = self
-                    .upload_stage_link_batch_async(persisted_object_ids.clone())
-                    .await
-            {
-                warn!(
-                    persisted_object_count = persisted_object_ids.len(),
-                    error = %error,
-                    "failed to create zero-copy upload links for durable slice payloads"
-                );
-            }
             Ok(())
         }
         .await;

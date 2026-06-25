@@ -1,6 +1,8 @@
 use crate::runtime::LocalPayloadLayout;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
@@ -62,7 +64,6 @@ impl UploadStageStore {
     /// The operation is intended to be idempotent: if the staged file already exists, it is a
     /// no-op.
     pub fn link_payload(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
-        let payload_path = self.layout.payload_object_path(object_id);
         let stage_path = self.layout.upload_stage_object_path(object_id);
         let stage_dir = stage_path.parent().ok_or_else(|| {
             io::Error::other(format!(
@@ -71,6 +72,13 @@ impl UploadStageStore {
             ))
         })?;
         fs::create_dir_all(stage_dir)?;
+
+        self.link_payload_prepared(object_id)
+    }
+
+    fn link_payload_prepared(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
+        let payload_path = self.layout.payload_object_path(object_id);
+        let stage_path = self.layout.upload_stage_object_path(object_id);
 
         match fs::hard_link(&payload_path, &stage_path) {
             Ok(()) => Ok(()),
@@ -91,10 +99,22 @@ impl UploadStageStore {
         }
     }
 
-    /// Calls [`Self::link_payload`] for each object id in `object_ids`.
+    /// Links each object id in `object_ids`, preparing shared shard directories once per batch.
     pub fn link_payload_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
+        let mut prepared_dirs = HashSet::<PathBuf>::new();
         for &object_id in object_ids {
-            self.link_payload(object_id)?;
+            let stage_path = self.layout.upload_stage_object_path(object_id);
+            let stage_dir = stage_path.parent().ok_or_else(|| {
+                io::Error::other(format!(
+                    "upload stage path has no parent directory: {}",
+                    stage_path.display()
+                ))
+            })?;
+            if !prepared_dirs.contains(stage_dir) {
+                fs::create_dir_all(stage_dir)?;
+                prepared_dirs.insert(stage_dir.to_path_buf());
+            }
+            self.link_payload_prepared(object_id)?;
         }
         Ok(())
     }

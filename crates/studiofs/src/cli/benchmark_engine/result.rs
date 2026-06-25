@@ -553,6 +553,9 @@ pub(crate) struct MountedWritebackTimelineSampleReport {
     pub(crate) hard_backpressure_events_delta: u64,
     pub(crate) materialization_calls_delta: u64,
     pub(crate) materialization_total_ms_delta: f64,
+    pub(crate) cache_materialize_batches_delta: u64,
+    pub(crate) cache_materialize_payloads_delta: u64,
+    pub(crate) cache_materialize_bytes_delta: u64,
     pub(crate) local_cache_io_calls_delta: u64,
     pub(crate) local_cache_backend_io_total_ms_delta: f64,
     pub(crate) local_cache_backend_io_cumulative_max_ms: f64,
@@ -598,6 +601,9 @@ pub(crate) struct MountedWriteDiagnosticsReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_accounted_bytes_after: Option<u64>,
     pub(crate) payload_persist_calls_delta: u64,
+    pub(crate) cache_materialize_batches_delta: u64,
+    pub(crate) cache_materialize_payloads_delta: u64,
+    pub(crate) cache_materialize_bytes_delta: u64,
     pub(crate) local_cache_io_calls_delta: u64,
     pub(crate) local_cache_backend_io_total_ms_delta: f64,
     pub(crate) hard_backpressure_events_delta: u64,
@@ -700,6 +706,7 @@ pub(crate) struct PublicBenchDuringUploadReadReport {
 pub(crate) struct PublicBenchReadMetricsReport {
     pub(crate) first_read: OpReport,
     pub(crate) hot_read: OpReport,
+    pub(crate) large_hot_read_best4: OpReport,
     pub(crate) pseudo_random_read: OpReport,
     pub(crate) sequential_medium_read: OpReport,
 }

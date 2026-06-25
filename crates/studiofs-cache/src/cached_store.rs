@@ -588,7 +588,13 @@ impl CachedStore {
 
     /// Populates the in-memory hot-upload buffer with payload bytes from `entries`.
     pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
+        if entries.is_empty() {
+            return;
+        }
         let mut upload_hot = self.upload_hot.lock();
+        if upload_hot.budget_bytes == 0 {
+            return;
+        }
         for entry in entries {
             upload_hot.insert(entry.object_id, entry.data.clone());
         }
@@ -632,12 +638,7 @@ impl CachedStore {
                 source,
             });
         }
-        {
-            let mut upload_hot = self.upload_hot.lock();
-            for put in &puts {
-                upload_hot.insert(put.object_id, Bytes::copy_from_slice(put.data.as_ref()));
-            }
-        }
+        self.cache_hot_upload_batch(&puts);
         let mut total_bytes = 0u64;
         for entry in &entries {
             total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
@@ -1099,6 +1100,7 @@ impl CachedStoreWriterSlice {
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
         let payload = self.take_prefix(len);
+        let can_reuse_hot_payload = self.dirty_bytes() == 0;
         let object_id = self.next_object_id;
 
         if let Err(source) = self.store.local_payload_backend.put_owned(LocalPayloadPut {
@@ -1113,7 +1115,7 @@ impl CachedStoreWriterSlice {
             self.restore_staged_prefix(payload);
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
-        self.cache_hot_upload_if_enabled(object_id, &payload);
+        self.cache_hot_upload_if_enabled(object_id, payload, can_reuse_hot_payload);
         self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
@@ -1196,10 +1198,19 @@ impl CachedStoreWriterSlice {
         self.dirty_len = self.dirty_len.saturating_add(payload.len());
     }
 
-    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: &Bytes) {
+    fn cache_hot_upload_if_enabled(
+        &self,
+        object_id: ObjectId,
+        payload: Bytes,
+        can_reuse_payload: bool,
+    ) {
         let mut upload_hot = self.store.upload_hot.lock();
         if upload_hot.budget_bytes > 0 {
-            let payload = Bytes::copy_from_slice(payload.as_ref());
+            let payload = if can_reuse_payload {
+                payload
+            } else {
+                Bytes::copy_from_slice(payload.as_ref())
+            };
             upload_hot.insert(object_id, payload);
         }
     }
@@ -1689,6 +1700,38 @@ mod tests {
     }
 
     #[test]
+    fn detached_persist_reuses_payload_for_hot_upload_cache() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner_backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let backend_for_store: Arc<dyn LocalPayloadBackend> = backend.clone();
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
+            backend_for_store,
+        )
+        .expect("open cached store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let recorded = backend.take_owned_puts();
+        assert_eq!(recorded.len(), 1);
+        let hot = cached_store
+            .get_hot_upload(recorded[0].object_id)
+            .expect("hot upload payload");
+        assert_eq!(recorded[0].data.as_ptr(), hot.as_ptr());
+    }
+
+    #[test]
     fn writer_slice_full_block_flush_uses_compact_hot_upload_payload() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let inner_backend =
@@ -1721,10 +1764,10 @@ mod tests {
             .get_hot_upload(staged[0].object_id)
             .expect("hot upload payload");
         assert_eq!(hot.as_ref(), b"abcdefgh");
-        assert_ne!(
+        assert_eq!(
             recorded[0].data.as_ptr(),
             hot.as_ptr(),
-            "hot upload cache should keep a compact payload instead of retaining writer backing memory"
+            "hot upload cache should reuse an already detached staged slice"
         );
     }
 
@@ -2150,6 +2193,28 @@ mod tests {
             cached_store.get_hot_upload(3).as_deref(),
             Some(&b"cccc"[..])
         );
+    }
+
+    #[test]
+    fn hot_upload_batch_skips_work_when_disabled() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(0),
+            backend,
+        )
+        .expect("open cached store");
+
+        cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
+            object_id: 1,
+            data: Bytes::from_static(b"aaaa"),
+            evictable: false,
+        }]);
+
+        assert!(cached_store.get_hot_upload(1).is_none());
     }
 
     #[test]

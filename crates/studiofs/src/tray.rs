@@ -602,7 +602,7 @@ mod supported {
         let event_loop = match event_loop_builder.build() {
             Ok(event_loop) => event_loop,
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     error = %error,
                     "failed to create tray event loop; continuing without tray"
                 );

@@ -72,18 +72,19 @@ pub use locking::LockKind;
 pub use metrics::{
     RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
-    RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
-    VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
-    VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
-    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
+    VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -202,7 +203,6 @@ const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
-const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
@@ -5409,11 +5409,7 @@ impl StudioVfs {
                 .pending_bytes
                 .saturating_add(persisted_bytes);
 
-            let trigger = write_path_sync_trigger(
-                local_sync_policy,
-                local_sync_group.pending_bytes,
-                self.local_sync_group_min_bytes,
-            );
+            let trigger = write_path_sync_trigger(local_sync_policy);
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
                     self.state
@@ -5443,11 +5439,7 @@ impl StudioVfs {
         self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
             let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
-            let trigger = write_path_sync_trigger(
-                local_sync_policy,
-                local_sync_group.pending_bytes,
-                self.local_sync_group_min_bytes,
-            );
+            let trigger = write_path_sync_trigger(local_sync_policy);
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
                     self.state
@@ -6279,8 +6271,8 @@ impl StudioVfs {
     }
 
     fn writer_stack_steady_drain_quota_bytes(&self) -> usize {
-        WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES
-            .min(self.block_size as usize)
+        self.write_eager_flush_drain_chunk_bytes
+            .max(self.block_size as usize)
             .max(1)
     }
 
@@ -7451,6 +7443,7 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let cache_pipeline_metrics = self.cached_store.cache_pipeline_metrics();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
         let fetch_cache_hit_bytes = fetch_metrics.cache_hit_bytes.load(Ordering::Relaxed);
@@ -8085,6 +8078,17 @@ impl StudioVfs {
                     (fetch_total_ns as f64 / fetch_total_calls as f64) / 1_000_000.0
                 },
                 fetch_total_max_ms: fetch_total_max_ns as f64 / 1_000_000.0,
+            },
+            cache_pipeline: VfsCachePipelineStats {
+                materialize: VfsCachePipelineMaterializeStats {
+                    batches: cache_pipeline_metrics.materialize_batches.batches,
+                    payloads: cache_pipeline_metrics.materialize_batches.payloads,
+                    bytes: cache_pipeline_metrics.materialize_batches.bytes,
+                    inflight_batches: cache_pipeline_metrics.materialize_batches.inflight_batches,
+                    inflight_batches_peak: cache_pipeline_metrics
+                        .materialize_batches
+                        .inflight_batches_peak,
+                },
             },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,

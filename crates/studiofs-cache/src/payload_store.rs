@@ -4,7 +4,7 @@
 
 use std::array;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
@@ -644,13 +644,10 @@ impl FilePayloadStore {
     /// Flushes and syncs pending payload writes according to the configured sync mode.
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {
-            let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();
-            return self.sync_pending_grouped_targets(
-                pending_object_ids,
-                pending_dirs,
-                |object_id| self.sync_payload_file_grouped(object_id),
-                |dir| self.sync_directory_grouped_barrier(dir),
-            );
+            // ponytail: Fast mode is throughput-first; use Durable mode when
+            // crash-safe payload fsync/dirsync is required.
+            self.clear_grouped_sync_targets();
+            return Ok(());
         }
 
         for dir in [
@@ -1243,6 +1240,12 @@ impl FilePayloadStore {
         directories.insert(self.layout.runtime_root.clone());
     }
 
+    fn clear_grouped_sync_targets(&self) {
+        self.shared.pending_grouped_sync.object_ids.lock().clear();
+        self.shared.pending_grouped_sync.directories.lock().clear();
+    }
+
+    #[cfg(test)]
     fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
         let object_ids = {
             let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
@@ -1255,6 +1258,7 @@ impl FilePayloadStore {
         (object_ids, directories)
     }
 
+    #[cfg(test)]
     fn requeue_grouped_sync_targets(&self, object_ids: &[u64], directories: &[PathBuf]) {
         if !object_ids.is_empty() {
             let mut pending_object_ids = self.shared.pending_grouped_sync.object_ids.lock();
@@ -1266,6 +1270,7 @@ impl FilePayloadStore {
         }
     }
 
+    #[cfg(test)]
     fn sync_pending_grouped_targets<SyncFile, SyncDir>(
         &self,
         pending_object_ids: Vec<u64>,
@@ -1289,29 +1294,6 @@ impl FilePayloadStore {
                 return Err(error);
             }
         }
-        Ok(())
-    }
-
-    fn sync_payload_file_grouped(&self, object_id: u64) -> Result<(), FilePayloadStoreError> {
-        let path = self.layout.payload_object_path(object_id);
-        let file = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                warn!(
-                    object_id,
-                    path = %path.display(),
-                    "local payload runtime grouped payload sync skipped because file could not be opened for writing"
-                );
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        platform::sync_data(&file)?;
-        self.shared
-            .barrier_counters
-            .grouped_file_sync_calls
-            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1475,6 +1457,7 @@ struct PayloadReadCounters {
 struct SyncBarrierCounters {
     per_put_file_sync_calls: CachePaddedAtomicU64,
     per_put_dir_sync_calls: CachePaddedAtomicU64,
+    #[cfg(test)]
     grouped_file_sync_calls: CachePaddedAtomicU64,
     grouped_dir_sync_calls: CachePaddedAtomicU64,
 }
@@ -2075,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_defers_put_barriers_until_grouped_sync_data() {
+    fn fast_mode_skips_put_barriers_on_grouped_sync_data() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
@@ -2094,18 +2077,42 @@ mod tests {
             before_sync.pending_grouped_dir_syncs >= 1,
             "fast mode should queue directories for grouped sync_data barriers"
         );
+        let object_capacity_before_sync = store
+            .shared
+            .pending_grouped_sync
+            .object_ids
+            .lock()
+            .capacity();
+        let dir_capacity_before_sync = store
+            .shared
+            .pending_grouped_sync
+            .directories
+            .lock()
+            .capacity();
 
         store.sync_data().unwrap();
         let after_sync = store.sync_barrier_snapshot();
         assert_eq!(after_sync.pending_grouped_file_syncs, 0);
         assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
+        assert_eq!(after_sync.grouped_file_sync_calls, 0);
+        assert_eq!(after_sync.grouped_dir_sync_calls, 0);
         assert!(
-            after_sync.grouped_file_sync_calls >= 2,
-            "grouped sync_data should sync queued payload files"
+            store
+                .shared
+                .pending_grouped_sync
+                .object_ids
+                .lock()
+                .capacity()
+                >= object_capacity_before_sync
         );
         assert!(
-            after_sync.grouped_dir_sync_calls >= 1,
-            "grouped sync_data should sync queued directories"
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .capacity()
+                >= dir_capacity_before_sync
         );
     }
 
@@ -2189,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_put_batch_defers_barriers_until_grouped_sync_data() {
+    fn fast_mode_put_batch_skips_barriers_on_grouped_sync_data() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
@@ -2226,10 +2233,8 @@ mod tests {
         let after_sync = store.sync_barrier_snapshot();
         assert_eq!(after_sync.pending_grouped_file_syncs, 0);
         assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
-        assert!(
-            after_sync.grouped_file_sync_calls >= entries.len() as u64,
-            "grouped sync_data should sync all queued payload files from batched put"
-        );
+        assert_eq!(after_sync.grouped_file_sync_calls, 0);
+        assert_eq!(after_sync.grouped_dir_sync_calls, 0);
     }
 
     #[test]

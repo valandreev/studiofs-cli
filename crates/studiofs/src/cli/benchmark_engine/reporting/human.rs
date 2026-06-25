@@ -180,6 +180,16 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
+        "Large hot-read: {} (best 4 of 10)",
+        format_throughput(
+            public_bench
+                .read_metrics
+                .large_hot_read_best4
+                .throughput_bytes_per_sec
+        )
+    );
+    let _ = writeln!(
+        &mut out,
         "Pseudo-random read: {}, {} p95",
         format_throughput(
             public_bench
@@ -502,6 +512,13 @@ fn render_mounted_write_diagnostics(out: &mut String, diagnostics: &MountedWrite
     );
     let _ = writeln!(
         out,
+        "Materialize: {} batches, {} payloads, {}",
+        diagnostics.cache_materialize_batches_delta,
+        diagnostics.cache_materialize_payloads_delta,
+        format_bytes(diagnostics.cache_materialize_bytes_delta),
+    );
+    let _ = writeln!(
+        out,
         "Accounted after: writer {}, staged {}, pending upload {}, cache pressure {}, total {}",
         format_optional_bytes(diagnostics.writer_stack_dirty_bytes_after),
         format_optional_bytes(diagnostics.pending_persisted_slice_bytes_after),
@@ -552,10 +569,12 @@ fn render_mounted_writeback_timeline(out: &mut String, timeline: &MountedWriteba
     );
     let _ = writeln!(
         out,
-        "Backpressure: last events {} wait {}, worst wait {}; local cache IO last {} calls/{}, worst bucket {}",
+        "Backpressure: last events {} wait {}, worst wait {}; materialize last {} batches/{}; local cache IO last {} calls/{}, worst bucket {}",
         last.backpressure_events_delta,
         format_duration_ms(last.backpressure_wait_ms_delta as f64),
         format_duration_ms(max_backpressure_wait_ms as f64),
+        last.cache_materialize_batches_delta,
+        format_bytes(last.cache_materialize_bytes_delta),
         last.local_cache_io_calls_delta,
         format_duration_ms(last.local_cache_backend_io_total_ms_delta),
         format_duration_ms(max_local_cache_io_ms),
@@ -1152,6 +1171,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read: op_report(1081, 4 * 1024 * 1024 * 1024, 510.0, 12.0),
                 hot_read: op_report(1081, 4 * 1024 * 1024 * 1024, 1800.0, 2.4),
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },
@@ -1185,6 +1205,7 @@ mod tests {
         assert!(summary.contains("Mixed-write speed: 52.00MiB/s"));
         assert!(summary.contains("First-read speed:"));
         assert!(summary.contains("Hot-read speed:"));
+        assert!(summary.contains("Large hot-read: 2.15GiB/s (best 4 of 10)"));
         assert!(summary.contains("Pseudo-random read: 240.00MiB/s, 3.20 ms p95"));
         assert!(summary.contains("Upload drain: not observed after 10.00 s"));
         assert!(summary.contains("CPU: avg n/a, peak n/a"));
@@ -1245,6 +1266,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read: op_report(1081, 4 * 1024 * 1024 * 1024, 510.0, 12.0),
                 hot_read: op_report(1081, 4 * 1024 * 1024 * 1024, 1800.0, 2.4),
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },
@@ -1316,6 +1338,7 @@ mod tests {
             read_metrics: PublicBenchReadMetricsReport {
                 first_read,
                 hot_read,
+                large_hot_read_best4: op_report(4, 16 * 1024 * 1024 * 1024, 2200.0, 1.8),
                 pseudo_random_read: op_report(256, 256 * 1024 * 1024, 240.0, 3.2),
                 sequential_medium_read: op_report(80, 2 * 1024 * 1024 * 1024, 920.0, 4.8),
             },
@@ -1532,6 +1555,9 @@ mod tests {
                 hard_backpressure_events_delta: 1,
                 materialization_calls_delta: 8,
                 materialization_total_ms_delta: 44.0,
+                cache_materialize_batches_delta: 4,
+                cache_materialize_payloads_delta: 8,
+                cache_materialize_bytes_delta: 32 * 1024 * 1024,
                 local_cache_io_calls_delta: 8,
                 local_cache_backend_io_total_ms_delta: 40.0,
                 local_cache_backend_io_cumulative_max_ms: 12.0,
