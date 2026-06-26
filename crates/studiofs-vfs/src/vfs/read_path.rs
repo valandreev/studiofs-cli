@@ -2266,6 +2266,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_read_metadata_async_keeps_multiple_published_read_plan_windows_per_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-windows");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"published-read-plan-cache-windows.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let block_size = vfs.block_size as u64;
+            let read_len = block_size.min(128 * 1024);
+            let second_window_start =
+                block_size.saturating_mul(PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS + 1);
+            let payload = vec![0x4B_u8; (second_window_start + read_len) as usize];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let (_, first_window_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, read_len)
+                .await
+                .expect("resolve first window");
+            let (_, second_window_slices) = vfs
+                .resolve_read_metadata_async(ino, second_window_start, read_len)
+                .await
+                .expect("resolve second window");
+            let (_, first_window_again_slices) = vfs
+                .resolve_read_metadata_async(ino, read_len, read_len)
+                .await
+                .expect("resolve first window again");
+
+            assert!(
+                !Arc::ptr_eq(&first_window_slices, &second_window_slices),
+                "disjoint hot windows should have separate resolved slice plans"
+            );
+            assert!(
+                Arc::ptr_eq(&first_window_slices, &first_window_again_slices),
+                "adding another hot window for the same inode must not evict the first window"
+            );
+        });
+    }
+
+    #[test]
     fn metadata_invalidation_clears_published_read_plan_cache_without_attr_change() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-invalidate");

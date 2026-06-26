@@ -1650,7 +1650,8 @@ struct ForegroundReadSample {
     policy: AccessPolicy,
 }
 
-const PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES: usize = 1_024;
+const PUBLISHED_READ_PLAN_CACHE_MAX_INODES: usize = 1_024;
+const PUBLISHED_READ_PLAN_CACHE_MAX_WINDOWS_PER_INODE: usize = 4;
 const PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1708,7 +1709,7 @@ struct ReadState {
     prefetch_last_hint: Mutex<HashMap<(Ino, u64), (u32, u32)>>,
     read_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
     write_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
-    published_read_plan_cache: Mutex<HashMap<Ino, PublishedReadPlanCacheEntry>>,
+    published_read_plan_cache: Mutex<HashMap<Ino, VecDeque<PublishedReadPlanCacheEntry>>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
     foreground_local_payload_reads: AtomicU64,
@@ -1749,11 +1750,15 @@ impl ReadState {
         start: u64,
         end: u64,
     ) -> Option<Arc<[studiofs_meta::schema::ResolvedSliceSpan]>> {
-        self.published_read_plan_cache
-            .lock()
-            .get(&ino)
-            .filter(|entry| entry.key == key && start >= entry.start && end <= entry.end)
-            .map(|entry| entry.resolved_slices.clone())
+        let mut cache = self.published_read_plan_cache.lock();
+        let entries = cache.get_mut(&ino)?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.key == key && start >= entry.start && end <= entry.end)?;
+        let entry = entries.remove(index)?;
+        let resolved_slices = entry.resolved_slices.clone();
+        entries.push_front(entry);
+        Some(resolved_slices)
     }
 
     fn published_read_plan_cache_put(
@@ -1765,18 +1770,23 @@ impl ReadState {
         resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
     ) {
         let mut cache = self.published_read_plan_cache.lock();
-        if cache.len() >= PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES && !cache.contains_key(&ino) {
+        if cache.len() >= PUBLISHED_READ_PLAN_CACHE_MAX_INODES && !cache.contains_key(&ino) {
             cache.clear();
         }
-        cache.insert(
-            ino,
-            PublishedReadPlanCacheEntry {
-                key,
-                start,
-                end,
-                resolved_slices,
-            },
-        );
+        let entries = cache.entry(ino).or_default();
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.key == key && entry.start == start && entry.end == end)
+        {
+            entries.remove(index);
+        }
+        entries.push_front(PublishedReadPlanCacheEntry {
+            key,
+            start,
+            end,
+            resolved_slices,
+        });
+        entries.truncate(PUBLISHED_READ_PLAN_CACHE_MAX_WINDOWS_PER_INODE);
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
