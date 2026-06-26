@@ -125,6 +125,28 @@ fn runtime_stats_test_tempdir() -> TempDir {
 }
 
 #[test]
+fn read_into_fh_clamps_to_remaining_file_size() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-into-fh-clamps");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(1, b"small.txt", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh(fh, attr.ino, 0, b"hello").await.unwrap();
+
+        let mut out = [0xAA; 8];
+        let read_len = vfs.read_into_fh(fh, attr.ino, 2, &mut out).await.unwrap();
+
+        assert_eq!(read_len, 3);
+        assert_eq!(&out[..read_len as usize], b"llo");
+        assert_eq!(&out[read_len as usize..], &[0xAA; 5]);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");

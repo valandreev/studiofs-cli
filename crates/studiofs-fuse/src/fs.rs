@@ -1510,35 +1510,21 @@ impl Filesystem for StudioFuseFs {
             reply.data(&bytes[start..end]);
             return;
         }
-        let clamped_size = match self.vfs.getattr(ino) {
-            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
-            Err(e) => {
-                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-                return;
-            }
-        };
-        let clamped_size = match usize::try_from(clamped_size) {
-            Ok(clamped_size) => clamped_size,
-            Err(_) => {
-                reply.error(libc::EOVERFLOW);
-                return;
-            }
-        };
-        if clamped_size == 0 {
+        let requested_size = size as usize;
+        if requested_size == 0 {
             reply.data(&[]);
             return;
         }
 
         // fuser's ReplyData API accepts an immutable reply slice instead of
         // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
-        let mut out = vec![0u8; clamped_size];
+        let mut out = vec![0u8; requested_size];
         let callback_started = Instant::now();
         let result = self
             .rt
             .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out));
         self.vfs.record_fuse_read_callback(
-            clamped_size,
+            requested_size,
             callback_started.elapsed(),
             result.is_err(),
         );

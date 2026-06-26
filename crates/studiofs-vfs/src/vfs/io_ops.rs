@@ -181,7 +181,13 @@ impl StudioVfs {
             return Ok(0);
         }
         let written = self
-            .execute_prepared_foreground_read(fh, ino, offset, buffer, &prepared)
+            .execute_prepared_foreground_read(
+                fh,
+                ino,
+                offset,
+                &mut buffer[..prepared.read_len],
+                &prepared,
+            )
             .await?;
         if let Some(path) = &debug_path {
             tracing::info!(
