@@ -182,6 +182,34 @@ impl StudioVfs {
                 .bytes
                 .saturating_add(write_path.winfsp_write_path.write_bytes),
         );
+        insert_gauge(
+            &mut snapshot.bridge,
+            "fuse_max_write_bytes",
+            "bytes",
+            u64::from(write_path.fuse_async_write.fuse_max_write_bytes),
+        );
+        insert_gauge(
+            &mut snapshot.bridge,
+            "fuse_max_readahead_bytes",
+            "bytes",
+            u64::from(write_path.fuse_async_write.fuse_max_readahead_bytes),
+        );
+        if let Some(max_background) = write_path.fuse_async_write.fuse_max_background {
+            insert_gauge(
+                &mut snapshot.bridge,
+                "fuse_max_background",
+                "count",
+                u64::from(max_background),
+            );
+        }
+        if let Some(congestion_threshold) = write_path.fuse_async_write.fuse_congestion_threshold {
+            insert_gauge(
+                &mut snapshot.bridge,
+                "fuse_congestion_threshold",
+                "count",
+                u64::from(congestion_threshold),
+            );
+        }
         insert_latency(
             &mut snapshot.bridge,
             "callback",

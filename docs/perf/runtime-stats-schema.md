@@ -78,6 +78,7 @@ Recommended gauges:
 | Section | Gauges |
 | --- | --- |
 | `system` | `uptime_ms`, `rss_bytes`, `worker_threads` |
+| `bridge` | `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold` |
 | `cache` | `resident_bytes`, `dirty_bytes`, `evictable_bytes`, `prefetch_queue_depth` |
 | `upload_queue` | `pending_depth`, `pending_bytes`, `active_uploads`, `oldest_pending_age_ms` |
 | `metadata` | `pending_ops`, `inflight_ops` |

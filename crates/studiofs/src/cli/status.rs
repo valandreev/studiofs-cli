@@ -147,8 +147,8 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     };
     [
         format!(
-            "  FUSE async writes:        {mode} (policy: {})",
-            snapshot.platform_policy
+            "  FUSE async writes:        {mode} (profile: {})",
+            snapshot.linux_fuse_profile
         ),
         format!(
             "  FUSE async pending:       {} writes, {} current, {} peak",
@@ -1029,7 +1029,11 @@ mod tests {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
             enabled: true,
-            platform_policy: "linux".into(),
+            linux_fuse_profile: "high-throughput".into(),
+            fuse_max_write_bytes: 16 * 1024 * 1024,
+            fuse_max_readahead_bytes: 16 * 1024 * 1024,
+            fuse_max_background: Some(128),
+            fuse_congestion_threshold: Some(96),
             max_pending_bytes: Some(128 * 1024 * 1024),
             max_pending_writes: Some(1024),
             per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -1050,7 +1054,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  FUSE async writes:        enabled (policy: linux)",
+                "  FUSE async writes:        enabled (profile: high-throughput)",
                 "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
@@ -1062,7 +1066,7 @@ mod tests {
     #[test]
     fn mounted_status_formats_non_finite_fuse_async_waits_as_unavailable() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
-            platform_policy: "linux".into(),
+            linux_fuse_profile: "conservative".into(),
             admission_wait_total_ms: f64::NAN,
             barrier_wait_total_ms: f64::INFINITY,
             ..Default::default()
