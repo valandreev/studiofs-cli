@@ -74,7 +74,9 @@ impl LinuxFuseProfile {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("conservative") {
             Self::Conservative
-        } else if trimmed.eq_ignore_ascii_case("high-throughput") {
+        } else if trimmed.eq_ignore_ascii_case("high-throughput")
+            || trimmed.eq_ignore_ascii_case("high_throughput")
+        {
             Self::HighThroughput
         } else {
             warn!(
@@ -1175,6 +1177,7 @@ impl Filesystem for StudioFuseFs {
             if config.set_max_write(max_supported).is_err() {
                 return Err(libc::EINVAL);
             }
+            self.fuse_max_write_bytes = max_supported;
         }
 
         let requested_readahead = self.fuse_max_readahead_bytes;
@@ -1187,6 +1190,7 @@ impl Filesystem for StudioFuseFs {
             if config.set_max_readahead(max_supported).is_err() {
                 return Err(libc::EINVAL);
             }
+            self.fuse_max_readahead_bytes = max_supported;
         }
 
         let background_queue_policy = self.fuse_background_queue_policy;
@@ -1201,6 +1205,7 @@ impl Filesystem for StudioFuseFs {
             if config.set_max_background(supported_limit).is_err() {
                 return Err(libc::EINVAL);
             }
+            self.fuse_background_queue_policy.max_background = Some(supported_limit);
         }
         if let Some(congestion_threshold) = background_queue_policy.congestion_threshold
             && let Err(supported_limit) = config.set_congestion_threshold(congestion_threshold)
@@ -1213,13 +1218,14 @@ impl Filesystem for StudioFuseFs {
             if config.set_congestion_threshold(supported_limit).is_err() {
                 return Err(libc::EINVAL);
             }
+            self.fuse_background_queue_policy.congestion_threshold = Some(supported_limit);
         }
 
         debug!(
-            max_write = requested_max_write,
-            max_readahead = requested_readahead,
-            max_background = ?background_queue_policy.max_background,
-            congestion_threshold = ?background_queue_policy.congestion_threshold,
+            max_write = self.fuse_max_write_bytes,
+            max_readahead = self.fuse_max_readahead_bytes,
+            max_background = ?self.fuse_background_queue_policy.max_background,
+            congestion_threshold = ?self.fuse_background_queue_policy.congestion_threshold,
             writeback_cache_enabled = self.linux_writeback_cache_enabled,
             "configured FUSE bridge I/O policy"
         );
@@ -2834,6 +2840,10 @@ mod tests {
         );
         assert_eq!(
             LinuxFuseProfile::from_env_value(Some("high-throughput")),
+            LinuxFuseProfile::HighThroughput
+        );
+        assert_eq!(
+            LinuxFuseProfile::from_env_value(Some("high_throughput")),
             LinuxFuseProfile::HighThroughput
         );
     }
