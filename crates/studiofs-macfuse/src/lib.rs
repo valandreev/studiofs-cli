@@ -1680,6 +1680,44 @@ mod tests {
     }
 
     #[test]
+    fn adapter_append_handle_fsync_survives_unlink_of_open_file() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-open-append-unlink-fsync",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-append-unlink.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let writer = adapter
+            .open(attr.ino, libc::O_RDONLY | libc::O_APPEND)
+            .expect("open append handle through macFUSE adapter");
+
+        fixture
+            .meta()
+            .unlink(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-append-unlink.txt",
+            )
+            .expect("unlink file while append handle is open");
+
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b" after unlink")
+            .expect("write through append handle after foreign unlink");
+        adapter
+            .fsync(Some(writer.file_handle()), attr.ino, true)
+            .expect("append handle-backed fsync should not depend on removed namespace entry");
+    }
+
+    #[test]
     fn adapter_rmdir_removes_empty_directory_and_respects_read_only() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-rmdir")

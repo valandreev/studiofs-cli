@@ -6558,7 +6558,10 @@ impl StudioVfs {
     }
 
     fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {
-        trunc || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
+        trunc
+            || flags.contains(OpenFlags::WRONLY)
+            || flags.contains(OpenFlags::RDWR)
+            || flags.contains(OpenFlags::APPEND)
     }
 
     fn active_open_overlay_required(flags: OpenFlags, trunc: bool) -> bool {
@@ -6566,7 +6569,9 @@ impl StudioVfs {
     }
 
     fn open_flags_allow_write(flags: OpenFlags) -> bool {
-        flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
+        flags.contains(OpenFlags::WRONLY)
+            || flags.contains(OpenFlags::RDWR)
+            || flags.contains(OpenFlags::APPEND)
     }
 
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {

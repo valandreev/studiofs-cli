@@ -1062,10 +1062,7 @@ impl StudioVfs {
                 .await
             {
                 Ok(outcome) => outcome,
-                Err(error)
-                    if open_file.active_open_overlay
-                        && Self::is_inode_not_found_error(&error, open_file.ino) =>
-                {
+                Err(error) if Self::is_inode_not_found_error(&error, open_file.ino) => {
                     self.handle_table.mark_orphan(open_file.ino);
                     return Ok(ExplicitFlushOutcome::default());
                 }

@@ -6773,6 +6773,10 @@ fn active_open_overlay_tracks_only_mutating_handles() {
         OpenFlags::RDWR,
         false
     ));
+    assert!(StudioVfs::active_open_overlay_required(
+        OpenFlags::RDONLY | OpenFlags::APPEND,
+        false
+    ));
 }
 
 #[test]
@@ -9049,6 +9053,63 @@ fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
             vfs.getattr(ino).is_err(),
             "orphan cleanup should remove the inode"
         );
+    });
+}
+
+#[test]
+fn flush_fh_survives_unlink_of_open_append_handle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-open-append-unlink");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"flush-open-append-unlink.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::WRONLY | OpenFlags::APPEND, false)
+            .unwrap();
+
+        vfs.unlink(1, b"flush-open-append-unlink.txt").unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"payload after unlink",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("handle-backed flush must survive open-unlink append writes");
+    });
+}
+
+#[test]
+fn flush_fh_survives_removed_inode_for_handle_with_cached_dirty_state() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-open-readonly-removed-dirty");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"flush-open-readonly-removed-dirty.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, attr.clone());
+
+        meta.unlink(1, b"flush-open-readonly-removed-dirty.txt")
+            .unwrap();
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("handle-backed flush must tolerate removed authoritative inode");
     });
 }
 
