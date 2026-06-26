@@ -51,7 +51,6 @@ const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
 
 #[derive(Clone)]
 struct OpenDirState {
-    ino: u64,
     dir_attr: studiofs_meta::InodeAttr,
     entries: Arc<Vec<DirEntryWithAttr>>,
 }
@@ -828,7 +827,6 @@ impl StudioFuseFs {
 
     fn load_open_dir_state(&self, ino: u64) -> Result<OpenDirState, VfsError> {
         Ok(OpenDirState {
-            ino,
             dir_attr: self.vfs.getattr(ino)?,
             entries: Arc::new(self.vfs.readdir_with_attrs(ino)?),
         })
@@ -843,24 +841,10 @@ impl StudioFuseFs {
     }
 
     fn open_dir_state(&self, ino: u64, fh: u64) -> Result<OpenDirState, VfsError> {
-        if let Some(state) = self.open_dir_handles.get(&fh)
-            && state.ino == ino
-        {
+        if let Some(state) = self.open_dir_handles.get(&fh) {
             return Ok(state.clone());
         }
         self.load_open_dir_state(ino)
-    }
-
-    #[cfg(test)]
-    fn opendir_snapshot_for_test(&mut self, ino: u64) -> Result<u64, VfsError> {
-        self.open_dir_snapshot(ino)
-    }
-
-    #[cfg(test)]
-    fn open_dir_snapshot_for_test(&self, fh: u64) -> Option<Arc<Vec<DirEntryWithAttr>>> {
-        self.open_dir_handles
-            .get(&fh)
-            .map(|state| Arc::clone(&state.entries))
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -3268,7 +3252,7 @@ mod tests {
             .expect("create first file");
 
         let fh = fs
-            .opendir_snapshot_for_test(studiofs_meta::ROOT_INO)
+            .open_dir_snapshot(studiofs_meta::ROOT_INO)
             .expect("open dir snapshot");
         vfs.create(studiofs_meta::ROOT_INO, b"second.txt", 1000, 1000, 0o644)
             .expect("create second file after opendir");
@@ -3282,9 +3266,11 @@ mod tests {
             "test setup should make the second file visible to fresh readdir"
         );
 
-        let snapshot = fs
-            .open_dir_snapshot_for_test(fh)
-            .expect("snapshot should remain open");
+        let snapshot = &fs
+            .open_dir_handles
+            .get(&fh)
+            .expect("snapshot should remain open")
+            .entries;
 
         assert_eq!(
             snapshot
