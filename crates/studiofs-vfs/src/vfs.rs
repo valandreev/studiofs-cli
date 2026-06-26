@@ -6196,7 +6196,7 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let mut pressure = self.write_admission_pressure();
+        let pressure = self.write_admission_pressure();
         let mut pressure_bytes = pressure.total_bytes();
         #[cfg(any(test, target_os = "macos"))]
         {
@@ -6225,8 +6225,7 @@ impl StudioVfs {
                 let started = Instant::now();
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 self.record_write_admission_wait(started.elapsed());
-                pressure = self.write_admission_pressure();
-                pressure_bytes = pressure.total_bytes();
+                pressure_bytes = self.write_admission_pressure().total_bytes();
                 if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
                     return;
                 }
