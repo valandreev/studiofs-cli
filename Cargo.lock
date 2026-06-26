@@ -5026,6 +5026,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures",
+ "lru",
  "opendal",
  "parking_lot",
  "serde",

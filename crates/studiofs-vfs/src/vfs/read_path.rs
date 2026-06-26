@@ -2520,7 +2520,7 @@ mod tests {
                     .read
                     .published_read_plan_cache
                     .lock()
-                    .contains_key(&ino),
+                    .contains(&ino),
                 "setup should leave a published read-plan cache entry"
             );
 
@@ -2538,7 +2538,7 @@ mod tests {
                     .read
                     .published_read_plan_cache
                     .lock()
-                    .contains_key(&ino),
+                    .contains(&ino),
                 "local writes must evict cached hole read plans for the same inode"
             );
         });

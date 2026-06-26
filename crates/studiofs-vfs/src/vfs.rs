@@ -147,6 +147,7 @@ use crate::utils::{now_unix_millis, now_unix_secs};
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
+use lru::LruCache;
 use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::{Mutex, RwLock};
@@ -154,6 +155,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1709,7 +1711,7 @@ struct ReadState {
     prefetch_last_hint: Mutex<HashMap<(Ino, u64), (u32, u32)>>,
     read_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
     write_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
-    published_read_plan_cache: Mutex<HashMap<Ino, VecDeque<PublishedReadPlanCacheEntry>>>,
+    published_read_plan_cache: Mutex<LruCache<Ino, VecDeque<PublishedReadPlanCacheEntry>>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
     foreground_local_payload_reads: AtomicU64,
@@ -1733,7 +1735,10 @@ impl ReadState {
             prefetch_last_hint: Mutex::new(HashMap::new()),
             read_access_fallback: Mutex::new(HashMap::new()),
             write_access_fallback: Mutex::new(HashMap::new()),
-            published_read_plan_cache: Mutex::new(HashMap::new()),
+            published_read_plan_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(PUBLISHED_READ_PLAN_CACHE_MAX_INODES)
+                    .expect("published read-plan cache capacity is non-zero"),
+            )),
             active_access_classes: std::array::from_fn(|_| AtomicU64::new(0)),
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
             foreground_local_payload_reads: AtomicU64::new(0),
@@ -1770,10 +1775,7 @@ impl ReadState {
         resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
     ) {
         let mut cache = self.published_read_plan_cache.lock();
-        if cache.len() >= PUBLISHED_READ_PLAN_CACHE_MAX_INODES && !cache.contains_key(&ino) {
-            cache.clear();
-        }
-        let entries = cache.entry(ino).or_default();
+        let mut entries = cache.pop(&ino).unwrap_or_default();
         if let Some(index) = entries
             .iter()
             .position(|entry| entry.key == key && entry.start == start && entry.end == end)
@@ -1787,6 +1789,7 @@ impl ReadState {
             resolved_slices,
         });
         entries.truncate(PUBLISHED_READ_PLAN_CACHE_MAX_WINDOWS_PER_INODE);
+        cache.put(ino, entries);
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {

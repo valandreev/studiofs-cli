@@ -44,6 +44,32 @@ impl KernelInvalidator for RecordingKernelInvalidator {
     }
 }
 
+#[test]
+fn published_read_plan_cache_evicts_least_recently_used_inode_when_full() {
+    let read = ReadState::new(1);
+    let key = PublishedReadPlanCacheKey {
+        size: 1,
+        committed_size: 1,
+        content_epoch: 1,
+        committed_content_epoch: 1,
+        upload_state: MetaUploadState::Ready,
+    };
+
+    for ino in 1..=PUBLISHED_READ_PLAN_CACHE_MAX_INODES as u64 {
+        read.published_read_plan_cache_put(ino, key, 0, 1, Arc::from([]));
+    }
+    assert!(
+        read.published_read_plan_cache_get(1, key, 0, 1).is_some(),
+        "setup should mark inode 1 as recently used"
+    );
+    read.published_read_plan_cache_put(9_999, key, 0, 1, Arc::from([]));
+
+    let cache = read.published_read_plan_cache.lock();
+    assert_eq!(cache.len(), PUBLISHED_READ_PLAN_CACHE_MAX_INODES);
+    assert!(cache.contains(&1));
+    assert!(cache.contains(&9_999));
+}
+
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
     FormatInfo {

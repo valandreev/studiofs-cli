@@ -557,7 +557,7 @@ impl StudioVfs {
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
         for ino in inodes {
-            read_plan_cache.remove(&ino);
+            read_plan_cache.pop(&ino);
             if cache.remove(ino) {
                 removed.push(ino);
             }

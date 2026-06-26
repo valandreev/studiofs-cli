@@ -704,6 +704,7 @@ fn complete_fuse_read_reply<R>(
             let n = match usize::try_from(n) {
                 Ok(n) => n,
                 Err(_) => {
+                    error!("read({ino}, off={offset}, sz={size}) -> EOVERFLOW");
                     buffer_pool.put(out);
                     reply.error(libc::EOVERFLOW);
                     return;
