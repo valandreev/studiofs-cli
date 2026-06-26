@@ -3,7 +3,7 @@ use super::{
     DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
     InodeIncarnationState, Instant, LocalSyncPolicy, MetaError, NamespacePathStyle,
     PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange,
-    SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
+    SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsUploadState,
     block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
     offset_within_block, validate_name, warn,
 };
@@ -992,7 +992,14 @@ impl StudioVfs {
         let mut attrs_by_ino = HashMap::new();
         if !entries.is_empty() {
             let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
-            let attrs = meta.get_attrs_batch(&child_inos)?;
+            let mut attrs = Vec::new();
+            let attr_batch_len = self
+                .readdir_attr_batch_chunk
+                .min(self.readdir_attr_batch_max_inodes)
+                .max(1);
+            for chunk in child_inos.chunks(attr_batch_len) {
+                attrs.extend(meta.get_attrs_batch(chunk)?);
+            }
             attrs_by_ino = attrs
                 .into_iter()
                 .map(|attr| (attr.ino, attr))
@@ -1065,18 +1072,15 @@ impl StudioVfs {
     /// Read directory entries from `ino` with namespace filtering and access checks.
     ///
     /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
-    /// blocked entries when necessary, and schedules batched attribute hydration for the
-    /// returned entries.
+    /// blocked entries when necessary, and hydrates the attribute cache.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
         let (entries, _) = self.readdir_entries_and_attrs(ino)?;
-        self.schedule_readdir_attr_hydration(&entries);
         Ok(entries)
     }
 
     /// Read directory entries and child attributes from the same metadata batch.
     pub fn readdir_with_attrs(&self, ino: Ino) -> VfsResult<Vec<super::DirEntryWithAttr>> {
         let (entries, mut attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
-        self.schedule_readdir_attr_hydration(&entries);
         Ok(entries
             .into_iter()
             .map(|entry| {
@@ -1084,69 +1088,6 @@ impl StudioVfs {
                 super::DirEntryWithAttr { entry, attr }
             })
             .collect())
-    }
-
-    fn schedule_readdir_attr_hydration(&self, entries: &[DirEntry]) {
-        if entries.is_empty()
-            || self.readdir_attr_batch_chunk == 0
-            || self.readdir_attr_batch_max_inodes == 0
-        {
-            return;
-        }
-
-        let mut inodes = Vec::with_capacity(entries.len().min(self.readdir_attr_batch_max_inodes));
-        for entry in entries.iter().take(self.readdir_attr_batch_max_inodes) {
-            if self.ignored_entry_attr(entry.ino).is_some() {
-                continue;
-            }
-            inodes.push(entry.ino);
-        }
-        if inodes.is_empty() {
-            return;
-        }
-
-        let meta = self.sync_meta();
-        let state = self.state.clone();
-        let chunk_size = self.readdir_attr_batch_chunk;
-        let hydrate = move || {
-            Self::hydrate_readdir_attr_cache_batches(meta, state, inodes, chunk_size);
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            drop(handle.spawn_blocking(hydrate));
-        } else {
-            drop(std::thread::spawn(hydrate));
-        }
-    }
-
-    fn hydrate_readdir_attr_cache_batches(
-        meta: Arc<dyn VfsMeta>,
-        state: Arc<VfsState>,
-        inodes: Vec<Ino>,
-        chunk_size: usize,
-    ) {
-        for chunk in inodes.chunks(chunk_size.max(1)) {
-            let attrs = match meta.get_attrs_batch(chunk) {
-                Ok(attrs) => attrs,
-                Err(err) => {
-                    debug!(
-                        chunk_len = chunk.len(),
-                        error = %err,
-                        "readdir attr hydration batch failed"
-                    );
-                    continue;
-                }
-            };
-
-            let now = Instant::now();
-            let dirty_attrs = state.namespace.dirty_attrs.lock();
-            let mut attr_cache = state.namespace.attr_read_cache.lock();
-            for attr in attrs {
-                if dirty_attrs.contains_key(&attr.ino) {
-                    continue;
-                }
-                attr_cache.put(attr.ino, attr, ATTR_CACHE_TTL, now);
-            }
-        }
     }
 
     fn resolve_unlink_target(

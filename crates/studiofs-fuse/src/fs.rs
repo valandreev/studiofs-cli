@@ -1880,14 +1880,14 @@ impl Filesystem for StudioFuseFs {
             idx = 2;
         }
 
-        for (i, entry_with_attr) in state.entries.iter().enumerate() {
+        for (i, entry_with_attr) in state.entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry = &entry_with_attr.entry;
             if should_hide_linux_root_metadata_entry(ino, &entry.name) {
                 heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
-            if entry_idx < idx {
+            if entry_with_attr.attr.is_none() {
                 continue;
             }
             let ft = fuse_file_type(entry.kind);
@@ -1953,16 +1953,13 @@ impl Filesystem for StudioFuseFs {
         }
 
         // Regular entries with full attributes
-        for (i, entry_with_attr) in state.entries.iter().enumerate() {
+        for (i, entry_with_attr) in state.entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry = &entry_with_attr.entry;
             if should_hide_linux_root_metadata_entry(ino, &entry.name) {
                 heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
-            if entry_idx < idx {
-                continue;
-            }
             let next_offset = match i64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
