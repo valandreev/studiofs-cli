@@ -361,6 +361,26 @@ mod tests {
                 .any(|arg| arg == "-ovolname=StudioFS Native")
         );
         assert!(mount_args.iter().any(|arg| arg == "-olocal"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
+        assert!(mount_args.iter().any(|arg| arg == "-osparse"));
+        assert!(mount_args.iter().any(|arg| arg == "-odirect_io"));
+        assert!(mount_args.iter().any(|arg| arg == "-onolocalcaches"));
+        assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
+        assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
+        assert!(!args.iter().any(|arg| arg == "-f"));
+        assert!(!args.iter().any(|arg| arg == "-oro"));
+        assert!(!args.iter().any(|arg| arg == "ro"));
+        assert!(!args.iter().any(|arg| arg.contains("StudioFS Native")));
+    }
+
+    #[test]
+    fn session_config_builds_buffered_cache_policy_mount_arguments_for_rollback_runs() {
+        let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native");
+
+        let mount_args = config
+            .mount_argv_strings_with_cache_policy(super::low_level::MacosFuseCachePolicy::Buffered);
+
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odaemon_timeout=60"));
         let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
@@ -374,33 +394,12 @@ mod tests {
                 .iter()
                 .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
         );
-        assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
-        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
+        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
         assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
-        assert!(!args.iter().any(|arg| arg == "-f"));
-        assert!(!args.iter().any(|arg| arg == "-oro"));
-        assert!(!args.iter().any(|arg| arg == "ro"));
-        assert!(!args.iter().any(|arg| arg.contains("StudioFS Native")));
-    }
-
-    #[test]
-    fn session_config_builds_direct_cache_policy_mount_arguments_for_rollback_runs() {
-        let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native");
-
-        let mount_args = config
-            .mount_argv_strings_with_cache_policy(super::low_level::MacosFuseCachePolicy::Direct);
-
-        assert!(mount_args.iter().any(|arg| arg == "-odirect_io"));
-        assert!(mount_args.iter().any(|arg| arg == "-onolocalcaches"));
-        assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
-        assert!(mount_args.iter().any(|arg| arg == "-osparse"));
-        assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
-        assert!(!mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
-        assert!(!mount_args.iter().any(|arg| arg == "-omax_read=1048576"));
+        assert!(!mount_args.iter().any(|arg| arg == "-oauto_cache"));
         assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
-        assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
     }
 
     #[test]

@@ -48,14 +48,14 @@ fn next_interrupt_key() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MacosFuseCachePolicy {
     Direct,
-    Winfsp,
+    Buffered,
 }
 
 impl MacosFuseCachePolicy {
     fn from_env() -> Self {
         match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
-            Ok(raw) if raw.trim().eq_ignore_ascii_case("direct") => Self::Direct,
-            _ => Self::Winfsp,
+            Ok(raw) if raw.trim().eq_ignore_ascii_case("buffered") => Self::Buffered,
+            _ => Self::Direct,
         }
     }
 }
@@ -506,7 +506,7 @@ impl SessionConfig {
                 args.push("-onolocalcaches".to_owned());
                 args.push("-oauto_cache".to_owned());
             }
-            MacosFuseCachePolicy::Winfsp => {
+            MacosFuseCachePolicy::Buffered => {
                 args.push("-onovncache".to_owned());
                 args.push("-odaemon_timeout=60".to_owned());
                 args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
