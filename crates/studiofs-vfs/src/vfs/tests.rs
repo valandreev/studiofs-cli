@@ -130,7 +130,7 @@ fn read_into_fh_clamps_to_remaining_file_size() {
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-into-fh-clamps");
     let _guard = rt.enter();
     rt.block_on(async {
-        let attr = vfs.create(1, b"small.txt", 0, 0, 0o644).unwrap();
+        let attr = vfs.create(ROOT_INO, b"small.txt", 0, 0, 0o644).unwrap();
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
 
         vfs.write_fh(fh, attr.ino, 0, b"hello").await.unwrap();
