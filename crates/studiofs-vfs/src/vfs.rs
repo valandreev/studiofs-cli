@@ -610,7 +610,7 @@ pub type VfsResult<T> = Result<T, VfsError>;
 #[derive(Debug, Clone)]
 pub struct DirEntryWithAttr {
     pub entry: DirEntry,
-    pub attr: InodeAttr,
+    pub attr: Option<InodeAttr>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1556,7 +1556,29 @@ mod tests {
             .find(|entry| entry.entry.ino == created.ino)
             .expect("created file should be listed");
 
-        assert_eq!(listed.attr.mode & 0o777, 0o640);
+        assert_eq!(
+            listed.attr.as_ref().expect("listed attr").mode & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn readdir_with_attrs_keeps_dangling_entries_without_attr() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-with-attrs-dangling");
+        let created = vfs
+            .create(ROOT_INO, b"dangling.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        meta.remove_attr(created.ino)
+            .expect("remove attr while leaving dentry behind");
+
+        let entries = vfs.readdir_with_attrs(ROOT_INO).expect("readdir root");
+        let listed = entries
+            .iter()
+            .find(|entry| entry.entry.name.as_slice() == b"dangling.txt")
+            .expect("dangling dentry should stay visible");
+
+        assert!(listed.attr.is_none());
     }
 
     #[test]

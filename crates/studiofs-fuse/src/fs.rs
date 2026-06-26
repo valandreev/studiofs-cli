@@ -844,6 +844,12 @@ impl StudioFuseFs {
         if let Some(state) = self.open_dir_handles.get(&fh) {
             return Ok(state.clone());
         }
+        if fh != 0 {
+            warn!(
+                ino,
+                fh, "readdir with unknown directory fh; rebuilding snapshot"
+            );
+        }
         self.load_open_dir_state(ino)
     }
 
@@ -1964,7 +1970,10 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
-            let fattr = to_fuse_attr(&entry_with_attr.attr, self.mount_uid, self.mount_gid);
+            let Some(attr) = &entry_with_attr.attr else {
+                continue;
+            };
+            let fattr = to_fuse_attr(attr, self.mount_uid, self.mount_gid);
             let entry_name = &entry.name;
             if reply.add(
                 entry.ino,

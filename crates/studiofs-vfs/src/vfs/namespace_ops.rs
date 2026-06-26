@@ -1075,15 +1075,13 @@ impl StudioVfs {
 
     /// Read directory entries and child attributes from the same metadata batch.
     pub fn readdir_with_attrs(&self, ino: Ino) -> VfsResult<Vec<super::DirEntryWithAttr>> {
-        let (entries, attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
+        let (entries, mut attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
         self.schedule_readdir_attr_hydration(&entries);
         Ok(entries
             .into_iter()
-            .filter_map(|entry| {
-                attrs_by_ino
-                    .get(&entry.ino)
-                    .cloned()
-                    .map(|attr| super::DirEntryWithAttr { entry, attr })
+            .map(|entry| {
+                let attr = attrs_by_ino.remove(&entry.ino);
+                super::DirEntryWithAttr { entry, attr }
             })
             .collect())
     }
