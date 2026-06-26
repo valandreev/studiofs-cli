@@ -139,7 +139,7 @@ impl FuseBufferPool {
         if let Some(mut buffer) = buffers.pop() {
             buffer.clear();
             if buffer.capacity() < len {
-                buffer.reserve(len - buffer.capacity());
+                buffer.reserve(len);
             }
             return buffer;
         }
@@ -2906,6 +2906,18 @@ mod tests {
         assert_eq!(second.len(), 512);
         assert_eq!(second[0], 0);
         assert_eq!(second.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn fuse_buffer_pool_expands_reused_buffers_to_requested_len() {
+        let pool = FuseBufferPool::new(1, 1, 4096);
+        let first = pool.take_zeroed(1024);
+        pool.put(first);
+
+        let second = pool.take_zeroed(2048);
+
+        assert_eq!(second.len(), 2048);
+        assert!(second.capacity() >= 2048);
     }
 
     #[test]

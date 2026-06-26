@@ -150,7 +150,7 @@ impl ReadDataPlanner {
                 let Some(block_length) = u32::try_from(length).ok() else {
                     continue;
                 };
-                let mut planned_block = block.clone();
+                let mut planned_block = *block;
                 planned_block.offset = block_offset;
                 planned_block.length = block_length;
                 segments.push(ReadSegment {
@@ -308,7 +308,7 @@ impl<'a> DataReader<'a> {
             };
             payload_refs
                 .entry(payload.object_id)
-                .or_insert_with(|| payload.clone());
+                .or_insert_with(|| *payload);
         }
         payload_refs
     }
@@ -560,7 +560,7 @@ impl<'a> DataReader<'a> {
                 ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
                     remote_blocks
                         .entry(payload.object_id)
-                        .or_insert_with(|| payload.clone());
+                        .or_insert_with(|| *payload);
                 }
                 ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
@@ -728,7 +728,7 @@ impl<'a> DataReader<'a> {
                 ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
                     let (run_end, run_dst_end) =
                         Self::committed_local_read_run(segments, index, offset, buffer.len());
-                    let mut run_payload = payload.clone();
+                    let mut run_payload = *payload;
                     run_payload.length =
                         u32::try_from(run_dst_end.saturating_sub(dst_start)).map_err(|_| {
                             VfsError::Other(format!(
@@ -1422,7 +1422,7 @@ impl StudioVfs {
                     ino, block_index, delta
                 ))
             })?;
-            let mut planned_block = block.clone();
+            let mut planned_block = *block;
             planned_block.offset =
                 planned_block.offset.checked_add(delta_u32).ok_or_else(|| {
                     VfsError::Other(format!(
@@ -2131,15 +2131,11 @@ mod tests {
         let segments = vec![
             ReadSegment {
                 range: read_range(0, 16),
-                source: ReadSegmentSource::Base {
-                    payload: first.clone(),
-                },
+                source: ReadSegmentSource::Base { payload: first },
             },
             ReadSegment {
                 range: read_range(16, 24),
-                source: ReadSegmentSource::Overlay {
-                    payload: second.clone(),
-                },
+                source: ReadSegmentSource::Overlay { payload: second },
             },
             ReadSegment {
                 range: read_range(24, 32),
@@ -2225,7 +2221,7 @@ mod tests {
                 source: ResolvedSliceSource::Overlay,
                 slice_id: Some(SliceId(1)),
                 slice_order: Some(SliceOrder(1)),
-                payload: Some(overlay_payload.clone()),
+                payload: Some(overlay_payload),
             },
             ResolvedSliceSpan {
                 chunk_id: ChunkId(0),
@@ -2233,7 +2229,7 @@ mod tests {
                 source: ResolvedSliceSource::Base,
                 slice_id: Some(SliceId(2)),
                 slice_order: Some(SliceOrder(2)),
-                payload: Some(base_payload.clone()),
+                payload: Some(base_payload),
             },
         ];
 
@@ -2460,7 +2456,7 @@ mod tests {
                         order: SliceOrder(0),
                         range: SliceRange::new(tail_start as u32, tail_start as u32 + tail_len)
                             .expect("tail range fits in chunk"),
-                        payload: Some(tail_payload.clone()),
+                        payload: Some(tail_payload),
                         payload_state: PayloadRefState::Published,
                     }],
                 )],
