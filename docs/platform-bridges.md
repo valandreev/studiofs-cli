@@ -191,7 +191,7 @@ Current signature includes additional policy controls:
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | `winfsp` target policy by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for strict rollback mode |
+| macOS: cache policy | `direct` by default |
 | macOS: validated macFUSE | 5.2.0 |
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
@@ -246,29 +246,20 @@ regular read callbacks.
 
 ### macOS cache and I/O policy
 
-macOS FUSE defaults to the WinFSP-style cache policy. The mount keeps `local`,
-`sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
-`iosize=4194304` tuned for larger sequential media callbacks, and does not
-globally mount with `direct_io` or `nolocalcaches`. The measured high-throughput
-read profile also passes `max_read=4194304` and `defer_permissions` to macFUSE
-so sequential media reads can request the same 4 MiB callback geometry while
-permission-path work is reduced. StudioFS does not pass `noappledouble`: macFUSE
-handles that option before userspace and can hide `.DS_Store`, which
-Finder/copyfile requires for folder copies. Kernel cache behavior is not set as
-a global mount option: read-only and
-write-capable handles continue to choose cache behavior through the per-open
-macFUSE policy below.
+macOS FUSE defaults to the direct cache policy. The mount keeps `local`,
+`sparse`, and `volname`, and adds `direct_io`, `nolocalcaches`, and `auto_cache`
+so AJA-style media workloads do not fight macOS UBC while StudioFS is already
+buffering and materializing writes locally. The mount also passes
+`iosize=4194304`, `max_read=4194304`, and `defer_permissions`; the 4 MiB
+geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
+large sequential media callbacks into smaller requests. StudioFS does not pass
+`noappledouble`: macFUSE handles that option before userspace and can hide
+`.DS_Store`, which Finder/copyfile requires for folder copies.
 The default macOS asyncFUSE profile also enables async write replies, applies
 the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
-reports the matching `4194304` preferred I/O size through regular file
-attributes. Set
+reports the preferred I/O size through regular file attributes. Set
 `STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
-changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for
-the strict direct-I/O rollback profile.
-For macFUSE 5.2.0, regular file attributes must report the same preferred I/O
-size (`st_blksize` / FUSE `blksize`) as the mount `iosize`; advertising the old
-512-byte value causes macFUSE to split large sequential reads and writes into
-small callbacks even when the mount-level `iosize` is larger.
+changing the cache policy.
 The mounted performance probe records SFS-491 read-geometry evidence in
 `performance-probe-summary.json`: `read_observations.fuse_read_calls`,
 `read_observations.fuse_read_bytes`, and `read_observations.avg_fuse_read_bytes`
@@ -282,19 +273,6 @@ When the probe waits for upload drain, the matching
 `read_observations.post_drain_foreground_local_payload_read_*` fields record the
 same geometry for the post-drain verification read.
 Use that report before adding any daemon-side hot read window.
-
-Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
-sequential-read workloads can use the kernel cache/readahead path. Write-capable
-or truncating opens return macFUSE `FOPEN_PURGE_UBC`, which drops stale readonly
-UBC pages without disabling buffered I/O for the descriptor. Correctness depends
-on scoped explicit invalidation through `FuseKernelInvalidator`: data invalidation
-uses `inval_inode(ino, 0, -1)` when cached pages are unsafe, while same-mount
-publication of already accepted local bytes uses attribute-only invalidation so
-macOS does not evict freshly written UBC pages after upload completion.
-
-`STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` preserves the older strict rollback
-mode: mount options include `direct_io`, `nolocalcaches`, and `auto_cache`, and
-all opens use direct I/O.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata

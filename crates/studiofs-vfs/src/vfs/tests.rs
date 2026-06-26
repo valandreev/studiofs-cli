@@ -5984,75 +5984,6 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 }
 
 #[test]
-fn soft_dirty_budget_pacing_starts_before_hard_limit() {
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(24, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(25, 100, 0), Some(2));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(40, 100, 0), Some(5));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(55, 100, 0), Some(8));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(70, 100, 0), Some(12));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(2));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(5));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(8));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(8));
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn write_admission_soft_paces_before_hard_window() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-soft-paces-before-hard-window");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(
-                1,
-                b"admission-soft-paces-before-hard-window.bin",
-                0,
-                0,
-                0o644,
-            )
-            .unwrap();
-        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
-        let buffer_budget_bytes = vfs.block_size as usize;
-        vfs.set_max_dirty_bytes(buffer_budget_bytes);
-        let seeded_len = buffer_budget_bytes * SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR
-            / SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR;
-        vfs.state
-            .writer_stack
-            .write_bytes(
-                super::writer_stack::WriterWriteSpec {
-                    fh,
-                    ino: attr.ino,
-                    current_size: 0,
-                    content_epoch: attr.content_epoch,
-                    first_object_id: 0,
-                    offset: 0,
-                },
-                Bytes::from(vec![0xAB; seeded_len]),
-            )
-            .unwrap();
-
-        tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1),
-        )
-        .await
-        .expect("soft pacing should avoid the hard admission stall");
-        assert!(
-            vfs.state
-                .metrics
-                .drain_lag_pacing_events
-                .load(Ordering::Relaxed)
-                >= 1,
-            "soft admission pacing should be recorded"
-        );
-
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
 fn write_admission_pressure_includes_pending_upload_backlog() {
     let pressure = WriteAdmissionPressure {
         writer_stack_dirty_bytes: 10,
@@ -6097,7 +6028,7 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 }
 
 #[test]
-fn write_admission_admits_below_soft_window_without_pacing() {
+fn write_admission_first_sample_below_budget_without_pacing() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-buffer-window");
     let _guard = rt.enter();
@@ -6108,8 +6039,7 @@ fn write_admission_admits_below_soft_window_without_pacing() {
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
         let buffer_budget_bytes = vfs.block_size as usize;
         vfs.set_max_dirty_bytes(buffer_budget_bytes);
-        let seeded_len = buffer_budget_bytes * (SOFT_DIRTY_PACING_START_NUMERATOR - 1)
-            / SOFT_DIRTY_PACING_START_DENOMINATOR;
+        let seeded_len = buffer_budget_bytes / 2;
         vfs.state
             .writer_stack
             .write_bytes(
@@ -6130,7 +6060,7 @@ fn write_admission_admits_below_soft_window_without_pacing() {
             vfs.maybe_throttle_write_admission(1),
         )
         .await
-        .expect("admission should not sleep below the soft window");
+        .expect("first adaptive admission sample should not sleep below budget");
         assert_eq!(
             vfs.state
                 .metrics
