@@ -137,10 +137,11 @@ fn read_into_fh_clamps_to_remaining_file_size() {
 
         let mut out = [0xAA; 8];
         let read_len = vfs.read_into_fh(fh, attr.ino, 2, &mut out).await.unwrap();
+        let read_len = read_len as usize;
 
         assert_eq!(read_len, 3);
-        assert_eq!(&out[..read_len as usize], b"llo");
-        assert_eq!(&out[read_len as usize..], &[0xAA; 5]);
+        assert_eq!(&out[..read_len], b"llo");
+        assert_eq!(&out[read_len..], &[0xAA; 5]);
 
         vfs.release_fh(fh).await.unwrap();
     });
