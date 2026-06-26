@@ -4940,6 +4940,7 @@ dependencies = [
  "dotenvy",
  "fuser",
  "libc",
+ "parking_lot",
  "smallvec",
  "studiofs-bridge",
  "studiofs-data",

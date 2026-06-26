@@ -6,8 +6,8 @@ mod pending_write_tracker;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -16,6 +16,7 @@ use fuser::{
     Request,
 };
 use handle_drain::FuseHandleDrainFacade;
+use parking_lot::Mutex;
 use pending_write_tracker::{
     PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteRegistration,
     PendingWriteTracker, WriteRegistrationError,
@@ -135,7 +136,7 @@ impl FuseBufferPool {
     }
 
     fn take(&self, len: usize) -> Vec<u8> {
-        let mut buffers = self.inner.lock().expect("FUSE buffer pool poisoned");
+        let mut buffers = self.inner.lock();
         if let Some(mut buffer) = buffers.pop() {
             buffer.clear();
             if buffer.capacity() < len {
@@ -151,7 +152,7 @@ impl FuseBufferPool {
             return;
         }
         buffer.clear();
-        let mut buffers = self.inner.lock().expect("FUSE buffer pool poisoned");
+        let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
         }

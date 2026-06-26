@@ -24,6 +24,7 @@ smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
