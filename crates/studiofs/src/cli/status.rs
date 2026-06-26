@@ -147,14 +147,21 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     };
     [
         format!(
-            "  FUSE async writes:        {mode} (policy: {})",
-            snapshot.platform_policy
+            "  FUSE async writes:        {mode} (profile: {})",
+            snapshot.linux_fuse_profile
         ),
         format!(
-            "  FUSE async pending:       {} writes, {} current, {} peak",
-            snapshot.pending_writes,
-            format_bytes(snapshot.pending_bytes as u64),
-            format_bytes(snapshot.peak_pending_bytes as u64)
+            "  FUSE bridge knobs:        max_write {}, readahead {}, bg {}, congestion {}",
+            format_bytes(u64::from(snapshot.fuse_max_write_bytes)),
+            format_bytes(u64::from(snapshot.fuse_max_readahead_bytes)),
+            snapshot
+                .fuse_max_background
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "kernel".to_string()),
+            snapshot
+                .fuse_congestion_threshold
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "kernel".to_string())
         ),
         format!(
             "  FUSE async caps:          max {}, max writes {}, per-handle {}",
@@ -1030,6 +1037,11 @@ mod tests {
             snapshot_generation: 1,
             enabled: true,
             platform_policy: "linux".into(),
+            linux_fuse_profile: "high-throughput".into(),
+            fuse_max_write_bytes: 16 * 1024 * 1024,
+            fuse_max_readahead_bytes: 16 * 1024 * 1024,
+            fuse_max_background: Some(128),
+            fuse_congestion_threshold: Some(96),
             max_pending_bytes: Some(128 * 1024 * 1024),
             max_pending_writes: Some(1024),
             per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -1050,8 +1062,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  FUSE async writes:        enabled (policy: linux)",
-                "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
+                "  FUSE async writes:        enabled (profile: high-throughput)",
+                "  FUSE bridge knobs:        max_write 16.0MiB, readahead 16.0MiB, bg 128, congestion 96",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",

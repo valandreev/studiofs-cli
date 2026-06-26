@@ -12489,6 +12489,11 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         snapshot_generation: 1,
         enabled: true,
         platform_policy: "linux".into(),
+        linux_fuse_profile: "high-throughput".into(),
+        fuse_max_write_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_background: Some(128),
+        fuse_congestion_threshold: Some(96),
         max_pending_bytes: Some(128 * 1024 * 1024),
         max_pending_writes: Some(1024),
         per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -12509,6 +12514,11 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert!(snapshot.fuse_async_write.enabled);
     assert_eq!(snapshot.fuse_async_write.platform_policy, "linux");
     assert_eq!(
+        snapshot.fuse_async_write.linux_fuse_profile,
+        "high-throughput"
+    );
+    assert_eq!(snapshot.fuse_async_write.fuse_max_background, Some(128));
+    assert_eq!(
         snapshot.fuse_async_write.max_pending_bytes,
         Some(128 * 1024 * 1024)
     );
@@ -12522,6 +12532,37 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+}
+
+#[test]
+fn runtime_stats_surface_reports_fuse_profile_knobs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-fuse-profile-knobs");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        linux_fuse_profile: "high-throughput".into(),
+        fuse_max_write_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_background: Some(128),
+        fuse_congestion_threshold: Some(96),
+        ..Default::default()
+    });
+
+    let snapshot = vfs.runtime_stats_snapshot();
+
+    assert_eq!(snapshot.bridge.gauges["fuse_max_background"].value, 128);
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_congestion_threshold"].value,
+        96
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_max_write_bytes"].value,
+        16 * 1024 * 1024
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
+        16 * 1024 * 1024
+    );
 }
 
 #[test]

@@ -7050,6 +7050,11 @@ impl StudioVfs {
             current.snapshot_generation = snapshot.snapshot_generation;
             current.enabled = snapshot.enabled;
             current.platform_policy = snapshot.platform_policy;
+            current.linux_fuse_profile = snapshot.linux_fuse_profile;
+            current.fuse_max_write_bytes = snapshot.fuse_max_write_bytes;
+            current.fuse_max_readahead_bytes = snapshot.fuse_max_readahead_bytes;
+            current.fuse_max_background = snapshot.fuse_max_background;
+            current.fuse_congestion_threshold = snapshot.fuse_congestion_threshold;
             current.max_pending_bytes = snapshot.max_pending_bytes;
             current.max_pending_writes = snapshot.max_pending_writes;
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;

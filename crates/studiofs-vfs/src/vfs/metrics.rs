@@ -962,6 +962,16 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub enabled: bool,
     /// Selected platform policy label.
     pub platform_policy: Cow<'static, str>,
+    /// Selected Linux FUSE profile label.
+    pub linux_fuse_profile: Cow<'static, str>,
+    /// Requested kernel `max_write` value.
+    pub fuse_max_write_bytes: u32,
+    /// Requested kernel `max_readahead` value.
+    pub fuse_max_readahead_bytes: u32,
+    /// Requested kernel `max_background` value.
+    pub fuse_max_background: Option<u16>,
+    /// Requested kernel `congestion_threshold` value.
+    pub fuse_congestion_threshold: Option<u16>,
     /// Maximum pending bytes admitted across the adapter.
     pub max_pending_bytes: Option<usize>,
     /// Maximum pending write requests admitted across the adapter.
