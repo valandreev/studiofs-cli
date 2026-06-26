@@ -607,9 +607,12 @@ pub enum VfsError {
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// Directory entry plus the child attributes loaded with the same metadata batch.
 #[derive(Debug, Clone)]
 pub struct DirEntryWithAttr {
+    /// Directory entry returned by the namespace index.
     pub entry: DirEntry,
+    /// Child attributes when the inode still exists; `None` keeps dangling dentries visible.
     pub attr: Option<InodeAttr>,
 }
 
@@ -6193,9 +6196,9 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let pressure = self.write_admission_pressure();
+        let mut pressure = self.write_admission_pressure();
         let mut pressure_bytes = pressure.total_bytes();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(test, target_os = "macos"))]
         {
             let writer_stack_dirty_with_next =
                 pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);

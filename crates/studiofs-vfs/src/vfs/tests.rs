@@ -6144,7 +6144,7 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
             .expect("persist pending upload backlog");
         assert!(
             vfs.write_admission_pressure().pending_upload_bytes
-                > (buffer_budget_bytes * HARD_BACKPRESSURE_DIRTY_MULTIPLIER) as usize,
+                > buffer_budget_bytes * HARD_BACKPRESSURE_DIRTY_MULTIPLIER,
             "test should seed upload backlog above the hard window"
         );
 
