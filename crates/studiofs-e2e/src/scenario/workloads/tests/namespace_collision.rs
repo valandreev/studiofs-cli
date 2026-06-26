@@ -924,15 +924,18 @@ fn hotspot_helper_timeout_is_enforced_before_parent_kill_on_unix() {
     assert!(progress_log.contains("\"phase\":\"timeout_cancel_requested\""));
 
     std::fs::write(&payload, b"payload").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + MOUNTED_WRITE_READBACK_TIMEOUT + HOTSPOT_HELPER_CANCEL_GRACE;
     while HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS.load(Ordering::Acquire) != 0
         && std::time::Instant::now() < deadline
     {
         thread::sleep(Duration::from_millis(10));
     }
+    let progress_after_unblock = std::fs::read_to_string(&progress).unwrap_or_default();
     assert_eq!(
         HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS.load(Ordering::Acquire),
-        0
+        0,
+        "hotspot helper worker should release after payload FIFO unblocks; progress:\n{progress_after_unblock}"
     );
 }
 

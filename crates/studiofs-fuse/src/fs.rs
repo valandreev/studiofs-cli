@@ -28,8 +28,8 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, StudioVfs, VfsError,
-    VfsFuseAsyncWriteSnapshot, classify_vfs_error,
+    BridgeVfsErrorKind, DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, LockKind, StudioVfs,
+    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -47,6 +47,13 @@ const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
 const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
     "STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES";
+const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
+
+#[derive(Clone)]
+struct OpenDirState {
+    dir_attr: studiofs_meta::InodeAttr,
+    entries: Arc<Vec<DirEntryWithAttr>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FuseBackgroundQueuePolicy {
@@ -656,6 +663,8 @@ pub struct StudioFuseFs {
     async_write_diagnostics_task: Option<JoinHandle<()>>,
     next_runtime_stats_fh: u64,
     runtime_stats_handles: HashMap<u64, Vec<u8>>,
+    next_open_dir_fh: u64,
+    open_dir_handles: HashMap<u64, OpenDirState>,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -756,6 +765,8 @@ impl StudioFuseFs {
             async_write_diagnostics_task: None,
             next_runtime_stats_fh: u64::MAX / 2,
             runtime_stats_handles: HashMap::new(),
+            next_open_dir_fh: FIRST_FUSE_DIR_FH,
+            open_dir_handles: HashMap::new(),
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
@@ -812,6 +823,34 @@ impl StudioFuseFs {
         self.runtime_stats_handles
             .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
         fh
+    }
+
+    fn load_open_dir_state(&self, ino: u64) -> Result<OpenDirState, VfsError> {
+        Ok(OpenDirState {
+            dir_attr: self.vfs.getattr(ino)?,
+            entries: Arc::new(self.vfs.readdir_with_attrs(ino)?),
+        })
+    }
+
+    fn open_dir_snapshot(&mut self, ino: u64) -> Result<u64, VfsError> {
+        let state = self.load_open_dir_state(ino)?;
+        let fh = self.next_open_dir_fh;
+        self.next_open_dir_fh = self.next_open_dir_fh.wrapping_add(1);
+        self.open_dir_handles.insert(fh, state);
+        Ok(fh)
+    }
+
+    fn open_dir_state(&self, ino: u64, fh: u64) -> Result<OpenDirState, VfsError> {
+        if let Some(state) = self.open_dir_handles.get(&fh) {
+            return Ok(state.clone());
+        }
+        if fh != 0 {
+            warn!(
+                ino,
+                fh, "readdir with unknown directory fh; rebuilding snapshot"
+            );
+        }
+        self.load_open_dir_state(ino)
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -1790,15 +1829,25 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        match self.open_dir_snapshot(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => {
+                error!("opendir({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     fn readdir(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.vfs.readdir(ino) {
+        let state = match self.open_dir_state(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdir({ino}) -> {e}");
@@ -1831,15 +1880,13 @@ impl Filesystem for StudioFuseFs {
             idx = 2;
         }
 
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, entry_with_attr) in state.entries.iter().enumerate().skip(idx.saturating_sub(2)) {
+            let entry = &entry_with_attr.entry;
             if should_hide_linux_root_metadata_entry(ino, &entry.name) {
                 heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
-            if entry_idx < idx {
-                continue;
-            }
             let ft = fuse_file_type(entry.kind);
             let entry_name = &entry.name;
             let next_offset = match i64::try_from(entry_idx + 1) {
@@ -1861,11 +1908,11 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        let entries = match self.vfs.readdir(ino) {
+        let state = match self.open_dir_state(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdirplus({ino}) -> {e}");
@@ -1884,13 +1931,7 @@ impl Filesystem for StudioFuseFs {
 
         // "." entry
         if idx == 0 {
-            let dot_attr = match self.vfs.getattr(ino) {
-                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
-                Err(e) => {
-                    reply.error(vfs_err_to_errno(&e));
-                    return;
-                }
-            };
+            let dot_attr = to_fuse_attr(&state.dir_attr, self.mount_uid, self.mount_gid);
             if reply.add(ino, 1, ".", &TTL, &dot_attr, 0) {
                 reply.ok();
                 return;
@@ -1900,13 +1941,7 @@ impl Filesystem for StudioFuseFs {
 
         // ".." entry
         if idx == 1 {
-            let dotdot_attr = match self.vfs.getattr(ino) {
-                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
-                Err(e) => {
-                    reply.error(vfs_err_to_errno(&e));
-                    return;
-                }
-            };
+            let dotdot_attr = to_fuse_attr(&state.dir_attr, self.mount_uid, self.mount_gid);
             if reply.add(ino, 2, "..", &TTL, &dotdot_attr, 0) {
                 reply.ok();
                 return;
@@ -1915,15 +1950,13 @@ impl Filesystem for StudioFuseFs {
         }
 
         // Regular entries with full attributes
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, entry_with_attr) in state.entries.iter().enumerate().skip(idx.saturating_sub(2)) {
+            let entry = &entry_with_attr.entry;
             if should_hide_linux_root_metadata_entry(ino, &entry.name) {
                 heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
-            if entry_idx < idx {
-                continue;
-            }
             let next_offset = match i64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
@@ -1931,10 +1964,18 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
-            let fattr = match self.vfs.getattr(entry.ino) {
-                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
-                Err(_) => continue, // skip entries we can't stat
+            let fallback_attr;
+            let attr = match &entry_with_attr.attr {
+                Some(attr) => attr,
+                None => match self.vfs.getattr(entry.ino) {
+                    Ok(attr) => {
+                        fallback_attr = attr;
+                        &fallback_attr
+                    }
+                    Err(_) => continue,
+                },
             };
+            let fattr = to_fuse_attr(attr, self.mount_uid, self.mount_gid);
             let entry_name = &entry.name;
             if reply.add(
                 entry.ino,
@@ -1948,6 +1989,18 @@ impl Filesystem for StudioFuseFs {
             }
         }
 
+        reply.ok();
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.open_dir_handles.remove(&fh);
         reply.ok();
     }
 
@@ -3200,5 +3253,48 @@ mod tests {
             studiofs_meta::ROOT_INO,
             b"visible"
         ));
+    }
+
+    #[test]
+    fn opendir_snapshot_is_reused_after_directory_changes() {
+        let (_tmp, _rt, vfs, mut fs) = make_test_fuse_fs("opendir-snapshot-reuse");
+        let first = vfs
+            .create(studiofs_meta::ROOT_INO, b"first.txt", 1000, 1000, 0o644)
+            .expect("create first file");
+
+        let fh = fs
+            .open_dir_snapshot(studiofs_meta::ROOT_INO)
+            .expect("open dir snapshot");
+        vfs.create(studiofs_meta::ROOT_INO, b"second.txt", 1000, 1000, 0o644)
+            .expect("create second file after opendir");
+        let live_entries = vfs
+            .readdir(studiofs_meta::ROOT_INO)
+            .expect("live readdir after second create");
+        assert!(
+            live_entries
+                .iter()
+                .any(|entry| entry.name.as_slice() == b"second.txt"),
+            "test setup should make the second file visible to fresh readdir"
+        );
+
+        let snapshot = &fs
+            .open_dir_handles
+            .get(&fh)
+            .expect("snapshot should remain open")
+            .entries;
+
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| entry.entry.ino == first.ino)
+                .count(),
+            1
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|entry| entry.entry.name.as_slice() == b"second.txt"),
+            "open directory snapshot should not refresh mid-handle"
+        );
     }
 }

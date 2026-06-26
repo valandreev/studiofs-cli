@@ -607,6 +607,15 @@ pub enum VfsError {
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// Directory entry plus the child attributes loaded with the same metadata batch.
+#[derive(Debug, Clone)]
+pub struct DirEntryWithAttr {
+    /// Directory entry returned by the namespace index.
+    pub entry: DirEntry,
+    /// Child attributes when the inode still exists; `None` keeps dangling dentries visible.
+    pub attr: Option<InodeAttr>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WinfspBarrierType {
     /// Barrier for WinFSP cleanup callbacks.
@@ -6216,8 +6225,7 @@ impl StudioVfs {
                 let started = Instant::now();
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 self.record_write_admission_wait(started.elapsed());
-                pressure = self.write_admission_pressure();
-                pressure_bytes = pressure.total_bytes();
+                pressure_bytes = self.write_admission_pressure().total_bytes();
                 if pressure_bytes.saturating_add(next_bytes) <= buffer_budget_bytes {
                     return;
                 }
