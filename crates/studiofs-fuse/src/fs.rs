@@ -52,9 +52,12 @@ const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
 const HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND: u16 = 128;
 const HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD: u16 = 96;
 
+/// Supported Linux FUSE tuning profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxFuseProfile {
+    /// Keep current conservative Linux FUSE defaults.
     Conservative,
+    /// Opt-in profile for high-throughput Linux write-path tuning.
     HighThroughput,
 }
 
@@ -68,17 +71,18 @@ impl LinuxFuseProfile {
         let Some(raw) = raw else {
             return Self::Conservative;
         };
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "conservative" => Self::Conservative,
-            "high-throughput" => Self::HighThroughput,
-            unknown => {
-                warn!(
-                    env_key = STUDIOFS_LINUX_FUSE_PROFILE_ENV,
-                    env_value = unknown,
-                    "unknown Linux FUSE profile; using conservative profile"
-                );
-                Self::Conservative
-            }
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("conservative") {
+            Self::Conservative
+        } else if trimmed.eq_ignore_ascii_case("high-throughput") {
+            Self::HighThroughput
+        } else {
+            warn!(
+                env_key = STUDIOFS_LINUX_FUSE_PROFILE_ENV,
+                env_value = trimmed,
+                "unknown Linux FUSE profile; using conservative profile"
+            );
+            Self::Conservative
         }
     }
 
@@ -128,8 +132,7 @@ impl FuseBackgroundQueuePolicy {
         }
     }
 
-    fn from_env() -> Self {
-        let profile = LinuxFuseProfile::from_env();
+    fn from_env_for_profile(profile: LinuxFuseProfile) -> Self {
         let max_background = std::env::var(STUDIOFS_FUSE_MAX_BACKGROUND_ENV).ok();
         let congestion_threshold = std::env::var(STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV).ok();
 
@@ -394,8 +397,7 @@ fn resolve_async_fuse_write_enabled(profile: LinuxFuseProfile, raw: Option<&str>
     )
 }
 
-fn should_enable_async_fuse_write_from_env() -> bool {
-    let profile = LinuxFuseProfile::from_env();
+fn should_enable_async_fuse_write_from_env(profile: LinuxFuseProfile) -> bool {
     let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
     resolve_async_fuse_write_enabled(profile, raw.as_deref())
 }
@@ -828,7 +830,7 @@ impl StudioFuseRuntimeOptions {
     /// Read FUSE runtime options from the current process environment.
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
-        let background_queue_policy = FuseBackgroundQueuePolicy::from_env();
+        let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
         Self {
             linux_fuse_profile: profile,
             fuse_max_write_bytes: parse_bridge_u32_env(
@@ -841,7 +843,7 @@ impl StudioFuseRuntimeOptions {
             ),
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
-            async_write_enabled: should_enable_async_fuse_write_from_env(),
+            async_write_enabled: should_enable_async_fuse_write_from_env(profile),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
             linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
