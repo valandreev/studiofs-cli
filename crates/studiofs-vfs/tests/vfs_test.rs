@@ -6762,7 +6762,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             )
             .await;
             ino = seeded_ino;
-            committed_block = seeded_blocks[0].1.clone();
+            committed_block = seeded_blocks[0].1;
 
             let mut staged_attr = meta.get_attr(ino).unwrap();
             staged_attr.size = replacement_payload.len() as u64;

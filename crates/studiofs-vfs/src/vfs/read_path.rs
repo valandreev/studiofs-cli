@@ -150,7 +150,7 @@ impl ReadDataPlanner {
                 let Some(block_length) = u32::try_from(length).ok() else {
                     continue;
                 };
-                let mut planned_block = block.clone();
+                let mut planned_block = *block;
                 planned_block.offset = block_offset;
                 planned_block.length = block_length;
                 segments.push(ReadSegment {
@@ -308,7 +308,7 @@ impl<'a> DataReader<'a> {
             };
             payload_refs
                 .entry(payload.object_id)
-                .or_insert_with(|| payload.clone());
+                .or_insert_with(|| *payload);
         }
         payload_refs
     }
@@ -560,7 +560,7 @@ impl<'a> DataReader<'a> {
                 ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
                     remote_blocks
                         .entry(payload.object_id)
-                        .or_insert_with(|| payload.clone());
+                        .or_insert_with(|| *payload);
                 }
                 ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
@@ -668,24 +668,29 @@ impl<'a> DataReader<'a> {
         buffer: &mut [u8],
     ) -> VfsResult<usize> {
         let mut written = 0usize;
-        for segment in segments {
+        let mut index = 0usize;
+        while index < segments.len() {
+            let segment = &segments[index];
             let dst_start = segment.range.start().saturating_sub(offset) as usize;
             let dst_end = segment.range.end().saturating_sub(offset) as usize;
             if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
+                index += 1;
                 continue;
             }
-            let dst = &mut buffer[dst_start..dst_end];
             match &segment.source {
                 ReadSegmentSource::Dirty { data, block_offset } => {
+                    let dst = &mut buffer[dst_start..dst_end];
                     vfs.copy_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
                 ReadSegmentSource::PendingOverlay { data, block_offset } => {
+                    let dst = &mut buffer[dst_start..dst_end];
                     vfs.copy_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
                 ReadSegmentSource::PendingExtent {
                     object_id,
                     block_offset,
                 } => {
+                    let dst = &mut buffer[dst_start..dst_end];
                     let block_offset = usize::try_from(*block_offset).map_err(|_| {
                         VfsError::Other(format!(
                             "pending extent offset does not fit usize: object_id={}, offset={}",
@@ -721,73 +726,162 @@ impl<'a> DataReader<'a> {
                     }
                 }
                 ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
-                    let block_offset = usize::try_from(payload.offset).map_err(|_| {
-                        VfsError::Other(format!(
-                            "block offset does not fit usize: object_id={}, offset={}",
-                            payload.object_id, payload.offset
-                        ))
-                    })?;
-                    let mut span_resolved = false;
-                    if let Some(read) = vfs
-                        .payload_store_read_into_async(payload.object_id, block_offset, dst)
-                        .await?
-                    {
-                        if read == dst.len() {
-                            span_resolved = true;
-                        }
-                        if !span_resolved {
-                            error!(
-                                object_id = payload.object_id,
-                                file_offset = segment.range.start(),
-                                block_offset = payload.offset,
-                                requested = dst.len(),
-                                read,
-                                "data_reader: short local backend read for committed payload object; evicting and refetching"
-                            );
-                            if let Err(evict_error) =
-                                vfs.payload_store_remove_async(payload.object_id).await
-                            {
-                                warn!(
-                                    object_id = payload.object_id,
-                                    error = %evict_error,
-                                    "data_reader: failed to evict short-read local payload before refetch"
-                                );
-                            }
-                        }
-                    }
-
-                    if !span_resolved {
-                        match vfs.fetch_block_for_ref_after_local_miss(payload).await {
-                            Ok(data) => {
-                                vfs.copy_committed_payload_into_range(
-                                    data.as_ref(),
-                                    payload,
-                                    segment.range.start(),
-                                    dst,
-                                )?;
-                            }
-                            Err(crate::fetch::FetchError::NotFound { key }) => {
-                                warn!(
-                                    object_id = payload.object_id,
-                                    key,
-                                    file_offset = segment.range.start(),
-                                    block_offset = payload.offset,
-                                    block_length = payload.length,
-                                    "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
-                                );
-                                dst.fill(0);
-                            }
-                            Err(error) => {
-                                return Err(VfsError::Fetch(error));
-                            }
-                        }
-                    }
+                    let (run_end, run_dst_end) =
+                        Self::committed_local_read_run(segments, index, offset, buffer.len());
+                    let mut run_payload = *payload;
+                    run_payload.length =
+                        u32::try_from(run_dst_end.saturating_sub(dst_start)).map_err(|_| {
+                            VfsError::Other(format!(
+                                "committed payload read run length does not fit u32: object_id={}, len={}",
+                                payload.object_id,
+                                run_dst_end.saturating_sub(dst_start)
+                            ))
+                        })?;
+                    let dst = &mut buffer[dst_start..run_dst_end];
+                    Self::assemble_committed_payload_into(
+                        vfs,
+                        &run_payload,
+                        segment.range.start(),
+                        dst,
+                    )
+                    .await?;
+                    written = written.max(run_dst_end);
+                    index = run_end;
+                    continue;
                 }
-                ReadSegmentSource::Zero => dst.fill(0),
+                ReadSegmentSource::Zero => {
+                    let dst = &mut buffer[dst_start..dst_end];
+                    dst.fill(0);
+                }
             }
             written = written.max(dst_end);
+            index += 1;
         }
         Ok(written)
+    }
+
+    fn committed_segment_payload(segment: &ReadSegment) -> Option<&PayloadRef> {
+        match &segment.source {
+            ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                Some(payload)
+            }
+            ReadSegmentSource::Dirty { .. }
+            | ReadSegmentSource::PendingOverlay { .. }
+            | ReadSegmentSource::PendingExtent { .. }
+            | ReadSegmentSource::Zero => None,
+        }
+    }
+
+    fn committed_local_read_run(
+        segments: &[ReadSegment],
+        start_index: usize,
+        read_offset: u64,
+        buffer_len: usize,
+    ) -> (usize, usize) {
+        let Some(first) = segments.get(start_index) else {
+            return (start_index, 0);
+        };
+        let Some(first_payload) = Self::committed_segment_payload(first) else {
+            let dst_end = first.range.end().saturating_sub(read_offset) as usize;
+            return (start_index + 1, dst_end.min(buffer_len));
+        };
+        let mut run_end = start_index + 1;
+        let mut file_end = first.range.end();
+        let mut dst_end = file_end.saturating_sub(read_offset) as usize;
+        let mut next_payload_offset = u64::from(first_payload.offset)
+            .saturating_add(first.range.end().saturating_sub(first.range.start()));
+
+        while let Some(next) = segments.get(run_end) {
+            let Some(next_payload) = Self::committed_segment_payload(next) else {
+                break;
+            };
+            let next_dst_start = next.range.start().saturating_sub(read_offset) as usize;
+            let next_dst_end = next.range.end().saturating_sub(read_offset) as usize;
+            if next_payload.object_id != first_payload.object_id
+                || next.range.start() != file_end
+                || u64::from(next_payload.offset) != next_payload_offset
+                || next_dst_start != dst_end
+                || next_dst_end > buffer_len
+                || next_dst_start >= next_dst_end
+            {
+                break;
+            }
+            run_end += 1;
+            file_end = next.range.end();
+            dst_end = next_dst_end;
+            next_payload_offset = next_payload_offset
+                .saturating_add(next.range.end().saturating_sub(next.range.start()));
+        }
+
+        (run_end, dst_end)
+    }
+
+    async fn assemble_committed_payload_into(
+        vfs: &StudioVfs,
+        payload: &PayloadRef,
+        file_offset: u64,
+        dst: &mut [u8],
+    ) -> VfsResult<()> {
+        let block_offset = usize::try_from(payload.offset).map_err(|_| {
+            VfsError::Other(format!(
+                "block offset does not fit usize: object_id={}, offset={}",
+                payload.object_id, payload.offset
+            ))
+        })?;
+        let mut span_resolved = false;
+        if let Some(read) = vfs
+            .payload_store_read_into_async(payload.object_id, block_offset, dst)
+            .await?
+        {
+            if read == dst.len() {
+                span_resolved = true;
+            }
+            if !span_resolved {
+                error!(
+                    object_id = payload.object_id,
+                    file_offset,
+                    block_offset = payload.offset,
+                    requested = dst.len(),
+                    read,
+                    "data_reader: short local backend read for committed payload object; evicting and refetching"
+                );
+                if let Err(evict_error) = vfs.payload_store_remove_async(payload.object_id).await {
+                    warn!(
+                        object_id = payload.object_id,
+                        error = %evict_error,
+                        "data_reader: failed to evict short-read local payload before refetch"
+                    );
+                }
+            }
+        }
+
+        if !span_resolved {
+            match vfs.fetch_block_for_ref_after_local_miss(payload).await {
+                Ok(data) => {
+                    vfs.copy_committed_payload_into_range(
+                        data.as_ref(),
+                        payload,
+                        file_offset,
+                        dst,
+                    )?;
+                }
+                Err(crate::fetch::FetchError::NotFound { key }) => {
+                    warn!(
+                        object_id = payload.object_id,
+                        key,
+                        file_offset,
+                        block_offset = payload.offset,
+                        block_length = payload.length,
+                        "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                    );
+                    dst.fill(0);
+                }
+                Err(error) => {
+                    return Err(VfsError::Fetch(error));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1328,7 +1422,7 @@ impl StudioVfs {
                     ino, block_index, delta
                 ))
             })?;
-            let mut planned_block = block.clone();
+            let mut planned_block = *block;
             planned_block.offset =
                 planned_block.offset.checked_add(delta_u32).ok_or_else(|| {
                     VfsError::Other(format!(
@@ -2037,15 +2131,11 @@ mod tests {
         let segments = vec![
             ReadSegment {
                 range: read_range(0, 16),
-                source: ReadSegmentSource::Base {
-                    payload: first.clone(),
-                },
+                source: ReadSegmentSource::Base { payload: first },
             },
             ReadSegment {
                 range: read_range(16, 24),
-                source: ReadSegmentSource::Overlay {
-                    payload: second.clone(),
-                },
+                source: ReadSegmentSource::Overlay { payload: second },
             },
             ReadSegment {
                 range: read_range(24, 32),
@@ -2131,7 +2221,7 @@ mod tests {
                 source: ResolvedSliceSource::Overlay,
                 slice_id: Some(SliceId(1)),
                 slice_order: Some(SliceOrder(1)),
-                payload: Some(overlay_payload.clone()),
+                payload: Some(overlay_payload),
             },
             ResolvedSliceSpan {
                 chunk_id: ChunkId(0),
@@ -2139,7 +2229,7 @@ mod tests {
                 source: ResolvedSliceSource::Base,
                 slice_id: Some(SliceId(2)),
                 slice_order: Some(SliceOrder(2)),
-                payload: Some(base_payload.clone()),
+                payload: Some(base_payload),
             },
         ];
 
@@ -2266,6 +2356,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_read_metadata_async_keeps_multiple_published_read_plan_windows_per_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-windows");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"published-read-plan-cache-windows.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let block_size = vfs.block_size as u64;
+            let read_len = block_size.min(128 * 1024);
+            let second_window_start =
+                block_size.saturating_mul(PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS + 1);
+            let payload = vec![0x4B_u8; (second_window_start + read_len) as usize];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let (_, first_window_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, read_len)
+                .await
+                .expect("resolve first window");
+            let (_, second_window_slices) = vfs
+                .resolve_read_metadata_async(ino, second_window_start, read_len)
+                .await
+                .expect("resolve second window");
+            let (_, first_window_again_slices) = vfs
+                .resolve_read_metadata_async(ino, read_len, read_len)
+                .await
+                .expect("resolve first window again");
+
+            assert!(
+                !Arc::ptr_eq(&first_window_slices, &second_window_slices),
+                "disjoint hot windows should have separate resolved slice plans"
+            );
+            assert!(
+                Arc::ptr_eq(&first_window_slices, &first_window_again_slices),
+                "adding another hot window for the same inode must not evict the first window"
+            );
+        });
+    }
+
+    #[test]
     fn metadata_invalidation_clears_published_read_plan_cache_without_attr_change() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-invalidate");
@@ -2312,7 +2456,7 @@ mod tests {
                         order: SliceOrder(0),
                         range: SliceRange::new(tail_start as u32, tail_start as u32 + tail_len)
                             .expect("tail range fits in chunk"),
-                        payload: Some(tail_payload.clone()),
+                        payload: Some(tail_payload),
                         payload_state: PayloadRefState::Published,
                     }],
                 )],
@@ -2376,7 +2520,7 @@ mod tests {
                     .read
                     .published_read_plan_cache
                     .lock()
-                    .contains_key(&ino),
+                    .contains(&ino),
                 "setup should leave a published read-plan cache entry"
             );
 
@@ -2394,7 +2538,7 @@ mod tests {
                     .read
                     .published_read_plan_cache
                     .lock()
-                    .contains_key(&ino),
+                    .contains(&ino),
                 "local writes must evict cached hole read plans for the same inode"
             );
         });
@@ -3201,6 +3345,58 @@ mod tests {
             assert!(
                 counting_backend.read_into_calls() > 0,
                 "committed local hits should use direct partial read_into()"
+            );
+        });
+    }
+
+    #[test]
+    fn committed_adjacent_local_segments_use_one_backend_read() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-adjacent-read-plan");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        rt.block_on(async {
+            let object_id = 0xACED;
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+                .await
+                .expect("payload store put");
+
+            let mut first = PayloadRef::new_full(object_id, 10);
+            first.offset = 2;
+            first.length = 2;
+            let mut second = PayloadRef::new_full(object_id, 10);
+            second.offset = 4;
+            second.length = 3;
+            let segments = vec![
+                ReadSegment {
+                    range: read_range(0, 2),
+                    source: ReadSegmentSource::Base { payload: first },
+                },
+                ReadSegment {
+                    range: read_range(2, 5),
+                    source: ReadSegmentSource::Base { payload: second },
+                },
+            ];
+            let mut buffer = [0_u8; 5];
+            counting_backend.reset_counters();
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+                .await
+                .expect("assemble data reader output");
+
+            assert_eq!(written, 5);
+            assert_eq!(&buffer, b"23456");
+            assert_eq!(
+                counting_backend.get_calls(),
+                0,
+                "adjacent committed local hits should stay on direct partial read_into()"
+            );
+            assert_eq!(
+                counting_backend.read_into_calls(),
+                1,
+                "adjacent committed local hits for the same object should coalesce into one backend read"
             );
         });
     }

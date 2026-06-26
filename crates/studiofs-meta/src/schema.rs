@@ -540,7 +540,7 @@ impl Default for BlockFlags {
 /// Design decisions:
 /// - Sequential object_id (not content hash) - simpler and faster
 /// - Immutable objects - never modified, only created/deleted
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayloadRef {
     /// Sequential payload object ID (unique across the volume).
     pub object_id: u64,
@@ -1323,7 +1323,7 @@ fn push_candidate_set(
                 slice_id: slice.slice_id,
                 slice_order: slice.order,
                 range: slice.range,
-                payload: slice.payload.clone(),
+                payload: slice.payload,
             });
         }
     }
@@ -2088,7 +2088,7 @@ mod tests {
             SliceId(7),
             SliceOrder(3),
             SliceRange::new(0, 4096).expect("valid slice"),
-            block.clone(),
+            block,
         );
 
         let mut slices = BTreeMap::new();

@@ -146,7 +146,7 @@ impl RedbMetaEngine {
             }
             let mut chunk_signature = Vec::with_capacity(chunk.slices.len());
             for slice in chunk.slices.values() {
-                chunk_signature.push((slice.range, slice.payload.clone()));
+                chunk_signature.push((slice.range, slice.payload));
             }
             signature.insert(*chunk_id, chunk_signature);
         }
@@ -485,7 +485,7 @@ impl RedbMetaEngine {
                                     "protected base merge produced an invalid range".to_string(),
                                 )
                             })?;
-                        let mut clipped_payload = payload.clone();
+                        let mut clipped_payload = *payload;
                         clipped_payload.offset = clipped_payload
                             .offset
                             .checked_add(offset_delta)
@@ -523,7 +523,7 @@ impl RedbMetaEngine {
                             slice_id,
                             order: slice_order,
                             range: incoming.range,
-                            payload: incoming.payload.clone(),
+                            payload: incoming.payload,
                             payload_state: PayloadRefState::Published,
                         },
                     );
@@ -575,8 +575,7 @@ impl RedbMetaEngine {
             let chunk_state = state.chunks.entry(chunk_id).or_default();
             let slice_id = chunk_state.alloc_slice_id();
             let slice_order = chunk_state.alloc_slice_order();
-            let slice_record =
-                SliceRecord::new(slice_id, slice_order, slice_range, block_ref.clone());
+            let slice_record = SliceRecord::new(slice_id, slice_order, slice_range, *block_ref);
             chunk_state.insert_slice(slice_record);
         }
 
@@ -714,7 +713,7 @@ impl RedbMetaEngine {
                 .ok_or_else(|| {
                     MetaError::Storage("compaction source slice is missing".to_string())
                 })?;
-            let block = span.payload.clone();
+            let block = span.payload;
 
             if let Some((last_range, last_block, last_state)) = merged.last_mut() {
                 match (last_block.as_mut(), block.as_ref()) {

@@ -1404,7 +1404,7 @@ fn replica_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
                     (2 * DEFAULT_BLOCK_SIZE) + 4096,
                 )
                 .unwrap(),
-                payload: Some(remote_middle.clone()),
+                payload: Some(remote_middle),
                 payload_state: PayloadRefState::Published,
             }],
         )],
@@ -1462,7 +1462,7 @@ fn replica_aux_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
                     (2 * DEFAULT_BLOCK_SIZE) + 4096,
                 )
                 .unwrap(),
-                payload: Some(remote_middle.clone()),
+                payload: Some(remote_middle),
                 payload_state: PayloadRefState::Published,
             }],
         )],
