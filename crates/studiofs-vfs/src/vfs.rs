@@ -6198,7 +6198,7 @@ impl StudioVfs {
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
         let pressure = self.write_admission_pressure();
         let mut pressure_bytes = pressure.total_bytes();
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             let writer_stack_dirty_with_next =
                 pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);

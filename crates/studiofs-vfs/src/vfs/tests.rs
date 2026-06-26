@@ -5949,6 +5949,7 @@ fn soft_dirty_budget_pacing_starts_before_hard_limit() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn write_admission_soft_paces_before_hard_window() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-soft-paces-before-hard-window");
