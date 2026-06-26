@@ -480,6 +480,9 @@ impl SessionConfig {
             "-odirect_io".to_owned(),
             "-onolocalcaches".to_owned(),
             "-oauto_cache".to_owned(),
+            format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
+            format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
+            "-odefer_permissions".to_owned(),
             "-osparse".to_owned(),
         ]
     }

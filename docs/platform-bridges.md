@@ -249,7 +249,10 @@ regular read callbacks.
 macOS FUSE defaults to the direct cache policy. The mount keeps `local`,
 `sparse`, and `volname`, and adds `direct_io`, `nolocalcaches`, and `auto_cache`
 so AJA-style media workloads do not fight macOS UBC while StudioFS is already
-buffering and materializing writes locally. StudioFS does not pass
+buffering and materializing writes locally. The mount also passes
+`iosize=4194304`, `max_read=4194304`, and `defer_permissions`; the 4 MiB
+geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
+large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide
 `.DS_Store`, which Finder/copyfile requires for folder copies.
 The default macOS asyncFUSE profile also enables async write replies, applies

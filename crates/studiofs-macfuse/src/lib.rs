@@ -366,8 +366,19 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-odirect_io"));
         assert!(mount_args.iter().any(|arg| arg == "-onolocalcaches"));
         assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
+        let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == &format!("-oiosize={expected_geometry}"))
+        );
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
+        );
         assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
-        assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
+        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));
         assert!(!args.iter().any(|arg| arg == "ro"));
