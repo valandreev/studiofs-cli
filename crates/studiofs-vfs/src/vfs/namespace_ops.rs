@@ -966,19 +966,17 @@ impl StudioVfs {
             .lookup_component(parent, name)
     }
 
-    /// Read directory entries from `ino` with namespace filtering and access checks.
-    ///
-    /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
-    /// blocked entries when necessary, and schedules batched attribute hydration for the
-    /// returned entries.
-    pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
+    fn readdir_entries_and_attrs(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<(Vec<DirEntry>, HashMap<Ino, InodeAttr>)> {
         let parent_effective = self.effective_access_level(ino)?;
         if parent_effective == AccessLevel::NoAccess {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         if self.ignored_dir_attr(ino).is_some() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
 
         let meta = self.sync_meta();
@@ -991,10 +989,11 @@ impl StudioVfs {
         }
 
         let mut confirmed_entry_inos = HashSet::new();
+        let mut attrs_by_ino = HashMap::new();
         if !entries.is_empty() {
             let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
             let attrs = meta.get_attrs_batch(&child_inos)?;
-            let attrs_by_ino = attrs
+            attrs_by_ino = attrs
                 .into_iter()
                 .map(|attr| (attr.ino, attr))
                 .collect::<HashMap<_, _>>();
@@ -1059,9 +1058,34 @@ impl StudioVfs {
         if !file_children.is_empty() {
             self.dir_prefetch.on_readdir_entries(ino, file_children);
         }
-        self.schedule_readdir_attr_hydration(&entries);
 
+        Ok((entries, attrs_by_ino))
+    }
+
+    /// Read directory entries from `ino` with namespace filtering and access checks.
+    ///
+    /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
+    /// blocked entries when necessary, and schedules batched attribute hydration for the
+    /// returned entries.
+    pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
+        let (entries, _) = self.readdir_entries_and_attrs(ino)?;
+        self.schedule_readdir_attr_hydration(&entries);
         Ok(entries)
+    }
+
+    /// Read directory entries and child attributes from the same metadata batch.
+    pub fn readdir_with_attrs(&self, ino: Ino) -> VfsResult<Vec<super::DirEntryWithAttr>> {
+        let (entries, attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
+        self.schedule_readdir_attr_hydration(&entries);
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| {
+                attrs_by_ino
+                    .get(&entry.ino)
+                    .cloned()
+                    .map(|attr| super::DirEntryWithAttr { entry, attr })
+            })
+            .collect())
     }
 
     fn schedule_readdir_attr_hydration(&self, entries: &[DirEntry]) {

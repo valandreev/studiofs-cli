@@ -1543,6 +1543,23 @@ mod tests {
     }
 
     #[test]
+    fn readdir_with_attrs_returns_child_attrs_from_same_snapshot() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "readdir-with-attrs");
+        let created = vfs
+            .create(ROOT_INO, b"batch-stat.txt", 1000, 1000, 0o640)
+            .expect("create file");
+
+        let entries = vfs.readdir_with_attrs(ROOT_INO).expect("readdir root");
+        let listed = entries
+            .iter()
+            .find(|entry| entry.entry.ino == created.ino)
+            .expect("created file should be listed");
+
+        assert_eq!(listed.attr.mode & 0o777, 0o640);
+    }
+
+    #[test]
     fn readdir_keeps_dangling_dentry_but_evicts_stale_attr_cache() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-attr-dangling-dentry");

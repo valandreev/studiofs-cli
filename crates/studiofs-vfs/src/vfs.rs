@@ -607,6 +607,12 @@ pub enum VfsError {
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
+#[derive(Debug, Clone)]
+pub struct DirEntryWithAttr {
+    pub entry: DirEntry,
+    pub attr: InodeAttr,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WinfspBarrierType {
     /// Barrier for WinFSP cleanup callbacks.
