@@ -207,48 +207,54 @@ const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
+#[cfg(test)]
 const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
+#[cfg(test)]
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 4_000;
+#[cfg(test)]
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 20;
+#[cfg(test)]
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
+#[cfg(test)]
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
 const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 1;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 4;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 2;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_HIGH_DENOMINATOR: usize = 5;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 11;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 20;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_CRITICAL_NUMERATOR: usize = 7;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_CRITICAL_DENOMINATOR: usize = 10;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 2;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 5;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 8;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_CRITICAL_MS: u64 = 12;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 256;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(test)]
 struct WriteAdmissionPressure {
     writer_stack_dirty_bytes: usize,
     pending_local_dirty_bytes: usize,
@@ -256,6 +262,7 @@ struct WriteAdmissionPressure {
     pending_upload_bytes: usize,
 }
 
+#[cfg(test)]
 impl WriteAdmissionPressure {
     fn total_bytes(self) -> usize {
         self.writer_stack_dirty_bytes
@@ -266,6 +273,7 @@ impl WriteAdmissionPressure {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct WriteAdmissionSample {
     now_ms: u64,
     pressure_bytes: usize,
@@ -274,6 +282,7 @@ struct WriteAdmissionSample {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(test)]
 struct WriteAdmissionDecision {
     delay_ms: u64,
     ingress_bytes_per_sec: u64,
@@ -292,6 +301,7 @@ struct WriteAdmissionGovernorStats {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct WriteAdmissionGovernor {
     last_sample_ms: u64,
     last_pressure_bytes: usize,
@@ -352,6 +362,7 @@ impl SustainedWriteState {
     }
 }
 
+#[cfg(test)]
 impl WriteAdmissionGovernor {
     fn record_accepted_bytes(&mut self, bytes: usize) {
         self.accepted_since_sample = self.accepted_since_sample.saturating_add(bytes as u64);
@@ -2601,6 +2612,7 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            #[cfg(test)]
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2660,6 +2672,7 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    #[cfg(test)]
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -2873,7 +2886,7 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
         .max(1)
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 fn soft_dirty_budget_pacing_delay_ms(
     total_dirty_bytes: usize,
     max_dirty_bytes: usize,
@@ -3256,6 +3269,7 @@ impl StudioVfs {
         }
     }
 
+    #[cfg(test)]
     fn write_debug_enabled(&self) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some())
@@ -4060,6 +4074,7 @@ impl StudioVfs {
     /// Reset diagnostics counters and event history for fresh observability baselines.
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        #[cfg(test)]
         self.state.write_admission_governor.lock().reset_stats();
         self.state
             .local_dirty
@@ -6124,6 +6139,7 @@ impl StudioVfs {
             .saturating_add(self.state.writer_stack.total_dirty_bytes())
     }
 
+    #[cfg(test)]
     fn write_admission_pressure(&self) -> WriteAdmissionPressure {
         let cached_store_writer_counters = self.cached_store.snapshot_writer_counters();
         WriteAdmissionPressure {
@@ -6170,20 +6186,12 @@ impl StudioVfs {
             });
     }
 
+    #[cfg(test)]
     fn write_admission_buffer_budget_bytes(&self) -> usize {
         self.max_dirty_bytes().max(self.block_size.max(1) as usize)
     }
 
-    fn record_write_admission_accepted_bytes(&self, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        self.state
-            .write_admission_governor
-            .lock()
-            .record_accepted_bytes(bytes);
-    }
-
+    #[cfg(test)]
     fn record_write_admission_wait(&self, waited: Duration) {
         let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
         if waited_ms == 0 {
@@ -6203,6 +6211,7 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
@@ -6323,7 +6332,15 @@ impl StudioVfs {
     }
 
     fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {
-        self.state.write_admission_governor.lock().stats()
+        #[cfg(test)]
+        {
+            return self.state.write_admission_governor.lock().stats();
+        }
+
+        #[cfg(not(test))]
+        {
+            WriteAdmissionGovernorStats::default()
+        }
     }
 
     fn writer_stack_steady_drain_quota_bytes(&self) -> usize {

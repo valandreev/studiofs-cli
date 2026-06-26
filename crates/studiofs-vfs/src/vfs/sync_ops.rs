@@ -1433,10 +1433,6 @@ impl StudioVfs {
         if local_sync_policy.is_opportunistic() {
             session = None;
         }
-        if let Ok(written) = &result {
-            self.record_write_admission_accepted_bytes(*written as usize);
-        }
-
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
             (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
