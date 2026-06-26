@@ -45,21 +45,6 @@ fn next_interrupt_key() -> usize {
     NEXT_INTERRUPT_KEY.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MacosFuseCachePolicy {
-    Direct,
-    Buffered,
-}
-
-impl MacosFuseCachePolicy {
-    fn from_env() -> Self {
-        match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
-            Ok(raw) if raw.trim().eq_ignore_ascii_case("buffered") => Self::Buffered,
-            _ => Self::Direct,
-        }
-    }
-}
-
 pub(crate) mod raw {
     use super::*;
 
@@ -488,34 +473,15 @@ impl SessionConfig {
 
     /// Build owned argv strings for the macFUSE mount channel.
     pub fn mount_argv_strings(&self) -> Vec<String> {
-        self.mount_argv_strings_with_cache_policy(MacosFuseCachePolicy::from_env())
-    }
-
-    pub(super) fn mount_argv_strings_with_cache_policy(
-        &self,
-        cache_policy: MacosFuseCachePolicy,
-    ) -> Vec<String> {
-        let mut args = vec![
+        vec![
             "studiofs-macfuse".to_owned(),
             format!("-ovolname={}", self.volume_name),
             "-olocal".to_owned(),
-        ];
-        match cache_policy {
-            MacosFuseCachePolicy::Direct => {
-                args.push("-odirect_io".to_owned());
-                args.push("-onolocalcaches".to_owned());
-                args.push("-oauto_cache".to_owned());
-            }
-            MacosFuseCachePolicy::Buffered => {
-                args.push("-onovncache".to_owned());
-                args.push("-odaemon_timeout=60".to_owned());
-                args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
-                args.push(format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"));
-                args.push("-odefer_permissions".to_owned());
-            }
-        }
-        args.push("-osparse".to_owned());
-        args
+            "-odirect_io".to_owned(),
+            "-onolocalcaches".to_owned(),
+            "-oauto_cache".to_owned(),
+            "-osparse".to_owned(),
+        ]
     }
 
     fn mount_point_cstring(&self) -> io::Result<CString> {

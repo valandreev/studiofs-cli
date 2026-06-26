@@ -191,7 +191,7 @@ Current signature includes additional policy controls:
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | `direct` by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=buffered` for the legacy buffered rollback mode |
+| macOS: cache policy | `direct` by default |
 | macOS: validated macFUSE | 5.2.0 |
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
@@ -256,13 +256,7 @@ The default macOS asyncFUSE profile also enables async write replies, applies
 the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
 reports the preferred I/O size through regular file attributes. Set
 `STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
-changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=buffered`
-for the legacy buffered rollback profile.
-For macFUSE 5.2.0 in the legacy buffered profile, regular file attributes must
-report the same preferred I/O size (`st_blksize` / FUSE `blksize`) as the mount
-`iosize`; advertising the old 512-byte value causes macFUSE to split large
-sequential reads and writes into small callbacks even when the mount-level
-`iosize` is larger.
+changing the cache policy.
 The mounted performance probe records SFS-491 read-geometry evidence in
 `performance-probe-summary.json`: `read_observations.fuse_read_calls`,
 `read_observations.fuse_read_bytes`, and `read_observations.avg_fuse_read_bytes`
@@ -276,21 +270,6 @@ When the probe waits for upload drain, the matching
 `read_observations.post_drain_foreground_local_payload_read_*` fields record the
 same geometry for the post-drain verification read.
 Use that report before adding any daemon-side hot read window.
-
-In the legacy buffered policy, read-only file opens return `FOPEN_KEEP_CACHE`
-so safe media and sequential-read workloads can use the kernel cache/readahead
-path. Write-capable or truncating opens return macFUSE `FOPEN_PURGE_UBC`, which
-drops stale readonly UBC pages without disabling buffered I/O for the
-descriptor. Correctness depends on scoped explicit invalidation through
-`FuseKernelInvalidator`: data invalidation uses `inval_inode(ino, 0, -1)` when
-cached pages are unsafe, while same-mount publication of already accepted local
-bytes uses attribute-only invalidation so macOS does not evict freshly written
-UBC pages after upload completion.
-
-`STUDIOFS_MACOS_FUSE_CACHE_POLICY=buffered` preserves the older large-callback
-profile: mount options include `novncache`, `daemon_timeout=60`,
-`iosize=4194304`, `max_read=4194304`, and `defer_permissions`, and per-open
-cache flags choose whether to retain kernel pages.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata

@@ -375,34 +375,6 @@ mod tests {
     }
 
     #[test]
-    fn session_config_builds_buffered_cache_policy_mount_arguments_for_rollback_runs() {
-        let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native");
-
-        let mount_args = config
-            .mount_argv_strings_with_cache_policy(super::low_level::MacosFuseCachePolicy::Buffered);
-
-        assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
-        assert!(mount_args.iter().any(|arg| arg == "-odaemon_timeout=60"));
-        let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
-        assert!(
-            mount_args
-                .iter()
-                .any(|arg| arg == &format!("-oiosize={expected_geometry}"))
-        );
-        assert!(
-            mount_args
-                .iter()
-                .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
-        );
-        assert!(mount_args.iter().any(|arg| arg == "-osparse"));
-        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
-        assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
-        assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
-        assert!(!mount_args.iter().any(|arg| arg == "-oauto_cache"));
-        assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
-    }
-
-    #[test]
     fn empty_low_level_ops_come_from_c_header_layout() {
         let ops = super::low_level::LowLevelOperations::empty();
 
