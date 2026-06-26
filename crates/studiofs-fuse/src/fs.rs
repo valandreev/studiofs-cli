@@ -6,8 +6,8 @@ mod pending_write_tracker;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -51,6 +51,7 @@ const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
 const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
 const HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND: u16 = 128;
 const HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD: u16 = 96;
+const FUSE_BUFFER_POOL_MAX_BUFFERS: usize = 16;
 
 /// Supported Linux FUSE tuning profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,60 @@ impl LinuxFuseProfile {
 struct OpenDirState {
     dir_attr: studiofs_meta::InodeAttr,
     entries: Arc<Vec<DirEntryWithAttr>>,
+}
+
+#[derive(Debug, Clone)]
+struct FuseBufferPool {
+    inner: Arc<Mutex<Vec<Vec<u8>>>>,
+    default_capacity: usize,
+    max_buffers: usize,
+    max_retained_capacity: usize,
+}
+
+impl FuseBufferPool {
+    fn new(default_capacity: usize, max_buffers: usize, max_retained_capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::with_capacity(max_buffers))),
+            default_capacity: default_capacity.max(1),
+            max_buffers,
+            max_retained_capacity,
+        }
+    }
+
+    fn take_zeroed(&self, len: usize) -> Vec<u8> {
+        let mut buffer = self.take(len);
+        buffer.resize(len, 0);
+        buffer
+    }
+
+    fn take_with_bytes(&self, data: &[u8]) -> Vec<u8> {
+        let mut buffer = self.take(data.len());
+        buffer.extend_from_slice(data);
+        buffer
+    }
+
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut buffers = self.inner.lock().expect("FUSE buffer pool poisoned");
+        if let Some(mut buffer) = buffers.pop() {
+            buffer.clear();
+            if buffer.capacity() < len {
+                buffer.reserve(len - buffer.capacity());
+            }
+            return buffer;
+        }
+        Vec::with_capacity(len.max(self.default_capacity))
+    }
+
+    fn put(&self, mut buffer: Vec<u8>) {
+        if self.max_buffers == 0 || buffer.capacity() > self.max_retained_capacity {
+            return;
+        }
+        buffer.clear();
+        let mut buffers = self.inner.lock().expect("FUSE buffer pool poisoned");
+        if buffers.len() < self.max_buffers {
+            buffers.push(buffer);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +807,7 @@ pub struct StudioFuseFs {
     runtime_stats_handles: HashMap<u64, Vec<u8>>,
     next_open_dir_fh: u64,
     open_dir_handles: HashMap<u64, OpenDirState>,
+    fuse_buffer_pool: FuseBufferPool,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -901,6 +957,11 @@ impl StudioFuseFs {
             runtime_stats_handles: HashMap::new(),
             next_open_dir_fh: FIRST_FUSE_DIR_FH,
             open_dir_handles: HashMap::new(),
+            fuse_buffer_pool: FuseBufferPool::new(
+                options.fuse_max_write_bytes as usize,
+                FUSE_BUFFER_POOL_MAX_BUFFERS,
+                options.fuse_max_write_bytes as usize,
+            ),
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
@@ -1043,9 +1104,6 @@ impl StudioFuseFs {
         };
         let callback_started = Instant::now();
         if self.async_write_enabled {
-            // TODO(SFS-465): Async writes must own the FUSE callback buffer.
-            // If this path graduates from experimental, replace per-write Vec
-            // allocation with a reusable buffer pool to reduce allocator churn.
             let data_len = data.len();
             let registration = match self.pending_writes.register_with_admission(
                 ino,
@@ -1075,7 +1133,8 @@ impl StudioFuseFs {
                 sequence = registration.sequence(),
                 "async FUSE write scheduled"
             );
-            let data = data.to_vec();
+            let data = self.fuse_buffer_pool.take_with_bytes(data);
+            let buffer_pool = self.fuse_buffer_pool.clone();
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
@@ -1092,6 +1151,7 @@ impl StudioFuseFs {
                     result.is_err(),
                 );
                 complete_fuse_write_reply(reply, result, &registration, ino, offset);
+                buffer_pool.put(data);
             });
             return;
         }
@@ -1659,7 +1719,7 @@ impl Filesystem for StudioFuseFs {
 
         // fuser's ReplyData API accepts an immutable reply slice instead of
         // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
-        let mut out = vec![0u8; requested_size];
+        let mut out = self.fuse_buffer_pool.take_zeroed(requested_size);
         let callback_started = Instant::now();
         let result = self
             .rt
@@ -1674,14 +1734,17 @@ impl Filesystem for StudioFuseFs {
                 let n = match usize::try_from(n) {
                     Ok(n) => n,
                     Err(_) => {
+                        self.fuse_buffer_pool.put(out);
                         reply.error(libc::EOVERFLOW);
                         return;
                     }
                 };
                 reply.data(&out[..n]);
+                self.fuse_buffer_pool.put(out);
             }
             Err(e) => {
                 error!("read({ino}, off={offset}, sz={size}) -> {e}");
+                self.fuse_buffer_pool.put(out);
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -2539,11 +2602,11 @@ mod tests {
     use super::fuse_open_reply_flags;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
-        FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
-        FuseWriteReplyGuard, LinuxFuseProfile, PendingFuseCloseGuard, StudioFuseFs, TTL,
-        complete_fuse_write_reply, fuse_attr_blksize, fuse_write_local_sync_policy,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
+        FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile, PendingFuseCloseGuard,
+        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_attr_blksize,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
         resolve_fuse_writeback_cache_enabled, should_enable_async_fuse_write_from_env_value,
         should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
         vfs_err_to_errno,
@@ -2667,6 +2730,34 @@ mod tests {
                 per_handle_pending_bytes: Some(1024),
             }
         );
+    }
+
+    #[test]
+    fn fuse_buffer_pool_reuses_cleared_buffers() {
+        let pool = FuseBufferPool::new(4096, 1, 4096);
+        let mut first = pool.take_zeroed(1024);
+        first[0] = 7;
+        let initial_capacity = first.capacity();
+        pool.put(first);
+
+        let second = pool.take_zeroed(512);
+
+        assert_eq!(second.len(), 512);
+        assert_eq!(second[0], 0);
+        assert_eq!(second.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn fuse_buffer_pool_retains_runtime_sized_buffers() {
+        let runtime_max = (DEFAULT_FUSE_MAX_WRITE_BYTES as usize) * 2;
+        let pool = FuseBufferPool::new(runtime_max, 1, runtime_max);
+        let first = pool.take_zeroed(runtime_max);
+        let initial_capacity = first.capacity();
+        pool.put(first);
+
+        let second = pool.take_zeroed(1024);
+
+        assert_eq!(second.capacity(), initial_capacity);
     }
 
     #[test]
