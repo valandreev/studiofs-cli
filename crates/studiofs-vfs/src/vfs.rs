@@ -6187,7 +6187,7 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let mut pressure = self.write_admission_pressure();
+        let pressure = self.write_admission_pressure();
         let mut pressure_bytes = pressure.total_bytes();
         #[cfg(target_os = "macos")]
         {
