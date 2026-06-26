@@ -1375,7 +1375,6 @@ impl StudioVfs {
         if local_sync_policy.is_opportunistic() {
             self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
-            self.maybe_throttle_write_admission(data.len()).await;
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
