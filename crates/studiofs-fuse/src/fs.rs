@@ -1887,9 +1887,6 @@ impl Filesystem for StudioFuseFs {
                 continue;
             }
             let entry_idx = i + 2;
-            if entry_with_attr.attr.is_none() {
-                continue;
-            }
             let ft = fuse_file_type(entry.kind);
             let entry_name = &entry.name;
             let next_offset = match i64::try_from(entry_idx + 1) {
@@ -1967,8 +1964,16 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
-            let Some(attr) = &entry_with_attr.attr else {
-                continue;
+            let fallback_attr;
+            let attr = match &entry_with_attr.attr {
+                Some(attr) => attr,
+                None => match self.vfs.getattr(entry.ino) {
+                    Ok(attr) => {
+                        fallback_attr = attr;
+                        &fallback_attr
+                    }
+                    Err(_) => continue,
+                },
             };
             let fattr = to_fuse_attr(attr, self.mount_uid, self.mount_gid);
             let entry_name = &entry.name;

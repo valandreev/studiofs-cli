@@ -991,7 +991,11 @@ impl StudioVfs {
         let mut confirmed_entry_inos = HashSet::new();
         let mut attrs_by_ino = HashMap::new();
         if !entries.is_empty() {
-            let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
+            let child_inos = entries
+                .iter()
+                .map(|entry| entry.ino)
+                .take(self.readdir_attr_batch_max_inodes)
+                .collect::<Vec<_>>();
             let mut attrs = Vec::new();
             let attr_batch_len = self
                 .readdir_attr_batch_chunk

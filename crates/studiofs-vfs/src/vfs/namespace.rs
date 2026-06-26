@@ -1171,6 +1171,14 @@ mod tests {
         tmp: &TempDir,
         volume_suffix: &str,
     ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        make_unstarted_test_vfs_with_config(tmp, volume_suffix, VfsConfig::default())
+    }
+
+    fn make_unstarted_test_vfs_with_config(
+        tmp: &TempDir,
+        volume_suffix: &str,
+        cfg: VfsConfig,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
@@ -1188,9 +1196,7 @@ mod tests {
             cache_dir.to_str().expect("cache dir str"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
-            VfsConfig::default()
-                .try_into()
-                .expect("default VFS config should validate"),
+            cfg.try_into().expect("test VFS config should validate"),
         )
         .expect("create vfs");
         (rt, vfs, meta)
@@ -1201,6 +1207,17 @@ mod tests {
         volume_suffix: &str,
     ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
         let (rt, vfs, meta) = make_unstarted_test_vfs(tmp, volume_suffix);
+        let _guard = rt.enter();
+        vfs.start().expect("start vfs background workers");
+        (rt, vfs, meta)
+    }
+
+    fn make_test_vfs_with_config(
+        tmp: &TempDir,
+        volume_suffix: &str,
+        cfg: VfsConfig,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let (rt, vfs, meta) = make_unstarted_test_vfs_with_config(tmp, volume_suffix, cfg);
         let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
@@ -1559,6 +1576,38 @@ mod tests {
         assert_eq!(
             listed.attr.as_ref().expect("listed attr").mode & 0o777,
             0o640
+        );
+    }
+
+    #[test]
+    fn readdir_with_attrs_respects_attr_batch_cap() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let cfg = VfsConfig {
+            readdir_attr_batch_chunk: 1,
+            readdir_attr_batch_max_inodes: 1,
+            ..VfsConfig::default()
+        };
+        let (_rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "readdir-with-attrs-cap", cfg);
+        let first = vfs
+            .create(ROOT_INO, b"cap-first.txt", 1000, 1000, 0o640)
+            .expect("create first file");
+        let second = vfs
+            .create(ROOT_INO, b"cap-second.txt", 1000, 1000, 0o640)
+            .expect("create second file");
+
+        let entries = vfs.readdir_with_attrs(ROOT_INO).expect("readdir root");
+        let created_entries = entries
+            .iter()
+            .filter(|entry| entry.entry.ino == first.ino || entry.entry.ino == second.ino)
+            .collect::<Vec<_>>();
+
+        assert_eq!(created_entries.len(), 2);
+        assert_eq!(
+            created_entries
+                .iter()
+                .filter(|entry| entry.attr.is_some())
+                .count(),
+            1
         );
     }
 
