@@ -309,8 +309,17 @@ fn fuse_attr_blksize() -> u32 {
     FUSE_ATTR_BLOCK_SIZE
 }
 
-fn fuse_open_reply_flags() -> u32 {
-    fuser::consts::FOPEN_KEEP_CACHE
+fn fuse_open_reply_flags(flags: i32, trunc: bool) -> u32 {
+    let access_mode = flags & libc::O_ACCMODE;
+    let write_capable = trunc
+        || access_mode == libc::O_WRONLY
+        || access_mode == libc::O_RDWR
+        || flags & libc::O_APPEND != 0;
+    if write_capable {
+        0
+    } else {
+        fuser::consts::FOPEN_KEEP_CACHE
+    }
 }
 
 fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
@@ -1615,7 +1624,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(),
+                            fuse_open_reply_flags(flags, false),
                         );
                     }
                     Err(e) => {
@@ -1807,7 +1816,7 @@ impl Filesystem for StudioFuseFs {
         }
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags();
+                let reply_flags = fuse_open_reply_flags(flags, trunc);
                 debug!(
                     ino,
                     fh,
@@ -3297,7 +3306,17 @@ mod tests {
 
     #[test]
     fn fuse_open_reply_flags_match_platform_cache_policy() {
-        assert_eq!(fuse_open_reply_flags(), fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDONLY, false),
+            fuser::consts::FOPEN_KEEP_CACHE
+        );
+        assert_eq!(fuse_open_reply_flags(libc::O_WRONLY, false), 0);
+        assert_eq!(fuse_open_reply_flags(libc::O_RDWR, false), 0);
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDONLY | libc::O_APPEND, false),
+            0
+        );
+        assert_eq!(fuse_open_reply_flags(libc::O_RDONLY, true), 0);
     }
 
     #[test]
