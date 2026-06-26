@@ -102,6 +102,14 @@ struct FuseBackgroundQueuePolicy {
     congestion_threshold: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FuseDiagnosticsPolicy {
+    linux_fuse_profile: &'static str,
+    max_write_bytes: u32,
+    max_readahead_bytes: u32,
+    background_queue_policy: FuseBackgroundQueuePolicy,
+}
+
 impl FuseBackgroundQueuePolicy {
     fn platform_default() -> Self {
         Self::platform_default_for_profile(LinuxFuseProfile::Conservative)
@@ -252,36 +260,33 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
-    let raw = std::env::var(key).ok();
-    parse_bridge_u32_env_value(key, raw.as_deref(), default)
-}
-
-fn parse_bridge_u32_env_value(key: &str, raw: Option<&str>, default: u32) -> u32 {
-    let Some(raw) = raw else {
-        return default;
-    };
-    let trimmed = raw.trim();
-    match trimmed.parse::<u32>() {
-        Ok(value) if value > 0 => value,
-        Ok(_) => {
-            warn!(
-                env_key = key,
-                env_value = trimmed,
-                fallback_value = default,
-                "bridge tuning override must be > 0; using default"
-            );
-            default
+    match std::env::var(key) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<u32>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) => {
+                    warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        "bridge tuning override must be > 0; using default"
+                    );
+                    default
+                }
+                Err(error) => {
+                    warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        error = %error,
+                        "invalid bridge tuning override; using default"
+                    );
+                    default
+                }
+            }
         }
-        Err(error) => {
-            warn!(
-                env_key = key,
-                env_value = trimmed,
-                fallback_value = default,
-                error = %error,
-                "invalid bridge tuning override; using default"
-            );
-            default
-        }
+        Err(_) => default,
     }
 }
 
@@ -896,7 +901,6 @@ impl StudioFuseFs {
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
             warn!(
-                platform_policy = fs.async_write_platform_policy_label(),
                 linux_fuse_profile = fs.linux_fuse_profile.label(),
                 "experimental async FUSE write bridge queue enabled"
             );
@@ -904,7 +908,6 @@ impl StudioFuseFs {
         }
         debug!(
             async_write_enabled = fs.async_write_enabled,
-            platform_policy = fs.async_write_platform_policy_label(),
             linux_fuse_profile = fs.linux_fuse_profile.label(),
             max_pending_bytes = ?fs.async_write_admission_policy.limits.max_pending_bytes,
             max_pending_writes = ?fs.async_write_admission_policy.limits.max_pending_writes,
@@ -940,8 +943,13 @@ impl StudioFuseFs {
         result
     }
 
-    fn async_write_platform_policy_label(&self) -> &'static str {
-        "linux"
+    fn fuse_diagnostics(&self) -> FuseDiagnosticsPolicy {
+        FuseDiagnosticsPolicy {
+            linux_fuse_profile: self.linux_fuse_profile.label(),
+            max_write_bytes: self.fuse_max_write_bytes,
+            max_readahead_bytes: self.fuse_max_readahead_bytes,
+            background_queue_policy: self.fuse_background_queue_policy,
+        }
     }
 
     fn open_runtime_stats_handle(&mut self) -> u64 {
@@ -984,11 +992,7 @@ impl StudioFuseFs {
         Self::publish_async_write_diagnostics_snapshot(
             &self.vfs,
             self.async_write_enabled,
-            self.async_write_platform_policy_label(),
-            self.linux_fuse_profile.label(),
-            self.fuse_max_write_bytes,
-            self.fuse_max_readahead_bytes,
-            self.fuse_background_queue_policy,
+            self.fuse_diagnostics(),
             self.async_write_admission_policy.limits,
             &self.pending_writes,
         );
@@ -998,12 +1002,8 @@ impl StudioFuseFs {
         let vfs = Arc::clone(&self.vfs);
         let pending_writes = self.pending_writes.clone();
         let enabled = self.async_write_enabled;
-        let platform_policy = self.async_write_platform_policy_label();
-        let linux_fuse_profile = self.linux_fuse_profile.label();
+        let diagnostics = self.fuse_diagnostics();
         let limits = self.async_write_admission_policy.limits;
-        let max_write = self.fuse_max_write_bytes;
-        let max_readahead = self.fuse_max_readahead_bytes;
-        let background_queue_policy = self.fuse_background_queue_policy;
         let stop = Arc::clone(&self.async_write_diagnostics_stop);
         self.rt.spawn(async move {
             let mut interval = tokio::time::interval_at(
@@ -1018,11 +1018,7 @@ impl StudioFuseFs {
                 StudioFuseFs::publish_async_write_diagnostics_snapshot(
                     &vfs,
                     enabled,
-                    platform_policy,
-                    linux_fuse_profile,
-                    max_write,
-                    max_readahead,
-                    background_queue_policy,
+                    diagnostics,
                     limits,
                     &pending_writes,
                 );
@@ -1122,11 +1118,7 @@ impl StudioFuseFs {
     fn publish_async_write_diagnostics_snapshot(
         vfs: &StudioVfs,
         enabled: bool,
-        platform_policy: &'static str,
-        linux_fuse_profile: &'static str,
-        max_write_bytes: u32,
-        max_readahead_bytes: u32,
-        background_queue_policy: FuseBackgroundQueuePolicy,
+        diagnostics: FuseDiagnosticsPolicy,
         limits: PendingWriteAdmissionLimits,
         pending_writes: &PendingWriteTracker,
     ) {
@@ -1134,12 +1126,11 @@ impl StudioFuseFs {
         vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
             snapshot_generation: tracker.mutation_generation,
             enabled,
-            platform_policy: platform_policy.into(),
-            linux_fuse_profile: linux_fuse_profile.into(),
-            fuse_max_write_bytes: max_write_bytes,
-            fuse_max_readahead_bytes: max_readahead_bytes,
-            fuse_max_background: background_queue_policy.max_background,
-            fuse_congestion_threshold: background_queue_policy.congestion_threshold,
+            linux_fuse_profile: diagnostics.linux_fuse_profile.into(),
+            fuse_max_write_bytes: diagnostics.max_write_bytes,
+            fuse_max_readahead_bytes: diagnostics.max_readahead_bytes,
+            fuse_max_background: diagnostics.background_queue_policy.max_background,
+            fuse_congestion_threshold: diagnostics.background_queue_policy.congestion_threshold,
             max_pending_bytes: limits.max_pending_bytes,
             max_pending_writes: limits.max_pending_writes,
             per_handle_pending_bytes: limits.per_handle_pending_bytes,
@@ -1722,11 +1713,7 @@ impl Filesystem for StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
             let admission_limits = self.async_write_admission_policy.limits;
-            let platform_policy = self.async_write_platform_policy_label();
-            let linux_fuse_profile = self.linux_fuse_profile.label();
-            let max_write = self.fuse_max_write_bytes;
-            let max_readahead = self.fuse_max_readahead_bytes;
-            let background_queue_policy = self.fuse_background_queue_policy;
+            let diagnostics = self.fuse_diagnostics();
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
@@ -1739,11 +1726,7 @@ impl Filesystem for StudioFuseFs {
                 StudioFuseFs::publish_async_write_diagnostics_snapshot(
                     &vfs,
                     true,
-                    platform_policy,
-                    linux_fuse_profile,
-                    max_write,
-                    max_readahead,
-                    background_queue_policy,
+                    diagnostics,
                     admission_limits,
                     &pending_writes,
                 );
@@ -1825,11 +1808,7 @@ impl Filesystem for StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
             let admission_limits = self.async_write_admission_policy.limits;
-            let platform_policy = self.async_write_platform_policy_label();
-            let linux_fuse_profile = self.linux_fuse_profile.label();
-            let max_write = self.fuse_max_write_bytes;
-            let max_readahead = self.fuse_max_readahead_bytes;
-            let background_queue_policy = self.fuse_background_queue_policy;
+            let diagnostics = self.fuse_diagnostics();
             let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -1843,11 +1822,7 @@ impl Filesystem for StudioFuseFs {
                 StudioFuseFs::publish_async_write_diagnostics_snapshot(
                     &vfs,
                     true,
-                    platform_policy,
-                    linux_fuse_profile,
-                    max_write,
-                    max_readahead,
-                    background_queue_policy,
+                    diagnostics,
                     admission_limits,
                     &pending_writes,
                 );
@@ -1897,11 +1872,7 @@ impl Filesystem for StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let pending_writes = self.pending_writes.clone();
             let admission_limits = self.async_write_admission_policy.limits;
-            let platform_policy = self.async_write_platform_policy_label();
-            let linux_fuse_profile = self.linux_fuse_profile.label();
-            let max_write = self.fuse_max_write_bytes;
-            let max_readahead = self.fuse_max_readahead_bytes;
-            let background_queue_policy = self.fuse_background_queue_policy;
+            let diagnostics = self.fuse_diagnostics();
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
@@ -1915,11 +1886,7 @@ impl Filesystem for StudioFuseFs {
                 StudioFuseFs::publish_async_write_diagnostics_snapshot(
                     &vfs,
                     true,
-                    platform_policy,
-                    linux_fuse_profile,
-                    max_write,
-                    max_readahead,
-                    background_queue_policy,
+                    diagnostics,
                     admission_limits,
                     &pending_writes,
                 );
@@ -2726,10 +2693,6 @@ mod tests {
         let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
 
         assert!(snapshot.enabled);
-        assert_eq!(
-            snapshot.platform_policy,
-            fs.async_write_platform_policy_label()
-        );
         assert_eq!(snapshot.linux_fuse_profile, fs.linux_fuse_profile.label());
         assert_eq!(snapshot.fuse_max_write_bytes, DEFAULT_FUSE_MAX_WRITE_BYTES);
         assert_eq!(
@@ -2769,7 +2732,7 @@ mod tests {
         vfs.record_fuse_async_write_snapshot(studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 0,
             enabled: true,
-            platform_policy: "sentinel".into(),
+            linux_fuse_profile: "sentinel".into(),
             ..Default::default()
         });
         rt.block_on(async {
@@ -2778,7 +2741,7 @@ mod tests {
 
         let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
         assert!(snapshot.enabled);
-        assert_eq!(snapshot.platform_policy, "sentinel");
+        assert_eq!(snapshot.linux_fuse_profile, "sentinel");
     }
 
     #[test]

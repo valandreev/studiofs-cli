@@ -960,8 +960,6 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub snapshot_generation: u64,
     /// Whether async write replies are enabled for this FUSE mount.
     pub enabled: bool,
-    /// Selected platform policy label.
-    pub platform_policy: Cow<'static, str>,
     /// Selected Linux FUSE profile label.
     pub linux_fuse_profile: Cow<'static, str>,
     /// Requested kernel `max_write` value.

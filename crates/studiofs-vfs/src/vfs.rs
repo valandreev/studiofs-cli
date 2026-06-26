@@ -7049,7 +7049,6 @@ impl StudioVfs {
         if snapshot.snapshot_generation >= current.snapshot_generation {
             current.snapshot_generation = snapshot.snapshot_generation;
             current.enabled = snapshot.enabled;
-            current.platform_policy = snapshot.platform_policy;
             current.linux_fuse_profile = snapshot.linux_fuse_profile;
             current.fuse_max_write_bytes = snapshot.fuse_max_write_bytes;
             current.fuse_max_readahead_bytes = snapshot.fuse_max_readahead_bytes;

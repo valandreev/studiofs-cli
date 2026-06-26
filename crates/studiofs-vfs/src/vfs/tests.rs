@@ -12488,7 +12488,6 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 1,
         enabled: true,
-        platform_policy: "linux".into(),
         linux_fuse_profile: "high-throughput".into(),
         fuse_max_write_bytes: 16 * 1024 * 1024,
         fuse_max_readahead_bytes: 16 * 1024 * 1024,
@@ -12512,7 +12511,6 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     let snapshot = vfs.write_path_observability_snapshot();
 
     assert!(snapshot.fuse_async_write.enabled);
-    assert_eq!(snapshot.fuse_async_write.platform_policy, "linux");
     assert_eq!(
         snapshot.fuse_async_write.linux_fuse_profile,
         "high-throughput"
@@ -12573,7 +12571,6 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 2,
         enabled: true,
-        platform_policy: "linux".into(),
         pending_writes: 0,
         pending_bytes: 0,
         peak_pending_bytes: 1024,
@@ -12589,7 +12586,6 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 1,
         enabled: true,
-        platform_policy: "linux".into(),
         pending_writes: 7,
         pending_bytes: 8 * 1024,
         peak_pending_bytes: 2048,
@@ -12731,7 +12727,6 @@ fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 7,
         enabled: true,
-        platform_policy: "linux".into(),
         pending_writes: 3,
         pending_bytes: 4096,
         peak_pending_bytes: 8192,
@@ -12774,7 +12769,6 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 7,
         enabled: true,
-        platform_policy: "linux".into(),
         pending_writes: 0,
         pending_bytes: 0,
         peak_pending_bytes: 8192,
@@ -12792,7 +12786,6 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 7,
         enabled: true,
-        platform_policy: "linux".into(),
         peak_pending_bytes: 8192,
         completed_writes: 11,
         failed_writes: 2,
@@ -12816,7 +12809,6 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: 8,
         enabled: true,
-        platform_policy: "linux".into(),
         pending_writes: 2,
         pending_bytes: 4096,
         peak_pending_bytes: 8192,
