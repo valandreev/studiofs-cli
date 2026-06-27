@@ -38,7 +38,7 @@ use tracing::{debug, error, trace, warn};
 
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
-const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 4 * 1024 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -462,28 +462,22 @@ fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
-fn resolve_async_fuse_write_enabled(profile: LinuxFuseProfile, raw: Option<&str>) -> bool {
-    raw.map_or(
-        profile == LinuxFuseProfile::HighThroughput,
-        should_enable_async_fuse_write_from_env_value,
-    )
+fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(should_enable_async_fuse_write_from_env_value)
 }
 
-fn resolve_async_fuse_read_enabled(profile: LinuxFuseProfile, raw: Option<&str>) -> bool {
-    raw.map_or(
-        profile == LinuxFuseProfile::HighThroughput,
-        should_enable_async_fuse_read_from_env_value,
-    )
+fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(should_enable_async_fuse_read_from_env_value)
 }
 
-fn should_enable_async_fuse_write_from_env(profile: LinuxFuseProfile) -> bool {
+fn should_enable_async_fuse_write_from_env() -> bool {
     let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
-    resolve_async_fuse_write_enabled(profile, raw.as_deref())
+    resolve_async_fuse_write_enabled(raw.as_deref())
 }
 
-fn should_enable_async_fuse_read_from_env(profile: LinuxFuseProfile) -> bool {
+fn should_enable_async_fuse_read_from_env() -> bool {
     let raw = std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok();
-    resolve_async_fuse_read_enabled(profile, raw.as_deref())
+    resolve_async_fuse_read_enabled(raw.as_deref())
 }
 
 trait FuseWriteReply {
@@ -1010,8 +1004,8 @@ impl StudioFuseRuntimeOptions {
             ),
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
-            async_write_enabled: should_enable_async_fuse_write_from_env(profile),
-            async_read_enabled: should_enable_async_fuse_read_from_env(profile),
+            async_write_enabled: should_enable_async_fuse_write_from_env(),
+            async_read_enabled: should_enable_async_fuse_read_from_env(),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
             linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
@@ -3130,20 +3124,11 @@ mod tests {
     }
 
     #[test]
-    fn async_read_resolves_like_async_write_for_high_throughput_profile() {
-        assert!(resolve_async_fuse_read_enabled(
-            LinuxFuseProfile::HighThroughput,
-            None
-        ));
-        assert!(!resolve_async_fuse_read_enabled(
-            LinuxFuseProfile::Conservative,
-            None
-        ));
-        assert!(!resolve_async_fuse_read_enabled(
-            LinuxFuseProfile::HighThroughput,
-            Some("false")
-        ));
+    fn high_throughput_linux_fuse_profile_keeps_async_read_opt_in() {
+        assert!(!resolve_async_fuse_read_enabled(None));
+        assert!(!resolve_async_fuse_read_enabled(Some("false")));
         assert!(should_enable_async_fuse_read_from_env_value("true"));
+        assert!(resolve_async_fuse_read_enabled(Some("true")));
     }
 
     #[test]
@@ -3165,7 +3150,7 @@ mod tests {
 
     #[test]
     fn default_fuse_max_readahead_matches_platform_expectation() {
-        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -3389,34 +3374,23 @@ mod tests {
 
     #[test]
     fn async_fuse_write_default_profile_is_disabled_when_env_unset() {
-        assert!(!resolve_async_fuse_write_enabled(
-            LinuxFuseProfile::Conservative,
-            None
-        ));
+        assert!(!resolve_async_fuse_write_enabled(None));
     }
 
     #[test]
-    fn high_throughput_linux_fuse_profile_enables_async_write_by_default() {
-        assert!(resolve_async_fuse_write_enabled(
-            LinuxFuseProfile::HighThroughput,
-            None
-        ));
+    fn high_throughput_linux_fuse_profile_keeps_async_write_opt_in() {
+        assert!(!resolve_async_fuse_write_enabled(None));
+        assert!(resolve_async_fuse_write_enabled(Some("true")));
     }
 
     #[test]
     fn async_fuse_write_env_overrides_default_profile() {
         for false_value in ["0", "false", "off", ""] {
-            assert!(!resolve_async_fuse_write_enabled(
-                LinuxFuseProfile::HighThroughput,
-                Some(false_value)
-            ));
+            assert!(!resolve_async_fuse_write_enabled(Some(false_value)));
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
-            assert!(resolve_async_fuse_write_enabled(
-                LinuxFuseProfile::Conservative,
-                Some(true_value)
-            ));
+            assert!(resolve_async_fuse_write_enabled(Some(true_value)));
         }
     }
 

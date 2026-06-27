@@ -182,11 +182,11 @@ Current signature includes additional policy controls:
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
-| Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
+| Kernel `max_readahead` | `4194304` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | macOS: `50` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `128`. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `96`. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
-| FUSE async write replies | macOS: enabled by default. Linux conservative profile: disabled. Linux high-throughput profile: enabled. Override: `STUDIOFS_FUSE_ASYNC_WRITE` |
-| FUSE async read replies | Linux conservative profile: disabled. Linux high-throughput profile: enabled. Override: `STUDIOFS_FUSE_ASYNC_READ` |
+| FUSE async write replies | macOS: enabled by default. Linux: disabled by default and opt-in with `STUDIOFS_FUSE_ASYNC_WRITE=1` |
+| FUSE async read replies | Linux: disabled by default and opt-in with `STUDIOFS_FUSE_ASYNC_READ=1` |
 | Linux: `writeback_cache` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_WRITEBACK_CACHE=1`; requested only when the kernel advertises `FUSE_WRITEBACK_CACHE` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
@@ -195,9 +195,9 @@ Current signature includes additional policy controls:
 | macOS: validated macFUSE | 5.2.0 |
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
-high-throughput tuning profile. It keeps `max_write` and `max_readahead` at
-16 MiB, sets `max_background=128`, `congestion_threshold=96`, and enables the
-existing async write queue and async read reply path. The profile is opt-in
+high-throughput tuning profile. It keeps `max_write` at 16 MiB, keeps
+`max_readahead` at the Linux default 4 MiB unless explicitly overridden, and
+sets `max_background=128` plus `congestion_threshold=96`. The profile is opt-in
 until mounted benchmark evidence and correctness gates justify making it the
 Linux default.
 
@@ -240,9 +240,8 @@ writer stack and leaves staging, barriers, and upload lifecycle there.
 
 `STUDIOFS_FUSE_ASYNC_READ=1` is a Linux-only bridge read reply path. It moves
 regular file reads from the FUSE callback stack onto the mount runtime while
-keeping runtime stats file reads synchronous. The high-throughput profile
-enables it by default; set `STUDIOFS_FUSE_ASYNC_READ=0` to force synchronous
-regular read callbacks.
+keeping runtime stats file reads synchronous. It stays opt-in for targeted A/B
+or profiling runs.
 
 ### macOS cache and I/O policy
 
