@@ -38,7 +38,7 @@ use tracing::{debug, error, trace, warn};
 
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
-const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 4 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -840,6 +840,21 @@ fn fuse_fh(fh: u64) -> fuser::FileHandle {
 
 fn fuse_generation(generation: u64) -> fuser::Generation {
     fuser::Generation(generation)
+}
+
+fn fs_ioc_getflags_reply_data(
+    cmd: u32,
+    in_data: &[u8],
+    out_size: u32,
+) -> Result<Option<[u8; 4]>, fuser::Errno> {
+    let is_getflags = cmd == libc::FS_IOC_GETFLAGS as u32 || cmd == libc::FS_IOC32_GETFLAGS as u32;
+    if !is_getflags {
+        return Ok(None);
+    }
+    if !in_data.is_empty() || out_size < u32::BITS / 8 {
+        return Err(fuser::Errno::EINVAL);
+    }
+    Ok(Some(0u32.to_ne_bytes()))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -2675,6 +2690,44 @@ impl Filesystem for StudioFuseFs {
         reply.locked(start, end, libc::F_UNLCK as i32, 0);
     }
 
+    fn ioctl(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        flags: fuser::IoctlFlags,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        match fs_ioc_getflags_reply_data(cmd, in_data, out_size) {
+            Ok(Some(data)) => {
+                trace!(
+                    ino,
+                    fh,
+                    flags = flags.bits(),
+                    cmd,
+                    "handled FS_IOC_GETFLAGS ioctl"
+                );
+                reply.ioctl(0, &data);
+            }
+            Ok(None) => {
+                warn!(
+                    ino,
+                    fh,
+                    flags = flags.bits(),
+                    cmd,
+                    in_data_len = in_data.len(),
+                    out_size,
+                    "unsupported FUSE ioctl"
+                );
+                reply.error(fuser::Errno::ENOTTY);
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn fallocate(
         &self,
         _req: &Request,
@@ -2773,9 +2826,10 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
         FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
-        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply, fuse_attr_blksize,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
+        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
         resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
         should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
@@ -3194,7 +3248,16 @@ mod tests {
 
     #[test]
     fn default_fuse_max_readahead_matches_platform_expectation() {
-        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 4 * 1024 * 1024);
+        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 128 * 1024);
+    }
+
+    #[test]
+    fn fs_ioc_getflags_ioctl_returns_empty_linux_inode_flags() {
+        let data = fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, &[], 4)
+            .expect("valid FS_IOC_GETFLAGS")
+            .expect("handled ioctl");
+
+        assert_eq!(u32::from_ne_bytes(data), 0);
     }
 
     #[test]

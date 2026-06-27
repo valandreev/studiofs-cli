@@ -182,7 +182,7 @@ Current signature includes additional policy controls:
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
-| Kernel `max_readahead` | `4194304` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
+| Kernel `max_readahead` | `131072` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | macOS: `50` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `128`. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `96`. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
 | FUSE async write replies | macOS: enabled by default. Linux: disabled by default and opt-in with `STUDIOFS_FUSE_ASYNC_WRITE=1` |
@@ -196,7 +196,7 @@ Current signature includes additional policy controls:
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
 high-throughput tuning profile. It keeps `max_write` at 16 MiB, keeps
-`max_readahead` at the Linux default 4 MiB unless explicitly overridden, and
+`max_readahead` at the Linux default 128 KiB unless explicitly overridden, and
 sets `max_background=128` plus `congestion_threshold=96`. The profile is opt-in
 until mounted benchmark evidence and correctness gates justify making it the
 Linux default.
