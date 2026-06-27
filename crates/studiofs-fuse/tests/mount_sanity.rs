@@ -376,6 +376,21 @@ fn mounted_tests_enabled() -> bool {
     std::env::var(MOUNT_TESTS_ENV).as_deref() == Ok("1")
 }
 
+fn fuse_test_config(name: impl Into<String>) -> fuser::Config {
+    let mut config = fuser::Config::default();
+    config
+        .mount_options
+        .push(fuser::MountOption::FSName(name.into()));
+    config
+}
+
+fn spawn_fuse_session(
+    session: fuser::Session<StudioFuseFs>,
+) -> std::thread::JoinHandle<io::Result<()>> {
+    let background = session.spawn().expect("spawn FUSE background session");
+    std::thread::spawn(move || background.join())
+}
+
 fn finish_mounted_fuse_test(
     test_result: std::thread::Result<MountedOperationGuard>,
     unmount_result: io::Result<()>,
@@ -739,7 +754,7 @@ fn with_mounted_fuse(
         },
     );
 
-    let options = vec![fuser::MountOption::FSName(format!("studiofs-{suffix}"))];
+    let config = fuse_test_config(format!("studiofs-{suffix}"));
 
     let mount_path = mount_dir.path().to_path_buf();
     use std::os::unix::fs::MetadataExt;
@@ -747,9 +762,9 @@ fn with_mounted_fuse(
         .expect("mount dir should exist before session creation")
         .dev();
 
-    let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
+    let mut session = fuser::Session::new(fs, &mount_path, &config).expect("create FUSE session");
     let mut unmount = session.unmount_callable();
-    let session_handle = std::thread::spawn(move || session.run());
+    let session_handle = spawn_fuse_session(session);
 
     let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -954,9 +969,9 @@ fn fuse_session_mount_and_drop_smoke() {
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());
-    let options = vec![fuser::MountOption::FSName("studiofs-test".into())];
+    let config = fuse_test_config("studiofs-test");
 
-    let session = fuser::Session::new(fs, mount_dir.path(), &options).expect("create FUSE session");
+    let session = fuser::Session::new(fs, mount_dir.path(), &config).expect("create FUSE session");
     drop(session);
 }
 
@@ -982,7 +997,7 @@ fn fuse_mount_write_read_unmount_smoke() {
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());
 
-    let options = vec![fuser::MountOption::FSName("studiofs-smoke".into())];
+    let config = fuse_test_config("studiofs-smoke");
 
     let mount_path = mount_dir.path().to_path_buf();
 
@@ -994,13 +1009,17 @@ fn fuse_mount_write_read_unmount_smoke() {
         .dev();
 
     println!("Creating FUSE session at {:?}...", mount_path);
-    let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
+    let mut session = fuser::Session::new(fs, &mount_path, &config).expect("create FUSE session");
     let mut unmount = session.unmount_callable();
 
     // Run the FUSE event loop in a background thread.
     println!("Starting FUSE background loop...");
     let session_handle = std::thread::spawn(move || {
-        if let Err(e) = session.run() {
+        if let Err(e) = session
+            .spawn()
+            .expect("spawn FUSE background session")
+            .join()
+        {
             eprintln!("FUSE session error (may be normal during unmount): {e}");
         }
         println!("FUSE background loop exited.");

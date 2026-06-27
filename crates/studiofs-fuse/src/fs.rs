@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -310,16 +310,16 @@ fn fuse_attr_blksize() -> u32 {
     FUSE_ATTR_BLOCK_SIZE
 }
 
-fn fuse_open_reply_flags(flags: i32, trunc: bool) -> u32 {
+fn fuse_open_reply_flags(flags: i32, trunc: bool) -> fuser::FopenFlags {
     let access_mode = flags & libc::O_ACCMODE;
     let write_capable = trunc
         || access_mode == libc::O_WRONLY
         || access_mode == libc::O_RDWR
         || flags & libc::O_APPEND != 0;
     if write_capable {
-        0
+        fuser::FopenFlags::empty()
     } else {
-        fuser::consts::FOPEN_KEEP_CACHE
+        fuser::FopenFlags::FOPEN_KEEP_CACHE
     }
 }
 
@@ -539,7 +539,7 @@ impl FuseWriteReply for ReplyWrite {
     }
 
     fn error(self, errno: i32) {
-        self.error(errno);
+        self.error(fuse_errno(errno));
     }
 }
 
@@ -575,7 +575,7 @@ impl FuseDataReply for ReplyData {
     }
 
     fn error(self, errno: i32) {
-        self.error(errno);
+        self.error(fuse_errno(errno));
     }
 }
 
@@ -611,7 +611,7 @@ impl FuseEmptyReply for ReplyEmpty {
     }
 
     fn error(self, errno: i32) {
-        self.error(errno);
+        self.error(fuse_errno(errno));
     }
 }
 
@@ -826,6 +826,22 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
     bridge_vfs_err_to_errno(e)
 }
 
+fn fuse_errno(errno: i32) -> fuser::Errno {
+    fuser::Errno::from_i32(errno)
+}
+
+fn fuse_ino(ino: u64) -> fuser::INodeNo {
+    fuser::INodeNo(ino)
+}
+
+fn fuse_fh(fh: u64) -> fuser::FileHandle {
+    fuser::FileHandle(fh)
+}
+
+fn fuse_generation(generation: u64) -> fuser::Generation {
+    fuser::Generation(generation)
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Convert InodeAttr to fuser FileAttr.
@@ -842,7 +858,7 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
 
 fn bridge_attr_to_fuse_attr(attr: BridgeFileAttr) -> FileAttr {
     FileAttr {
-        ino: attr.ino,
+        ino: fuse_ino(attr.ino),
         size: attr.size,
         blocks: attr.blocks,
         atime: attr.atime,
@@ -862,14 +878,6 @@ fn bridge_attr_to_fuse_attr(attr: BridgeFileAttr) -> FileAttr {
         blksize: attr.blksize,
         flags: attr.flags,
     }
-}
-
-fn to_u64_offset(offset: i64) -> Result<u64, libc::c_int> {
-    u64::try_from(offset).map_err(|_| libc::EINVAL)
-}
-
-fn clamp_offset_to_usize(offset: i64) -> Result<usize, libc::c_int> {
-    usize::try_from(offset).map_err(|_| libc::EINVAL)
 }
 
 fn fuse_file_type(kind: FileType) -> FuseFileType {
@@ -903,10 +911,10 @@ pub struct StudioFuseFs {
     mount_gid: u32,
     async_write_diagnostics_stop: Arc<AtomicBool>,
     async_write_diagnostics_task: Option<JoinHandle<()>>,
-    next_runtime_stats_fh: u64,
-    runtime_stats_handles: HashMap<u64, Vec<u8>>,
-    next_open_dir_fh: u64,
-    open_dir_handles: HashMap<u64, OpenDirState>,
+    next_runtime_stats_fh: AtomicU64,
+    runtime_stats_handles: Mutex<HashMap<u64, Vec<u8>>>,
+    next_open_dir_fh: AtomicU64,
+    open_dir_handles: Mutex<HashMap<u64, OpenDirState>>,
     fuse_buffer_pool: FuseBufferPool,
 }
 
@@ -1058,10 +1066,10 @@ impl StudioFuseFs {
             mount_gid,
             async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
             async_write_diagnostics_task: None,
-            next_runtime_stats_fh: u64::MAX / 2,
-            runtime_stats_handles: HashMap::new(),
-            next_open_dir_fh: FIRST_FUSE_DIR_FH,
-            open_dir_handles: HashMap::new(),
+            next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
+            runtime_stats_handles: Mutex::new(HashMap::new()),
+            next_open_dir_fh: AtomicU64::new(FIRST_FUSE_DIR_FH),
+            open_dir_handles: Mutex::new(HashMap::new()),
             fuse_buffer_pool: FuseBufferPool::new(
                 options.fuse_max_write_bytes as usize,
                 FUSE_BUFFER_POOL_MAX_BUFFERS,
@@ -1122,10 +1130,10 @@ impl StudioFuseFs {
         }
     }
 
-    fn open_runtime_stats_handle(&mut self) -> u64 {
-        let fh = self.next_runtime_stats_fh;
-        self.next_runtime_stats_fh = self.next_runtime_stats_fh.wrapping_add(1);
+    fn open_runtime_stats_handle(&self) -> u64 {
+        let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
         self.runtime_stats_handles
+            .lock()
             .insert(fh, self.vfs.runtime_stats_file_text().into_bytes());
         fh
     }
@@ -1137,16 +1145,15 @@ impl StudioFuseFs {
         })
     }
 
-    fn open_dir_snapshot(&mut self, ino: u64) -> Result<u64, VfsError> {
+    fn open_dir_snapshot(&self, ino: u64) -> Result<u64, VfsError> {
         let state = self.load_open_dir_state(ino)?;
-        let fh = self.next_open_dir_fh;
-        self.next_open_dir_fh = self.next_open_dir_fh.wrapping_add(1);
-        self.open_dir_handles.insert(fh, state);
+        let fh = self.next_open_dir_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_dir_handles.lock().insert(fh, state);
         Ok(fh)
     }
 
     fn open_dir_state(&self, ino: u64, fh: u64) -> Result<OpenDirState, VfsError> {
-        if let Some(state) = self.open_dir_handles.get(&fh) {
+        if let Some(state) = self.open_dir_handles.lock().get(&fh) {
             return Ok(state.clone());
         }
         if fh != 0 {
@@ -1196,17 +1203,10 @@ impl StudioFuseFs {
         })
     }
 
-    fn read_callback<R>(&self, ino: u64, fh: u64, offset: i64, size: u32, reply: R)
+    fn read_callback<R>(&self, ino: u64, fh: u64, offset: u64, size: u32, reply: R)
     where
         R: FuseDataReply + Send + 'static,
     {
-        let offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
         let requested_size = size as usize;
         if requested_size == 0 {
             reply.data(&[]);
@@ -1252,17 +1252,10 @@ impl StudioFuseFs {
         );
     }
 
-    fn write_callback<R>(&self, ino: u64, fh: u64, offset: i64, data: &[u8], flags: i32, reply: R)
+    fn write_callback<R>(&self, ino: u64, fh: u64, offset: u64, data: &[u8], flags: i32, reply: R)
     where
         R: FuseWriteReply + Send + 'static,
     {
-        let offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
         let callback_started = Instant::now();
         if self.async_write_enabled {
             let data_len = data.len();
@@ -1384,11 +1377,7 @@ impl Drop for StudioFuseFs {
 }
 
 impl Filesystem for StudioFuseFs {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         let requested_max_write = self.fuse_max_write_bytes;
         if let Err(max_supported) = config.set_max_write(requested_max_write) {
             warn!(
@@ -1396,7 +1385,7 @@ impl Filesystem for StudioFuseFs {
                 max_supported, "requested FUSE max_write exceeds kernel-supported limit; clamping"
             );
             if config.set_max_write(max_supported).is_err() {
-                return Err(libc::EINVAL);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             self.fuse_max_write_bytes = max_supported;
         }
@@ -1409,7 +1398,7 @@ impl Filesystem for StudioFuseFs {
                 "requested FUSE max_readahead exceeds kernel-supported limit; clamping"
             );
             if config.set_max_readahead(max_supported).is_err() {
-                return Err(libc::EINVAL);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             self.fuse_max_readahead_bytes = max_supported;
         }
@@ -1424,7 +1413,7 @@ impl Filesystem for StudioFuseFs {
                 "requested FUSE max_background is outside kernel-supported limits; clamping"
             );
             if config.set_max_background(supported_limit).is_err() {
-                return Err(libc::EINVAL);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             self.fuse_background_queue_policy.max_background = Some(supported_limit);
         }
@@ -1437,7 +1426,7 @@ impl Filesystem for StudioFuseFs {
                 "requested FUSE congestion_threshold is outside kernel-supported limits; clamping"
             );
             if config.set_congestion_threshold(supported_limit).is_err() {
-                return Err(libc::EINVAL);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             self.fuse_background_queue_policy.congestion_threshold = Some(supported_limit);
         }
@@ -1452,7 +1441,8 @@ impl Filesystem for StudioFuseFs {
         );
 
         if self.linux_writeback_cache_enabled
-            && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE)
+            && let Err(unsupported) =
+                config.add_capabilities(fuser::InitFlags::FUSE_WRITEBACK_CACHE)
         {
             warn!(
                 ?unsupported,
@@ -1461,7 +1451,7 @@ impl Filesystem for StudioFuseFs {
         }
 
         if self.linux_async_dio_enabled
-            && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
+            && let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_ASYNC_DIO)
         {
             warn!(
                 ?unsupported,
@@ -1472,11 +1462,17 @@ impl Filesystem for StudioFuseFs {
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
+        name: &OsStr,
+        reply: ReplyEntry,
+    ) {
         let name_bytes = os_str_bytes(name);
         if should_hide_linux_root_metadata_entry(parent, name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         let attr_result = self.vfs.lookup(parent, name_bytes);
@@ -1485,16 +1481,22 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
-                0,
+                fuse_generation(0),
             ),
             Err(e) => {
                 debug!("lookup({parent}, {:?}) -> {e}", name);
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        _fh: Option<fuser::FileHandle>,
+        reply: ReplyAttr,
+    ) {
         if self.vfs.is_runtime_stats_file_ino(ino) {
             let attr = self.vfs.runtime_stats_file_attr();
             reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid));
@@ -1504,15 +1506,15 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 debug!("getattr({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn mkdir(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -1521,7 +1523,7 @@ impl Filesystem for StudioFuseFs {
         let name_bytes = os_str_bytes(name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.mkdir(
@@ -1534,7 +1536,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
-                0,
+                fuse_generation(0),
             ),
             Err(e) => {
                 error!(
@@ -1547,15 +1549,15 @@ impl Filesystem for StudioFuseFs {
                     name_bytes = ?name_bytes,
                     "mkdir -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn mknod(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -1565,7 +1567,7 @@ impl Filesystem for StudioFuseFs {
         let name_bytes = os_str_bytes(name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.create(
@@ -1578,19 +1580,19 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
-                0,
+                fuse_generation(0),
             ),
             Err(e) => {
                 error!("mknod({parent}, {:?}) -> {e}", name);
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn create(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -1600,7 +1602,7 @@ impl Filesystem for StudioFuseFs {
         let name_bytes = os_str_bytes(name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.create(
@@ -1618,14 +1620,14 @@ impl Filesystem for StudioFuseFs {
                         reply.created(
                             &TTL,
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
-                            0,
-                            fh,
+                            fuse_generation(0),
+                            fuse_fh(fh),
                             fuse_open_reply_flags(flags, false),
                         );
                     }
                     Err(e) => {
                         error!("create open_file({}) -> {e}", attr.ino);
-                        reply.error(vfs_err_to_errno(&e));
+                        reply.error(fuse_errno(vfs_err_to_errno(&e)));
                     }
                 }
             }
@@ -1641,16 +1643,22 @@ impl Filesystem for StudioFuseFs {
                     name_bytes = ?name_bytes,
                     "create -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         let name_bytes = os_str_bytes(name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.unlink(parent, &name_bytes) {
@@ -1662,16 +1670,22 @@ impl Filesystem for StudioFuseFs {
                     name_bytes = ?name_bytes,
                     "unlink -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         let name_bytes = os_str_bytes(name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.rmdir(parent, &name_bytes) {
@@ -1683,15 +1697,15 @@ impl Filesystem for StudioFuseFs {
                     name_bytes = ?name_bytes,
                     "rmdir -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn symlink(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
         reply: ReplyEntry,
@@ -1699,7 +1713,7 @@ impl Filesystem for StudioFuseFs {
         let name = os_str_bytes(link_name).to_vec();
         if should_hide_linux_root_metadata_entry(parent, &name) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         let tgt = target.as_os_str().as_bytes().to_vec();
@@ -1707,71 +1721,71 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
-                0,
+                fuse_generation(0),
             ),
             Err(e) => {
                 error!("symlink({parent}, {:?}) -> {e}", link_name);
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, fuser::INodeNo(ino): fuser::INodeNo, reply: ReplyData) {
         match self.vfs.readlink(ino) {
             Ok(target) => reply.data(&target),
             Err(e) => {
                 error!("readlink({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn link(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        newparent: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::INodeNo(newparent): fuser::INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
         let name = os_str_bytes(newname).to_vec();
         if should_hide_linux_root_metadata_entry(newparent, &name) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, &name);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         match self.vfs.link(ino, newparent, &name) {
             Ok(attr) => {
                 let fattr = to_fuse_attr(&attr, self.mount_uid, self.mount_gid);
-                reply.entry(&TTL, &fattr, 0);
+                reply.entry(&TTL, &fattr, fuse_generation(0));
             }
             Err(e) => {
                 error!("link({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(parent): fuser::INodeNo,
         name: &OsStr,
-        newparent: u64,
+        fuser::INodeNo(newparent): fuser::INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
         let requested_old_name = os_str_bytes(name);
         let requested_new_name = os_str_bytes(newname);
         if should_hide_linux_root_metadata_entry(parent, requested_old_name) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, parent, requested_old_name);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
         if should_hide_linux_root_metadata_entry(newparent, requested_new_name) {
             heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, requested_new_name);
-            reply.error(libc::ENOENT);
+            reply.error(fuse_errno(libc::ENOENT));
             return;
         }
 
@@ -1784,30 +1798,36 @@ impl Filesystem for StudioFuseFs {
                 error!(
                     parent,
                     newparent,
-                    flags = _flags,
+                    flags = _flags.bits(),
                     requested_old_name = %debug_name(requested_old_name),
                     requested_new_name = %debug_name(requested_new_name),
                     requested_old_name_bytes = ?requested_old_name,
                     requested_new_name_bytes = ?requested_new_name,
                     "rename -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::OpenFlags(flags): fuser::OpenFlags,
+        reply: ReplyOpen,
+    ) {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         if self.vfs.is_runtime_stats_file_ino(ino) {
             if open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
                 || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
                 || trunc
             {
-                reply.error(libc::EROFS);
+                reply.error(fuse_errno(libc::EROFS));
                 return;
             }
             let fh = self.open_runtime_stats_handle();
-            reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
+            reply.opened(fuse_fh(fh), fuser::FopenFlags::FOPEN_DIRECT_IO);
             return;
         }
         match self.vfs.open_file(ino, open_flags, trunc) {
@@ -1819,12 +1839,12 @@ impl Filesystem for StudioFuseFs {
                     posix_flags = flags,
                     ?open_flags,
                     trunc,
-                    reply_flags,
-                    direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
-                    keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
+                    reply_flags = reply_flags.bits(),
+                    direct_io = reply_flags.contains(fuser::FopenFlags::FOPEN_DIRECT_IO),
+                    keep_cache = reply_flags.contains(fuser::FopenFlags::FOPEN_KEEP_CACHE),
                     "selected FUSE open cache policy"
                 );
-                reply.opened(fh, reply_flags);
+                reply.opened(fuse_fh(fh), reply_flags);
             }
             Err(e) => {
                 if matches!(e, VfsError::WouldBlock | VfsError::RemoteContentPending) {
@@ -1832,32 +1852,27 @@ impl Filesystem for StudioFuseFs {
                 } else {
                     error!("open({ino}) -> {e}");
                 }
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let stats_offset = match to_u64_offset(offset) {
-            Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
-                return;
-            }
-        };
+        let stats_offset = offset;
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            let Some(bytes) = self.runtime_stats_handles.get(&fh) else {
-                reply.error(libc::EBADF);
+            let runtime_stats_handles = self.runtime_stats_handles.lock();
+            let Some(bytes) = runtime_stats_handles.get(&fh) else {
+                reply.error(fuse_errno(libc::EBADF));
                 return;
             };
             let Ok(start) = usize::try_from(stats_offset) else {
@@ -1876,26 +1891,26 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: fuser::WriteFlags,
+        fuser::OpenFlags(flags): fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
         self.write_callback(ino, fh, offset, data, flags, reply);
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
         let started = Instant::now();
@@ -1950,11 +1965,11 @@ impl Filesystem for StudioFuseFs {
                 error!(
                     "flush({ino}, fh={fh}) observed pending write error: {errno}; local flush error: {e}"
                 );
-                reply.error(errno);
+                reply.error(fuse_errno(errno));
             }
             (Err(errno), _) => {
                 error!("flush({ino}, fh={fh}) observed pending write error: {errno}");
-                reply.error(errno);
+                reply.error(fuse_errno(errno));
             }
             (Ok(()), Ok(())) => {
                 debug!(
@@ -1971,25 +1986,25 @@ impl Filesystem for StudioFuseFs {
                 } else {
                     error!("flush({ino}) -> {e}");
                 }
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
         let started = Instant::now();
         debug!(ino, fh, "release started");
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            self.runtime_stats_handles.remove(&fh);
+            self.runtime_stats_handles.lock().remove(&fh);
             reply.ok();
             return;
         }
@@ -1997,7 +2012,7 @@ impl Filesystem for StudioFuseFs {
             let barrier = match self.pending_writes.begin_close(ino, fh) {
                 Ok(barrier) => barrier,
                 Err(e) => {
-                    reply.error(write_registration_error_to_errno(e));
+                    reply.error(fuse_errno(write_registration_error_to_errno(e)));
                     return;
                 }
             };
@@ -2055,12 +2070,19 @@ impl Filesystem for StudioFuseFs {
             }
             Err(e) => {
                 error!("release({ino}, fh={fh}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let started = Instant::now();
         debug!(ino, fh, datasync, "fsync started");
         if self.async_write_enabled {
@@ -2121,11 +2143,11 @@ impl Filesystem for StudioFuseFs {
                 error!(
                     "fsync({ino}, fh={fh}) observed pending write error: {errno}; local fsync error: {e}"
                 );
-                reply.error(errno);
+                reply.error(fuse_errno(errno));
             }
             (Err(errno), _) => {
                 error!("fsync({ino}, fh={fh}) observed pending write error: {errno}");
-                reply.error(errno);
+                reply.error(fuse_errno(errno));
             }
             (Ok(()), Ok(())) => {
                 debug!(
@@ -2139,48 +2161,54 @@ impl Filesystem for StudioFuseFs {
             }
             (Ok(()), Err(e)) => {
                 error!("fsync({ino}, fh={fh}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn opendir(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        _flags: fuser::OpenFlags,
+        reply: ReplyOpen,
+    ) {
         match self.open_dir_snapshot(ino) {
-            Ok(fh) => reply.opened(fh, 0),
+            Ok(fh) => reply.opened(fuse_fh(fh), fuser::FopenFlags::empty()),
             Err(e) => {
                 error!("opendir({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let state = match self.open_dir_state(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdir({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
                 return;
             }
         };
 
         // Offset-based iteration (offset 0 = ".", 1 = "..", 2+ = entries)
-        let mut idx = match clamp_offset_to_usize(offset) {
+        let mut idx = match usize::try_from(offset) {
             Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
+            Err(_) => {
+                reply.error(fuse_errno(libc::EINVAL));
                 return;
             }
         };
         if idx == 0 {
-            if reply.add(ino, 1, FuseFileType::Directory, ".") {
+            if reply.add(fuse_ino(ino), 1, FuseFileType::Directory, ".") {
                 reply.ok();
                 return;
             }
@@ -2188,7 +2216,7 @@ impl Filesystem for StudioFuseFs {
         }
         if idx == 1 {
             // Parent (simplified: use same ino)
-            if reply.add(ino, 2, FuseFileType::Directory, "..") {
+            if reply.add(fuse_ino(ino), 2, FuseFileType::Directory, "..") {
                 reply.ok();
                 return;
             }
@@ -2204,14 +2232,19 @@ impl Filesystem for StudioFuseFs {
             let entry_idx = i + 2;
             let ft = fuse_file_type(entry.kind);
             let entry_name = &entry.name;
-            let next_offset = match i64::try_from(entry_idx + 1) {
+            let next_offset = match u64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
-                    reply.error(libc::EOVERFLOW);
+                    reply.error(fuse_errno(libc::EOVERFLOW));
                     return;
                 }
             };
-            if reply.add(entry.ino, next_offset, ft, OsStr::from_bytes(entry_name)) {
+            if reply.add(
+                fuse_ino(entry.ino),
+                next_offset,
+                ft,
+                OsStr::from_bytes(entry_name),
+            ) {
                 break;
             }
         }
@@ -2220,26 +2253,26 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
         let state = match self.open_dir_state(ino, fh) {
             Ok(e) => e,
             Err(e) => {
                 error!("readdirplus({ino}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
                 return;
             }
         };
 
-        let mut idx = match clamp_offset_to_usize(offset) {
+        let mut idx = match usize::try_from(offset) {
             Ok(offset) => offset,
-            Err(errno) => {
-                reply.error(errno);
+            Err(_) => {
+                reply.error(fuse_errno(libc::EINVAL));
                 return;
             }
         };
@@ -2247,7 +2280,7 @@ impl Filesystem for StudioFuseFs {
         // "." entry
         if idx == 0 {
             let dot_attr = to_fuse_attr(&state.dir_attr, self.mount_uid, self.mount_gid);
-            if reply.add(ino, 1, ".", &TTL, &dot_attr, 0) {
+            if reply.add(fuse_ino(ino), 1, ".", &TTL, &dot_attr, fuse_generation(0)) {
                 reply.ok();
                 return;
             }
@@ -2257,7 +2290,14 @@ impl Filesystem for StudioFuseFs {
         // ".." entry
         if idx == 1 {
             let dotdot_attr = to_fuse_attr(&state.dir_attr, self.mount_uid, self.mount_gid);
-            if reply.add(ino, 2, "..", &TTL, &dotdot_attr, 0) {
+            if reply.add(
+                fuse_ino(ino),
+                2,
+                "..",
+                &TTL,
+                &dotdot_attr,
+                fuse_generation(0),
+            ) {
                 reply.ok();
                 return;
             }
@@ -2272,10 +2312,10 @@ impl Filesystem for StudioFuseFs {
                 continue;
             }
             let entry_idx = i + 2;
-            let next_offset = match i64::try_from(entry_idx + 1) {
+            let next_offset = match u64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
-                    reply.error(libc::EOVERFLOW);
+                    reply.error(fuse_errno(libc::EOVERFLOW));
                     return;
                 }
             };
@@ -2293,12 +2333,12 @@ impl Filesystem for StudioFuseFs {
             let fattr = to_fuse_attr(attr, self.mount_uid, self.mount_gid);
             let entry_name = &entry.name;
             if reply.add(
-                entry.ino,
+                fuse_ino(entry.ino),
                 next_offset,
                 OsStr::from_bytes(entry_name),
                 &TTL,
                 &fattr,
-                0,
+                fuse_generation(0),
             ) {
                 break;
             }
@@ -2308,21 +2348,21 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        _flags: fuser::OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.open_dir_handles.remove(&fh);
+        self.open_dir_handles.lock().remove(&fh);
         reply.ok();
     }
 
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -2330,11 +2370,11 @@ impl Filesystem for StudioFuseFs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<fuser::FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         let args = SetattrArgs {
@@ -2358,7 +2398,7 @@ impl Filesystem for StudioFuseFs {
             },
             win_attrs: None,
         };
-        match self.vfs.setattr_with_handle(fh, ino, args) {
+        match self.vfs.setattr_with_handle(fh.map(|fh| fh.0), ino, args) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 error!(
@@ -2375,12 +2415,12 @@ impl Filesystem for StudioFuseFs {
                     flags = ?_flags,
                     "setattr -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: fuser::INodeNo, reply: fuser::ReplyStatfs) {
         match self.vfs.statfs() {
             Ok(st) => reply.statfs(
                 st.blocks, st.bfree, st.bavail, st.files, st.ffree, st.bsize, st.namelen, st.frsize,
@@ -2403,14 +2443,20 @@ impl Filesystem for StudioFuseFs {
     }
 
     // With DefaultPermissions set the kernel already checked mode bits.
-    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
+    fn access(
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _mask: fuser::AccessFlags,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
     fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
         name: &OsStr,
         size: u32,
         reply: ReplyXattr,
@@ -2423,7 +2469,7 @@ impl Filesystem for StudioFuseFs {
                     let data_len = match u32::try_from(val.len()) {
                         Ok(data_len) => data_len,
                         Err(_) => {
-                            reply.error(libc::EOVERFLOW);
+                            reply.error(fuse_errno(libc::EOVERFLOW));
                             return;
                         }
                     };
@@ -2431,11 +2477,11 @@ impl Filesystem for StudioFuseFs {
                 } else if val.len() <= size as usize {
                     reply.data(&val);
                 } else {
-                    reply.error(libc::ERANGE);
+                    reply.error(fuse_errno(libc::ERANGE));
                 }
             }
             Ok(None) => {
-                reply.error(missing_xattr_errno());
+                reply.error(fuse_errno(missing_xattr_errno()));
             }
             Err(e) => {
                 error!(
@@ -2445,15 +2491,15 @@ impl Filesystem for StudioFuseFs {
                     size,
                     "getxattr -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
     fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
         name: &OsStr,
         value: &[u8],
         flags: i32,
@@ -2465,7 +2511,7 @@ impl Filesystem for StudioFuseFs {
         let normalized_flags = match u32::try_from(flags) {
             Ok(normalized_flags) => normalized_flags,
             Err(_) => {
-                reply.error(libc::EINVAL);
+                reply.error(fuse_errno(libc::EINVAL));
                 return;
             }
         };
@@ -2485,7 +2531,7 @@ impl Filesystem for StudioFuseFs {
                         position = _position,
                         "setxattr missing xattr"
                     );
-                    reply.error(missing_xattr_errno());
+                    reply.error(fuse_errno(missing_xattr_errno()));
                     return;
                 }
                 error!(
@@ -2499,12 +2545,18 @@ impl Filesystem for StudioFuseFs {
                     position = _position,
                     "setxattr -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         let key = name.as_encoded_bytes();
 
         match self.vfs.remove_xattr(ino, key) {
@@ -2517,7 +2569,7 @@ impl Filesystem for StudioFuseFs {
                         key_bytes = ?key,
                         "removexattr missing xattr"
                     );
-                    reply.error(missing_xattr_errno());
+                    reply.error(fuse_errno(missing_xattr_errno()));
                     return;
                 }
                 error!(
@@ -2526,12 +2578,18 @@ impl Filesystem for StudioFuseFs {
                     key_bytes = ?key,
                     "removexattr -> {e}"
                 );
-                reply.error(vfs_err_to_errno(&e));
+                reply.error(fuse_errno(vfs_err_to_errno(&e)));
             }
         }
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
         match self.vfs.list_xattrs(ino) {
             Ok(names) => {
                 // xattr list format: null-terminated name strings concatenated
@@ -2543,7 +2601,7 @@ impl Filesystem for StudioFuseFs {
                     let data_len = match u32::try_from(data.len()) {
                         Ok(data_len) => data_len,
                         Err(_) => {
-                            reply.error(libc::EOVERFLOW);
+                            reply.error(fuse_errno(libc::EOVERFLOW));
                             return;
                         }
                     };
@@ -2551,18 +2609,18 @@ impl Filesystem for StudioFuseFs {
                 } else if data.len() <= size as usize {
                     reply.data(&data);
                 } else {
-                    reply.error(libc::ERANGE);
+                    reply.error(fuse_errno(libc::ERANGE));
                 }
             }
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
+            Err(e) => reply.error(fuse_errno(vfs_err_to_errno(&e))),
         }
     }
 
     fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
@@ -2571,11 +2629,11 @@ impl Filesystem for StudioFuseFs {
 
     #[allow(clippy::unnecessary_cast)]
     fn setlk(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        lock_owner: u64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        fuser::LockOwner(lock_owner): fuser::LockOwner,
         _start: u64,
         _end: u64,
         typ: i32,
@@ -2591,22 +2649,22 @@ impl Filesystem for StudioFuseFs {
         } else if typ == libc::F_UNLCK as i32 {
             LockKind::Unlock
         } else {
-            reply.error(libc::EINVAL);
+            reply.error(fuse_errno(libc::EINVAL));
             return;
         };
         match self.rt.block_on(self.vfs.flock(ino, op, lock_owner, sleep)) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
+            Err(e) => reply.error(fuse_errno(vfs_err_to_errno(&e))),
         }
     }
 
     #[allow(clippy::unnecessary_cast)]
     fn getlk(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
         start: u64,
         end: u64,
         _typ: i32,
@@ -2618,12 +2676,12 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        length: i64,
+        &self,
+        _req: &Request,
+        fuser::INodeNo(ino): fuser::INodeNo,
+        fuser::FileHandle(fh): fuser::FileHandle,
+        offset: u64,
+        length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
@@ -2633,24 +2691,10 @@ impl Filesystem for StudioFuseFs {
             // FALLOC_FL_KEEP_SIZE not set → extend size if needed
             match self.vfs.getattr(ino) {
                 Ok(attr) => {
-                    let offset = match to_u64_offset(offset) {
-                        Ok(offset) => offset,
-                        Err(errno) => {
-                            reply.error(errno);
-                            return;
-                        }
-                    };
-                    let length = match u64::try_from(length) {
-                        Ok(length) => length,
-                        Err(_) => {
-                            reply.error(libc::EINVAL);
-                            return;
-                        }
-                    };
                     let new_size = match offset.checked_add(length) {
                         Some(new_size) => new_size,
                         None => {
-                            reply.error(libc::EINVAL);
+                            reply.error(fuse_errno(libc::EINVAL));
                             return;
                         }
                     };
@@ -2661,14 +2705,14 @@ impl Filesystem for StudioFuseFs {
                         };
                         if let Err(e) = self.vfs.setattr_with_handle(Some(fh), ino, args) {
                             error!("fallocate setattr({ino}) -> {e}");
-                            reply.error(vfs_err_to_errno(&e));
+                            reply.error(fuse_errno(vfs_err_to_errno(&e)));
                             return;
                         }
                     }
                 }
                 Err(e) => {
                     error!("fallocate getattr({ino}) -> {e}");
-                    reply.error(vfs_err_to_errno(&e));
+                    reply.error(fuse_errno(vfs_err_to_errno(&e)));
                     return;
                 }
             }
@@ -2713,7 +2757,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 impl FuseKernelInvalidator {
     fn inval_inode_range(&self, ino: u64, offset: i64, len: i64, scope: &'static str) {
-        if let Err(e) = self.notifier.inval_inode(ino, offset, len) {
+        if let Err(e) = self.notifier.inval_inode(fuse_ino(ino), offset, len) {
             // ENOENT is harmless (kernel already evicted the entry).
             if should_log_invalidation_error(&e) {
                 warn!(ino, offset, len, scope, error = %e, "FUSE notify_inval_inode failed");
@@ -3307,15 +3351,24 @@ mod tests {
     fn fuse_open_reply_flags_match_platform_cache_policy() {
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY, false),
-            fuser::consts::FOPEN_KEEP_CACHE
+            fuser::FopenFlags::FOPEN_KEEP_CACHE
         );
-        assert_eq!(fuse_open_reply_flags(libc::O_WRONLY, false), 0);
-        assert_eq!(fuse_open_reply_flags(libc::O_RDWR, false), 0);
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_WRONLY, false),
+            fuser::FopenFlags::empty()
+        );
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDWR, false),
+            fuser::FopenFlags::empty()
+        );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY | libc::O_APPEND, false),
-            0
+            fuser::FopenFlags::empty()
         );
-        assert_eq!(fuse_open_reply_flags(libc::O_RDONLY, true), 0);
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDONLY, true),
+            fuser::FopenFlags::empty()
+        );
     }
 
     #[test]
@@ -3812,7 +3865,7 @@ mod tests {
 
     #[test]
     fn opendir_snapshot_is_reused_after_directory_changes() {
-        let (_tmp, _rt, vfs, mut fs) = make_test_fuse_fs("opendir-snapshot-reuse");
+        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("opendir-snapshot-reuse");
         let first = vfs
             .create(studiofs_meta::ROOT_INO, b"first.txt", 1000, 1000, 0o644)
             .expect("create first file");
@@ -3832,8 +3885,8 @@ mod tests {
             "test setup should make the second file visible to fresh readdir"
         );
 
-        let snapshot = &fs
-            .open_dir_handles
+        let open_dir_handles = fs.open_dir_handles.lock();
+        let snapshot = &open_dir_handles
             .get(&fh)
             .expect("snapshot should remain open")
             .entries;

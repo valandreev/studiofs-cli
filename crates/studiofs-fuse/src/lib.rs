@@ -4,8 +4,8 @@
 //!
 //! # Mount options
 //!
-//! The `STUDIOFS_FUSE_ALLOW_OTHER=1` environment variable enables the
-//! `AllowOther` mount option.
+//! The `STUDIOFS_FUSE_ALLOW_OTHER=1` environment variable enables unrestricted
+//! FUSE session ACLs.
 
 #![cfg(target_os = "linux")]
 
@@ -46,7 +46,7 @@ fn build_mount_options(
     volume_name: &str,
     _foreground: bool,
     read_only: bool,
-) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+) -> Result<fuser::Config, MountOptionError> {
     build_mount_options_with_allow_other(
         volume_name,
         read_only,
@@ -58,19 +58,22 @@ fn build_mount_options_with_allow_other(
     volume_name: &str,
     read_only: bool,
     allow_other_env: bool,
-) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+) -> Result<fuser::Config, MountOptionError> {
     validate_volume_name(volume_name)?;
-    let mut options = vec![fuser::MountOption::FSName(volume_name.into())];
+    let mut config = fuser::Config::default();
+    config
+        .mount_options
+        .push(fuser::MountOption::FSName(volume_name.into()));
     // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
     // attached until the external watchdog sends SIGKILL. Let Mount::drop use
     // the explicit lazy fusermount/umount path instead.
     if allow_other_env {
-        options.push(fuser::MountOption::AllowOther);
+        config.acl = fuser::SessionACL::All;
     }
     if read_only {
-        options.push(fuser::MountOption::RO);
+        config.mount_options.push(fuser::MountOption::RO);
     }
-    Ok(options)
+    Ok(config)
 }
 
 // ─── Signal Handling ─────────────────────────────────────────────────────────
@@ -229,12 +232,21 @@ fn signal_handlers_for_policy(
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
     handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
 impl SignalWatcher {
     fn restore_handlers(&self) {
         let _ = lock_signal_handlers(&self.handlers).take();
+    }
+
+    fn join(mut self) -> std::io::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("signal watcher thread panicked"))?
     }
 }
 
@@ -249,11 +261,11 @@ impl Drop for SignalWatcher {
 }
 
 /// Spawn a background thread that watches for SIGINT/SIGTERM and triggers
-/// an in-process unmount so `fuser::Session::run` returns cleanly and
+/// an in-process unmount so the FUSE background session returns cleanly and
 /// the VFS shutdown/drain logic can execute.
 fn spawn_signal_watcher(
     mount_point: String,
-    mut unmount: fuser::SessionUnmounter,
+    background: fuser::BackgroundSession,
     signal_handling: SignalHandling,
     unmount_signal: Option<FuseUnmountSignal>,
 ) -> std::io::Result<SignalWatcher> {
@@ -266,21 +278,24 @@ fn spawn_signal_watcher(
         .name("signal-watcher".into())
         .spawn(move || {
             // Poll the atomic flag until a signal arrives.
-            while !watcher_stop.load(Ordering::Acquire)
-                && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-                && !unmount_signal
-                    .as_ref()
-                    .is_some_and(FuseUnmountSignal::is_requested)
-            {
+            while !watcher_stop.load(Ordering::Acquire) {
+                if background.guard.is_finished() {
+                    let _ = lock_signal_handlers(&watcher_handlers).take();
+                    return background.join();
+                }
+                if SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                    || unmount_signal
+                        .as_ref()
+                        .is_some_and(FuseUnmountSignal::is_requested)
+                {
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                    tracing::info!("received shutdown request, unmounting {mp} …");
+                    let _ = lock_signal_handlers(&watcher_handlers).take();
+                    return background.umount_and_join();
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if watcher_stop.load(Ordering::Acquire) {
-                return;
-            }
-            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-            tracing::info!("received shutdown request, unmounting {mp} …");
-            let _ = lock_signal_handlers(&watcher_handlers).take();
-            let _ = unmount.unmount();
+            Ok(())
         })?;
     Ok(SignalWatcher {
         stop,
@@ -338,7 +353,7 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
     // would see the mounting user as "other" (r-x only) and block writes.
     // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let options = build_mount_options(&volume_name, foreground, read_only)
+    let config = build_mount_options(&volume_name, foreground, read_only)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let shutdown_hint = match signal_handling {
         SignalHandling::Disabled => "unmount through the host lifecycle",
@@ -346,42 +361,29 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
     };
     tracing::info!("mounting StudioFS at {mount_point}, {shutdown_hint}");
 
-    // Use Session::new + run() instead of fuser::mount2 so we can obtain a
+    // Use Session::new + spawn() instead of fuser::mount2 so we can obtain a
     // Notifier. The notifier allows VFS metadata refresh paths to
     // proactively clear the kernel FUSE dentry/attribute cache, making remote
     // creates/deletes visible immediately without waiting for TTL expiry.
-    let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
-    let unmount = session.unmount_callable();
+    let session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &config)?;
+    let notifier = session.notifier();
+    let background = session.spawn()?;
     let signal_watcher = spawn_signal_watcher(
         mount_point.clone(),
-        unmount,
+        background,
         signal_handling,
         unmount_signal,
     )?;
-    let notifier = session.notifier();
 
     // Register the kernel cache invalidator with the VFS.
     let invalidator = std::sync::Arc::new(FuseKernelInvalidator::new(notifier));
     vfs.set_kernel_invalidator(invalidator);
 
-    session.run()?;
-    drop(signal_watcher);
+    signal_watcher.join()?;
 
-    // Session::run returns when the filesystem is unmounted.
+    // BackgroundSession::join returns when the filesystem is unmounted.
     vfs.clear_kernel_invalidator();
     tracing::info!("unmounted, finalizing FUSE session cleanup …");
-    // If we arrived here without SIGINT/SIGTERM, the mount point was most
-    // likely detached externally. In that case skip dropping the session object
-    // to avoid a second unmount attempt during Drop.
-    let requested_shutdown = SHUTDOWN_REQUESTED.load(Ordering::Acquire);
-    if requested_shutdown {
-        // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard
-        // exit. Without this, low-level resources can remain partially alive
-        // and abort on process shutdown.
-        drop(session);
-    } else {
-        std::mem::forget(session);
-    }
     tracing::info!("shutdown complete");
     Ok(())
 }
@@ -427,10 +429,8 @@ mod tests {
         }
     }
 
-    fn mount_options_include_allow_other(options: &[fuser::MountOption]) -> bool {
-        options
-            .iter()
-            .any(|opt| matches!(opt, fuser::MountOption::AllowOther))
+    fn mount_config_allows_other(config: &fuser::Config) -> bool {
+        config.acl == fuser::SessionACL::All
     }
 
     #[test]
@@ -448,20 +448,22 @@ mod tests {
 
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
-        let options =
+        let config =
             build_mount_options_with_allow_other("studiofs", false, false).expect("options");
         assert!(
-            options
+            config
+                .mount_options
                 .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::FSName(name) if name == "studiofs"))
         );
         assert!(
-            !options
+            !config
+                .mount_options
                 .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::AutoUnmount))
         );
-        assert!(!mount_options_include_allow_other(&options));
-        assert!(!options.iter().any(
+        assert!(!mount_config_allows_other(&config));
+        assert!(!config.mount_options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
     }
@@ -553,17 +555,17 @@ mod tests {
 
     #[test]
     fn build_mount_options_adds_allow_other_when_opted_in() {
-        let options =
+        let config =
             build_mount_options_with_allow_other("studiofs", false, true).expect("options");
-        assert!(mount_options_include_allow_other(&options));
+        assert!(mount_config_allows_other(&config));
     }
 
     #[test]
     fn build_mount_options_foreground_not_added() {
         // On Linux, fusermount3 does not accept 'foreground' as a mount option.
-        // fuser keeps the process in the foreground via session.run() itself.
-        let options = build_mount_options("studiofs", true, false).expect("options");
-        assert!(!options.iter().any(
+        // fuser keeps the process in the foreground through the background session join.
+        let config = build_mount_options("studiofs", true, false).expect("options");
+        assert!(!config.mount_options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
     }
