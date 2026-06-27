@@ -1006,7 +1006,7 @@ mod tests {
         assert_eq!(validated.writer_page_size, None);
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
-            validated.upload_worker_count, 20,
+            validated.upload_worker_count, DEFAULT_UPLOAD_WORKER_COUNT,
             "validation should materialize upload worker default"
         );
         assert_eq!(
