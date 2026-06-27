@@ -61,6 +61,11 @@ fn build_mount_options_with_allow_other(
 ) -> Result<fuser::Config, MountOptionError> {
     validate_volume_name(volume_name)?;
     let mut config = fuser::Config::default();
+    #[cfg(target_os = "linux")]
+    {
+        config.n_threads = Some(4);
+        config.clone_fd = true;
+    }
     config
         .mount_options
         .push(fuser::MountOption::FSName(volume_name.into()));
@@ -466,6 +471,16 @@ mod tests {
         assert!(!config.mount_options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mount_options_use_parallel_fuser_dispatch() {
+        let config =
+            build_mount_options_with_allow_other("studiofs", false, false).expect("options");
+
+        assert_eq!(config.n_threads, Some(4));
+        assert!(config.clone_fd);
     }
 
     #[test]

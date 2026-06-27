@@ -6516,8 +6516,20 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
         DEFAULT_PREFETCH_CONCURRENCY_MIN
     );
     assert_eq!(validated.slab_flush_interval_ms, 1);
-    assert_eq!(validated.upload_worker_count, 20);
+    assert_eq!(validated.upload_worker_count, DEFAULT_UPLOAD_WORKER_COUNT);
     assert_eq!(validated.principal, "*");
+}
+
+#[test]
+fn vfs_config_raw_validate_preserves_explicit_upload_worker_count() {
+    let validated = VfsConfigRaw {
+        upload_worker_count: Some(20),
+        ..Default::default()
+    }
+    .validate()
+    .expect("validate explicit upload worker count");
+
+    assert_eq!(validated.upload_worker_count, 20);
 }
 
 #[test]
@@ -11718,6 +11730,16 @@ fn release_fh_materializes_sparse_cross_chunk_tail_before_size_extend() {
             "cross-chunk sparse payload must be materialized before size-only extend: {spans:?}"
         );
     });
+}
+
+#[test]
+fn deferred_materialization_linger_matches_juicefs_scale() {
+    assert!(
+        Duration::from_millis(
+            DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
+                * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
+        ) >= Duration::from_secs(1)
+    );
 }
 
 #[test]
