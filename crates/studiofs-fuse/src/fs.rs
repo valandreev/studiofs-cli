@@ -37,7 +37,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 
 const TTL: Duration = Duration::from_secs(1);
-const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
@@ -3262,7 +3262,7 @@ mod tests {
 
     #[test]
     fn default_fuse_max_write_matches_platform_expectation() {
-        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
     }
 
     #[test]
