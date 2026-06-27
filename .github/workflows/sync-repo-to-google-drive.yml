@@ -49,7 +49,7 @@ jobs:
 
       - name: Sync repository files to Google Drive
         run: |
-          rclone sync . gdrive:/current \
+          rclone sync . gdrive:/repo-cli \
             --exclude ".git/**" \
             --exclude "target/**" \
             --exclude "node_modules/**" \
