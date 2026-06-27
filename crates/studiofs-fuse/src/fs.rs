@@ -846,7 +846,7 @@ fn fs_ioc_getflags_reply_data(
     cmd: u32,
     in_data: &[u8],
     out_size: u32,
-) -> Result<Option<[u8; 4]>, fuser::Errno> {
+) -> Result<Option<Vec<u8>>, fuser::Errno> {
     let is_getflags = cmd == libc::FS_IOC_GETFLAGS as u32 || cmd == libc::FS_IOC32_GETFLAGS as u32;
     if !is_getflags {
         return Ok(None);
@@ -854,7 +854,7 @@ fn fs_ioc_getflags_reply_data(
     if !in_data.is_empty() || out_size < u32::BITS / 8 {
         return Err(fuser::Errno::EINVAL);
     }
-    Ok(Some(0u32.to_ne_bytes()))
+    Ok(Some(vec![0; out_size as usize]))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -3257,7 +3257,16 @@ mod tests {
             .expect("valid FS_IOC_GETFLAGS")
             .expect("handled ioctl");
 
-        assert_eq!(u32::from_ne_bytes(data), 0);
+        assert_eq!(data, vec![0; 4]);
+    }
+
+    #[test]
+    fn fs_ioc_getflags_ioctl_honors_64_bit_out_size() {
+        let data = fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, &[], 8)
+            .expect("valid FS_IOC_GETFLAGS")
+            .expect("handled ioctl");
+
+        assert_eq!(data, vec![0; 8]);
     }
 
     #[test]
