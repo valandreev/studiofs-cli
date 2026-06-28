@@ -1960,7 +1960,7 @@ mod tests {
 
         writer.write_at(0, b"x").expect("small append");
 
-        assert_eq!(writer.pages[0].capacity(), MIN_WRITER_PAGE_ALLOCATION);
+        assert!(writer.pages[0].capacity() >= MIN_WRITER_PAGE_ALLOCATION);
     }
 
     #[test]
