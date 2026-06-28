@@ -103,62 +103,6 @@ impl LinuxFuseProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FuseIoSizePolicy {
-    max_write_bytes: u32,
-    max_readahead_bytes: u32,
-}
-
-impl FuseIoSizePolicy {
-    fn platform_default_for_profile(profile: LinuxFuseProfile) -> Self {
-        match profile {
-            LinuxFuseProfile::Conservative => Self {
-                max_write_bytes: DEFAULT_FUSE_MAX_WRITE_BYTES,
-                max_readahead_bytes: DEFAULT_FUSE_MAX_READAHEAD_BYTES,
-            },
-            LinuxFuseProfile::HighThroughput => Self {
-                max_write_bytes: HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
-                max_readahead_bytes: HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
-            },
-        }
-    }
-
-    fn from_env_for_profile(profile: LinuxFuseProfile) -> Self {
-        let defaults = Self::platform_default_for_profile(profile);
-        Self {
-            max_write_bytes: parse_bridge_u32_env(
-                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
-                defaults.max_write_bytes,
-            ),
-            max_readahead_bytes: parse_bridge_u32_env(
-                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
-                defaults.max_readahead_bytes,
-            ),
-        }
-    }
-
-    #[cfg(test)]
-    fn from_env_values_for_profile(
-        profile: LinuxFuseProfile,
-        max_write: Option<&str>,
-        max_readahead: Option<&str>,
-    ) -> Self {
-        let defaults = Self::platform_default_for_profile(profile);
-        Self {
-            max_write_bytes: parse_bridge_u32_env_value(
-                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
-                max_write,
-                defaults.max_write_bytes,
-            ),
-            max_readahead_bytes: parse_bridge_u32_env_value(
-                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
-                max_readahead,
-                defaults.max_readahead_bytes,
-            ),
-        }
-    }
-}
-
 #[derive(Clone)]
 struct OpenDirState {
     dir_attr: studiofs_meta::InodeAttr,
@@ -1078,11 +1022,26 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
-        let io_size_policy = FuseIoSizePolicy::from_env_for_profile(profile);
+        let (default_max_write_bytes, default_max_readahead_bytes) = match profile {
+            LinuxFuseProfile::Conservative => (
+                DEFAULT_FUSE_MAX_WRITE_BYTES,
+                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            ),
+            LinuxFuseProfile::HighThroughput => (
+                HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+                HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+            ),
+        };
         Self {
             linux_fuse_profile: profile,
-            fuse_max_write_bytes: io_size_policy.max_write_bytes,
-            fuse_max_readahead_bytes: io_size_policy.max_readahead_bytes,
+            fuse_max_write_bytes: parse_bridge_u32_env(
+                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+                default_max_write_bytes,
+            ),
+            fuse_max_readahead_bytes: parse_bridge_u32_env(
+                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+                default_max_readahead_bytes,
+            ),
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: should_enable_async_fuse_write_from_env(),
@@ -2883,9 +2842,8 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
-        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseIoSizePolicy, FuseWriteReplyGuard,
-        HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES, HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
-        LinuxFuseProfile, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
+        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
         fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
@@ -3308,57 +3266,6 @@ mod tests {
     #[test]
     fn default_fuse_max_readahead_matches_platform_expectation() {
         assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 128 * 1024);
-    }
-
-    #[test]
-    fn high_throughput_fuse_io_size_policy_uses_large_callbacks_by_default() {
-        let policy = FuseIoSizePolicy::from_env_values_for_profile(
-            LinuxFuseProfile::HighThroughput,
-            None,
-            None,
-        );
-
-        assert_eq!(
-            policy,
-            FuseIoSizePolicy {
-                max_write_bytes: HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
-                max_readahead_bytes: HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
-            }
-        );
-    }
-
-    #[test]
-    fn conservative_fuse_io_size_policy_keeps_legacy_callbacks() {
-        let policy = FuseIoSizePolicy::from_env_values_for_profile(
-            LinuxFuseProfile::Conservative,
-            None,
-            None,
-        );
-
-        assert_eq!(
-            policy,
-            FuseIoSizePolicy {
-                max_write_bytes: DEFAULT_FUSE_MAX_WRITE_BYTES,
-                max_readahead_bytes: DEFAULT_FUSE_MAX_READAHEAD_BYTES,
-            }
-        );
-    }
-
-    #[test]
-    fn explicit_fuse_io_size_env_overrides_profile_defaults() {
-        let policy = FuseIoSizePolicy::from_env_values_for_profile(
-            LinuxFuseProfile::HighThroughput,
-            Some("1048576"),
-            Some("524288"),
-        );
-
-        assert_eq!(
-            policy,
-            FuseIoSizePolicy {
-                max_write_bytes: 1024 * 1024,
-                max_readahead_bytes: 512 * 1024,
-            }
-        );
     }
 
     #[test]
