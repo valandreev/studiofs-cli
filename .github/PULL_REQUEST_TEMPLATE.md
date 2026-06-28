@@ -1,6 +1,6 @@
 ## Summary
 
-<!-- What does this PR do? Why? Link related Linear issues (e.g. SFS-XXX). -->
+<!-- What does this PR do? Why? -->
 
 ## Changes
 
