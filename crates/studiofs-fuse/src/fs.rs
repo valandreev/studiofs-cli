@@ -493,7 +493,7 @@ fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
 }
 
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.map_or(true, should_enable_async_fuse_write_from_env_value)
+    raw.is_none_or(should_enable_async_fuse_write_from_env_value)
 }
 
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {

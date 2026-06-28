@@ -1235,6 +1235,7 @@ impl StudioVfs {
         self.create_with_metadata_flush(parent, name, uid, gid, mode, true)
     }
 
+    /// Create a regular file without forcing a foreground metadata flush.
     pub fn create_deferred_metadata_flush(
         &self,
         parent: Ino,

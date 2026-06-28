@@ -804,6 +804,7 @@ impl StudioVfs {
         result
     }
 
+    /// Start deferred FUSE writeback materialization and report local dirty state.
     pub async fn flush_fuse_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
