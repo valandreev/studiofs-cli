@@ -26,6 +26,7 @@ use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 /// Stable identifier for cached payload objects.
 pub type ObjectId = u64;
 const DEFAULT_WRITER_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const MIN_WRITER_PAGE_ALLOCATION: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 /// Configuration for opening a [`CachedStore`].
@@ -1251,9 +1252,11 @@ impl CachedStoreWriterSlice {
                 .back()
                 .is_none_or(|page| page.len() >= self.config.page_size)
             {
-                self.pages.push_back(BytesMut::with_capacity(
-                    data.len().min(self.config.page_size),
-                ));
+                let capacity = self
+                    .config
+                    .page_size
+                    .min(data.len().max(MIN_WRITER_PAGE_ALLOCATION));
+                self.pages.push_back(BytesMut::with_capacity(capacity));
             }
             #[expect(
                 clippy::expect_used,
@@ -1944,6 +1947,20 @@ mod tests {
         let mut out = [0_u8; 12];
         assert_eq!(writer.read_accepted(0, &mut out), out.len());
         assert_eq!(&out, b"abcdEFghijkl");
+    }
+
+    #[test]
+    fn writer_slice_small_append_preallocates_minimum_page_capacity() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.block_size = 1024 * 1024;
+        config.page_size = 1024 * 1024;
+        let mut writer = cached_store.open_writer_slice(config);
+
+        writer.write_at(0, b"x").expect("small append");
+
+        assert_eq!(writer.pages[0].capacity(), MIN_WRITER_PAGE_ALLOCATION);
     }
 
     #[test]

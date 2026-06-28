@@ -155,11 +155,10 @@ impl FuseBufferPool {
         Vec::with_capacity(len.max(self.default_capacity))
     }
 
-    fn put(&self, mut buffer: Vec<u8>) {
+    fn put(&self, buffer: Vec<u8>) {
         if self.max_buffers == 0 || buffer.capacity() > self.max_retained_capacity {
             return;
         }
-        buffer.resize(buffer.capacity(), 0);
         let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
@@ -339,8 +338,26 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
-    let raw = std::env::var(key).ok();
-    parse_bridge_u32_env_value(key, raw.as_deref(), default)
+    parse_bridge_u32_env_result(key, std::env::var(key), default)
+}
+
+fn parse_bridge_u32_env_result(
+    key: &str,
+    raw: Result<String, std::env::VarError>,
+    default: u32,
+) -> u32 {
+    match raw {
+        Ok(raw) => parse_bridge_u32_env_value(key, Some(&raw), default),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(
+                env_key = key,
+                fallback_value = default,
+                "bridge tuning override is not valid Unicode; using default"
+            );
+            default
+        }
+    }
 }
 
 fn parse_bridge_u32_env_value(key: &str, raw: Option<&str>, default: u32) -> u32 {
@@ -2847,7 +2864,7 @@ mod tests {
         PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
         fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
+        parse_bridge_u32_env_result, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
         resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
         should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
@@ -3027,7 +3044,7 @@ mod tests {
         pool.put(first);
         let buffers = pool.inner.lock();
         let stored = &buffers[0];
-        assert_eq!(stored.len(), stored.capacity());
+        assert_eq!(stored.len(), 1024);
         drop(buffers);
 
         let second = pool.take_initialized(2048);
@@ -3354,6 +3371,18 @@ mod tests {
         assert_eq!(
             LinuxFuseProfile::from_env_value(Some("turbo")),
             LinuxFuseProfile::Conservative
+        );
+    }
+
+    #[test]
+    fn bridge_u32_env_not_unicode_falls_back_to_default() {
+        let raw = Err(std::env::VarError::NotUnicode(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]),
+        ));
+
+        assert_eq!(
+            parse_bridge_u32_env_result("TEST_BRIDGE_U32", raw, 128),
+            128
         );
     }
 
