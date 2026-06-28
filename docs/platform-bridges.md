@@ -186,7 +186,7 @@ Current signature includes additional policy controls:
 | Kernel `max_background` | macOS: `50` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `128`. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `96`. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
 | FUSE async write replies | macOS: enabled by default. Linux: enabled by default; disable with `STUDIOFS_FUSE_ASYNC_WRITE=0` |
-| FUSE async read replies | Linux: enabled by default; disable with `STUDIOFS_FUSE_ASYNC_READ=0` |
+| FUSE async read replies | Linux: direct reads by default; opt in with `STUDIOFS_FUSE_ASYNC_READ=1` |
 | Linux: `writeback_cache` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_WRITEBACK_CACHE=1`; requested only when the kernel advertises `FUSE_WRITEBACK_CACHE` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
@@ -237,7 +237,7 @@ runs. The default Linux write callback copies caller bytes into owned buffers,
 admits writes on runtime tasks, and keeps staging, barriers, and upload
 lifecycle in the shared VFS writer stack.
 
-`STUDIOFS_FUSE_ASYNC_READ=0` disables the Linux bridge read reply path. It moves
+`STUDIOFS_FUSE_ASYNC_READ=1` enables the Linux bridge read reply path. It moves
 regular file reads from the FUSE callback stack onto the mount runtime while
 keeping runtime stats file reads synchronous.
 

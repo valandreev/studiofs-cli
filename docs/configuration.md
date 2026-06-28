@@ -176,7 +176,7 @@ Notes:
 - AIMD fetch/upload windows reset to their initial window after an idle gap by default. Advanced tuning can set `fetch_idle_reset_secs` and `upload_idle_reset_secs` independently; `0` disables idle reset for that traffic class.
 - On Windows and Linux, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
 - `STUDIOFS_FUSE_ASYNC_WRITE` controls the Linux bridge-owned async write queue. Linux enables it by default; set `STUDIOFS_FUSE_ASYNC_WRITE=0` for targeted synchronous A/B or profiling runs. Async mode copies each FUSE write buffer into owned memory, admits writes on Tokio tasks, serializes writes per file handle before entering the VFS, and keeps `flush`, `fsync`, and `release` behind pending-write barriers.
-- `STUDIOFS_FUSE_ASYNC_READ` controls the Linux bridge-owned async read reply path. Linux enables it by default; set `STUDIOFS_FUSE_ASYNC_READ=0` for targeted synchronous A/B or profiling runs.
+- `STUDIOFS_FUSE_ASYNC_READ` controls the Linux bridge-owned async read reply path. Linux uses direct reads by default; set `STUDIOFS_FUSE_ASYNC_READ=1` for targeted async-read A/B or profiling runs.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

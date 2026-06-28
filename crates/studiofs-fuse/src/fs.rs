@@ -129,6 +129,8 @@ impl FuseBufferPool {
 
     fn take_initialized(&self, len: usize) -> Vec<u8> {
         let mut buffer = self.take(len);
+        // SAFETY: FUSE replies only expose the byte count returned by VFS, and
+        // VFS read assembly zero-pads holes and short local reads before return.
         if buffer.len() > len {
             buffer.truncate(len);
         } else {
