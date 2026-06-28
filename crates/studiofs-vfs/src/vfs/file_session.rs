@@ -199,7 +199,7 @@ impl FileSessionOperation {
     }
 
     fn shared_lock(self) -> bool {
-        matches!(self, Self::Read | Self::Finalize)
+        matches!(self, Self::Read | Self::Materialize | Self::Finalize)
     }
 
     fn index(self) -> usize {

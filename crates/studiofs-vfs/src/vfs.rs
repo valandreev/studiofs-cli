@@ -719,9 +719,6 @@ const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_UPLOAD_IDLE_RESET_SECS: u64 = 60;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-#[cfg(target_os = "linux")]
-const DEFAULT_UPLOAD_WORKER_COUNT: usize = 1;
-#[cfg(not(target_os = "linux"))]
 const DEFAULT_UPLOAD_WORKER_COUNT: usize = 20;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 4;
@@ -5036,9 +5033,14 @@ impl StudioVfs {
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
+        let mut debug_inos = HashSet::new();
         for (op, _) in pending_uploads {
             pending_evictions.remove(&op.object_id);
-            self.debug_pending_inode_state(op.ino, "pending_upload_canceled");
+            debug_inos.insert(op.ino);
+        }
+        drop(pending_evictions);
+        for ino in debug_inos {
+            self.debug_pending_inode_state(ino, "pending_upload_canceled");
         }
     }
 

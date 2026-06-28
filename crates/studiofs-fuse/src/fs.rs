@@ -39,6 +39,8 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -60,7 +62,7 @@ const FUSE_BUFFER_POOL_MAX_BUFFERS: usize = 16;
 pub enum LinuxFuseProfile {
     /// Keep current conservative Linux FUSE defaults.
     Conservative,
-    /// Opt-in profile for high-throughput Linux write-path tuning.
+    /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
 }
 
@@ -72,10 +74,12 @@ impl LinuxFuseProfile {
 
     fn from_env_value(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
-            return Self::Conservative;
+            return Self::HighThroughput;
         };
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("conservative") {
+        if trimmed.is_empty() {
+            Self::HighThroughput
+        } else if trimmed.eq_ignore_ascii_case("conservative") {
             Self::Conservative
         } else if trimmed.eq_ignore_ascii_case("high-throughput")
             || trimmed.eq_ignore_ascii_case("high_throughput")
@@ -123,14 +127,21 @@ impl FuseBufferPool {
         }
     }
 
-    fn take_zeroed(&self, len: usize) -> Vec<u8> {
+    fn take_initialized(&self, len: usize) -> Vec<u8> {
         let mut buffer = self.take(len);
-        buffer.resize(len, 0);
+        // SAFETY: FUSE replies only expose the byte count returned by VFS, and
+        // VFS read assembly zero-pads holes and short local reads before return.
+        if buffer.len() > len {
+            buffer.truncate(len);
+        } else {
+            buffer.resize(len, 0);
+        }
         buffer
     }
 
     fn take_with_bytes(&self, data: &[u8]) -> Vec<u8> {
         let mut buffer = self.take(data.len());
+        buffer.clear();
         buffer.extend_from_slice(data);
         buffer
     }
@@ -138,7 +149,6 @@ impl FuseBufferPool {
     fn take(&self, len: usize) -> Vec<u8> {
         let mut buffers = self.inner.lock();
         if let Some(mut buffer) = buffers.pop() {
-            buffer.clear();
             if buffer.capacity() < len {
                 buffer.reserve(len);
             }
@@ -147,11 +157,10 @@ impl FuseBufferPool {
         Vec::with_capacity(len.max(self.default_capacity))
     }
 
-    fn put(&self, mut buffer: Vec<u8>) {
+    fn put(&self, buffer: Vec<u8>) {
         if self.max_buffers == 0 || buffer.capacity() > self.max_retained_capacity {
             return;
         }
-        buffer.clear();
         let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
@@ -331,33 +340,54 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
-    match std::env::var(key) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            match trimmed.parse::<u32>() {
-                Ok(value) if value > 0 => value,
-                Ok(_) => {
-                    warn!(
-                        env_key = key,
-                        env_value = trimmed,
-                        fallback_value = default,
-                        "bridge tuning override must be > 0; using default"
-                    );
-                    default
-                }
-                Err(error) => {
-                    warn!(
-                        env_key = key,
-                        env_value = trimmed,
-                        fallback_value = default,
-                        error = %error,
-                        "invalid bridge tuning override; using default"
-                    );
-                    default
-                }
-            }
+    parse_bridge_u32_env_result(key, std::env::var(key), default)
+}
+
+fn parse_bridge_u32_env_result(
+    key: &str,
+    raw: Result<String, std::env::VarError>,
+    default: u32,
+) -> u32 {
+    match raw {
+        Ok(raw) => parse_bridge_u32_env_value(key, Some(&raw), default),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(
+                env_key = key,
+                fallback_value = default,
+                "bridge tuning override is not valid Unicode; using default"
+            );
+            default
         }
-        Err(_) => default,
+    }
+}
+
+fn parse_bridge_u32_env_value(key: &str, raw: Option<&str>, default: u32) -> u32 {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(value) if value > 0 => value,
+        Ok(_) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = default,
+                "bridge tuning override must be > 0; using default"
+            );
+            default
+        }
+        Err(error) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = default,
+                error = %error,
+                "invalid bridge tuning override; using default"
+            );
+            default
+        }
     }
 }
 
@@ -463,7 +493,7 @@ fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
 }
 
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(should_enable_async_fuse_write_from_env_value)
+    raw.is_none_or(should_enable_async_fuse_write_from_env_value)
 }
 
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
@@ -1015,15 +1045,25 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
+        let (default_max_write_bytes, default_max_readahead_bytes) = match profile {
+            LinuxFuseProfile::Conservative => (
+                DEFAULT_FUSE_MAX_WRITE_BYTES,
+                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            ),
+            LinuxFuseProfile::HighThroughput => (
+                HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+                HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+            ),
+        };
         Self {
             linux_fuse_profile: profile,
             fuse_max_write_bytes: parse_bridge_u32_env(
                 "STUDIOFS_FUSE_MAX_WRITE_BYTES",
-                DEFAULT_FUSE_MAX_WRITE_BYTES,
+                default_max_write_bytes,
             ),
             fuse_max_readahead_bytes: parse_bridge_u32_env(
                 "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
-                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+                default_max_readahead_bytes,
             ),
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
@@ -1093,10 +1133,6 @@ impl StudioFuseFs {
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
-            warn!(
-                linux_fuse_profile = fs.linux_fuse_profile.label(),
-                "experimental async FUSE write bridge queue enabled"
-            );
             fs.async_write_diagnostics_task = Some(fs.spawn_async_write_diagnostics_publisher());
         }
         debug!(
@@ -1230,7 +1266,7 @@ impl StudioFuseFs {
 
         // fuser's ReplyData API accepts an immutable reply slice instead of
         // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
-        let mut out = self.fuse_buffer_pool.take_zeroed(requested_size);
+        let mut out = self.fuse_buffer_pool.take_initialized(requested_size);
         let callback_started = Instant::now();
         if self.async_read_enabled {
             let vfs = Arc::clone(&self.vfs);
@@ -1585,7 +1621,7 @@ impl Filesystem for StudioFuseFs {
             reply.error(fuse_errno(libc::ENOENT));
             return;
         }
-        match self.vfs.create(
+        match self.vfs.create_deferred_metadata_flush(
             parent,
             &name_bytes,
             req.uid(),
@@ -1620,7 +1656,7 @@ impl Filesystem for StudioFuseFs {
             reply.error(fuse_errno(libc::ENOENT));
             return;
         }
-        match self.vfs.create(
+        match self.vfs.create_deferred_metadata_flush(
             parent,
             &name_bytes,
             req.uid(),
@@ -1956,11 +1992,10 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
-                let result = if fh != 0 {
-                    vfs.flush_fh(fh).await
-                } else {
-                    vfs.flush(ino).await
-                };
+                let result = vfs
+                    .flush_fuse_writeback_with_outcome(ino, fh)
+                    .await
+                    .map(|_| ());
                 if pending_result.is_ok() && result.is_ok() {
                     debug!(
                         ino,
@@ -2035,6 +2070,7 @@ impl Filesystem for StudioFuseFs {
             let pending_writes = self.pending_writes.clone();
             let admission_limits = self.async_write_admission_policy.limits;
             let diagnostics = self.fuse_diagnostics();
+            let rt_handle = self.rt.clone();
             let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -2052,7 +2088,8 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
-                let release_result = vfs.release_fh(fh).await;
+                vfs.release_fh_with_deferred_last_handle_barrier(fh, &rt_handle);
+                let release_result = Ok(());
                 close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
                     debug!(
@@ -2829,7 +2866,7 @@ mod tests {
         PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
         fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
+        parse_bridge_u32_env_result, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
         resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
         should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
@@ -2988,27 +3025,31 @@ mod tests {
     }
 
     #[test]
-    fn fuse_buffer_pool_reuses_cleared_buffers() {
+    fn fuse_buffer_pool_reuses_initialized_buffers_without_zeroing_prefix() {
         let pool = FuseBufferPool::new(4096, 1, 4096);
-        let mut first = pool.take_zeroed(1024);
+        let mut first = pool.take_initialized(1024);
         first[0] = 7;
         let initial_capacity = first.capacity();
         pool.put(first);
 
-        let second = pool.take_zeroed(512);
+        let second = pool.take_initialized(512);
 
         assert_eq!(second.len(), 512);
-        assert_eq!(second[0], 0);
+        assert_eq!(second[0], 7);
         assert_eq!(second.capacity(), initial_capacity);
     }
 
     #[test]
     fn fuse_buffer_pool_expands_reused_buffers_to_requested_len() {
         let pool = FuseBufferPool::new(1, 1, 4096);
-        let first = pool.take_zeroed(1024);
+        let first = pool.take_initialized(1024);
         pool.put(first);
+        let buffers = pool.inner.lock();
+        let stored = &buffers[0];
+        assert_eq!(stored.len(), 1024);
+        drop(buffers);
 
-        let second = pool.take_zeroed(2048);
+        let second = pool.take_initialized(2048);
 
         assert_eq!(second.len(), 2048);
         assert!(second.capacity() >= 2048);
@@ -3018,11 +3059,11 @@ mod tests {
     fn fuse_buffer_pool_retains_runtime_sized_buffers() {
         let runtime_max = (DEFAULT_FUSE_MAX_WRITE_BYTES as usize) * 2;
         let pool = FuseBufferPool::new(runtime_max, 1, runtime_max);
-        let first = pool.take_zeroed(runtime_max);
+        let first = pool.take_initialized(runtime_max);
         let initial_capacity = first.capacity();
         pool.put(first);
 
-        let second = pool.take_zeroed(1024);
+        let second = pool.take_initialized(1024);
 
         assert_eq!(second.capacity(), initial_capacity);
     }
@@ -3111,10 +3152,18 @@ mod tests {
     }
 
     #[test]
-    fn default_linux_write_callback_routes_directly_to_vfs() {
-        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("default-write-route");
+    fn sync_write_callback_routes_directly_to_vfs_when_async_disabled() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("sync-write-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
         let attr = vfs
-            .create(1, b"default-write-route.txt", 0, 0, 0o644)
+            .create(1, b"sync-write-route.txt", 0, 0, 0o644)
             .expect("create test file");
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -3178,9 +3227,17 @@ mod tests {
     }
 
     #[test]
-    fn default_linux_read_callback_routes_directly_to_vfs() {
-        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("default-read-route");
-        let (ino, fh) = create_readable_test_file(&rt, &vfs, b"default-read-route.txt", b"abcdef");
+    fn sync_read_callback_routes_directly_to_vfs_when_async_disabled() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("sync-read-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_read_enabled: false,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let (ino, fh) = create_readable_test_file(&rt, &vfs, b"sync-read-route.txt", b"abcdef");
         let reply = TestDataReply::default();
 
         fs.read_callback(ino, fh, 1, 3, reply.clone());
@@ -3222,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn high_throughput_linux_fuse_profile_keeps_async_read_opt_in() {
+    fn linux_fuse_profile_uses_direct_read_by_default() {
         assert!(!resolve_async_fuse_read_enabled(None));
         assert!(!resolve_async_fuse_read_enabled(Some("false")));
         assert!(should_enable_async_fuse_read_from_env_value("true"));
@@ -3291,7 +3348,11 @@ mod tests {
     fn linux_fuse_profile_parser_accepts_supported_values() {
         assert_eq!(
             LinuxFuseProfile::from_env_value(None),
-            LinuxFuseProfile::Conservative
+            LinuxFuseProfile::HighThroughput
+        );
+        assert_eq!(
+            LinuxFuseProfile::from_env_value(Some("")),
+            LinuxFuseProfile::HighThroughput
         );
         assert_eq!(
             LinuxFuseProfile::from_env_value(Some("conservative")),
@@ -3312,6 +3373,18 @@ mod tests {
         assert_eq!(
             LinuxFuseProfile::from_env_value(Some("turbo")),
             LinuxFuseProfile::Conservative
+        );
+    }
+
+    #[test]
+    fn bridge_u32_env_not_unicode_falls_back_to_default() {
+        let raw = Err(std::env::VarError::NotUnicode(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]),
+        ));
+
+        assert_eq!(
+            parse_bridge_u32_env_result("TEST_BRIDGE_U32", raw, 128),
+            128
         );
     }
 
@@ -3498,13 +3571,13 @@ mod tests {
     }
 
     #[test]
-    fn async_fuse_write_default_profile_is_disabled_when_env_unset() {
-        assert!(!resolve_async_fuse_write_enabled(None));
+    fn async_fuse_write_default_profile_is_enabled_when_env_unset() {
+        assert!(resolve_async_fuse_write_enabled(None));
     }
 
     #[test]
-    fn high_throughput_linux_fuse_profile_keeps_async_write_opt_in() {
-        assert!(!resolve_async_fuse_write_enabled(None));
+    fn linux_fuse_profile_enables_async_write_by_default() {
+        assert!(resolve_async_fuse_write_enabled(None));
         assert!(resolve_async_fuse_write_enabled(Some("true")));
     }
 

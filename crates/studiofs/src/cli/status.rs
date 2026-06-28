@@ -1031,7 +1031,7 @@ mod tests {
             enabled: true,
             linux_fuse_profile: "high-throughput".into(),
             fuse_max_write_bytes: 16 * 1024 * 1024,
-            fuse_max_readahead_bytes: 16 * 1024 * 1024,
+            fuse_max_readahead_bytes: 128 * 1024,
             fuse_max_background: Some(128),
             fuse_congestion_threshold: Some(96),
             max_pending_bytes: Some(128 * 1024 * 1024),

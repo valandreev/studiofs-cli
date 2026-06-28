@@ -174,6 +174,40 @@ fn read_into_fh_clamps_to_remaining_file_size() {
 }
 
 #[test]
+fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"read-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, attr.ino, 0, b"dirty-overlay")
+            .await
+            .unwrap();
+
+        let _materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let mut out = [0; 13];
+        let read = tokio::time::timeout(Duration::from_millis(100), async {
+            vfs.read_into_fh(fh, attr.ino, 0, &mut out).await
+        })
+        .await
+        .expect("foreground read should not queue behind background materialization")
+        .expect("dirty overlay read should succeed");
+
+        assert_eq!(read as usize, out.len());
+        assert_eq!(&out, b"dirty-overlay");
+        drop(_materialize);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");
@@ -2703,6 +2737,7 @@ fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
             "expected tail payload publication, got status {} with attr {:?}",
             match status {
                 super::commit::EpochFinalizeStatus::Published => "published",
+                super::commit::EpochFinalizeStatus::WaitingForUploads => "waiting_uploads",
                 super::commit::EpochFinalizeStatus::Deferred => "deferred",
                 super::commit::EpochFinalizeStatus::Skipped => "skipped",
             },
@@ -5290,6 +5325,9 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
         .expect("finalize metadata-only grow");
         match status {
             super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::WaitingForUploads => {
+                panic!("metadata-only grow unexpectedly waited for uploads")
+            }
             super::commit::EpochFinalizeStatus::Deferred => {
                 panic!("metadata-only grow unexpectedly deferred")
             }
@@ -5491,6 +5529,9 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
         .expect("finalize sparse shrink");
         match status {
             super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::WaitingForUploads => {
+                panic!("sparse shrink unexpectedly waited for uploads")
+            }
             super::commit::EpochFinalizeStatus::Deferred => {
                 panic!("sparse shrink unexpectedly deferred")
             }
@@ -5556,6 +5597,47 @@ fn writer_stack_object_reservation_counts_only_current_write() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn epoch_finalizer_waits_for_pending_upload_completion_without_retrying() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-waiting-uploads");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-waiting-uploads.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = vec![0xCAu8; vfs.block_size as usize];
+        vfs.write(attr.ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(attr.ino).await.expect("flush slice-graph epoch");
+
+        let pending_attr = meta
+            .get_attr(attr.ino)
+            .expect("load pending-upload epoch attr");
+        assert!(
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "setup must leave an uploaded extent in the local pending queue"
+        );
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            pending_attr.content_epoch,
+        )
+        .await
+        .expect("finalize should observe pending uploads as a normal wait state");
+        assert!(
+            matches!(
+                status,
+                super::commit::EpochFinalizeStatus::WaitingForUploads
+            ),
+            "pending uploads should not use the timed deferred retry path"
+        );
+    });
 }
 
 #[test]
@@ -12529,7 +12611,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         enabled: true,
         linux_fuse_profile: "high-throughput".into(),
         fuse_max_write_bytes: 16 * 1024 * 1024,
-        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
         max_pending_bytes: Some(128 * 1024 * 1024),
@@ -12579,7 +12661,7 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         linux_fuse_profile: "high-throughput".into(),
         fuse_max_write_bytes: 16 * 1024 * 1024,
-        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
         ..Default::default()
@@ -12598,7 +12680,7 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
     );
     assert_eq!(
         snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
-        16 * 1024 * 1024
+        128 * 1024
     );
 }
 

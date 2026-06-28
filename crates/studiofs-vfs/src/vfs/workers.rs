@@ -268,6 +268,13 @@ impl StudioVfs {
                         "published",
                     );
                 }
+                Ok(commit::EpochFinalizeStatus::WaitingForUploads) => {
+                    self.state.file_session.note_background_transition(
+                        ino,
+                        FileSessionOperation::Finalize,
+                        "waiting_uploads",
+                    );
+                }
                 Ok(commit::EpochFinalizeStatus::Skipped) => {
                     self.state.file_session.note_background_transition(
                         ino,

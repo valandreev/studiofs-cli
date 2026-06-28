@@ -18,9 +18,6 @@ impl<'a> FuseHandleDrainFacade<'a> {
     }
 
     pub(super) fn flush(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        if fh != 0 {
-            return self.fs.rt.block_on(self.fs.vfs.flush_fh(fh));
-        }
         self.barrier().on_flush(HandleDrainRequest { ino, fh })
     }
 
@@ -80,15 +77,11 @@ impl LocalSyncBarrierPort for FuseLocalSyncBarrierPort<'_> {
         &self,
         request: HandleDrainRequest,
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
-        if request.fh != 0 {
+        self.fs.rt.block_on(
             self.fs
-                .rt
-                .block_on(self.fs.vfs.flush_fh_with_outcome(request.fh))
-        } else {
-            self.fs
-                .rt
-                .block_on(self.fs.vfs.flush_with_outcome(request.ino))
-        }
+                .vfs
+                .flush_fuse_writeback_with_outcome(request.ino, request.fh),
+        )
     }
 }
 
@@ -97,9 +90,10 @@ impl HandleReleasePort for FuseHandleReleasePort<'_> {
         &self,
         request: HandleDrainRequest,
     ) -> studiofs_vfs::VfsResult<ReleaseFhOutcome> {
-        self.fs
-            .rt
-            .block_on(self.fs.vfs.release_fh_with_outcome(request.fh))
+        Ok(self
+            .fs
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(request.fh, &self.fs.rt))
     }
 }
 
@@ -183,8 +177,9 @@ impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
 #[cfg(test)]
 mod tests {
     use super::super::tests::make_test_fuse_fs;
-    use super::FuseHandleDrainFacade;
+    use super::{FuseHandleDrainFacade, FuseHandleReleasePort};
     use studiofs_meta::ROOT_INO;
+    use studiofs_vfs::HandleReleasePort;
     use studiofs_vfs::OpenFlags;
 
     #[test]
@@ -208,6 +203,49 @@ mod tests {
 
         let data = rt.block_on(vfs.read(ino, 0, 5)).expect("read data");
         assert_eq!(data.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn fuse_handle_drain_flush_defers_dirty_state_without_foreground_sync_data() {
+        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("flush-fh-opportunistic");
+        let created = vfs
+            .create(ROOT_INO, b"flush-fh-opportunistic.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file handle");
+
+        rt.block_on(vfs.write_fh(fh, ino, 0, b"hello"))
+            .expect("write via handle");
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "FUSE bridge flush precondition should have dirty local state"
+        );
+        let sync_calls_before = vfs
+            .write_path_observability_snapshot()
+            .payload_store_sync_data
+            .calls;
+
+        FuseHandleDrainFacade::new(&fs)
+            .flush(ino, fh)
+            .expect("handle-backed flush should succeed");
+
+        let sync_calls_after = vfs
+            .write_path_observability_snapshot()
+            .payload_store_sync_data
+            .calls;
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "FUSE bridge flush should leave dirty state for background release/materialization"
+        );
+        assert_eq!(
+            sync_calls_after, sync_calls_before,
+            "FUSE bridge flush should not force foreground sync_data"
+        );
+
+        rt.block_on(vfs.release_fh(fh))
+            .expect("release file handle");
     }
 
     #[test]
@@ -247,5 +285,69 @@ mod tests {
 
         let data = rt.block_on(vfs.read(ino, 0, 7)).expect("read data");
         assert_eq!(data.as_ref(), b"release");
+    }
+
+    #[test]
+    fn fuse_dirty_release_uses_deferred_last_handle_fast_path() {
+        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("dirty-release-fast-path");
+        let created = vfs
+            .create(ROOT_INO, b"dirty-release-fast-path.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file handle");
+        rt.block_on(vfs.write_fh(fh, ino, 0, b"dirty"))
+            .expect("write via handle");
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "release precondition should be dirty"
+        );
+        let before = vfs.file_session_stats();
+
+        let outcome = FuseHandleReleasePort { fs: &fs }
+            .release_handle(studiofs_vfs::HandleDrainRequest { ino, fh })
+            .expect("dirty release should succeed");
+
+        let after = vfs.file_session_stats();
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+        assert!(
+            after.transitions <= before.transitions + 5,
+            "dirty FUSE release should schedule the deferred release barrier, not run it foreground"
+        );
+    }
+
+    #[test]
+    fn fuse_clean_release_uses_deferred_last_handle_fast_path() {
+        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("clean-release-fast-path");
+        let created = vfs
+            .create(ROOT_INO, b"clean-release-fast-path.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file handle");
+        rt.block_on(vfs.write_fh(fh, ino, 0, b"clean"))
+            .expect("write via handle");
+        rt.block_on(vfs.fsync(ino, false))
+            .expect("fsync should clean local dirty state");
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "release precondition should be clean after fsync"
+        );
+        let before = vfs.file_session_stats();
+
+        let outcome = FuseHandleReleasePort { fs: &fs }
+            .release_handle(studiofs_vfs::HandleDrainRequest { ino, fh })
+            .expect("clean release should succeed");
+
+        let after = vfs.file_session_stats();
+        assert!(outcome.closed_last_handle);
+        assert!(!outcome.flushed_local_dirty_state);
+        assert!(
+            after.transitions <= before.transitions + 5,
+            "clean FUSE release should use the deferred fast path, not the full release session"
+        );
     }
 }

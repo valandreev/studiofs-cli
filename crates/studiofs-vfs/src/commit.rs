@@ -5,6 +5,7 @@ pub(super) struct CommitCoordinator;
 
 pub(super) enum EpochFinalizeStatus {
     Published,
+    WaitingForUploads,
     Deferred,
     Skipped,
 }
@@ -49,6 +50,14 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
+        if vfs.inode_has_pending_uploads(ino) {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                "waiting for pending uploads before epoch publication"
+            );
+            return Ok(EpochFinalizeStatus::WaitingForUploads);
+        }
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             return Ok(EpochFinalizeStatus::Deferred);
         }
@@ -149,6 +158,16 @@ impl CommitCoordinator {
             drop(finalize_session);
             vfs.state.file_session.gc_if_idle(ino);
             return Ok(EpochFinalizeStatus::Deferred);
+        }
+        if vfs.inode_has_pending_uploads(ino) {
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
+            tracing::debug!(
+                ino,
+                content_epoch,
+                "waiting for pending uploads before epoch publication after finalization gate"
+            );
+            return Ok(EpochFinalizeStatus::WaitingForUploads);
         }
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             drop(finalize_session);

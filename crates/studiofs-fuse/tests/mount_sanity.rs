@@ -142,13 +142,13 @@ declare_mounted_scenarios! {
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::WriteOnlyUntilUnmount
     },
-    linux_async_mounted_default_sync => {
-        name: "linux-default-sync",
+    linux_async_mounted_sync_override => {
+        name: "linux-sync-override",
         mode: MountedFuseMode::Sync,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
-    linux_async_mounted_async_opt_in => {
-        name: "linux-async-opt-in",
+    linux_async_mounted_async_default => {
+        name: "linux-async-default",
         mode: MountedFuseMode::AsyncWrite,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
@@ -165,7 +165,7 @@ declare_mounted_scenarios! {
 }
 
 #[test]
-fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() {
+fn async_mounted_test_matrix_covers_correctness_and_platform_default_scenarios() {
     let scenarios = mounted_async_scenarios();
     let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
     let modes: BTreeSet<_> = scenarios
@@ -180,8 +180,8 @@ fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() 
         "close-reopen-readback",
         "multiple-writers",
         "same-handle-appends",
-        "linux-default-sync",
-        "linux-async-opt-in",
+        "linux-sync-override",
+        "linux-async-default",
         "linux-async-dio-opt-in",
         "linux-fio-multi-job",
         "unmount-after-async-write",
