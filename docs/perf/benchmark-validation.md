@@ -145,9 +145,9 @@ tools for mounted StudioFS volumes.
 ## Linux High-Throughput FUSE Profile Gate
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` is the permanent Linux tuning
-profile while it remains opt-in. Capture its evidence under
+profile. Capture its evidence under
 `target/perf/linux-high-throughput/` and compare it against the conservative
-profile before folding additional knobs into the profile or making it default.
+profile before folding additional knobs into the profile.
 
 Run at least three conservative and three high-throughput mounted runs with the
 same machine, mount point, cache disk, metadata disk, object store, PostgreSQL

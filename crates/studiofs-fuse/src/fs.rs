@@ -40,7 +40,7 @@ const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
-const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -1114,10 +1114,6 @@ impl StudioFuseFs {
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
-            warn!(
-                linux_fuse_profile = fs.linux_fuse_profile.label(),
-                "experimental async FUSE write bridge queue enabled"
-            );
             fs.async_write_diagnostics_task = Some(fs.spawn_async_write_diagnostics_publisher());
         }
         debug!(

@@ -12611,7 +12611,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         enabled: true,
         linux_fuse_profile: "high-throughput".into(),
         fuse_max_write_bytes: 16 * 1024 * 1024,
-        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
         max_pending_bytes: Some(128 * 1024 * 1024),
@@ -12661,7 +12661,7 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         linux_fuse_profile: "high-throughput".into(),
         fuse_max_write_bytes: 16 * 1024 * 1024,
-        fuse_max_readahead_bytes: 16 * 1024 * 1024,
+        fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
         ..Default::default()
@@ -12680,7 +12680,7 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
     );
     assert_eq!(
         snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
-        16 * 1024 * 1024
+        128 * 1024
     );
 }
 

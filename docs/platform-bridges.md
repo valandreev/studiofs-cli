@@ -197,9 +197,7 @@ Current signature includes additional policy controls:
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
 high-throughput tuning profile. It keeps `max_write` and `max_readahead` at the
 Linux default 128 KiB unless explicitly overridden, and sets
-`max_background=128` plus `congestion_threshold=96`. The profile is opt-in
-until mounted benchmark evidence and correctness gates justify making it the
-Linux default.
+`max_background=128` plus `congestion_threshold=96`. This is the Linux default.
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
 `STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
