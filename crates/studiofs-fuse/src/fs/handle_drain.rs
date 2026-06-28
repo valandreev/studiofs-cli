@@ -97,9 +97,16 @@ impl HandleReleasePort for FuseHandleReleasePort<'_> {
         &self,
         request: HandleDrainRequest,
     ) -> studiofs_vfs::VfsResult<ReleaseFhOutcome> {
-        self.fs
-            .rt
-            .block_on(self.fs.vfs.release_fh_with_outcome(request.fh))
+        if self.fs.vfs.inode_has_local_dirty_state(request.ino) {
+            self.fs
+                .rt
+                .block_on(self.fs.vfs.release_fh_with_outcome(request.fh))
+        } else {
+            Ok(self
+                .fs
+                .vfs
+                .release_fh_with_deferred_last_handle_barrier(request.fh, &self.fs.rt))
+        }
     }
 }
 
@@ -183,8 +190,9 @@ impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
 #[cfg(test)]
 mod tests {
     use super::super::tests::make_test_fuse_fs;
-    use super::FuseHandleDrainFacade;
+    use super::{FuseHandleDrainFacade, FuseHandleReleasePort};
     use studiofs_meta::ROOT_INO;
+    use studiofs_vfs::HandleReleasePort;
     use studiofs_vfs::OpenFlags;
 
     #[test]
@@ -247,5 +255,39 @@ mod tests {
 
         let data = rt.block_on(vfs.read(ino, 0, 7)).expect("read data");
         assert_eq!(data.as_ref(), b"release");
+    }
+
+    #[test]
+    fn fuse_clean_release_uses_deferred_last_handle_fast_path() {
+        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("clean-release-fast-path");
+        let created = vfs
+            .create(ROOT_INO, b"clean-release-fast-path.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file handle");
+        rt.block_on(vfs.write_fh(fh, ino, 0, b"clean"))
+            .expect("write via handle");
+        FuseHandleDrainFacade::new(&fs)
+            .flush(ino, fh)
+            .expect("flush should clean local dirty state");
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "release precondition should be clean after flush"
+        );
+        let before = vfs.file_session_stats();
+
+        let outcome = FuseHandleReleasePort { fs: &fs }
+            .release_handle(studiofs_vfs::HandleDrainRequest { ino, fh })
+            .expect("clean release should succeed");
+
+        let after = vfs.file_session_stats();
+        assert!(outcome.closed_last_handle);
+        assert!(!outcome.flushed_local_dirty_state);
+        assert!(
+            after.transitions <= before.transitions + 5,
+            "clean FUSE release should use the deferred fast path, not the full release session"
+        );
     }
 }

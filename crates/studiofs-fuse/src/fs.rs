@@ -470,11 +470,11 @@ fn should_enable_async_fuse_read_from_env_value(raw: &str) -> bool {
 }
 
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(should_enable_async_fuse_write_from_env_value)
+    raw.map_or(true, should_enable_async_fuse_write_from_env_value)
 }
 
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(should_enable_async_fuse_read_from_env_value)
+    raw.map_or(true, should_enable_async_fuse_read_from_env_value)
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
@@ -2052,6 +2052,7 @@ impl Filesystem for StudioFuseFs {
             let pending_writes = self.pending_writes.clone();
             let admission_limits = self.async_write_admission_policy.limits;
             let diagnostics = self.fuse_diagnostics();
+            let rt_handle = self.rt.clone();
             let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -2069,7 +2070,12 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
-                let release_result = vfs.release_fh(fh).await;
+                let release_result = if vfs.inode_has_local_dirty_state(ino) {
+                    vfs.release_fh(fh).await
+                } else {
+                    vfs.release_fh_with_deferred_last_handle_barrier(fh, &rt_handle);
+                    Ok(())
+                };
                 close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
                     debug!(
@@ -3128,10 +3134,18 @@ mod tests {
     }
 
     #[test]
-    fn default_linux_write_callback_routes_directly_to_vfs() {
-        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("default-write-route");
+    fn sync_write_callback_routes_directly_to_vfs_when_async_disabled() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("sync-write-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
         let attr = vfs
-            .create(1, b"default-write-route.txt", 0, 0, 0o644)
+            .create(1, b"sync-write-route.txt", 0, 0, 0o644)
             .expect("create test file");
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -3195,9 +3209,17 @@ mod tests {
     }
 
     #[test]
-    fn default_linux_read_callback_routes_directly_to_vfs() {
-        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("default-read-route");
-        let (ino, fh) = create_readable_test_file(&rt, &vfs, b"default-read-route.txt", b"abcdef");
+    fn sync_read_callback_routes_directly_to_vfs_when_async_disabled() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("sync-read-route");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_read_enabled: false,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let (ino, fh) = create_readable_test_file(&rt, &vfs, b"sync-read-route.txt", b"abcdef");
         let reply = TestDataReply::default();
 
         fs.read_callback(ino, fh, 1, 3, reply.clone());
@@ -3239,8 +3261,8 @@ mod tests {
     }
 
     #[test]
-    fn high_throughput_linux_fuse_profile_keeps_async_read_opt_in() {
-        assert!(!resolve_async_fuse_read_enabled(None));
+    fn linux_fuse_profile_enables_async_read_by_default() {
+        assert!(resolve_async_fuse_read_enabled(None));
         assert!(!resolve_async_fuse_read_enabled(Some("false")));
         assert!(should_enable_async_fuse_read_from_env_value("true"));
         assert!(resolve_async_fuse_read_enabled(Some("true")));
@@ -3519,13 +3541,13 @@ mod tests {
     }
 
     #[test]
-    fn async_fuse_write_default_profile_is_disabled_when_env_unset() {
-        assert!(!resolve_async_fuse_write_enabled(None));
+    fn async_fuse_write_default_profile_is_enabled_when_env_unset() {
+        assert!(resolve_async_fuse_write_enabled(None));
     }
 
     #[test]
-    fn high_throughput_linux_fuse_profile_keeps_async_write_opt_in() {
-        assert!(!resolve_async_fuse_write_enabled(None));
+    fn linux_fuse_profile_enables_async_write_by_default() {
+        assert!(resolve_async_fuse_write_enabled(None));
         assert!(resolve_async_fuse_write_enabled(Some("true")));
     }
 
