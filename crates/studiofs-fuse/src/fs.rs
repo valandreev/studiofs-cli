@@ -159,7 +159,7 @@ impl FuseBufferPool {
         if self.max_buffers == 0 || buffer.capacity() > self.max_retained_capacity {
             return;
         }
-        buffer.truncate(buffer.capacity().min(self.max_retained_capacity));
+        buffer.resize(buffer.capacity(), 0);
         let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
@@ -3025,6 +3025,10 @@ mod tests {
         let pool = FuseBufferPool::new(1, 1, 4096);
         let first = pool.take_initialized(1024);
         pool.put(first);
+        let buffers = pool.inner.lock();
+        let stored = &buffers[0];
+        assert_eq!(stored.len(), stored.capacity());
+        drop(buffers);
 
         let second = pool.take_initialized(2048);
 
