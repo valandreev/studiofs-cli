@@ -39,6 +39,8 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -60,7 +62,7 @@ const FUSE_BUFFER_POOL_MAX_BUFFERS: usize = 16;
 pub enum LinuxFuseProfile {
     /// Keep current conservative Linux FUSE defaults.
     Conservative,
-    /// Opt-in profile for high-throughput Linux write-path tuning.
+    /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
 }
 
@@ -72,10 +74,12 @@ impl LinuxFuseProfile {
 
     fn from_env_value(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
-            return Self::Conservative;
+            return Self::HighThroughput;
         };
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("conservative") {
+        if trimmed.is_empty() {
+            Self::HighThroughput
+        } else if trimmed.eq_ignore_ascii_case("conservative") {
             Self::Conservative
         } else if trimmed.eq_ignore_ascii_case("high-throughput")
             || trimmed.eq_ignore_ascii_case("high_throughput")
@@ -95,6 +99,62 @@ impl LinuxFuseProfile {
         match self {
             Self::Conservative => "conservative",
             Self::HighThroughput => "high-throughput",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuseIoSizePolicy {
+    max_write_bytes: u32,
+    max_readahead_bytes: u32,
+}
+
+impl FuseIoSizePolicy {
+    fn platform_default_for_profile(profile: LinuxFuseProfile) -> Self {
+        match profile {
+            LinuxFuseProfile::Conservative => Self {
+                max_write_bytes: DEFAULT_FUSE_MAX_WRITE_BYTES,
+                max_readahead_bytes: DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            },
+            LinuxFuseProfile::HighThroughput => Self {
+                max_write_bytes: HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+                max_readahead_bytes: HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+            },
+        }
+    }
+
+    fn from_env_for_profile(profile: LinuxFuseProfile) -> Self {
+        let defaults = Self::platform_default_for_profile(profile);
+        Self {
+            max_write_bytes: parse_bridge_u32_env(
+                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+                defaults.max_write_bytes,
+            ),
+            max_readahead_bytes: parse_bridge_u32_env(
+                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+                defaults.max_readahead_bytes,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_env_values_for_profile(
+        profile: LinuxFuseProfile,
+        max_write: Option<&str>,
+        max_readahead: Option<&str>,
+    ) -> Self {
+        let defaults = Self::platform_default_for_profile(profile);
+        Self {
+            max_write_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+                max_write,
+                defaults.max_write_bytes,
+            ),
+            max_readahead_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+                max_readahead,
+                defaults.max_readahead_bytes,
+            ),
         }
     }
 }
@@ -331,33 +391,36 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
-    match std::env::var(key) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            match trimmed.parse::<u32>() {
-                Ok(value) if value > 0 => value,
-                Ok(_) => {
-                    warn!(
-                        env_key = key,
-                        env_value = trimmed,
-                        fallback_value = default,
-                        "bridge tuning override must be > 0; using default"
-                    );
-                    default
-                }
-                Err(error) => {
-                    warn!(
-                        env_key = key,
-                        env_value = trimmed,
-                        fallback_value = default,
-                        error = %error,
-                        "invalid bridge tuning override; using default"
-                    );
-                    default
-                }
-            }
+    let raw = std::env::var(key).ok();
+    parse_bridge_u32_env_value(key, raw.as_deref(), default)
+}
+
+fn parse_bridge_u32_env_value(key: &str, raw: Option<&str>, default: u32) -> u32 {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(value) if value > 0 => value,
+        Ok(_) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = default,
+                "bridge tuning override must be > 0; using default"
+            );
+            default
         }
-        Err(_) => default,
+        Err(error) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = default,
+                error = %error,
+                "invalid bridge tuning override; using default"
+            );
+            default
+        }
     }
 }
 
@@ -1015,16 +1078,11 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
+        let io_size_policy = FuseIoSizePolicy::from_env_for_profile(profile);
         Self {
             linux_fuse_profile: profile,
-            fuse_max_write_bytes: parse_bridge_u32_env(
-                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
-                DEFAULT_FUSE_MAX_WRITE_BYTES,
-            ),
-            fuse_max_readahead_bytes: parse_bridge_u32_env(
-                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
-                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
-            ),
+            fuse_max_write_bytes: io_size_policy.max_write_bytes,
+            fuse_max_readahead_bytes: io_size_policy.max_readahead_bytes,
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: should_enable_async_fuse_write_from_env(),
@@ -2825,8 +2883,9 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
-        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
-        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseIoSizePolicy, FuseWriteReplyGuard,
+        HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES, HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+        LinuxFuseProfile, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
         fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
@@ -3252,6 +3311,57 @@ mod tests {
     }
 
     #[test]
+    fn high_throughput_fuse_io_size_policy_uses_large_callbacks_by_default() {
+        let policy = FuseIoSizePolicy::from_env_values_for_profile(
+            LinuxFuseProfile::HighThroughput,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            policy,
+            FuseIoSizePolicy {
+                max_write_bytes: HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+                max_readahead_bytes: HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn conservative_fuse_io_size_policy_keeps_legacy_callbacks() {
+        let policy = FuseIoSizePolicy::from_env_values_for_profile(
+            LinuxFuseProfile::Conservative,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            policy,
+            FuseIoSizePolicy {
+                max_write_bytes: DEFAULT_FUSE_MAX_WRITE_BYTES,
+                max_readahead_bytes: DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_fuse_io_size_env_overrides_profile_defaults() {
+        let policy = FuseIoSizePolicy::from_env_values_for_profile(
+            LinuxFuseProfile::HighThroughput,
+            Some("1048576"),
+            Some("524288"),
+        );
+
+        assert_eq!(
+            policy,
+            FuseIoSizePolicy {
+                max_write_bytes: 1024 * 1024,
+                max_readahead_bytes: 512 * 1024,
+            }
+        );
+    }
+
+    #[test]
     fn fs_ioc_getflags_ioctl_returns_empty_linux_inode_flags() {
         let data = fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, &[], 4)
             .expect("valid FS_IOC_GETFLAGS")
@@ -3291,7 +3401,11 @@ mod tests {
     fn linux_fuse_profile_parser_accepts_supported_values() {
         assert_eq!(
             LinuxFuseProfile::from_env_value(None),
-            LinuxFuseProfile::Conservative
+            LinuxFuseProfile::HighThroughput
+        );
+        assert_eq!(
+            LinuxFuseProfile::from_env_value(Some("")),
+            LinuxFuseProfile::HighThroughput
         );
         assert_eq!(
             LinuxFuseProfile::from_env_value(Some("conservative")),

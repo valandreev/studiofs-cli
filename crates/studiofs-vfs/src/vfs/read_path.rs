@@ -1233,11 +1233,8 @@ impl<'a> ReadMetadataResolver<'a> {
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
-        let dirty_attr_cacheable = dirty_attr_present
-            && !self
-                .vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino)
-            && !self.vfs.inode_has_dirty_writer_stack(self.ino);
+        let dirty_attr_cacheable =
+            dirty_attr_present && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
@@ -2593,6 +2590,54 @@ mod tests {
     }
 
     #[test]
+    fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_with_pending_local_payloads() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "read-metadata-pending-local-plan-cache");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"pending-local-read-plan-cache.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x52_u8; 512 * 1024];
+
+            vfs.write_with_local_sync_policy(ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+                .await
+                .expect("write payload");
+
+            assert!(
+                vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "setup should keep local payloads pending materialization"
+            );
+            assert!(
+                !vfs.inode_has_dirty_writer_stack(ino),
+                "flushed payloads should not leave active writer-stack state"
+            );
+
+            let (_, first_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve first read");
+            let (_, second_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve second read");
+
+            assert!(
+                Arc::ptr_eq(&first_slices, &second_slices),
+                "dirty attrs with pending local payloads should reuse the widened slice plan"
+            );
+        });
+    }
+
+    #[test]
     fn ready_remote_attr_supersedes_matching_local_dirty_read_state() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
@@ -2989,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_local_dirty_exists() {
+    fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_exists() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) =
             make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache-bypass");
@@ -3049,14 +3094,14 @@ mod tests {
                 .pending_bytes
                 .fetch_add(64 * 1024, AtomicOrdering::Relaxed);
 
-            let (_, bypassed_slices) = vfs
+            let (_, local_dirty_slices) = vfs
                 .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
                 .await
                 .expect("resolve while local dirty state is active");
 
             assert!(
-                !Arc::ptr_eq(&cached_slices, &bypassed_slices),
-                "active local dirty payloads must bypass the dirty-attr read-plan cache"
+                Arc::ptr_eq(&cached_slices, &local_dirty_slices),
+                "active local dirty payloads should reuse the dirty-attr read-plan cache"
             );
         });
     }

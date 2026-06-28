@@ -5036,9 +5036,14 @@ impl StudioVfs {
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
+        let mut debug_inos = HashSet::new();
         for (op, _) in pending_uploads {
             pending_evictions.remove(&op.object_id);
-            self.debug_pending_inode_state(op.ino, "pending_upload_canceled");
+            debug_inos.insert(op.ino);
+        }
+        drop(pending_evictions);
+        for ino in debug_inos {
+            self.debug_pending_inode_state(ino, "pending_upload_canceled");
         }
     }
 

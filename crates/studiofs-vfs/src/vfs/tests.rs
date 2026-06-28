@@ -2703,6 +2703,7 @@ fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
             "expected tail payload publication, got status {} with attr {:?}",
             match status {
                 super::commit::EpochFinalizeStatus::Published => "published",
+                super::commit::EpochFinalizeStatus::WaitingForUploads => "waiting_uploads",
                 super::commit::EpochFinalizeStatus::Deferred => "deferred",
                 super::commit::EpochFinalizeStatus::Skipped => "skipped",
             },
@@ -5290,6 +5291,9 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
         .expect("finalize metadata-only grow");
         match status {
             super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::WaitingForUploads => {
+                panic!("metadata-only grow unexpectedly waited for uploads")
+            }
             super::commit::EpochFinalizeStatus::Deferred => {
                 panic!("metadata-only grow unexpectedly deferred")
             }
@@ -5491,6 +5495,9 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
         .expect("finalize sparse shrink");
         match status {
             super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::WaitingForUploads => {
+                panic!("sparse shrink unexpectedly waited for uploads")
+            }
             super::commit::EpochFinalizeStatus::Deferred => {
                 panic!("sparse shrink unexpectedly deferred")
             }
@@ -5556,6 +5563,47 @@ fn writer_stack_object_reservation_counts_only_current_write() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn epoch_finalizer_waits_for_pending_upload_completion_without_retrying() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-waiting-uploads");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-waiting-uploads.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = vec![0xCAu8; vfs.block_size as usize];
+        vfs.write(attr.ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(attr.ino).await.expect("flush slice-graph epoch");
+
+        let pending_attr = meta
+            .get_attr(attr.ino)
+            .expect("load pending-upload epoch attr");
+        assert!(
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "setup must leave an uploaded extent in the local pending queue"
+        );
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            pending_attr.content_epoch,
+        )
+        .await
+        .expect("finalize should observe pending uploads as a normal wait state");
+        assert!(
+            matches!(
+                status,
+                super::commit::EpochFinalizeStatus::WaitingForUploads
+            ),
+            "pending uploads should not use the timed deferred retry path"
+        );
+    });
 }
 
 #[test]

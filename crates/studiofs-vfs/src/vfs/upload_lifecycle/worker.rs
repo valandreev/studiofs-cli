@@ -422,7 +422,17 @@ where
             Ok(SingleUploadOutcome::Completed) => UploadOutcome::Completed,
             Ok(SingleUploadOutcome::CancelledDeleted) => UploadOutcome::CancelledDeleted,
             Ok(SingleUploadOutcome::CancelledStale) => UploadOutcome::CancelledStale,
-            Ok(SingleUploadOutcome::Shutdown) => UploadOutcome::Shutdown,
+            Ok(SingleUploadOutcome::Shutdown) => {
+                if self.shutdown.uploader_shutdown_requested() {
+                    return UploadOutcome::Shutdown;
+                }
+                if self.coordinator.requeue_upload(op) {
+                    self.shutdown.record_requeue();
+                    UploadOutcome::Requeued
+                } else {
+                    UploadOutcome::Shutdown
+                }
+            }
             Err(error) => {
                 if self.shutdown.uploader_shutdown_requested() {
                     return UploadOutcome::Shutdown;
@@ -2389,6 +2399,9 @@ mod tests {
             _fragment_keys: &[String],
             cancel_token: &CancellationToken,
         ) -> UploadPutOutcome {
+            if cancel_token.is_cancelled() {
+                return UploadPutOutcome::Cancelled;
+            }
             let outcome = self
                 .upload_result
                 .lock()
@@ -2441,6 +2454,7 @@ mod tests {
         canceled_stale_after_put_bytes: Arc<AtomicU64>,
         requeues: Arc<AtomicU64>,
         shutdown_token: CancellationToken,
+        upload_cancel_token: CancellationToken,
     }
 
     impl Default for FakeShutdown {
@@ -2457,6 +2471,7 @@ mod tests {
                 canceled_stale_after_put_bytes: Arc::new(AtomicU64::new(0)),
                 requeues: Arc::new(AtomicU64::new(0)),
                 shutdown_token: CancellationToken::new(),
+                upload_cancel_token: CancellationToken::new(),
             }
         }
     }
@@ -2471,7 +2486,7 @@ mod tests {
         }
 
         fn uploader_cancel_token_for_inode(&self, _ino: Ino) -> CancellationToken {
-            CancellationToken::new()
+            self.upload_cancel_token.clone()
         }
 
         fn maybe_release_upload_cancel_token(&self, ino: Ino) {
@@ -3016,6 +3031,31 @@ mod tests {
         assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
         assert_eq!(policy.sticky_errors.lock().len(), 1);
         assert!(policy.finalized_upload_epochs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_when_supersede_token_cancels_active_upload() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        shutdown.upload_cancel_token.cancel();
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert_eq!(coordinator.requeued.lock().len(), 1);
+        assert_eq!(coordinator.requeued.lock()[0].object_id, op.object_id);
+        assert!(coordinator.completed.lock().is_empty());
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.failed.lock().is_empty());
+        assert!(policy.sticky_errors.lock().is_empty());
     }
 
     #[tokio::test]
