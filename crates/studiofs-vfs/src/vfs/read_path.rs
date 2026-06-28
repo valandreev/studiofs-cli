@@ -1233,11 +1233,8 @@ impl<'a> ReadMetadataResolver<'a> {
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
-        let dirty_attr_cacheable = dirty_attr_present
-            && !self
-                .vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino)
-            && !self.vfs.inode_has_dirty_writer_stack(self.ino);
+        let dirty_attr_cacheable =
+            dirty_attr_present && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
