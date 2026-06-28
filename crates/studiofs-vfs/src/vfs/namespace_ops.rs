@@ -1232,6 +1232,29 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> VfsResult<InodeAttr> {
+        self.create_with_metadata_flush(parent, name, uid, gid, mode, true)
+    }
+
+    pub fn create_deferred_metadata_flush(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> VfsResult<InodeAttr> {
+        self.create_with_metadata_flush(parent, name, uid, gid, mode, false)
+    }
+
+    fn create_with_metadata_flush(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+        request_eager_flush: bool,
+    ) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -1258,7 +1281,9 @@ impl StudioVfs {
             },
         );
         namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
-        self.sync_meta().request_eager_flush();
+        if request_eager_flush {
+            self.sync_meta().request_eager_flush();
+        }
         Ok(attr)
     }
 

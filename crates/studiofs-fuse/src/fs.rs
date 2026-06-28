@@ -127,14 +127,19 @@ impl FuseBufferPool {
         }
     }
 
-    fn take_zeroed(&self, len: usize) -> Vec<u8> {
+    fn take_initialized(&self, len: usize) -> Vec<u8> {
         let mut buffer = self.take(len);
-        buffer.resize(len, 0);
+        if buffer.len() > len {
+            buffer.truncate(len);
+        } else {
+            buffer.resize(len, 0);
+        }
         buffer
     }
 
     fn take_with_bytes(&self, data: &[u8]) -> Vec<u8> {
         let mut buffer = self.take(data.len());
+        buffer.clear();
         buffer.extend_from_slice(data);
         buffer
     }
@@ -142,7 +147,6 @@ impl FuseBufferPool {
     fn take(&self, len: usize) -> Vec<u8> {
         let mut buffers = self.inner.lock();
         if let Some(mut buffer) = buffers.pop() {
-            buffer.clear();
             if buffer.capacity() < len {
                 buffer.reserve(len);
             }
@@ -155,7 +159,7 @@ impl FuseBufferPool {
         if self.max_buffers == 0 || buffer.capacity() > self.max_retained_capacity {
             return;
         }
-        buffer.clear();
+        buffer.truncate(buffer.capacity().min(self.max_retained_capacity));
         let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
@@ -474,7 +478,7 @@ fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
 }
 
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
-    raw.map_or(true, should_enable_async_fuse_read_from_env_value)
+    raw.is_some_and(should_enable_async_fuse_read_from_env_value)
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
@@ -1247,7 +1251,7 @@ impl StudioFuseFs {
 
         // fuser's ReplyData API accepts an immutable reply slice instead of
         // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
-        let mut out = self.fuse_buffer_pool.take_zeroed(requested_size);
+        let mut out = self.fuse_buffer_pool.take_initialized(requested_size);
         let callback_started = Instant::now();
         if self.async_read_enabled {
             let vfs = Arc::clone(&self.vfs);
@@ -1602,7 +1606,7 @@ impl Filesystem for StudioFuseFs {
             reply.error(fuse_errno(libc::ENOENT));
             return;
         }
-        match self.vfs.create(
+        match self.vfs.create_deferred_metadata_flush(
             parent,
             &name_bytes,
             req.uid(),
@@ -1637,7 +1641,7 @@ impl Filesystem for StudioFuseFs {
             reply.error(fuse_errno(libc::ENOENT));
             return;
         }
-        match self.vfs.create(
+        match self.vfs.create_deferred_metadata_flush(
             parent,
             &name_bytes,
             req.uid(),
@@ -1973,11 +1977,10 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
-                let result = if fh != 0 {
-                    vfs.flush_fh(fh).await
-                } else {
-                    vfs.flush(ino).await
-                };
+                let result = vfs
+                    .flush_fuse_writeback_with_outcome(ino, fh)
+                    .await
+                    .map(|_| ());
                 if pending_result.is_ok() && result.is_ok() {
                     debug!(
                         ino,
@@ -2070,12 +2073,8 @@ impl Filesystem for StudioFuseFs {
                     admission_limits,
                     &pending_writes,
                 );
-                let release_result = if vfs.inode_has_local_dirty_state(ino) {
-                    vfs.release_fh(fh).await
-                } else {
-                    vfs.release_fh_with_deferred_last_handle_barrier(fh, &rt_handle);
-                    Ok(())
-                };
+                vfs.release_fh_with_deferred_last_handle_barrier(fh, &rt_handle);
+                let release_result = Ok(());
                 close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
                     debug!(
@@ -3011,27 +3010,27 @@ mod tests {
     }
 
     #[test]
-    fn fuse_buffer_pool_reuses_cleared_buffers() {
+    fn fuse_buffer_pool_reuses_initialized_buffers_without_zeroing_prefix() {
         let pool = FuseBufferPool::new(4096, 1, 4096);
-        let mut first = pool.take_zeroed(1024);
+        let mut first = pool.take_initialized(1024);
         first[0] = 7;
         let initial_capacity = first.capacity();
         pool.put(first);
 
-        let second = pool.take_zeroed(512);
+        let second = pool.take_initialized(512);
 
         assert_eq!(second.len(), 512);
-        assert_eq!(second[0], 0);
+        assert_eq!(second[0], 7);
         assert_eq!(second.capacity(), initial_capacity);
     }
 
     #[test]
     fn fuse_buffer_pool_expands_reused_buffers_to_requested_len() {
         let pool = FuseBufferPool::new(1, 1, 4096);
-        let first = pool.take_zeroed(1024);
+        let first = pool.take_initialized(1024);
         pool.put(first);
 
-        let second = pool.take_zeroed(2048);
+        let second = pool.take_initialized(2048);
 
         assert_eq!(second.len(), 2048);
         assert!(second.capacity() >= 2048);
@@ -3041,11 +3040,11 @@ mod tests {
     fn fuse_buffer_pool_retains_runtime_sized_buffers() {
         let runtime_max = (DEFAULT_FUSE_MAX_WRITE_BYTES as usize) * 2;
         let pool = FuseBufferPool::new(runtime_max, 1, runtime_max);
-        let first = pool.take_zeroed(runtime_max);
+        let first = pool.take_initialized(runtime_max);
         let initial_capacity = first.capacity();
         pool.put(first);
 
-        let second = pool.take_zeroed(1024);
+        let second = pool.take_initialized(1024);
 
         assert_eq!(second.capacity(), initial_capacity);
     }
@@ -3261,8 +3260,8 @@ mod tests {
     }
 
     #[test]
-    fn linux_fuse_profile_enables_async_read_by_default() {
-        assert!(resolve_async_fuse_read_enabled(None));
+    fn linux_fuse_profile_uses_direct_read_by_default() {
+        assert!(!resolve_async_fuse_read_enabled(None));
         assert!(!resolve_async_fuse_read_enabled(Some("false")));
         assert!(should_enable_async_fuse_read_from_env_value("true"));
         assert!(resolve_async_fuse_read_enabled(Some("true")));

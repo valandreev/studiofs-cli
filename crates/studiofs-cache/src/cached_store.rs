@@ -945,9 +945,12 @@ impl CachedStoreWriterSlice {
         let absolute_end = end;
         let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
         self.validate_buffer_limit(target_capacity)?;
-        self.ensure_len(absolute_end);
-        let write_start = relative;
-        self.copy_into_dirty(write_start, data);
+        if relative == old_len {
+            self.append_to_dirty(data);
+        } else {
+            self.ensure_len(absolute_end);
+            self.copy_into_dirty(relative, data);
+        }
 
         let dirty_delta = end.saturating_sub(old_len);
         if dirty_delta > 0 {
@@ -1238,6 +1241,29 @@ impl CachedStoreWriterSlice {
             let append = remaining.min(self.config.page_size - page.len());
             page.resize(page.len() + append, 0);
             self.dirty_len += append;
+        }
+    }
+
+    fn append_to_dirty(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self
+                .pages
+                .back()
+                .is_none_or(|page| page.len() >= self.config.page_size)
+            {
+                self.pages.push_back(BytesMut::with_capacity(
+                    data.len().min(self.config.page_size),
+                ));
+            }
+            #[expect(
+                clippy::expect_used,
+                reason = "page deque is populated by the preceding branch"
+            )]
+            let page = self.pages.back_mut().expect("page exists after push");
+            let take = data.len().min(self.config.page_size - page.len());
+            page.extend_from_slice(&data[..take]);
+            self.dirty_len += take;
+            data = &data[take..];
         }
     }
 
@@ -1900,6 +1926,24 @@ mod tests {
         let mut tail = [0_u8; 4];
         assert_eq!(writer.read_accepted(8, &mut tail), 4);
         assert_eq!(&tail, b"ijkl");
+    }
+
+    #[test]
+    fn writer_slice_sequential_append_preserves_overwrite_path() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcd").expect("append first page");
+        writer.write_at(4, b"efgh").expect("append second page");
+        writer.write_at(8, b"ijkl").expect("append third page");
+        writer
+            .write_at(4, b"EF")
+            .expect("overwrite inside dirty pages");
+
+        let mut out = [0_u8; 12];
+        assert_eq!(writer.read_accepted(0, &mut out), out.len());
+        assert_eq!(&out, b"abcdEFghijkl");
     }
 
     #[test]

@@ -174,6 +174,40 @@ fn read_into_fh_clamps_to_remaining_file_size() {
 }
 
 #[test]
+fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"read-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, attr.ino, 0, b"dirty-overlay")
+            .await
+            .unwrap();
+
+        let _materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let mut out = [0; 13];
+        let read = tokio::time::timeout(Duration::from_millis(100), async {
+            vfs.read_into_fh(fh, attr.ino, 0, &mut out).await
+        })
+        .await
+        .expect("foreground read should not queue behind background materialization")
+        .expect("dirty overlay read should succeed");
+
+        assert_eq!(read as usize, out.len());
+        assert_eq!(&out, b"dirty-overlay");
+        drop(_materialize);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");

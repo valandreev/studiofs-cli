@@ -804,6 +804,28 @@ impl StudioVfs {
         result
     }
 
+    pub async fn flush_fuse_writeback_with_outcome(
+        self: &Arc<Self>,
+        ino: Ino,
+        fh: u64,
+    ) -> VfsResult<ExplicitFlushOutcome> {
+        let target_ino = if fh != 0 {
+            self.handle_table.get(fh).map(|open_file| open_file.ino)
+        } else {
+            None
+        }
+        .unwrap_or(ino);
+        self.wait_for_deferred_release_inflight(target_ino).await;
+        let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
+        if self.state.writer_stack.has_dirty_writers(target_ino) {
+            self.spawn_deferred_materialization_if_needed(target_ino)
+                .await;
+        }
+        Ok(ExplicitFlushOutcome {
+            flushed_local_dirty_state: had_local_dirty_state,
+        })
+    }
+
     async fn local_sync_barrier_with_outcome(
         &self,
         ino: Ino,
