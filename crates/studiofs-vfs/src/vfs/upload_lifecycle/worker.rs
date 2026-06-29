@@ -1114,19 +1114,22 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
     }
 
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        while let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
-            let foreground_active = self
-                .vfs
-                .state
-                .read
-                .foreground_write_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-            let start_delay = upload_hot_start_delay(
-                foreground_active,
-                self.vfs.total_pending_write_buffer_bytes(),
-                self.vfs.max_dirty_bytes(),
-                self.vfs.upload_user_idle_grace,
-            );
-            if !start_delay.is_zero() {
+        if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
+            loop {
+                let foreground_active = self
+                    .vfs
+                    .state
+                    .read
+                    .foreground_write_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+                let start_delay = upload_hot_start_delay(
+                    foreground_active,
+                    self.vfs.total_pending_write_buffer_bytes(),
+                    self.vfs.max_dirty_bytes(),
+                    self.vfs.upload_user_idle_grace,
+                );
+                if start_delay.is_zero() {
+                    break;
+                }
                 self.vfs.debug_write_probe(
                     "H5",
                     concat!(file!(), ":", line!()),
@@ -1138,7 +1141,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                     }),
                 );
                 tokio::time::sleep(start_delay).await;
-                continue;
             }
             self.vfs
                 .state
