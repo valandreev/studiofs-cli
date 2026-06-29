@@ -236,9 +236,11 @@ the default is off.
 runs. The default Linux write callback copies caller bytes into owned buffers,
 replies once those bytes are accepted into StudioFS memory, and completes the
 pending write after VFS staging. Flush/fsync/release barriers surface delayed
-staging errors; upload lifecycle remains in the shared VFS writer stack. The
-default per-handle async write admission window is 64 MiB, matching one logical
-chunk, with a 64 MiB global cap.
+staging errors, so direct-I/O write handles intentionally use StudioFS
+writeback semantics for throughput rather than per-syscall durability. Upload
+lifecycle remains in the shared VFS writer stack. The default per-handle async
+write admission window is 64 MiB, matching one logical chunk, with a 256 MiB
+global cap so several handles can make progress concurrently.
 
 `STUDIOFS_FUSE_ASYNC_READ=1` enables the Linux bridge read reply path. It moves
 regular file reads from the FUSE callback stack onto the mount runtime while

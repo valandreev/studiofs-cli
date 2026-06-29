@@ -180,7 +180,7 @@ fn upload_hot_start_delay(
     idle_grace: Duration,
 ) -> Duration {
     if foreground_write_active
-        && dirty_bytes < super::super::aggressive_materialization_threshold_bytes(max_dirty_bytes)
+        && dirty_bytes < crate::vfs::aggressive_materialization_threshold_bytes(max_dirty_bytes)
     {
         idle_grace
     } else {
@@ -1103,8 +1103,8 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 "upload stage unavailable; skipping local-priority defer and using bounded reread",
                 serde_json::json!({
                     "object_id": object_id,
-                    "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "would_defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "adaptive_penalty_ms": u64::try_from(adaptive_penalty.as_millis()).unwrap_or(u64::MAX),
+                    "would_defer_delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
                 }),
             );
@@ -1134,7 +1134,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                     serde_json::json!({
                         "object_id": object_id,
                         "buffer_bytes": hot_payload.len(),
-                        "start_delay_ms": start_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "start_delay_ms": u64::try_from(start_delay.as_millis()).unwrap_or(u64::MAX),
                     }),
                 );
                 tokio::time::sleep(start_delay).await;
@@ -1212,7 +1212,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                     serde_json::json!({
                         "object_id": object_id,
                         "staged_bytes": staged_payload.len(),
-                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "pacing_delay_ms": u64::try_from(pacing_delay.as_millis()).unwrap_or(u64::MAX),
                         "slot_cost": upload_io_cost,
                     }),
                 );
@@ -1268,7 +1268,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 serde_json::json!({
                     "object_id": object_id,
                     "reread_bytes": read_result.as_ref().map(|payload| payload.len()).unwrap_or(0),
-                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "pacing_delay_ms": u64::try_from(pacing_delay.as_millis()).unwrap_or(u64::MAX),
                     "slot_cost": upload_io_cost,
                 }),
             );

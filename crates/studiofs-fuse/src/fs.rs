@@ -265,7 +265,7 @@ impl FuseAsyncWriteAdmissionPolicy {
         {
             Self {
                 limits: PendingWriteAdmissionLimits {
-                    max_pending_bytes: Some(64 * 1024 * 1024),
+                    max_pending_bytes: Some(256 * 1024 * 1024),
                     max_pending_writes: Some(1024),
                     per_handle_pending_bytes: Some(64 * 1024 * 1024),
                 },
@@ -3672,10 +3672,10 @@ mod tests {
     }
 
     #[test]
-    fn fuse_async_write_default_per_handle_window_matches_chunk_size() {
+    fn fuse_async_write_default_windows_leave_global_room_for_multiple_handles() {
         let policy = FuseAsyncWriteAdmissionPolicy::platform_default();
 
-        assert_eq!(policy.limits.max_pending_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(policy.limits.max_pending_bytes, Some(256 * 1024 * 1024));
         assert_eq!(
             policy.limits.per_handle_pending_bytes,
             Some(64 * 1024 * 1024)

@@ -307,8 +307,7 @@ impl SustainedWriteState {
         self.last_end_offset = end_offset;
 
         let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
-        let effective_buffer_bytes =
-            sustained_write_effective_buffer_bytes(base_buffer_bytes, drain_chunk_bytes);
+        let effective_buffer_bytes = base_buffer_bytes.max(drain_chunk_bytes.max(1));
         SustainedWriteAdmission {
             duration_ms,
             effective_buffer_bytes,
@@ -473,14 +472,6 @@ impl WriteAdmissionGovernor {
         let divisor = u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT.saturating_add(1));
         (weighted / divisor).min(u128::from(u64::MAX)) as u64
     }
-}
-
-fn sustained_write_effective_buffer_bytes(
-    base_buffer_bytes: usize,
-    drain_chunk_bytes: usize,
-) -> usize {
-    let floor = drain_chunk_bytes.max(1);
-    base_buffer_bytes.max(floor)
 }
 
 // =============================================================================
