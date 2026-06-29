@@ -4311,6 +4311,7 @@ fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
         let grown_attr = vfs.getattr(ino).expect("load grown attr");
         assert_eq!(grown_attr.size, logical_size);
 
+        vfs.spawn_deferred_materialization_if_needed(ino).await;
         drop(guard);
         vfs.finish_deferred_materialization_task(entry, true);
         vfs.wait_for_deferred_materialization_inflight(ino).await;
@@ -6038,9 +6039,9 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 800 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 4 * 1024 * 1024 * 1024);
     assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
-    assert_eq!(derived.max_dirty_bytes, 800 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 4 * 1024 * 1024 * 1024);
     assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
     assert_eq!(derived.transit_memory_budget_bytes, 800 * 1024 * 1024);
 }
@@ -6292,7 +6293,7 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         vfs.set_max_dirty_bytes(64 * 1024 * 1024);
 
-        let seeded_len = 33 * 1024 * 1024;
+        let seeded_len = 65 * 1024 * 1024;
         vfs.state
             .writer_stack
             .write_bytes(
@@ -6349,8 +6350,8 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
 }
 
 #[test]
-fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
-    let base = 800 * 1024 * 1024;
+fn sustained_write_window_keeps_full_buffer_for_long_streams() {
+    let base = 4 * 1024 * 1024 * 1024usize;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -6359,29 +6360,29 @@ fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
     assert!(!first.pre_drain);
 
     let half = state.observe(2_500, 4, 4, base, drain, base + 1);
-    assert_eq!(half.effective_buffer_bytes, base / 2);
+    assert_eq!(half.effective_buffer_bytes, base);
     assert!(half.pre_drain);
 
     let quarter = state.observe(4_000, 8, 4, base, drain, base);
-    assert_eq!(quarter.effective_buffer_bytes, base / 4);
-    assert!(quarter.pre_drain);
+    assert_eq!(quarter.effective_buffer_bytes, base);
+    assert!(!quarter.pre_drain);
 
     let eighth = state.observe(5_500, 12, 4, base, drain, base);
-    assert_eq!(eighth.effective_buffer_bytes, base / 8);
-    assert!(eighth.pre_drain);
+    assert_eq!(eighth.effective_buffer_bytes, base);
+    assert!(!eighth.pre_drain);
 
     let sixteenth = state.observe(7_000, 16, 4, base, drain, base);
-    assert_eq!(sixteenth.effective_buffer_bytes, base / 16);
-    assert!(sixteenth.pre_drain);
+    assert_eq!(sixteenth.effective_buffer_bytes, base);
+    assert!(!sixteenth.pre_drain);
 
     let floor = state.observe(8_500, 20, 4, base, drain, base);
-    assert_eq!(floor.effective_buffer_bytes, drain);
-    assert!(floor.pre_drain);
+    assert_eq!(floor.effective_buffer_bytes, base);
+    assert!(!floor.pre_drain);
 }
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 800 * 1024 * 1024;
+    let base = 4 * 1024 * 1024 * 1024usize;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -6395,7 +6396,7 @@ fn sustained_write_window_resets_after_idle_or_seek() {
         state
             .observe(2_500, 4, 4, base, drain, base + 1)
             .effective_buffer_bytes,
-        base / 2
+        base
     );
 
     let after_idle = state.observe(
@@ -6717,6 +6718,34 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
         !state.foreground_read_active(171, grace),
         "foreground read activity should expire after the configured idle grace"
     );
+}
+
+#[test]
+fn foreground_read_active_respects_idle_grace_after_last_write() {
+    let state = ReadState::new(1);
+    let grace = Duration::from_millis(50);
+
+    state.mark_foreground_write(100);
+
+    assert!(
+        state.foreground_read_active(149, grace),
+        "foreground writes should protect the local write path from uploader rereads"
+    );
+    assert!(
+        !state.foreground_read_active(151, grace),
+        "foreground write activity should expire after the configured idle grace"
+    );
+}
+
+#[test]
+fn foreground_write_active_ignores_read_only_activity() {
+    let state = ReadState::new(1);
+    let grace = Duration::from_millis(50);
+
+    state.mark_foreground_read(100);
+
+    assert!(state.foreground_read_active(100, grace));
+    assert!(!state.foreground_write_active(100, grace));
 }
 
 #[tokio::test]
@@ -8036,6 +8065,67 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
 }
 
 #[test]
+fn opportunistic_write_above_eager_batch_stays_in_writer_stack_until_dirty_limit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 8 * 1024 * 1024,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_unstarted_test_vfs_with_config(
+        &tmp,
+        "sfs-306-eager-batch-does-not-inline-materialize",
+        cfg,
+    );
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-306-eager-batch-does-not-inline.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
+        let seeded_len = 9 * 1024 * 1024;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xEF; seeded_len]),
+            )
+            .expect("seed writer-stack above eager batch but below dirty limit");
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            seeded_len as u64,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.vfs_write_path.materialize_for_limits.calls, 0,
+            "eager batch threshold must not force inline materialization on foreground opportunistic writes"
+        );
+        assert!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino) >= seeded_len,
+            "foreground opportunistic write should stay buffered until dirty budget pressure"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-305-deferred-soft-writeback");
@@ -8558,6 +8648,47 @@ fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
             "flush_fh should commit local metadata without turning into foreground PG publication"
         );
         assert_eq!(flushed.upload.completed_uploads, 0);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_full_block_write_does_not_start_materialization_without_pressure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-548-full-block-stays-foreground");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs-548-full-block-stays-foreground.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = vec![0x48; vfs.block_size as usize];
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !vfs.state.deferred_materialize_inflight.contains(ino),
+            "foreground writes should not start local-cache materialization until pressure or a barrier"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            payload.len(),
+            "accepted bytes should stay in the foreground writer stack"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "ordinary foreground acceptance must not immediately feed uploader backlog"
+        );
 
         vfs.release_fh(fh).await.unwrap();
     });
@@ -11849,6 +11980,7 @@ fn deferred_materialization_drains_idle_tail_before_close() {
         )
         .await
         .unwrap();
+        vfs.spawn_deferred_materialization_if_needed(ino).await;
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -11903,6 +12035,7 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         )
         .await
         .unwrap();
+        vfs.spawn_deferred_materialization_if_needed(ino).await;
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -11979,6 +12112,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         )
         .await
         .unwrap();
+        vfs.spawn_deferred_materialization_if_needed(ino).await;
         assert!(
             vfs.pending_uploads_for_inode(ino).is_empty(),
             "occupied in-flight slot should suppress immediate upload scheduling"

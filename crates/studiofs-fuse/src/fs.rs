@@ -18,8 +18,8 @@ use fuser::{
 use handle_drain::FuseHandleDrainFacade;
 use parking_lot::Mutex;
 use pending_write_tracker::{
-    PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteRegistration,
-    PendingWriteTracker, WriteRegistrationError,
+    PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteTracker,
+    WriteRegistrationError,
 };
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr,
@@ -39,7 +39,7 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
-const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = DEFAULT_FUSE_MAX_WRITE_BYTES;
 const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
@@ -265,9 +265,9 @@ impl FuseAsyncWriteAdmissionPolicy {
         {
             Self {
                 limits: PendingWriteAdmissionLimits {
-                    max_pending_bytes: Some(128 * 1024 * 1024),
+                    max_pending_bytes: Some(64 * 1024 * 1024),
                     max_pending_writes: Some(1024),
-                    per_handle_pending_bytes: Some(32 * 1024 * 1024),
+                    per_handle_pending_bytes: Some(64 * 1024 * 1024),
                 },
             }
         }
@@ -326,7 +326,7 @@ fn fuse_open_reply_flags(flags: i32, trunc: bool) -> fuser::FopenFlags {
         || access_mode == libc::O_RDWR
         || flags & libc::O_APPEND != 0;
     if write_capable {
-        fuser::FopenFlags::empty()
+        fuser::FopenFlags::FOPEN_DIRECT_IO
     } else {
         fuser::FopenFlags::FOPEN_KEEP_CACHE
     }
@@ -548,6 +548,7 @@ impl<R: FuseWriteReply> FuseWriteReplyGuard<R> {
         }
     }
 
+    #[cfg(test)]
     fn error(mut self, errno: i32) {
         if let Some(reply) = self.reply.take() {
             reply.error(errno);
@@ -673,43 +674,6 @@ impl PendingFuseCloseGuard {
 impl Drop for PendingFuseCloseGuard {
     fn drop(&mut self) {
         self.finish();
-    }
-}
-
-fn complete_fuse_write_reply<R>(
-    reply: FuseWriteReplyGuard<R>,
-    result: Result<u32, VfsError>,
-    registration: &PendingWriteRegistration,
-    ino: u64,
-    offset: u64,
-) where
-    R: FuseWriteReply,
-{
-    match result {
-        Ok(written) => {
-            trace!(
-                ino,
-                offset,
-                sequence = registration.sequence(),
-                written,
-                "async FUSE write completed"
-            );
-            reply.written(written);
-            registration.complete(PendingWriteCompletion::Success);
-        }
-        Err(e) => {
-            error!("write({ino}, off={offset}) -> {e}");
-            let errno = vfs_err_to_errno(&e);
-            trace!(
-                ino,
-                offset,
-                sequence = registration.sequence(),
-                errno,
-                "async FUSE write failed"
-            );
-            reply.error(errno);
-            registration.complete(PendingWriteCompletion::Error(errno));
-        }
     }
 }
 
@@ -1345,17 +1309,32 @@ impl StudioFuseFs {
             let reply = FuseWriteReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let mut registration = registration;
+                reply.written(data_len as u32);
+                vfs.record_fuse_write_callback(data_len, callback_started.elapsed(), false);
                 let turn = registration.turn_waiter();
                 turn.wait().await;
                 let result = vfs
                     .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
                     .await;
-                vfs.record_fuse_write_callback(
-                    data_len,
-                    callback_started.elapsed(),
-                    result.is_err(),
-                );
-                complete_fuse_write_reply(reply, result, &registration, ino, offset);
+                match result {
+                    Ok(written) if written as usize == data_len => {
+                        registration.complete(PendingWriteCompletion::Success);
+                    }
+                    Ok(written) => {
+                        error!(
+                            ino,
+                            offset,
+                            written,
+                            expected = data_len,
+                            "async FUSE write accepted short write after early reply"
+                        );
+                        registration.complete(PendingWriteCompletion::Error(libc::EIO));
+                    }
+                    Err(e) => {
+                        error!("write({ino}, off={offset}) -> {e}");
+                        registration.complete(PendingWriteCompletion::Error(vfs_err_to_errno(&e)));
+                    }
+                }
                 buffer_pool.put(data);
             });
             return;
@@ -2862,20 +2841,24 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
-        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
-        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        parse_bridge_u32_env_result, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
-        resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
-        should_enable_async_fuse_read_from_env_value,
+        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard,
+        HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES, LinuxFuseProfile, PendingFuseCloseGuard,
+        StudioFuseFs, TTL, fs_ioc_getflags_reply_data, fuse_attr_blksize,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, parse_bridge_u32_env_result, posix_flags_to_open_flags,
+        resolve_async_fuse_read_enabled, resolve_async_fuse_write_enabled,
+        resolve_fuse_writeback_cache_enabled, should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
-    use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
+    use crate::fs::pending_write_tracker::{
+        PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteRegistration,
+        PendingWriteTracker,
+    };
     use std::cell::Cell;
 
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
@@ -2900,6 +2883,19 @@ mod tests {
         fn written_size(&self) -> Option<u32> {
             self.state.lock().expect("test reply lock").written
         }
+
+        fn wait_written_size(&self, timeout: Duration) -> Option<u32> {
+            let started = Instant::now();
+            loop {
+                if let Some(size) = self.written_size() {
+                    return Some(size);
+                }
+                if started.elapsed() >= timeout {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     impl super::FuseWriteReply for TestWriteReply {
@@ -2909,6 +2905,26 @@ mod tests {
 
         fn error(self, errno: i32) {
             self.state.lock().expect("test reply lock").error = Some(errno);
+        }
+    }
+
+    fn complete_fuse_write_reply<R>(
+        reply: FuseWriteReplyGuard<R>,
+        result: Result<u32, VfsError>,
+        registration: &PendingWriteRegistration,
+    ) where
+        R: super::FuseWriteReply,
+    {
+        match result {
+            Ok(written) => {
+                reply.written(written);
+                registration.complete(PendingWriteCompletion::Success);
+            }
+            Err(e) => {
+                let errno = vfs_err_to_errno(&e);
+                reply.error(errno);
+                registration.complete(PendingWriteCompletion::Error(errno));
+            }
         }
     }
 
@@ -3205,6 +3221,49 @@ mod tests {
         assert!(snapshot.pending_writes > 0 || snapshot.completed_writes > 0);
     }
 
+    #[test]
+    fn async_write_callback_replies_before_waiting_for_handle_turn() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-write-early-reply");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let attr = vfs
+            .create(1, b"async-write-early-reply.txt", 0, 0, 0o644)
+            .expect("create test file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open test file");
+        let first = fs
+            .pending_writes
+            .register(attr.ino, fh)
+            .expect("register first pending write");
+        let reply = TestWriteReply::default();
+
+        fs.write_callback(attr.ino, fh, 0, b"abc", 0, reply.clone());
+
+        assert_eq!(
+            reply.wait_written_size(Duration::from_millis(100)),
+            Some(3),
+            "async FUSE write should reply after copying into StudioFS memory, before waiting on the per-handle VFS turn"
+        );
+
+        first.complete(super::PendingWriteCompletion::Success);
+        rt.block_on(async {
+            for _ in 0..100 {
+                if fs.pending_writes.snapshot().pending_writes == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        assert_eq!(fs.pending_writes.snapshot().pending_writes, 0);
+    }
+
     fn create_readable_test_file(
         rt: &Runtime,
         vfs: &StudioVfs,
@@ -3329,6 +3388,11 @@ mod tests {
     #[test]
     fn default_fuse_max_write_matches_platform_expectation() {
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
+    }
+
+    #[test]
+    fn high_throughput_fuse_max_write_matches_linux_kernel_limit() {
+        assert_eq!(HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
     }
 
     #[test]
@@ -3500,19 +3564,19 @@ mod tests {
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_WRONLY, false),
-            fuser::FopenFlags::empty()
+            fuser::FopenFlags::FOPEN_DIRECT_IO
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDWR, false),
-            fuser::FopenFlags::empty()
+            fuser::FopenFlags::FOPEN_DIRECT_IO
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY | libc::O_APPEND, false),
-            fuser::FopenFlags::empty()
+            fuser::FopenFlags::FOPEN_DIRECT_IO
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY, true),
-            fuser::FopenFlags::empty()
+            fuser::FopenFlags::FOPEN_DIRECT_IO
         );
     }
 
@@ -3604,6 +3668,17 @@ mod tests {
                 max_pending_writes: Some(9),
                 per_handle_pending_bytes: Some(1024),
             }
+        );
+    }
+
+    #[test]
+    fn fuse_async_write_default_per_handle_window_matches_chunk_size() {
+        let policy = FuseAsyncWriteAdmissionPolicy::platform_default();
+
+        assert_eq!(policy.limits.max_pending_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(
+            policy.limits.per_handle_pending_bytes,
+            Some(64 * 1024 * 1024)
         );
     }
 
@@ -3703,13 +3778,7 @@ mod tests {
         let barrier = tracker.handle_barrier(42, 7);
         let mut reply = RecordingWriteReply::default();
 
-        complete_fuse_write_reply(
-            FuseWriteReplyGuard::new(&mut reply),
-            Ok(5),
-            &registration,
-            42,
-            0,
-        );
+        complete_fuse_write_reply(FuseWriteReplyGuard::new(&mut reply), Ok(5), &registration);
 
         reply.assert_written_once(5);
         assert!(barrier.is_ready());
@@ -3727,8 +3796,6 @@ mod tests {
             FuseWriteReplyGuard::new(&mut reply),
             Err(VfsError::WouldBlock),
             &registration,
-            42,
-            0,
         );
 
         assert!(reply.written.is_empty());
@@ -3748,7 +3815,7 @@ mod tests {
             saw_barrier_pending_on_reply: &saw_barrier_pending_on_reply,
         };
 
-        complete_fuse_write_reply(FuseWriteReplyGuard::new(reply), Ok(5), &registration, 42, 0);
+        complete_fuse_write_reply(FuseWriteReplyGuard::new(reply), Ok(5), &registration);
 
         assert!(
             saw_barrier_pending_on_reply.get(),

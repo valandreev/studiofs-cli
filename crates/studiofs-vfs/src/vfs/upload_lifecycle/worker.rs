@@ -1099,7 +1099,31 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
     }
 
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
+        while let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
+            let foreground_active = self
+                .vfs
+                .state
+                .read
+                .foreground_write_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            let start_delay = if foreground_active {
+                self.vfs.upload_user_idle_grace
+            } else {
+                Duration::ZERO
+            };
+            if !start_delay.is_zero() {
+                self.vfs.debug_write_probe(
+                    "H5",
+                    concat!(file!(), ":", line!()),
+                    "upload hot payload deferred under foreground activity",
+                    serde_json::json!({
+                        "object_id": object_id,
+                        "buffer_bytes": hot_payload.len(),
+                        "start_delay_ms": start_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    }),
+                );
+                tokio::time::sleep(start_delay).await;
+                continue;
+            }
             self.vfs
                 .state
                 .upload
