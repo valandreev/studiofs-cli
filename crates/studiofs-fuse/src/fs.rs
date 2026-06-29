@@ -39,7 +39,6 @@ use tracing::{debug, error, trace, warn};
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
-const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = DEFAULT_FUSE_MAX_WRITE_BYTES;
 const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
@@ -1015,7 +1014,7 @@ impl StudioFuseRuntimeOptions {
                 DEFAULT_FUSE_MAX_READAHEAD_BYTES,
             ),
             LinuxFuseProfile::HighThroughput => (
-                HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+                DEFAULT_FUSE_MAX_WRITE_BYTES,
                 HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
             ),
         };
@@ -2841,9 +2840,8 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
-        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard,
-        HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES, LinuxFuseProfile, PendingFuseCloseGuard,
-        StudioFuseFs, TTL, fs_ioc_getflags_reply_data, fuse_attr_blksize,
+        FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
+        PendingFuseCloseGuard, StudioFuseFs, TTL, fs_ioc_getflags_reply_data, fuse_attr_blksize,
         fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
         normalize_unix_mode, parse_bridge_u32_env_result, posix_flags_to_open_flags,
         resolve_async_fuse_read_enabled, resolve_async_fuse_write_enabled,
@@ -3388,11 +3386,6 @@ mod tests {
     #[test]
     fn default_fuse_max_write_matches_platform_expectation() {
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
-    }
-
-    #[test]
-    fn high_throughput_fuse_max_write_matches_linux_kernel_limit() {
-        assert_eq!(HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
     }
 
     #[test]

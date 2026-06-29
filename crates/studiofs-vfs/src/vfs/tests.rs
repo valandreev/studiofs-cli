@@ -6702,37 +6702,37 @@ fn foreground_speedometer_trim_drops_expired_samples() {
 }
 
 #[test]
-fn foreground_read_active_respects_idle_grace_after_last_read() {
+fn foreground_io_active_respects_idle_grace_after_last_read() {
     let state = ReadState::new(1);
     let grace = Duration::from_millis(50);
 
     state.mark_foreground_read(100);
-    assert!(state.foreground_read_active(100, grace));
+    assert!(state.foreground_io_active(100, grace));
 
     state.unmark_foreground_read(120);
     assert!(
-        state.foreground_read_active(169, grace),
+        state.foreground_io_active(169, grace),
         "idle grace should keep reads active shortly after scope exit"
     );
     assert!(
-        !state.foreground_read_active(171, grace),
+        !state.foreground_io_active(171, grace),
         "foreground read activity should expire after the configured idle grace"
     );
 }
 
 #[test]
-fn foreground_read_active_respects_idle_grace_after_last_write() {
+fn foreground_io_active_respects_idle_grace_after_last_write() {
     let state = ReadState::new(1);
     let grace = Duration::from_millis(50);
 
     state.mark_foreground_write(100);
 
     assert!(
-        state.foreground_read_active(149, grace),
+        state.foreground_io_active(149, grace),
         "foreground writes should protect the local write path from uploader rereads"
     );
     assert!(
-        !state.foreground_read_active(151, grace),
+        !state.foreground_io_active(151, grace),
         "foreground write activity should expire after the configured idle grace"
     );
 }
@@ -6744,7 +6744,7 @@ fn foreground_write_active_ignores_read_only_activity() {
 
     state.mark_foreground_read(100);
 
-    assert!(state.foreground_read_active(100, grace));
+    assert!(state.foreground_io_active(100, grace));
     assert!(!state.foreground_write_active(100, grace));
 }
 

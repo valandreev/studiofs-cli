@@ -1928,7 +1928,7 @@ impl ReadState {
             .store(now_ms, Ordering::Relaxed);
     }
 
-    fn foreground_read_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+    fn foreground_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
         if self.foreground_reads_inflight.load(Ordering::Relaxed) > 0 {
             return true;
         }
@@ -1939,7 +1939,7 @@ impl ReadState {
         if last == 0 {
             return false;
         }
-        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+        now_ms.saturating_sub(last) <= u64::try_from(idle_grace.as_millis()).unwrap_or(u64::MAX)
     }
 
     fn foreground_write_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
@@ -1947,7 +1947,7 @@ impl ReadState {
         if last == 0 {
             return false;
         }
-        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+        now_ms.saturating_sub(last) <= u64::try_from(idle_grace.as_millis()).unwrap_or(u64::MAX)
     }
 
     fn record_foreground_read_latency(
@@ -3185,7 +3185,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let max_dirty_bytes = self.max_dirty_bytes();
         if foreground_active && total_dirty_bytes < max_dirty_bytes {
             return false;
@@ -4278,7 +4278,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -5938,7 +5938,7 @@ impl StudioVfs {
             if !self
                 .state
                 .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+                .foreground_io_active(now_ms, self.upload_user_idle_grace)
             {
                 return true;
             }
@@ -5953,7 +5953,7 @@ impl StudioVfs {
             if !self
                 .state
                 .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+                .foreground_io_active(now_ms, self.upload_user_idle_grace)
             {
                 return true;
             }
