@@ -1322,8 +1322,9 @@ impl StudioVfs {
                     .await?;
                 }
             }
-            let dirty_pressure_requires_materialization =
-                self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
+            let dirty_pressure_requires_materialization = self.total_pending_write_buffer_bytes()
+                > self.max_dirty_bytes()
+                || self.state.writer_stack.total_dirty_bytes() > self.write_eager_flush_batch_bytes;
             let should_materialize_for_limits =
                 local_sync_policy.is_opportunistic() && dirty_pressure_requires_materialization;
             if should_materialize_for_limits {
@@ -1458,32 +1459,43 @@ impl StudioVfs {
         }
 
         // ── Materialization phase ────────────────────────────────────────
-        if result.is_ok() && local_sync_policy.requires_write_path_durability() {
-            // Durability-required: await writer-stack materialization inline.
-            self.wait_for_deferred_materialization_inflight(ino).await;
-            let materialize_strict_started = Instant::now();
-            let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
-                Ok(materialized_bytes) => materialized_bytes,
-                Err(e) => {
+        match (&result, local_sync_policy) {
+            (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
+                self.spawn_deferred_materialization_if_needed(ino).await;
+            }
+            (Ok(_), policy) if policy.requires_write_path_durability() => {
+                // Durability-required: await writer-stack materialization inline.
+                self.wait_for_deferred_materialization_inflight(ino).await;
+                let materialize_strict_started = Instant::now();
+                let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
+                    Ok(materialized_bytes) => materialized_bytes,
+                    Err(e) => {
+                        drop(session);
+                        self.state.file_session.gc_if_idle(ino);
+                        return Err(e);
+                    }
+                };
+                self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
+
+                if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                     return Err(e);
                 }
-            };
-            self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
-
-            if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
-                drop(session);
-                self.state.file_session.gc_if_idle(ino);
-                return Err(e);
+                if let Err(e) = self
+                    .maybe_payload_store_sync_data_async(
+                        materialized_bytes as u64,
+                        local_sync_policy,
+                    )
+                    .await
+                {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
             }
-            if let Err(e) = self
-                .maybe_payload_store_sync_data_async(materialized_bytes as u64, local_sync_policy)
-                .await
-            {
-                drop(session);
-                self.state.file_session.gc_if_idle(ino);
-                return Err(e);
+            _ => {
+                // Write failed or unknown policy — nothing to materialize.
             }
         }
 
