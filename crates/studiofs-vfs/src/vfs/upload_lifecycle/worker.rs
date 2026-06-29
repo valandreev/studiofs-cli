@@ -294,7 +294,7 @@ trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
         object_id: u64,
         adaptive_penalty: Duration,
     ) -> VfsResult<()>;
-    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>>;
+    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()>;
@@ -622,7 +622,9 @@ where
         let raw_payload: Option<Bytes> = if remote_object_visible {
             None
         } else {
-            self.local_payloads.read_for_upload(op.object_id).await?
+            self.local_payloads
+                .read_for_upload(op.object_id, op.payload_len)
+                .await?
         };
 
         let raw_payload = match raw_payload {
@@ -748,7 +750,10 @@ where
         if reconcile.is_none()
             && remote_object_visible
             && payload_len == 0
-            && let Some(cached_payload) = self.local_payloads.read_for_upload(op.object_id).await?
+            && let Some(cached_payload) = self
+                .local_payloads
+                .read_for_upload(op.object_id, op.payload_len)
+                .await?
         {
             payload_len = cached_payload.len() as u64;
             reconcile = self
@@ -1073,7 +1078,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .vfs
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let defer_delay = upload_disk_reread_defer_delay(
             foreground_active,
             false,
@@ -1098,7 +1103,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         Ok(())
     }
 
-    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>> {
         if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
             self.vfs
                 .state
@@ -1135,7 +1140,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .vfs
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let foreground_cost = self
             .vfs
             .state
@@ -1147,6 +1152,22 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             foreground_cost,
             self.vfs.upload_cache_io_slots_max,
         );
+        let pacing_delay =
+            foreground_upload_reread_pacing_delay(foreground_active, payload_len as usize);
+        if !pacing_delay.is_zero() {
+            self.vfs.debug_write_probe(
+                "H5",
+                concat!(file!(), ":", line!()),
+                "upload reread paced before local payload read",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "payload_len": payload_len,
+                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "slot_cost": upload_io_cost,
+                }),
+            );
+            tokio::time::sleep(pacing_delay).await;
+        }
         let wait_started = Instant::now();
         let upload_io_permit = self
             .vfs
@@ -1162,22 +1183,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let staged_payload = self.vfs.upload_stage_get_async(object_id).await?;
         if let Some(staged_payload) = staged_payload {
-            let pacing_delay =
-                foreground_upload_reread_pacing_delay(foreground_active, staged_payload.len());
-            if !pacing_delay.is_zero() {
-                self.vfs.debug_write_probe(
-                    "H5",
-                    concat!(file!(), ":", line!()),
-                    "upload staged read paced under foreground reads",
-                    serde_json::json!({
-                        "object_id": object_id,
-                        "staged_bytes": staged_payload.len(),
-                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "slot_cost": upload_io_cost,
-                    }),
-                );
-                tokio::time::sleep(pacing_delay).await;
-            }
             drop(upload_io_permit);
             self.vfs
                 .state
@@ -1216,24 +1221,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .payload_store_get_for_upload_async(object_id)
             .await?;
         let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-        let pacing_delay = read_result
-            .as_ref()
-            .map(|payload| foreground_upload_reread_pacing_delay(foreground_active, payload.len()))
-            .unwrap_or(Duration::ZERO);
-        if !pacing_delay.is_zero() {
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload reread paced under foreground reads",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "reread_bytes": read_result.as_ref().map(|payload| payload.len()).unwrap_or(0),
-                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "slot_cost": upload_io_cost,
-                }),
-            );
-            tokio::time::sleep(pacing_delay).await;
-        }
         drop(upload_io_permit);
 
         self.vfs
@@ -2179,7 +2166,11 @@ mod tests {
             Ok(())
         }
 
-        async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        async fn read_for_upload(
+            &self,
+            object_id: u64,
+            _payload_len: u64,
+        ) -> VfsResult<Option<Bytes>> {
             Ok(self
                 .upload_reads
                 .lock()

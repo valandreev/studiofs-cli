@@ -744,14 +744,13 @@ fn with_mounted_fuse(
     let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, suffix, &rt);
+    let mut runtime_options = StudioFuseRuntimeOptions::from_env();
+    runtime_options.async_write_enabled = mode.async_write_enabled();
+    runtime_options.linux_async_dio_enabled = mode.async_dio_enabled();
     let fs = StudioFuseFs::new_with_runtime_options(
-        vfs,
+        Arc::clone(&vfs),
         rt.handle().clone(),
-        StudioFuseRuntimeOptions {
-            async_write_enabled: mode.async_write_enabled(),
-            linux_async_dio_enabled: mode.async_dio_enabled(),
-            ..StudioFuseRuntimeOptions::default()
-        },
+        runtime_options,
     );
 
     let config = fuse_test_config(format!("studiofs-{suffix}"));

@@ -231,7 +231,6 @@ impl WriteAdmissionPressure {
         self.writer_stack_dirty_bytes
             .saturating_add(self.pending_local_dirty_bytes)
             .saturating_add(self.pending_persisted_slice_bytes)
-            .saturating_add(self.pending_upload_bytes)
     }
 }
 
@@ -1670,6 +1669,7 @@ struct PublishedReadPlanCacheEntry {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
+    last_foreground_write_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
@@ -1695,6 +1695,7 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
+            last_foreground_write_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
@@ -1849,6 +1850,8 @@ impl ReadState {
         len: usize,
         tracker: AccessTrackerConfig,
     ) -> AccessDecision {
+        self.last_foreground_write_ms
+            .store(now_unix_millis(), Ordering::Relaxed);
         if let Some(open_file) = open_file {
             let decision = open_file.observe_write(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
@@ -1952,6 +1955,17 @@ impl ReadState {
             return true;
         }
         let last = self.last_foreground_read_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn foreground_user_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        if self.foreground_read_active(now_ms, idle_grace) {
+            return true;
+        }
+        let last = self.last_foreground_write_ms.load(Ordering::Relaxed);
         if last == 0 {
             return false;
         }
@@ -4278,7 +4292,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_user_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6153,6 +6167,7 @@ impl StudioVfs {
                         "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
                         "writer_stack_dirty_bytes": writer_stack_pressure_bytes,
                         "pressure_bytes": pressure_bytes,
+                        "pending_upload_bytes": pressure.pending_upload_bytes,
                         "buffer_budget_bytes": buffer_budget_bytes,
                         "hard_window_bytes": hard_window_bytes,
                         "next_bytes": next_bytes,
@@ -6196,6 +6211,7 @@ impl StudioVfs {
                     "drain_bytes_per_sec": decision.drain_bytes_per_sec,
                     "runway_ms": decision.runway_ms,
                     "pressure_bytes": pressure_bytes,
+                    "pending_upload_bytes": pressure.pending_upload_bytes,
                     "budget_bytes": buffer_budget_bytes,
                     "next_bytes": next_bytes,
                 }),

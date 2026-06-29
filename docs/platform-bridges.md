@@ -181,7 +181,7 @@ Current signature includes additional policy controls:
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | `131072` bytes on macOS and Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
+| Kernel `max_write` | macOS and Linux conservative profile: `131072` bytes. Linux high-throughput profile: up to `16777216` bytes, clamped by `/proc/sys/fs/fuse/max_pages_limit`. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
 | Kernel `max_readahead` | `131072` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | macOS: `50` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `128`. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `96`. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
@@ -195,19 +195,23 @@ Current signature includes additional policy controls:
 | macOS: validated macFUSE | 5.2.0 |
 
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
-high-throughput tuning profile. It keeps `max_write` and `max_readahead` at the
-Linux default 128 KiB unless explicitly overridden, and sets
-`max_background=128` plus `congestion_threshold=96`. This is the Linux default.
+high-throughput tuning profile. It requests `max_write=16 MiB`, keeps
+`max_readahead` at the Linux default 128 KiB, and sets `max_background=128`
+plus `congestion_threshold=96`. This is the Linux default.
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
 `STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
 the primary FUSE bridge throughput controls for local payload I/O. Explicit env
-vars override the selected Linux profile. Set either background queue env var to
-an empty string to leave that value at the kernel/fuser default; `0` has the
-same opt-out meaning for these two background queue controls. StudioFS clamps
-congestion thresholds above an explicitly configured `max_background`; when only
-`STUDIOFS_FUSE_CONGESTION_THRESHOLD` is set, fuser may still clamp it against
-its own default `max_background` during the FUSE init reply.
+vars override the selected Linux profile. Linux `max_write` is also capped by
+the kernel FUSE page limit: `max_pages_limit * page_size`. On typical 4 KiB
+pages, `max_pages_limit=256` means a 1 MiB ceiling; use `1024` for 4 MiB if the
+stand allows changing `/proc/sys/fs/fuse/max_pages_limit`. Set either
+background queue env var to an empty string to leave that value at the
+kernel/fuser default; `0` has the same opt-out meaning for these two background
+queue controls. StudioFS clamps congestion thresholds above an explicitly
+configured `max_background`; when only `STUDIOFS_FUSE_CONGESTION_THRESHOLD` is
+set, fuser may still clamp it against its own default `max_background` during
+the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 

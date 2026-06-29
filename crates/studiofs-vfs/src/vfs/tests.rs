@@ -6066,7 +6066,7 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 }
 
 #[test]
-fn write_admission_pressure_includes_pending_upload_backlog() {
+fn write_admission_pressure_total_excludes_pending_upload_backlog() {
     let pressure = WriteAdmissionPressure {
         writer_stack_dirty_bytes: 10,
         pending_local_dirty_bytes: 20,
@@ -6074,7 +6074,8 @@ fn write_admission_pressure_includes_pending_upload_backlog() {
         pending_upload_bytes: 40,
     };
 
-    assert_eq!(pressure.total_bytes(), 100);
+    assert_eq!(pressure.pending_upload_bytes, 40);
+    assert_eq!(pressure.total_bytes(), 60);
 }
 
 #[test]
@@ -6106,7 +6107,7 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
     let pressure = vfs.write_admission_pressure();
 
     assert_eq!(pressure.pending_upload_bytes, 8);
-    assert_eq!(pressure.total_bytes(), 8);
+    assert_eq!(pressure.total_bytes(), 0);
 }
 
 #[test]
@@ -6717,6 +6718,29 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
         !state.foreground_read_active(171, grace),
         "foreground read activity should expire after the configured idle grace"
     );
+}
+
+#[test]
+fn foreground_user_io_active_respects_idle_grace_after_last_write() {
+    let state = ReadState::new(1);
+    let grace = Duration::from_millis(50);
+
+    let _ = state.observe_write_access(
+        None,
+        1,
+        0,
+        4096,
+        AccessTrackerConfig {
+            block_size: 4096,
+            readahead_base_width: 8,
+            readahead_max_width: 32,
+            readahead_min_prefetch: 2,
+        },
+    );
+
+    let last_write = state.last_foreground_write_ms.load(AtomicOrdering::Relaxed);
+    assert!(state.foreground_user_io_active(last_write + 49, grace));
+    assert!(!state.foreground_user_io_active(last_write + 51, grace));
 }
 
 #[tokio::test]
