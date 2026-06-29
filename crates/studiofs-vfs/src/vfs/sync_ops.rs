@@ -186,13 +186,13 @@ impl StudioVfs {
         offset: u64,
         len: usize,
         local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<u64> {
         if !local_sync_policy.is_opportunistic() || len == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let admission = self.observe_sustained_write_admission(ino, offset, len);
         if !admission.pre_drain {
-            return Ok(());
+            return Ok(admission.delay_ms);
         }
 
         // #region debug log
@@ -206,6 +206,7 @@ impl StudioVfs {
                 "len": len,
                 "duration_ms": admission.duration_ms,
                 "effective_buffer_bytes": admission.effective_buffer_bytes,
+                "delay_ms": admission.delay_ms,
                 "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
             }),
@@ -213,7 +214,7 @@ impl StudioVfs {
         // #endregion debug log
 
         self.spawn_deferred_materialization_if_needed(ino).await;
-        Ok(())
+        Ok(admission.delay_ms)
     }
 
     fn record_deferred_write_hard_backpressure(&self, ino: Ino, hard_threshold_bytes: usize) {
@@ -1393,9 +1394,11 @@ impl StudioVfs {
             }
         }
         if local_sync_policy.is_opportunistic() {
-            self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
+            let sustained_delay_ms = self
+                .maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
-            self.maybe_throttle_write_admission(data.len()).await;
+            self.maybe_throttle_write_admission(data.len(), sustained_delay_ms)
+                .await;
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(

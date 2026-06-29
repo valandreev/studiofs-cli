@@ -213,8 +213,9 @@ const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
-const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
-const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DELAY_STEP_MS: u64 = 1_500;
+const SUSTAINED_WRITE_MAX_DELAY_MS: u64 = 8;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -284,6 +285,7 @@ struct SustainedWriteState {
 struct SustainedWriteAdmission {
     duration_ms: u64,
     effective_buffer_bytes: usize,
+    delay_ms: u64,
     pre_drain: bool,
 }
 
@@ -315,8 +317,9 @@ impl SustainedWriteState {
         SustainedWriteAdmission {
             duration_ms,
             effective_buffer_bytes,
-            pre_drain: duration_ms >= SUSTAINED_WRITE_DECAY_START_MS
-                && dirty_bytes_after_write > effective_buffer_bytes,
+            delay_ms: sustained_write_delay_ms(duration_ms),
+            pre_drain: duration_ms >= SUSTAINED_WRITE_DELAY_START_MS
+                && dirty_bytes_after_write > drain_chunk_bytes,
         }
     }
 }
@@ -481,22 +484,20 @@ impl WriteAdmissionGovernor {
 fn sustained_write_effective_buffer_bytes(
     base_buffer_bytes: usize,
     drain_chunk_bytes: usize,
-    duration_ms: u64,
+    _duration_ms: u64,
 ) -> usize {
-    let floor = drain_chunk_bytes.max(1);
-    if duration_ms < SUSTAINED_WRITE_DECAY_START_MS {
-        return base_buffer_bytes.max(floor);
-    }
+    base_buffer_bytes.max(drain_chunk_bytes).max(1)
+}
 
-    let steps = duration_ms
-        .saturating_sub(SUSTAINED_WRITE_DECAY_START_MS)
-        .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
+fn sustained_write_delay_ms(duration_ms: u64) -> u64 {
+    if duration_ms < SUSTAINED_WRITE_DELAY_START_MS {
+        return 0;
+    }
+    duration_ms
+        .saturating_sub(SUSTAINED_WRITE_DELAY_START_MS)
+        .saturating_div(SUSTAINED_WRITE_DELAY_STEP_MS)
         .saturating_add(1)
-        .min(usize::BITS as u64 - 1);
-    let divisor = 1usize
-        .checked_shl(steps as u32)
-        .expect("shift count is clamped below usize bit width");
-    base_buffer_bytes.saturating_div(divisor).max(floor)
+        .min(SUSTAINED_WRITE_MAX_DELAY_MS)
 }
 
 // =============================================================================
@@ -6142,7 +6143,7 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
-    async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
+    async fn maybe_throttle_write_admission(&self, next_bytes: usize, sustained_delay_ms: u64) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
@@ -6196,7 +6197,8 @@ impl StudioVfs {
                 next_bytes,
             })
         };
-        if decision.delay_ms == 0 {
+        let delay_ms = decision.delay_ms.max(sustained_delay_ms);
+        if delay_ms == 0 {
             return;
         }
         // #region debug log
@@ -6206,7 +6208,9 @@ impl StudioVfs {
                 concat!(file!(), ":", line!()),
                 "write admission governor pacing",
                 serde_json::json!({
-                    "delay_ms": decision.delay_ms,
+                    "delay_ms": delay_ms,
+                    "governor_delay_ms": decision.delay_ms,
+                    "sustained_delay_ms": sustained_delay_ms,
                     "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
                     "drain_bytes_per_sec": decision.drain_bytes_per_sec,
                     "runway_ms": decision.runway_ms,
@@ -6223,7 +6227,7 @@ impl StudioVfs {
             return;
         }
         let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         self.record_write_admission_wait(started.elapsed());
     }
 
