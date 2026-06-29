@@ -173,6 +173,21 @@ fn upload_disk_reread_defer_delay(
     (!wait.is_zero()).then_some(wait)
 }
 
+fn upload_hot_start_delay(
+    foreground_write_active: bool,
+    dirty_bytes: usize,
+    max_dirty_bytes: usize,
+    idle_grace: Duration,
+) -> Duration {
+    if foreground_write_active
+        && dirty_bytes < super::super::aggressive_materialization_threshold_bytes(max_dirty_bytes)
+    {
+        idle_grace
+    } else {
+        Duration::ZERO
+    }
+}
+
 fn foreground_upload_reread_slot_cost(
     foreground_active: bool,
     foreground_cost: u32,
@@ -1105,11 +1120,12 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .state
                 .read
                 .foreground_write_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-            let start_delay = if foreground_active {
-                self.vfs.upload_user_idle_grace
-            } else {
-                Duration::ZERO
-            };
+            let start_delay = upload_hot_start_delay(
+                foreground_active,
+                self.vfs.total_pending_write_buffer_bytes(),
+                self.vfs.max_dirty_bytes(),
+                self.vfs.upload_user_idle_grace,
+            );
             if !start_delay.is_zero() {
                 self.vfs.debug_write_probe(
                     "H5",
@@ -3773,6 +3789,22 @@ mod tests {
                 Duration::from_millis(500),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn upload_hot_start_delay_stops_waiting_at_dirty_threshold() {
+        assert_eq!(
+            upload_hot_start_delay(true, 3, 8, Duration::from_millis(50)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            upload_hot_start_delay(true, 4, 8, Duration::from_millis(50)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            upload_hot_start_delay(false, 0, 8, Duration::from_millis(50)),
+            Duration::ZERO
         );
     }
 

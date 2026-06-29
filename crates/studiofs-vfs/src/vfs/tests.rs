@@ -6039,9 +6039,9 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 4 * 1024 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 800 * 1024 * 1024);
     assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
-    assert_eq!(derived.max_dirty_bytes, 4 * 1024 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 800 * 1024 * 1024);
     assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
     assert_eq!(derived.transit_memory_budget_bytes, 800 * 1024 * 1024);
 }
@@ -6351,7 +6351,7 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
 
 #[test]
 fn sustained_write_window_keeps_full_buffer_for_long_streams() {
-    let base = 4 * 1024 * 1024 * 1024usize;
+    let base = 800 * 1024 * 1024usize;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -6382,7 +6382,7 @@ fn sustained_write_window_keeps_full_buffer_for_long_streams() {
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 4 * 1024 * 1024 * 1024usize;
+    let base = 800 * 1024 * 1024usize;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
