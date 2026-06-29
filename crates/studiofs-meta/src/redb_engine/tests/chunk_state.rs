@@ -737,6 +737,49 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
 }
 
 #[test]
+fn mark_overlay_objects_uploaded_batches_matching_objects() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"overlay-upload-batch.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 7;
+    attr.size = 8192;
+
+    let slices = vec![
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(0, 4096).expect("valid range"),
+            payload: Some(PayloadRef::new_partial(700_001, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(4096, 8192).expect("valid range"),
+            payload: Some(PayloadRef::new_partial(700_002, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+    ];
+    engine
+        .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], Some(&attr))
+        .unwrap();
+
+    let marked = engine
+        .mark_regular_file_overlay_objects_uploaded_if_match(ino, 7, &[700_001, 700_999, 700_002])
+        .unwrap();
+
+    assert_eq!(marked, vec![700_001, 700_002]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(ino, 7)
+            .unwrap(),
+        "batch-marked objects should satisfy publish preconditions"
+    );
+}
+
+#[test]
 fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
     let engine = temp_engine();
     let mut stale_attr = engine

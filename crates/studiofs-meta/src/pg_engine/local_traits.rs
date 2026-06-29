@@ -231,14 +231,26 @@ impl MetaPayloadObjects for PgMetaEngine {
         expected_epoch: u64,
         object_id: u64,
     ) -> MetaResult<bool> {
+        let result = self
+            .mark_regular_file_overlay_objects_uploaded_if_match(ino, expected_epoch, &[object_id])
+            .map(|marked| marked.contains(&object_id));
+        result
+    }
+
+    fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
         let result = self.mutate(|local| {
-            local.mark_regular_file_overlay_object_uploaded_if_matches(
+            local.mark_regular_file_overlay_objects_uploaded_if_match(
                 ino,
                 expected_epoch,
-                object_id,
+                object_ids,
             )
         });
-        if matches!(result, Ok(true)) {
+        if matches!(result, Ok(ref marked) if !marked.is_empty()) {
             self.request_pending_flush();
         }
         result

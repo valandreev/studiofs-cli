@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -318,6 +318,27 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
+    async fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        let mut marked = Vec::new();
+        for &object_id in object_ids {
+            if self
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    expected_epoch,
+                    object_id,
+                )
+                .await?
+            {
+                marked.push(object_id);
+            }
+        }
+        Ok(marked)
+    }
     async fn reattach_uploaded_object_if_uncovered(
         &self,
         ino: Ino,
@@ -1315,6 +1336,56 @@ struct VfsUploadMetaPort {
     vfs: Arc<StudioVfs>,
 }
 
+impl VfsUploadMetaPort {
+    async fn drain_upload_completion_batch(&self) {
+        loop {
+            tokio::task::yield_now().await;
+            let entries = {
+                let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+                if batch.pending.is_empty() {
+                    batch.draining = false;
+                    return;
+                }
+                std::mem::take(&mut batch.pending)
+            };
+
+            let mut groups: HashMap<(Ino, u64), Vec<super::super::UploadCompletionBatchEntry>> =
+                HashMap::new();
+            for entry in entries {
+                groups
+                    .entry((entry.ino, entry.expected_epoch))
+                    .or_default()
+                    .push(entry);
+            }
+
+            for ((ino, expected_epoch), entries) in groups {
+                let object_ids: Vec<u64> = entries.iter().map(|entry| entry.object_id).collect();
+                match self
+                    .mark_regular_file_overlay_objects_uploaded_if_match(
+                        ino,
+                        expected_epoch,
+                        &object_ids,
+                    )
+                    .await
+                {
+                    Ok(marked) => {
+                        let marked: HashSet<u64> = marked.into_iter().collect();
+                        for entry in entries {
+                            let _ = entry.result_tx.send(Ok(marked.contains(&entry.object_id)));
+                        }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        for entry in entries {
+                            let _ = entry.result_tx.send(Err(VfsError::Other(error.clone())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl UploadMetaPort for VfsUploadMetaPort {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>> {
         let meta = self.vfs.meta.clone();
@@ -1344,12 +1415,48 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let should_drain = {
+            let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+            batch
+                .pending
+                .push(super::super::UploadCompletionBatchEntry {
+                    ino,
+                    expected_epoch,
+                    object_id,
+                    result_tx,
+                });
+            if batch.draining {
+                false
+            } else {
+                batch.draining = true;
+                true
+            }
+        };
+        if should_drain {
+            self.drain_upload_completion_batch().await;
+        }
+        result_rx.await.map_err(|_| {
+            VfsError::Other("upload completion batch result was dropped".to_string())
+        })?
+    }
+
+    async fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let meta = self.vfs.meta.clone();
+        let object_ids = object_ids.to_vec();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.mark_regular_file_overlay_object_uploaded_if_matches(
+            engine.mark_regular_file_overlay_objects_uploaded_if_match(
                 ino,
                 expected_epoch,
-                object_id,
+                &object_ids,
             )
         })
         .await

@@ -1346,6 +1346,7 @@ struct UploadState {
     pending_epoch_finalizations: OrderedMutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
+    upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
@@ -1369,6 +1370,18 @@ struct UploadState {
     upload_fallback_read_max_ns: AtomicU64,
     /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
+}
+
+struct UploadCompletionBatch {
+    pending: Vec<UploadCompletionBatchEntry>,
+    draining: bool,
+}
+
+struct UploadCompletionBatchEntry {
+    ino: Ino,
+    expected_epoch: u64,
+    object_id: u64,
+    result_tx: tokio::sync::oneshot::Sender<VfsResult<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1567,6 +1580,10 @@ impl UploadState {
                 std::collections::HashMap::new(),
                 LockTier::Upload,
             ),
+            upload_completion_batch: tokio::sync::Mutex::new(UploadCompletionBatch {
+                pending: Vec::new(),
+                draining: false,
+            }),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),

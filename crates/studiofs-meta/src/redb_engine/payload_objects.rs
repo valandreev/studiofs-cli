@@ -311,11 +311,26 @@ impl MetaPayloadObjects for RedbMetaEngine {
         expected_epoch: u64,
         object_id: u64,
     ) -> MetaResult<bool> {
+        Ok(self
+            .mark_regular_file_overlay_objects_uploaded_if_match(ino, expected_epoch, &[object_id])?
+            .contains(&object_id))
+    }
+
+    fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested: HashSet<u64> = object_ids.iter().copied().collect();
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let changed_chunk_slices = {
+        let matched_ids = {
             let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -324,11 +339,11 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
                 Some(g) => g.value().to_vec(),
-                None => return Ok(false),
+                None => return Ok(Vec::new()),
             };
             let attr: InodeAttr = decode(&attr_bytes)?;
             if attr.content_epoch != expected_epoch {
-                return Ok(false);
+                return Ok(Vec::new());
             }
             drop(inodes);
 
@@ -338,7 +353,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 ino,
             )?;
             let mut changed_chunk_slices = Vec::new();
-            let mut matched_object = false;
+            let mut matched_ids = HashSet::new();
 
             for (chunk_id, mut chunk_state) in overlay_chunks {
                 let mut changed = false;
@@ -346,10 +361,10 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     let Some(block) = slice.payload.as_ref() else {
                         continue;
                     };
-                    if block.object_id != object_id {
+                    if !requested.contains(&block.object_id) {
                         continue;
                     }
-                    matched_object = true;
+                    matched_ids.insert(block.object_id);
                     if slice.payload_state != PayloadRefState::Uploaded {
                         slice.payload_state = PayloadRefState::Uploaded;
                         changed = true;
@@ -369,8 +384,8 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 }
             }
 
-            if !matched_object {
-                return Ok(false);
+            if matched_ids.is_empty() {
+                return Ok(Vec::new());
             }
 
             if !changed_chunk_slices.is_empty() {
@@ -384,18 +399,15 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
             }
 
-            changed_chunk_slices
+            matched_ids
         };
-
-        if changed_chunk_slices.is_empty() {
-            txn.commit()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            return Ok(true);
-        }
-
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(true)
+        Ok(object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| matched_ids.contains(object_id))
+            .collect())
     }
 
     fn publish_regular_file_overlay_to_base_if_matches(
@@ -656,6 +668,7 @@ impl RedbMetaEngine {
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+
         if let Some(attr) = attr {
             match Self::get_attr_merged_in_write_txn(&txn, ino) {
                 Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),
@@ -785,6 +798,7 @@ impl RedbMetaEngine {
                 Self::set_inode_overlay_in_txn(&txn, attr)?;
             }
         }
+
         Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
         Self::append_event_in_txn(
