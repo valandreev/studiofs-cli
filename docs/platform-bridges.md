@@ -213,10 +213,10 @@ On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 
 ### Linux cache and I/O policy
 
-Linux FUSE keeps buffered I/O as the default. Read-only regular file opens
-return `FOPEN_KEEP_CACHE`, while write-capable, append, and truncate opens leave
-the flag clear so the kernel does not keep potentially stale cached pages across
-write-capable handles. Opens do not request `FOPEN_DIRECT_IO`.
+Linux FUSE keeps buffered I/O for read-only regular file opens, which return
+`FOPEN_KEEP_CACHE`. Write-capable, append, and truncate opens return
+`FOPEN_DIRECT_IO` so StudioFS owns write buffering instead of entering Linux
+page-cache dirty throttling during foreground writes.
 Regular file attributes report a 4 MiB preferred I/O size to match the bridge
 read/write sizing policy instead of advertising a 512-byte block size.
 
@@ -234,8 +234,13 @@ the default is off.
 
 `STUDIOFS_FUSE_ASYNC_WRITE=0` disables the Linux bridge queue for targeted A/B
 runs. The default Linux write callback copies caller bytes into owned buffers,
-admits writes on runtime tasks, and keeps staging, barriers, and upload
-lifecycle in the shared VFS writer stack.
+replies once those bytes are accepted into StudioFS memory, and completes the
+pending write after VFS staging. Flush/fsync/release barriers surface delayed
+staging errors, so direct-I/O write handles intentionally use StudioFS
+writeback semantics for throughput rather than per-syscall durability. Upload
+lifecycle remains in the shared VFS writer stack. The default per-handle async
+write admission window is 64 MiB, matching one logical chunk, with a 256 MiB
+global cap so several handles can make progress concurrently.
 
 `STUDIOFS_FUSE_ASYNC_READ=1` enables the Linux bridge read reply path. It moves
 regular file reads from the FUSE callback stack onto the mount runtime while

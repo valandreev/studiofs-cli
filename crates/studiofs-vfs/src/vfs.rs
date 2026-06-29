@@ -214,7 +214,6 @@ const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
-const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -308,11 +307,7 @@ impl SustainedWriteState {
         self.last_end_offset = end_offset;
 
         let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
-        let effective_buffer_bytes = sustained_write_effective_buffer_bytes(
-            base_buffer_bytes,
-            drain_chunk_bytes,
-            duration_ms,
-        );
+        let effective_buffer_bytes = base_buffer_bytes.max(drain_chunk_bytes.max(1));
         SustainedWriteAdmission {
             duration_ms,
             effective_buffer_bytes,
@@ -477,27 +472,6 @@ impl WriteAdmissionGovernor {
         let divisor = u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT.saturating_add(1));
         (weighted / divisor).min(u128::from(u64::MAX)) as u64
     }
-}
-
-fn sustained_write_effective_buffer_bytes(
-    base_buffer_bytes: usize,
-    drain_chunk_bytes: usize,
-    duration_ms: u64,
-) -> usize {
-    let floor = drain_chunk_bytes.max(1);
-    if duration_ms < SUSTAINED_WRITE_DECAY_START_MS {
-        return base_buffer_bytes.max(floor);
-    }
-
-    let steps = duration_ms
-        .saturating_sub(SUSTAINED_WRITE_DECAY_START_MS)
-        .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
-        .saturating_add(1)
-        .min(usize::BITS as u64 - 1);
-    let divisor = 1usize
-        .checked_shl(steps as u32)
-        .expect("shift count is clamped below usize bit width");
-    base_buffer_bytes.saturating_div(divisor).max(floor)
 }
 
 // =============================================================================
@@ -1670,6 +1644,7 @@ struct PublishedReadPlanCacheEntry {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
+    last_foreground_write_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
@@ -1695,6 +1670,7 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
+            last_foreground_write_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
@@ -1947,15 +1923,31 @@ impl ReadState {
         }
     }
 
-    fn foreground_read_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+    fn mark_foreground_write(&self, now_ms: u64) {
+        self.last_foreground_write_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+
+    fn foreground_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
         if self.foreground_reads_inflight.load(Ordering::Relaxed) > 0 {
             return true;
         }
-        let last = self.last_foreground_read_ms.load(Ordering::Relaxed);
+        let last = self
+            .last_foreground_read_ms
+            .load(Ordering::Relaxed)
+            .max(self.last_foreground_write_ms.load(Ordering::Relaxed));
         if last == 0 {
             return false;
         }
-        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+        now_ms.saturating_sub(last) <= u64::try_from(idle_grace.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn foreground_write_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        let last = self.last_foreground_write_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(last) <= u64::try_from(idle_grace.as_millis()).unwrap_or(u64::MAX)
     }
 
     fn record_foreground_read_latency(
@@ -3190,7 +3182,15 @@ impl StudioVfs {
         if total_dirty_bytes == 0 {
             return false;
         }
-        total_dirty_bytes >= aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+        let foreground_active = self
+            .state
+            .read
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
+        let max_dirty_bytes = self.max_dirty_bytes();
+        if foreground_active && total_dirty_bytes < max_dirty_bytes {
+            return false;
+        }
+        total_dirty_bytes >= aggressive_materialization_threshold_bytes(max_dirty_bytes)
     }
 
     fn clone_into_write_buffer(&self, data: &[u8]) -> BytesMut {
@@ -4278,7 +4278,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -5938,7 +5938,7 @@ impl StudioVfs {
             if !self
                 .state
                 .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+                .foreground_io_active(now_ms, self.upload_user_idle_grace)
             {
                 return true;
             }
@@ -5953,7 +5953,7 @@ impl StudioVfs {
             if !self
                 .state
                 .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+                .foreground_io_active(now_ms, self.upload_user_idle_grace)
             {
                 return true;
             }
@@ -6793,6 +6793,7 @@ impl StudioVfs {
 
     /// Record VFS write call counters and byte totals.
     pub(super) fn note_vfs_write_call(&self, write_bytes: usize) {
+        self.state.read.mark_foreground_write(now_unix_millis());
         self.state
             .metrics
             .vfs_write_calls

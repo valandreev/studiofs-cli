@@ -507,11 +507,10 @@ prefetch reserve is capped to at most half of the current fetch AIMD window so
 the default foreground reserve cannot collapse cold sequential prefetch to only
 one or two active S3 GETs during ramp-up.
 
-The writeback dirty-buffer default is `300MB` (`max_dirty_bytes`), matching the
-JuiceFS default read/write buffer size. StudioFS derives the soft throttle window
-and hard safety threshold from that single dirty budget. Upload backlog bytes are
-reported separately and do not by themselves stall ordinary writes while local
-cache headroom remains available.
+The writeback dirty-buffer default is `800MiB` (`max_dirty_bytes`). StudioFS
+derives the soft throttle window and hard safety threshold from that single
+dirty budget. Upload backlog bytes are reported separately and do not by
+themselves stall ordinary writes while local cache headroom remains available.
 
 `STUDIOFS_WRITER_PAGE_SIZE_BYTES` is an expert-only mount/runtime override for
 the mounted writer stack's internal page geometry. Leave it unset to preserve
