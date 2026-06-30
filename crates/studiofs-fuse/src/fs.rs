@@ -1482,14 +1482,11 @@ impl StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
-            match u32::try_from(data_len) {
-                Ok(_) => {}
-                Err(_) => {
-                    reply.error(libc::EOVERFLOW);
-                    registration.complete(PendingWriteCompletion::Error(libc::EOVERFLOW));
-                    buffer_pool.put(data);
-                    return;
-                }
+            let Ok(_) = u32::try_from(data_len) else {
+                reply.error(libc::EOVERFLOW);
+                registration.complete(PendingWriteCompletion::Error(libc::EOVERFLOW));
+                buffer_pool.put(data);
+                return;
             };
             self.rt.spawn(async move {
                 let mut registration = registration;

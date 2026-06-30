@@ -158,7 +158,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalPayloadBackendError;
 use studiofs_cache::PreparedLocalPayloadRuntime;
@@ -1347,6 +1347,7 @@ struct UploadState {
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
     upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
+    upload_completion_draining: AtomicBool,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
@@ -1374,7 +1375,6 @@ struct UploadState {
 
 struct UploadCompletionBatch {
     pending: Vec<UploadCompletionBatchEntry>,
-    draining: bool,
 }
 
 struct UploadCompletionBatchEntry {
@@ -1582,8 +1582,8 @@ impl UploadState {
             ),
             upload_completion_batch: tokio::sync::Mutex::new(UploadCompletionBatch {
                 pending: Vec::new(),
-                draining: false,
             }),
+            upload_completion_draining: AtomicBool::new(false),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),

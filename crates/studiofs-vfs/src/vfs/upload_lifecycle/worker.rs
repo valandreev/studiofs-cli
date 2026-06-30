@@ -1336,14 +1336,26 @@ struct VfsUploadMetaPort {
     vfs: Arc<StudioVfs>,
 }
 
+struct UploadCompletionDrainGuard<'a> {
+    draining: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for UploadCompletionDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.draining.store(false, Ordering::Release);
+    }
+}
+
 impl VfsUploadMetaPort {
     async fn drain_upload_completion_batch(&self) {
+        let _guard = UploadCompletionDrainGuard {
+            draining: &self.vfs.state.upload.upload_completion_draining,
+        };
         loop {
             tokio::task::yield_now().await;
             let entries = {
                 let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
                 if batch.pending.is_empty() {
-                    batch.draining = false;
                     return;
                 }
                 std::mem::take(&mut batch.pending)
@@ -1426,12 +1438,12 @@ impl UploadMetaPort for VfsUploadMetaPort {
                     object_id,
                     result_tx,
                 });
-            if batch.draining {
-                false
-            } else {
-                batch.draining = true;
-                true
-            }
+            self.vfs
+                .state
+                .upload
+                .upload_completion_draining
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         };
         if should_drain {
             self.drain_upload_completion_batch().await;
@@ -2183,6 +2195,18 @@ mod tests {
         assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
         assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
         assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn upload_completion_drain_guard_resets_draining_on_drop() {
+        let draining = AtomicBool::new(true);
+        {
+            let _guard = UploadCompletionDrainGuard {
+                draining: &draining,
+            };
+        }
+
+        assert!(!draining.load(Ordering::Acquire));
     }
 
     #[test]
