@@ -174,7 +174,6 @@ impl StudioVfs {
             now_unix_millis(),
             offset,
             len,
-            self.max_dirty_bytes(),
             self.write_eager_flush_drain_chunk_bytes,
             dirty_bytes_after_write,
         )
@@ -205,7 +204,6 @@ impl StudioVfs {
                 "offset": offset,
                 "len": len,
                 "duration_ms": admission.duration_ms,
-                "effective_buffer_bytes": admission.effective_buffer_bytes,
                 "delay_ms": admission.delay_ms,
                 "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),

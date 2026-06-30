@@ -229,6 +229,7 @@ struct WriteAdmissionPressure {
 
 impl WriteAdmissionPressure {
     fn total_bytes(self) -> usize {
+        // Network upload backlog is not local write pressure; including it stalls local-first writes.
         self.writer_stack_dirty_bytes
             .saturating_add(self.pending_local_dirty_bytes)
             .saturating_add(self.pending_persisted_slice_bytes)
@@ -284,7 +285,6 @@ struct SustainedWriteState {
 #[derive(Debug, Clone, Copy, Default)]
 struct SustainedWriteAdmission {
     duration_ms: u64,
-    effective_buffer_bytes: usize,
     delay_ms: u64,
     pre_drain: bool,
 }
@@ -295,7 +295,6 @@ impl SustainedWriteState {
         now_ms: u64,
         offset: u64,
         len: usize,
-        base_buffer_bytes: usize,
         drain_chunk_bytes: usize,
         dirty_bytes_after_write: usize,
     ) -> SustainedWriteAdmission {
@@ -309,14 +308,8 @@ impl SustainedWriteState {
         self.last_end_offset = end_offset;
 
         let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
-        let effective_buffer_bytes = sustained_write_effective_buffer_bytes(
-            base_buffer_bytes,
-            drain_chunk_bytes,
-            duration_ms,
-        );
         SustainedWriteAdmission {
             duration_ms,
-            effective_buffer_bytes,
             delay_ms: sustained_write_delay_ms(duration_ms),
             pre_drain: duration_ms >= SUSTAINED_WRITE_DELAY_START_MS
                 && dirty_bytes_after_write > drain_chunk_bytes,
@@ -479,14 +472,6 @@ impl WriteAdmissionGovernor {
         let divisor = u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT.saturating_add(1));
         (weighted / divisor).min(u128::from(u64::MAX)) as u64
     }
-}
-
-fn sustained_write_effective_buffer_bytes(
-    base_buffer_bytes: usize,
-    drain_chunk_bytes: usize,
-    _duration_ms: u64,
-) -> usize {
-    base_buffer_bytes.max(drain_chunk_bytes).max(1)
 }
 
 fn sustained_write_delay_ms(duration_ms: u64) -> u64 {

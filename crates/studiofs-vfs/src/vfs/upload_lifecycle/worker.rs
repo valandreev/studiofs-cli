@@ -1338,24 +1338,40 @@ struct VfsUploadMetaPort {
 
 struct UploadCompletionDrainGuard<'a> {
     draining: &'a std::sync::atomic::AtomicBool,
+    armed: bool,
+}
+
+impl UploadCompletionDrainGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for UploadCompletionDrainGuard<'_> {
     fn drop(&mut self) {
-        self.draining.store(false, Ordering::Release);
+        if self.armed {
+            self.draining.store(false, Ordering::Release);
+        }
     }
 }
 
 impl VfsUploadMetaPort {
     async fn drain_upload_completion_batch(&self) {
-        let _guard = UploadCompletionDrainGuard {
+        let mut guard = UploadCompletionDrainGuard {
             draining: &self.vfs.state.upload.upload_completion_draining,
+            armed: true,
         };
         loop {
             tokio::task::yield_now().await;
             let entries = {
                 let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
                 if batch.pending.is_empty() {
+                    self.vfs
+                        .state
+                        .upload
+                        .upload_completion_draining
+                        .store(false, Ordering::Release);
+                    guard.disarm();
                     return;
                 }
                 std::mem::take(&mut batch.pending)
@@ -2203,10 +2219,25 @@ mod tests {
         {
             let _guard = UploadCompletionDrainGuard {
                 draining: &draining,
+                armed: true,
             };
         }
 
         assert!(!draining.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn upload_completion_drain_guard_disarm_preserves_draining_flag() {
+        let draining = AtomicBool::new(true);
+        {
+            let mut guard = UploadCompletionDrainGuard {
+                draining: &draining,
+                armed: true,
+            };
+            guard.disarm();
+        }
+
+        assert!(draining.load(Ordering::Acquire));
     }
 
     #[test]

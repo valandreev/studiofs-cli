@@ -325,7 +325,6 @@ impl MetaPayloadObjects for RedbMetaEngine {
         if object_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let requested: HashSet<u64> = object_ids.iter().copied().collect();
         let txn = self
             .db
             .begin_write()
@@ -361,7 +360,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     let Some(block) = slice.payload.as_ref() else {
                         continue;
                     };
-                    if !requested.contains(&block.object_id) {
+                    if !object_ids.contains(&block.object_id) {
                         continue;
                     }
                     matched_ids.insert(block.object_id);

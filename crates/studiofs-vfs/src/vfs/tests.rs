@@ -6353,76 +6353,50 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
 
 #[test]
 fn sustained_write_delay_ramps_to_stable_plateau_for_long_streams() {
-    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
-    let first = state.observe(1_000, 0, 4, base, drain, 4);
-    assert_eq!(first.effective_buffer_bytes, base);
+    let first = state.observe(1_000, 0, 4, drain, 4);
     assert_eq!(first.delay_ms, 0);
     assert!(!first.pre_drain);
 
-    let one = state.observe(2_500, 4, 4, base, drain, drain + 1);
-    assert_eq!(one.effective_buffer_bytes, base);
+    let one = state.observe(2_500, 4, 4, drain, drain + 1);
     assert_eq!(one.delay_ms, 1);
     assert!(one.pre_drain);
 
-    let two = state.observe(4_000, 8, 4, base, drain, drain + 1);
-    assert_eq!(two.effective_buffer_bytes, base);
+    let two = state.observe(4_000, 8, 4, drain, drain + 1);
     assert_eq!(two.delay_ms, 2);
     assert!(two.pre_drain);
 
     let mut plateau = two;
     for step in 3..=SUSTAINED_WRITE_MAX_DELAY_MS {
-        plateau = state.observe(
-            2_500 + (step - 1) * 1_500,
-            step * 4,
-            4,
-            base,
-            drain,
-            drain + 1,
-        );
+        plateau = state.observe(2_500 + (step - 1) * 1_500, step * 4, 4, drain, drain + 1);
     }
-    assert_eq!(plateau.effective_buffer_bytes, base);
     assert_eq!(plateau.delay_ms, SUSTAINED_WRITE_MAX_DELAY_MS);
     assert!(plateau.pre_drain);
 }
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
-    assert_eq!(
-        state
-            .observe(1_000, 0, 4, base, drain, base + 1)
-            .effective_buffer_bytes,
-        base
-    );
-    assert_eq!(
-        state
-            .observe(2_500, 4, 4, base, drain, base + 1)
-            .effective_buffer_bytes,
-        base
-    );
+    state.observe(1_000, 0, 4, drain, drain + 1);
+    state.observe(2_500, 4, 4, drain, drain + 1);
 
     let after_idle = state.observe(
         2_500 + SUSTAINED_WRITE_IDLE_RESET_MS + 1,
         8,
         4,
-        base,
         drain,
-        base + 1,
+        drain + 1,
     );
     assert_eq!(after_idle.duration_ms, 0);
-    assert_eq!(after_idle.effective_buffer_bytes, base);
     assert_eq!(after_idle.delay_ms, 0);
     assert!(!after_idle.pre_drain);
 
-    let after_seek = state.observe(4_000, 128, 4, base, drain, base + 1);
+    let after_seek = state.observe(4_000, 128, 4, drain, drain + 1);
     assert_eq!(after_seek.duration_ms, 0);
-    assert_eq!(after_seek.effective_buffer_bytes, base);
     assert_eq!(after_seek.delay_ms, 0);
     assert!(!after_seek.pre_drain);
 }
