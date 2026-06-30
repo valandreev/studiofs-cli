@@ -68,7 +68,7 @@ pub enum LinuxFuseProfile {
     Conservative,
     /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
-    /// macOS-like media profile: larger sequential geometry.
+    /// Media profile: larger sequential geometry.
     Media,
 }
 
@@ -1012,7 +1012,7 @@ pub struct StudioFuseFs {
     linux_writeback_cache_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
-    /// the DB are remapped to this so macOS permission checks don't block writes.
+    /// the DB are remapped to this so Unix permission checks don't block writes.
     mount_uid: u32,
     /// GID of the user that mounted the filesystem.
     mount_gid: u32,
@@ -1145,6 +1145,10 @@ impl StudioFuseRuntimeOptions {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors independent FUSE env knobs"
+    )]
     fn from_env_values(
         profile: Option<&str>,
         max_write: Option<&str>,
@@ -3612,7 +3616,7 @@ mod tests {
     }
 
     #[test]
-    fn media_linux_fuse_profile_matches_macos_media_geometry() {
+    fn media_linux_fuse_profile_matches_media_geometry() {
         let options = StudioFuseRuntimeOptions::from_env_values(
             Some("media"),
             None,

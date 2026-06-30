@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1349,8 +1349,8 @@ impl VfsUploadMetaPort {
                 std::mem::take(&mut batch.pending)
             };
 
-            let mut groups: HashMap<(Ino, u64), Vec<super::super::UploadCompletionBatchEntry>> =
-                HashMap::new();
+            let mut groups: BTreeMap<(Ino, u64), Vec<super::super::UploadCompletionBatchEntry>> =
+                BTreeMap::new();
             for entry in entries {
                 groups
                     .entry((entry.ino, entry.expected_epoch))
