@@ -158,7 +158,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalPayloadBackendError;
 use studiofs_cache::PreparedLocalPayloadRuntime;
@@ -213,8 +213,9 @@ const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
-const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
-const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DELAY_STEP_MS: u64 = 1_500;
+const SUSTAINED_WRITE_MAX_DELAY_MS: u64 = 8;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -228,10 +229,10 @@ struct WriteAdmissionPressure {
 
 impl WriteAdmissionPressure {
     fn total_bytes(self) -> usize {
+        // Network upload backlog is not local write pressure; including it stalls local-first writes.
         self.writer_stack_dirty_bytes
             .saturating_add(self.pending_local_dirty_bytes)
             .saturating_add(self.pending_persisted_slice_bytes)
-            .saturating_add(self.pending_upload_bytes)
     }
 }
 
@@ -284,7 +285,7 @@ struct SustainedWriteState {
 #[derive(Debug, Clone, Copy, Default)]
 struct SustainedWriteAdmission {
     duration_ms: u64,
-    effective_buffer_bytes: usize,
+    delay_ms: u64,
     pre_drain: bool,
 }
 
@@ -294,7 +295,6 @@ impl SustainedWriteState {
         now_ms: u64,
         offset: u64,
         len: usize,
-        base_buffer_bytes: usize,
         drain_chunk_bytes: usize,
         dirty_bytes_after_write: usize,
     ) -> SustainedWriteAdmission {
@@ -308,16 +308,11 @@ impl SustainedWriteState {
         self.last_end_offset = end_offset;
 
         let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
-        let effective_buffer_bytes = sustained_write_effective_buffer_bytes(
-            base_buffer_bytes,
-            drain_chunk_bytes,
-            duration_ms,
-        );
         SustainedWriteAdmission {
             duration_ms,
-            effective_buffer_bytes,
-            pre_drain: duration_ms >= SUSTAINED_WRITE_DECAY_START_MS
-                && dirty_bytes_after_write > effective_buffer_bytes,
+            delay_ms: sustained_write_delay_ms(duration_ms),
+            pre_drain: duration_ms >= SUSTAINED_WRITE_DELAY_START_MS
+                && dirty_bytes_after_write > drain_chunk_bytes,
         }
     }
 }
@@ -479,25 +474,15 @@ impl WriteAdmissionGovernor {
     }
 }
 
-fn sustained_write_effective_buffer_bytes(
-    base_buffer_bytes: usize,
-    drain_chunk_bytes: usize,
-    duration_ms: u64,
-) -> usize {
-    let floor = drain_chunk_bytes.max(1);
-    if duration_ms < SUSTAINED_WRITE_DECAY_START_MS {
-        return base_buffer_bytes.max(floor);
+fn sustained_write_delay_ms(duration_ms: u64) -> u64 {
+    if duration_ms < SUSTAINED_WRITE_DELAY_START_MS {
+        return 0;
     }
-
-    let steps = duration_ms
-        .saturating_sub(SUSTAINED_WRITE_DECAY_START_MS)
-        .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
+    duration_ms
+        .saturating_sub(SUSTAINED_WRITE_DELAY_START_MS)
+        .saturating_div(SUSTAINED_WRITE_DELAY_STEP_MS)
         .saturating_add(1)
-        .min(usize::BITS as u64 - 1);
-    let divisor = 1usize
-        .checked_shl(steps as u32)
-        .expect("shift count is clamped below usize bit width");
-    base_buffer_bytes.saturating_div(divisor).max(floor)
+        .min(SUSTAINED_WRITE_MAX_DELAY_MS)
 }
 
 // =============================================================================
@@ -1346,6 +1331,8 @@ struct UploadState {
     pending_epoch_finalizations: OrderedMutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
+    upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
+    upload_completion_draining: AtomicBool,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
@@ -1369,6 +1356,17 @@ struct UploadState {
     upload_fallback_read_max_ns: AtomicU64,
     /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
+}
+
+struct UploadCompletionBatch {
+    pending: Vec<UploadCompletionBatchEntry>,
+}
+
+struct UploadCompletionBatchEntry {
+    ino: Ino,
+    expected_epoch: u64,
+    object_id: u64,
+    result_tx: tokio::sync::oneshot::Sender<VfsResult<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1567,6 +1565,10 @@ impl UploadState {
                 std::collections::HashMap::new(),
                 LockTier::Upload,
             ),
+            upload_completion_batch: tokio::sync::Mutex::new(UploadCompletionBatch {
+                pending: Vec::new(),
+            }),
+            upload_completion_draining: AtomicBool::new(false),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
@@ -1670,6 +1672,7 @@ struct PublishedReadPlanCacheEntry {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
+    last_foreground_write_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
@@ -1695,6 +1698,7 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
+            last_foreground_write_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
@@ -1849,6 +1853,8 @@ impl ReadState {
         len: usize,
         tracker: AccessTrackerConfig,
     ) -> AccessDecision {
+        self.last_foreground_write_ms
+            .store(now_unix_millis(), Ordering::Relaxed);
         if let Some(open_file) = open_file {
             let decision = open_file.observe_write(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
@@ -1952,6 +1958,17 @@ impl ReadState {
             return true;
         }
         let last = self.last_foreground_read_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn foreground_user_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        if self.foreground_read_active(now_ms, idle_grace) {
+            return true;
+        }
+        let last = self.last_foreground_write_ms.load(Ordering::Relaxed);
         if last == 0 {
             return false;
         }
@@ -4278,7 +4295,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_user_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6128,7 +6145,7 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
-    async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
+    async fn maybe_throttle_write_admission(&self, next_bytes: usize, sustained_delay_ms: u64) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
@@ -6153,6 +6170,7 @@ impl StudioVfs {
                         "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
                         "writer_stack_dirty_bytes": writer_stack_pressure_bytes,
                         "pressure_bytes": pressure_bytes,
+                        "pending_upload_bytes": pressure.pending_upload_bytes,
                         "buffer_budget_bytes": buffer_budget_bytes,
                         "hard_window_bytes": hard_window_bytes,
                         "next_bytes": next_bytes,
@@ -6181,7 +6199,8 @@ impl StudioVfs {
                 next_bytes,
             })
         };
-        if decision.delay_ms == 0 {
+        let delay_ms = decision.delay_ms.max(sustained_delay_ms);
+        if delay_ms == 0 {
             return;
         }
         // #region debug log
@@ -6191,11 +6210,14 @@ impl StudioVfs {
                 concat!(file!(), ":", line!()),
                 "write admission governor pacing",
                 serde_json::json!({
-                    "delay_ms": decision.delay_ms,
+                    "delay_ms": delay_ms,
+                    "governor_delay_ms": decision.delay_ms,
+                    "sustained_delay_ms": sustained_delay_ms,
                     "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
                     "drain_bytes_per_sec": decision.drain_bytes_per_sec,
                     "runway_ms": decision.runway_ms,
                     "pressure_bytes": pressure_bytes,
+                    "pending_upload_bytes": pressure.pending_upload_bytes,
                     "budget_bytes": buffer_budget_bytes,
                     "next_bytes": next_bytes,
                 }),
@@ -6207,7 +6229,7 @@ impl StudioVfs {
             return;
         }
         let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         self.record_write_admission_wait(started.elapsed());
     }
 

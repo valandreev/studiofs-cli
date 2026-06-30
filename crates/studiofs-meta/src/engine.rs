@@ -626,6 +626,28 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         Ok(false)
     }
 
+    /// Batch form of [`mark_regular_file_overlay_object_uploaded_if_matches`].
+    ///
+    /// Returns the object ids that still matched the inode/epoch overlay.
+    fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
+        let mut marked = Vec::new();
+        for &object_id in object_ids {
+            if self.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                expected_epoch,
+                object_id,
+            )? {
+                marked.push(object_id);
+            }
+        }
+        Ok(marked)
+    }
+
     /// Promote the local regular-file overlay graph to the remote-visible base
     /// graph for a specific inode/content epoch.
     ///

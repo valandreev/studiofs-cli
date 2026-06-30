@@ -41,6 +41,7 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
+const MEDIA_FUSE_IO_BYTES: u32 = 4 * 1024 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -48,6 +49,7 @@ const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_T
 const STUDIOFS_FUSE_WRITEBACK_CACHE_ENV: &str = "STUDIOFS_FUSE_WRITEBACK_CACHE";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
 const STUDIOFS_FUSE_ASYNC_READ_ENV: &str = "STUDIOFS_FUSE_ASYNC_READ";
+const STUDIOFS_FUSE_ASYNC_DIO_ENV: &str = "STUDIOFS_FUSE_ASYNC_DIO";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
 const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
@@ -55,6 +57,8 @@ const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
 const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
 const HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND: u16 = 128;
 const HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD: u16 = 96;
+const MEDIA_FUSE_MAX_BACKGROUND: u16 = 50;
+const MEDIA_FUSE_CONGESTION_THRESHOLD: u16 = 40;
 const FUSE_BUFFER_POOL_MAX_BUFFERS: usize = 16;
 
 /// Supported Linux FUSE tuning profiles.
@@ -64,6 +68,8 @@ pub enum LinuxFuseProfile {
     Conservative,
     /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
+    /// Media profile: larger sequential geometry.
+    Media,
 }
 
 impl LinuxFuseProfile {
@@ -85,6 +91,8 @@ impl LinuxFuseProfile {
             || trimmed.eq_ignore_ascii_case("high_throughput")
         {
             Self::HighThroughput
+        } else if trimmed.eq_ignore_ascii_case("media") {
+            Self::Media
         } else {
             warn!(
                 env_key = STUDIOFS_LINUX_FUSE_PROFILE_ENV,
@@ -99,7 +107,22 @@ impl LinuxFuseProfile {
         match self {
             Self::Conservative => "conservative",
             Self::HighThroughput => "high-throughput",
+            Self::Media => "media",
         }
+    }
+}
+
+fn default_fuse_geometry_for_profile(profile: LinuxFuseProfile) -> (u32, u32) {
+    match profile {
+        LinuxFuseProfile::Conservative => (
+            DEFAULT_FUSE_MAX_WRITE_BYTES,
+            DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+        ),
+        LinuxFuseProfile::HighThroughput => (
+            HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+            HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+        ),
+        LinuxFuseProfile::Media => (MEDIA_FUSE_IO_BYTES, MEDIA_FUSE_IO_BYTES),
     }
 }
 
@@ -196,6 +219,10 @@ impl FuseBackgroundQueuePolicy {
             LinuxFuseProfile::HighThroughput => Self {
                 max_background: Some(HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND),
                 congestion_threshold: Some(HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD),
+            },
+            LinuxFuseProfile::Media => Self {
+                max_background: Some(MEDIA_FUSE_MAX_BACKGROUND),
+                congestion_threshold: Some(MEDIA_FUSE_CONGESTION_THRESHOLD),
             },
         }
     }
@@ -339,6 +366,50 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
     LocalSyncPolicy::Opportunistic
 }
 
+fn clamp_fuse_max_write_to_current_kernel_limit(requested: u32) -> u32 {
+    let Some(max_pages_limit) = read_linux_fuse_max_pages_limit() else {
+        return requested;
+    };
+    let Some(page_size) = current_page_size() else {
+        return requested;
+    };
+    let clamped =
+        clamp_fuse_max_write_to_kernel_max_pages_limit(requested, page_size, max_pages_limit);
+    if clamped < requested {
+        debug!(
+            requested,
+            clamped,
+            page_size,
+            max_pages_limit,
+            "clamped FUSE max_write to Linux fuse.max_pages_limit"
+        );
+    }
+    clamped
+}
+
+fn clamp_fuse_max_write_to_kernel_max_pages_limit(
+    requested: u32,
+    page_size: u32,
+    max_pages_limit: u32,
+) -> u32 {
+    if page_size == 0 || max_pages_limit == 0 {
+        return requested;
+    }
+    let kernel_limit = u64::from(page_size) * u64::from(max_pages_limit);
+    requested.min(kernel_limit.min(u64::from(u32::MAX)) as u32)
+}
+
+fn read_linux_fuse_max_pages_limit() -> Option<u32> {
+    let raw = std::fs::read_to_string("/proc/sys/fs/fuse/max_pages_limit").ok()?;
+    raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn current_page_size() -> Option<u32> {
+    // SAFETY: sysconf(_SC_PAGESIZE) reads process-global configuration only.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u32::try_from(value).ok().filter(|value| *value > 0)
+}
+
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
     parse_bridge_u32_env_result(key, std::env::var(key), default)
 }
@@ -470,11 +541,6 @@ fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
-fn should_request_fuse_async_dio_from_env() -> bool {
-    std::env::var("STUDIOFS_FUSE_ASYNC_DIO")
-        .is_ok_and(|raw| should_request_fuse_async_dio_from_env_value(&raw))
-}
-
 fn resolve_fuse_writeback_cache_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(parse_bridge_bool_env_value)
 }
@@ -496,6 +562,7 @@ fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
     raw.is_none_or(should_enable_async_fuse_write_from_env_value)
 }
 
+#[cfg(test)]
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(should_enable_async_fuse_read_from_env_value)
 }
@@ -503,11 +570,6 @@ fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
 fn should_enable_async_fuse_write_from_env() -> bool {
     let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
     resolve_async_fuse_write_enabled(raw.as_deref())
-}
-
-fn should_enable_async_fuse_read_from_env() -> bool {
-    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok();
-    resolve_async_fuse_read_enabled(raw.as_deref())
 }
 
 trait FuseWriteReply {
@@ -950,7 +1012,7 @@ pub struct StudioFuseFs {
     linux_writeback_cache_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
-    /// the DB are remapped to this so macOS permission checks don't block writes.
+    /// the DB are remapped to this so Unix permission checks don't block writes.
     mount_uid: u32,
     /// GID of the user that mounted the filesystem.
     mount_gid: u32,
@@ -1045,22 +1107,15 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
-        let (default_max_write_bytes, default_max_readahead_bytes) = match profile {
-            LinuxFuseProfile::Conservative => (
-                DEFAULT_FUSE_MAX_WRITE_BYTES,
-                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
-            ),
-            LinuxFuseProfile::HighThroughput => (
-                HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
-                HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
-            ),
-        };
+        let (default_max_write_bytes, default_max_readahead_bytes) =
+            default_fuse_geometry_for_profile(profile);
+        let requested_max_write_bytes =
+            parse_bridge_u32_env("STUDIOFS_FUSE_MAX_WRITE_BYTES", default_max_write_bytes);
+        let fuse_max_write_bytes =
+            clamp_fuse_max_write_to_current_kernel_limit(requested_max_write_bytes);
         Self {
             linux_fuse_profile: profile,
-            fuse_max_write_bytes: parse_bridge_u32_env(
-                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
-                default_max_write_bytes,
-            ),
+            fuse_max_write_bytes,
             fuse_max_readahead_bytes: parse_bridge_u32_env(
                 "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
                 default_max_readahead_bytes,
@@ -1068,12 +1123,75 @@ impl StudioFuseRuntimeOptions {
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: should_enable_async_fuse_write_from_env(),
-            async_read_enabled: should_enable_async_fuse_read_from_env(),
-            linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
+            async_read_enabled: std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV)
+                .ok()
+                .as_deref()
+                .map_or(
+                    matches!(profile, LinuxFuseProfile::Media),
+                    should_enable_async_fuse_read_from_env_value,
+                ),
+            linux_async_dio_enabled: std::env::var(STUDIOFS_FUSE_ASYNC_DIO_ENV)
+                .ok()
+                .as_deref()
+                .map_or(
+                    matches!(profile, LinuxFuseProfile::Media),
+                    should_request_fuse_async_dio_from_env_value,
+                ),
             linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
+        }
+    }
+
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors independent FUSE env knobs"
+    )]
+    fn from_env_values(
+        profile: Option<&str>,
+        max_write: Option<&str>,
+        max_readahead: Option<&str>,
+        max_background: Option<&str>,
+        congestion_threshold: Option<&str>,
+        async_read: Option<&str>,
+        async_dio: Option<&str>,
+        writeback_cache: Option<&str>,
+    ) -> Self {
+        let profile = LinuxFuseProfile::from_env_value(profile);
+        let background_queue_policy = FuseBackgroundQueuePolicy::from_env_values_for_profile(
+            profile,
+            max_background,
+            congestion_threshold,
+        );
+        let (default_max_write_bytes, default_max_readahead_bytes) =
+            default_fuse_geometry_for_profile(profile);
+        Self {
+            linux_fuse_profile: profile,
+            fuse_max_write_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+                max_write,
+                default_max_write_bytes,
+            ),
+            fuse_max_readahead_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+                max_readahead,
+                default_max_readahead_bytes,
+            ),
+            fuse_max_background: background_queue_policy.max_background,
+            fuse_congestion_threshold: background_queue_policy.congestion_threshold,
+            async_write_enabled: true,
+            async_read_enabled: async_read.map_or(
+                matches!(profile, LinuxFuseProfile::Media),
+                should_enable_async_fuse_read_from_env_value,
+            ),
+            linux_async_dio_enabled: async_dio.map_or(
+                matches!(profile, LinuxFuseProfile::Media),
+                should_request_fuse_async_dio_from_env_value,
+            ),
+            linux_writeback_cache_enabled: resolve_fuse_writeback_cache_enabled(writeback_cache),
+            async_write_admission_limits: None,
         }
     }
 }
@@ -1272,7 +1390,21 @@ impl StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let buffer_pool = self.fuse_buffer_pool.clone();
             let reply = FuseDataReplyGuard::new(reply);
+            let pending_write_barrier = self
+                .async_write_enabled
+                .then(|| self.pending_writes.inode_barrier(ino));
             self.rt.spawn(async move {
+                let pending_write_error = if let Some(barrier) = pending_write_barrier {
+                    barrier.wait_async().await.err()
+                } else {
+                    None
+                };
+                if let Some(errno) = pending_write_error {
+                    vfs.record_fuse_read_callback(requested_size, callback_started.elapsed(), true);
+                    buffer_pool.put(out);
+                    reply.error(errno);
+                    return;
+                }
                 let result = vfs.read_into_fh(fh, ino, offset, &mut out).await;
                 vfs.record_fuse_read_callback(
                     requested_size,
@@ -1281,6 +1413,19 @@ impl StudioFuseFs {
                 );
                 complete_fuse_read_reply(reply, result, out, buffer_pool, ino, offset, size);
             });
+            return;
+        }
+
+        let pending_write_error = if self.async_write_enabled {
+            self.pending_writes.inode_barrier(ino).wait().err()
+        } else {
+            None
+        };
+        if let Some(errno) = pending_write_error {
+            self.vfs
+                .record_fuse_read_callback(requested_size, callback_started.elapsed(), true);
+            self.fuse_buffer_pool.put(out);
+            reply.error(errno);
             return;
         }
 
@@ -1343,6 +1488,12 @@ impl StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
+            let Ok(_) = u32::try_from(data_len) else {
+                reply.error(libc::EOVERFLOW);
+                registration.complete(PendingWriteCompletion::Error(libc::EOVERFLOW));
+                buffer_pool.put(data);
+                return;
+            };
             self.rt.spawn(async move {
                 let mut registration = registration;
                 let turn = registration.turn_waiter();
@@ -1350,11 +1501,8 @@ impl StudioFuseFs {
                 let result = vfs
                     .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
                     .await;
-                vfs.record_fuse_write_callback(
-                    data_len,
-                    callback_started.elapsed(),
-                    result.is_err(),
-                );
+                let failed = result.is_err();
+                vfs.record_fuse_write_callback(data_len, callback_started.elapsed(), failed);
                 complete_fuse_write_reply(reply, result, &registration, ino, offset);
                 buffer_pool.put(data);
             });
@@ -2863,12 +3011,12 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
         FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
-        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        parse_bridge_u32_env_result, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
-        resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
-        should_enable_async_fuse_read_from_env_value,
+        PendingFuseCloseGuard, StudioFuseFs, StudioFuseRuntimeOptions, TTL,
+        complete_fuse_write_reply, fs_ioc_getflags_reply_data, fuse_attr_blksize,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, parse_bridge_u32_env_result, posix_flags_to_open_flags,
+        resolve_async_fuse_read_enabled, resolve_async_fuse_write_enabled,
+        resolve_fuse_writeback_cache_enabled, should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
@@ -2876,6 +3024,7 @@ mod tests {
     use std::cell::Cell;
 
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
@@ -3205,6 +3354,87 @@ mod tests {
         assert!(snapshot.pending_writes > 0 || snapshot.completed_writes > 0);
     }
 
+    #[test]
+    fn async_write_reply_waits_for_vfs_admission_turn() {
+        let (_tmp, _rt, vfs, _env_fs) = make_test_fuse_fs("async-write-buffered-reply");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            _rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let attr = vfs
+            .create(1, b"async-write-buffered-reply.txt", 0, 0, 0o644)
+            .expect("create test file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open test file");
+        let held_turn = fs
+            .pending_writes
+            .register(attr.ino, fh)
+            .expect("hold first pending write turn");
+        let reply = TestWriteReply::default();
+
+        fs.write_callback(attr.ino, fh, 0, b"abc", 0, reply.clone());
+
+        assert!(
+            fs.pending_writes.snapshot().pending_writes >= 2,
+            "queued write should wait behind the held VFS turn"
+        );
+        assert_eq!(reply.written_size(), None);
+        held_turn.complete(super::PendingWriteCompletion::Success);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while reply.written_size() != Some(3) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reply.written_size(), Some(3));
+    }
+
+    #[test]
+    fn async_read_waits_for_pending_buffered_write_barrier() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-read-waits-buffered-write");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                async_read_enabled: true,
+                ..super::StudioFuseRuntimeOptions::default()
+            },
+        );
+        let (ino, fh) = create_readable_test_file(&rt, &vfs, b"async-read-waits.txt", b"abcdef");
+        let pending = fs
+            .pending_writes
+            .register(ino, fh)
+            .expect("hold pending write barrier");
+        let reply = TestDataReply::default();
+
+        fs.read_callback(ino, fh, 1, 3, reply.clone());
+        rt.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        });
+        assert_eq!(reply.data(), None);
+        assert_eq!(reply.error(), None);
+
+        pending.complete(super::PendingWriteCompletion::Success);
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if reply.data().is_some() || reply.error().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("async read reply should complete after pending write barrier");
+        });
+        assert_eq!(reply.data(), Some(b"bcd".to_vec()));
+        assert_eq!(reply.error(), None);
+    }
+
     fn create_readable_test_file(
         rt: &Runtime,
         vfs: &StudioVfs,
@@ -3332,6 +3562,22 @@ mod tests {
     }
 
     #[test]
+    fn fuse_max_write_clamps_to_kernel_max_pages_limit() {
+        let limit =
+            super::clamp_fuse_max_write_to_kernel_max_pages_limit(16 * 1024 * 1024, 4096, 256);
+
+        assert_eq!(limit, 1024 * 1024);
+    }
+
+    #[test]
+    fn fuse_max_write_keeps_request_within_kernel_max_pages_limit() {
+        let limit =
+            super::clamp_fuse_max_write_to_kernel_max_pages_limit(4 * 1024 * 1024, 4096, 1024);
+
+        assert_eq!(limit, 4 * 1024 * 1024);
+    }
+
+    #[test]
     fn default_fuse_background_queue_policy_matches_platform_expectation() {
         let policy = FuseBackgroundQueuePolicy::platform_default();
 
@@ -3366,6 +3612,31 @@ mod tests {
             LinuxFuseProfile::from_env_value(Some("high_throughput")),
             LinuxFuseProfile::HighThroughput
         );
+        assert_eq!(
+            LinuxFuseProfile::from_env_value(Some("media")),
+            LinuxFuseProfile::Media
+        );
+    }
+
+    #[test]
+    fn media_linux_fuse_profile_matches_media_geometry() {
+        let options = StudioFuseRuntimeOptions::from_env_values(
+            Some("media"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(options.linux_fuse_profile, LinuxFuseProfile::Media);
+        assert_eq!(options.fuse_max_write_bytes, 4 * 1024 * 1024);
+        assert_eq!(options.fuse_max_readahead_bytes, 4 * 1024 * 1024);
+        assert!(options.async_read_enabled);
+        assert!(options.linux_async_dio_enabled);
+        assert!(!options.linux_writeback_cache_enabled);
     }
 
     #[test]

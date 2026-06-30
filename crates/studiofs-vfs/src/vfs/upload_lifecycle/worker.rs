@@ -294,7 +294,7 @@ trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
         object_id: u64,
         adaptive_penalty: Duration,
     ) -> VfsResult<()>;
-    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>>;
+    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()>;
@@ -318,6 +318,27 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
+    async fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        let mut marked = Vec::new();
+        for &object_id in object_ids {
+            if self
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    expected_epoch,
+                    object_id,
+                )
+                .await?
+            {
+                marked.push(object_id);
+            }
+        }
+        Ok(marked)
+    }
     async fn reattach_uploaded_object_if_uncovered(
         &self,
         ino: Ino,
@@ -622,7 +643,9 @@ where
         let raw_payload: Option<Bytes> = if remote_object_visible {
             None
         } else {
-            self.local_payloads.read_for_upload(op.object_id).await?
+            self.local_payloads
+                .read_for_upload(op.object_id, op.payload_len)
+                .await?
         };
 
         let raw_payload = match raw_payload {
@@ -745,11 +768,16 @@ where
         let mut reconcile = self
             .reconcile_uploaded_object_metadata(op, payload_len)
             .await?;
-        if reconcile.is_none()
-            && remote_object_visible
-            && payload_len == 0
-            && let Some(cached_payload) = self.local_payloads.read_for_upload(op.object_id).await?
-        {
+        let should_reconcile_from_local_payload =
+            reconcile.is_none() && remote_object_visible && payload_len == 0;
+        let cached_payload = if should_reconcile_from_local_payload {
+            self.local_payloads
+                .read_for_upload(op.object_id, op.payload_len)
+                .await?
+        } else {
+            None
+        };
+        if let Some(cached_payload) = cached_payload {
             payload_len = cached_payload.len() as u64;
             reconcile = self
                 .reconcile_uploaded_object_metadata(op, payload_len)
@@ -1098,7 +1126,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         Ok(())
     }
 
-    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>> {
         if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
             self.vfs
                 .state
@@ -1147,6 +1175,22 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             foreground_cost,
             self.vfs.upload_cache_io_slots_max,
         );
+        let pacing_delay =
+            foreground_upload_reread_pacing_delay(foreground_active, payload_len as usize);
+        if !pacing_delay.is_zero() {
+            self.vfs.debug_write_probe(
+                "H5",
+                concat!(file!(), ":", line!()),
+                "upload reread paced before local payload read",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "payload_len": payload_len,
+                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "slot_cost": upload_io_cost,
+                }),
+            );
+            tokio::time::sleep(pacing_delay).await;
+        }
         let wait_started = Instant::now();
         let upload_io_permit = self
             .vfs
@@ -1162,22 +1206,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let staged_payload = self.vfs.upload_stage_get_async(object_id).await?;
         if let Some(staged_payload) = staged_payload {
-            let pacing_delay =
-                foreground_upload_reread_pacing_delay(foreground_active, staged_payload.len());
-            if !pacing_delay.is_zero() {
-                self.vfs.debug_write_probe(
-                    "H5",
-                    concat!(file!(), ":", line!()),
-                    "upload staged read paced under foreground reads",
-                    serde_json::json!({
-                        "object_id": object_id,
-                        "staged_bytes": staged_payload.len(),
-                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "slot_cost": upload_io_cost,
-                    }),
-                );
-                tokio::time::sleep(pacing_delay).await;
-            }
             drop(upload_io_permit);
             self.vfs
                 .state
@@ -1216,24 +1244,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .payload_store_get_for_upload_async(object_id)
             .await?;
         let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-        let pacing_delay = read_result
-            .as_ref()
-            .map(|payload| foreground_upload_reread_pacing_delay(foreground_active, payload.len()))
-            .unwrap_or(Duration::ZERO);
-        if !pacing_delay.is_zero() {
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload reread paced under foreground reads",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "reread_bytes": read_result.as_ref().map(|payload| payload.len()).unwrap_or(0),
-                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "slot_cost": upload_io_cost,
-                }),
-            );
-            tokio::time::sleep(pacing_delay).await;
-        }
         drop(upload_io_permit);
 
         self.vfs
@@ -1328,6 +1338,84 @@ struct VfsUploadMetaPort {
     vfs: Arc<StudioVfs>,
 }
 
+struct UploadCompletionDrainGuard<'a> {
+    draining: &'a std::sync::atomic::AtomicBool,
+    armed: bool,
+}
+
+impl UploadCompletionDrainGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UploadCompletionDrainGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.draining.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl VfsUploadMetaPort {
+    async fn drain_upload_completion_batch(&self) {
+        let mut guard = UploadCompletionDrainGuard {
+            draining: &self.vfs.state.upload.upload_completion_draining,
+            armed: true,
+        };
+        loop {
+            tokio::task::yield_now().await;
+            let entries = {
+                let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+                if batch.pending.is_empty() {
+                    self.vfs
+                        .state
+                        .upload
+                        .upload_completion_draining
+                        .store(false, Ordering::Release);
+                    guard.disarm();
+                    return;
+                }
+                std::mem::take(&mut batch.pending)
+            };
+
+            let mut groups: BTreeMap<(Ino, u64), Vec<super::super::UploadCompletionBatchEntry>> =
+                BTreeMap::new();
+            for entry in entries {
+                groups
+                    .entry((entry.ino, entry.expected_epoch))
+                    .or_default()
+                    .push(entry);
+            }
+
+            for ((ino, expected_epoch), entries) in groups {
+                let object_ids: Vec<u64> = entries.iter().map(|entry| entry.object_id).collect();
+                match self
+                    .mark_regular_file_overlay_objects_uploaded_if_match(
+                        ino,
+                        expected_epoch,
+                        &object_ids,
+                    )
+                    .await
+                {
+                    Ok(marked) => {
+                        let marked: HashSet<u64> = marked.into_iter().collect();
+                        for entry in entries {
+                            let _ = entry.result_tx.send(Ok(marked.contains(&entry.object_id)));
+                        }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        for entry in entries {
+                            let _ = entry.result_tx.send(Err(VfsError::Other(error.clone())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl UploadMetaPort for VfsUploadMetaPort {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>> {
         let meta = self.vfs.meta.clone();
@@ -1357,12 +1445,51 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let should_drain = {
+            let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+            batch
+                .pending
+                .push(super::super::UploadCompletionBatchEntry {
+                    ino,
+                    expected_epoch,
+                    object_id,
+                    result_tx,
+                });
+            self.vfs
+                .state
+                .upload
+                .upload_completion_draining
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if should_drain {
+            let port = self.clone();
+            tokio::spawn(async move {
+                port.drain_upload_completion_batch().await;
+            });
+        }
+        result_rx.await.map_err(|_| {
+            VfsError::Other("upload completion batch result was dropped".to_string())
+        })?
+    }
+
+    async fn mark_regular_file_overlay_objects_uploaded_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let meta = self.vfs.meta.clone();
+        let object_ids = object_ids.to_vec();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.mark_regular_file_overlay_object_uploaded_if_matches(
+            engine.mark_regular_file_overlay_objects_uploaded_if_match(
                 ino,
                 expected_epoch,
-                object_id,
+                &object_ids,
             )
         })
         .await
@@ -2092,6 +2219,33 @@ mod tests {
     }
 
     #[test]
+    fn upload_completion_drain_guard_resets_draining_on_drop() {
+        let draining = AtomicBool::new(true);
+        {
+            let _guard = UploadCompletionDrainGuard {
+                draining: &draining,
+                armed: true,
+            };
+        }
+
+        assert!(!draining.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn upload_completion_drain_guard_disarm_preserves_draining_flag() {
+        let draining = AtomicBool::new(true);
+        {
+            let mut guard = UploadCompletionDrainGuard {
+                draining: &draining,
+                armed: true,
+            };
+            guard.disarm();
+        }
+
+        assert!(draining.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn reattach_uploaded_object_marks_full_block_at_nonzero_object_offset_as_full() {
         let block_size = 4096;
         let object_id = 42;
@@ -2179,7 +2333,11 @@ mod tests {
             Ok(())
         }
 
-        async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        async fn read_for_upload(
+            &self,
+            object_id: u64,
+            _payload_len: u64,
+        ) -> VfsResult<Option<Bytes>> {
             Ok(self
                 .upload_reads
                 .lock()

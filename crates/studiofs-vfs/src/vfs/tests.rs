@@ -6066,7 +6066,7 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 }
 
 #[test]
-fn write_admission_pressure_includes_pending_upload_backlog() {
+fn write_admission_pressure_total_excludes_pending_upload_backlog() {
     let pressure = WriteAdmissionPressure {
         writer_stack_dirty_bytes: 10,
         pending_local_dirty_bytes: 20,
@@ -6074,7 +6074,8 @@ fn write_admission_pressure_includes_pending_upload_backlog() {
         pending_upload_bytes: 40,
     };
 
-    assert_eq!(pressure.total_bytes(), 100);
+    assert_eq!(pressure.pending_upload_bytes, 40);
+    assert_eq!(pressure.total_bytes(), 60);
 }
 
 #[test]
@@ -6106,7 +6107,7 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
     let pressure = vfs.write_admission_pressure();
 
     assert_eq!(pressure.pending_upload_bytes, 8);
-    assert_eq!(pressure.total_bytes(), 8);
+    assert_eq!(pressure.total_bytes(), 0);
 }
 
 #[test]
@@ -6139,7 +6140,7 @@ fn write_admission_first_sample_below_budget_without_pacing() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1),
+            vfs.maybe_throttle_write_admission(1, 0),
         )
         .await
         .expect("first adaptive admission sample should not sleep below budget");
@@ -6166,7 +6167,7 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
-            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1, 0),
         )
         .await
         .expect("empty pressure should admit a single oversized write");
@@ -6212,7 +6213,7 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1),
+            vfs.maybe_throttle_write_admission(1, 0),
         )
         .await
         .expect("pending upload backlog must not trigger hard admission wait");
@@ -6248,7 +6249,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
 
         let admission_vfs = Arc::clone(&vfs);
         let wait_task =
-            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
+            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1, 0).await });
         tokio::time::sleep(Duration::from_millis(
             WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
         ))
@@ -6311,7 +6312,7 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
         vfs.state.sustained_write_streams.lock().insert(
             ino,
             SustainedWriteState {
-                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DECAY_START_MS),
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DELAY_START_MS),
                 last_write_ms: now.saturating_sub(1),
                 last_end_offset: seeded_len as u64,
             },
@@ -6322,14 +6323,16 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             .try_register(ino)
             .expect("test should reserve deferred materialization gate");
 
-        vfs.maybe_pre_drain_sustained_write_buffer(
-            ino,
-            seeded_len as u64,
-            1,
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
+        let delay_ms = vfs
+            .maybe_pre_drain_sustained_write_buffer(
+                ino,
+                seeded_len as u64,
+                1,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+        assert_eq!(delay_ms, 1);
 
         assert!(
             vfs.state
@@ -6349,70 +6352,52 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
 }
 
 #[test]
-fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
-    let base = 800 * 1024 * 1024;
+fn sustained_write_delay_ramps_to_stable_plateau_for_long_streams() {
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
-    let first = state.observe(1_000, 0, 4, base, drain, 4);
-    assert_eq!(first.effective_buffer_bytes, base);
+    let first = state.observe(1_000, 0, 4, drain, 4);
+    assert_eq!(first.delay_ms, 0);
     assert!(!first.pre_drain);
 
-    let half = state.observe(2_500, 4, 4, base, drain, base + 1);
-    assert_eq!(half.effective_buffer_bytes, base / 2);
-    assert!(half.pre_drain);
+    let one = state.observe(2_500, 4, 4, drain, drain + 1);
+    assert_eq!(one.delay_ms, 1);
+    assert!(one.pre_drain);
 
-    let quarter = state.observe(4_000, 8, 4, base, drain, base);
-    assert_eq!(quarter.effective_buffer_bytes, base / 4);
-    assert!(quarter.pre_drain);
+    let two = state.observe(4_000, 8, 4, drain, drain + 1);
+    assert_eq!(two.delay_ms, 2);
+    assert!(two.pre_drain);
 
-    let eighth = state.observe(5_500, 12, 4, base, drain, base);
-    assert_eq!(eighth.effective_buffer_bytes, base / 8);
-    assert!(eighth.pre_drain);
-
-    let sixteenth = state.observe(7_000, 16, 4, base, drain, base);
-    assert_eq!(sixteenth.effective_buffer_bytes, base / 16);
-    assert!(sixteenth.pre_drain);
-
-    let floor = state.observe(8_500, 20, 4, base, drain, base);
-    assert_eq!(floor.effective_buffer_bytes, drain);
-    assert!(floor.pre_drain);
+    let mut plateau = two;
+    for step in 3..=SUSTAINED_WRITE_MAX_DELAY_MS {
+        plateau = state.observe(2_500 + (step - 1) * 1_500, step * 4, 4, drain, drain + 1);
+    }
+    assert_eq!(plateau.delay_ms, SUSTAINED_WRITE_MAX_DELAY_MS);
+    assert!(plateau.pre_drain);
 }
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
-    assert_eq!(
-        state
-            .observe(1_000, 0, 4, base, drain, base + 1)
-            .effective_buffer_bytes,
-        base
-    );
-    assert_eq!(
-        state
-            .observe(2_500, 4, 4, base, drain, base + 1)
-            .effective_buffer_bytes,
-        base / 2
-    );
+    state.observe(1_000, 0, 4, drain, drain + 1);
+    state.observe(2_500, 4, 4, drain, drain + 1);
 
     let after_idle = state.observe(
         2_500 + SUSTAINED_WRITE_IDLE_RESET_MS + 1,
         8,
         4,
-        base,
         drain,
-        base + 1,
+        drain + 1,
     );
     assert_eq!(after_idle.duration_ms, 0);
-    assert_eq!(after_idle.effective_buffer_bytes, base);
+    assert_eq!(after_idle.delay_ms, 0);
     assert!(!after_idle.pre_drain);
 
-    let after_seek = state.observe(4_000, 128, 4, base, drain, base + 1);
+    let after_seek = state.observe(4_000, 128, 4, drain, drain + 1);
     assert_eq!(after_seek.duration_ms, 0);
-    assert_eq!(after_seek.effective_buffer_bytes, base);
+    assert_eq!(after_seek.delay_ms, 0);
     assert!(!after_seek.pre_drain);
 }
 
@@ -6716,6 +6701,33 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
     assert!(
         !state.foreground_read_active(171, grace),
         "foreground read activity should expire after the configured idle grace"
+    );
+}
+
+#[test]
+fn foreground_user_io_active_respects_idle_grace_after_last_write() {
+    let state = ReadState::new(1);
+    let grace = Duration::from_millis(50);
+
+    let _ = state.observe_write_access(
+        None,
+        1,
+        0,
+        4096,
+        AccessTrackerConfig {
+            block_size: 4096,
+            readahead_base_width: 8,
+            readahead_max_width: 32,
+            readahead_min_prefetch: 2,
+        },
+    );
+
+    let last_write = state.last_foreground_write_ms.load(AtomicOrdering::Relaxed);
+    assert!(state.foreground_user_io_active(last_write + 49, grace));
+    assert!(!state.foreground_user_io_active(last_write + 51, grace));
+    assert!(
+        !state.foreground_read_active(last_write + 49, grace),
+        "upload disk rereads should not throttle purely because foreground writes are active"
     );
 }
 
@@ -8009,7 +8021,7 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
         vfs.state.sustained_write_streams.lock().insert(
             ino,
             SustainedWriteState {
-                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DECAY_START_MS),
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DELAY_START_MS),
                 last_write_ms: now.saturating_sub(1),
                 last_end_offset: seeded_len as u64,
             },
