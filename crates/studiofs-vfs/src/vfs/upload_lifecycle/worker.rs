@@ -768,14 +768,16 @@ where
         let mut reconcile = self
             .reconcile_uploaded_object_metadata(op, payload_len)
             .await?;
-        if reconcile.is_none()
-            && remote_object_visible
-            && payload_len == 0
-            && let Some(cached_payload) = self
-                .local_payloads
+        let should_reconcile_from_local_payload =
+            reconcile.is_none() && remote_object_visible && payload_len == 0;
+        let cached_payload = if should_reconcile_from_local_payload {
+            self.local_payloads
                 .read_for_upload(op.object_id, op.payload_len)
                 .await?
-        {
+        } else {
+            None
+        };
+        if let Some(cached_payload) = cached_payload {
             payload_len = cached_payload.len() as u64;
             reconcile = self
                 .reconcile_uploaded_object_metadata(op, payload_len)
@@ -1462,7 +1464,10 @@ impl UploadMetaPort for VfsUploadMetaPort {
                 .is_ok()
         };
         if should_drain {
-            self.drain_upload_completion_batch().await;
+            let port = self.clone();
+            tokio::spawn(async move {
+                port.drain_upload_completion_batch().await;
+            });
         }
         result_rx.await.map_err(|_| {
             VfsError::Other("upload completion batch result was dropped".to_string())

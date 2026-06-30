@@ -1394,9 +1394,12 @@ impl StudioFuseFs {
                 .async_write_enabled
                 .then(|| self.pending_writes.inode_barrier(ino));
             self.rt.spawn(async move {
-                if let Some(barrier) = pending_write_barrier
-                    && let Err(errno) = barrier.wait_async().await
-                {
+                let pending_write_error = if let Some(barrier) = pending_write_barrier {
+                    barrier.wait_async().await.err()
+                } else {
+                    None
+                };
+                if let Some(errno) = pending_write_error {
                     vfs.record_fuse_read_callback(requested_size, callback_started.elapsed(), true);
                     buffer_pool.put(out);
                     reply.error(errno);
@@ -1413,9 +1416,12 @@ impl StudioFuseFs {
             return;
         }
 
-        if self.async_write_enabled
-            && let Err(errno) = self.pending_writes.inode_barrier(ino).wait()
-        {
+        let pending_write_error = if self.async_write_enabled {
+            self.pending_writes.inode_barrier(ino).wait().err()
+        } else {
+            None
+        };
+        if let Some(errno) = pending_write_error {
             self.vfs
                 .record_fuse_read_callback(requested_size, callback_started.elapsed(), true);
             self.fuse_buffer_pool.put(out);
