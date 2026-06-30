@@ -41,6 +41,7 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
+const MEDIA_FUSE_IO_BYTES: u32 = 4 * 1024 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
@@ -48,6 +49,7 @@ const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_T
 const STUDIOFS_FUSE_WRITEBACK_CACHE_ENV: &str = "STUDIOFS_FUSE_WRITEBACK_CACHE";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
 const STUDIOFS_FUSE_ASYNC_READ_ENV: &str = "STUDIOFS_FUSE_ASYNC_READ";
+const STUDIOFS_FUSE_ASYNC_DIO_ENV: &str = "STUDIOFS_FUSE_ASYNC_DIO";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES";
 const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
 const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
@@ -55,6 +57,8 @@ const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
 const FIRST_FUSE_DIR_FH: u64 = u64::MAX / 4;
 const HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND: u16 = 128;
 const HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD: u16 = 96;
+const MEDIA_FUSE_MAX_BACKGROUND: u16 = 50;
+const MEDIA_FUSE_CONGESTION_THRESHOLD: u16 = 40;
 const FUSE_BUFFER_POOL_MAX_BUFFERS: usize = 16;
 
 /// Supported Linux FUSE tuning profiles.
@@ -64,6 +68,8 @@ pub enum LinuxFuseProfile {
     Conservative,
     /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
+    /// macOS-like media profile: larger sequential geometry plus bridge read windows.
+    Media,
 }
 
 impl LinuxFuseProfile {
@@ -85,6 +91,8 @@ impl LinuxFuseProfile {
             || trimmed.eq_ignore_ascii_case("high_throughput")
         {
             Self::HighThroughput
+        } else if trimmed.eq_ignore_ascii_case("media") {
+            Self::Media
         } else {
             warn!(
                 env_key = STUDIOFS_LINUX_FUSE_PROFILE_ENV,
@@ -99,7 +107,22 @@ impl LinuxFuseProfile {
         match self {
             Self::Conservative => "conservative",
             Self::HighThroughput => "high-throughput",
+            Self::Media => "media",
         }
+    }
+}
+
+fn default_fuse_geometry_for_profile(profile: LinuxFuseProfile) -> (u32, u32) {
+    match profile {
+        LinuxFuseProfile::Conservative => (
+            DEFAULT_FUSE_MAX_WRITE_BYTES,
+            DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+        ),
+        LinuxFuseProfile::HighThroughput => (
+            HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
+            HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
+        ),
+        LinuxFuseProfile::Media => (MEDIA_FUSE_IO_BYTES, MEDIA_FUSE_IO_BYTES),
     }
 }
 
@@ -196,6 +219,10 @@ impl FuseBackgroundQueuePolicy {
             LinuxFuseProfile::HighThroughput => Self {
                 max_background: Some(HIGH_THROUGHPUT_FUSE_MAX_BACKGROUND),
                 congestion_threshold: Some(HIGH_THROUGHPUT_FUSE_CONGESTION_THRESHOLD),
+            },
+            LinuxFuseProfile::Media => Self {
+                max_background: Some(MEDIA_FUSE_MAX_BACKGROUND),
+                congestion_threshold: Some(MEDIA_FUSE_CONGESTION_THRESHOLD),
             },
         }
     }
@@ -514,11 +541,6 @@ fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
-fn should_request_fuse_async_dio_from_env() -> bool {
-    std::env::var("STUDIOFS_FUSE_ASYNC_DIO")
-        .is_ok_and(|raw| should_request_fuse_async_dio_from_env_value(&raw))
-}
-
 fn resolve_fuse_writeback_cache_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(parse_bridge_bool_env_value)
 }
@@ -540,18 +562,31 @@ fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
     raw.is_none_or(should_enable_async_fuse_write_from_env_value)
 }
 
+#[cfg(test)]
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(should_enable_async_fuse_read_from_env_value)
+}
+
+fn resolve_async_fuse_read_enabled_for_profile(
+    profile: LinuxFuseProfile,
+    raw: Option<&str>,
+) -> bool {
+    raw.map_or(
+        matches!(profile, LinuxFuseProfile::Media),
+        should_enable_async_fuse_read_from_env_value,
+    )
+}
+
+fn resolve_async_dio_enabled_for_profile(profile: LinuxFuseProfile, raw: Option<&str>) -> bool {
+    raw.map_or(
+        matches!(profile, LinuxFuseProfile::Media),
+        should_request_fuse_async_dio_from_env_value,
+    )
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
     let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
     resolve_async_fuse_write_enabled(raw.as_deref())
-}
-
-fn should_enable_async_fuse_read_from_env() -> bool {
-    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok();
-    resolve_async_fuse_read_enabled(raw.as_deref())
 }
 
 trait FuseWriteReply {
@@ -1089,16 +1124,8 @@ impl StudioFuseRuntimeOptions {
     pub fn from_env() -> Self {
         let profile = LinuxFuseProfile::from_env();
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env_for_profile(profile);
-        let (default_max_write_bytes, default_max_readahead_bytes) = match profile {
-            LinuxFuseProfile::Conservative => (
-                DEFAULT_FUSE_MAX_WRITE_BYTES,
-                DEFAULT_FUSE_MAX_READAHEAD_BYTES,
-            ),
-            LinuxFuseProfile::HighThroughput => (
-                HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES,
-                HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES,
-            ),
-        };
+        let (default_max_write_bytes, default_max_readahead_bytes) =
+            default_fuse_geometry_for_profile(profile);
         let requested_max_write_bytes =
             parse_bridge_u32_env("STUDIOFS_FUSE_MAX_WRITE_BYTES", default_max_write_bytes);
         let fuse_max_write_bytes =
@@ -1113,12 +1140,59 @@ impl StudioFuseRuntimeOptions {
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: should_enable_async_fuse_write_from_env(),
-            async_read_enabled: should_enable_async_fuse_read_from_env(),
-            linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
+            async_read_enabled: resolve_async_fuse_read_enabled_for_profile(
+                profile,
+                std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok().as_deref(),
+            ),
+            linux_async_dio_enabled: resolve_async_dio_enabled_for_profile(
+                profile,
+                std::env::var(STUDIOFS_FUSE_ASYNC_DIO_ENV).ok().as_deref(),
+            ),
             linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
             ),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_env_values(
+        profile: Option<&str>,
+        max_write: Option<&str>,
+        max_readahead: Option<&str>,
+        max_background: Option<&str>,
+        congestion_threshold: Option<&str>,
+        async_read: Option<&str>,
+        async_dio: Option<&str>,
+        writeback_cache: Option<&str>,
+    ) -> Self {
+        let profile = LinuxFuseProfile::from_env_value(profile);
+        let background_queue_policy = FuseBackgroundQueuePolicy::from_env_values_for_profile(
+            profile,
+            max_background,
+            congestion_threshold,
+        );
+        let (default_max_write_bytes, default_max_readahead_bytes) =
+            default_fuse_geometry_for_profile(profile);
+        Self {
+            linux_fuse_profile: profile,
+            fuse_max_write_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+                max_write,
+                default_max_write_bytes,
+            ),
+            fuse_max_readahead_bytes: parse_bridge_u32_env_value(
+                "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+                max_readahead,
+                default_max_readahead_bytes,
+            ),
+            fuse_max_background: background_queue_policy.max_background,
+            fuse_congestion_threshold: background_queue_policy.congestion_threshold,
+            async_write_enabled: true,
+            async_read_enabled: resolve_async_fuse_read_enabled_for_profile(profile, async_read),
+            linux_async_dio_enabled: resolve_async_dio_enabled_for_profile(profile, async_dio),
+            linux_writeback_cache_enabled: resolve_fuse_writeback_cache_enabled(writeback_cache),
+            async_write_admission_limits: None,
         }
     }
 }
@@ -2935,12 +3009,12 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseBufferPool,
         FuseDataReplyGuard, FuseEmptyReplyGuard, FuseWriteReplyGuard, LinuxFuseProfile,
-        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fs_ioc_getflags_reply_data, fuse_attr_blksize, fuse_write_local_sync_policy,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        parse_bridge_u32_env_result, posix_flags_to_open_flags, resolve_async_fuse_read_enabled,
-        resolve_async_fuse_write_enabled, resolve_fuse_writeback_cache_enabled,
-        should_enable_async_fuse_read_from_env_value,
+        PendingFuseCloseGuard, StudioFuseFs, StudioFuseRuntimeOptions, TTL,
+        complete_fuse_write_reply, fs_ioc_getflags_reply_data, fuse_attr_blksize,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, parse_bridge_u32_env_result, posix_flags_to_open_flags,
+        resolve_async_fuse_read_enabled, resolve_async_fuse_write_enabled,
+        resolve_fuse_writeback_cache_enabled, should_enable_async_fuse_read_from_env_value,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
@@ -3536,6 +3610,31 @@ mod tests {
             LinuxFuseProfile::from_env_value(Some("high_throughput")),
             LinuxFuseProfile::HighThroughput
         );
+        assert_eq!(
+            LinuxFuseProfile::from_env_value(Some("media")),
+            LinuxFuseProfile::Media
+        );
+    }
+
+    #[test]
+    fn media_linux_fuse_profile_matches_macos_media_geometry() {
+        let options = StudioFuseRuntimeOptions::from_env_values(
+            Some("media"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(options.linux_fuse_profile, LinuxFuseProfile::Media);
+        assert_eq!(options.fuse_max_write_bytes, 4 * 1024 * 1024);
+        assert_eq!(options.fuse_max_readahead_bytes, 4 * 1024 * 1024);
+        assert!(options.async_read_enabled);
+        assert!(options.linux_async_dio_enabled);
+        assert!(!options.linux_writeback_cache_enabled);
     }
 
     #[test]
@@ -3682,6 +3781,18 @@ mod tests {
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY, true),
+            fuser::FopenFlags::empty()
+        );
+    }
+
+    #[test]
+    fn media_linux_fuse_profile_keeps_kernel_cache_policy() {
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDONLY, false),
+            fuser::FopenFlags::FOPEN_KEEP_CACHE
+        );
+        assert_eq!(
+            fuse_open_reply_flags(libc::O_RDWR, false),
             fuser::FopenFlags::empty()
         );
     }

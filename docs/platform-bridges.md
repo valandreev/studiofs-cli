@@ -199,6 +199,12 @@ high-throughput tuning profile. It requests `max_write=16 MiB`, keeps
 `max_readahead` at the Linux default 128 KiB, and sets `max_background=128`
 plus `congestion_threshold=96`. This is the Linux default.
 
+`STUDIOFS_LINUX_FUSE_PROFILE=media` selects a macOS-like media profile for
+Linux A/B runs. It requests `max_write=4 MiB`, `max_readahead=4 MiB`, enables
+async read replies and Linux async DIO, keeps kernel cache policy enabled for
+read-only opens, keeps writeback cache disabled, and uses the macOS-style
+`50/40` background queue policy.
+
 `STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
 `STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
 the primary FUSE bridge throughput controls for local payload I/O. Explicit env
