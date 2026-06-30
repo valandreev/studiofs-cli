@@ -68,7 +68,7 @@ pub enum LinuxFuseProfile {
     Conservative,
     /// Profile for high-throughput Linux FUSE I/O tuning.
     HighThroughput,
-    /// macOS-like media profile: larger sequential geometry plus bridge read windows.
+    /// macOS-like media profile: larger sequential geometry.
     Media,
 }
 
@@ -565,23 +565,6 @@ fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 fn resolve_async_fuse_read_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(should_enable_async_fuse_read_from_env_value)
-}
-
-fn resolve_async_fuse_read_enabled_for_profile(
-    profile: LinuxFuseProfile,
-    raw: Option<&str>,
-) -> bool {
-    raw.map_or(
-        matches!(profile, LinuxFuseProfile::Media),
-        should_enable_async_fuse_read_from_env_value,
-    )
-}
-
-fn resolve_async_dio_enabled_for_profile(profile: LinuxFuseProfile, raw: Option<&str>) -> bool {
-    raw.map_or(
-        matches!(profile, LinuxFuseProfile::Media),
-        should_request_fuse_async_dio_from_env_value,
-    )
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
@@ -1140,14 +1123,20 @@ impl StudioFuseRuntimeOptions {
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: should_enable_async_fuse_write_from_env(),
-            async_read_enabled: resolve_async_fuse_read_enabled_for_profile(
-                profile,
-                std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV).ok().as_deref(),
-            ),
-            linux_async_dio_enabled: resolve_async_dio_enabled_for_profile(
-                profile,
-                std::env::var(STUDIOFS_FUSE_ASYNC_DIO_ENV).ok().as_deref(),
-            ),
+            async_read_enabled: std::env::var(STUDIOFS_FUSE_ASYNC_READ_ENV)
+                .ok()
+                .as_deref()
+                .map_or(
+                    matches!(profile, LinuxFuseProfile::Media),
+                    should_enable_async_fuse_read_from_env_value,
+                ),
+            linux_async_dio_enabled: std::env::var(STUDIOFS_FUSE_ASYNC_DIO_ENV)
+                .ok()
+                .as_deref()
+                .map_or(
+                    matches!(profile, LinuxFuseProfile::Media),
+                    should_request_fuse_async_dio_from_env_value,
+                ),
             linux_writeback_cache_enabled: should_enable_fuse_writeback_cache_from_env(),
             async_write_admission_limits: Some(
                 FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
@@ -1189,8 +1178,14 @@ impl StudioFuseRuntimeOptions {
             fuse_max_background: background_queue_policy.max_background,
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: true,
-            async_read_enabled: resolve_async_fuse_read_enabled_for_profile(profile, async_read),
-            linux_async_dio_enabled: resolve_async_dio_enabled_for_profile(profile, async_dio),
+            async_read_enabled: async_read.map_or(
+                matches!(profile, LinuxFuseProfile::Media),
+                should_enable_async_fuse_read_from_env_value,
+            ),
+            linux_async_dio_enabled: async_dio.map_or(
+                matches!(profile, LinuxFuseProfile::Media),
+                should_request_fuse_async_dio_from_env_value,
+            ),
             linux_writeback_cache_enabled: resolve_fuse_writeback_cache_enabled(writeback_cache),
             async_write_admission_limits: None,
         }
@@ -3781,18 +3776,6 @@ mod tests {
         );
         assert_eq!(
             fuse_open_reply_flags(libc::O_RDONLY, true),
-            fuser::FopenFlags::empty()
-        );
-    }
-
-    #[test]
-    fn media_linux_fuse_profile_keeps_kernel_cache_policy() {
-        assert_eq!(
-            fuse_open_reply_flags(libc::O_RDONLY, false),
-            fuser::FopenFlags::FOPEN_KEEP_CACHE
-        );
-        assert_eq!(
-            fuse_open_reply_flags(libc::O_RDWR, false),
             fuser::FopenFlags::empty()
         );
     }
