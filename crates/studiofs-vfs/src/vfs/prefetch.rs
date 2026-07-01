@@ -323,6 +323,12 @@ impl PrefetchWorker {
             for object_idx in block_indices {
                 if self.vfs.readahead.start_prefetch(ino, object_idx) {
                     started_blocks.push(object_idx);
+                } else {
+                    self.vfs
+                        .state
+                        .metrics
+                        .readahead_dropped_blocks
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
             if started_blocks.is_empty() {
@@ -363,10 +369,21 @@ impl PrefetchWorker {
 
         for mut batch in planned {
             let ino = batch.ino;
+            let original_blocks = batch.block_indices.len() as u64;
             batch
                 .block_indices
                 .retain(|object_idx| self.pending_set.insert((ino, *object_idx)));
+            let queued_blocks = batch.block_indices.len() as u64;
+            self.vfs.state.metrics.readahead_dropped_blocks.fetch_add(
+                original_blocks.saturating_sub(queued_blocks),
+                Ordering::Relaxed,
+            );
             if !batch.is_empty() {
+                self.vfs
+                    .state
+                    .metrics
+                    .readahead_scheduled_blocks
+                    .fetch_add(queued_blocks, Ordering::Relaxed);
                 self.pending_queue.push_back(batch);
             }
         }

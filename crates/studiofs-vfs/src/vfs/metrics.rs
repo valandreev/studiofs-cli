@@ -1359,6 +1359,15 @@ pub struct VfsFetchStats {
     pub malformed_encrypted_objects: u64,
     /// Prefetch skips count.
     pub prefetch_skips: u64,
+    /// Readahead blocks scheduled for background prefetch.
+    #[serde(default)]
+    pub readahead_scheduled_blocks: u64,
+    /// Readahead blocks dropped by duplicate suppression or stale queue pruning.
+    #[serde(default)]
+    pub readahead_dropped_blocks: u64,
+    /// Bytes later served from objects populated by readahead.
+    #[serde(default)]
+    pub readahead_used_bytes: u64,
     /// Local cache I/O calls count.
     pub local_cache_io_calls: u64,
     /// Total local cache handoff time in milliseconds.

@@ -254,6 +254,14 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     assert!(parsed.bridge.counters.contains_key("read_callbacks"));
     assert!(parsed.vfs_read.counters.contains_key("calls"));
     assert!(parsed.cache.counters.contains_key("prefetch_skips"));
+    assert!(
+        parsed
+            .cache
+            .counters
+            .contains_key("readahead_scheduled_ops")
+    );
+    assert!(parsed.cache.counters.contains_key("readahead_dropped_ops"));
+    assert!(parsed.cache.counters.contains_key("readahead_useful_bytes"));
     assert!(parsed.upload_queue.gauges.contains_key("pending_depth"));
 }
 
@@ -12563,6 +12571,18 @@ fn write_path_observability_reports_fetch_counters() {
         .metrics
         .bytes_downloaded
         .store(20 * 1024 * 1024, Ordering::Relaxed);
+    vfs.state
+        .metrics
+        .readahead_scheduled_blocks
+        .store(11, Ordering::Relaxed);
+    vfs.state
+        .metrics
+        .readahead_dropped_blocks
+        .store(2, Ordering::Relaxed);
+    vfs.state
+        .metrics
+        .readahead_used_bytes
+        .store(6 * 1024 * 1024, Ordering::Relaxed);
 
     let snapshot = vfs.write_path_observability_snapshot();
 
@@ -12570,6 +12590,9 @@ fn write_path_observability_reports_fetch_counters() {
     assert_eq!(snapshot.fetch.s3_fetches, 5);
     assert_eq!(snapshot.fetch.singleflight_joins, 3);
     assert_eq!(snapshot.fetch.bytes_downloaded, 20 * 1024 * 1024);
+    assert_eq!(snapshot.fetch.readahead_scheduled_blocks, 11);
+    assert_eq!(snapshot.fetch.readahead_dropped_blocks, 2);
+    assert_eq!(snapshot.fetch.readahead_used_bytes, 6 * 1024 * 1024);
 }
 
 #[test]

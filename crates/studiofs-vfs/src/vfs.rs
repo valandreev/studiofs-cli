@@ -146,6 +146,7 @@ use crate::runtime::{
 use crate::utils::{now_unix_millis, now_unix_secs};
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Buf, Bytes, BytesMut};
+use dashmap::DashSet;
 use futures::FutureExt;
 use lru::LruCache;
 use opendal::options::WriteOptions;
@@ -1627,6 +1628,7 @@ struct ForegroundReadSample {
 const PUBLISHED_READ_PLAN_CACHE_MAX_INODES: usize = 1_024;
 const PUBLISHED_READ_PLAN_CACHE_MAX_WINDOWS_PER_INODE: usize = 4;
 const PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS: u64 = 4;
+const PREFETCHED_OBJECT_TRACKING_LIMIT: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PublishedReadPlanCacheKey {
@@ -2114,6 +2116,11 @@ struct MetricsState {
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
+    readahead_scheduled_blocks: AtomicU64,
+    readahead_dropped_blocks: AtomicU64,
+    readahead_used_bytes: AtomicU64,
+    prefetched_object_ids: DashSet<u64>,
+    prefetched_object_remaining_bytes: Mutex<LruCache<u64, u32>>,
     flush_barrier_calls: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
@@ -2257,6 +2264,14 @@ impl MetricsState {
             ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
+            readahead_scheduled_blocks: AtomicU64::new(0),
+            readahead_dropped_blocks: AtomicU64::new(0),
+            readahead_used_bytes: AtomicU64::new(0),
+            prefetched_object_ids: DashSet::with_capacity(PREFETCHED_OBJECT_TRACKING_LIMIT),
+            prefetched_object_remaining_bytes: Mutex::new(LruCache::new(
+                NonZeroUsize::new(PREFETCHED_OBJECT_TRACKING_LIMIT)
+                    .expect("prefetched object tracking capacity is non-zero"),
+            )),
             flush_barrier_calls: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
@@ -2405,7 +2420,12 @@ impl MetricsState {
         // diagnostics "reset counters" action remains a complete bounded reset.
         self.materialize_batch_stats.reset();
         self.prefetch_queue_depth.store(0, Ordering::Relaxed);
+        self.prefetched_object_ids.clear();
+        self.prefetched_object_remaining_bytes.lock().clear();
         reset_atomic!(
+            readahead_scheduled_blocks,
+            readahead_dropped_blocks,
+            readahead_used_bytes,
             flush_barrier_calls,
             local_cache_io_calls,
             local_cache_io_handoff_total_ns,
@@ -7438,6 +7458,21 @@ impl StudioVfs {
             .malformed_encrypted_objects
             .load(Ordering::Relaxed);
         let fetch_prefetch_skips = fetch_metrics.prefetch_skips.load(Ordering::Relaxed);
+        let readahead_scheduled_blocks = self
+            .state
+            .metrics
+            .readahead_scheduled_blocks
+            .load(Ordering::Relaxed);
+        let readahead_dropped_blocks = self
+            .state
+            .metrics
+            .readahead_dropped_blocks
+            .load(Ordering::Relaxed);
+        let readahead_used_bytes = self
+            .state
+            .metrics
+            .readahead_used_bytes
+            .load(Ordering::Relaxed);
         let fetch_local_cache_io_calls = fetch_metrics.local_cache_io_calls.load(Ordering::Relaxed);
         let fetch_local_cache_handoff_total_ns = fetch_metrics
             .local_cache_io_handoff_total_ns
@@ -7991,6 +8026,9 @@ impl StudioVfs {
                 encrypted_object_read_failures: fetch_encrypted_object_read_failures,
                 malformed_encrypted_objects: fetch_malformed_encrypted_objects,
                 prefetch_skips: fetch_prefetch_skips,
+                readahead_scheduled_blocks,
+                readahead_dropped_blocks,
+                readahead_used_bytes,
                 local_cache_io_calls: fetch_local_cache_io_calls,
                 local_cache_handoff_total_ms: fetch_local_cache_handoff_total_ns as f64
                     / 1_000_000.0,

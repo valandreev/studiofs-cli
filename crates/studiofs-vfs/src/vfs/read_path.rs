@@ -13,6 +13,7 @@ use futures::{StreamExt, stream};
 use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
@@ -634,7 +635,27 @@ impl<'a> DataReader<'a> {
             vfs.fetch_block_for_ref_after_local_miss(&block).await
         };
         match result {
-            Ok(_) => Ok::<(), VfsError>(()),
+            Ok(_) => {
+                if prefetch {
+                    let removed = vfs
+                        .state
+                        .metrics
+                        .prefetched_object_remaining_bytes
+                        .lock()
+                        .push(block.object_id, block.length)
+                        .map(|(object_id, _)| object_id);
+                    if let Some(object_id) = removed
+                        && object_id != block.object_id
+                    {
+                        vfs.state.metrics.prefetched_object_ids.remove(&object_id);
+                    }
+                    vfs.state
+                        .metrics
+                        .prefetched_object_ids
+                        .insert(block.object_id);
+                }
+                Ok::<(), VfsError>(())
+            }
             Err(crate::fetch::FetchError::NotFound { ref key }) => {
                 warn!(
                     object_id = block.object_id,
@@ -835,6 +856,29 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
+                let prefetched = &vfs.state.metrics.prefetched_object_ids;
+                if prefetched.contains(&payload.object_id) {
+                    let mut remaining_bytes =
+                        vfs.state.metrics.prefetched_object_remaining_bytes.lock();
+                    let remove =
+                        if let Some(remaining) = remaining_bytes.get_mut(&payload.object_id) {
+                            let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
+                            let useful = (*remaining).min(read_bytes);
+                            *remaining = (*remaining).saturating_sub(useful);
+                            vfs.state
+                                .metrics
+                                .readahead_used_bytes
+                                .fetch_add(u64::from(useful), Ordering::Relaxed);
+                            *remaining == 0
+                        } else {
+                            true
+                        };
+                    if remove {
+                        remaining_bytes.pop(&payload.object_id);
+                        drop(remaining_bytes);
+                        prefetched.remove(&payload.object_id);
+                    }
+                }
             }
             if !span_resolved {
                 error!(

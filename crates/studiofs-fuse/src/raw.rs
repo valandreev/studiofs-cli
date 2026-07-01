@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -15,9 +14,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs};
@@ -31,6 +31,7 @@ thread_local! {
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
+const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -879,7 +880,7 @@ fn serve_minimal_session(
         runtime_handle,
         ids,
         next_open_dir_fh: Arc::new(AtomicU64::new(1)),
-        open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+        open_dir_handles: Arc::new(DashMap::new()),
     };
     let session_result = loop {
         let len = match read_fd(fd, &mut buf) {
@@ -1497,11 +1498,7 @@ fn raw_opendir(
     match raw_load_open_dir_state(vfs, header.nodeid) {
         Ok(state) => {
             let fh = context.next_open_dir_fh.fetch_add(1, Ordering::Relaxed);
-            context
-                .open_dir_handles
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(fh, state);
+            context.open_dir_handles.insert(fh, state);
             reply_open(fd, header.unique, fh, 0, Some(accounting))
         }
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
@@ -1517,11 +1514,7 @@ fn raw_releasedir(
 ) -> io::Result<()> {
     if payload.len() >= size_of::<ReleaseIn>() {
         let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
-        context
-            .open_dir_handles
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&input.fh);
+        context.open_dir_handles.remove(&input.fh);
     }
     reply_empty(fd, header.unique, Some(accounting))
 }
@@ -1540,7 +1533,7 @@ fn raw_readdir(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
-    let mut out = Vec::with_capacity(input.size as usize);
+    let mut out = Vec::with_capacity((input.size as usize).min(READDIR_REPLY_INITIAL_CAPACITY));
     if input.offset == 0
         && !push_dirent(
             &mut out,
@@ -1614,7 +1607,7 @@ fn raw_readdirplus(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
-    let mut out = Vec::with_capacity(input.size as usize);
+    let mut out = Vec::with_capacity((input.size as usize).min(READDIR_REPLY_INITIAL_CAPACITY));
     if input.offset <= 1 {
         let current_attr = match vfs.getattr(header.nodeid) {
             Ok(attr) => attr,
@@ -1834,7 +1827,7 @@ struct RawRequestContext {
     runtime_handle: Option<Handle>,
     ids: SessionIds,
     next_open_dir_fh: Arc<AtomicU64>,
-    open_dir_handles: Arc<RwLock<HashMap<u64, RawOpenDirState>>>,
+    open_dir_handles: Arc<DashMap<u64, RawOpenDirState>>,
 }
 
 #[derive(Clone)]
@@ -1950,13 +1943,8 @@ fn raw_open_dir_handle_state(
     ino: u64,
     fh: u64,
 ) -> Result<Option<RawOpenDirState>, i32> {
-    if let Some(state) = context
-        .open_dir_handles
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&fh)
-    {
-        return Ok(Some(state.clone()));
+    if let Some(state) = context.open_dir_handles.get(&fh) {
+        return Ok(Some(state.value().clone()));
     }
     if fh != 0 {
         warn!(ino, fh, "raw readdir with unknown directory fh");
@@ -2917,7 +2905,7 @@ mod tests {
                 gid: 1000,
             },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
-            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+            open_dir_handles: Arc::new(DashMap::new()),
         };
         let current = InodeAttr::new_dir(7, FUSE_ROOT_ID, 1000, 1000, 0o755);
         let parent = InodeAttr::new_dir(FUSE_ROOT_ID, 0, 1000, 1000, 0o755);
@@ -2951,7 +2939,7 @@ mod tests {
             runtime_handle: None,
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
-            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+            open_dir_handles: Arc::new(DashMap::new()),
         };
 
         assert!(matches!(
