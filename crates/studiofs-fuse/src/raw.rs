@@ -611,9 +611,7 @@ fn call_fusermount(
     let remote_fd = remote.as_raw_fd();
     let mut command = Command::new(bin);
     command.arg(mount_point);
-    if !options.is_empty() {
-        command.arg("-o").arg(options.join(","));
-    }
+    command.arg("-o").arg(options);
     command.env("_FUSE_COMMFD", "3");
     // SAFETY: `pre_exec` runs after fork and before exec; `dup2`/`fcntl` are
     // async-signal-safe and only prepare the fusermount communication fd.
@@ -654,23 +652,18 @@ fn unix_seqpacket_socketpair() -> io::Result<(File, File)> {
     Ok((left, right))
 }
 
-fn fusermount_options(
-    volume_name: &str,
-    read_only: bool,
-    profile: LinuxRawFuseProfile,
-) -> Vec<String> {
+fn fusermount_options(volume_name: &str, read_only: bool, profile: LinuxRawFuseProfile) -> String {
     let fsname = if volume_name.is_empty() {
         "studiofs"
     } else {
         volume_name
     };
-    let mut options = vec![
-        format!("fsname={fsname}"),
-        "subtype=studiofs".to_string(),
-        format!("max_read={}", profile.max_read),
-    ];
+    let mut options = format!(
+        "fsname={fsname},subtype=studiofs,max_read={}",
+        profile.max_read
+    );
     if read_only {
-        options.push("ro".to_string());
+        options.push_str(",ro");
     }
     options
 }
@@ -2175,12 +2168,7 @@ mod tests {
 
         assert_eq!(
             options,
-            vec![
-                "fsname=studio".to_string(),
-                "subtype=studiofs".to_string(),
-                "max_read=1048576".to_string(),
-                "ro".to_string(),
-            ]
+            "fsname=studio,subtype=studiofs,max_read=1048576,ro"
         );
     }
 
