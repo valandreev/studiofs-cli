@@ -637,10 +637,14 @@ impl<'a> DataReader<'a> {
         match result {
             Ok(_) => {
                 if prefetch {
-                    let prefetched = &vfs.state.metrics.prefetched_object_ids;
-                    if prefetched.len() < PREFETCHED_OBJECT_TRACKING_LIMIT {
-                        prefetched.insert(block.object_id);
+                    let prefetched = &vfs.state.metrics.prefetched_object_remaining_bytes;
+                    if prefetched.len() >= PREFETCHED_OBJECT_TRACKING_LIMIT {
+                        if let Some(object_id) = prefetched.iter().next().map(|entry| *entry.key())
+                        {
+                            prefetched.remove(&object_id);
+                        }
                     }
+                    prefetched.insert(block.object_id, block.length);
                 }
                 Ok::<(), VfsError>(())
             }
@@ -844,17 +848,26 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
-                if vfs
+                if let Some(mut remaining) = vfs
                     .state
                     .metrics
-                    .prefetched_object_ids
-                    .remove(&payload.object_id)
-                    .is_some()
+                    .prefetched_object_remaining_bytes
+                    .get_mut(&payload.object_id)
                 {
+                    let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
+                    let useful = (*remaining).min(read_bytes);
+                    *remaining = (*remaining).saturating_sub(useful);
                     vfs.state
                         .metrics
                         .readahead_used_bytes
-                        .fetch_add(read as u64, Ordering::Relaxed);
+                        .fetch_add(u64::from(useful), Ordering::Relaxed);
+                    if *remaining == 0 {
+                        drop(remaining);
+                        vfs.state
+                            .metrics
+                            .prefetched_object_remaining_bytes
+                            .remove(&payload.object_id);
+                    }
                 }
             }
             if !span_resolved {

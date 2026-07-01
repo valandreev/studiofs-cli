@@ -19,6 +19,7 @@ workspace = true
 features = ["abi-7-23"]
 
 [target.'cfg(unix)'.dependencies]
+dashmap.workspace = true
 libc.workspace = true
 smallvec.workspace = true
 tokio.workspace = true
