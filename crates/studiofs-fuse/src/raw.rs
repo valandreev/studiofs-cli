@@ -1567,8 +1567,8 @@ fn raw_readdir(
     }
     let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
         Ok(state) => state,
-        Err(err) => {
-            return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
+        Err(errno) => {
+            return reply_error(fd, header.unique, errno, Some(accounting));
         }
     };
     for (index, entry_with_attr) in state
@@ -1617,8 +1617,8 @@ fn raw_readdirplus(
     let mut out = Vec::with_capacity(input.size as usize);
     let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
         Ok(state) => state,
-        Err(err) => {
-            return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
+        Err(errno) => {
+            return reply_error(fd, header.unique, errno, Some(accounting));
         }
     };
     for (index, entry_with_attr) in state
@@ -1905,22 +1905,31 @@ fn raw_open_dir_state(
     vfs: &StudioVfs,
     ino: u64,
     fh: u64,
-) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
+) -> Result<RawOpenDirState, i32> {
+    if let Some(state) = raw_open_dir_handle_state(context, ino, fh)? {
+        return Ok(state);
+    }
+    raw_load_open_dir_state(vfs, ino).map_err(|err| vfs_err_to_errno(&err))
+}
+
+fn raw_open_dir_handle_state(
+    context: &RawRequestContext,
+    ino: u64,
+    fh: u64,
+) -> Result<Option<RawOpenDirState>, i32> {
     if let Some(state) = context
         .open_dir_handles
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&fh)
     {
-        return Ok(state.clone());
+        return Ok(Some(state.clone()));
     }
     if fh != 0 {
-        warn!(
-            ino,
-            fh, "raw readdir with unknown directory fh; rebuilding snapshot"
-        );
+        warn!(ino, fh, "raw readdir with unknown directory fh");
+        return Err(libc::EBADF);
     }
-    raw_load_open_dir_state(vfs, ino)
+    Ok(None)
 }
 
 fn reply_getattr(
@@ -2846,6 +2855,22 @@ mod tests {
         assert_eq!(readdir_entry_skip_offset(1), 0);
         assert_eq!(readdir_entry_skip_offset(2), 0);
         assert_eq!(readdir_entry_skip_offset(3), 1);
+    }
+
+    #[test]
+    fn raw_open_dir_handle_state_rejects_unknown_nonzero_fh() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds { uid: 0, gid: 0 },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        assert!(matches!(
+            raw_open_dir_handle_state(&context, FUSE_ROOT_ID, 42),
+            Err(errno) if errno == libc::EBADF
+        ));
     }
 
     #[test]
