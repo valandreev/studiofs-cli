@@ -1,9 +1,9 @@
 use super::overlay::PendingOverlayBlockSource;
 use super::writer_stack::WriterStackReadClaim;
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
-    PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
-    VfsError, VfsResult,
+    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PREFETCHED_OBJECT_TRACKING_LIMIT,
+    PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS, PrefetchBatch, PrefetchReadContext,
+    PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs, VfsError, VfsResult,
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
@@ -13,6 +13,7 @@ use futures::{StreamExt, stream};
 use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
@@ -634,7 +635,16 @@ impl<'a> DataReader<'a> {
             vfs.fetch_block_for_ref_after_local_miss(&block).await
         };
         match result {
-            Ok(_) => Ok::<(), VfsError>(()),
+            Ok(_) => {
+                if prefetch {
+                    let mut prefetched = vfs.state.metrics.prefetched_object_ids.lock();
+                    if prefetched.len() >= PREFETCHED_OBJECT_TRACKING_LIMIT {
+                        prefetched.clear();
+                    }
+                    prefetched.insert(block.object_id);
+                }
+                Ok::<(), VfsError>(())
+            }
             Err(crate::fetch::FetchError::NotFound { ref key }) => {
                 warn!(
                     object_id = block.object_id,
@@ -835,6 +845,18 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
+                if vfs
+                    .state
+                    .metrics
+                    .prefetched_object_ids
+                    .lock()
+                    .remove(&payload.object_id)
+                {
+                    vfs.state
+                        .metrics
+                        .readahead_used_bytes
+                        .fetch_add(read as u64, Ordering::Relaxed);
+                }
             }
             if !span_resolved {
                 error!(

@@ -1057,15 +1057,21 @@ fn runtime_stats_efficiency(
         label,
         &mut warnings,
     );
-    let readahead_scheduled_ops = efficiency_unsupported(
+    let readahead_scheduled_ops = efficiency_counter(
+        sections,
+        "cache",
+        "readahead_scheduled_ops",
         "count",
-        format!(
-            "runtime stats do not expose readahead scheduled operation counters during {label}"
-        ),
+        label,
+        &mut warnings,
     );
-    let readahead_useful_bytes = efficiency_unsupported(
+    let readahead_useful_bytes = efficiency_counter(
+        sections,
+        "cache",
+        "readahead_useful_bytes",
         "bytes",
-        format!("runtime stats cannot attribute later cache hits to readahead during {label}"),
+        label,
+        &mut warnings,
     );
     let prefetch_skipped_ops = efficiency_counter(
         sections,
@@ -2106,6 +2112,14 @@ mod tests {
             .insert("prefetch_skips".to_string(), scalar(1, "count"));
         before
             .cache
+            .counters
+            .insert("readahead_scheduled_ops".to_string(), scalar(2, "count"));
+        before
+            .cache
+            .counters
+            .insert("readahead_useful_bytes".to_string(), scalar(128, "bytes"));
+        before
+            .cache
             .gauges
             .insert("prefetch_queue_depth".to_string(), scalar(0, "count"));
         before.bridge.counters.insert(
@@ -2151,6 +2165,18 @@ mod tests {
             .get_mut("prefetch_skips")
             .unwrap()
             .value = 4;
+        after
+            .cache
+            .counters
+            .get_mut("readahead_scheduled_ops")
+            .unwrap()
+            .value = 10;
+        after
+            .cache
+            .counters
+            .get_mut("readahead_useful_bytes")
+            .unwrap()
+            .value = 1_152;
         after
             .cache
             .gauges
@@ -2203,6 +2229,8 @@ mod tests {
         assert_eq!(delta.efficiency.upload.ops.value, Some(4));
         assert_eq!(delta.efficiency.upload.bytes.value, Some(2_000));
         assert_eq!(delta.efficiency.prefetch.queue_depth_after.value, Some(7));
+        assert_eq!(delta.efficiency.readahead.scheduled_ops.value, Some(8));
+        assert_eq!(delta.efficiency.readahead.useful_bytes.value, Some(1024));
         assert_eq!(delta.efficiency.prefetch.skipped_ops.value, Some(3));
         assert!(!delta.efficiency.prefetch.useful_bytes.available);
         assert!(delta.efficiency.warnings.is_empty());

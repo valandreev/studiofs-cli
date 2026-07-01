@@ -320,6 +320,24 @@ impl StudioVfs {
             "count",
             write_path.fetch.prefetch_skips,
         );
+        insert_counter(
+            &mut snapshot.cache,
+            "readahead_scheduled_ops",
+            "count",
+            write_path.fetch.readahead_scheduled_blocks,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "readahead_dropped_ops",
+            "count",
+            write_path.fetch.readahead_dropped_blocks,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "readahead_useful_bytes",
+            "bytes",
+            write_path.fetch.readahead_used_bytes,
+        );
         insert_gauge(
             &mut snapshot.upload_queue,
             "pending_depth",
