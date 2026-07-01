@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
-use studiofs_meta::{FileType, InodeAttr};
+use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
@@ -46,6 +46,16 @@ const OP_CREATE: u32 = 35;
 const OP_DESTROY: u32 = 38;
 const OP_IOCTL: u32 = 39;
 const OP_READDIRPLUS: u32 = 44;
+
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_ATIME: u32 = 1 << 4;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_FH: u32 = 1 << 6;
+const FATTR_ATIME_NOW: u32 = 1 << 7;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
 
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_FILE_OPS: u32 = 1 << 2;
@@ -446,6 +456,54 @@ struct ReleaseIn {
     lock_owner: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SetattrIn {
+    valid: u32,
+    padding: u32,
+    fh: u64,
+    size: u64,
+    lock_owner: u64,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    atimensec: u32,
+    mtimensec: u32,
+    ctimensec: u32,
+    mode: u32,
+    unused4: u32,
+    uid: u32,
+    gid: u32,
+    unused5: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SetxattrIn {
+    size: u32,
+    flags: u32,
+    setxattr_flags: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GetxattrIn {
+    size: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IoctlIn {
+    fh: u64,
+    flags: u32,
+    cmd: u32,
+    arg: u64,
+    in_size: u32,
+    out_size: u32,
+}
+
 /// Mount and serve a minimal Linux raw FUSE session.
 pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
     let RawFuseMountRequest {
@@ -667,11 +725,17 @@ fn handle_minimal_request(
         OP_GETATTR => reply_getattr(fd, header.unique, header.nodeid, context, Some(accounting)),
         OP_STATFS => reply_statfs(fd, header.unique, Some(accounting)),
         OP_OPEN => raw_open(fd, header, payload, context, accounting),
+        OP_SETATTR => raw_setattr(fd, header, payload, context, accounting),
         OP_READ => raw_read(fd, header, payload, context, accounting),
         OP_WRITE => raw_write(fd, header, payload, context, accounting),
         OP_FLUSH => raw_flush(fd, header, payload, context, accounting),
         OP_FSYNC => raw_fsync(fd, header, payload, context, accounting),
         OP_RELEASE => raw_release(fd, header, payload, context, accounting),
+        OP_SETXATTR => raw_setxattr(fd, header, payload, context, accounting),
+        OP_GETXATTR => raw_getxattr(fd, header, payload, context, accounting),
+        OP_LISTXATTR => raw_listxattr(fd, header, payload, context, accounting),
+        OP_REMOVEXATTR => raw_removexattr(fd, header, payload, context, accounting),
+        OP_IOCTL => raw_ioctl(fd, header, payload, context, accounting),
         OP_OPENDIR => reply_open(fd, header.unique, 1, 0, Some(accounting)),
         OP_READDIR | OP_READDIRPLUS => raw_readdir(fd, header, payload, context, accounting),
         OP_ACCESS | OP_RELEASEDIR => reply_empty(fd, header.unique, Some(accounting)),
@@ -684,6 +748,32 @@ fn handle_minimal_request(
             );
             reply_error(fd, header.unique, libc::ENOSYS, Some(accounting))
         }
+    }
+}
+
+fn raw_setattr(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<SetattrIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<SetattrIn>(&payload[..size_of::<SetattrIn>()])?;
+    let args = setattr_args_from_raw(input);
+    let fh = if input.valid & FATTR_FH != 0 {
+        Some(input.fh)
+    } else {
+        None
+    };
+    match vfs.setattr_with_handle(fh, header.nodeid, args) {
+        Ok(attr) => reply_attr(fd, header.unique, &attr, context, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
 
@@ -928,6 +1018,123 @@ fn raw_readdir(
     reply_data(fd, header.unique, &out, Some(accounting))
 }
 
+fn raw_setxattr(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<SetxattrIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<SetxattrIn>(&payload[..size_of::<SetxattrIn>()])?;
+    let rest = &payload[size_of::<SetxattrIn>()..];
+    let Some(name_end) = rest.iter().position(|byte| *byte == 0) else {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    };
+    let name = &rest[..name_end];
+    let value = &rest[name_end + 1..];
+    if value.len() < input.size as usize {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    match vfs.set_xattr(
+        header.nodeid,
+        name,
+        &value[..input.size as usize],
+        input.flags,
+    ) {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, raw_xattr_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_getxattr(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<GetxattrIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<GetxattrIn>(&payload[..size_of::<GetxattrIn>()])?;
+    let name = payload[size_of::<GetxattrIn>()..]
+        .strip_suffix(&[0])
+        .unwrap_or(&payload[size_of::<GetxattrIn>()..]);
+    match vfs.get_xattr(header.nodeid, name) {
+        Ok(Some(value)) => reply_xattr_value(fd, header.unique, &value, input.size, accounting),
+        Ok(None) => reply_error(fd, header.unique, libc::ENODATA, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, raw_xattr_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_listxattr(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<GetxattrIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<GetxattrIn>(&payload[..size_of::<GetxattrIn>()])?;
+    match vfs.list_xattrs(header.nodeid) {
+        Ok(names) => {
+            let data = encode_xattr_name_list(&names);
+            reply_xattr_value(fd, header.unique, &data, input.size, accounting)
+        }
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_removexattr(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    let name = payload.strip_suffix(&[0]).unwrap_or(payload);
+    match vfs.remove_xattr(header.nodeid, name) {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, raw_xattr_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_ioctl(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    _context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() < size_of::<IoctlIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<IoctlIn>(&payload[..size_of::<IoctlIn>()])?;
+    let data = &payload[size_of::<IoctlIn>()..];
+    match raw_fs_ioc_getflags_reply_data(input.cmd, data, input.out_size) {
+        Ok(Some(out)) => reply_ioctl(fd, header.unique, 0, &out, Some(accounting)),
+        Ok(None) => reply_error(fd, header.unique, libc::ENOTTY, Some(accounting)),
+        Err(errno) => reply_error(fd, header.unique, errno, Some(accounting)),
+    }
+}
+
 fn handle_init(
     fd: RawFd,
     header: InHeader,
@@ -1132,6 +1339,71 @@ fn reply_entry(
     reply_struct(fd, unique, &out, accounting)
 }
 
+fn reply_attr(
+    fd: RawFd,
+    unique: u64,
+    inode_attr: &InodeAttr,
+    context: &RawRequestContext,
+    accounting: Option<&RawDispatchAccounting>,
+) -> io::Result<()> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Attr {
+        ino: u64,
+        size: u64,
+        blocks: u64,
+        atime: u64,
+        mtime: u64,
+        ctime: u64,
+        atimensec: u32,
+        mtimensec: u32,
+        ctimensec: u32,
+        mode: u32,
+        nlink: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        blksize: u32,
+        padding: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AttrOut {
+        attr_valid: u64,
+        attr_valid_nsec: u32,
+        dummy: u32,
+        attr: Attr,
+    }
+    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let out = AttrOut {
+        attr_valid: 1,
+        attr_valid_nsec: 0,
+        dummy: 0,
+        attr: Attr {
+            ino: bridge.ino,
+            size: bridge.size,
+            blocks: bridge.blocks,
+            atime: system_time_secs(bridge.atime),
+            mtime: system_time_secs(bridge.mtime),
+            ctime: system_time_secs(bridge.ctime),
+            atimensec: system_time_nsecs(bridge.atime),
+            mtimensec: system_time_nsecs(bridge.mtime),
+            ctimensec: system_time_nsecs(bridge.ctime),
+            mode: raw_mode(inode_attr),
+            nlink: bridge.nlink,
+            uid: bridge.uid,
+            gid: bridge.gid,
+            rdev: bridge.rdev,
+            blksize: bridge.blksize,
+            padding: 0,
+        },
+    };
+    // SAFETY: `AttrOut` and nested structs are `repr(C)`, integer-only, and
+    // include explicit padding fields for the Linux FUSE wire layout.
+    unsafe impl FuseBytes for AttrOut {}
+    reply_struct(fd, unique, &out, accounting)
+}
+
 fn reply_statfs(
     fd: RawFd,
     unique: u64,
@@ -1250,6 +1522,82 @@ fn reply_write(
         },
         accounting,
     )
+}
+
+fn reply_xattr_value(
+    fd: RawFd,
+    unique: u64,
+    data: &[u8],
+    size: u32,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if size == 0 {
+        let Ok(data_len) = u32::try_from(data.len()) else {
+            return reply_error(fd, unique, libc::EOVERFLOW, Some(accounting));
+        };
+        return reply_xattr_size(fd, unique, data_len, Some(accounting));
+    }
+    if data.len() <= size as usize {
+        reply_data(fd, unique, data, Some(accounting))
+    } else {
+        reply_error(fd, unique, libc::ERANGE, Some(accounting))
+    }
+}
+
+fn reply_xattr_size(
+    fd: RawFd,
+    unique: u64,
+    size: u32,
+    accounting: Option<&RawDispatchAccounting>,
+) -> io::Result<()> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct GetxattrOut {
+        size: u32,
+        padding: u32,
+    }
+    // SAFETY: `GetxattrOut` is `repr(C)`, integer-only, and has explicit padding.
+    unsafe impl FuseBytes for GetxattrOut {}
+    reply_struct(fd, unique, &GetxattrOut { size, padding: 0 }, accounting)
+}
+
+fn reply_ioctl(
+    fd: RawFd,
+    unique: u64,
+    result: i32,
+    data: &[u8],
+    accounting: Option<&RawDispatchAccounting>,
+) -> io::Result<()> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct IoctlOut {
+        result: i32,
+        flags: u32,
+        in_iovs: u32,
+        out_iovs: u32,
+    }
+    // SAFETY: `IoctlOut` is `repr(C)`, integer-only, and has explicit fields.
+    unsafe impl FuseBytes for IoctlOut {}
+    let out = IoctlOut {
+        result,
+        flags: 0,
+        in_iovs: 0,
+        out_iovs: 0,
+    };
+    let header_len = size_of::<OutHeader>() + size_of::<IoctlOut>() + data.len();
+    let header = OutHeader {
+        len: header_len as u32,
+        error: 0,
+        unique,
+    };
+    let mut body = Vec::with_capacity(size_of::<IoctlOut>() + data.len());
+    body.extend_from_slice(as_bytes(&out));
+    body.extend_from_slice(data);
+    write_fuse_packet_vectored_fd(fd, as_bytes(&header), &body)?;
+    if let Some(accounting) = accounting {
+        accounting.record_reply_bytes(header_len);
+    }
+    Ok(())
 }
 
 fn push_dirent(
@@ -1435,6 +1783,75 @@ fn raw_mode(attr: &InodeAttr) -> u32 {
     kind | u32::from(attr.mode & 0o7777)
 }
 
+fn setattr_args_from_raw(input: SetattrIn) -> SetattrArgs {
+    SetattrArgs {
+        size: (input.valid & FATTR_SIZE != 0).then_some(input.size),
+        mode: (input.valid & FATTR_MODE != 0).then_some((input.mode & 0o7777) as u16),
+        uid: (input.valid & FATTR_UID != 0).then_some(input.uid),
+        gid: (input.valid & FATTR_GID != 0).then_some(input.gid),
+        atime: raw_time_spec(
+            input.valid,
+            FATTR_ATIME,
+            FATTR_ATIME_NOW,
+            input.atime,
+            input.atimensec,
+        ),
+        mtime: raw_time_spec(
+            input.valid,
+            FATTR_MTIME,
+            FATTR_MTIME_NOW,
+            input.mtime,
+            input.mtimensec,
+        ),
+        crtime: TimeSpec::Omit,
+        win_attrs: None,
+    }
+}
+
+fn raw_time_spec(valid: u32, field: u32, now_field: u32, secs: u64, nsecs: u32) -> TimeSpec {
+    if valid & field == 0 {
+        TimeSpec::Omit
+    } else if valid & now_field != 0 {
+        TimeSpec::Now
+    } else {
+        let nanos = (u128::from(secs) * 1_000_000_000).saturating_add(u128::from(nsecs));
+        TimeSpec::Set(nanos.min(i64::MAX as u128) as i64)
+    }
+}
+
+fn encode_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
+    names
+        .iter()
+        .flat_map(|name| name.iter().copied().chain(std::iter::once(0)))
+        .collect()
+}
+
+fn raw_xattr_errno(err: &studiofs_vfs::VfsError) -> i32 {
+    if matches!(
+        err,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    ) {
+        libc::ENODATA
+    } else {
+        vfs_err_to_errno(err)
+    }
+}
+
+fn raw_fs_ioc_getflags_reply_data(
+    cmd: u32,
+    in_data: &[u8],
+    out_size: u32,
+) -> Result<Option<Vec<u8>>, i32> {
+    let is_getflags = cmd == libc::FS_IOC_GETFLAGS as u32 || cmd == libc::FS_IOC32_GETFLAGS as u32;
+    if !is_getflags {
+        return Ok(None);
+    }
+    if !in_data.is_empty() || out_size < u32::BITS / 8 {
+        return Err(libc::EINVAL);
+    }
+    Ok(Some(vec![0; out_size as usize]))
+}
+
 fn system_time_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1502,6 +1919,10 @@ unsafe impl FuseBytes for WriteIn {}
 unsafe impl FuseBytes for FlushIn {}
 unsafe impl FuseBytes for FsyncIn {}
 unsafe impl FuseBytes for ReleaseIn {}
+unsafe impl FuseBytes for SetattrIn {}
+unsafe impl FuseBytes for SetxattrIn {}
+unsafe impl FuseBytes for GetxattrIn {}
+unsafe impl FuseBytes for IoctlIn {}
 unsafe impl FuseBytes for OutHeader {}
 
 #[cfg(test)]
@@ -1566,5 +1987,29 @@ mod tests {
         assert_eq!(snapshot.read_latency_nanos, 7);
         assert_eq!(snapshot.write_latency_count, 1);
         assert_eq!(snapshot.write_latency_nanos, 11);
+    }
+
+    #[test]
+    fn raw_xattr_name_list_uses_null_terminated_names() {
+        let data = encode_xattr_name_list(&[b"user.one".to_vec(), b"user.two".to_vec()]);
+
+        assert_eq!(data, b"user.one\0user.two\0");
+    }
+
+    #[test]
+    fn raw_ioctl_getflags_reply_matches_requested_output_size() {
+        let data = raw_fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, &[], 8)
+            .expect("getflags should be valid")
+            .expect("getflags should return data");
+
+        assert_eq!(data, vec![0; 8]);
+    }
+
+    #[test]
+    fn raw_ioctl_getflags_rejects_input_payload() {
+        assert_eq!(
+            raw_fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, b"x", 4).unwrap_err(),
+            libc::EINVAL
+        );
     }
 }

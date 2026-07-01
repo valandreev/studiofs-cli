@@ -985,15 +985,19 @@ fn raw_fuse_mount_and_unmount_smoke() {
         return;
     }
 
+    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
     let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
     let mount_path = mount_dir.path().to_path_buf();
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "raw_mount_sanity", &rt);
 
     use std::os::unix::fs::MetadataExt;
     let pre_dev = std::fs::metadata(&mount_path)
         .expect("mount dir should exist before raw session")
         .dev();
 
-    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke");
+    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke")
+        .with_vfs(vfs, rt.handle().clone());
     request.read_only = true;
     let session_handle = std::thread::spawn(move || mount_raw_with_request(request));
 
