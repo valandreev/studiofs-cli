@@ -637,11 +637,10 @@ impl<'a> DataReader<'a> {
         match result {
             Ok(_) => {
                 if prefetch {
-                    let mut prefetched = vfs.state.metrics.prefetched_object_ids.lock();
-                    if prefetched.len() >= PREFETCHED_OBJECT_TRACKING_LIMIT {
-                        prefetched.clear();
+                    let prefetched = &vfs.state.metrics.prefetched_object_ids;
+                    if prefetched.len() < PREFETCHED_OBJECT_TRACKING_LIMIT {
+                        prefetched.insert(block.object_id);
                     }
-                    prefetched.insert(block.object_id);
                 }
                 Ok::<(), VfsError>(())
             }
@@ -849,8 +848,8 @@ impl<'a> DataReader<'a> {
                     .state
                     .metrics
                     .prefetched_object_ids
-                    .lock()
                     .remove(&payload.object_id)
+                    .is_some()
                 {
                     vfs.state
                         .metrics

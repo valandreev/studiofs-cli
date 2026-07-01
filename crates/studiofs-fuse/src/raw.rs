@@ -31,6 +31,7 @@ thread_local! {
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
+const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -1540,7 +1541,7 @@ fn raw_readdir(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
-    let mut out = Vec::with_capacity(input.size as usize);
+    let mut out = Vec::with_capacity((input.size as usize).min(READDIR_REPLY_INITIAL_CAPACITY));
     if input.offset == 0
         && !push_dirent(
             &mut out,
@@ -1614,7 +1615,7 @@ fn raw_readdirplus(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
-    let mut out = Vec::with_capacity(input.size as usize);
+    let mut out = Vec::with_capacity((input.size as usize).min(READDIR_REPLY_INITIAL_CAPACITY));
     if input.offset <= 1 {
         let current_attr = match vfs.getattr(header.nodeid) {
             Ok(attr) => attr,

@@ -146,6 +146,7 @@ use crate::runtime::{
 use crate::utils::{now_unix_millis, now_unix_secs};
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Buf, Bytes, BytesMut};
+use dashmap::DashSet;
 use futures::FutureExt;
 use lru::LruCache;
 use opendal::options::WriteOptions;
@@ -2118,7 +2119,7 @@ struct MetricsState {
     readahead_scheduled_blocks: AtomicU64,
     readahead_dropped_blocks: AtomicU64,
     readahead_used_bytes: AtomicU64,
-    prefetched_object_ids: Mutex<HashSet<u64>>,
+    prefetched_object_ids: DashSet<u64>,
     flush_barrier_calls: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
@@ -2265,7 +2266,7 @@ impl MetricsState {
             readahead_scheduled_blocks: AtomicU64::new(0),
             readahead_dropped_blocks: AtomicU64::new(0),
             readahead_used_bytes: AtomicU64::new(0),
-            prefetched_object_ids: Mutex::new(HashSet::new()),
+            prefetched_object_ids: DashSet::with_capacity(PREFETCHED_OBJECT_TRACKING_LIMIT),
             flush_barrier_calls: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
@@ -2414,7 +2415,7 @@ impl MetricsState {
         // diagnostics "reset counters" action remains a complete bounded reset.
         self.materialize_batch_stats.reset();
         self.prefetch_queue_depth.store(0, Ordering::Relaxed);
-        self.prefetched_object_ids.lock().clear();
+        self.prefetched_object_ids.clear();
         reset_atomic!(
             readahead_scheduled_blocks,
             readahead_dropped_blocks,
