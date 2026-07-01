@@ -1,9 +1,10 @@
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
-use std::mem::{self, size_of};
+use std::mem::size_of;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -198,9 +199,8 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
         profile,
     )?;
     info!(mount_point = %mount_point.display(), "mounted StudioFS raw FUSE session");
-    let result = serve_minimal_session(dev_fuse.as_raw_fd(), profile);
-    let _ = unmount_raw(&mount_point);
-    result
+    let _guard = RawMountGuard(&mount_point);
+    serve_minimal_session(dev_fuse.as_raw_fd(), profile)
 }
 
 fn mount_dev_fuse(
@@ -218,10 +218,10 @@ fn mount_dev_fuse(
     })
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))?;
     let fstype = c"fuse.studiofs";
-    let st = stat_path(mount_point)?;
+    let mode = std::fs::metadata(mount_point)?.mode();
     let data = CString::new(format!(
         "fd={fd},rootmode={:o},user_id={},group_id={},max_read={}",
-        st.st_mode & libc::S_IFMT,
+        mode,
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         unsafe { libc::geteuid() },
         // SAFETY: `getegid` has no preconditions and does not dereference pointers.
@@ -486,12 +486,16 @@ fn write_reply_header(fd: RawFd, unique: u64, error: i32, len: u32) -> io::Resul
 }
 
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: `buf` is a valid writable byte slice for the provided length.
-    let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if rc >= 0 {
-        Ok(rc as usize)
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        // SAFETY: `buf` is a valid writable byte slice for the provided length.
+        let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if rc >= 0 {
+            return Ok(rc as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }
 
@@ -546,23 +550,17 @@ fn check_fuse_packet_write(expected: usize, written: usize) -> io::Result<()> {
     }
 }
 
-fn stat_path(path: &Path) -> io::Result<libc::stat> {
-    let path = cstring_path(path)?;
-    let mut st = mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `path` is a valid NUL-terminated C string and `st` points to
-    // writable storage for `stat(2)`.
-    let rc = unsafe { libc::stat(path.as_ptr(), st.as_mut_ptr()) };
-    if rc == 0 {
-        // SAFETY: successful `stat(2)` initialized `st`.
-        Ok(unsafe { st.assume_init() })
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 fn cstring_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+struct RawMountGuard<'a>(&'a Path);
+
+impl Drop for RawMountGuard<'_> {
+    fn drop(&mut self) {
+        let _ = unmount_raw(self.0);
+    }
 }
 
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
