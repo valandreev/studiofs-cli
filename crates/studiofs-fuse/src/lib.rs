@@ -1,6 +1,7 @@
-//! StudioFS FUSE backend for Linux using `fuser`.
+//! StudioFS FUSE backends for Linux.
 //!
 //! Implements `fuser::Filesystem` to expose `studiofs_vfs::StudioVfs` via FUSE.
+//! Also exposes an experimental raw `/dev/fuse` mount/session path.
 //!
 //! # Mount options
 //!
@@ -10,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 mod fs;
+mod raw;
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -22,6 +24,7 @@ pub use fs::FuseKernelInvalidator;
 /// The `fuser::Filesystem` implementation that bridges StudioFS VFS operations
 /// into FUSE callbacks.
 pub use fs::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseFs, StudioFuseRuntimeOptions};
+pub use raw::{RawFuseMountRequest, mount_raw_with_request};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -397,6 +400,11 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
 mod tests {
     use std::sync::Mutex;
 
+    use super::raw::{
+        FUSE_ASYNC_READ, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_EXPLICIT_INVAL_DATA,
+        FUSE_FILE_OPS, FUSE_MAX_PAGES, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS,
+        FUSE_READDIRPLUS_AUTO, InitIn, LinuxRawFuseProfile,
+    };
     use super::{
         FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options,
         build_mount_options_with_allow_other, validate_volume_name,
@@ -583,5 +591,70 @@ mod tests {
         assert!(!config.mount_options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
+    }
+
+    #[test]
+    fn raw_init_negotiation_uses_juicefs_like_linux_profile() {
+        let profile = LinuxRawFuseProfile::juicefs_like();
+        let input = InitIn {
+            major: 7,
+            minor: 38,
+            max_readahead: 2 * 1024 * 1024,
+            flags: FUSE_ASYNC_READ
+                | FUSE_BIG_WRITES
+                | FUSE_MAX_PAGES
+                | FUSE_PARALLEL_DIROPS
+                | FUSE_READDIRPLUS
+                | FUSE_FILE_OPS
+                | FUSE_AUTO_INVAL_DATA
+                | FUSE_EXPLICIT_INVAL_DATA,
+        };
+
+        let negotiated = profile.negotiate_init(input);
+
+        assert_eq!(negotiated.out.max_write, profile.max_write);
+        assert_eq!(negotiated.out.max_pages, profile.max_pages);
+        assert_eq!(negotiated.out.max_background, profile.max_background);
+        assert_eq!(
+            negotiated.out.congestion_threshold,
+            profile.congestion_threshold
+        );
+        assert_eq!(negotiated.out.max_readahead, profile.max_readahead);
+        assert_eq!(
+            negotiated.out.flags,
+            FUSE_ASYNC_READ
+                | FUSE_BIG_WRITES
+                | FUSE_MAX_PAGES
+                | FUSE_PARALLEL_DIROPS
+                | FUSE_READDIRPLUS
+                | FUSE_READDIRPLUS_AUTO
+                | FUSE_FILE_OPS
+                | FUSE_EXPLICIT_INVAL_DATA
+        );
+    }
+
+    #[test]
+    fn raw_init_negotiation_degrades_unadvertised_capabilities() {
+        let profile = LinuxRawFuseProfile::juicefs_like();
+        let input = InitIn {
+            major: 7,
+            minor: 23,
+            max_readahead: 64 * 1024,
+            flags: FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_AUTO_INVAL_DATA,
+        };
+
+        let negotiated = profile.negotiate_init(input);
+
+        assert_eq!(negotiated.out.max_readahead, 64 * 1024);
+        assert_eq!(negotiated.out.max_write, profile.max_write);
+        assert_eq!(negotiated.out.max_pages, 0);
+        assert_eq!(
+            negotiated.out.flags,
+            FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_AUTO_INVAL_DATA
+        );
+        assert!(negotiated.degraded.contains(&FUSE_MAX_PAGES));
+        assert!(negotiated.degraded.contains(&FUSE_PARALLEL_DIROPS));
+        assert!(negotiated.degraded.contains(&FUSE_READDIRPLUS));
+        assert!(negotiated.degraded.contains(&FUSE_FILE_OPS));
     }
 }

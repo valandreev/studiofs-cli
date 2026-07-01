@@ -4,7 +4,7 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
 #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
@@ -25,7 +25,7 @@ pub(crate) trait MountBackend: Send + Sync {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
-    Box::new(FuseMountBackend)
+    mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -36,6 +36,22 @@ pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
 #[cfg(windows)]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
     Box::new(WinfspMountBackend)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn MountBackend> {
+    match selector.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("raw") => Box::new(RawFuseMountBackend),
+        Some(value) if value.eq_ignore_ascii_case("fuser") => Box::new(FuseMountBackend),
+        Some(value) => {
+            tracing::warn!(
+                backend = value,
+                "unknown Linux mount backend; falling back to fuser"
+            );
+            Box::new(FuseMountBackend)
+        }
+        None => Box::new(FuseMountBackend),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -71,6 +87,24 @@ impl MountBackend for FuseMountBackend {
         request.read_only = launch.read_only;
         request.signal_handling = studiofs_fuse::SignalHandling::InstallForCli;
         studiofs_fuse::mount_with_request(request)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct RawFuseMountBackend;
+
+#[cfg(target_os = "linux")]
+impl MountBackend for RawFuseMountBackend {
+    fn name(&self) -> &'static str {
+        "raw-fuse"
+    }
+
+    fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
+        // SFS-591 raw mode owns mount/INIT only; real VFS callbacks stay on fuser fallback.
+        let mut request =
+            studiofs_fuse::RawFuseMountRequest::new(launch.mount_point, launch.volume_name);
+        request.read_only = launch.read_only;
+        studiofs_fuse::mount_raw_with_request(request)
     }
 }
 
@@ -188,5 +222,23 @@ mod tests {
         let backend = super::mount_backend_for_selector(None);
 
         assert_eq!(backend.name(), "unsupported-unix");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_raw_selector_routes_to_raw_fuse_backend() {
+        let backend = super::mount_backend_for_selector(Some("raw"));
+
+        assert_eq!(backend.name(), "raw-fuse");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fuser_selector_remains_fallback_backend() {
+        for selector in [None, Some(""), Some("fuser"), Some("unknown")] {
+            let backend = super::mount_backend_for_selector(selector);
+
+            assert_eq!(backend.name(), "FUSE");
+        }
     }
 }

@@ -3,9 +3,11 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -14,7 +16,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
-use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
+use studiofs_fuse::{
+    RawFuseMountRequest, StudioFuseFs, StudioFuseRuntimeOptions, mount_raw_with_request,
+};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
@@ -972,6 +976,71 @@ fn fuse_session_mount_and_drop_smoke() {
 
     let session = fuser::Session::new(fs, mount_dir.path(), &config).expect("create FUSE session");
     drop(session);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn raw_fuse_mount_and_unmount_smoke() {
+    if !mounted_tests_enabled() {
+        return;
+    }
+
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
+    let mount_path = mount_dir.path().to_path_buf();
+
+    use std::os::unix::fs::MetadataExt;
+    let pre_dev = std::fs::metadata(&mount_path)
+        .expect("mount dir should exist before raw session")
+        .dev();
+
+    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke");
+    request.read_only = true;
+    let session_handle = std::thread::spawn(move || mount_raw_with_request(request));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fuse_mount_path_cleared(&mount_path, pre_dev) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "raw FUSE mount did not become available within 10 s"
+        );
+        if session_handle.is_finished() {
+            let result = session_handle
+                .join()
+                .expect("raw FUSE session thread should not panic");
+            panic!("raw FUSE session exited before mount became available: {result:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    for entry in std::fs::read_dir(&mount_path).expect("read raw FUSE root directory") {
+        entry.expect("read raw FUSE root directory entry");
+    }
+
+    force_unmount_raw_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
+    assert!(
+        wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5)),
+        "raw FUSE mount should clear after unmount"
+    );
+    if let Some(join_result) =
+        join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
+    {
+        join_result
+            .expect("raw FUSE session thread should not panic")
+            .expect("raw FUSE session should exit cleanly");
+    }
+}
+
+fn force_unmount_raw_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
+    let path = CString::new(mount_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount path contains NUL"))?;
+    // SAFETY: `path` is a valid NUL-terminated mount path. The raw smoke test
+    // owns this temporary mount point.
+    let rc = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Full lifecycle smoke test: mount → write → read → readdir → delete → unmount.
