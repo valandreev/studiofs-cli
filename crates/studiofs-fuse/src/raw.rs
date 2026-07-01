@@ -12,7 +12,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::JoinHandle;
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
@@ -322,6 +324,12 @@ impl RawDispatchAccounting {
             read_latency_nanos: self.inner.read_latency_nanos.load(Ordering::Acquire),
             write_latency_count: self.inner.write_latency_count.load(Ordering::Acquire),
             write_latency_nanos: self.inner.write_latency_nanos.load(Ordering::Acquire),
+        }
+    }
+
+    fn wait_for_idle(&self) {
+        while self.inner.inflight_total.load(Ordering::Acquire) != 0 {
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -739,7 +747,8 @@ fn serve_minimal_session(
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
 ) -> io::Result<()> {
-    let mut buf = vec![0_u8; profile.max_write as usize + 4096];
+    let buffer_size = profile.max_write as usize + 4096;
+    let mut buf = vec![0_u8; buffer_size];
     let ids = SessionIds {
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         uid: unsafe { libc::geteuid() },
@@ -755,7 +764,7 @@ fn serve_minimal_session(
         runtime_handle,
         ids,
     };
-    let mut workers = Vec::new();
+    let (buffer_recycler, recycled_buffers) = mpsc::channel();
     let session_result = loop {
         let len = match read_fd(fd, &mut buf) {
             Ok(len) => len,
@@ -790,39 +799,65 @@ fn serve_minimal_session(
             )?;
             continue;
         }
-        let payload = buf[size_of::<InHeader>()..len].to_vec();
+        let request_buf = std::mem::replace(
+            &mut buf,
+            recycled_buffers
+                .try_recv()
+                .unwrap_or_else(|_| vec![0_u8; buffer_size]),
+        );
         dispatch_minimal_request(
             fd,
             header,
-            payload,
+            request_buf,
+            len,
             context.clone(),
             &accounting,
-            &mut workers,
+            buffer_recycler.clone(),
         )?;
-        reap_finished_workers(&mut workers)?;
     };
-    join_workers(workers)?;
+    accounting.wait_for_idle();
     session_result
 }
 
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
-    payload: Vec<u8>,
+    request_buf: Vec<u8>,
+    request_len: usize,
     context: RawRequestContext,
     accounting: &RawDispatchAccounting,
-    workers: &mut Vec<JoinHandle<io::Result<()>>>,
+    buffer_recycler: Sender<Vec<u8>>,
 ) -> io::Result<()> {
     match accounting.try_admit(RawDispatchClass::for_opcode(header.opcode)) {
         Ok(guard) => {
             let accounting = accounting.clone();
-            workers.push(std::thread::spawn(move || {
+            if let Some(runtime_handle) = context.runtime_handle.clone() {
+                runtime_handle.spawn_blocking(move || {
+                    let _guard = guard;
+                    let started = Instant::now();
+                    let payload = &request_buf[size_of::<InHeader>()..request_len];
+                    if let Err(err) =
+                        handle_minimal_request(fd, header, payload, &context, &accounting)
+                    {
+                        warn!(
+                            opcode = header.opcode,
+                            unique = header.unique,
+                            error = %err,
+                            "raw FUSE worker failed to reply"
+                        );
+                    }
+                    accounting.record_latency(header.opcode, started.elapsed());
+                    let _ = buffer_recycler.send(request_buf);
+                });
+            } else {
                 let _guard = guard;
                 let started = Instant::now();
-                let result = handle_minimal_request(fd, header, &payload, &context, &accounting);
+                let payload = &request_buf[size_of::<InHeader>()..request_len];
+                let result = handle_minimal_request(fd, header, payload, &context, &accounting);
                 accounting.record_latency(header.opcode, started.elapsed());
-                result
-            }));
+                buffer_recycler.send(request_buf).ok();
+                result?;
+            }
             Ok(())
         }
         Err(err) => {
@@ -838,32 +873,6 @@ fn dispatch_minimal_request(
             reply_error(fd, header.unique, libc::EAGAIN, Some(accounting))
         }
     }
-}
-
-fn join_workers(workers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
-    for worker in workers {
-        match worker.join() {
-            Ok(result) => result?,
-            Err(_) => return Err(io::Error::other("raw FUSE worker thread panicked")),
-        }
-    }
-    Ok(())
-}
-
-fn reap_finished_workers(workers: &mut Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            match worker.join() {
-                Ok(result) => result?,
-                Err(_) => return Err(io::Error::other("raw FUSE worker thread panicked")),
-            }
-        } else {
-            index += 1;
-        }
-    }
-    Ok(())
 }
 
 fn handle_minimal_request(
@@ -1069,11 +1078,7 @@ fn raw_fsync(
     }
     let input = read_struct::<FsyncIn>(&payload[..size_of::<FsyncIn>()])?;
     let datasync = input.fsync_flags & 1 != 0;
-    let result = if input.fh != 0 {
-        rt.block_on(vfs.flush_fh(input.fh))
-    } else {
-        rt.block_on(vfs.fsync(header.nodeid, datasync))
-    };
+    let result = rt.block_on(vfs.fsync(header.nodeid, datasync));
     match result {
         Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
