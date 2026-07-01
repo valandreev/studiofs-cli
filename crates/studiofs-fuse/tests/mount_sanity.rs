@@ -3,15 +3,14 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -491,6 +490,7 @@ fn umount_fuse_mount_path_command(mount_path: &Path) -> Command {
     let (program, args) = forced_fuse_unmount_command_parts(std::env::consts::OS);
     let mut command = Command::new(program);
     command.args(args).arg(mount_path);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     command
 }
 
@@ -1020,7 +1020,7 @@ fn raw_fuse_mount_and_unmount_smoke() {
         entry.expect("read raw FUSE root directory entry");
     }
 
-    force_unmount_raw_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
+    force_unmount_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
     assert!(
         wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5)),
         "raw FUSE mount should clear after unmount"
@@ -1031,19 +1031,6 @@ fn raw_fuse_mount_and_unmount_smoke() {
         join_result
             .expect("raw FUSE session thread should not panic")
             .expect("raw FUSE session should exit cleanly");
-    }
-}
-
-fn force_unmount_raw_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
-    let path = CString::new(mount_path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount path contains NUL"))?;
-    // SAFETY: `path` is a valid NUL-terminated mount path. The raw smoke test
-    // owns this temporary mount point.
-    let rc = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
     }
 }
 

@@ -1,11 +1,14 @@
 use std::ffi::CString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -516,23 +519,38 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
     } = request;
 
     let mount_point = PathBuf::from(mount_point);
-    let dev_fuse = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")?;
-    mount_dev_fuse(
-        dev_fuse.as_raw_fd(),
-        &mount_point,
-        &volume_name,
-        read_only,
-        profile,
-    )?;
+    let dev_fuse = mount_dev_fuse(&mount_point, &volume_name, read_only, profile)?;
     info!(mount_point = %mount_point.display(), "mounted StudioFS raw FUSE session");
     let _guard = RawMountGuard(&mount_point);
     serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle)
 }
 
 fn mount_dev_fuse(
+    mount_point: &Path,
+    volume_name: &str,
+    read_only: bool,
+    profile: LinuxRawFuseProfile,
+) -> io::Result<File> {
+    let dev_fuse = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")?;
+    match mount_dev_fuse_direct(
+        dev_fuse.as_raw_fd(),
+        mount_point,
+        volume_name,
+        read_only,
+        profile,
+    ) {
+        Ok(()) => Ok(dev_fuse),
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => {
+            call_fusermount(mount_point, volume_name, read_only, profile)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn mount_dev_fuse_direct(
     fd: RawFd,
     mount_point: &Path,
     volume_name: &str,
@@ -579,6 +597,146 @@ fn mount_dev_fuse(
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn call_fusermount(
+    mount_point: &Path,
+    volume_name: &str,
+    read_only: bool,
+    profile: LinuxRawFuseProfile,
+) -> io::Result<File> {
+    let (local, remote) = unix_seqpacket_socketpair()?;
+    let bin = fusermount_binary()?;
+    let options = fusermount_options(volume_name, read_only, profile);
+    let remote_fd = remote.as_raw_fd();
+    let mut command = Command::new(bin);
+    command.arg(mount_point);
+    if !options.is_empty() {
+        command.arg("-o").arg(options.join(","));
+    }
+    command.env("_FUSE_COMMFD", "3");
+    // SAFETY: `pre_exec` runs after fork and before exec; `dup2`/`fcntl` are
+    // async-signal-safe and only prepare the fusermount communication fd.
+    unsafe {
+        command.pre_exec(move || {
+            if remote_fd == 3 {
+                let flags = libc::fcntl(3, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if libc::dup2(remote_fd, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "{bin} exited with status {status}"
+        )));
+    }
+    recv_fuse_fd(&local)
+}
+
+fn unix_seqpacket_socketpair() -> io::Result<(File, File)> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` points to two writable fd slots for `socketpair`.
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `socketpair` returned two owned file descriptors.
+    let left = unsafe { File::from_raw_fd(fds[0]) };
+    // SAFETY: `socketpair` returned two owned file descriptors.
+    let right = unsafe { File::from_raw_fd(fds[1]) };
+    Ok((left, right))
+}
+
+fn fusermount_options(
+    volume_name: &str,
+    read_only: bool,
+    profile: LinuxRawFuseProfile,
+) -> Vec<String> {
+    let fsname = if volume_name.is_empty() {
+        "studiofs"
+    } else {
+        volume_name
+    };
+    let mut options = vec![
+        format!("fsname={fsname}"),
+        "subtype=studiofs".to_string(),
+        format!("max_read={}", profile.max_read),
+    ];
+    if read_only {
+        options.push("ro".to_string());
+    }
+    options
+}
+
+fn fusermount_binary() -> io::Result<&'static str> {
+    if binary_in_path("fusermount3") || Path::new("/bin/fusermount3").exists() {
+        Ok("fusermount3")
+    } else if binary_in_path("fusermount") || Path::new("/bin/fusermount").exists() {
+        Ok("fusermount")
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "fusermount3 or fusermount not found",
+        ))
+    }
+}
+
+fn binary_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+fn recv_fuse_fd(socket: &File) -> io::Result<File> {
+    let mut byte = 0_u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut control = [0_usize; 8];
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr().cast(),
+        msg_controllen: size_of::<[usize; 8]>(),
+        msg_flags: 0,
+    };
+    // SAFETY: `msg` points to live iovec/control buffers for this `recvmsg`.
+    let rc = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `recvmsg` initialized the control buffer; CMSG helpers only walk
+    // within `msg_controllen`.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount did not return a FUSE fd",
+        ));
+    }
+    // SAFETY: `cmsg` is non-null and points inside the control buffer.
+    let is_rights =
+        unsafe { (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS };
+    if !is_rights {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount returned unexpected control message",
+        ));
+    }
+    // SAFETY: SCM_RIGHTS payload starts with at least one received file
+    // descriptor when fusermount succeeds.
+    let fd = unsafe { *libc::CMSG_DATA(cmsg).cast::<RawFd>() };
+    // SAFETY: ownership of this fd was transferred through SCM_RIGHTS.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn serve_minimal_session(
@@ -1878,13 +2036,35 @@ impl Drop for RawMountGuard<'_> {
 }
 
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
-    let mount_point = cstring_path(mount_point)?;
+    let mount_point_c = cstring_path(mount_point)?;
     // SAFETY: `mount_point` is a valid NUL-terminated C string.
-    let rc = unsafe { libc::umount2(mount_point.as_ptr(), libc::MNT_DETACH) };
+    let rc = unsafe { libc::umount2(mount_point_c.as_ptr(), libc::MNT_DETACH) };
     if rc == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let err = io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
+            Err(err)
+        } else {
+            unmount_raw_with_fusermount(mount_point)
+        }
+    }
+}
+
+fn unmount_raw_with_fusermount(mount_point: &Path) -> io::Result<()> {
+    let bin = fusermount_binary()?;
+    let status = Command::new(bin)
+        .arg("-u")
+        .arg(mount_point)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{bin} -u exited with status {status}"
+        )))
     }
 }
 
@@ -1987,6 +2167,21 @@ mod tests {
         assert_eq!(snapshot.read_latency_nanos, 7);
         assert_eq!(snapshot.write_latency_count, 1);
         assert_eq!(snapshot.write_latency_nanos, 11);
+    }
+
+    #[test]
+    fn raw_fusermount_options_match_direct_mount_identity() {
+        let options = fusermount_options("studio", true, LinuxRawFuseProfile::juicefs_like());
+
+        assert_eq!(
+            options,
+            vec![
+                "fsname=studio".to_string(),
+                "subtype=studiofs".to_string(),
+                "max_read=1048576".to_string(),
+                "ro".to_string(),
+            ]
+        );
     }
 
     #[test]
