@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
+use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -63,8 +64,6 @@ const OP_CREATE: u32 = 35;
 const OP_DESTROY: u32 = 38;
 const OP_IOCTL: u32 = 39;
 const OP_READDIRPLUS: u32 = 44;
-
-const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -879,6 +878,8 @@ fn serve_minimal_session(
         vfs,
         runtime_handle,
         ids,
+        next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+        open_dir_handles: Arc::new(Mutex::new(HashMap::new())),
     };
     let session_result = loop {
         let len = match read_fd(fd, &mut buf) {
@@ -1032,10 +1033,11 @@ fn handle_minimal_request(
         OP_LISTXATTR => raw_listxattr(fd, header, payload, context, accounting),
         OP_REMOVEXATTR => raw_removexattr(fd, header, payload, context, accounting),
         OP_IOCTL => raw_ioctl(fd, header, payload, context, accounting),
-        OP_OPENDIR => reply_open(fd, header.unique, 1, 0, Some(accounting)),
+        OP_OPENDIR => raw_opendir(fd, header, context, accounting),
         OP_READDIR => raw_readdir(fd, header, payload, context, accounting),
         OP_READDIRPLUS => raw_readdirplus(fd, header, payload, context, accounting),
-        OP_ACCESS | OP_RELEASEDIR => reply_empty(fd, header.unique, Some(accounting)),
+        OP_RELEASEDIR => raw_releasedir(fd, header, payload, context, accounting),
+        OP_ACCESS => reply_empty(fd, header.unique, Some(accounting)),
         OP_LOOKUP => raw_lookup(fd, header, payload, context, accounting),
         OP_FORGET | OP_DESTROY => Ok(()),
         opcode => {
@@ -1110,13 +1112,7 @@ fn raw_open(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
-        Ok(fh) => reply_open(
-            fd,
-            header.unique,
-            fh,
-            raw_open_reply_flags(flags, trunc),
-            Some(accounting),
-        ),
+        Ok(fh) => reply_open(fd, header.unique, fh, 0, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1153,15 +1149,7 @@ fn raw_create(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(attr.ino, open_flags, trunc) {
-        Ok(fh) => reply_create(
-            fd,
-            header.unique,
-            &attr,
-            fh,
-            raw_open_reply_flags(flags, trunc),
-            context,
-            Some(accounting),
-        ),
+        Ok(fh) => reply_create(fd, header.unique, &attr, fh, 0, context, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1497,6 +1485,47 @@ fn raw_release(
     }
 }
 
+fn raw_opendir(
+    fd: RawFd,
+    header: InHeader,
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_open(fd, header.unique, 1, 0, Some(accounting));
+    };
+    match raw_load_open_dir_state(vfs, header.nodeid) {
+        Ok(state) => {
+            let fh = context.next_open_dir_fh.fetch_add(1, Ordering::Relaxed);
+            context
+                .open_dir_handles
+                .lock()
+                .expect("raw open dir handle table lock poisoned")
+                .insert(fh, state);
+            reply_open(fd, header.unique, fh, 0, Some(accounting))
+        }
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_releasedir(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() >= size_of::<ReleaseIn>() {
+        let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
+        context
+            .open_dir_handles
+            .lock()
+            .expect("raw open dir handle table lock poisoned")
+            .remove(&input.fh);
+    }
+    reply_empty(fd, header.unique, Some(accounting))
+}
+
 fn raw_readdir(
     fd: RawFd,
     header: InHeader,
@@ -1536,13 +1565,14 @@ fn raw_readdir(
     {
         return reply_data(fd, header.unique, &out, Some(accounting));
     }
-    let entries = match vfs.readdir_with_attrs(header.nodeid) {
-        Ok(entries) => entries,
+    let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
+        Ok(state) => state,
         Err(err) => {
             return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
         }
     };
-    for (index, entry_with_attr) in entries
+    for (index, entry_with_attr) in state
+        .entries
         .iter()
         .enumerate()
         .skip(readdir_entry_skip_offset(input.offset))
@@ -1585,13 +1615,14 @@ fn raw_readdirplus(
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
     let mut out = Vec::with_capacity(input.size as usize);
-    let entries = match vfs.readdir_with_attrs(header.nodeid) {
-        Ok(entries) => entries,
+    let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
+        Ok(state) => state,
         Err(err) => {
             return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
         }
     };
-    for (index, entry_with_attr) in entries
+    for (index, entry_with_attr) in state
+        .entries
         .iter()
         .enumerate()
         .skip(readdir_entry_skip_offset(input.offset))
@@ -1769,6 +1800,13 @@ struct RawRequestContext {
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
     ids: SessionIds,
+    next_open_dir_fh: Arc<AtomicU64>,
+    open_dir_handles: Arc<Mutex<HashMap<u64, RawOpenDirState>>>,
+}
+
+#[derive(Clone)]
+struct RawOpenDirState {
+    entries: Arc<Vec<DirEntryWithAttr>>,
 }
 
 #[repr(C)]
@@ -1849,6 +1887,38 @@ fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntr
             padding: 0,
         },
     }
+}
+
+fn raw_load_open_dir_state(
+    vfs: &StudioVfs,
+    ino: u64,
+) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
+    Ok(RawOpenDirState {
+        entries: Arc::new(vfs.readdir_with_attrs(ino)?),
+    })
+}
+
+fn raw_open_dir_state(
+    context: &RawRequestContext,
+    vfs: &StudioVfs,
+    ino: u64,
+    fh: u64,
+) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
+    if let Some(state) = context
+        .open_dir_handles
+        .lock()
+        .expect("raw open dir handle table lock poisoned")
+        .get(&fh)
+    {
+        return Ok(state.clone());
+    }
+    if fh != 0 {
+        warn!(
+            ino,
+            fh, "raw readdir with unknown directory fh; rebuilding snapshot"
+        );
+    }
+    raw_load_open_dir_state(vfs, ino)
 }
 
 fn reply_getattr(
@@ -2486,15 +2556,6 @@ fn raw_mode(attr: &InodeAttr) -> u32 {
 
 fn normalize_unix_mode(mode: u32) -> u16 {
     u16::try_from(mode & 0o7777).unwrap_or(0)
-}
-
-fn raw_open_reply_flags(flags: i32, trunc: bool) -> u32 {
-    let access_mode = flags & libc::O_ACCMODE;
-    let write_capable = trunc
-        || access_mode == libc::O_WRONLY
-        || access_mode == libc::O_RDWR
-        || flags & libc::O_APPEND != 0;
-    if write_capable { 0 } else { FOPEN_KEEP_CACHE }
 }
 
 fn nul_stripped(bytes: &[u8]) -> &[u8] {
