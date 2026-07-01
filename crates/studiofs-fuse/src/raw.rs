@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -9,12 +10,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::Sender;
-use std::thread;
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
@@ -22,6 +22,10 @@ use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
+
+thread_local! {
+    static RAW_READ_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
@@ -207,6 +211,7 @@ impl RawDispatchClass {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawDispatchSnapshot {
     inflight_total: usize,
@@ -236,6 +241,8 @@ struct RawDispatchAccountingInner {
     max_stream_inflight: usize,
     inflight_total: AtomicUsize,
     inflight_stream: AtomicUsize,
+    idle_lock: Mutex<()>,
+    idle_changed: Condvar,
     request_count: AtomicU64,
     reply_bytes: AtomicU64,
     read_latency_count: AtomicU64,
@@ -252,6 +259,8 @@ impl RawDispatchAccounting {
                 max_stream_inflight: max_stream_inflight.max(1),
                 inflight_total: AtomicUsize::new(0),
                 inflight_stream: AtomicUsize::new(0),
+                idle_lock: Mutex::new(()),
+                idle_changed: Condvar::new(),
                 request_count: AtomicU64::new(0),
                 reply_bytes: AtomicU64::new(0),
                 read_latency_count: AtomicU64::new(0),
@@ -279,6 +288,29 @@ impl RawDispatchAccounting {
             accounting: self.clone(),
             class,
         })
+    }
+
+    fn admit_blocking(&self, class: RawDispatchClass) -> RawDispatchAdmissionGuard {
+        let mut wait = self
+            .inner
+            .idle_lock
+            .lock()
+            .expect("raw dispatch lock poisoned");
+        loop {
+            match self.try_admit(class) {
+                Ok(guard) => return guard,
+                Err(
+                    RawDispatchAdmissionError::QueueFull
+                    | RawDispatchAdmissionError::StreamQueueFull,
+                ) => {
+                    wait = self
+                        .inner
+                        .idle_changed
+                        .wait(wait)
+                        .expect("raw dispatch lock poisoned");
+                }
+            }
+        }
     }
 
     fn record_request(&self) {
@@ -314,6 +346,7 @@ impl RawDispatchAccounting {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> RawDispatchSnapshot {
         RawDispatchSnapshot {
             inflight_total: self.inner.inflight_total.load(Ordering::Acquire),
@@ -328,8 +361,17 @@ impl RawDispatchAccounting {
     }
 
     fn wait_for_idle(&self) {
+        let mut wait = self
+            .inner
+            .idle_lock
+            .lock()
+            .expect("raw dispatch lock poisoned");
         while self.inner.inflight_total.load(Ordering::Acquire) != 0 {
-            thread::sleep(Duration::from_millis(1));
+            wait = self
+                .inner
+                .idle_changed
+                .wait(wait)
+                .expect("raw dispatch lock poisoned");
         }
     }
 }
@@ -352,6 +394,7 @@ impl Drop for RawDispatchAdmissionGuard {
                 .inflight_stream
                 .fetch_sub(1, Ordering::AcqRel);
         }
+        self.accounting.inner.idle_changed.notify_all();
     }
 }
 
@@ -748,7 +791,14 @@ fn serve_minimal_session(
     runtime_handle: Option<Handle>,
 ) -> io::Result<()> {
     let buffer_size = profile.max_write as usize + 4096;
-    let mut buf = vec![0_u8; buffer_size];
+    let buffer_count = usize::from(profile.max_background.max(1));
+    let (buffer_recycler, recycled_buffers) = mpsc::sync_channel(buffer_count);
+    for _ in 0..buffer_count {
+        buffer_recycler
+            .send(vec![0_u8; buffer_size])
+            .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))?;
+    }
+    let mut buf = recv_request_buffer(&recycled_buffers)?;
     let ids = SessionIds {
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         uid: unsafe { libc::geteuid() },
@@ -764,7 +814,6 @@ fn serve_minimal_session(
         runtime_handle,
         ids,
     };
-    let (buffer_recycler, recycled_buffers) = mpsc::channel();
     let session_result = loop {
         let len = match read_fd(fd, &mut buf) {
             Ok(len) => len,
@@ -799,12 +848,7 @@ fn serve_minimal_session(
             )?;
             continue;
         }
-        let request_buf = std::mem::replace(
-            &mut buf,
-            recycled_buffers
-                .try_recv()
-                .unwrap_or_else(|_| vec![0_u8; buffer_size]),
-        );
+        let request_buf = std::mem::replace(&mut buf, recv_request_buffer(&recycled_buffers)?);
         dispatch_minimal_request(
             fd,
             header,
@@ -819,6 +863,12 @@ fn serve_minimal_session(
     session_result
 }
 
+fn recv_request_buffer(receiver: &Receiver<Vec<u8>>) -> io::Result<Vec<u8>> {
+    receiver
+        .recv()
+        .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))
+}
+
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
@@ -826,53 +876,36 @@ fn dispatch_minimal_request(
     request_len: usize,
     context: RawRequestContext,
     accounting: &RawDispatchAccounting,
-    buffer_recycler: Sender<Vec<u8>>,
+    buffer_recycler: SyncSender<Vec<u8>>,
 ) -> io::Result<()> {
-    match accounting.try_admit(RawDispatchClass::for_opcode(header.opcode)) {
-        Ok(guard) => {
-            let accounting = accounting.clone();
-            if let Some(runtime_handle) = context.runtime_handle.clone() {
-                runtime_handle.spawn_blocking(move || {
-                    let _guard = guard;
-                    let started = Instant::now();
-                    let payload = &request_buf[size_of::<InHeader>()..request_len];
-                    if let Err(err) =
-                        handle_minimal_request(fd, header, payload, &context, &accounting)
-                    {
-                        warn!(
-                            opcode = header.opcode,
-                            unique = header.unique,
-                            error = %err,
-                            "raw FUSE worker failed to reply"
-                        );
-                    }
-                    accounting.record_latency(header.opcode, started.elapsed());
-                    let _ = buffer_recycler.send(request_buf);
-                });
-            } else {
-                let _guard = guard;
-                let started = Instant::now();
-                let payload = &request_buf[size_of::<InHeader>()..request_len];
-                let result = handle_minimal_request(fd, header, payload, &context, &accounting);
-                accounting.record_latency(header.opcode, started.elapsed());
-                buffer_recycler.send(request_buf).ok();
-                result?;
+    let guard = accounting.admit_blocking(RawDispatchClass::for_opcode(header.opcode));
+    let accounting = accounting.clone();
+    if let Some(runtime_handle) = context.runtime_handle.clone() {
+        runtime_handle.spawn_blocking(move || {
+            let _guard = guard;
+            let started = Instant::now();
+            let payload = &request_buf[size_of::<InHeader>()..request_len];
+            if let Err(err) = handle_minimal_request(fd, header, payload, &context, &accounting) {
+                warn!(
+                    opcode = header.opcode,
+                    unique = header.unique,
+                    error = %err,
+                    "raw FUSE worker failed to reply"
+                );
             }
-            Ok(())
-        }
-        Err(err) => {
-            let snapshot = accounting.snapshot();
-            warn!(
-                opcode = header.opcode,
-                unique = header.unique,
-                inflight_total = snapshot.inflight_total,
-                inflight_stream = snapshot.inflight_stream,
-                ?err,
-                "raw FUSE request rejected by bounded dispatcher"
-            );
-            reply_error(fd, header.unique, libc::EAGAIN, Some(accounting))
-        }
+            accounting.record_latency(header.opcode, started.elapsed());
+            let _ = buffer_recycler.send(request_buf);
+        });
+    } else {
+        let _guard = guard;
+        let started = Instant::now();
+        let payload = &request_buf[size_of::<InHeader>()..request_len];
+        let result = handle_minimal_request(fd, header, payload, &context, &accounting);
+        accounting.record_latency(header.opcode, started.elapsed());
+        buffer_recycler.send(request_buf).ok();
+        result?;
     }
+    Ok(())
 }
 
 fn handle_minimal_request(
@@ -996,14 +1029,18 @@ fn raw_read(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
-    let mut out = vec![0; input.size as usize];
-    match rt.block_on(vfs.read_into_fh(input.fh, header.nodeid, input.offset, &mut out)) {
-        Ok(read) => {
-            out.truncate(read as usize);
-            reply_data(fd, header.unique, &out, Some(accounting))
+    RAW_READ_BUFFER.with(|buffer| {
+        let mut out = buffer.borrow_mut();
+        let size = input.size as usize;
+        if out.len() < size {
+            out.resize(size, 0);
         }
-        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
-    }
+        match rt.block_on(vfs.read_into_fh(input.fh, header.nodeid, input.offset, &mut out[..size]))
+        {
+            Ok(read) => reply_data(fd, header.unique, &out[..read as usize], Some(accounting)),
+            Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+        }
+    })
 }
 
 fn raw_write(
@@ -1123,23 +1160,29 @@ fn raw_readdir(
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
     let mut out = Vec::with_capacity(input.size as usize);
-    if input.offset == 0 {
-        push_dirent(
+    if input.offset == 0
+        && !push_dirent(
             &mut out,
             FUSE_ROOT_ID,
             1,
             libc::DT_DIR,
             b".",
             input.size as usize,
-        );
-        push_dirent(
+        )
+    {
+        return reply_data(fd, header.unique, &out, Some(accounting));
+    }
+    if input.offset <= 1
+        && !push_dirent(
             &mut out,
             FUSE_ROOT_ID,
             2,
             libc::DT_DIR,
             b"..",
             input.size as usize,
-        );
+        )
+    {
+        return reply_data(fd, header.unique, &out, Some(accounting));
     }
     let entries = match vfs.readdir_with_attrs(header.nodeid) {
         Ok(entries) => entries,
@@ -1150,7 +1193,7 @@ fn raw_readdir(
     for (index, entry_with_attr) in entries
         .iter()
         .enumerate()
-        .skip(input.offset.saturating_sub(2) as usize)
+        .skip(readdir_entry_skip_offset(input.offset))
     {
         let entry = &entry_with_attr.entry;
         let Ok(offset) = u64::try_from(index + 3) else {
@@ -1797,6 +1840,10 @@ fn push_dirent(
     true
 }
 
+fn readdir_entry_skip_offset(offset: u64) -> usize {
+    offset.saturating_sub(2) as usize
+}
+
 fn align_8(value: usize) -> usize {
     (value + 7) & !7
 }
@@ -1977,10 +2024,13 @@ fn raw_time_spec(valid: u32, field: u32, now_field: u32, secs: u64, nsecs: u32) 
 }
 
 fn encode_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
-    names
-        .iter()
-        .flat_map(|name| name.iter().copied().chain(std::iter::once(0)))
-        .collect()
+    let total_len = names.iter().map(|name| name.len() + 1).sum();
+    let mut data = Vec::with_capacity(total_len);
+    for name in names {
+        data.extend_from_slice(name);
+        data.push(0);
+    }
+    data
 }
 
 fn raw_xattr_errno(err: &studiofs_vfs::VfsError) -> i32 {
@@ -2182,6 +2232,14 @@ mod tests {
             options,
             "fsname=studio,subtype=studiofs,max_read=1048576,ro"
         );
+    }
+
+    #[test]
+    fn raw_readdir_cookie_one_preserves_first_real_entry() {
+        assert_eq!(readdir_entry_skip_offset(0), 0);
+        assert_eq!(readdir_entry_skip_offset(1), 0);
+        assert_eq!(readdir_entry_skip_offset(2), 0);
+        assert_eq!(readdir_entry_skip_offset(3), 1);
     }
 
     #[test]
