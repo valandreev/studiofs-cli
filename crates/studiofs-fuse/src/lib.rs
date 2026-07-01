@@ -626,11 +626,11 @@ mod tests {
                 | FUSE_BIG_WRITES
                 | FUSE_MAX_PAGES
                 | FUSE_PARALLEL_DIROPS
-                | FUSE_READDIRPLUS
-                | FUSE_READDIRPLUS_AUTO
                 | FUSE_FILE_OPS
                 | FUSE_EXPLICIT_INVAL_DATA
         );
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
     }
 
     #[test]
@@ -654,7 +654,7 @@ mod tests {
         );
         assert!(negotiated.degraded.contains(&FUSE_MAX_PAGES));
         assert!(negotiated.degraded.contains(&FUSE_PARALLEL_DIROPS));
-        assert!(negotiated.degraded.contains(&FUSE_READDIRPLUS));
+        assert!(!negotiated.degraded.contains(&FUSE_READDIRPLUS));
         assert!(negotiated.degraded.contains(&FUSE_FILE_OPS));
     }
 }

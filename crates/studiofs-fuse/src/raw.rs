@@ -70,18 +70,19 @@ pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_FILE_OPS: u32 = 1 << 2;
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
 pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
+#[cfg(test)]
 pub const FUSE_READDIRPLUS: u32 = 1 << 13;
+#[cfg(test)]
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 
-const WANTED_CAPS: [u32; 7] = [
+const WANTED_CAPS: [u32; 6] = [
     FUSE_ASYNC_READ,
     FUSE_BIG_WRITES,
     FUSE_MAX_PAGES,
     FUSE_PARALLEL_DIROPS,
-    FUSE_READDIRPLUS,
     FUSE_FILE_OPS,
     FUSE_EXPLICIT_INVAL_DATA,
 ];
@@ -156,9 +157,6 @@ impl LinuxRawFuseProfile {
             } else {
                 degraded.push(cap);
             }
-        }
-        if flags & FUSE_READDIRPLUS != 0 {
-            flags |= FUSE_READDIRPLUS_AUTO;
         }
         if flags & FUSE_EXPLICIT_INVAL_DATA == 0 && input.flags & FUSE_AUTO_INVAL_DATA != 0 {
             flags |= FUSE_AUTO_INVAL_DATA;
@@ -693,7 +691,14 @@ fn call_fusermount(
 fn unix_seqpacket_socketpair() -> io::Result<(File, File)> {
     let mut fds = [-1; 2];
     // SAFETY: `fds` points to two writable fd slots for `socketpair`.
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) };
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -755,7 +760,7 @@ fn recv_fuse_fd(socket: &File) -> io::Result<File> {
         msg_flags: 0,
     };
     // SAFETY: `msg` points to live iovec/control buffers for this `recvmsg`.
-    let rc = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
+    let rc = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -869,6 +874,35 @@ fn recv_request_buffer(receiver: &Receiver<Vec<u8>>) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))
 }
 
+struct RecycledRequestBuffer {
+    buffer: Option<Vec<u8>>,
+    recycler: SyncSender<Vec<u8>>,
+}
+
+impl RecycledRequestBuffer {
+    fn new(buffer: Vec<u8>, recycler: SyncSender<Vec<u8>>) -> Self {
+        Self {
+            buffer: Some(buffer),
+            recycler,
+        }
+    }
+
+    fn payload(&self, request_len: usize) -> &[u8] {
+        &self.buffer.as_ref().expect("request buffer present")[size_of::<InHeader>()..request_len]
+    }
+}
+
+impl Drop for RecycledRequestBuffer {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if self.recycler.try_send(buffer).is_err() {
+            warn!("raw FUSE request buffer recycler is full or closed");
+        }
+    }
+}
+
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
@@ -880,11 +914,12 @@ fn dispatch_minimal_request(
 ) -> io::Result<()> {
     let guard = accounting.admit_blocking(RawDispatchClass::for_opcode(header.opcode));
     let accounting = accounting.clone();
+    let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
     if let Some(runtime_handle) = context.runtime_handle.clone() {
         runtime_handle.spawn_blocking(move || {
             let _guard = guard;
             let started = Instant::now();
-            let payload = &request_buf[size_of::<InHeader>()..request_len];
+            let payload = request_buf.payload(request_len);
             if let Err(err) = handle_minimal_request(fd, header, payload, &context, &accounting) {
                 warn!(
                     opcode = header.opcode,
@@ -894,15 +929,13 @@ fn dispatch_minimal_request(
                 );
             }
             accounting.record_latency(header.opcode, started.elapsed());
-            let _ = buffer_recycler.send(request_buf);
         });
     } else {
         let _guard = guard;
         let started = Instant::now();
-        let payload = &request_buf[size_of::<InHeader>()..request_len];
+        let payload = request_buf.payload(request_len);
         let result = handle_minimal_request(fd, header, payload, &context, &accounting);
         accounting.record_latency(header.opcode, started.elapsed());
-        buffer_recycler.send(request_buf).ok();
         result?;
     }
     Ok(())
@@ -931,7 +964,8 @@ fn handle_minimal_request(
         OP_REMOVEXATTR => raw_removexattr(fd, header, payload, context, accounting),
         OP_IOCTL => raw_ioctl(fd, header, payload, context, accounting),
         OP_OPENDIR => reply_open(fd, header.unique, 1, 0, Some(accounting)),
-        OP_READDIR | OP_READDIRPLUS => raw_readdir(fd, header, payload, context, accounting),
+        OP_READDIR => raw_readdir(fd, header, payload, context, accounting),
+        OP_READDIRPLUS => reply_error(fd, header.unique, libc::ENOSYS, Some(accounting)),
         OP_ACCESS | OP_RELEASEDIR => reply_empty(fd, header.unique, Some(accounting)),
         OP_LOOKUP => raw_lookup(fd, header, payload, context, accounting),
         OP_FORGET | OP_DESTROY => Ok(()),
@@ -2235,11 +2269,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_init_does_not_advertise_readdirplus_without_direntplus_support() {
+        let negotiated = LinuxRawFuseProfile::juicefs_like().negotiate_init(InitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_MINOR_VERSION,
+            max_readahead: 1024 * 1024,
+            flags: u32::MAX,
+        });
+
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
+    }
+
+    #[test]
     fn raw_readdir_cookie_one_preserves_first_real_entry() {
         assert_eq!(readdir_entry_skip_offset(0), 0);
         assert_eq!(readdir_entry_skip_offset(1), 0);
         assert_eq!(readdir_entry_skip_offset(2), 0);
         assert_eq!(readdir_entry_skip_offset(3), 1);
+    }
+
+    #[test]
+    fn raw_request_buffer_returns_to_pool_on_drop() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
+
+        assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
     }
 
     #[test]
