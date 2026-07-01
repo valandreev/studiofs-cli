@@ -782,6 +782,13 @@ fn recv_fuse_fd(socket: &File) -> io::Result<File> {
             "fusermount returned unexpected control message",
         ));
     }
+    let min_cmsg_len = unsafe { libc::CMSG_LEN(size_of::<RawFd>() as libc::c_uint) } as usize;
+    if unsafe { (*cmsg).cmsg_len } < min_cmsg_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fusermount returned truncated control message",
+        ));
+    }
     // SAFETY: SCM_RIGHTS payload starts with at least one received file
     // descriptor when fusermount succeeds.
     let fd = unsafe { *libc::CMSG_DATA(cmsg).cast::<RawFd>() };
@@ -912,12 +919,11 @@ fn dispatch_minimal_request(
     accounting: &RawDispatchAccounting,
     buffer_recycler: SyncSender<Vec<u8>>,
 ) -> io::Result<()> {
-    let guard = accounting.admit_blocking(RawDispatchClass::for_opcode(header.opcode));
     let accounting = accounting.clone();
     let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
     if let Some(runtime_handle) = context.runtime_handle.clone() {
         runtime_handle.spawn_blocking(move || {
-            let _guard = guard;
+            let _guard = accounting.admit_blocking(RawDispatchClass::for_opcode(header.opcode));
             let started = Instant::now();
             let payload = request_buf.payload(request_len);
             if let Err(err) = handle_minimal_request(fd, header, payload, &context, &accounting) {
@@ -931,7 +937,7 @@ fn dispatch_minimal_request(
             accounting.record_latency(header.opcode, started.elapsed());
         });
     } else {
-        let _guard = guard;
+        let _guard = accounting.admit_blocking(RawDispatchClass::for_opcode(header.opcode));
         let started = Instant::now();
         let payload = request_buf.payload(request_len);
         let result = handle_minimal_request(fd, header, payload, &context, &accounting);
@@ -1072,7 +1078,10 @@ fn raw_read(
         match rt.block_on(vfs.read_into_fh(input.fh, header.nodeid, input.offset, &mut out[..size]))
         {
             Ok(read) => reply_data(fd, header.unique, &out[..read as usize], Some(accounting)),
-            Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+            Err(err) => {
+                out.clear();
+                reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting))
+            }
         }
     })
 }
@@ -2087,7 +2096,7 @@ fn raw_fs_ioc_getflags_reply_data(
     if !is_getflags {
         return Ok(None);
     }
-    if !in_data.is_empty() || out_size < u32::BITS / 8 {
+    if !in_data.is_empty() || !(u32::BITS / 8..=8).contains(&out_size) {
         return Err(libc::EINVAL);
     }
     Ok(Some(vec![0; out_size as usize]))
@@ -2318,6 +2327,14 @@ mod tests {
     fn raw_ioctl_getflags_rejects_input_payload() {
         assert_eq!(
             raw_fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, b"x", 4).unwrap_err(),
+            libc::EINVAL
+        );
+    }
+
+    #[test]
+    fn raw_ioctl_getflags_rejects_oversized_output() {
+        assert_eq!(
+            raw_fs_ioc_getflags_reply_data(libc::FS_IOC_GETFLAGS as u32, &[], 16).unwrap_err(),
             libc::EINVAL
         );
     }
