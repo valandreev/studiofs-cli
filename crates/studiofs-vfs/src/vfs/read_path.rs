@@ -1,9 +1,9 @@
 use super::overlay::PendingOverlayBlockSource;
 use super::writer_stack::WriterStackReadClaim;
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PREFETCHED_OBJECT_TRACKING_LIMIT,
-    PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS, PrefetchBatch, PrefetchReadContext,
-    PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs, VfsError, VfsResult,
+    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
+    PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
+    VfsError, VfsResult,
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
@@ -637,14 +637,11 @@ impl<'a> DataReader<'a> {
         match result {
             Ok(_) => {
                 if prefetch {
-                    let prefetched = &vfs.state.metrics.prefetched_object_remaining_bytes;
-                    if prefetched.len() >= PREFETCHED_OBJECT_TRACKING_LIMIT {
-                        if let Some(object_id) = prefetched.iter().next().map(|entry| *entry.key())
-                        {
-                            prefetched.remove(&object_id);
-                        }
-                    }
-                    prefetched.insert(block.object_id, block.length);
+                    vfs.state
+                        .metrics
+                        .prefetched_object_remaining_bytes
+                        .lock()
+                        .put(block.object_id, block.length);
                 }
                 Ok::<(), VfsError>(())
             }
@@ -848,12 +845,8 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
-                if let Some(mut remaining) = vfs
-                    .state
-                    .metrics
-                    .prefetched_object_remaining_bytes
-                    .get_mut(&payload.object_id)
-                {
+                let mut prefetched = vfs.state.metrics.prefetched_object_remaining_bytes.lock();
+                let remove = if let Some(remaining) = prefetched.get_mut(&payload.object_id) {
                     let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
                     let useful = (*remaining).min(read_bytes);
                     *remaining = (*remaining).saturating_sub(useful);
@@ -861,13 +854,12 @@ impl<'a> DataReader<'a> {
                         .metrics
                         .readahead_used_bytes
                         .fetch_add(u64::from(useful), Ordering::Relaxed);
-                    if *remaining == 0 {
-                        drop(remaining);
-                        vfs.state
-                            .metrics
-                            .prefetched_object_remaining_bytes
-                            .remove(&payload.object_id);
-                    }
+                    *remaining == 0
+                } else {
+                    false
+                };
+                if remove {
+                    prefetched.pop(&payload.object_id);
                 }
             }
             if !span_resolved {
