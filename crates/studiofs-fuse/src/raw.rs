@@ -1615,6 +1615,39 @@ fn raw_readdirplus(
     }
     let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
     let mut out = Vec::with_capacity(input.size as usize);
+    if input.offset <= 1 {
+        let current_attr = match vfs.getattr(header.nodeid) {
+            Ok(attr) => attr,
+            Err(err) => {
+                return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
+            }
+        };
+        let parent_attr = if current_attr.parent == 0 || current_attr.parent == current_attr.ino {
+            current_attr.clone()
+        } else {
+            match vfs.getattr(current_attr.parent) {
+                Ok(attr) => attr,
+                Err(err) => {
+                    return reply_error(
+                        fd,
+                        header.unique,
+                        vfs_err_to_errno(&err),
+                        Some(accounting),
+                    );
+                }
+            }
+        };
+        if !push_readdirplus_dot_entries(
+            &mut out,
+            &current_attr,
+            &parent_attr,
+            context,
+            input.offset,
+            input.size as usize,
+        ) {
+            return reply_data(fd, header.unique, &out, Some(accounting));
+        }
+    }
     let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
         Ok(state) => state,
         Err(errno) => {
@@ -2420,6 +2453,23 @@ fn push_direntplus(
     true
 }
 
+fn push_readdirplus_dot_entries(
+    out: &mut Vec<u8>,
+    current_attr: &InodeAttr,
+    parent_attr: &InodeAttr,
+    context: &RawRequestContext,
+    offset: u64,
+    limit: usize,
+) -> bool {
+    if offset == 0 && !push_direntplus(out, current_attr, context, 1, b".", limit) {
+        return false;
+    }
+    if offset <= 1 && !push_direntplus(out, parent_attr, context, 2, b"..", limit) {
+        return false;
+    }
+    true
+}
+
 fn readdir_entry_skip_offset(offset: u64) -> usize {
     offset.saturating_sub(2) as usize
 }
@@ -2855,6 +2905,43 @@ mod tests {
         assert_eq!(readdir_entry_skip_offset(1), 0);
         assert_eq!(readdir_entry_skip_offset(2), 0);
         assert_eq!(readdir_entry_skip_offset(3), 1);
+    }
+
+    #[test]
+    fn raw_readdirplus_dot_entries_use_standard_offsets() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds {
+                uid: 1000,
+                gid: 1000,
+            },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let current = InodeAttr::new_dir(7, FUSE_ROOT_ID, 1000, 1000, 0o755);
+        let parent = InodeAttr::new_dir(FUSE_ROOT_ID, 0, 1000, 1000, 0o755);
+        let mut out = Vec::new();
+
+        assert!(push_readdirplus_dot_entries(
+            &mut out, &current, &parent, &context, 0, 4096
+        ));
+
+        let dirent_offset = size_of::<RawEntryOut>();
+        let first = read_struct::<RawDirent>(&out[dirent_offset..]).unwrap();
+        let first_name = dirent_offset + size_of::<RawDirent>();
+        let second_offset = align_8(size_of::<RawEntryOut>() + size_of::<RawDirent>() + 1);
+        let second = read_struct::<RawDirent>(&out[second_offset + dirent_offset..]).unwrap();
+        let second_name = second_offset + dirent_offset + size_of::<RawDirent>();
+
+        assert_eq!(
+            (first.ino, first.off, &out[first_name..first_name + 1]),
+            (7, 1, &b"."[..])
+        );
+        assert_eq!(
+            (second.ino, second.off, &out[second_name..second_name + 2]),
+            (FUSE_ROOT_ID, 2, &b".."[..])
+        );
     }
 
     #[test]
