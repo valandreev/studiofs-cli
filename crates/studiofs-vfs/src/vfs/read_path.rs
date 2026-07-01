@@ -637,11 +637,22 @@ impl<'a> DataReader<'a> {
         match result {
             Ok(_) => {
                 if prefetch {
-                    vfs.state
+                    let removed = vfs
+                        .state
                         .metrics
                         .prefetched_object_remaining_bytes
                         .lock()
-                        .put(block.object_id, block.length);
+                        .push(block.object_id, block.length)
+                        .map(|(object_id, _)| object_id);
+                    if let Some(object_id) = removed
+                        && object_id != block.object_id
+                    {
+                        vfs.state.metrics.prefetched_object_ids.remove(&object_id);
+                    }
+                    vfs.state
+                        .metrics
+                        .prefetched_object_ids
+                        .insert(block.object_id);
                 }
                 Ok::<(), VfsError>(())
             }
@@ -845,21 +856,28 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
-                let mut prefetched = vfs.state.metrics.prefetched_object_remaining_bytes.lock();
-                let remove = if let Some(remaining) = prefetched.get_mut(&payload.object_id) {
-                    let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
-                    let useful = (*remaining).min(read_bytes);
-                    *remaining = (*remaining).saturating_sub(useful);
-                    vfs.state
-                        .metrics
-                        .readahead_used_bytes
-                        .fetch_add(u64::from(useful), Ordering::Relaxed);
-                    *remaining == 0
-                } else {
-                    false
-                };
-                if remove {
-                    prefetched.pop(&payload.object_id);
+                let prefetched = &vfs.state.metrics.prefetched_object_ids;
+                if prefetched.contains(&payload.object_id) {
+                    let mut remaining_bytes =
+                        vfs.state.metrics.prefetched_object_remaining_bytes.lock();
+                    let remove =
+                        if let Some(remaining) = remaining_bytes.get_mut(&payload.object_id) {
+                            let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
+                            let useful = (*remaining).min(read_bytes);
+                            *remaining = (*remaining).saturating_sub(useful);
+                            vfs.state
+                                .metrics
+                                .readahead_used_bytes
+                                .fetch_add(u64::from(useful), Ordering::Relaxed);
+                            *remaining == 0
+                        } else {
+                            true
+                        };
+                    if remove {
+                        remaining_bytes.pop(&payload.object_id);
+                        drop(remaining_bytes);
+                        prefetched.remove(&payload.object_id);
+                    }
                 }
             }
             if !span_resolved {
