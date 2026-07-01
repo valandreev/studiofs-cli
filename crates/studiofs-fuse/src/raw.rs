@@ -470,10 +470,7 @@ fn reply_struct<T: FuseBytes>(fd: RawFd, unique: u64, value: &T) -> io::Result<(
         error: 0,
         unique,
     };
-    let mut reply = Vec::with_capacity(len as usize);
-    reply.extend_from_slice(as_bytes(&header));
-    reply.extend_from_slice(bytes);
-    write_all_fd(fd, &reply)
+    write_fuse_packet_vectored_fd(fd, as_bytes(&header), bytes)
 }
 
 #[repr(C)]
@@ -485,7 +482,7 @@ struct OutHeader {
 }
 
 fn write_reply_header(fd: RawFd, unique: u64, error: i32, len: u32) -> io::Result<()> {
-    write_all_fd(fd, as_bytes(&OutHeader { len, error, unique }))
+    write_fuse_packet_fd(fd, as_bytes(&OutHeader { len, error, unique }))
 }
 
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
@@ -498,16 +495,55 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
-    while !bytes.is_empty() {
+fn write_fuse_packet_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
+    loop {
         // SAFETY: `bytes` is a valid readable byte slice for the provided length.
         let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        if rc >= 0 {
+            return check_fuse_packet_write(bytes.len(), rc as usize);
         }
-        bytes = &bytes[rc as usize..];
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
-    Ok(())
+}
+
+fn write_fuse_packet_vectored_fd(fd: RawFd, first: &[u8], second: &[u8]) -> io::Result<()> {
+    let iov = [
+        libc::iovec {
+            iov_base: first.as_ptr().cast_mut().cast(),
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: second.as_ptr().cast_mut().cast(),
+            iov_len: second.len(),
+        },
+    ];
+    let expected = first.len() + second.len();
+    loop {
+        // SAFETY: both iovec entries point to readable byte slices that stay
+        // alive for the duration of this single `writev(2)` call.
+        let rc = unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) };
+        if rc >= 0 {
+            return check_fuse_packet_write(expected, rc as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn check_fuse_packet_write(expected: usize, written: usize) -> io::Result<()> {
+    if written == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short FUSE packet write",
+        ))
+    }
 }
 
 fn stat_path(path: &Path) -> io::Result<libc::stat> {
