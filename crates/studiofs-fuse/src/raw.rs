@@ -254,6 +254,12 @@ fn mount_dev_fuse(
 
 fn serve_minimal_session(fd: RawFd, profile: LinuxRawFuseProfile) -> io::Result<()> {
     let mut buf = vec![0_u8; profile.max_write as usize + 4096];
+    let ids = SessionIds {
+        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+        uid: unsafe { libc::geteuid() },
+        // SAFETY: `getegid` has no preconditions and does not dereference pointers.
+        gid: unsafe { libc::getegid() },
+    };
     loop {
         let len = match read_fd(fd, &mut buf) {
             Ok(len) => len,
@@ -276,10 +282,10 @@ fn serve_minimal_session(fd: RawFd, profile: LinuxRawFuseProfile) -> io::Result<
                 "short FUSE request header",
             ));
         }
-        let header = read_struct::<InHeader>(&buf[..size_of::<InHeader>()]);
+        let header = read_struct::<InHeader>(&buf[..size_of::<InHeader>()])?;
         match header.opcode {
             OP_INIT => handle_init(fd, header, &buf[size_of::<InHeader>()..len], profile)?,
-            OP_GETATTR => reply_getattr(fd, header.unique)?,
+            OP_GETATTR => reply_getattr(fd, header.unique, ids)?,
             OP_STATFS => reply_statfs(fd, header.unique)?,
             OP_OPENDIR => reply_open(fd, header.unique)?,
             OP_READDIR | OP_READDIRPLUS => reply_empty(fd, header.unique)?,
@@ -306,7 +312,7 @@ fn handle_init(
     if payload.len() < size_of::<InitIn>() {
         return reply_error(fd, header.unique, libc::EINVAL);
     }
-    let input = read_struct::<InitIn>(&payload[..size_of::<InitIn>()]);
+    let input = read_struct::<InitIn>(&payload[..size_of::<InitIn>()])?;
     if input.major != FUSE_KERNEL_VERSION {
         return reply_error(fd, header.unique, libc::EPROTO);
     }
@@ -320,7 +326,13 @@ fn handle_init(
     reply_struct(fd, header.unique, &negotiated.out)
 }
 
-fn reply_getattr(fd: RawFd, unique: u64) -> io::Result<()> {
+#[derive(Clone, Copy)]
+struct SessionIds {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+fn reply_getattr(fd: RawFd, unique: u64, ids: SessionIds) -> io::Result<()> {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Attr {
@@ -365,15 +377,16 @@ fn reply_getattr(fd: RawFd, unique: u64) -> io::Result<()> {
             ctimensec: 0,
             mode: libc::S_IFDIR | 0o755,
             nlink: 2,
-            // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
-            uid: unsafe { libc::geteuid() },
-            // SAFETY: `getegid` has no preconditions and does not dereference pointers.
-            gid: unsafe { libc::getegid() },
+            uid: ids.uid,
+            gid: ids.gid,
             rdev: 0,
             blksize: 4096,
             padding: 0,
         },
     };
+    // SAFETY: `AttrOut` and nested structs are `repr(C)`, integer-only, and
+    // include explicit padding fields for the Linux FUSE wire layout.
+    unsafe impl FuseBytes for AttrOut {}
     reply_struct(fd, unique, &attr)
 }
 
@@ -397,6 +410,9 @@ fn reply_statfs(fd: RawFd, unique: u64) -> io::Result<()> {
     struct StatfsOut {
         st: Kstatfs,
     }
+    // SAFETY: `StatfsOut` and nested structs are `repr(C)`, integer-only, and
+    // include explicit padding fields for the Linux FUSE wire layout.
+    unsafe impl FuseBytes for StatfsOut {}
     reply_struct(
         fd,
         unique,
@@ -425,6 +441,8 @@ fn reply_open(fd: RawFd, unique: u64) -> io::Result<()> {
         open_flags: u32,
         padding: u32,
     }
+    // SAFETY: `OpenOut` is `repr(C)`, integer-only, and has explicit padding.
+    unsafe impl FuseBytes for OpenOut {}
     reply_struct(
         fd,
         unique,
@@ -444,7 +462,7 @@ fn reply_error(fd: RawFd, unique: u64, errno: i32) -> io::Result<()> {
     write_reply_header(fd, unique, -errno, size_of::<OutHeader>() as u32)
 }
 
-fn reply_struct<T: Copy>(fd: RawFd, unique: u64, value: &T) -> io::Result<()> {
+fn reply_struct<T: FuseBytes>(fd: RawFd, unique: u64, value: &T) -> io::Result<()> {
     let bytes = as_bytes(value);
     let len = (size_of::<OutHeader>() + bytes.len()) as u32;
     let header = OutHeader {
@@ -522,15 +540,29 @@ fn unmount_raw(mount_point: &Path) -> io::Result<()> {
     }
 }
 
-fn read_struct<T: Copy>(bytes: &[u8]) -> T {
-    debug_assert!(bytes.len() >= size_of::<T>());
+fn read_struct<T: FuseBytes>(bytes: &[u8]) -> io::Result<T> {
+    if bytes.len() < size_of::<T>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE struct",
+        ));
+    }
     // SAFETY: callers pass at least `size_of::<T>()` bytes; unaligned reads are
     // accepted because FUSE payload alignment is not trusted at this boundary.
-    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) }
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
 }
 
-fn as_bytes<T: Copy>(value: &T) -> &[u8] {
+fn as_bytes<T: FuseBytes>(value: &T) -> &[u8] {
     // SAFETY: `value` is valid for `size_of::<T>()` bytes and the returned slice
     // is tied to `value`'s lifetime.
     unsafe { std::slice::from_raw_parts((value as *const T).cast(), size_of::<T>()) }
 }
+
+unsafe trait FuseBytes: Copy {}
+
+// SAFETY: these Linux FUSE wire structs are `repr(C)`, integer-only, and any
+// protocol padding is represented as initialized fields.
+unsafe impl FuseBytes for InHeader {}
+unsafe impl FuseBytes for InitIn {}
+unsafe impl FuseBytes for InitOut {}
+unsafe impl FuseBytes for OutHeader {}

@@ -43,7 +43,14 @@ pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn Moun
     match selector.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) if value.eq_ignore_ascii_case("raw") => Box::new(RawFuseMountBackend),
         Some(value) if value.eq_ignore_ascii_case("fuser") => Box::new(FuseMountBackend),
-        _ => Box::new(FuseMountBackend),
+        Some(value) => {
+            tracing::warn!(
+                backend = value,
+                "unknown Linux mount backend; falling back to fuser"
+            );
+            Box::new(FuseMountBackend)
+        }
+        None => Box::new(FuseMountBackend),
     }
 }
 
