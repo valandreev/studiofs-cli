@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -14,12 +15,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
+use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -35,6 +36,14 @@ const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
 const OP_GETATTR: u32 = 3;
 const OP_SETATTR: u32 = 4;
+const OP_READLINK: u32 = 5;
+const OP_SYMLINK: u32 = 6;
+const OP_MKNOD: u32 = 8;
+const OP_MKDIR: u32 = 9;
+const OP_UNLINK: u32 = 10;
+const OP_RMDIR: u32 = 11;
+const OP_RENAME: u32 = 12;
+const OP_LINK: u32 = 13;
 const OP_OPEN: u32 = 14;
 const OP_READ: u32 = 15;
 const OP_WRITE: u32 = 16;
@@ -201,9 +210,10 @@ impl RawDispatchClass {
     fn for_opcode(opcode: u32) -> Self {
         match opcode {
             OP_READ | OP_WRITE | OP_FLUSH | OP_FSYNC | OP_RELEASE => Self::Stream,
-            OP_LOOKUP | OP_GETATTR | OP_SETATTR | OP_STATFS | OP_OPENDIR | OP_READDIR
-            | OP_RELEASEDIR | OP_ACCESS | OP_CREATE | OP_SETXATTR | OP_GETXATTR | OP_LISTXATTR
-            | OP_REMOVEXATTR | OP_IOCTL | OP_READDIRPLUS | OP_OPEN => Self::Metadata,
+            OP_LOOKUP | OP_GETATTR | OP_SETATTR | OP_READLINK | OP_SYMLINK | OP_MKNOD
+            | OP_MKDIR | OP_UNLINK | OP_RMDIR | OP_RENAME | OP_LINK | OP_STATFS | OP_OPENDIR
+            | OP_READDIR | OP_RELEASEDIR | OP_ACCESS | OP_CREATE | OP_SETXATTR | OP_GETXATTR
+            | OP_LISTXATTR | OP_REMOVEXATTR | OP_IOCTL | OP_READDIRPLUS | OP_OPEN => Self::Metadata,
             _ => Self::Metadata,
         }
     }
@@ -226,6 +236,12 @@ struct RawDispatchSnapshot {
 enum RawDispatchAdmissionError {
     QueueFull,
     StreamQueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawCreateEntryKind {
+    File,
+    Directory,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +472,43 @@ pub struct InitOut {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct OpenIn {
     flags: u32,
+    open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MknodIn {
+    mode: u32,
+    rdev: u32,
+    umask: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MkdirIn {
+    mode: u32,
+    umask: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RenameIn {
+    newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LinkIn {
+    oldnodeid: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CreateIn {
+    flags: u32,
+    mode: u32,
+    umask: u32,
     open_flags: u32,
 }
 
@@ -825,6 +878,8 @@ fn serve_minimal_session(
         vfs,
         runtime_handle,
         ids,
+        next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+        open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
     };
     let session_result = loop {
         let len = match read_fd(fd, &mut buf) {
@@ -956,8 +1011,17 @@ fn handle_minimal_request(
 ) -> io::Result<()> {
     match header.opcode {
         OP_GETATTR => reply_getattr(fd, header.unique, header.nodeid, context, Some(accounting)),
-        OP_STATFS => reply_statfs(fd, header.unique, Some(accounting)),
+        OP_STATFS => reply_statfs(fd, header.unique, context, Some(accounting)),
         OP_OPEN => raw_open(fd, header, payload, context, accounting),
+        OP_CREATE => raw_create(fd, header, payload, context, accounting),
+        OP_MKNOD => raw_mknod(fd, header, payload, context, accounting),
+        OP_MKDIR => raw_mkdir(fd, header, payload, context, accounting),
+        OP_UNLINK => raw_unlink(fd, header, payload, context, accounting),
+        OP_RMDIR => raw_rmdir(fd, header, payload, context, accounting),
+        OP_RENAME => raw_rename(fd, header, payload, context, accounting),
+        OP_SYMLINK => raw_symlink(fd, header, payload, context, accounting),
+        OP_READLINK => raw_readlink(fd, header, context, accounting),
+        OP_LINK => raw_link(fd, header, payload, context, accounting),
         OP_SETATTR => raw_setattr(fd, header, payload, context, accounting),
         OP_READ => raw_read(fd, header, payload, context, accounting),
         OP_WRITE => raw_write(fd, header, payload, context, accounting),
@@ -969,10 +1033,11 @@ fn handle_minimal_request(
         OP_LISTXATTR => raw_listxattr(fd, header, payload, context, accounting),
         OP_REMOVEXATTR => raw_removexattr(fd, header, payload, context, accounting),
         OP_IOCTL => raw_ioctl(fd, header, payload, context, accounting),
-        OP_OPENDIR => reply_open(fd, header.unique, 1, 0, Some(accounting)),
+        OP_OPENDIR => raw_opendir(fd, header, context, accounting),
         OP_READDIR => raw_readdir(fd, header, payload, context, accounting),
-        OP_READDIRPLUS => reply_error(fd, header.unique, libc::ENOSYS, Some(accounting)),
-        OP_ACCESS | OP_RELEASEDIR => reply_empty(fd, header.unique, Some(accounting)),
+        OP_READDIRPLUS => raw_readdirplus(fd, header, payload, context, accounting),
+        OP_RELEASEDIR => raw_releasedir(fd, header, payload, context, accounting),
+        OP_ACCESS => reply_empty(fd, header.unique, Some(accounting)),
         OP_LOOKUP => raw_lookup(fd, header, payload, context, accounting),
         OP_FORGET | OP_DESTROY => Ok(()),
         opcode => {
@@ -1048,6 +1113,238 @@ fn raw_open(
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
         Ok(fh) => reply_open(fd, header.unique, fh, 0, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_create(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() < size_of::<CreateIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<CreateIn>(&payload[..size_of::<CreateIn>()])?;
+    let name = nul_stripped(&payload[size_of::<CreateIn>()..]);
+    let Some(attr) = raw_create_parent_entry(
+        fd,
+        header,
+        context,
+        accounting,
+        name,
+        input.mode,
+        RawCreateEntryKind::File,
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    let Ok(flags) = i32::try_from(input.flags) else {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    };
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    match vfs.open_file(attr.ino, open_flags, trunc) {
+        Ok(fh) => reply_create(fd, header.unique, &attr, fh, 0, context, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_mknod(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() < size_of::<MknodIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<MknodIn>(&payload[..size_of::<MknodIn>()])?;
+    let name = nul_stripped(&payload[size_of::<MknodIn>()..]);
+    if let Some(attr) = raw_create_parent_entry(
+        fd,
+        header,
+        context,
+        accounting,
+        name,
+        input.mode,
+        RawCreateEntryKind::File,
+    )? {
+        reply_entry(fd, header.unique, &attr, context, Some(accounting))
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_mkdir(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() < size_of::<MkdirIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<MkdirIn>(&payload[..size_of::<MkdirIn>()])?;
+    let name = nul_stripped(&payload[size_of::<MkdirIn>()..]);
+    if let Some(attr) = raw_create_parent_entry(
+        fd,
+        header,
+        context,
+        accounting,
+        name,
+        input.mode,
+        RawCreateEntryKind::Directory,
+    )? {
+        reply_entry(fd, header.unique, &attr, context, Some(accounting))
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_create_parent_entry(
+    fd: RawFd,
+    header: InHeader,
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+    name: &[u8],
+    mode: u32,
+    kind: RawCreateEntryKind,
+) -> io::Result<Option<InodeAttr>> {
+    let Some(vfs) = &context.vfs else {
+        reply_error(fd, header.unique, libc::ENOSYS, Some(accounting))?;
+        return Ok(None);
+    };
+    let mode = normalize_unix_mode(mode);
+    let result = match kind {
+        RawCreateEntryKind::File => {
+            vfs.create_deferred_metadata_flush(header.nodeid, name, header.uid, header.gid, mode)
+        }
+        RawCreateEntryKind::Directory => {
+            vfs.mkdir(header.nodeid, name, header.uid, header.gid, mode)
+        }
+    };
+    match result {
+        Ok(attr) => Ok(Some(attr)),
+        Err(err) => {
+            reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting))?;
+            Ok(None)
+        }
+    }
+}
+
+fn raw_unlink(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    match vfs.unlink(header.nodeid, nul_stripped(payload)) {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_rmdir(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    match vfs.rmdir(header.nodeid, nul_stripped(payload)) {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_rename(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<RenameIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<RenameIn>(&payload[..size_of::<RenameIn>()])?;
+    let Some((name, new_name)) = split_two_nul_strings(&payload[size_of::<RenameIn>()..]) else {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    };
+    match vfs.rename(header.nodeid, name, input.newdir, new_name) {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_symlink(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    let Some((name, target)) = split_two_nul_strings(payload) else {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    };
+    match vfs.symlink(header.nodeid, name, target, header.uid, header.gid) {
+        Ok(attr) => reply_entry(fd, header.unique, &attr, context, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_readlink(
+    fd: RawFd,
+    header: InHeader,
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    match vfs.readlink(header.nodeid) {
+        Ok(target) => reply_data(fd, header.unique, &target, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_link(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_error(fd, header.unique, libc::ENOSYS, Some(accounting));
+    };
+    if payload.len() < size_of::<LinkIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<LinkIn>(&payload[..size_of::<LinkIn>()])?;
+    let name = nul_stripped(&payload[size_of::<LinkIn>()..]);
+    match vfs.link(input.oldnodeid, header.nodeid, name) {
+        Ok(attr) => reply_entry(fd, header.unique, &attr, context, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1188,6 +1485,47 @@ fn raw_release(
     }
 }
 
+fn raw_opendir(
+    fd: RawFd,
+    header: InHeader,
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_open(fd, header.unique, 1, 0, Some(accounting));
+    };
+    match raw_load_open_dir_state(vfs, header.nodeid) {
+        Ok(state) => {
+            let fh = context.next_open_dir_fh.fetch_add(1, Ordering::Relaxed);
+            context
+                .open_dir_handles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(fh, state);
+            reply_open(fd, header.unique, fh, 0, Some(accounting))
+        }
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_releasedir(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    if payload.len() >= size_of::<ReleaseIn>() {
+        let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
+        context
+            .open_dir_handles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&input.fh);
+    }
+    reply_empty(fd, header.unique, Some(accounting))
+}
+
 fn raw_readdir(
     fd: RawFd,
     header: InHeader,
@@ -1227,13 +1565,14 @@ fn raw_readdir(
     {
         return reply_data(fd, header.unique, &out, Some(accounting));
     }
-    let entries = match vfs.readdir_with_attrs(header.nodeid) {
-        Ok(entries) => entries,
-        Err(err) => {
-            return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
+    let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
+        Ok(state) => state,
+        Err(errno) => {
+            return reply_error(fd, header.unique, errno, Some(accounting));
         }
     };
-    for (index, entry_with_attr) in entries
+    for (index, entry_with_attr) in state
+        .entries
         .iter()
         .enumerate()
         .skip(readdir_entry_skip_offset(input.offset))
@@ -1252,6 +1591,87 @@ fn raw_readdir(
             entry.ino,
             offset,
             dtype,
+            &entry.name,
+            input.size as usize,
+        ) {
+            break;
+        }
+    }
+    reply_data(fd, header.unique, &out, Some(accounting))
+}
+
+fn raw_readdirplus(
+    fd: RawFd,
+    header: InHeader,
+    payload: &[u8],
+    context: &RawRequestContext,
+    accounting: &RawDispatchAccounting,
+) -> io::Result<()> {
+    let Some(vfs) = &context.vfs else {
+        return reply_empty(fd, header.unique, Some(accounting));
+    };
+    if payload.len() < size_of::<ReadIn>() {
+        return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
+    }
+    let input = read_struct::<ReadIn>(&payload[..size_of::<ReadIn>()])?;
+    let mut out = Vec::with_capacity(input.size as usize);
+    if input.offset <= 1 {
+        let current_attr = match vfs.getattr(header.nodeid) {
+            Ok(attr) => attr,
+            Err(err) => {
+                return reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting));
+            }
+        };
+        let parent_attr = if current_attr.parent == 0 || current_attr.parent == current_attr.ino {
+            current_attr.clone()
+        } else {
+            match vfs.getattr(current_attr.parent) {
+                Ok(attr) => attr,
+                Err(err) => {
+                    return reply_error(
+                        fd,
+                        header.unique,
+                        vfs_err_to_errno(&err),
+                        Some(accounting),
+                    );
+                }
+            }
+        };
+        if !push_readdirplus_dot_entries(
+            &mut out,
+            &current_attr,
+            &parent_attr,
+            context,
+            input.offset,
+            input.size as usize,
+        ) {
+            return reply_data(fd, header.unique, &out, Some(accounting));
+        }
+    }
+    let state = match raw_open_dir_state(context, vfs, header.nodeid, input.fh) {
+        Ok(state) => state,
+        Err(errno) => {
+            return reply_error(fd, header.unique, errno, Some(accounting));
+        }
+    };
+    for (index, entry_with_attr) in state
+        .entries
+        .iter()
+        .enumerate()
+        .skip(readdir_entry_skip_offset(input.offset))
+    {
+        let entry = &entry_with_attr.entry;
+        let Some(attr) = &entry_with_attr.attr else {
+            continue;
+        };
+        let Ok(offset) = u64::try_from(index + 3) else {
+            return reply_error(fd, header.unique, libc::EOVERFLOW, Some(accounting));
+        };
+        if !push_direntplus(
+            &mut out,
+            attr,
+            context,
+            offset,
             &entry.name,
             input.size as usize,
         ) {
@@ -1413,6 +1833,136 @@ struct RawRequestContext {
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
     ids: SessionIds,
+    next_open_dir_fh: Arc<AtomicU64>,
+    open_dir_handles: Arc<RwLock<HashMap<u64, RawOpenDirState>>>,
+}
+
+#[derive(Clone)]
+struct RawOpenDirState {
+    entries: Arc<Vec<DirEntryWithAttr>>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawEntryOut {
+    nodeid: u64,
+    generation: u64,
+    entry_valid: u64,
+    attr_valid: u64,
+    entry_valid_nsec: u32,
+    attr_valid_nsec: u32,
+    attr: RawEntryAttr,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawEntryAttr {
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    atimensec: u32,
+    mtimensec: u32,
+    ctimensec: u32,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    blksize: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawOpenOut {
+    fh: u64,
+    open_flags: u32,
+    backing_id: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawDirent {
+    ino: u64,
+    off: u64,
+    namelen: u32,
+    dtype: u32,
+}
+
+fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntryOut {
+    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    RawEntryOut {
+        nodeid: inode_attr.ino,
+        generation: 0,
+        entry_valid: 1,
+        attr_valid: 1,
+        entry_valid_nsec: 0,
+        attr_valid_nsec: 0,
+        attr: RawEntryAttr {
+            ino: bridge.ino,
+            size: bridge.size,
+            blocks: bridge.blocks,
+            atime: system_time_secs(bridge.atime),
+            mtime: system_time_secs(bridge.mtime),
+            ctime: system_time_secs(bridge.ctime),
+            atimensec: system_time_nsecs(bridge.atime),
+            mtimensec: system_time_nsecs(bridge.mtime),
+            ctimensec: system_time_nsecs(bridge.ctime),
+            mode: raw_mode(inode_attr),
+            nlink: bridge.nlink,
+            uid: bridge.uid,
+            gid: bridge.gid,
+            rdev: bridge.rdev,
+            blksize: bridge.blksize,
+            padding: 0,
+        },
+    }
+}
+
+fn raw_load_open_dir_state(
+    vfs: &StudioVfs,
+    ino: u64,
+) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
+    // ponytail: full-dir snapshot matches the existing fuser backend; move to
+    // paginated VFS readdir if large-directory memory pressure shows up.
+    Ok(RawOpenDirState {
+        entries: Arc::new(vfs.readdir_with_attrs(ino)?),
+    })
+}
+
+fn raw_open_dir_state(
+    context: &RawRequestContext,
+    vfs: &StudioVfs,
+    ino: u64,
+    fh: u64,
+) -> Result<RawOpenDirState, i32> {
+    if let Some(state) = raw_open_dir_handle_state(context, ino, fh)? {
+        return Ok(state);
+    }
+    raw_load_open_dir_state(vfs, ino).map_err(|err| vfs_err_to_errno(&err))
+}
+
+fn raw_open_dir_handle_state(
+    context: &RawRequestContext,
+    ino: u64,
+    fh: u64,
+) -> Result<Option<RawOpenDirState>, i32> {
+    if let Some(state) = context
+        .open_dir_handles
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&fh)
+    {
+        return Ok(Some(state.clone()));
+    }
+    if fh != 0 {
+        warn!(ino, fh, "raw readdir with unknown directory fh");
+        return Err(libc::EBADF);
+    }
+    Ok(None)
 }
 
 fn reply_getattr(
@@ -1518,67 +2068,36 @@ fn reply_entry(
     context: &RawRequestContext,
     accounting: Option<&RawDispatchAccounting>,
 ) -> io::Result<()> {
+    let out = raw_entry_out(inode_attr, context);
+    reply_struct(fd, unique, &out, accounting)
+}
+
+fn reply_create(
+    fd: RawFd,
+    unique: u64,
+    inode_attr: &InodeAttr,
+    fh: u64,
+    open_flags: u32,
+    context: &RawRequestContext,
+    accounting: Option<&RawDispatchAccounting>,
+) -> io::Result<()> {
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct EntryOut {
-        nodeid: u64,
-        generation: u64,
-        entry_valid: u64,
-        attr_valid: u64,
-        entry_valid_nsec: u32,
-        attr_valid_nsec: u32,
-        attr: EntryAttr,
+    struct CreateOut {
+        entry: RawEntryOut,
+        open: RawOpenOut,
     }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct EntryAttr {
-        ino: u64,
-        size: u64,
-        blocks: u64,
-        atime: u64,
-        mtime: u64,
-        ctime: u64,
-        atimensec: u32,
-        mtimensec: u32,
-        ctimensec: u32,
-        mode: u32,
-        nlink: u32,
-        uid: u32,
-        gid: u32,
-        rdev: u32,
-        blksize: u32,
-        padding: u32,
-    }
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
-    let out = EntryOut {
-        nodeid: inode_attr.ino,
-        generation: 0,
-        entry_valid: 1,
-        attr_valid: 1,
-        entry_valid_nsec: 0,
-        attr_valid_nsec: 0,
-        attr: EntryAttr {
-            ino: bridge.ino,
-            size: bridge.size,
-            blocks: bridge.blocks,
-            atime: system_time_secs(bridge.atime),
-            mtime: system_time_secs(bridge.mtime),
-            ctime: system_time_secs(bridge.ctime),
-            atimensec: system_time_nsecs(bridge.atime),
-            mtimensec: system_time_nsecs(bridge.mtime),
-            ctimensec: system_time_nsecs(bridge.ctime),
-            mode: raw_mode(inode_attr),
-            nlink: bridge.nlink,
-            uid: bridge.uid,
-            gid: bridge.gid,
-            rdev: bridge.rdev,
-            blksize: bridge.blksize,
-            padding: 0,
+    let out = CreateOut {
+        entry: raw_entry_out(inode_attr, context),
+        open: RawOpenOut {
+            fh,
+            open_flags,
+            backing_id: 0,
         },
     };
-    // SAFETY: `EntryOut` and nested structs are `repr(C)`, integer-only, and
-    // include explicit padding fields for the Linux FUSE wire layout.
-    unsafe impl FuseBytes for EntryOut {}
+    // SAFETY: `CreateOut` and nested structs are `repr(C)`, integer-only, and
+    // include explicit padding/layout fields for the Linux FUSE wire layout.
+    unsafe impl FuseBytes for CreateOut {}
     reply_struct(fd, unique, &out, accounting)
 }
 
@@ -1650,6 +2169,7 @@ fn reply_attr(
 fn reply_statfs(
     fd: RawFd,
     unique: u64,
+    context: &RawRequestContext,
     accounting: Option<&RawDispatchAccounting>,
 ) -> io::Result<()> {
     #[repr(C)]
@@ -1674,25 +2194,36 @@ fn reply_statfs(
     // SAFETY: `StatfsOut` and nested structs are `repr(C)`, integer-only, and
     // include explicit padding fields for the Linux FUSE wire layout.
     unsafe impl FuseBytes for StatfsOut {}
-    reply_struct(
-        fd,
-        unique,
-        &StatfsOut {
-            st: Kstatfs {
-                blocks: 1,
-                bfree: 1,
-                bavail: 1,
-                files: 1,
-                ffree: 1,
-                bsize: 4096,
-                namelen: 255,
-                frsize: 4096,
+    let st = match &context.vfs {
+        Some(vfs) => match vfs.statfs() {
+            Ok(st) => Kstatfs {
+                blocks: st.blocks,
+                bfree: st.bfree,
+                bavail: st.bavail,
+                files: st.files,
+                ffree: st.ffree,
+                bsize: st.bsize,
+                namelen: st.namelen,
+                frsize: st.frsize,
                 padding: 0,
                 spare: [0; 6],
             },
+            Err(err) => return reply_error(fd, unique, vfs_err_to_errno(&err), accounting),
         },
-        accounting,
-    )
+        None => Kstatfs {
+            blocks: 1,
+            bfree: 1,
+            bavail: 1,
+            files: 1,
+            ffree: 1,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+            padding: 0,
+            spare: [0; 6],
+        },
+    };
+    reply_struct(fd, unique, &StatfsOut { st }, accounting)
 }
 
 fn reply_open(
@@ -1707,7 +2238,7 @@ fn reply_open(
     struct OpenOut {
         fh: u64,
         open_flags: u32,
-        padding: u32,
+        backing_id: i32,
     }
     // SAFETY: `OpenOut` is `repr(C)`, integer-only, and has explicit padding.
     unsafe impl FuseBytes for OpenOut {}
@@ -1717,7 +2248,7 @@ fn reply_open(
         &OpenOut {
             fh,
             open_flags,
-            padding: 0,
+            backing_id: 0,
         },
         accounting,
     )
@@ -1851,35 +2382,91 @@ fn push_dirent(
     name: &[u8],
     limit: usize,
 ) -> bool {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Dirent {
-        ino: u64,
-        off: u64,
-        namelen: u32,
-        dtype: u32,
-    }
     let Ok(namelen) = u32::try_from(name.len()) else {
         return false;
     };
-    let entry_len = align_8(size_of::<Dirent>() + name.len());
+    let entry_len = align_8(size_of::<RawDirent>() + name.len());
     if out.len().saturating_add(entry_len) > limit {
         return false;
     }
-    let dirent = Dirent {
+    let dirent = RawDirent {
         ino,
         off: offset,
         namelen,
         dtype: u32::from(dtype),
     };
-    // SAFETY: `Dirent` is `repr(C)`, integer-only, and has no uninitialized padding.
-    unsafe impl FuseBytes for Dirent {}
     out.extend_from_slice(as_bytes(&dirent));
     out.extend_from_slice(name);
     out.resize(
-        out.len() + (entry_len - size_of::<Dirent>() - name.len()),
+        out.len() + (entry_len - size_of::<RawDirent>() - name.len()),
         0,
     );
+    true
+}
+
+fn push_direntplus(
+    out: &mut Vec<u8>,
+    attr: &InodeAttr,
+    context: &RawRequestContext,
+    offset: u64,
+    name: &[u8],
+    limit: usize,
+) -> bool {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DirentPlus {
+        entry_out: RawEntryOut,
+        dirent: RawDirent,
+    }
+    const _: () =
+        assert!(size_of::<DirentPlus>() == size_of::<RawEntryOut>() + size_of::<RawDirent>());
+    let Ok(namelen) = u32::try_from(name.len()) else {
+        return false;
+    };
+    let entry_len = align_8(size_of::<DirentPlus>() + name.len());
+    if out.len().saturating_add(entry_len) > limit {
+        return false;
+    }
+    let dtype = match attr.kind {
+        FileType::RegularFile => libc::DT_REG,
+        FileType::Directory => libc::DT_DIR,
+        FileType::Symlink => libc::DT_LNK,
+    };
+    let entry = DirentPlus {
+        entry_out: raw_entry_out(attr, context),
+        dirent: RawDirent {
+            ino: attr.ino,
+            off: offset,
+            namelen,
+            dtype: u32::from(dtype),
+        },
+    };
+    // SAFETY: `DirentPlus` and nested structs are `repr(C)`, integer-only, and
+    // include explicit padding/layout fields for the Linux FUSE wire layout.
+    unsafe impl FuseBytes for DirentPlus {}
+    out.extend_from_slice(as_bytes(&entry));
+    out.extend_from_slice(name);
+    out.resize(
+        out.len() + (entry_len - size_of::<DirentPlus>() - name.len()),
+        0,
+    );
+    true
+}
+
+fn push_readdirplus_dot_entries(
+    out: &mut Vec<u8>,
+    current_attr: &InodeAttr,
+    parent_attr: &InodeAttr,
+    context: &RawRequestContext,
+    offset: u64,
+    limit: usize,
+) -> bool {
+    if offset == 0 && !push_direntplus(out, current_attr, context, 1, b".", limit) {
+        return false;
+    }
+    if offset <= 1 && !push_direntplus(out, parent_attr, context, 2, b"..", limit) {
+        return false;
+    }
     true
 }
 
@@ -2028,6 +2615,20 @@ fn raw_mode(attr: &InodeAttr) -> u32 {
         FileType::Symlink => libc::S_IFLNK,
     };
     kind | u32::from(attr.mode & 0o7777)
+}
+
+fn normalize_unix_mode(mode: u32) -> u16 {
+    u16::try_from(mode & 0o7777).unwrap_or(0)
+}
+
+fn nul_stripped(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(&[0]).unwrap_or(bytes)
+}
+
+fn split_two_nul_strings(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let first_end = bytes.iter().position(|byte| *byte == 0)?;
+    let rest = &bytes[first_end + 1..];
+    Some((&bytes[..first_end], nul_stripped(rest)))
 }
 
 fn setattr_args_from_raw(input: SetattrIn) -> SetattrArgs {
@@ -2191,7 +2792,15 @@ unsafe trait FuseBytes: Copy {}
 unsafe impl FuseBytes for InHeader {}
 unsafe impl FuseBytes for InitIn {}
 unsafe impl FuseBytes for InitOut {}
+unsafe impl FuseBytes for RawEntryOut {}
+unsafe impl FuseBytes for RawOpenOut {}
+unsafe impl FuseBytes for RawDirent {}
 unsafe impl FuseBytes for OpenIn {}
+unsafe impl FuseBytes for MknodIn {}
+unsafe impl FuseBytes for MkdirIn {}
+unsafe impl FuseBytes for RenameIn {}
+unsafe impl FuseBytes for LinkIn {}
+unsafe impl FuseBytes for CreateIn {}
 unsafe impl FuseBytes for ReadIn {}
 unsafe impl FuseBytes for WriteIn {}
 unsafe impl FuseBytes for FlushIn {}
@@ -2296,6 +2905,59 @@ mod tests {
         assert_eq!(readdir_entry_skip_offset(1), 0);
         assert_eq!(readdir_entry_skip_offset(2), 0);
         assert_eq!(readdir_entry_skip_offset(3), 1);
+    }
+
+    #[test]
+    fn raw_readdirplus_dot_entries_use_standard_offsets() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds {
+                uid: 1000,
+                gid: 1000,
+            },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let current = InodeAttr::new_dir(7, FUSE_ROOT_ID, 1000, 1000, 0o755);
+        let parent = InodeAttr::new_dir(FUSE_ROOT_ID, 0, 1000, 1000, 0o755);
+        let mut out = Vec::new();
+
+        assert!(push_readdirplus_dot_entries(
+            &mut out, &current, &parent, &context, 0, 4096
+        ));
+
+        let dirent_offset = size_of::<RawEntryOut>();
+        let first = read_struct::<RawDirent>(&out[dirent_offset..]).unwrap();
+        let first_name = dirent_offset + size_of::<RawDirent>();
+        let second_offset = align_8(size_of::<RawEntryOut>() + size_of::<RawDirent>() + 1);
+        let second = read_struct::<RawDirent>(&out[second_offset + dirent_offset..]).unwrap();
+        let second_name = second_offset + dirent_offset + size_of::<RawDirent>();
+
+        assert_eq!(
+            (first.ino, first.off, &out[first_name..first_name + 1]),
+            (7, 1, &b"."[..])
+        );
+        assert_eq!(
+            (second.ino, second.off, &out[second_name..second_name + 2]),
+            (FUSE_ROOT_ID, 2, &b".."[..])
+        );
+    }
+
+    #[test]
+    fn raw_open_dir_handle_state_rejects_unknown_nonzero_fh() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds { uid: 0, gid: 0 },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        assert!(matches!(
+            raw_open_dir_handle_state(&context, FUSE_ROOT_ID, 42),
+            Err(errno) if errno == libc::EBADF
+        ));
     }
 
     #[test]
