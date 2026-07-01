@@ -169,6 +169,10 @@ Current signature includes additional policy controls:
 
 ## FUSE Bridge (`studiofs-fuse`)
 
+Linux has two selectable FUSE paths:
+- `STUDIOFS_MOUNT_BACKEND=fuser` or unset: legacy `fuser` backend, kept as the fallback/control path.
+- `STUDIOFS_MOUNT_BACKEND=raw`: experimental JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse` directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse high-level callbacks.
+
 ### Requirements
 
 - Linux: `libfuse3-dev` (or `fuse3`)
