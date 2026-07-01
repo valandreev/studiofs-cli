@@ -109,6 +109,7 @@ impl RawFuseMountRequest {
         }
     }
 
+    /// Attach the VFS instance and Tokio runtime used by raw FUSE callbacks.
     pub fn with_vfs(mut self, vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
         self.vfs = Some(vfs);
         self.runtime_handle = Some(runtime_handle);
@@ -2079,6 +2080,12 @@ fn as_bytes<T: FuseBytes>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast(), size_of::<T>()) }
 }
 
+/// Marker for plain-old-data FUSE wire structs that can be viewed as bytes.
+///
+/// # Safety
+///
+/// Implementors must be `repr(C)`, contain only initialized byte-safe fields,
+/// and have no padding whose contents can be observed as uninitialized memory.
 unsafe trait FuseBytes: Copy {}
 
 // SAFETY: these Linux FUSE wire structs are `repr(C)`, integer-only, and any
