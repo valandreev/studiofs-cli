@@ -100,6 +100,7 @@ impl MountBackend for RawFuseMountBackend {
     }
 
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
+        // SFS-591 raw mode owns mount/INIT only; real VFS callbacks stay on fuser fallback.
         let mut request =
             studiofs_fuse::RawFuseMountRequest::new(launch.mount_point, launch.volume_name);
         request.read_only = launch.read_only;

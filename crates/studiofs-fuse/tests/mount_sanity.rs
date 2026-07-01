@@ -993,10 +993,7 @@ fn raw_fuse_mount_and_unmount_smoke() {
         .expect("mount dir should exist before raw session")
         .dev();
 
-    let mut request = RawFuseMountRequest::new(
-        mount_path.to_string_lossy().into_owned(),
-        "studiofs-raw-smoke",
-    );
+    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke");
     request.read_only = true;
     let session_handle = std::thread::spawn(move || mount_raw_with_request(request));
 

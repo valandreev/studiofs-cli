@@ -217,7 +217,7 @@ fn mount_dev_fuse(
         volume_name
     })
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))?;
-    let fstype = CString::new("fuse.studiofs").expect("static string has no NUL");
+    let fstype = c"fuse.studiofs";
     let st = stat_path(mount_point)?;
     let data = CString::new(format!(
         "fd={fd},rootmode={:o},user_id={},group_id={},max_read={}",
