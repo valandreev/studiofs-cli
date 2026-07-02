@@ -231,7 +231,7 @@ impl StudioVfs {
             ),
             (
                 "fuse_kernel_writeback_cache",
-                "bool",
+                "count",
                 write_path
                     .fuse_async_write
                     .kernel_writeback_cache

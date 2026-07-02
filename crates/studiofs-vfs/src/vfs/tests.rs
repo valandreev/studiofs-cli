@@ -12747,6 +12747,10 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         snapshot.bridge.gauges["fuse_kernel_writeback_cache"].value,
         0
     );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_kernel_writeback_cache"].unit,
+        "count"
+    );
 }
 
 #[test]
