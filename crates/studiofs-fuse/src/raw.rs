@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +46,7 @@ const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
 const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
 const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
 const RAW_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RAW_INVALIDATION_QUEUE_CAPACITY: usize = 4096;
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -3031,7 +3032,7 @@ impl Drop for RawKernelInvalidatorRegistration {
 }
 
 struct RawFuseKernelInvalidator {
-    requests: Sender<RawInvalidationRequest>,
+    requests: SyncSender<RawInvalidationRequest>,
 }
 
 impl RawFuseKernelInvalidator {
@@ -3045,7 +3046,7 @@ impl RawFuseKernelInvalidator {
         // SAFETY: `fd` was freshly returned by `dup` above and is not owned
         // anywhere else.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let (requests, receiver) = mpsc::channel();
+        let (requests, receiver) = mpsc::sync_channel(RAW_INVALIDATION_QUEUE_CAPACITY);
         thread::Builder::new()
             .name("studiofs-raw-fuse-invalidator".into())
             .spawn(move || run_raw_invalidation_worker(fd, receiver))?;
@@ -3054,15 +3055,23 @@ impl RawFuseKernelInvalidator {
 
     fn enqueue_inval_inode(&self, ino: u64, off: i64, len: i64, description: &'static str) {
         let out = NotifyInvalInodeOut { ino, off, len };
-        if let Err(error) = self
+        match self
             .requests
-            .send(RawInvalidationRequest::InvalInode { out, description })
+            .try_send(RawInvalidationRequest::InvalInode { out, description })
         {
-            warn!(
-                ino,
-                error = ?error,
-                "raw FUSE inode invalidation worker is unavailable"
-            );
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    ino,
+                    description, "raw FUSE inode invalidation queue is full; dropping notification"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                warn!(
+                    ino,
+                    description, "raw FUSE inode invalidation worker is unavailable"
+                );
+            }
         }
     }
 }
@@ -3088,17 +3097,21 @@ fn run_raw_invalidation_worker(fd: OwnedFd, receiver: Receiver<RawInvalidationRe
     while let Ok(request) = receiver.recv() {
         match request {
             RawInvalidationRequest::InvalInode { out, description } => {
-                if let Err(error) = notify_inval_inode_fd(fd.as_raw_fd(), out)
-                    && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
-                {
-                    warn!(
-                        ino = out.ino,
-                        off = out.off,
-                        len = out.len,
-                        error = ?error,
-                        description,
-                        "raw FUSE inode invalidation failed"
-                    );
+                if let Err(error) = notify_inval_inode_fd(fd.as_raw_fd(), out) {
+                    match raw_invalidation_error_action(&error) {
+                        RawInvalidationErrorAction::StopWorker => break,
+                        RawInvalidationErrorAction::Ignore => {}
+                        RawInvalidationErrorAction::Warn => {
+                            warn!(
+                                ino = out.ino,
+                                off = out.off,
+                                len = out.len,
+                                error = ?error,
+                                description,
+                                "raw FUSE inode invalidation failed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3108,6 +3121,21 @@ fn run_raw_invalidation_worker(fd: OwnedFd, receiver: Receiver<RawInvalidationRe
 fn notify_inval_inode_fd(fd: RawFd, out: NotifyInvalInodeOut) -> io::Result<()> {
     let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
     write_fuse_packet_vectored_fd(fd, as_bytes(&header), as_bytes(&out))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawInvalidationErrorAction {
+    StopWorker,
+    Ignore,
+    Warn,
+}
+
+fn raw_invalidation_error_action(error: &io::Error) -> RawInvalidationErrorAction {
+    match error.raw_os_error() {
+        Some(libc::ENODEV) => RawInvalidationErrorAction::StopWorker,
+        Some(libc::ENOENT) => RawInvalidationErrorAction::Ignore,
+        _ => RawInvalidationErrorAction::Warn,
+    }
 }
 
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
@@ -3229,6 +3257,22 @@ mod tests {
         assert_eq!(attrs_only.off, -1);
         assert_eq!(full.len, -1);
         assert_eq!(attrs_only.len, 0);
+    }
+
+    #[test]
+    fn raw_invalidation_error_action_stops_only_on_dead_fuse_session() {
+        assert_eq!(
+            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENODEV)),
+            RawInvalidationErrorAction::StopWorker
+        );
+        assert_eq!(
+            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENOENT)),
+            RawInvalidationErrorAction::Ignore
+        );
+        assert_eq!(
+            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENOBUFS)),
+            RawInvalidationErrorAction::Warn
+        );
     }
 
     #[test]
