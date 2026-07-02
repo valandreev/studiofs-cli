@@ -64,7 +64,8 @@ impl MountBackend for RawFuseMountBackend {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         let mut request =
             studiofs_fuse::RawFuseMountRequest::new(launch.mount_point, launch.volume_name)
-                .with_vfs(launch.vfs, launch.runtime_handle);
+                .with_vfs(launch.vfs, launch.runtime_handle)
+                .with_signal_handling(studiofs_fuse::SignalHandling::InstallForCli);
         request.read_only = launch.read_only;
         studiofs_fuse::mount_raw_with_request(request)
     }

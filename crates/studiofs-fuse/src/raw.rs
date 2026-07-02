@@ -17,6 +17,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::{SignalHandling, signal_handlers_for_policy};
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
@@ -35,10 +36,13 @@ const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
 const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
 const JFS_LIKE_READ_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
 const JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
+const JFS_LIKE_MAX_BACKGROUND: u16 = 200;
+const JFS_LIKE_CONGESTION_THRESHOLD: u16 = 150;
 const JFS_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
 const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
 const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
 const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
+const RAW_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -121,6 +125,8 @@ pub struct RawFuseMountRequest {
     pub vfs: Option<Arc<StudioVfs>>,
     /// Tokio runtime used for async VFS read/write/barrier operations.
     pub runtime_handle: Option<Handle>,
+    /// Process signal handling policy for foreground CLI mounts.
+    pub signal_handling: SignalHandling,
 }
 
 impl RawFuseMountRequest {
@@ -133,6 +139,7 @@ impl RawFuseMountRequest {
             profile: LinuxRawFuseProfile::juicefs_like(),
             vfs: None,
             runtime_handle: None,
+            signal_handling: SignalHandling::default(),
         }
     }
 
@@ -142,6 +149,20 @@ impl RawFuseMountRequest {
         self.runtime_handle = Some(runtime_handle);
         self
     }
+
+    /// Set process signal ownership policy.
+    pub fn with_signal_handling(mut self, signal_handling: SignalHandling) -> Self {
+        self.signal_handling = signal_handling;
+        self
+    }
+}
+
+fn raw_shutdown_requested() -> bool {
+    crate::SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+fn raw_shutdown_never_requested() -> bool {
+    false
 }
 
 /// One Linux FUSE profile used for mount options and INIT negotiation.
@@ -186,8 +207,8 @@ impl LinuxRawFuseProfile {
             max_write,
             max_read: max_write,
             max_pages: (max_write / 4096) as u16,
-            max_background: 50,
-            congestion_threshold: 37,
+            max_background: JFS_LIKE_MAX_BACKGROUND,
+            congestion_threshold: JFS_LIKE_CONGESTION_THRESHOLD,
             max_readahead: 1024 * 1024,
             read_buffer_budget_bytes: JFS_LIKE_READ_BUFFER_BUDGET_BYTES,
             write_buffer_budget_bytes: JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES,
@@ -195,7 +216,7 @@ impl LinuxRawFuseProfile {
             upload_concurrency: JFS_LIKE_UPLOAD_CONCURRENCY,
             download_concurrency: JFS_LIKE_DOWNLOAD_CONCURRENCY,
             cache_size_policy: JFS_LIKE_CACHE_SIZE_POLICY,
-            kernel_writeback_cache: false,
+            kernel_writeback_cache: true,
         }
     }
 
@@ -664,6 +685,7 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
         profile,
         vfs,
         runtime_handle,
+        signal_handling,
     } = request;
 
     let mount_point = PathBuf::from(mount_point);
@@ -687,8 +709,11 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
     if let Some(vfs) = vfs.as_ref() {
         publish_raw_profile_diagnostics(vfs, &profile);
     }
+    crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    let _signal_handlers = signal_handlers_for_policy(signal_handling)?;
+    let shutdown = RawSessionShutdown::for_signal_handling(signal_handling);
     let _guard = RawMountGuard(&mount_point);
-    serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle)
+    serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle, shutdown)
 }
 
 fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: &LinuxRawFuseProfile) {
@@ -935,6 +960,7 @@ fn serve_minimal_session(
     profile: LinuxRawFuseProfile,
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
+    shutdown: RawSessionShutdown,
 ) -> io::Result<()> {
     let buffer_size = profile.max_write as usize + 4096;
     let buffer_count = usize::from(profile.max_background.max(1));
@@ -963,8 +989,9 @@ fn serve_minimal_session(
         open_dir_handles: Arc::new(DashMap::new()),
     };
     let session_result = loop {
-        let len = match read_fd(fd, &mut buf) {
-            Ok(len) => len,
+        let len = match read_next_fuse_request(fd, &mut buf, shutdown) {
+            Ok(Some(len)) => len,
+            Ok(None) => break Ok(()),
             Err(err)
                 if matches!(
                     err.raw_os_error(),
@@ -1046,6 +1073,16 @@ impl Drop for RecycledRequestBuffer {
     }
 }
 
+struct RawRequestJob {
+    fd: RawFd,
+    header: InHeader,
+    request_buf: Vec<u8>,
+    request_len: usize,
+    context: RawRequestContext,
+    accounting: RawDispatchAccounting,
+    buffer_recycler: SyncSender<Vec<u8>>,
+}
+
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
@@ -1056,6 +1093,31 @@ fn dispatch_minimal_request(
     buffer_recycler: SyncSender<Vec<u8>>,
 ) -> io::Result<()> {
     let accounting = accounting.clone();
+    let job = RawRequestJob {
+        fd,
+        header,
+        request_buf,
+        request_len,
+        context,
+        accounting,
+        buffer_recycler,
+    };
+    if header.opcode == OP_WRITE
+        && let Some(runtime_handle) = job.context.runtime_handle.clone()
+    {
+        dispatch_write_async(job, runtime_handle);
+        return Ok(());
+    }
+
+    let RawRequestJob {
+        fd,
+        header,
+        request_buf,
+        request_len,
+        context,
+        accounting,
+        buffer_recycler,
+    } = job;
     let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
     if let Some(runtime_handle) = context.runtime_handle.clone() {
         runtime_handle.spawn_blocking(move || {
@@ -1081,6 +1143,61 @@ fn dispatch_minimal_request(
         result?;
     }
     Ok(())
+}
+
+fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
+    let RawRequestJob {
+        fd,
+        header,
+        request_buf,
+        request_len,
+        context,
+        accounting,
+        buffer_recycler,
+    } = job;
+    let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
+    let guard = accounting.admit_blocking(RawDispatchClass::Stream);
+    runtime_handle.spawn(async move {
+        let _guard = guard;
+        let started = Instant::now();
+        let payload = request_buf.payload(request_len);
+        let reply_result = async {
+            let Some(vfs) = &context.vfs else {
+                return reply_error(fd, header.unique, libc::ENOSYS, Some(&accounting));
+            };
+            if payload.len() < size_of::<WriteIn>() {
+                return reply_error(fd, header.unique, libc::EINVAL, Some(&accounting));
+            }
+            let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
+            let data = &payload[size_of::<WriteIn>()..];
+            let write_len = (input.size as usize).min(data.len());
+            match vfs
+                .write_fh_with_deferred_materialize(
+                    input.fh,
+                    header.nodeid,
+                    input.offset,
+                    &data[..write_len],
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await
+            {
+                Ok(written) => reply_write(fd, header.unique, written, Some(&accounting)),
+                Err(err) => {
+                    reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(&accounting))
+                }
+            }
+        }
+        .await;
+        if let Err(err) = reply_result {
+            warn!(
+                opcode = header.opcode,
+                unique = header.unique,
+                error = %err,
+                "raw FUSE async write failed to reply"
+            );
+        }
+        accounting.record_latency(header.opcode, started.elapsed());
+    });
 }
 
 fn handle_minimal_request(
@@ -1512,8 +1629,8 @@ fn raw_flush(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<FlushIn>(&payload[..size_of::<FlushIn>()])?;
-    match rt.block_on(vfs.flush_fh(input.fh)) {
-        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+    match rt.block_on(vfs.flush_fuse_writeback_with_outcome(header.nodeid, input.fh)) {
+        Ok(_) => reply_empty(fd, header.unique, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -2631,6 +2748,74 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RawSessionShutdown {
+    poll_interval: Option<Duration>,
+    requested: fn() -> bool,
+}
+
+impl RawSessionShutdown {
+    fn for_signal_handling(signal_handling: SignalHandling) -> Self {
+        match signal_handling {
+            SignalHandling::Disabled => Self {
+                poll_interval: None,
+                requested: raw_shutdown_never_requested,
+            },
+            SignalHandling::InstallForCli => Self {
+                poll_interval: Some(RAW_SIGNAL_POLL_INTERVAL),
+                requested: raw_shutdown_requested,
+            },
+        }
+    }
+
+    fn is_requested(self) -> bool {
+        (self.requested)()
+    }
+}
+
+fn read_next_fuse_request(
+    fd: RawFd,
+    buf: &mut [u8],
+    shutdown: RawSessionShutdown,
+) -> io::Result<Option<usize>> {
+    let Some(poll_interval) = shutdown.poll_interval else {
+        return read_fd(fd, buf).map(Some);
+    };
+
+    loop {
+        if shutdown.is_requested() {
+            return Ok(None);
+        }
+        if !poll_fd_for_read(fd, poll_interval)? {
+            continue;
+        }
+        return read_fd(fd, buf).map(Some);
+    }
+}
+
+fn poll_fd_for_read(fd: RawFd, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pollfd` points to one valid poll descriptor.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(pollfd.revents != 0);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 fn write_fuse_packet_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     loop {
         // SAFETY: `bytes` is a valid readable byte slice for the provided length.
@@ -2957,11 +3142,13 @@ mod tests {
         assert_eq!(profile.label(), "raw-juicefs-like");
         assert_eq!(profile.read_buffer_budget_bytes, 400 * 1024 * 1024);
         assert_eq!(profile.write_buffer_budget_bytes, 400 * 1024 * 1024);
+        assert_eq!(profile.max_background, 200);
+        assert_eq!(profile.congestion_threshold, 150);
         assert_eq!(profile.prefetch_concurrency, 1);
         assert_eq!(profile.upload_concurrency, 20);
         assert_eq!(profile.download_concurrency, 200);
         assert_eq!(profile.cache_size_policy, "operator-cache-budget");
-        assert!(!profile.kernel_writeback_cache);
+        assert!(profile.kernel_writeback_cache);
     }
 
     #[test]
@@ -2988,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_advertises_writeback_cache_only_when_profile_requests_it() {
+    fn raw_init_advertises_writeback_cache_for_juicefs_like_profile_when_kernel_supports_it() {
         let input = InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
@@ -2996,18 +3183,18 @@ mod tests {
             flags: FUSE_ASYNC_READ | FUSE_WRITEBACK_CACHE,
         };
 
-        let disabled = LinuxRawFuseProfile::juicefs_like().negotiate_init(input);
-        let enabled = LinuxRawFuseProfile {
-            kernel_writeback_cache: true,
+        let enabled = LinuxRawFuseProfile::juicefs_like().negotiate_init(input);
+        let disabled = LinuxRawFuseProfile {
+            kernel_writeback_cache: false,
             ..LinuxRawFuseProfile::juicefs_like()
         }
         .negotiate_init(input);
 
-        assert_eq!(disabled.out.flags & FUSE_WRITEBACK_CACHE, 0);
         assert_eq!(
             enabled.out.flags & FUSE_WRITEBACK_CACHE,
             FUSE_WRITEBACK_CACHE
         );
+        assert_eq!(disabled.out.flags & FUSE_WRITEBACK_CACHE, 0);
     }
 
     #[test]
@@ -3078,6 +3265,19 @@ mod tests {
         drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
 
         assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn raw_read_loop_returns_cleanly_when_cli_shutdown_is_requested() {
+        let shutdown = RawSessionShutdown {
+            poll_interval: Some(Duration::ZERO),
+            requested: || true,
+        };
+        let mut buf = [];
+
+        let result = read_next_fuse_request(-1, &mut buf, shutdown).unwrap();
+
+        assert_eq!(result, None);
     }
 
     #[test]
