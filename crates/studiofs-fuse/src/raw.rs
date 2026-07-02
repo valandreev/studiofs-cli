@@ -176,7 +176,7 @@ pub struct LinuxRawFuseProfile {
 }
 
 impl LinuxRawFuseProfile {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         "raw-juicefs-like"
     }
 
