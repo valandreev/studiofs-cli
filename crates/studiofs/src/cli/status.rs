@@ -1047,6 +1047,7 @@ mod tests {
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
             barrier_wait_total_ms: 8.5,
+            ..Default::default()
         };
 
         let lines = format_fuse_async_write_diagnostics(&snapshot);
