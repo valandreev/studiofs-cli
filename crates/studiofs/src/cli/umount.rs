@@ -159,6 +159,14 @@ type UnixSignalFn = fn(u32, libc::c_int) -> std::io::Result<()>;
 type UnixDetachFn = fn(&str, std::time::Duration) -> Result<()>;
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct UnixUnmountTiming {
+    detach_timeout: std::time::Duration,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+}
+
+#[cfg(unix)]
 fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
     // SAFETY: `kill` is called with a concrete PID and signal supplied by the
     // caller. Signal 0 is the standard existence probe and has no side effects.
@@ -179,9 +187,11 @@ fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -
         is_mount_active,
         send_unix_signal,
         detach_unix_mount,
-        Duration::from_secs(10),
-        Duration::from_secs(15),
-        Duration::from_millis(200),
+        UnixUnmountTiming {
+            detach_timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(200),
+        },
     )
 }
 
@@ -244,13 +254,11 @@ fn unmount_unix_with_detach(
     is_mount_active: IsMountActiveFn,
     signal: UnixSignalFn,
     detach: UnixDetachFn,
-    detach_timeout: std::time::Duration,
-    timeout: std::time::Duration,
-    poll_interval: std::time::Duration,
+    timing: UnixUnmountTiming,
 ) -> Result<()> {
     use std::time::Instant;
 
-    detach(mount_point, detach_timeout)?;
+    detach(mount_point, timing.detach_timeout)?;
 
     // Send SIGTERM after detaching the kernel mount so the FUSE background
     // thread can return naturally instead of unmounting from inside shutdown.
@@ -264,9 +272,9 @@ fn unmount_unix_with_detach(
     // A successfully exited child can remain visible to kill(pid, 0) as a
     // zombie until its parent reaps it. The mountpoint state is the contract
     // this command owns, so stop once it is no longer active.
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timing.timeout;
     loop {
-        std::thread::sleep(poll_interval);
+        std::thread::sleep(timing.poll_interval);
         if !is_mount_active(mount_point)? {
             break;
         }
@@ -279,7 +287,7 @@ fn unmount_unix_with_detach(
         if Instant::now() > deadline {
             tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
             let _ = signal(pid, libc::SIGKILL);
-            std::thread::sleep(poll_interval);
+            std::thread::sleep(timing.poll_interval);
             if is_mount_active(mount_point)? {
                 anyhow::bail!(
                     "mount process {pid} did not release lifecycle lock after SIGKILL; leaving mount record intact"
@@ -308,9 +316,11 @@ fn unmount_unix_with(
         is_mount_active,
         signal,
         |_mount_point, _timeout| Ok(()),
-        std::time::Duration::ZERO,
-        timeout,
-        poll_interval,
+        UnixUnmountTiming {
+            detach_timeout: std::time::Duration::ZERO,
+            timeout,
+            poll_interval,
+        },
     )
 }
 
@@ -538,9 +548,11 @@ mod tests {
             test_mount_not_active,
             record_unix_signal,
             record_unix_detach,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
+            UnixUnmountTiming {
+                detach_timeout: Duration::ZERO,
+                timeout: Duration::ZERO,
+                poll_interval: Duration::ZERO,
+            },
         );
 
         assert!(
