@@ -51,6 +51,10 @@ The generated `report.json` contains `write_path_gate` with
 `dirty_backlog`, and `top_wait_counter_deltas`. `fio is not required for the
 StudioFS side`.
 
+For SFS-598 Linux rollout evidence, use `linux-juicefs-parity-gate.sh` against
+already-mounted local, new StudioFS, old StudioFS, and JuiceFS paths. It writes
+the side-by-side gate artifacts and rollout `decision.md` under `target/perf`.
+
 ## Scope
 
 For this pass we care about two focused scenarios:
