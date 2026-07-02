@@ -718,7 +718,7 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
             let session = vfs
                 .state
                 .file_session
