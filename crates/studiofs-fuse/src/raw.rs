@@ -3037,13 +3037,13 @@ struct RawFuseKernelInvalidator {
 
 impl RawFuseKernelInvalidator {
     fn new(fd: RawFd) -> io::Result<Self> {
-        // SAFETY: `dup` only copies the file descriptor number and returns an
-        // independent fd that the worker thread owns through `OwnedFd`.
-        let fd = unsafe { libc::dup(fd) };
+        // SAFETY: `F_DUPFD_CLOEXEC` duplicates the fd and marks it close-on-exec
+        // so the worker copy cannot leak into child processes.
+        let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `fd` was freshly returned by `dup` above and is not owned
+        // SAFETY: `fd` was freshly returned by `fcntl` above and is not owned
         // anywhere else.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let (requests, receiver) = mpsc::sync_channel(RAW_INVALIDATION_QUEUE_CAPACITY);
@@ -3132,7 +3132,9 @@ enum RawInvalidationErrorAction {
 
 fn raw_invalidation_error_action(error: &io::Error) -> RawInvalidationErrorAction {
     match error.raw_os_error() {
-        Some(libc::ENODEV) => RawInvalidationErrorAction::StopWorker,
+        Some(libc::ENODEV | libc::ENOTCONN | libc::EPIPE | libc::EBADF | libc::ESHUTDOWN) => {
+            RawInvalidationErrorAction::StopWorker
+        }
         Some(libc::ENOENT) => RawInvalidationErrorAction::Ignore,
         _ => RawInvalidationErrorAction::Warn,
     }
@@ -3261,10 +3263,18 @@ mod tests {
 
     #[test]
     fn raw_invalidation_error_action_stops_only_on_dead_fuse_session() {
-        assert_eq!(
-            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENODEV)),
-            RawInvalidationErrorAction::StopWorker
-        );
+        for errno in [
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::EPIPE,
+            libc::EBADF,
+            libc::ESHUTDOWN,
+        ] {
+            assert_eq!(
+                raw_invalidation_error_action(&io::Error::from_raw_os_error(errno)),
+                RawInvalidationErrorAction::StopWorker
+            );
+        }
         assert_eq!(
             raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENOENT)),
             RawInvalidationErrorAction::Ignore

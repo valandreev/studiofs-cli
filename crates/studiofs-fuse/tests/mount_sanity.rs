@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -253,16 +254,21 @@ fn with_raw_fuse_mount(suffix: &str, read_only: bool, test_fn: impl FnOnce(&Path
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    test_fn(&mount_path);
-
-    force_unmount_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
-    assert!(
-        wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5)),
-        "raw FUSE mount should clear after unmount"
-    );
-    if let Some(join_result) =
+    let test_result = catch_unwind(AssertUnwindSafe(|| test_fn(&mount_path)));
+    let unmount_result = force_unmount_fuse_mount_path(&mount_path);
+    let cleared = wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5));
+    let join_result = if test_result.is_ok() && unmount_result.is_ok() && cleared {
         join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
-    {
+    } else {
+        None
+    };
+
+    if let Err(panic) = test_result {
+        resume_unwind(panic);
+    }
+    unmount_result.expect("raw FUSE unmount should succeed");
+    assert!(cleared, "raw FUSE mount should clear after unmount");
+    if let Some(join_result) = join_result {
         join_result
             .expect("raw FUSE session thread should not panic")
             .expect("raw FUSE session should exit cleanly");
