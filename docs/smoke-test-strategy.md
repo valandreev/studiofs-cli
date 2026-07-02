@@ -47,9 +47,9 @@ reads for recently written data without an upstream data store.
 |--------|--------|
 | **Runner** | `ubuntu-latest` |
 | **Driver** | `/dev/fuse` (present on GitHub-hosted Ubuntu runners) |
-| **Mount mode** | `fuser` pure-Rust, no `libfuse3` link |
-| **Mount options** | `FSName`, `AutoUnmount` (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
-| **Feasibility** | **High** — `/dev/fuse` exists on hosted runners, pure-Rust fuser works without root for create+read+write |
+| **Mount mode** | StudioFS raw `/dev/fuse`, no `libfuse3` link |
+| **Mount options** | raw JuiceFS-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
+| **Feasibility** | **High** — `/dev/fuse` exists on hosted runners and raw FUSE can mount without libfuse |
 | **Gating** | Manual dispatch only |
 
 ### macOS — `macos-latest` (GitHub-hosted)
@@ -58,7 +58,7 @@ reads for recently written data without an upstream data store.
 |--------|--------|
 | **Runner** | `macos-latest` |
 | **Driver** | macFUSE (`brew install --cask macfuse`) |
-| **Mount mode** | `fuser` with `libfuse` feature linking to macFUSE |
+| **Mount mode** | StudioFS native macFUSE bridge |
 | **Feasibility** | **Low on hosted runners** — macFUSE installs a system extension that typically requires a reboot or Security & Privacy approval before the kernel extension loads. `brew install` alone does not guarantee the kext is active. |
 | **Gating** | `continue-on-error: true` on hosted runners; self-hosted runners are the reliable path |
 
@@ -144,13 +144,10 @@ If self-hosted runners are provisioned:
 
 ### FUSE smoke tests (`crates/studiofs-fuse/tests/mount_sanity.rs`)
 
-- **Session control**: uses `fuser::Session::new()` + `session.run()` in a
-  background thread. This avoids `mount_and_serve()` which calls
-  `std::process::exit(0)` after unmount.
-- **Unmount**: `SessionUnmounter` obtained before the session thread starts.
-  Called from the main thread after I/O completes.
-- **Cleanup**: `AutoUnmount` as a safety net — if the test panics, FUSE
-  auto-unmounts when the process exits.
+- **Session control**: uses the raw `/dev/fuse` session loop in a background
+  thread.
+- **Unmount**: the main thread calls OS FUSE tooling after the smoke read.
+- **Cleanup**: the raw mount guard detaches the mount during session teardown.
 
 ### WinFSP smoke tests (`crates/studiofs-winfsp/tests/mount_sanity.rs`)
 

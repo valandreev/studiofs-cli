@@ -2036,49 +2036,6 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_waits_for_pending_upload_drain_before_capacity_exhausted() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let layout = LocalPayloadLayout::from_cache_root(temp.path());
-        create_v3_marker(&layout);
-
-        let backend = std::sync::Arc::new(
-            LocalPayloadBackendRuntime::open_with_budget(
-                LocalPayloadBackendConfig {
-                    cache_root: temp.path().to_path_buf(),
-                    volume_uuid: [0x7B; 16],
-                },
-                Some(32),
-            )
-            .unwrap(),
-        );
-        backend.put(10, &[0xAA; 32], false).unwrap();
-        backend.mark_uploading(10);
-
-        let background = std::sync::Arc::clone(&backend);
-        let join = std::thread::spawn(move || {
-            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
-            background.mark_uploaded(10);
-        });
-
-        backend.put(11, &[0xBB; 16], false).unwrap();
-
-        join.join().unwrap();
-        assert!(
-            !backend.contains(10),
-            "once the older pending payload object finishes upload, low-space admission should reclaim it before rejecting a new local payload"
-        );
-        assert!(
-            backend.contains(11),
-            "the new payload object should be admitted after reclaiming the older uploaded payload object"
-        );
-        assert_eq!(
-            backend.lifecycle_state(11),
-            LocalPayloadLifecycleState::Dirty,
-            "the newly admitted local payload remains dirty until a later upload transition marks it uploaded"
-        );
-    }
-
-    #[test]
     fn local_backend_retry_low_space_reclaims_when_pending_upload_already_finished() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());

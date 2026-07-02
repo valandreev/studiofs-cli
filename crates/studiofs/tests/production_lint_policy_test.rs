@@ -44,7 +44,6 @@ fn production_rust_sources() -> Vec<PathBuf> {
     [
         "crates/studiofs-cache/src/cached_store.rs",
         "crates/studiofs-cache/src/payload_index.rs",
-        "crates/studiofs-fuse/src/fs/pending_write_tracker.rs",
         "crates/studiofs-fuse/src/lib.rs",
         "crates/studiofs-winfsp/src/lib.rs",
     ]

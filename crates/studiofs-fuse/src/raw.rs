@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -13,15 +13,18 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{SignalHandling, signal_handlers_for_policy};
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot};
+use studiofs_vfs::{
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot,
+};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -43,6 +46,7 @@ const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
 const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
 const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
 const RAW_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RAW_INVALIDATION_QUEUE_CAPACITY: usize = 4096;
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -78,6 +82,7 @@ const OP_IOCTL: u32 = 39;
 const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
+const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -712,7 +717,14 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
     crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_handlers = signal_handlers_for_policy(signal_handling)?;
     let shutdown = RawSessionShutdown::for_signal_handling(signal_handling);
-    let _guard = RawMountGuard(&mount_point);
+    let _mount_guard = RawMountGuard(&mount_point);
+    let _kernel_invalidator = match vfs.as_ref() {
+        Some(vfs) => Some(RawKernelInvalidatorRegistration::new(
+            Arc::clone(vfs),
+            dev_fuse.as_raw_fd(),
+        )?),
+        None => None,
+    };
     serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle, shutdown)
 }
 
@@ -2120,7 +2132,7 @@ fn raw_load_open_dir_state(
     vfs: &StudioVfs,
     ino: u64,
 ) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
-    // ponytail: full-dir snapshot matches the existing fuser backend; move to
+    // ponytail: full-dir snapshot is enough for current mounted workloads; move to
     // paginated VFS readdir if large-directory memory pressure shows up.
     Ok(RawOpenDirState {
         entries: Arc::new(vfs.readdir_with_attrs(ino)?),
@@ -2718,6 +2730,22 @@ struct OutHeader {
     unique: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NotifyInvalInodeOut {
+    ino: u64,
+    off: i64,
+    len: i64,
+}
+
+fn fuse_notify_header(notify_code: i32, payload_len: usize) -> OutHeader {
+    OutHeader {
+        len: (size_of::<OutHeader>() + payload_len) as u32,
+        error: notify_code,
+        unique: 0,
+    }
+}
+
 fn write_reply_header(
     fd: RawFd,
     unique: u64,
@@ -2985,6 +3013,133 @@ impl Drop for RawMountGuard<'_> {
     }
 }
 
+struct RawKernelInvalidatorRegistration {
+    vfs: Arc<StudioVfs>,
+}
+
+impl RawKernelInvalidatorRegistration {
+    fn new(vfs: Arc<StudioVfs>, fd: RawFd) -> io::Result<Self> {
+        let invalidator = Arc::new(RawFuseKernelInvalidator::new(fd)?);
+        vfs.set_kernel_invalidator(invalidator);
+        Ok(Self { vfs })
+    }
+}
+
+impl Drop for RawKernelInvalidatorRegistration {
+    fn drop(&mut self) {
+        self.vfs.clear_kernel_invalidator();
+    }
+}
+
+struct RawFuseKernelInvalidator {
+    requests: SyncSender<RawInvalidationRequest>,
+}
+
+impl RawFuseKernelInvalidator {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `F_DUPFD_CLOEXEC` duplicates the fd and marks it close-on-exec
+        // so the worker copy cannot leak into child processes.
+        let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was freshly returned by `fcntl` above and is not owned
+        // anywhere else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let (requests, receiver) = mpsc::sync_channel(RAW_INVALIDATION_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("studiofs-raw-fuse-invalidator".into())
+            .spawn(move || run_raw_invalidation_worker(fd, receiver))?;
+        Ok(Self { requests })
+    }
+
+    fn enqueue_inval_inode(&self, ino: u64, off: i64, len: i64, description: &'static str) {
+        let out = NotifyInvalInodeOut { ino, off, len };
+        match self
+            .requests
+            .try_send(RawInvalidationRequest::InvalInode { out, description })
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    ino,
+                    description, "raw FUSE inode invalidation queue is full; dropping notification"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                warn!(
+                    ino,
+                    description, "raw FUSE inode invalidation worker is unavailable"
+                );
+            }
+        }
+    }
+}
+
+impl KernelInvalidator for RawFuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.enqueue_inval_inode(ino, 0, -1, "data");
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.enqueue_inval_inode(ino, -1, 0, "attributes");
+    }
+}
+
+enum RawInvalidationRequest {
+    InvalInode {
+        out: NotifyInvalInodeOut,
+        description: &'static str,
+    },
+}
+
+fn run_raw_invalidation_worker(fd: OwnedFd, receiver: Receiver<RawInvalidationRequest>) {
+    while let Ok(request) = receiver.recv() {
+        match request {
+            RawInvalidationRequest::InvalInode { out, description } => {
+                if let Err(error) = notify_inval_inode_fd(fd.as_raw_fd(), out) {
+                    match raw_invalidation_error_action(&error) {
+                        RawInvalidationErrorAction::StopWorker => break,
+                        RawInvalidationErrorAction::Ignore => {}
+                        RawInvalidationErrorAction::Warn => {
+                            warn!(
+                                ino = out.ino,
+                                off = out.off,
+                                len = out.len,
+                                error = ?error,
+                                description,
+                                "raw FUSE inode invalidation failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn notify_inval_inode_fd(fd: RawFd, out: NotifyInvalInodeOut) -> io::Result<()> {
+    let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
+    write_fuse_packet_vectored_fd(fd, as_bytes(&header), as_bytes(&out))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawInvalidationErrorAction {
+    StopWorker,
+    Ignore,
+    Warn,
+}
+
+fn raw_invalidation_error_action(error: &io::Error) -> RawInvalidationErrorAction {
+    match error.raw_os_error() {
+        Some(libc::ENODEV | libc::ENOTCONN | libc::EPIPE | libc::EBADF | libc::ESHUTDOWN) => {
+            RawInvalidationErrorAction::StopWorker
+        }
+        Some(libc::ENOENT) => RawInvalidationErrorAction::Ignore,
+        _ => RawInvalidationErrorAction::Warn,
+    }
+}
+
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
     let mount_point_c = cstring_path(mount_point)?;
     // SAFETY: `mount_point` is a valid NUL-terminated C string.
@@ -3052,6 +3207,7 @@ unsafe impl FuseBytes for InitOut {}
 unsafe impl FuseBytes for RawEntryOut {}
 unsafe impl FuseBytes for RawOpenOut {}
 unsafe impl FuseBytes for RawDirent {}
+unsafe impl FuseBytes for NotifyInvalInodeOut {}
 unsafe impl FuseBytes for OpenIn {}
 unsafe impl FuseBytes for MknodIn {}
 unsafe impl FuseBytes for MkdirIn {}
@@ -3072,6 +3228,62 @@ unsafe impl FuseBytes for OutHeader {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_notify_inval_inode_header_uses_kernel_notify_opcode() {
+        let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
+
+        assert_eq!(
+            header.len as usize,
+            size_of::<OutHeader>() + size_of::<NotifyInvalInodeOut>()
+        );
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(header.unique, 0);
+    }
+
+    #[test]
+    fn raw_notify_inval_inode_payload_supports_full_and_attr_only_invalidations() {
+        let full = NotifyInvalInodeOut {
+            ino: 42,
+            off: 0,
+            len: -1,
+        };
+        let attrs_only = NotifyInvalInodeOut {
+            ino: 42,
+            off: -1,
+            len: 0,
+        };
+
+        assert_eq!(full.ino, attrs_only.ino);
+        assert_eq!(full.off, 0);
+        assert_eq!(attrs_only.off, -1);
+        assert_eq!(full.len, -1);
+        assert_eq!(attrs_only.len, 0);
+    }
+
+    #[test]
+    fn raw_invalidation_error_action_stops_only_on_dead_fuse_session() {
+        for errno in [
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::EPIPE,
+            libc::EBADF,
+            libc::ESHUTDOWN,
+        ] {
+            assert_eq!(
+                raw_invalidation_error_action(&io::Error::from_raw_os_error(errno)),
+                RawInvalidationErrorAction::StopWorker
+            );
+        }
+        assert_eq!(
+            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENOENT)),
+            RawInvalidationErrorAction::Ignore
+        );
+        assert_eq!(
+            raw_invalidation_error_action(&io::Error::from_raw_os_error(libc::ENOBUFS)),
+            RawInvalidationErrorAction::Warn
+        );
+    }
 
     #[test]
     fn raw_dispatch_classifies_stream_heavy_operations() {

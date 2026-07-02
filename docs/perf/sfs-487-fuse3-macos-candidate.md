@@ -41,8 +41,8 @@ proof has run yet.
 - `crates/studiofs-macfuse/src/adapter.rs` owns StudioVfs callback translation,
   including `read`, `write`, `open`, `setattr`, `getxattr`, `setxattr`,
   `listxattr`, and `removexattr`.
-- `crates/studiofs-fuse/Cargo.toml` keeps the existing `fuser` dependency
-  Linux-only; `fuse3` is not a production dependency.
+- `crates/studiofs-fuse/Cargo.toml` stays Linux raw `/dev/fuse` only; `fuse3`
+  is not a production dependency.
 
 ## Proof Scope
 
