@@ -170,8 +170,8 @@ Current signature includes additional policy controls:
 ## FUSE Bridge (`studiofs-fuse`)
 
 Linux has two selectable FUSE paths:
-- `STUDIOFS_MOUNT_BACKEND=fuser` or unset: legacy `fuser` backend, kept as the fallback/control path.
-- `STUDIOFS_MOUNT_BACKEND=raw`: experimental JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse` directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse high-level callbacks.
+- `STUDIOFS_MOUNT_BACKEND=raw` or unset: JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse` directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse high-level callbacks.
+- `STUDIOFS_MOUNT_BACKEND=fuser`: legacy `fuser` backend, kept as an explicit fallback/control path.
 
 ### Requirements
 
@@ -200,8 +200,8 @@ Linux has two selectable FUSE paths:
 
 The raw Linux backend uses one JuiceFS-like runtime profile by default:
 `max_write=1 MiB`, `max_read=1 MiB`, `max_readahead=1 MiB`,
-`max_background=50`, `congestion_threshold=37`, read buffer budget `150 MiB`,
-write buffer budget `150 MiB`, prefetch concurrency `1`, upload concurrency
+`max_background=50`, `congestion_threshold=37`, read buffer budget `400 MiB`,
+write buffer budget `400 MiB`, prefetch concurrency `1`, upload concurrency
 `20`, download concurrency `200`, and cache sizing delegated to the existing
 operator cache budget. Kernel writeback cache remains disabled in this profile.
 The resolved raw profile is logged at mount startup and published through the

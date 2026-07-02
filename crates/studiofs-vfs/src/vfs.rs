@@ -8210,7 +8210,7 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        self.open_file_resolved(ino, flags, trunc, None)
+        self.open_file_resolved(ino, flags, trunc, None, true)
     }
 
     /// Open a file when the caller already has a fresh inode attr from create.
@@ -8220,7 +8220,22 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
     ) -> VfsResult<u64> {
-        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()))
+        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), true)
+    }
+
+    /// Open a file that was just created by this mount operation.
+    ///
+    /// Create already checked mutation authority for the parent and returned a
+    /// fresh inode that cannot yet have a foreign lock, so this mirrors the
+    /// JuiceFS create fast path by allocating the handle directly from the
+    /// returned attr.
+    pub fn open_created_file_with_known_attr(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), false)
     }
 
     fn open_file_resolved(
@@ -8229,14 +8244,17 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
         known_attr: Option<InodeAttr>,
+        check_authority: bool,
     ) -> VfsResult<u64> {
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {
             AccessLevel::ReadOnly
         };
-        self.enforce_access(ino, required_access)?;
-        if Self::write_access_requested(flags, trunc) {
+        if check_authority {
+            self.enforce_access(ino, required_access)?;
+        }
+        if check_authority && Self::write_access_requested(flags, trunc) {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
         if let Some(ignored_attr) = self.ignored_entry_attr(ino) {

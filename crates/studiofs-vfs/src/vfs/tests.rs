@@ -3074,6 +3074,30 @@ fn open_file_with_known_attr_uses_supplied_create_attr() {
 }
 
 #[test]
+fn open_created_file_with_known_attr_does_not_recheck_mutation_authority() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "open-created-known-attr");
+
+    let attr = vfs
+        .create(ROOT_INO, b"created-open-known-attr.txt", 0, 0, 0o644)
+        .expect("create test file");
+    vfs.set_metadata_authority_status_for_test(Some(MetadataAuthorityStatus::read_only()));
+
+    assert!(
+        vfs.open_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .is_err(),
+        "regular write-open still enforces current mutation authority"
+    );
+
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open freshly created file with create attr");
+    let open_file = vfs.get_open_file(fh).expect("open handle");
+
+    assert_eq!(open_file.open_attr.expect("open attr").ino, attr.ino);
+}
+
+#[test]
 fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-local");

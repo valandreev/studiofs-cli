@@ -50,7 +50,7 @@ pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn Moun
             );
             Box::new(FuseMountBackend)
         }
-        None => Box::new(FuseMountBackend),
+        None => Box::new(RawFuseMountBackend),
     }
 }
 
@@ -234,8 +234,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_fuser_selector_remains_fallback_backend() {
-        for selector in [None, Some(""), Some("fuser"), Some("unknown")] {
+    fn linux_default_selector_routes_to_raw_fuse_backend() {
+        for selector in [None, Some("")] {
+            let backend = super::mount_backend_for_selector(selector);
+
+            assert_eq!(backend.name(), "raw-fuse");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fuser_selector_remains_explicit_fallback_backend() {
+        for selector in [Some("fuser"), Some("unknown")] {
             let backend = super::mount_backend_for_selector(selector);
 
             assert_eq!(backend.name(), "FUSE");

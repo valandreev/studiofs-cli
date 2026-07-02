@@ -1172,7 +1172,8 @@ impl StudioVfsAdapter {
         let open = self.open_with_result(
             attr.ino,
             flag_policy,
-            self.vfs.open_file_with_known_attr(&attr, open_flags, trunc),
+            self.vfs
+                .open_created_file_with_known_attr(&attr, open_flags, trunc),
         )?;
         Ok((attr, open))
     }

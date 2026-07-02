@@ -32,7 +32,7 @@ const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
 const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
-const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 300 * 1024 * 1024;
+const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
 const JFS_LIKE_READ_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
 const JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
 const JFS_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
@@ -2955,8 +2955,8 @@ mod tests {
         let profile = LinuxRawFuseProfile::juicefs_like();
 
         assert_eq!(profile.label(), "raw-juicefs-like");
-        assert_eq!(profile.read_buffer_budget_bytes, 150 * 1024 * 1024);
-        assert_eq!(profile.write_buffer_budget_bytes, 150 * 1024 * 1024);
+        assert_eq!(profile.read_buffer_budget_bytes, 400 * 1024 * 1024);
+        assert_eq!(profile.write_buffer_budget_bytes, 400 * 1024 * 1024);
         assert_eq!(profile.prefetch_concurrency, 1);
         assert_eq!(profile.upload_concurrency, 20);
         assert_eq!(profile.download_concurrency, 200);
