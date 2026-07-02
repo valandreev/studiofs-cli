@@ -7003,6 +7003,12 @@ impl StudioVfs {
             current.fuse_max_readahead_bytes = snapshot.fuse_max_readahead_bytes;
             current.fuse_max_background = snapshot.fuse_max_background;
             current.fuse_congestion_threshold = snapshot.fuse_congestion_threshold;
+            current.read_buffer_budget_bytes = snapshot.read_buffer_budget_bytes;
+            current.write_buffer_budget_bytes = snapshot.write_buffer_budget_bytes;
+            current.prefetch_concurrency = snapshot.prefetch_concurrency;
+            current.upload_concurrency = snapshot.upload_concurrency;
+            current.download_concurrency = snapshot.download_concurrency;
+            current.kernel_writeback_cache = snapshot.kernel_writeback_cache;
             current.max_pending_bytes = snapshot.max_pending_bytes;
             current.max_pending_writes = snapshot.max_pending_writes;
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;

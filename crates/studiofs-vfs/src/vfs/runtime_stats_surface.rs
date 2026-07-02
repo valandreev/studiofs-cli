@@ -194,6 +194,40 @@ impl StudioVfs {
             "bytes",
             u64::from(write_path.fuse_async_write.fuse_max_readahead_bytes),
         );
+        for (name, unit, value) in [
+            (
+                "fuse_read_buffer_budget_bytes",
+                "bytes",
+                write_path.fuse_async_write.read_buffer_budget_bytes,
+            ),
+            (
+                "fuse_write_buffer_budget_bytes",
+                "bytes",
+                write_path.fuse_async_write.write_buffer_budget_bytes,
+            ),
+            (
+                "fuse_prefetch_concurrency",
+                "count",
+                u64::from(write_path.fuse_async_write.prefetch_concurrency),
+            ),
+            (
+                "fuse_upload_concurrency",
+                "count",
+                u64::from(write_path.fuse_async_write.upload_concurrency),
+            ),
+            (
+                "fuse_download_concurrency",
+                "count",
+                u64::from(write_path.fuse_async_write.download_concurrency),
+            ),
+            (
+                "fuse_kernel_writeback_cache",
+                "bool",
+                u64::from(write_path.fuse_async_write.kernel_writeback_cache),
+            ),
+        ] {
+            insert_gauge(&mut snapshot.bridge, name, unit, value);
+        }
         if let Some(max_background) = write_path.fuse_async_write.fuse_max_background {
             insert_gauge(
                 &mut snapshot.bridge,

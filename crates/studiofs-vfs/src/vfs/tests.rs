@@ -12649,6 +12649,12 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
+        read_buffer_budget_bytes: 150 * 1024 * 1024,
+        write_buffer_budget_bytes: 150 * 1024 * 1024,
+        prefetch_concurrency: 1,
+        upload_concurrency: 20,
+        download_concurrency: 200,
+        kernel_writeback_cache: false,
         max_pending_bytes: Some(128 * 1024 * 1024),
         max_pending_writes: Some(1024),
         per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -12686,6 +12692,12 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+    assert_eq!(
+        snapshot.fuse_async_write.read_buffer_budget_bytes,
+        150 * 1024 * 1024
+    );
+    assert_eq!(snapshot.fuse_async_write.upload_concurrency, 20);
+    assert!(!snapshot.fuse_async_write.kernel_writeback_cache);
 }
 
 #[test]
@@ -12699,6 +12711,11 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
+        read_buffer_budget_bytes: 150 * 1024 * 1024,
+        write_buffer_budget_bytes: 150 * 1024 * 1024,
+        prefetch_concurrency: 1,
+        upload_concurrency: 20,
+        download_concurrency: 200,
         ..Default::default()
     });
 
@@ -12717,6 +12734,11 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
         128 * 1024
     );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_read_buffer_budget_bytes"].value,
+        150 * 1024 * 1024
+    );
+    assert_eq!(snapshot.bridge.gauges["fuse_upload_concurrency"].value, 20);
 }
 
 #[test]

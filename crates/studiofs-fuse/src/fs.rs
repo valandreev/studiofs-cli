@@ -203,6 +203,7 @@ struct FuseDiagnosticsPolicy {
     max_write_bytes: u32,
     max_readahead_bytes: u32,
     background_queue_policy: FuseBackgroundQueuePolicy,
+    kernel_writeback_cache: bool,
 }
 
 impl FuseBackgroundQueuePolicy {
@@ -1296,6 +1297,7 @@ impl StudioFuseFs {
             max_write_bytes: self.fuse_max_write_bytes,
             max_readahead_bytes: self.fuse_max_readahead_bytes,
             background_queue_policy: self.fuse_background_queue_policy,
+            kernel_writeback_cache: self.linux_writeback_cache_enabled,
         }
     }
 
@@ -1548,6 +1550,7 @@ impl StudioFuseFs {
             fuse_max_readahead_bytes: diagnostics.max_readahead_bytes,
             fuse_max_background: diagnostics.background_queue_policy.max_background,
             fuse_congestion_threshold: diagnostics.background_queue_policy.congestion_threshold,
+            kernel_writeback_cache: diagnostics.kernel_writeback_cache,
             max_pending_bytes: limits.max_pending_bytes,
             max_pending_writes: limits.max_pending_writes,
             per_handle_pending_bytes: limits.per_handle_pending_bytes,
@@ -1561,6 +1564,7 @@ impl StudioFuseFs {
             admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
             barrier_waits: tracker.barrier_waits,
             barrier_wait_total_ms: tracker.barrier_wait_ns as f64 / 1_000_000.0,
+            ..Default::default()
         });
     }
 }

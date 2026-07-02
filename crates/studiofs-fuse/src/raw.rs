@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs};
+use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -32,6 +32,13 @@ const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
 const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
+const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 300 * 1024 * 1024;
+const JFS_LIKE_READ_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
+const JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
+const JFS_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
+const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
+const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
+const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -86,6 +93,7 @@ pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 pub const FUSE_READDIRPLUS: u32 = 1 << 13;
 #[cfg(test)]
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
+pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
@@ -145,6 +153,13 @@ pub struct LinuxRawFuseProfile {
     pub max_background: u16,
     pub congestion_threshold: u16,
     pub max_readahead: u32,
+    pub read_buffer_budget_bytes: u64,
+    pub write_buffer_budget_bytes: u64,
+    pub prefetch_concurrency: u16,
+    pub upload_concurrency: u16,
+    pub download_concurrency: u16,
+    pub cache_size_policy: &'static str,
+    pub kernel_writeback_cache: bool,
 }
 
 impl LinuxRawFuseProfile {
@@ -157,6 +172,13 @@ impl LinuxRawFuseProfile {
             max_background: 50,
             congestion_threshold: 37,
             max_readahead: 1024 * 1024,
+            read_buffer_budget_bytes: JFS_LIKE_READ_BUFFER_BUDGET_BYTES,
+            write_buffer_budget_bytes: JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES,
+            prefetch_concurrency: JFS_LIKE_PREFETCH_CONCURRENCY,
+            upload_concurrency: JFS_LIKE_UPLOAD_CONCURRENCY,
+            download_concurrency: JFS_LIKE_DOWNLOAD_CONCURRENCY,
+            cache_size_policy: JFS_LIKE_CACHE_SIZE_POLICY,
+            kernel_writeback_cache: false,
         }
     }
 
@@ -172,6 +194,9 @@ impl LinuxRawFuseProfile {
         }
         if flags & FUSE_EXPLICIT_INVAL_DATA == 0 && input.flags & FUSE_AUTO_INVAL_DATA != 0 {
             flags |= FUSE_AUTO_INVAL_DATA;
+        }
+        if self.kernel_writeback_cache && input.flags & FUSE_WRITEBACK_CACHE != 0 {
+            flags |= FUSE_WRITEBACK_CACHE;
         }
 
         NegotiatedInit {
@@ -626,9 +651,45 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
 
     let mount_point = PathBuf::from(mount_point);
     let dev_fuse = mount_dev_fuse(&mount_point, &volume_name, read_only, profile)?;
-    info!(mount_point = %mount_point.display(), "mounted StudioFS raw FUSE session");
+    info!(
+        mount_point = %mount_point.display(),
+        max_write = profile.max_write,
+        max_read = profile.max_read,
+        max_readahead = profile.max_readahead,
+        max_background = profile.max_background,
+        congestion_threshold = profile.congestion_threshold,
+        read_buffer_budget_bytes = profile.read_buffer_budget_bytes,
+        write_buffer_budget_bytes = profile.write_buffer_budget_bytes,
+        prefetch_concurrency = profile.prefetch_concurrency,
+        upload_concurrency = profile.upload_concurrency,
+        download_concurrency = profile.download_concurrency,
+        cache_size_policy = profile.cache_size_policy,
+        kernel_writeback_cache = profile.kernel_writeback_cache,
+        "mounted StudioFS raw FUSE session"
+    );
+    if let Some(vfs) = vfs.as_ref() {
+        publish_raw_profile_diagnostics(vfs, profile);
+    }
     let _guard = RawMountGuard(&mount_point);
     serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle)
+}
+
+fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: LinuxRawFuseProfile) {
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        enabled: true,
+        linux_fuse_profile: "raw-juicefs-like".into(),
+        fuse_max_write_bytes: profile.max_write,
+        fuse_max_readahead_bytes: profile.max_readahead,
+        fuse_max_background: Some(profile.max_background),
+        fuse_congestion_threshold: Some(profile.congestion_threshold),
+        read_buffer_budget_bytes: profile.read_buffer_budget_bytes,
+        write_buffer_budget_bytes: profile.write_buffer_budget_bytes,
+        prefetch_concurrency: profile.prefetch_concurrency,
+        upload_concurrency: profile.upload_concurrency,
+        download_concurrency: profile.download_concurrency,
+        kernel_writeback_cache: profile.kernel_writeback_cache,
+        ..Default::default()
+    });
 }
 
 fn mount_dev_fuse(
@@ -2873,6 +2934,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_juicefs_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
+        let profile = LinuxRawFuseProfile::juicefs_like();
+
+        assert_eq!(profile.read_buffer_budget_bytes, 150 * 1024 * 1024);
+        assert_eq!(profile.write_buffer_budget_bytes, 150 * 1024 * 1024);
+        assert_eq!(profile.prefetch_concurrency, 1);
+        assert_eq!(profile.upload_concurrency, 20);
+        assert_eq!(profile.download_concurrency, 200);
+        assert_eq!(profile.cache_size_policy, "operator-cache-budget");
+        assert!(!profile.kernel_writeback_cache);
+    }
+
+    #[test]
     fn raw_fusermount_options_match_direct_mount_identity() {
         let options = fusermount_options("studio", true, LinuxRawFuseProfile::juicefs_like());
 
@@ -2893,6 +2967,29 @@ mod tests {
 
         assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
         assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
+    }
+
+    #[test]
+    fn raw_init_advertises_writeback_cache_only_when_profile_requests_it() {
+        let input = InitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_MINOR_VERSION,
+            max_readahead: 1024 * 1024,
+            flags: FUSE_ASYNC_READ | FUSE_WRITEBACK_CACHE,
+        };
+
+        let disabled = LinuxRawFuseProfile::juicefs_like().negotiate_init(input);
+        let enabled = LinuxRawFuseProfile {
+            kernel_writeback_cache: true,
+            ..LinuxRawFuseProfile::juicefs_like()
+        }
+        .negotiate_init(input);
+
+        assert_eq!(disabled.out.flags & FUSE_WRITEBACK_CACHE, 0);
+        assert_eq!(
+            enabled.out.flags & FUSE_WRITEBACK_CACHE,
+            FUSE_WRITEBACK_CACHE
+        );
     }
 
     #[test]
