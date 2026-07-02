@@ -685,13 +685,13 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
         "mounted StudioFS raw FUSE session"
     );
     if let Some(vfs) = vfs.as_ref() {
-        publish_raw_profile_diagnostics(vfs, profile);
+        publish_raw_profile_diagnostics(vfs, &profile);
     }
     let _guard = RawMountGuard(&mount_point);
     serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle)
 }
 
-fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: LinuxRawFuseProfile) {
+fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: &LinuxRawFuseProfile) {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         enabled: true,
         linux_fuse_profile: profile.label().into(),

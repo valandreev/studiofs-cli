@@ -173,49 +173,46 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     } else {
         "disabled"
     };
-    let mut lines = vec![
-        format!(
-            "  FUSE async writes:        {mode} (profile: {})",
-            snapshot.linux_fuse_profile
-        ),
-        format!(
-            "  FUSE async pending:       {} writes, {} current, {} peak",
-            snapshot.pending_writes,
-            format_bytes(snapshot.pending_bytes as u64),
-            format_bytes(snapshot.peak_pending_bytes as u64)
-        ),
-        format!(
-            "  FUSE async caps:          max {}, max writes {}, per-handle {}",
-            format_optional_bytes(snapshot.max_pending_bytes),
-            format_optional_count(snapshot.max_pending_writes),
-            format_optional_bytes(snapshot.per_handle_pending_bytes)
-        ),
-        format!(
-            "  FUSE async completions:   {} ok, {} errors, {} task failures",
-            snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
-        ),
-        format!(
-            "  FUSE async waits:         admission {}/{}, barriers {}/{}",
-            snapshot.admission_waits,
-            format_finite_ms(snapshot.admission_wait_total_ms),
-            snapshot.barrier_waits,
-            format_finite_ms(snapshot.barrier_wait_total_ms)
-        ),
-    ];
-    if has_raw_fuse_profile_knobs(snapshot) {
-        lines.insert(
-            1,
-            format!(
-                "  FUSE profile knobs:       read {}, write {}, prefetch {}, upload {}, download {}, writeback {}",
-                format_optional_profile_bytes(snapshot.read_buffer_budget_bytes),
-                format_optional_profile_bytes(snapshot.write_buffer_budget_bytes),
-                format_optional_profile_count(snapshot.prefetch_concurrency),
-                format_optional_profile_count(snapshot.upload_concurrency),
-                format_optional_profile_count(snapshot.download_concurrency),
-                format_optional_switch(snapshot.kernel_writeback_cache)
-            ),
-        );
+    let has_profile_knobs = has_raw_fuse_profile_knobs(snapshot);
+    let mut lines = Vec::with_capacity(if has_profile_knobs { 6 } else { 5 });
+    lines.push(format!(
+        "  FUSE async writes:        {mode} (profile: {})",
+        snapshot.linux_fuse_profile
+    ));
+    if has_profile_knobs {
+        lines.push(format!(
+            "  FUSE profile knobs:       read {}, write {}, prefetch {}, upload {}, download {}, writeback {}",
+            format_optional_profile_bytes(snapshot.read_buffer_budget_bytes),
+            format_optional_profile_bytes(snapshot.write_buffer_budget_bytes),
+            format_optional_profile_count(snapshot.prefetch_concurrency),
+            format_optional_profile_count(snapshot.upload_concurrency),
+            format_optional_profile_count(snapshot.download_concurrency),
+            format_optional_switch(snapshot.kernel_writeback_cache)
+        ));
     }
+    lines.push(format!(
+        "  FUSE async pending:       {} writes, {} current, {} peak",
+        snapshot.pending_writes,
+        format_bytes(snapshot.pending_bytes as u64),
+        format_bytes(snapshot.peak_pending_bytes as u64)
+    ));
+    lines.push(format!(
+        "  FUSE async caps:          max {}, max writes {}, per-handle {}",
+        format_optional_bytes(snapshot.max_pending_bytes),
+        format_optional_count(snapshot.max_pending_writes),
+        format_optional_bytes(snapshot.per_handle_pending_bytes)
+    ));
+    lines.push(format!(
+        "  FUSE async completions:   {} ok, {} errors, {} task failures",
+        snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
+    ));
+    lines.push(format!(
+        "  FUSE async waits:         admission {}/{}, barriers {}/{}",
+        snapshot.admission_waits,
+        format_finite_ms(snapshot.admission_wait_total_ms),
+        snapshot.barrier_waits,
+        format_finite_ms(snapshot.barrier_wait_total_ms)
+    ));
     lines
 }
 
