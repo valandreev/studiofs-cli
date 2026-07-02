@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 
 #[cfg(unix)]
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 
 type ReadPidFn = fn(&str) -> Result<(u32, String, String)>;
 type RemovePidFn = fn(&str) -> Result<()>;
@@ -197,6 +197,7 @@ fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -
 
 #[cfg(target_os = "linux")]
 fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<()> {
+    use anyhow::Context;
     use std::ffi::CString;
     use std::process::{Command, Stdio};
     use std::time::Instant;
