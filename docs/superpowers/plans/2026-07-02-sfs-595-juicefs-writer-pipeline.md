@@ -125,14 +125,30 @@ Change only the loop condition or linger scheduling in `crates/studiofs-vfs/src/
 
 ```rust
 let completed_blocks_remain = vfs.should_continue_deferred_materialization(ino);
-if made_progress || completed_blocks_remain {
+if made_progress {
     no_progress_retries = 0;
+} else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+    && vfs.should_linger_deferred_materialization(ino)
+{
+    no_progress_retries += 1;
+    tokio::time::sleep(Duration::from_millis(
+        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+    ))
+    .await;
+    continue;
+}
+if !made_progress || !completed_blocks_remain {
+    break;
+}
+if completed_blocks_remain {
     tokio::task::yield_now().await;
     continue;
 }
 ```
 
-Use this only if the current loop exits while completed blocks remain.
+Use this only if the current loop exits while completed blocks remain. Do not
+reset retry accounting just because completed blocks remain; no-progress
+iterations must still back off or exit.
 
 - [x] **Step 2: Verify GREEN**
 
