@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 
 #[cfg(unix)]
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 
 type ReadPidFn = fn(&str) -> Result<(u32, String, String)>;
 type RemovePidFn = fn(&str) -> Result<()>;
@@ -155,6 +155,16 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
 
 #[cfg(unix)]
 type UnixSignalFn = fn(u32, libc::c_int) -> std::io::Result<()>;
+#[cfg(unix)]
+type UnixDetachFn = fn(&str, std::time::Duration) -> Result<()>;
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct UnixUnmountTiming {
+    detach_timeout: std::time::Duration,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+}
 
 #[cfg(unix)]
 fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
@@ -171,28 +181,92 @@ fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
 fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -> Result<()> {
     use std::time::Duration;
 
-    unmount_unix_with(
+    unmount_unix_with_detach(
         mount_point,
         pid,
         is_mount_active,
         send_unix_signal,
-        Duration::from_secs(15),
-        Duration::from_millis(200),
+        detach_unix_mount,
+        UnixUnmountTiming {
+            detach_timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(200),
+        },
     )
 }
 
+#[cfg(target_os = "linux")]
+fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<()> {
+    use std::ffi::CString;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let c_mount_point = CString::new(mount_point)
+        .map_err(|_| anyhow!("mount point contains an embedded NUL: {mount_point:?}"))?;
+    // SAFETY: `c_mount_point` is a valid NUL-terminated path string.
+    if unsafe { libc::umount2(c_mount_point.as_ptr(), libc::MNT_DETACH) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
+        return Ok(());
+    }
+
+    for bin in ["fusermount3", "fusermount"] {
+        let mut child = match Command::new(bin)
+            .arg("-u")
+            .arg(mount_point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("start {bin} -u")),
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {bin} -u"))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(anyhow!("{bin} -u exited with status {status}"))
+                };
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                anyhow::bail!("{bin} -u did not finish within {}s", timeout.as_secs());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    Err(err).context("detach FUSE mount with umount2; fusermount not found")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn detach_unix_mount(_mount_point: &str, _timeout: std::time::Duration) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
-fn unmount_unix_with(
+fn unmount_unix_with_detach(
     mount_point: &str,
     pid: u32,
     is_mount_active: IsMountActiveFn,
     signal: UnixSignalFn,
-    timeout: std::time::Duration,
-    poll_interval: std::time::Duration,
+    detach: UnixDetachFn,
+    timing: UnixUnmountTiming,
 ) -> Result<()> {
     use std::time::Instant;
 
-    // Send SIGTERM (the FUSE signal-watcher thread will handle it)
+    detach(mount_point, timing.detach_timeout)?;
+
+    // Send SIGTERM after detaching the kernel mount so the FUSE background
+    // thread can return naturally instead of unmounting from inside shutdown.
     if let Err(err) = signal(pid, libc::SIGTERM) {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(()); // already gone
@@ -203,9 +277,9 @@ fn unmount_unix_with(
     // A successfully exited child can remain visible to kill(pid, 0) as a
     // zombie until its parent reaps it. The mountpoint state is the contract
     // this command owns, so stop once it is no longer active.
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timing.timeout;
     loop {
-        std::thread::sleep(poll_interval);
+        std::thread::sleep(timing.poll_interval);
         if !is_mount_active(mount_point)? {
             break;
         }
@@ -218,11 +292,41 @@ fn unmount_unix_with(
         if Instant::now() > deadline {
             tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
             let _ = signal(pid, libc::SIGKILL);
+            std::thread::sleep(timing.poll_interval);
+            if is_mount_active(mount_point)? {
+                anyhow::bail!(
+                    "mount process {pid} did not release lifecycle lock after SIGKILL; leaving mount record intact"
+                );
+            }
             break;
         }
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn unmount_unix_with(
+    mount_point: &str,
+    pid: u32,
+    is_mount_active: IsMountActiveFn,
+    signal: UnixSignalFn,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<()> {
+    unmount_unix_with_detach(
+        mount_point,
+        pid,
+        is_mount_active,
+        signal,
+        |_mount_point, _timeout| Ok(()),
+        UnixUnmountTiming {
+            detach_timeout: std::time::Duration::ZERO,
+            timeout,
+            poll_interval,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -240,6 +344,10 @@ mod tests {
     static TEST_PID_STATE: OnceLock<Mutex<TestPidState>> = OnceLock::new();
     #[cfg(unix)]
     static TEST_UNIX_SIGNALS: OnceLock<Mutex<Vec<libc::c_int>>> = OnceLock::new();
+    #[cfg(unix)]
+    static TEST_UNIX_EVENTS: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+    #[cfg(unix)]
+    static TEST_UNIX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn pid_state() -> &'static Mutex<TestPidState> {
         TEST_PID_STATE.get_or_init(|| Mutex::new(TestPidState::default()))
@@ -269,13 +377,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn test_mount_active(_mount_point: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[cfg(unix)]
     fn unix_signal_log() -> &'static Mutex<Vec<libc::c_int>> {
         TEST_UNIX_SIGNALS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     #[cfg(unix)]
+    fn unix_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_UNIX_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
     fn record_unix_signal(_pid: u32, signal: libc::c_int) -> std::io::Result<()> {
         unix_signal_log().lock().unwrap().push(signal);
+        unix_event_log().lock().unwrap().push("signal");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn unix_event_log() -> &'static Mutex<Vec<&'static str>> {
+        TEST_UNIX_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    #[cfg(unix)]
+    fn record_unix_detach(_mount_point: &str, _timeout: std::time::Duration) -> Result<()> {
+        unix_event_log().lock().unwrap().push("detach");
         Ok(())
     }
 
@@ -354,6 +487,7 @@ mod tests {
     fn unix_unmount_returns_once_mountpoint_is_inactive() {
         use std::time::Duration;
 
+        let _guard = unix_test_lock();
         unix_signal_log().lock().unwrap().clear();
 
         let result = unmount_unix_with(
@@ -373,6 +507,67 @@ mod tests {
             *unix_signal_log().lock().unwrap(),
             vec![libc::SIGTERM],
             "inactive mountpoint should not wait for kill(pid, 0) or send SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_unmount_reports_timeout_when_lifecycle_lock_stays_active() {
+        use std::time::Duration;
+
+        let _guard = unix_test_lock();
+        unix_signal_log().lock().unwrap().clear();
+
+        let result = unmount_unix_with(
+            "/mnt/studiofs-test",
+            12345,
+            test_mount_active,
+            record_unix_signal,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        assert!(
+            result.is_err(),
+            "active lifecycle lock after SIGKILL should be reported as failed unmount"
+        );
+        assert_eq!(
+            *unix_signal_log().lock().unwrap(),
+            vec![libc::SIGTERM, 0, libc::SIGKILL],
+            "timeout path should probe once, send SIGKILL, then return an error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_unmount_detaches_mount_before_signaling_mount_process() {
+        use std::time::Duration;
+
+        let _guard = unix_test_lock();
+        unix_event_log().lock().unwrap().clear();
+        unix_signal_log().lock().unwrap().clear();
+
+        let result = unmount_unix_with_detach(
+            "/mnt/studiofs-test",
+            12345,
+            test_mount_not_active,
+            record_unix_signal,
+            record_unix_detach,
+            UnixUnmountTiming {
+                detach_timeout: Duration::ZERO,
+                timeout: Duration::ZERO,
+                poll_interval: Duration::ZERO,
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "external detach before SIGTERM should complete graceful unmount: {result:?}"
+        );
+        assert_eq!(
+            *unix_event_log().lock().unwrap(),
+            vec!["detach", "signal"],
+            "FUSE mount must be detached before the mount process receives SIGTERM"
         );
     }
 }

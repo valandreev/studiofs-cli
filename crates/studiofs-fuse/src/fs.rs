@@ -40,7 +40,7 @@ const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 128 * 1024;
 const HIGH_THROUGHPUT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
-const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = DEFAULT_FUSE_MAX_READAHEAD_BYTES;
+const HIGH_THROUGHPUT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
 const MEDIA_FUSE_IO_BYTES: u32 = 4 * 1024 * 1024;
 const FUSE_ATTR_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const STUDIOFS_LINUX_FUSE_PROFILE_ENV: &str = "STUDIOFS_LINUX_FUSE_PROFILE";
@@ -1128,7 +1128,7 @@ impl StudioFuseRuntimeOptions {
                 .ok()
                 .as_deref()
                 .map_or(
-                    matches!(profile, LinuxFuseProfile::Media),
+                    !matches!(profile, LinuxFuseProfile::Conservative),
                     should_enable_async_fuse_read_from_env_value,
                 ),
             linux_async_dio_enabled: std::env::var(STUDIOFS_FUSE_ASYNC_DIO_ENV)
@@ -1184,7 +1184,7 @@ impl StudioFuseRuntimeOptions {
             fuse_congestion_threshold: background_queue_policy.congestion_threshold,
             async_write_enabled: true,
             async_read_enabled: async_read.map_or(
-                matches!(profile, LinuxFuseProfile::Media),
+                !matches!(profile, LinuxFuseProfile::Conservative),
                 should_enable_async_fuse_read_from_env_value,
             ),
             linux_async_dio_enabled: async_dio.map_or(
@@ -1818,7 +1818,10 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => {
                 // Open a handle for the newly created file
                 let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
-                match self.vfs.open_file(attr.ino, open_flags, false) {
+                match self
+                    .vfs
+                    .open_created_file_with_known_attr(&attr, open_flags, false)
+                {
                     Ok(fh) => {
                         reply.created(
                             &TTL,
@@ -3641,6 +3644,41 @@ mod tests {
         assert!(options.async_read_enabled);
         assert!(options.linux_async_dio_enabled);
         assert!(!options.linux_writeback_cache_enabled);
+    }
+
+    #[test]
+    fn high_throughput_linux_fuse_profile_matches_juicefs_readahead_geometry() {
+        let options = StudioFuseRuntimeOptions::from_env_values(
+            Some("high-throughput"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(options.linux_fuse_profile, LinuxFuseProfile::HighThroughput);
+        assert_eq!(options.fuse_max_write_bytes, 16 * 1024 * 1024);
+        assert_eq!(options.fuse_max_readahead_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn high_throughput_linux_fuse_profile_enables_async_read_by_default() {
+        let options = StudioFuseRuntimeOptions::from_env_values(
+            Some("high-throughput"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(options.async_read_enabled);
+        assert!(!options.linux_async_dio_enabled);
     }
 
     #[test]

@@ -8210,13 +8210,51 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
+        self.open_file_resolved(ino, flags, trunc, None, true)
+    }
+
+    /// Open a file when the caller already has a fresh inode attr from create.
+    pub fn open_file_with_known_attr(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), true)
+    }
+
+    /// Open a file that was just created by this mount operation.
+    ///
+    /// Create already checked mutation authority for the parent and returned a
+    /// fresh inode that cannot yet have a foreign lock, so this mirrors the
+    /// JuiceFS create fast path by allocating the handle directly from the
+    /// returned attr.
+    pub fn open_created_file_with_known_attr(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), false)
+    }
+
+    fn open_file_resolved(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        trunc: bool,
+        known_attr: Option<InodeAttr>,
+        check_authority: bool,
+    ) -> VfsResult<u64> {
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {
             AccessLevel::ReadOnly
         };
-        self.enforce_access(ino, required_access)?;
-        if Self::write_access_requested(flags, trunc) {
+        if check_authority {
+            self.enforce_access(ino, required_access)?;
+        }
+        if check_authority && Self::write_access_requested(flags, trunc) {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
         if let Some(ignored_attr) = self.ignored_entry_attr(ino) {
@@ -8242,7 +8280,11 @@ impl StudioVfs {
         }
 
         // Verify the inode exists
-        let read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
+        let open_attr = match known_attr {
+            Some(attr) => attr,
+            None => self.getattr(ino)?,
+        };
+        let mut read_context = ReadRequestContext::from_attr(self, ino, open_attr);
         if read_context.placeholder_visible(self, ino) {
             self.debug_pending_inode_state(ino, "open_blocked_remote_content_pending");
             return Err(VfsError::RemoteContentPending);
@@ -8250,7 +8292,11 @@ impl StudioVfs {
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
-            self.setattr(ino, SetattrArgs::size_only(0))?;
+            read_context = ReadRequestContext::from_attr(
+                self,
+                ino,
+                self.setattr(ino, SetattrArgs::size_only(0))?,
+            );
         }
 
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);

@@ -25,7 +25,7 @@ use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, Upload
 use studiofs_vfs::vfs::ReleaseFhOutcome;
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
-    VfsMacFuseOpenCacheDecision,
+    VfsMacFuseOpenCacheDecision, VfsResult,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -1167,7 +1167,14 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
-        let open = self.open(attr.ino, flags)?;
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+        let flag_policy = macfuse_open_cache_policy(flags, trunc);
+        let open = self.open_with_result(
+            attr.ino,
+            flag_policy,
+            self.vfs
+                .open_created_file_with_known_attr(&attr, open_flags, trunc),
+        )?;
         Ok((attr, open))
     }
 
@@ -1208,8 +1215,16 @@ impl StudioVfsAdapter {
             return Ok(OpenReply::new(fh).with_direct_io(true));
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
-        self.vfs
-            .open_file(ino, open_flags, trunc)
+        self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
+    }
+
+    fn open_with_result(
+        &self,
+        ino: u64,
+        flag_policy: MacFuseOpenCachePolicy,
+        open_result: VfsResult<u64>,
+    ) -> Result<OpenReply, i32> {
+        open_result
             .map(|fh| {
                 let keep_cache = if flag_policy.keep_cache {
                     self.keep_cache_for_current_generation(ino)

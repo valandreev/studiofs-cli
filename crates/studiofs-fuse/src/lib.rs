@@ -403,7 +403,7 @@ mod tests {
     use super::raw::{
         FUSE_ASYNC_READ, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_EXPLICIT_INVAL_DATA,
         FUSE_FILE_OPS, FUSE_MAX_PAGES, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS,
-        FUSE_READDIRPLUS_AUTO, InitIn, LinuxRawFuseProfile,
+        FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE, InitIn, LinuxRawFuseProfile,
     };
     use super::{
         FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options,
@@ -607,7 +607,8 @@ mod tests {
                 | FUSE_READDIRPLUS
                 | FUSE_FILE_OPS
                 | FUSE_AUTO_INVAL_DATA
-                | FUSE_EXPLICIT_INVAL_DATA,
+                | FUSE_EXPLICIT_INVAL_DATA
+                | FUSE_WRITEBACK_CACHE,
         };
 
         let negotiated = profile.negotiate_init(input);
@@ -628,6 +629,7 @@ mod tests {
                 | FUSE_PARALLEL_DIROPS
                 | FUSE_FILE_OPS
                 | FUSE_EXPLICIT_INVAL_DATA
+                | FUSE_WRITEBACK_CACHE
         );
         assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
         assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);

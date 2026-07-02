@@ -53,6 +53,34 @@ with `-StudioFsPath` on Windows or `--studiofs` on macOS/Linux.
 On Windows, `-StudioFsPath target\release\studiofs` also resolves the matching
 `.exe` file when it exists.
 
+## SFS-598 Linux JuiceFS Parity Gate
+
+SFS-598 gates the new Linux backend before default rollout. The gate compares
+already-mounted paths for local disk/cache, the new StudioFS Linux backend, the
+old Linux backend, and JuiceFS on the same host:
+
+```bash
+bash ./tools/perf/linux-juicefs-parity-gate.sh \
+  --local-target /mnt/local-cache \
+  --studiofs-new-target /mnt/studiofs-new \
+  --studiofs-old-target /mnt/studiofs-old \
+  --juicefs-target /mnt/juicefs
+```
+
+The script uses `target/bench/studiofs-bench` for portable throughput workloads
+and small POSIX smoke workloads for metadata scan, source repository copy,
+truncate/rewrite, fsync-heavy behavior, and optional DCC compatibility smoke.
+It writes a non-overwriting artifact directory under `target/perf` with
+`environment.json`, per-target/per-workload `command.txt`, `stdout.txt`,
+`stderr.txt`, `metrics.json`, optional `/usr/bin/time` output, `summary.md`,
+and `decision.md`.
+
+Use `--dry-run` for CI or review checks that only need to validate the command
+matrix and artifact layout. Fill in `decision.md` after reviewing side-by-side
+throughput, wall time, CPU, warning/error counts, unsupported ioctl counts,
+StudioFS runtime counters, cache behavior, queue depth, and publication/upload
+lag evidence.
+
 ## Public Benchmark Example
 
 For user-facing validation notes, prefer the fixed public command:
