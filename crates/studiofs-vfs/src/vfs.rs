@@ -8210,6 +8210,26 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
+        self.open_file_resolved(ino, flags, trunc, None)
+    }
+
+    /// Open a file when the caller already has a fresh inode attr from create.
+    pub fn open_file_with_known_attr(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()))
+    }
+
+    fn open_file_resolved(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        trunc: bool,
+        known_attr: Option<InodeAttr>,
+    ) -> VfsResult<u64> {
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {
@@ -8242,7 +8262,11 @@ impl StudioVfs {
         }
 
         // Verify the inode exists
-        let read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
+        let open_attr = match known_attr {
+            Some(attr) => attr,
+            None => self.getattr(ino)?,
+        };
+        let mut read_context = ReadRequestContext::from_attr(self, ino, open_attr);
         if read_context.placeholder_visible(self, ino) {
             self.debug_pending_inode_state(ino, "open_blocked_remote_content_pending");
             return Err(VfsError::RemoteContentPending);
@@ -8250,7 +8274,11 @@ impl StudioVfs {
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
-            self.setattr(ino, SetattrArgs::size_only(0))?;
+            read_context = ReadRequestContext::from_attr(
+                self,
+                ino,
+                self.setattr(ino, SetattrArgs::size_only(0))?,
+            );
         }
 
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);

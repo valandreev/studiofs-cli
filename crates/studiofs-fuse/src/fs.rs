@@ -1818,7 +1818,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => {
                 // Open a handle for the newly created file
                 let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
-                match self.vfs.open_file(attr.ino, open_flags, false) {
+                match self.vfs.open_file_with_known_attr(&attr, open_flags, false) {
                     Ok(fh) => {
                         reply.created(
                             &TTL,

@@ -3049,6 +3049,31 @@ fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
 }
 
 #[test]
+fn open_file_with_known_attr_uses_supplied_create_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "open-known-attr");
+
+    let attr = vfs
+        .create(ROOT_INO, b"known-open-attr.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let mut stale_attr = attr.clone();
+    stale_attr.size = 99;
+    vfs.state.namespace.attr_read_cache.lock().put(
+        attr.ino,
+        stale_attr,
+        ATTR_CACHE_TTL,
+        std::time::Instant::now(),
+    );
+
+    let fh = vfs
+        .open_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open file with create attr");
+    let open_file = vfs.get_open_file(fh).expect("open handle");
+
+    assert_eq!(open_file.open_attr.expect("open attr").size, attr.size);
+}
+
+#[test]
 fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-local");
