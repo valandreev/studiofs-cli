@@ -1459,8 +1459,8 @@ fn raw_fsync(
     let input = read_struct::<FsyncIn>(&payload[..size_of::<FsyncIn>()])?;
     let is_datasync = (input.fsync_flags & FUSE_FSYNC_FDATASYNC) != 0;
     let result = if input.fh != 0 {
-        // Handle-backed fsync follows flush_fh's local barrier contract; it is
-        // already sufficient for fdatasync and never waits for remote publish.
+        // flush_fh persists local dirty file data and attrs, so it is strong
+        // enough for both fsync and fdatasync without waiting for publication.
         rt.block_on(vfs.flush_fh(input.fh))
     } else {
         rt.block_on(vfs.fsync(header.nodeid, is_datasync))
