@@ -70,10 +70,6 @@ thiserror = "2"
 anyhow = "1"
 
 # Platform - FUSE (Linux/macOS)
-# Linux can use fuser's pure-Rust /dev/fuse transport, which avoids linking
-# libfuse3 and the "library too old" warning emitted by the C library on some
-# newer distros. macOS still requires libfuse via macFUSE/osxfuse.
-fuser = "0.17"
 libc = "0.2"
 
 # Platform - WinFSP (Windows)

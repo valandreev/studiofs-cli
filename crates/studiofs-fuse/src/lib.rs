@@ -1,7 +1,4 @@
-//! StudioFS FUSE backends for Linux.
-//!
-//! Implements `fuser::Filesystem` to expose `studiofs_vfs::StudioVfs` via FUSE.
-//! Also exposes an experimental raw `/dev/fuse` mount/session path.
+//! StudioFS raw `/dev/fuse` backend for Linux.
 //!
 //! # Mount options
 //!
@@ -10,79 +7,11 @@
 
 #![cfg(target_os = "linux")]
 
-mod fs;
 mod raw;
 
-use std::sync::{
-    Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A `fuser::Notifier`-backed cache invalidator used by `studiofs_vfs` to
-/// proactively clear kernel FUSE dentry/attribute caches.
-pub use fs::FuseKernelInvalidator;
-/// The `fuser::Filesystem` implementation that bridges StudioFS VFS operations
-/// into FUSE callbacks.
-pub use fs::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseFs, StudioFuseRuntimeOptions};
 pub use raw::{RawFuseMountRequest, mount_raw_with_request};
-use thiserror::Error;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-enum MountOptionError {
-    #[error("volume name cannot be empty")]
-    EmptyVolumeName,
-    #[error("volume name cannot contain NUL")]
-    VolumeNameContainsNul,
-}
-
-fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
-    if volume_name.trim().is_empty() {
-        return Err(MountOptionError::EmptyVolumeName);
-    }
-    if volume_name.contains('\0') {
-        return Err(MountOptionError::VolumeNameContainsNul);
-    }
-    Ok(())
-}
-
-fn build_mount_options(
-    volume_name: &str,
-    _foreground: bool,
-    read_only: bool,
-) -> Result<fuser::Config, MountOptionError> {
-    build_mount_options_with_allow_other(
-        volume_name,
-        read_only,
-        std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1"),
-    )
-}
-
-fn build_mount_options_with_allow_other(
-    volume_name: &str,
-    read_only: bool,
-    allow_other_env: bool,
-) -> Result<fuser::Config, MountOptionError> {
-    validate_volume_name(volume_name)?;
-    let mut config = fuser::Config::default();
-    #[cfg(target_os = "linux")]
-    {
-        config.n_threads = Some(4);
-        config.clone_fd = true;
-    }
-    config
-        .mount_options
-        .push(fuser::MountOption::FSName(volume_name.into()));
-    // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
-    // attached until the external watchdog sends SIGKILL. Let Mount::drop use
-    // the explicit lazy fusermount/umount path instead.
-    if allow_other_env {
-        config.acl = fuser::SessionACL::All;
-    }
-    if read_only {
-        config.mount_options.push(fuser::MountOption::RO);
-    }
-    Ok(config)
-}
 
 // ─── Signal Handling ─────────────────────────────────────────────────────────
 
@@ -106,70 +35,6 @@ pub enum SignalHandling {
     /// This mode mutates process-global Unix signal dispositions and only one
     /// active mount in the current process may use it at a time.
     InstallForCli,
-}
-
-/// Mount request for the FUSE bridge.
-pub struct FuseMountRequest {
-    /// Shared VFS instance exposed through FUSE callbacks.
-    pub vfs: Arc<studiofs_vfs::StudioVfs>,
-    /// Tokio runtime handle used to execute VFS async operations from FUSE callbacks.
-    pub runtime_handle: tokio::runtime::Handle,
-    /// Filesystem mount point path.
-    pub mount_point: String,
-    /// Volume name passed to the FUSE mount options.
-    pub volume_name: String,
-    /// Whether to request foreground mode where supported by the platform.
-    pub foreground: bool,
-    /// Whether the mounted filesystem should reject mutating operations.
-    pub read_only: bool,
-    /// Process signal ownership policy for this mount.
-    pub signal_handling: SignalHandling,
-    /// Optional caller-owned signal used to request a graceful in-process unmount.
-    pub unmount_signal: Option<FuseUnmountSignal>,
-}
-
-impl FuseMountRequest {
-    /// Create a FUSE mount request with embeddable defaults.
-    pub fn new(
-        vfs: Arc<studiofs_vfs::StudioVfs>,
-        runtime_handle: tokio::runtime::Handle,
-        mount_point: impl Into<String>,
-        volume_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            vfs,
-            runtime_handle,
-            mount_point: mount_point.into(),
-            volume_name: volume_name.into(),
-            foreground: false,
-            read_only: false,
-            signal_handling: SignalHandling::default(),
-            unmount_signal: None,
-        }
-    }
-}
-
-/// Caller-owned handle for requesting graceful FUSE unmount without process signals.
-#[derive(Clone, Debug, Default)]
-pub struct FuseUnmountSignal {
-    requested: Arc<AtomicBool>,
-}
-
-impl FuseUnmountSignal {
-    /// Create a new unmount signal.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Request the mount session to unmount.
-    pub fn request_unmount(&self) {
-        self.requested.store(true, Ordering::Release);
-    }
-
-    /// Return whether unmount has been requested.
-    pub fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
-    }
 }
 
 struct CliSignalHandlers {
@@ -228,7 +93,7 @@ impl Drop for CliSignalHandlers {
     }
 }
 
-fn signal_handlers_for_policy(
+pub(crate) fn signal_handlers_for_policy(
     signal_handling: SignalHandling,
 ) -> std::io::Result<Option<CliSignalHandlers>> {
     match signal_handling {
@@ -237,177 +102,15 @@ fn signal_handlers_for_policy(
     }
 }
 
-struct SignalWatcher {
-    stop: Arc<AtomicBool>,
-    handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
-    thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-}
-
-impl SignalWatcher {
-    fn restore_handlers(&self) {
-        let _ = lock_signal_handlers(&self.handlers).take();
-    }
-
-    fn join(mut self) -> std::io::Result<()> {
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
-        };
-        thread
-            .join()
-            .map_err(|_| std::io::Error::other("signal watcher thread panicked"))?
-    }
-}
-
-impl Drop for SignalWatcher {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        self.restore_handlers();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Spawn a background thread that watches for SIGINT/SIGTERM and triggers
-/// an in-process unmount so the FUSE background session returns cleanly and
-/// the VFS shutdown/drain logic can execute.
-fn spawn_signal_watcher(
-    mount_point: String,
-    background: fuser::BackgroundSession,
-    signal_handling: SignalHandling,
-    unmount_signal: Option<FuseUnmountSignal>,
-) -> std::io::Result<SignalWatcher> {
-    let mp = mount_point.to_string();
-    let stop = Arc::new(AtomicBool::new(false));
-    let handlers = Arc::new(Mutex::new(signal_handlers_for_policy(signal_handling)?));
-    let watcher_stop = Arc::clone(&stop);
-    let watcher_handlers = Arc::clone(&handlers);
-    let thread = std::thread::Builder::new()
-        .name("signal-watcher".into())
-        .spawn(move || {
-            // Poll the atomic flag until a signal arrives.
-            while !watcher_stop.load(Ordering::Acquire) {
-                if background.guard.is_finished() {
-                    let _ = lock_signal_handlers(&watcher_handlers).take();
-                    return background.join();
-                }
-                if SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-                    || unmount_signal
-                        .as_ref()
-                        .is_some_and(FuseUnmountSignal::is_requested)
-                {
-                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-                    tracing::info!("received shutdown request, unmounting {mp} …");
-                    let _ = lock_signal_handlers(&watcher_handlers).take();
-                    return background.umount_and_join();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Ok(())
-        })?;
-    Ok(SignalWatcher {
-        stop,
-        handlers,
-        thread: Some(thread),
-    })
-}
-
-fn lock_signal_handlers(
-    handlers: &Mutex<Option<CliSignalHandlers>>,
-) -> MutexGuard<'_, Option<CliSignalHandlers>> {
-    // INVARIANT: this lock owns process signal-handler installation state.
-    // If a holder panicked mid-restore, continuing could leave handlers leaked
-    // or restored in the wrong order, so the FUSE backend fails closed.
-    #[expect(
-        clippy::expect_used,
-        reason = "fail closed on poisoned signal handler state"
-    )]
-    handlers.lock().expect("signal handler lock")
-}
-
-// ─── Public API ──────────────────────────────────────────────────────────────
-
-/// Mount and serve the FUSE filesystem (blocks until unmounted).
-pub fn mount_and_serve(
-    vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
-    runtime_handle: tokio::runtime::Handle,
-    mount_point: &str,
-    volume_name: &str,
-    foreground: bool,
-    read_only: bool,
-) -> std::io::Result<()> {
-    let mut request = FuseMountRequest::new(vfs, runtime_handle, mount_point, volume_name);
-    request.foreground = foreground;
-    request.read_only = read_only;
-    mount_with_request(request)
-}
-
-/// Mount and serve a FUSE filesystem with explicit library/CLI ownership policy.
-pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
-    let FuseMountRequest {
-        vfs,
-        runtime_handle,
-        mount_point,
-        volume_name,
-        foreground,
-        read_only,
-        signal_handling,
-        unmount_signal,
-    } = request;
-    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let fs = StudioFuseFs::new(vfs.clone(), runtime_handle);
-    // Do NOT add DefaultPermissions here: it would make the kernel enforce
-    // POSIX mode/uid/gid from getattr() in-kernel.  Old volumes have the
-    // root inode stored with uid=0/gid=0 (historic default), so the kernel
-    // would see the mounting user as "other" (r-x only) and block writes.
-    // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let config = build_mount_options(&volume_name, foreground, read_only)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    let shutdown_hint = match signal_handling {
-        SignalHandling::Disabled => "unmount through the host lifecycle",
-        SignalHandling::InstallForCli => "press Ctrl+C to unmount",
-    };
-    tracing::info!("mounting StudioFS at {mount_point}, {shutdown_hint}");
-
-    // Use Session::new + spawn() instead of fuser::mount2 so we can obtain a
-    // Notifier. The notifier allows VFS metadata refresh paths to
-    // proactively clear the kernel FUSE dentry/attribute cache, making remote
-    // creates/deletes visible immediately without waiting for TTL expiry.
-    let session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &config)?;
-    let notifier = session.notifier();
-    let background = session.spawn()?;
-    let signal_watcher = spawn_signal_watcher(
-        mount_point.clone(),
-        background,
-        signal_handling,
-        unmount_signal,
-    )?;
-
-    // Register the kernel cache invalidator with the VFS.
-    let invalidator = std::sync::Arc::new(FuseKernelInvalidator::new(notifier));
-    vfs.set_kernel_invalidator(invalidator);
-
-    signal_watcher.join()?;
-
-    // BackgroundSession::join returns when the filesystem is unmounted.
-    vfs.clear_kernel_invalidator();
-    tracing::info!("unmounted, finalizing FUSE session cleanup …");
-    tracing::info!("shutdown complete");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
+    use super::SignalHandling;
     use super::raw::{
         FUSE_ASYNC_READ, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_EXPLICIT_INVAL_DATA,
         FUSE_FILE_OPS, FUSE_MAX_PAGES, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS,
         FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE, InitIn, LinuxRawFuseProfile,
-    };
-    use super::{
-        FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options,
-        build_mount_options_with_allow_other, validate_volume_name,
     };
 
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -442,57 +145,8 @@ mod tests {
         }
     }
 
-    fn mount_config_allows_other(config: &fuser::Config) -> bool {
-        config.acl == fuser::SessionACL::All
-    }
-
     #[test]
-    fn volume_name_validation_rejects_empty_or_nul() {
-        assert_eq!(
-            validate_volume_name("   ").unwrap_err(),
-            MountOptionError::EmptyVolumeName
-        );
-        assert_eq!(
-            validate_volume_name("has\0nul").unwrap_err(),
-            MountOptionError::VolumeNameContainsNul
-        );
-        validate_volume_name("studiofs").expect("valid volume name");
-    }
-
-    #[test]
-    fn build_mount_options_sets_core_fuse_flags() {
-        let config =
-            build_mount_options_with_allow_other("studiofs", false, false).expect("options");
-        assert!(
-            config
-                .mount_options
-                .iter()
-                .any(|opt| matches!(opt, fuser::MountOption::FSName(name) if name == "studiofs"))
-        );
-        assert!(
-            !config
-                .mount_options
-                .iter()
-                .any(|opt| matches!(opt, fuser::MountOption::AutoUnmount))
-        );
-        assert!(!mount_config_allows_other(&config));
-        assert!(!config.mount_options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_mount_options_use_parallel_fuser_dispatch() {
-        let config =
-            build_mount_options_with_allow_other("studiofs", false, false).expect("options");
-
-        assert_eq!(config.n_threads, Some(4));
-        assert!(config.clone_fd);
-    }
-
-    #[test]
-    fn fuse_mount_request_defaults_to_library_owned_signal_policy() {
+    fn raw_mount_request_defaults_to_library_owned_signal_policy() {
         assert_eq!(SignalHandling::default(), SignalHandling::Disabled);
     }
 
@@ -525,17 +179,6 @@ mod tests {
                 previous_handler as *const () as libc::sighandler_t
             );
         }
-    }
-
-    #[test]
-    fn fuse_unmount_signal_records_programmatic_unmount_request() {
-        let signal = FuseUnmountSignal::new();
-        assert!(!signal.is_requested());
-
-        let cloned = signal.clone();
-        cloned.request_unmount();
-
-        assert!(signal.is_requested());
     }
 
     #[test]
@@ -574,23 +217,6 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 
         drop(first);
-    }
-
-    #[test]
-    fn build_mount_options_adds_allow_other_when_opted_in() {
-        let config =
-            build_mount_options_with_allow_other("studiofs", false, true).expect("options");
-        assert!(mount_config_allows_other(&config));
-    }
-
-    #[test]
-    fn build_mount_options_foreground_not_added() {
-        // On Linux, fusermount3 does not accept 'foreground' as a mount option.
-        // fuser keeps the process in the foreground through the background session join.
-        let config = build_mount_options("studiofs", true, false).expect("options");
-        assert!(!config.mount_options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
-        ));
     }
 
     #[test]

@@ -2120,7 +2120,7 @@ fn raw_load_open_dir_state(
     vfs: &StudioVfs,
     ino: u64,
 ) -> Result<RawOpenDirState, studiofs_vfs::VfsError> {
-    // ponytail: full-dir snapshot matches the existing fuser backend; move to
+    // ponytail: full-dir snapshot is enough for current mounted workloads; move to
     // paginated VFS readdir if large-directory memory pressure shows up.
     Ok(RawOpenDirState {
         entries: Arc::new(vfs.readdir_with_attrs(ino)?),

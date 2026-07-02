@@ -9,10 +9,9 @@ fn studiofs_fuse_sources_do_not_own_macos_bridge_behavior() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let checked_files = [
         "Cargo.toml",
-        "src/fs.rs",
         "src/lib.rs",
+        "src/raw.rs",
         "tests/mount_sanity.rs",
-        "tests/virtual_mount_test.rs",
     ];
 
     let forbidden = [

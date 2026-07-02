@@ -149,8 +149,7 @@ Local loopback examples remain available as development/test examples.
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
-| FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
-| FUSE async write mounted matrix | `cargo test -p studiofs-fuse --test mount_sanity async_mounted_test_matrix_covers_correctness_and_platform_default_scenarios -- --exact --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity async_mounted -- --ignored --nocapture --test-threads=1` |
+| Linux raw FUSE unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity raw_fuse_mount_and_unmount_smoke -- --ignored --exact --nocapture --test-threads=1` |
 | macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
@@ -173,17 +172,14 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 
 | Test | Backend | Verifies |
 |------|---------|----------|
-| `fuse_session_mount_and_drop_smoke` | FUSE | Session creation and immediate drop (minimal lifecycle) |
-| `fuse_mount_write_read_unmount_smoke` | FUSE | Full lifecycle: mount → write → read → readdir → delete → unmount |
-| `async_mounted_test_matrix_covers_correctness_and_platform_default_scenarios` | FUSE | Fast, non-mounted guard that keeps the async FUSE mounted scenario matrix aligned with SFS-468/SFS-472 acceptance |
-| `async_mounted_*` | FUSE | Individual mounted async write scenarios for sequential readback, flush, fsync, release/reopen, multiple writers, same-handle appends, and unmount-after-write |
-| `linux_async_mounted_*` | FUSE/Linux | Individual mounted checks for Linux async default mode, explicit sync override, async DIO mode, and optional `fio` multi-job writes |
+| `raw_fuse_mount_and_unmount_smoke` | Linux raw FUSE | Mount → read root directory → unmount through OS FUSE tooling |
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 
-The full-lifecycle tests (`*_write_read_unmount_smoke`) are the primary smoke
-tests for SFS-133. They exercise file I/O through the real OS filesystem layer,
-not just session creation.
+The full-lifecycle tests (`*_write_read_unmount_smoke`) exercise file I/O
+through the real OS filesystem layer, not just session creation. Linux keeps a
+focused raw `/dev/fuse` mount/unmount smoke because raw FUSE is the only Linux
+bridge.
 
 The WinFSP suite also contains post-upload/finalization cases. Those require a
 reachable S3 backend and return early when the resolved test endpoint is not

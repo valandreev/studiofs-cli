@@ -170,25 +170,18 @@ For comparisons, compare medians before drawing conclusions:
 These scripts do not run full test suites. They are benchmark evidence capture
 tools for mounted StudioFS volumes.
 
-## Linux High-Throughput FUSE Profile Gate
+## Linux Raw FUSE Profile Gate
 
-`STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` is the permanent Linux tuning
-profile. Capture its evidence under
-`target/perf/linux-high-throughput/` and compare it against the conservative
-profile before folding additional knobs into the profile.
-
-Run at least three conservative and three high-throughput mounted runs with the
-same machine, mount point, cache disk, metadata disk, object store, PostgreSQL
-service, and workload shape:
+Linux has one raw `/dev/fuse` runtime profile. Capture its evidence under
+`target/perf/linux-raw-fuse/` and compare runs with the same machine, mount
+point, cache disk, metadata disk, object store, PostgreSQL service, and workload
+shape:
 
 ```sh
-STUDIOFS_LINUX_FUSE_PROFILE=high-throughput \
 bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate --big-file-size 8GB --block-size 4MB --threads 1
 ```
 
 Also run `studiofs bench <mountpoint> --report <path>` for fixed public mounted
-evidence. The high-throughput profile must improve or match median sequential
-write throughput and must not materially regress repeated warm read throughput,
-p95/p99 callback latency, fsync/flush latency, or RSS. If a knob improves
-throughput but hurts tail latency or memory, keep that knob explicit instead of
-adding it to the profile.
+evidence. The raw profile must keep median sequential write throughput,
+repeated warm read throughput, p95/p99 callback latency, fsync/flush latency,
+and RSS within the documented release thresholds.

@@ -187,9 +187,9 @@ high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | Linux raw: `1 MiB`. macOS: `131072` bytes by default |
 | Kernel `max_readahead` | Linux raw: `1 MiB`. macOS: `1048576` bytes by default |
-| Kernel `max_background` | Linux raw: `50`. macOS: `50` by default |
-| Kernel `congestion_threshold` | Linux raw: `37`. macOS: `40` by default |
-| Linux: `writeback_cache` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_WRITEBACK_CACHE=1`; requested only when the kernel advertises `FUSE_WRITEBACK_CACHE` |
+| Kernel `max_background` | Linux raw: `200`. macOS: `50` by default |
+| Kernel `congestion_threshold` | Linux raw: `150`. macOS: `40` by default |
+| Linux: `writeback_cache` capability | Enabled in the raw JuiceFS-like profile when the kernel advertises `FUSE_WRITEBACK_CACHE` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `direct` by default |
@@ -197,10 +197,11 @@ high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 
 The raw Linux backend uses one JuiceFS-like runtime profile by default:
 `max_write=1 MiB`, `max_read=1 MiB`, `max_readahead=1 MiB`,
-`max_background=50`, `congestion_threshold=37`, read buffer budget `400 MiB`,
+`max_background=200`, `congestion_threshold=150`, read buffer budget `400 MiB`,
 write buffer budget `400 MiB`, prefetch concurrency `1`, upload concurrency
 `20`, download concurrency `200`, and cache sizing delegated to the existing
-operator cache budget. Kernel writeback cache remains disabled in this profile.
+operator cache budget. Kernel writeback cache is requested in this profile when
+the kernel supports it.
 The resolved raw profile is logged at mount startup and published through the
 bridge diagnostics gauges.
 
@@ -220,22 +221,6 @@ The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote
 metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `LocalSyncPolicy::WriteThrough`; ordinary writes remain opportunistic.
-
-`STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
-`FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
-turn on global direct I/O and does not change the buffered read cache policy.
-
-`STUDIOFS_FUSE_WRITEBACK_CACHE=1` requests Linux writeback cache for A/B runs;
-the default is off.
-
-`STUDIOFS_FUSE_ASYNC_WRITE=0` disables the Linux bridge queue for targeted A/B
-runs. The default Linux write callback copies caller bytes into owned buffers,
-admits writes on runtime tasks, and keeps staging, barriers, and upload
-lifecycle in the shared VFS writer stack.
-
-`STUDIOFS_FUSE_ASYNC_READ=1` enables the Linux bridge read reply path. It moves
-regular file reads from the FUSE callback stack onto the mount runtime while
-keeping runtime stats file reads synchronous.
 
 ### macOS cache and I/O policy
 
@@ -340,10 +325,11 @@ Current policy:
 This scope keeps macOS interoperability predictable without broad
 cross-platform name-semantics changes.
 
-### Legacy Implementation: `StudioFuseFs`
+### Linux Raw Callback Mappings
 
-The old `fuser::Filesystem` bridge remains in the crate until the Linux cleanup
-issue removes it, but the Linux CLI no longer selects it.
+Linux production mounts use only the raw `/dev/fuse` callback loop. There is no
+high-level Filesystem fallback and `STUDIOFS_MOUNT_BACKEND` is not a Linux
+selector.
 
 **Key mappings:**
 
@@ -380,7 +366,7 @@ FUSE callback barrier semantics:
 
 FUSE data-buffer behavior:
 - `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS writer-stack path; the bridge does not allocate a second full payload buffer before VFS acceptance.
-- `read`: `fuser::ReplyData` exposes `reply.data(&[u8])` rather than a mutable caller buffer, so `StudioFuseFs` must allocate one reply-sized `Vec<u8>` for the callback, fill it through `read_into_fh()`, and pass the populated slice to `ReplyData`. This is the bridge-level exception to direct caller-buffer filling and is limited to the API boundary.
+- `read`: raw FUSE reads fill the reply buffer from `read_into_fh()` without the old high-level reply-data boundary.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.
 
@@ -393,14 +379,15 @@ FUSE data-buffer behavior:
 - `IsADirectory` → `EISDIR`
 - Other → `EIO`
 
-### Mount Lifecycle
+### Linux Mount Lifecycle
 
 ```
-mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
+mount_raw_with_request(request)
   │
-  ├─ Build mount options
-  ├─ Configure kernel `max_write` / `max_readahead` and optional background queue policy in `Filesystem::init()`
-  ├─ `fuser::Session::new(...).run()` — blocks until unmount
+  ├─ Open /dev/fuse
+  ├─ Mount directly with mount(2), falling back to fusermount only for FUSE fd setup
+  ├─ Negotiate INIT with the raw JuiceFS-like profile
+  ├─ Serve raw FUSE opcodes until shutdown or unmount
   │
   └─ Shutdown:
        ├─ Attempt bounded drain of pending uploads (`STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS`)
@@ -410,17 +397,12 @@ mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
 
 Signal ownership is explicit. The reusable FUSE library path defaults to
 `SignalHandling::Disabled` and does not install process-global `SIGINT` /
-`SIGTERM` handlers. Library embedders can pass a `FuseUnmountSignal` in
-`FuseMountRequest` and trigger it from their own lifecycle code to request
-graceful in-process unmount. The mount lifecycle watcher also remains active
-without process signal handlers so critical VFS runtime failures can request an
-emergency unmount. The StudioFS CLI opts into `SignalHandling::InstallForCli`
-so Ctrl+C/SIGTERM still trigger graceful in-process unmount; that CLI-only path
-restores the previously installed signal dispositions during cleanup instead of
-resetting them to `SIG_DFL`. Because Unix signal disposition is process-global,
-only one active FUSE mount in a process may use `InstallForCli` at a time.
-The watcher uses a simple 100 ms polling loop to bridge both process signals
-and explicit unmount requests into `fuser::SessionUnmounter`.
+`SIGTERM` handlers. The StudioFS CLI opts into
+`SignalHandling::InstallForCli` so Ctrl+C/SIGTERM request raw-session shutdown;
+that CLI-only path restores the previously installed signal dispositions during
+cleanup instead of resetting them to `SIG_DFL`. Because Unix signal disposition
+is process-global, only one active FUSE mount in a process may use
+`InstallForCli` at a time.
 
 ## Platform Differences
 
