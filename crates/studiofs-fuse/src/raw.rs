@@ -66,6 +66,8 @@ const OP_DESTROY: u32 = 38;
 const OP_IOCTL: u32 = 39;
 const OP_READDIRPLUS: u32 = 44;
 
+const FUSE_FSYNC_FDATASYNC: u32 = 1;
+
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
 const FATTR_GID: u32 = 1 << 2;
@@ -1455,8 +1457,13 @@ fn raw_fsync(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<FsyncIn>(&payload[..size_of::<FsyncIn>()])?;
-    let datasync = input.fsync_flags & 1 != 0;
-    let result = rt.block_on(vfs.fsync(header.nodeid, datasync));
+    let result = if input.fh != 0 {
+        // Handle-backed fsync follows flush_fh's local barrier contract; it is
+        // already sufficient for fdatasync and never waits for remote publish.
+        rt.block_on(vfs.flush_fh(input.fh))
+    } else {
+        rt.block_on(vfs.fsync(header.nodeid, input.fsync_flags & FUSE_FSYNC_FDATASYNC != 0))
+    };
     match result {
         Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
@@ -1480,10 +1487,10 @@ fn raw_release(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
-    match rt.block_on(vfs.release_fh(input.fh)) {
-        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
-        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
-    }
+    // The deferred helper owns final-handle errors by logging them out of band;
+    // raw FUSE release must not park the dispatch loop on the local barrier.
+    vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
+    reply_empty(fd, header.unique, Some(accounting))
 }
 
 fn raw_opendir(
