@@ -1550,7 +1550,7 @@ impl StudioFuseFs {
             fuse_max_readahead_bytes: diagnostics.max_readahead_bytes,
             fuse_max_background: diagnostics.background_queue_policy.max_background,
             fuse_congestion_threshold: diagnostics.background_queue_policy.congestion_threshold,
-            kernel_writeback_cache: diagnostics.kernel_writeback_cache,
+            kernel_writeback_cache: Some(diagnostics.kernel_writeback_cache),
             max_pending_bytes: limits.max_pending_bytes,
             max_pending_writes: limits.max_pending_writes,
             per_handle_pending_bytes: limits.per_handle_pending_bytes,

@@ -147,18 +147,31 @@ impl RawFuseMountRequest {
 /// One Linux FUSE profile used for mount options and INIT negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxRawFuseProfile {
+    /// Requested FUSE INIT `max_write`.
     pub max_write: u32,
+    /// Requested mount `max_read`.
     pub max_read: u32,
+    /// Requested FUSE INIT max pages for kernels that advertise `FUSE_MAX_PAGES`.
     pub max_pages: u16,
+    /// Requested FUSE INIT background queue depth.
     pub max_background: u16,
+    /// Requested FUSE INIT congestion threshold.
     pub congestion_threshold: u16,
+    /// Requested FUSE INIT kernel readahead.
     pub max_readahead: u32,
+    /// Read-side userspace buffer budget represented by this profile.
     pub read_buffer_budget_bytes: u64,
+    /// Write-side userspace buffer budget represented by this profile.
     pub write_buffer_budget_bytes: u64,
+    /// Number of read-ahead fetches to run in parallel.
     pub prefetch_concurrency: u16,
+    /// Number of object uploads to run in parallel.
     pub upload_concurrency: u16,
+    /// Number of object downloads to run in parallel.
     pub download_concurrency: u16,
+    /// Cache sizing source for this profile.
     pub cache_size_policy: &'static str,
+    /// Whether to request kernel writeback cache when the kernel advertises it.
     pub kernel_writeback_cache: bool,
 }
 
@@ -682,12 +695,12 @@ fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: LinuxRawFuseProfile
         fuse_max_readahead_bytes: profile.max_readahead,
         fuse_max_background: Some(profile.max_background),
         fuse_congestion_threshold: Some(profile.congestion_threshold),
-        read_buffer_budget_bytes: profile.read_buffer_budget_bytes,
-        write_buffer_budget_bytes: profile.write_buffer_budget_bytes,
-        prefetch_concurrency: profile.prefetch_concurrency,
-        upload_concurrency: profile.upload_concurrency,
-        download_concurrency: profile.download_concurrency,
-        kernel_writeback_cache: profile.kernel_writeback_cache,
+        read_buffer_budget_bytes: Some(profile.read_buffer_budget_bytes),
+        write_buffer_budget_bytes: Some(profile.write_buffer_budget_bytes),
+        prefetch_concurrency: Some(profile.prefetch_concurrency),
+        upload_concurrency: Some(profile.upload_concurrency),
+        download_concurrency: Some(profile.download_concurrency),
+        kernel_writeback_cache: Some(profile.kernel_writeback_cache),
         ..Default::default()
     });
 }
