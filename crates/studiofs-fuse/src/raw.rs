@@ -176,6 +176,10 @@ pub struct LinuxRawFuseProfile {
 }
 
 impl LinuxRawFuseProfile {
+    pub fn label(self) -> &'static str {
+        "raw-juicefs-like"
+    }
+
     pub fn juicefs_like() -> Self {
         let max_write = 1024 * 1024;
         Self {
@@ -690,7 +694,7 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
 fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: LinuxRawFuseProfile) {
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         enabled: true,
-        linux_fuse_profile: "raw-juicefs-like".into(),
+        linux_fuse_profile: profile.label().into(),
         fuse_max_write_bytes: profile.max_write,
         fuse_max_readahead_bytes: profile.max_readahead,
         fuse_max_background: Some(profile.max_background),
@@ -2950,6 +2954,7 @@ mod tests {
     fn raw_juicefs_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
         let profile = LinuxRawFuseProfile::juicefs_like();
 
+        assert_eq!(profile.label(), "raw-juicefs-like");
         assert_eq!(profile.read_buffer_budget_bytes, 150 * 1024 * 1024);
         assert_eq!(profile.write_buffer_budget_bytes, 150 * 1024 * 1024);
         assert_eq!(profile.prefetch_concurrency, 1);
