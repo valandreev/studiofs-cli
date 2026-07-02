@@ -1102,9 +1102,7 @@ fn dispatch_minimal_request(
         accounting,
         buffer_recycler,
     };
-    if header.opcode == OP_WRITE
-        && let Some(runtime_handle) = job.context.runtime_handle.clone()
-    {
+    if let (OP_WRITE, Some(runtime_handle)) = (header.opcode, job.context.runtime_handle.clone()) {
         dispatch_write_async(job, runtime_handle);
         return Ok(());
     }

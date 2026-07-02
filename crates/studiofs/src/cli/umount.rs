@@ -195,7 +195,7 @@ fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -
     )
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<()> {
     use std::ffi::CString;
     use std::process::{Command, Stdio};
@@ -245,6 +245,11 @@ fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<
     }
 
     Err(err).context("detach FUSE mount with umount2; fusermount not found")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn detach_unix_mount(_mount_point: &str, _timeout: std::time::Duration) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]

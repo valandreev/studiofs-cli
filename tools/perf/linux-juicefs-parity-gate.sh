@@ -282,7 +282,7 @@ PY"
   local start_ns end_ns wall_ms status
   start_ns="$(date +%s%N)"
   status=0
-  if command -v /usr/bin/time >/dev/null 2>&1; then
+  if [[ -x /usr/bin/time ]]; then
     (cd "$run_dir" && /usr/bin/time -v -o time.txt bash -o pipefail -c "$command_text") > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt" || status=$?
   else
     (cd "$run_dir" && bash -o pipefail -c "$command_text") > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt" || status=$?
