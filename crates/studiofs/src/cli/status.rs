@@ -165,6 +165,7 @@ fn has_raw_fuse_profile_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> bool {
         || snapshot.prefetch_concurrency.is_some()
         || snapshot.upload_concurrency.is_some()
         || snapshot.download_concurrency.is_some()
+        || snapshot.kernel_writeback_cache.is_some()
 }
 
 fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> Vec<String> {
@@ -1108,6 +1109,22 @@ mod tests {
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_fuse_writeback_when_it_is_the_only_profile_knob() {
+        let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            linux_fuse_profile: "raw-juicefs-like".into(),
+            kernel_writeback_cache: Some(true),
+            ..Default::default()
+        };
+
+        let lines = format_fuse_async_write_diagnostics(&snapshot);
+
+        assert_eq!(
+            lines[1],
+            "  FUSE profile knobs:       read unavailable, write unavailable, prefetch unavailable, upload unavailable, download unavailable, writeback on"
         );
     }
 
