@@ -2913,7 +2913,7 @@ mod tests {
             let renewed = launch
                 .runtime_handle
                 .block_on(
-                    competing_client.renew_controller(&takeover.lease_id, Duration::from_secs(2)),
+                    competing_client.renew_controller(&takeover.lease_id, Duration::from_secs(30)),
                 )
                 .expect("renew controller lease");
             assert_eq!(renewed.lease_id, takeover.lease_id);
