@@ -970,6 +970,18 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub fuse_max_background: Option<u16>,
     /// Requested kernel `congestion_threshold` value.
     pub fuse_congestion_threshold: Option<u16>,
+    /// Read buffer budget selected by the Linux FUSE profile.
+    pub read_buffer_budget_bytes: Option<u64>,
+    /// Write buffer budget selected by the Linux FUSE profile.
+    pub write_buffer_budget_bytes: Option<u64>,
+    /// Prefetch concurrency selected by the Linux FUSE profile.
+    pub prefetch_concurrency: Option<u16>,
+    /// Upload concurrency selected by the Linux FUSE profile.
+    pub upload_concurrency: Option<u16>,
+    /// Download concurrency selected by the Linux FUSE profile.
+    pub download_concurrency: Option<u16>,
+    /// Whether the profile requested Linux kernel writeback cache.
+    pub kernel_writeback_cache: Option<bool>,
     /// Maximum pending bytes admitted across the adapter.
     pub max_pending_bytes: Option<usize>,
     /// Maximum pending write requests admitted across the adapter.

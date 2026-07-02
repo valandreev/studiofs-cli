@@ -139,41 +139,82 @@ fn format_optional_count(value: Option<usize>) -> String {
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
-fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 5] {
+fn format_optional_profile_bytes(value: Option<u64>) -> String {
+    value
+        .map(format_bytes)
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn format_optional_profile_count(value: Option<u16>) -> String {
+    value
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn format_optional_switch(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unavailable",
+    }
+}
+
+fn has_raw_fuse_profile_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> bool {
+    snapshot.read_buffer_budget_bytes.is_some()
+        || snapshot.write_buffer_budget_bytes.is_some()
+        || snapshot.prefetch_concurrency.is_some()
+        || snapshot.upload_concurrency.is_some()
+        || snapshot.download_concurrency.is_some()
+        || snapshot.kernel_writeback_cache.is_some()
+}
+
+fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> Vec<String> {
     let mode = if snapshot.enabled {
         "enabled"
     } else {
         "disabled"
     };
-    [
-        format!(
-            "  FUSE async writes:        {mode} (profile: {})",
-            snapshot.linux_fuse_profile
-        ),
-        format!(
-            "  FUSE async pending:       {} writes, {} current, {} peak",
-            snapshot.pending_writes,
-            format_bytes(snapshot.pending_bytes as u64),
-            format_bytes(snapshot.peak_pending_bytes as u64)
-        ),
-        format!(
-            "  FUSE async caps:          max {}, max writes {}, per-handle {}",
-            format_optional_bytes(snapshot.max_pending_bytes),
-            format_optional_count(snapshot.max_pending_writes),
-            format_optional_bytes(snapshot.per_handle_pending_bytes)
-        ),
-        format!(
-            "  FUSE async completions:   {} ok, {} errors, {} task failures",
-            snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
-        ),
-        format!(
-            "  FUSE async waits:         admission {}/{}, barriers {}/{}",
-            snapshot.admission_waits,
-            format_finite_ms(snapshot.admission_wait_total_ms),
-            snapshot.barrier_waits,
-            format_finite_ms(snapshot.barrier_wait_total_ms)
-        ),
-    ]
+    let has_profile_knobs = has_raw_fuse_profile_knobs(snapshot);
+    let mut lines = Vec::with_capacity(if has_profile_knobs { 6 } else { 5 });
+    lines.push(format!(
+        "  FUSE async writes:        {mode} (profile: {})",
+        snapshot.linux_fuse_profile
+    ));
+    if has_profile_knobs {
+        lines.push(format!(
+            "  FUSE profile knobs:       read {}, write {}, prefetch {}, upload {}, download {}, writeback {}",
+            format_optional_profile_bytes(snapshot.read_buffer_budget_bytes),
+            format_optional_profile_bytes(snapshot.write_buffer_budget_bytes),
+            format_optional_profile_count(snapshot.prefetch_concurrency),
+            format_optional_profile_count(snapshot.upload_concurrency),
+            format_optional_profile_count(snapshot.download_concurrency),
+            format_optional_switch(snapshot.kernel_writeback_cache)
+        ));
+    }
+    lines.push(format!(
+        "  FUSE async pending:       {} writes, {} current, {} peak",
+        snapshot.pending_writes,
+        format_bytes(snapshot.pending_bytes as u64),
+        format_bytes(snapshot.peak_pending_bytes as u64)
+    ));
+    lines.push(format!(
+        "  FUSE async caps:          max {}, max writes {}, per-handle {}",
+        format_optional_bytes(snapshot.max_pending_bytes),
+        format_optional_count(snapshot.max_pending_writes),
+        format_optional_bytes(snapshot.per_handle_pending_bytes)
+    ));
+    lines.push(format!(
+        "  FUSE async completions:   {} ok, {} errors, {} task failures",
+        snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
+    ));
+    lines.push(format!(
+        "  FUSE async waits:         admission {}/{}, barriers {}/{}",
+        snapshot.admission_waits,
+        format_finite_ms(snapshot.admission_wait_total_ms),
+        snapshot.barrier_waits,
+        format_finite_ms(snapshot.barrier_wait_total_ms)
+    ));
+    lines
 }
 
 fn snapshot_freshness(snapshot_age_ms: u64) -> &'static str {
@@ -1029,11 +1070,17 @@ mod tests {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
             enabled: true,
-            linux_fuse_profile: "high-throughput".into(),
+            linux_fuse_profile: "raw-juicefs-like".into(),
             fuse_max_write_bytes: 16 * 1024 * 1024,
             fuse_max_readahead_bytes: 128 * 1024,
             fuse_max_background: Some(128),
             fuse_congestion_threshold: Some(96),
+            read_buffer_budget_bytes: Some(150 * 1024 * 1024),
+            write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+            prefetch_concurrency: Some(1),
+            upload_concurrency: Some(20),
+            download_concurrency: Some(200),
+            kernel_writeback_cache: Some(false),
             max_pending_bytes: Some(128 * 1024 * 1024),
             max_pending_writes: Some(1024),
             per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -1047,6 +1094,7 @@ mod tests {
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
             barrier_wait_total_ms: 8.5,
+            ..Default::default()
         };
 
         let lines = format_fuse_async_write_diagnostics(&snapshot);
@@ -1054,12 +1102,29 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  FUSE async writes:        enabled (profile: high-throughput)",
+                "  FUSE async writes:        enabled (profile: raw-juicefs-like)",
+                "  FUSE profile knobs:       read 150.0MiB, write 150.0MiB, prefetch 1, upload 20, download 200, writeback off",
                 "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_fuse_writeback_when_it_is_the_only_profile_knob() {
+        let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            linux_fuse_profile: "raw-juicefs-like".into(),
+            kernel_writeback_cache: Some(true),
+            ..Default::default()
+        };
+
+        let lines = format_fuse_async_write_diagnostics(&snapshot);
+
+        assert_eq!(
+            lines[1],
+            "  FUSE profile knobs:       read unavailable, write unavailable, prefetch unavailable, upload unavailable, download unavailable, writeback on"
         );
     }
 

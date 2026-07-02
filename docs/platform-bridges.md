@@ -198,6 +198,15 @@ Linux has two selectable FUSE paths:
 | macOS: cache policy | `direct` by default |
 | macOS: validated macFUSE | 5.2.0 |
 
+The raw Linux backend uses one JuiceFS-like runtime profile by default:
+`max_write=1 MiB`, `max_read=1 MiB`, `max_readahead=1 MiB`,
+`max_background=50`, `congestion_threshold=37`, read buffer budget `150 MiB`,
+write buffer budget `150 MiB`, prefetch concurrency `1`, upload concurrency
+`20`, download concurrency `200`, and cache sizing delegated to the existing
+operator cache budget. Kernel writeback cache remains disabled in this profile.
+The resolved raw profile is logged at mount startup and published through the
+bridge diagnostics gauges.
+
 `STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
 high-throughput tuning profile. It requests `max_write=16 MiB`, keeps
 `max_readahead` at the Linux default 128 KiB, and sets `max_background=128`

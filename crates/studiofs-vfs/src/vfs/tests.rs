@@ -12649,6 +12649,12 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
+        read_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        prefetch_concurrency: Some(1),
+        upload_concurrency: Some(20),
+        download_concurrency: Some(200),
+        kernel_writeback_cache: Some(false),
         max_pending_bytes: Some(128 * 1024 * 1024),
         max_pending_writes: Some(1024),
         per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -12686,6 +12692,15 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+    assert_eq!(
+        snapshot.fuse_async_write.read_buffer_budget_bytes,
+        Some(150 * 1024 * 1024)
+    );
+    assert_eq!(snapshot.fuse_async_write.upload_concurrency, Some(20));
+    assert_eq!(
+        snapshot.fuse_async_write.kernel_writeback_cache,
+        Some(false)
+    );
 }
 
 #[test]
@@ -12699,6 +12714,12 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
+        read_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        prefetch_concurrency: Some(1),
+        upload_concurrency: Some(20),
+        download_concurrency: Some(200),
+        kernel_writeback_cache: Some(false),
         ..Default::default()
     });
 
@@ -12716,6 +12737,46 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
     assert_eq!(
         snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
         128 * 1024
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_read_buffer_budget_bytes"].value,
+        150 * 1024 * 1024
+    );
+    assert_eq!(snapshot.bridge.gauges["fuse_upload_concurrency"].value, 20);
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_kernel_writeback_cache"].value,
+        0
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_kernel_writeback_cache"].unit,
+        "count"
+    );
+}
+
+#[test]
+fn runtime_stats_surface_skips_absent_fuse_profile_knobs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-absent-fuse-profile-knobs");
+
+    let snapshot = vfs.runtime_stats_snapshot();
+
+    assert!(
+        !snapshot
+            .bridge
+            .gauges
+            .contains_key("fuse_read_buffer_budget_bytes")
+    );
+    assert!(
+        !snapshot
+            .bridge
+            .gauges
+            .contains_key("fuse_upload_concurrency")
+    );
+    assert!(
+        !snapshot
+            .bridge
+            .gauges
+            .contains_key("fuse_kernel_writeback_cache")
     );
 }
 
