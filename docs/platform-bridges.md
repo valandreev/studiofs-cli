@@ -235,9 +235,7 @@ large sequential media callbacks into smaller requests. StudioFS does not pass
 `.DS_Store`, which Finder/copyfile requires for folder copies.
 The default macOS asyncFUSE profile also enables async write replies, applies
 the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
-reports the preferred I/O size through regular file attributes. Set
-`STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
-changing the cache policy.
+reports the preferred I/O size through regular file attributes.
 The mounted performance probe records SFS-491 read-geometry evidence in
 `performance-probe-summary.json`: `read_observations.fuse_read_calls`,
 `read_observations.fuse_read_bytes`, and `read_observations.avg_fuse_read_bytes`

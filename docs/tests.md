@@ -149,7 +149,7 @@ Local loopback examples remain available as development/test examples.
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
-| Linux raw FUSE unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity raw_fuse_mount_and_unmount_smoke -- --ignored --exact --nocapture --test-threads=1` |
+| Linux raw FUSE unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity raw_fuse -- --ignored --nocapture --test-threads=1` |
 | macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
@@ -173,6 +173,10 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 | Test | Backend | Verifies |
 |------|---------|----------|
 | `raw_fuse_mount_and_unmount_smoke` | Linux raw FUSE | Mount → read root directory → unmount through OS FUSE tooling |
+| `raw_fuse_write_read_unmount_smoke` | Linux raw FUSE | Mounted write/readback through the raw transport |
+| `raw_fuse_flush_readback_smoke` | Linux raw FUSE | Mounted write → flush → close → readback |
+| `raw_fuse_fsync_readback_smoke` | Linux raw FUSE | Mounted write → fsync → close → readback |
+| `raw_fuse_close_reopen_readback_smoke` | Linux raw FUSE | Mounted write → close/reopen readback |
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 

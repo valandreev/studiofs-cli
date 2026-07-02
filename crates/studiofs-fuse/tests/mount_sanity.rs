@@ -4,6 +4,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -216,6 +217,58 @@ fn force_unmount_fuse_mount_path_with(
     Err(io::Error::other(umount_failure))
 }
 
+fn with_raw_fuse_mount(suffix: &str, read_only: bool, test_fn: impl FnOnce(&Path)) {
+    if !mounted_tests_enabled() {
+        return;
+    }
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
+    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
+    let mount_path = mount_dir.path().to_path_buf();
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, suffix, &rt);
+
+    use std::os::unix::fs::MetadataExt;
+    let pre_dev = std::fs::metadata(&mount_path)
+        .expect("mount dir should exist before raw session")
+        .dev();
+
+    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke")
+        .with_vfs(vfs, rt.handle().clone());
+    request.read_only = read_only;
+    let session_handle = std::thread::spawn(move || mount_raw_with_request(request));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fuse_mount_path_cleared(&mount_path, pre_dev) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "raw FUSE mount did not become available within 10 s"
+        );
+        if session_handle.is_finished() {
+            let result = session_handle
+                .join()
+                .expect("raw FUSE session thread should not panic");
+            panic!("raw FUSE session exited before mount became available: {result:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    test_fn(&mount_path);
+
+    force_unmount_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
+    assert!(
+        wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5)),
+        "raw FUSE mount should clear after unmount"
+    );
+    if let Some(join_result) =
+        join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
+    {
+        join_result
+            .expect("raw FUSE session thread should not panic")
+            .expect("raw FUSE session should exit cleanly");
+    }
+}
+
 #[test]
 fn mounted_fuse_cleanup_detects_mount_path_device_restoration() {
     let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-detection-");
@@ -282,55 +335,73 @@ fn force_unmount_fuse_mount_path_reports_failed_system_unmount() {
 #[test]
 #[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn raw_fuse_mount_and_unmount_smoke() {
-    if !mounted_tests_enabled() {
-        return;
-    }
-
-    let tmp = studiofs_test_support::workspace_target_tempdir("vfs-");
-    let mount_dir = studiofs_test_support::workspace_target_tempdir("mount-");
-    let mount_path = mount_dir.path().to_path_buf();
-    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-    let vfs = make_test_vfs(&tmp, "raw_mount_sanity", &rt);
-
-    use std::os::unix::fs::MetadataExt;
-    let pre_dev = std::fs::metadata(&mount_path)
-        .expect("mount dir should exist before raw session")
-        .dev();
-
-    let mut request = RawFuseMountRequest::new(mount_path.to_string_lossy(), "studiofs-raw-smoke")
-        .with_vfs(vfs, rt.handle().clone());
-    request.read_only = true;
-    let session_handle = std::thread::spawn(move || mount_raw_with_request(request));
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while fuse_mount_path_cleared(&mount_path, pre_dev) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "raw FUSE mount did not become available within 10 s"
-        );
-        if session_handle.is_finished() {
-            let result = session_handle
-                .join()
-                .expect("raw FUSE session thread should not panic");
-            panic!("raw FUSE session exited before mount became available: {result:?}");
+    with_raw_fuse_mount("raw_mount_sanity", true, |mount_path| {
+        for entry in std::fs::read_dir(mount_path).expect("read raw FUSE root directory") {
+            entry.expect("read raw FUSE root directory entry");
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    });
+}
 
-    for entry in std::fs::read_dir(&mount_path).expect("read raw FUSE root directory") {
-        entry.expect("read raw FUSE root directory entry");
-    }
+#[test]
+#[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn raw_fuse_write_read_unmount_smoke() {
+    with_raw_fuse_mount("raw_write_read", false, |mount_path| {
+        let test_file = mount_path.join("write-read.txt");
+        let payload = b"StudioFS raw FUSE write/read payload";
 
-    force_unmount_fuse_mount_path(&mount_path).expect("raw FUSE unmount should succeed");
-    assert!(
-        wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(5)),
-        "raw FUSE mount should clear after unmount"
-    );
-    if let Some(join_result) =
-        join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
-    {
-        join_result
-            .expect("raw FUSE session thread should not panic")
-            .expect("raw FUSE session should exit cleanly");
-    }
+        std::fs::write(&test_file, payload).expect("write through raw FUSE mount");
+        let readback = std::fs::read(&test_file).expect("read through raw FUSE mount");
+
+        assert_eq!(readback, payload);
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn raw_fuse_flush_readback_smoke() {
+    with_raw_fuse_mount("raw_flush_readback", false, |mount_path| {
+        let test_file = mount_path.join("flush.txt");
+        let payload = b"StudioFS raw FUSE flush payload";
+        let mut file = std::fs::File::create(&test_file).expect("create file");
+
+        file.write_all(payload).expect("write payload");
+        file.flush().expect("flush file handle");
+        drop(file);
+
+        let readback = std::fs::read(&test_file).expect("read after flush and close");
+        assert_eq!(readback, payload);
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn raw_fuse_fsync_readback_smoke() {
+    with_raw_fuse_mount("raw_fsync_readback", false, |mount_path| {
+        let test_file = mount_path.join("fsync.txt");
+        let payload = b"StudioFS raw FUSE fsync payload";
+        let mut file = std::fs::File::create(&test_file).expect("create file");
+
+        file.write_all(payload).expect("write payload");
+        file.sync_all().expect("fsync file");
+        drop(file);
+
+        let readback = std::fs::read(&test_file).expect("read after fsync");
+        assert_eq!(readback, payload);
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn raw_fuse_close_reopen_readback_smoke() {
+    with_raw_fuse_mount("raw_close_reopen", false, |mount_path| {
+        let test_file = mount_path.join("close-reopen.txt");
+        let payload = b"StudioFS raw FUSE close/reopen payload";
+        {
+            let mut file = std::fs::File::create(&test_file).expect("create file");
+            file.write_all(payload).expect("write payload");
+        }
+
+        let readback = std::fs::read(&test_file).expect("read reopened file");
+        assert_eq!(readback, payload);
+    });
 }
