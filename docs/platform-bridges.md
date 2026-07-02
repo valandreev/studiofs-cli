@@ -9,8 +9,8 @@ StudioFS supports two platforms through thin bridge crates that translate OS-spe
 │   studiofs-winfsp    │     │   studiofs-fuse       │
 │   (Windows only)     │     │   (Linux / macOS)     │
 ├──────────────────────┤     ├──────────────────────┤
-│  winfsp crate (0.12) │     │  fuser crate (0.16)  │
-│  FileSystemContext    │     │  Filesystem trait     │
+│  winfsp crate (0.12) │     │  raw /dev/fuse       │
+│  FileSystemContext    │     │  FUSE protocol       │
 ├──────────────────────┤     ├──────────────────────┤
 │     StudioVfs        │     │     StudioVfs         │
 └──────────────────────┘     └──────────────────────┘
@@ -169,9 +169,9 @@ Current signature includes additional policy controls:
 
 ## FUSE Bridge (`studiofs-fuse`)
 
-Linux has two selectable FUSE paths:
-- `STUDIOFS_MOUNT_BACKEND=raw` or unset: JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse` directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse high-level callbacks.
-- `STUDIOFS_MOUNT_BACKEND=fuser`: legacy `fuser` backend, kept as an explicit fallback/control path.
+Linux uses the JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse`
+directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse
+high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 
 ### Requirements
 
@@ -185,14 +185,11 @@ Linux has two selectable FUSE paths:
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | macOS and Linux conservative profile: `131072` bytes. Linux high-throughput profile: up to `16777216` bytes, clamped by `/proc/sys/fs/fuse/max_pages_limit`. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
-| Kernel `max_readahead` | `131072` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
-| Kernel `max_background` | macOS: `50` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `128`. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
-| Kernel `congestion_threshold` | macOS: `40` by default. Linux conservative profile: kernel/fuser default. Linux high-throughput profile: `96`. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
-| FUSE async write replies | macOS: enabled by default. Linux: enabled by default; disable with `STUDIOFS_FUSE_ASYNC_WRITE=0` |
-| FUSE async read replies | Linux: direct reads by default; opt in with `STUDIOFS_FUSE_ASYNC_READ=1` |
+| Kernel `max_write` | Linux raw: `1 MiB`. macOS: `131072` bytes by default |
+| Kernel `max_readahead` | Linux raw: `1 MiB`. macOS: `1048576` bytes by default |
+| Kernel `max_background` | Linux raw: `50`. macOS: `50` by default |
+| Kernel `congestion_threshold` | Linux raw: `37`. macOS: `40` by default |
 | Linux: `writeback_cache` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_WRITEBACK_CACHE=1`; requested only when the kernel advertises `FUSE_WRITEBACK_CACHE` |
-| Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `direct` by default |
@@ -207,30 +204,6 @@ operator cache budget. Kernel writeback cache remains disabled in this profile.
 The resolved raw profile is logged at mount startup and published through the
 bridge diagnostics gauges.
 
-`STUDIOFS_LINUX_FUSE_PROFILE=high-throughput` selects the permanent Linux
-high-throughput tuning profile. It requests `max_write=16 MiB`, keeps
-`max_readahead` at the Linux default 128 KiB, and sets `max_background=128`
-plus `congestion_threshold=96`. This is the Linux default.
-
-`STUDIOFS_LINUX_FUSE_PROFILE=media` selects a macOS-like media profile for
-Linux A/B runs. It requests `max_write=4 MiB`, `max_readahead=4 MiB`, enables
-async read replies and Linux async DIO, keeps kernel cache policy enabled for
-read-only opens, keeps writeback cache disabled, and uses the macOS-style
-`50/40` background queue policy.
-
-`STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
-`STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
-the primary FUSE bridge throughput controls for local payload I/O. Explicit env
-vars override the selected Linux profile. Linux `max_write` is also capped by
-the kernel FUSE page limit: `max_pages_limit * page_size`. On typical 4 KiB
-pages, `max_pages_limit=256` means a 1 MiB ceiling; use `1024` for 4 MiB if the
-stand allows changing `/proc/sys/fs/fuse/max_pages_limit`. Set either
-background queue env var to an empty string to leave that value at the
-kernel/fuser default; `0` has the same opt-out meaning for these two background
-queue controls. StudioFS clamps congestion thresholds above an explicitly
-configured `max_background`; when only `STUDIOFS_FUSE_CONGESTION_THRESHOLD` is
-set, fuser may still clamp it against its own default `max_background` during
-the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
@@ -367,9 +340,10 @@ Current policy:
 This scope keeps macOS interoperability predictable without broad
 cross-platform name-semantics changes.
 
-### Implementation: `StudioFuseFs`
+### Legacy Implementation: `StudioFuseFs`
 
-Implements `fuser::Filesystem` trait.
+The old `fuser::Filesystem` bridge remains in the crate until the Linux cleanup
+issue removes it, but the Linux CLI no longer selects it.
 
 **Key mappings:**
 
@@ -401,7 +375,7 @@ background local-I/O pool.
 FUSE callback barrier semantics:
 - `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
 - `fsync` with a file handle follows the handle-backed local barrier used by `flush`; inode-only `fsync` persists local unpublished state for the inode, including dirty writer-stack state. Neither path forces remote publication.
-- `release` becomes the fallback strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, using the deferred last-handle barrier on Linux raw FUSE and the shared handle-drain path on the legacy fuser bridge. It must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
+- `release` becomes the strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, using the deferred last-handle barrier on Linux raw FUSE. It must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
 
 FUSE data-buffer behavior:

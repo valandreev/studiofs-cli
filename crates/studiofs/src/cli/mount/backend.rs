@@ -4,7 +4,7 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
 #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
@@ -25,7 +25,7 @@ pub(crate) trait MountBackend: Send + Sync {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
-    mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
+    Box::new(RawFuseMountBackend)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -36,22 +36,6 @@ pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
 #[cfg(windows)]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
     Box::new(WinfspMountBackend)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn MountBackend> {
-    match selector.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) if value.eq_ignore_ascii_case("raw") => Box::new(RawFuseMountBackend),
-        Some(value) if value.eq_ignore_ascii_case("fuser") => Box::new(FuseMountBackend),
-        Some(value) => {
-            tracing::warn!(
-                backend = value,
-                "unknown Linux mount backend; falling back to fuser"
-            );
-            Box::new(FuseMountBackend)
-        }
-        None => Box::new(RawFuseMountBackend),
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -66,28 +50,6 @@ pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn Moun
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn mount_backend_for_selector(_selector: Option<&str>) -> Box<dyn MountBackend> {
     Box::new(UnsupportedUnixMountBackend)
-}
-
-#[cfg(target_os = "linux")]
-struct FuseMountBackend;
-
-#[cfg(target_os = "linux")]
-impl MountBackend for FuseMountBackend {
-    fn name(&self) -> &'static str {
-        "FUSE"
-    }
-
-    fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
-        let mut request = studiofs_fuse::FuseMountRequest::new(
-            launch.vfs,
-            launch.runtime_handle,
-            launch.mount_point,
-            launch.volume_name,
-        );
-        request.read_only = launch.read_only;
-        request.signal_handling = studiofs_fuse::SignalHandling::InstallForCli;
-        studiofs_fuse::mount_with_request(request)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -226,29 +188,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_raw_selector_routes_to_raw_fuse_backend() {
-        let backend = super::mount_backend_for_selector(Some("raw"));
+    fn linux_default_backend_is_raw_fuse() {
+        let backend = super::default_mount_backend();
 
         assert_eq!(backend.name(), "raw-fuse");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_default_selector_routes_to_raw_fuse_backend() {
-        for selector in [None, Some("")] {
-            let backend = super::mount_backend_for_selector(selector);
-
-            assert_eq!(backend.name(), "raw-fuse");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_fuser_selector_remains_explicit_fallback_backend() {
-        for selector in [Some("fuser"), Some("unknown")] {
-            let backend = super::mount_backend_for_selector(selector);
-
-            assert_eq!(backend.name(), "FUSE");
-        }
     }
 }
