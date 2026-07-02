@@ -221,6 +221,9 @@ The VFS invalidator remains responsible for dropping kernel pages after unsafe
 transitions such as local writes, truncation, sparse size changes, and remote
 metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `LocalSyncPolicy::WriteThrough`; ordinary writes remain opportunistic.
+The raw Linux bridge registers a VFS `KernelInvalidator` for the mounted
+session and emits `FUSE_NOTIFY_INVAL_INODE` to `/dev/fuse` for full-inode and
+attribute-only invalidations.
 
 ### macOS cache and I/O policy
 

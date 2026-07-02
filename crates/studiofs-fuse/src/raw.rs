@@ -21,7 +21,9 @@ use crate::{SignalHandling, signal_handlers_for_policy};
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot};
+use studiofs_vfs::{
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot,
+};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -78,6 +80,7 @@ const OP_IOCTL: u32 = 39;
 const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
+const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -712,7 +715,14 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
     crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_handlers = signal_handlers_for_policy(signal_handling)?;
     let shutdown = RawSessionShutdown::for_signal_handling(signal_handling);
-    let _guard = RawMountGuard(&mount_point);
+    let _mount_guard = RawMountGuard(&mount_point);
+    let _kernel_invalidator = match vfs.as_ref() {
+        Some(vfs) => Some(RawKernelInvalidatorRegistration::new(
+            Arc::clone(vfs),
+            dev_fuse.as_raw_fd(),
+        )?),
+        None => None,
+    };
     serve_minimal_session(dev_fuse.as_raw_fd(), profile, vfs, runtime_handle, shutdown)
 }
 
@@ -2718,6 +2728,22 @@ struct OutHeader {
     unique: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NotifyInvalInodeOut {
+    ino: u64,
+    off: i64,
+    len: i64,
+}
+
+fn fuse_notify_header(notify_code: i32, payload_len: usize) -> OutHeader {
+    OutHeader {
+        len: (size_of::<OutHeader>() + payload_len) as u32,
+        error: notify_code,
+        unique: 0,
+    }
+}
+
 fn write_reply_header(
     fd: RawFd,
     unique: u64,
@@ -2985,6 +3011,72 @@ impl Drop for RawMountGuard<'_> {
     }
 }
 
+struct RawKernelInvalidatorRegistration {
+    vfs: Arc<StudioVfs>,
+}
+
+impl RawKernelInvalidatorRegistration {
+    fn new(vfs: Arc<StudioVfs>, fd: RawFd) -> io::Result<Self> {
+        let invalidator = Arc::new(RawFuseKernelInvalidator::new(fd)?);
+        vfs.set_kernel_invalidator(invalidator);
+        Ok(Self { vfs })
+    }
+}
+
+impl Drop for RawKernelInvalidatorRegistration {
+    fn drop(&mut self) {
+        self.vfs.clear_kernel_invalidator();
+    }
+}
+
+struct RawFuseKernelInvalidator {
+    fd: RawFd,
+}
+
+impl RawFuseKernelInvalidator {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `dup` only copies the file descriptor number and returns an
+        // independent fd that this invalidator owns and closes on drop.
+        let fd = unsafe { libc::dup(fd) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn notify_inval_inode(&self, ino: u64, off: i64, len: i64) -> io::Result<()> {
+        let out = NotifyInvalInodeOut { ino, off, len };
+        let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
+        write_fuse_packet_vectored_fd(self.fd, as_bytes(&header), as_bytes(&out))
+    }
+}
+
+impl KernelInvalidator for RawFuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        if let Err(error) = self.notify_inval_inode(ino, 0, 0)
+            && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
+        {
+            debug!(ino, error = ?error, "raw FUSE inode invalidation failed");
+        }
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        if let Err(error) = self.notify_inval_inode(ino, -1, 0)
+            && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
+        {
+            debug!(ino, error = ?error, "raw FUSE inode attribute invalidation failed");
+        }
+    }
+}
+
+impl Drop for RawFuseKernelInvalidator {
+    fn drop(&mut self) {
+        // SAFETY: this fd came from `dup` in `RawFuseKernelInvalidator::new`
+        // and is owned by this invalidator.
+        let _ = unsafe { libc::close(self.fd) };
+    }
+}
+
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
     let mount_point_c = cstring_path(mount_point)?;
     // SAFETY: `mount_point` is a valid NUL-terminated C string.
@@ -3052,6 +3144,7 @@ unsafe impl FuseBytes for InitOut {}
 unsafe impl FuseBytes for RawEntryOut {}
 unsafe impl FuseBytes for RawOpenOut {}
 unsafe impl FuseBytes for RawDirent {}
+unsafe impl FuseBytes for NotifyInvalInodeOut {}
 unsafe impl FuseBytes for OpenIn {}
 unsafe impl FuseBytes for MknodIn {}
 unsafe impl FuseBytes for MkdirIn {}
@@ -3072,6 +3165,38 @@ unsafe impl FuseBytes for OutHeader {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_notify_inval_inode_header_uses_kernel_notify_opcode() {
+        let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
+
+        assert_eq!(
+            header.len as usize,
+            size_of::<OutHeader>() + size_of::<NotifyInvalInodeOut>()
+        );
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(header.unique, 0);
+    }
+
+    #[test]
+    fn raw_notify_inval_inode_payload_supports_full_and_attr_only_invalidations() {
+        let full = NotifyInvalInodeOut {
+            ino: 42,
+            off: 0,
+            len: 0,
+        };
+        let attrs_only = NotifyInvalInodeOut {
+            ino: 42,
+            off: -1,
+            len: 0,
+        };
+
+        assert_eq!(full.ino, attrs_only.ino);
+        assert_eq!(full.off, 0);
+        assert_eq!(attrs_only.off, -1);
+        assert_eq!(full.len, 0);
+        assert_eq!(attrs_only.len, 0);
+    }
 
     #[test]
     fn raw_dispatch_classifies_stream_heavy_operations() {
