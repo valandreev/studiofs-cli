@@ -1457,12 +1457,13 @@ fn raw_fsync(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<FsyncIn>(&payload[..size_of::<FsyncIn>()])?;
+    let is_datasync = (input.fsync_flags & FUSE_FSYNC_FDATASYNC) != 0;
     let result = if input.fh != 0 {
         // Handle-backed fsync follows flush_fh's local barrier contract; it is
         // already sufficient for fdatasync and never waits for remote publish.
         rt.block_on(vfs.flush_fh(input.fh))
     } else {
-        rt.block_on(vfs.fsync(header.nodeid, input.fsync_flags & FUSE_FSYNC_FDATASYNC != 0))
+        rt.block_on(vfs.fsync(header.nodeid, is_datasync))
     };
     match result {
         Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
