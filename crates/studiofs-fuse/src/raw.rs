@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -13,8 +13,9 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{SignalHandling, signal_handlers_for_policy};
@@ -3030,51 +3031,83 @@ impl Drop for RawKernelInvalidatorRegistration {
 }
 
 struct RawFuseKernelInvalidator {
-    fd: RawFd,
+    requests: Sender<RawInvalidationRequest>,
 }
 
 impl RawFuseKernelInvalidator {
     fn new(fd: RawFd) -> io::Result<Self> {
         // SAFETY: `dup` only copies the file descriptor number and returns an
-        // independent fd that this invalidator owns and closes on drop.
+        // independent fd that the worker thread owns through `OwnedFd`.
         let fd = unsafe { libc::dup(fd) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        // SAFETY: `fd` was freshly returned by `dup` above and is not owned
+        // anywhere else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let (requests, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("studiofs-raw-fuse-invalidator".into())
+            .spawn(move || run_raw_invalidation_worker(fd, receiver))?;
+        Ok(Self { requests })
     }
 
-    fn notify_inval_inode(&self, ino: u64, off: i64, len: i64) -> io::Result<()> {
+    fn enqueue_inval_inode(&self, ino: u64, off: i64, len: i64, description: &'static str) {
         let out = NotifyInvalInodeOut { ino, off, len };
-        let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
-        write_fuse_packet_vectored_fd(self.fd, as_bytes(&header), as_bytes(&out))
+        if let Err(error) = self
+            .requests
+            .send(RawInvalidationRequest::InvalInode { out, description })
+        {
+            warn!(
+                ino,
+                error = ?error,
+                "raw FUSE inode invalidation worker is unavailable"
+            );
+        }
     }
 }
 
 impl KernelInvalidator for RawFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        if let Err(error) = self.notify_inval_inode(ino, 0, 0)
-            && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
-        {
-            debug!(ino, error = ?error, "raw FUSE inode invalidation failed");
-        }
+        self.enqueue_inval_inode(ino, 0, -1, "data");
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        if let Err(error) = self.notify_inval_inode(ino, -1, 0)
-            && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
-        {
-            debug!(ino, error = ?error, "raw FUSE inode attribute invalidation failed");
+        self.enqueue_inval_inode(ino, -1, 0, "attributes");
+    }
+}
+
+enum RawInvalidationRequest {
+    InvalInode {
+        out: NotifyInvalInodeOut,
+        description: &'static str,
+    },
+}
+
+fn run_raw_invalidation_worker(fd: OwnedFd, receiver: Receiver<RawInvalidationRequest>) {
+    while let Ok(request) = receiver.recv() {
+        match request {
+            RawInvalidationRequest::InvalInode { out, description } => {
+                if let Err(error) = notify_inval_inode_fd(fd.as_raw_fd(), out)
+                    && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
+                {
+                    warn!(
+                        ino = out.ino,
+                        off = out.off,
+                        len = out.len,
+                        error = ?error,
+                        description,
+                        "raw FUSE inode invalidation failed"
+                    );
+                }
+            }
         }
     }
 }
 
-impl Drop for RawFuseKernelInvalidator {
-    fn drop(&mut self) {
-        // SAFETY: this fd came from `dup` in `RawFuseKernelInvalidator::new`
-        // and is owned by this invalidator.
-        let _ = unsafe { libc::close(self.fd) };
-    }
+fn notify_inval_inode_fd(fd: RawFd, out: NotifyInvalInodeOut) -> io::Result<()> {
+    let header = fuse_notify_header(FUSE_NOTIFY_INVAL_INODE, size_of::<NotifyInvalInodeOut>());
+    write_fuse_packet_vectored_fd(fd, as_bytes(&header), as_bytes(&out))
 }
 
 fn unmount_raw(mount_point: &Path) -> io::Result<()> {
@@ -3183,7 +3216,7 @@ mod tests {
         let full = NotifyInvalInodeOut {
             ino: 42,
             off: 0,
-            len: 0,
+            len: -1,
         };
         let attrs_only = NotifyInvalInodeOut {
             ino: 42,
@@ -3194,7 +3227,7 @@ mod tests {
         assert_eq!(full.ino, attrs_only.ino);
         assert_eq!(full.off, 0);
         assert_eq!(attrs_only.off, -1);
-        assert_eq!(full.len, 0);
+        assert_eq!(full.len, -1);
         assert_eq!(attrs_only.len, 0);
     }
 
