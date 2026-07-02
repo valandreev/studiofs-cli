@@ -1458,7 +1458,7 @@ fn raw_fsync(
     }
     let input = read_struct::<FsyncIn>(&payload[..size_of::<FsyncIn>()])?;
     let is_datasync = (input.fsync_flags & FUSE_FSYNC_FDATASYNC) != 0;
-    let result = if input.fh != 0 {
+    let result = if input.fh != 0 && vfs.get_open_file(input.fh).is_some() {
         // flush_fh persists local dirty file data and attrs, so it is strong
         // enough for both fsync and fdatasync without waiting for publication.
         rt.block_on(vfs.flush_fh(input.fh))
