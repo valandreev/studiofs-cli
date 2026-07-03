@@ -1001,6 +1001,7 @@ fn serve_minimal_session(
     let context = RawRequestContext {
         vfs,
         runtime_handle,
+        max_write: profile.max_write as usize,
         ids,
         next_open_dir_fh: Arc::new(AtomicU64::new(1)),
         open_dir_handles: Arc::new(DashMap::new()),
@@ -1141,11 +1142,11 @@ fn owned_request_payload(
 }
 
 fn linux_should_use_owned_write_for_block(write_len: usize, block_size: usize) -> bool {
-    write_len >= block_size
+    block_size > 0 && write_len >= block_size
 }
 
-fn linux_should_use_owned_write(vfs: &StudioVfs, write_len: usize) -> bool {
-    linux_should_use_owned_write_for_block(write_len, vfs.block_size() as usize)
+fn linux_should_use_owned_write(context: &RawRequestContext, write_len: usize) -> bool {
+    linux_should_use_owned_write_for_block(write_len, context.max_write)
 }
 
 struct RawRequestJob {
@@ -1257,7 +1258,7 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
             let data = payload.slice(size_of::<WriteIn>()..);
             let write_len = (input.size as usize).min(data.len());
             let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
-            let result = if linux_should_use_owned_write(vfs, write_len) {
+            let result = if linux_should_use_owned_write(&context, write_len) {
                 vfs.write_fh_owned_with_deferred_materialize(
                     input.fh,
                     header.nodeid,
@@ -2139,6 +2140,7 @@ struct SessionIds {
 struct RawRequestContext {
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
+    max_write: usize,
     ids: SessionIds,
     next_open_dir_fh: Arc<AtomicU64>,
     open_dir_handles: Arc<DashMap<u64, RawOpenDirState>>,
@@ -3568,6 +3570,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3619,6 +3622,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3638,6 +3642,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
@@ -3681,18 +3686,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_owned_write_is_reserved_for_block_sized_payloads() {
+    fn raw_owned_write_is_reserved_for_full_fuse_writes() {
+        assert!(!linux_should_use_owned_write_for_block(0, 0));
         assert!(!linux_should_use_owned_write_for_block(
             4 * 1024,
-            4 * 1024 * 1024
+            1024 * 1024
         ));
         assert!(!linux_should_use_owned_write_for_block(
-            1024 * 1024,
-            4 * 1024 * 1024
+            1024 * 1024 - 1,
+            1024 * 1024
         ));
         assert!(linux_should_use_owned_write_for_block(
-            4 * 1024 * 1024,
-            4 * 1024 * 1024
+            1024 * 1024,
+            1024 * 1024
         ));
     }
 

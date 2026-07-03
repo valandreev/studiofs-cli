@@ -256,7 +256,7 @@ impl UploadQueue {
             .get(&ino)
             .into_iter()
             .flat_map(|ops| ops.values())
-            .any(|op| op.ino == ino && op.content_epoch > content_epoch)
+            .any(|op| op.content_epoch > content_epoch)
     }
 
     /// O(1) check whether a specific object id is currently pending upload.
