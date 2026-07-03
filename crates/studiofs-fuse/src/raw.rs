@@ -1140,6 +1140,14 @@ fn owned_request_payload(
     RecyclableRequestPayload::new(buffer, request_len, recycler).map(Bytes::from_owner)
 }
 
+fn linux_should_use_owned_write_for_block(write_len: usize, block_size: usize) -> bool {
+    write_len >= block_size
+}
+
+fn linux_should_use_owned_write(vfs: &StudioVfs, write_len: usize) -> bool {
+    linux_should_use_owned_write_for_block(write_len, vfs.block_size() as usize)
+}
+
 struct RawRequestJob {
     fd: RawFd,
     header: InHeader,
@@ -1249,8 +1257,8 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
             let data = payload.slice(size_of::<WriteIn>()..);
             let write_len = (input.size as usize).min(data.len());
             let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
-            match vfs
-                .write_fh_owned_with_deferred_materialize(
+            let result = if linux_should_use_owned_write(vfs, write_len) {
+                vfs.write_fh_owned_with_deferred_materialize(
                     input.fh,
                     header.nodeid,
                     input.offset,
@@ -1258,7 +1266,17 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
                     local_sync_policy,
                 )
                 .await
-            {
+            } else {
+                vfs.write_fh_with_deferred_materialize(
+                    input.fh,
+                    header.nodeid,
+                    input.offset,
+                    &data[..write_len],
+                    local_sync_policy,
+                )
+                .await
+            };
+            match result {
                 Ok(written) => reply_write(fd, header.unique, written, Some(&accounting)),
                 Err(err) => {
                     reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(&accounting))
@@ -3660,6 +3678,22 @@ mod tests {
         drop(view);
         let recycled = receiver.try_recv().expect("request buffer recycled");
         assert_eq!(&recycled[size_of::<InHeader>()..], b"data");
+    }
+
+    #[test]
+    fn raw_owned_write_is_reserved_for_block_sized_payloads() {
+        assert!(!linux_should_use_owned_write_for_block(
+            4 * 1024,
+            4 * 1024 * 1024
+        ));
+        assert!(!linux_should_use_owned_write_for_block(
+            1024 * 1024,
+            4 * 1024 * 1024
+        ));
+        assert!(linux_should_use_owned_write_for_block(
+            4 * 1024 * 1024,
+            4 * 1024 * 1024
+        ));
     }
 
     #[test]

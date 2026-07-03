@@ -292,6 +292,7 @@ impl UploadQueue {
             {
                 let previous = current.clone();
                 *current = op.clone();
+                Self::remove_inode_index_entry(&mut state, previous.ino, previous.object_id);
                 state
                     .by_inode
                     .entry(op.ino)
@@ -350,6 +351,7 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
+        Self::remove_inode_index_entry(&mut state, previous.ino, previous.object_id);
         state
             .by_inode
             .entry(op.ino)
@@ -374,6 +376,7 @@ impl UploadQueue {
             && current.not_before_unix_ms == failed_op.not_before_unix_ms
         {
             *current = previous.clone();
+            Self::remove_inode_index_entry(&mut state, failed_op.ino, failed_op.object_id);
             state
                 .by_inode
                 .entry(previous.ino)
@@ -471,6 +474,9 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].object_id, 77);
         assert_eq!(pending[0].content_epoch, 3);
+        let pending_for_inode = queue.snapshot_pending_for_ino(1);
+        assert_eq!(pending_for_inode.len(), 1);
+        assert_eq!(pending_for_inode[0].content_epoch, 3);
 
         assert!(queue.complete(&updated));
         assert_eq!(queue.pending_count(), 0);
