@@ -1322,20 +1322,15 @@ fn raw_open(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-    let response_flags = raw_open_response_flags(flags, trunc);
+    let response_flags = raw_open_response_flags(trunc);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
         Ok(fh) => reply_open(fd, header.unique, fh, response_flags, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
 
-fn raw_open_response_flags(flags: i32, trunc: bool) -> u32 {
-    let access_mode = flags & libc::O_ACCMODE;
-    if !trunc && access_mode == libc::O_RDONLY && flags & libc::O_APPEND == 0 {
-        FOPEN_KEEP_CACHE
-    } else {
-        0
-    }
+fn raw_open_response_flags(trunc: bool) -> u32 {
+    if !trunc { FOPEN_KEEP_CACHE } else { 0 }
 }
 
 fn raw_create(
@@ -1369,8 +1364,17 @@ fn raw_create(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    let response_flags = raw_open_response_flags(trunc);
     match vfs.open_file(attr.ino, open_flags, trunc) {
-        Ok(fh) => reply_create(fd, header.unique, &attr, fh, 0, context, Some(accounting)),
+        Ok(fh) => reply_create(
+            fd,
+            header.unique,
+            &attr,
+            fh,
+            response_flags,
+            context,
+            Some(accounting),
+        ),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -3341,18 +3345,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_open_response_keeps_kernel_cache_only_for_read_only_handles() {
-        assert_eq!(
-            raw_open_response_flags(libc::O_RDONLY, false),
-            FOPEN_KEEP_CACHE
-        );
-        assert_eq!(raw_open_response_flags(libc::O_WRONLY, false), 0);
-        assert_eq!(raw_open_response_flags(libc::O_RDWR, false), 0);
-        assert_eq!(
-            raw_open_response_flags(libc::O_RDONLY | libc::O_APPEND, false),
-            0
-        );
-        assert_eq!(raw_open_response_flags(libc::O_RDONLY, true), 0);
+    fn raw_open_response_keeps_kernel_cache_for_non_truncating_handles() {
+        assert_eq!(raw_open_response_flags(false), FOPEN_KEEP_CACHE);
+        assert_eq!(raw_open_response_flags(true), 0);
     }
 
     #[test]
