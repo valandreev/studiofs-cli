@@ -83,6 +83,9 @@ const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const RAW_DEFAULT_ATTR_BLKSIZE: u32 = 4096;
+const RAW_REGULAR_FILE_PREFERRED_IO_SIZE: u32 = 4 * 1024 * 1024;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -1319,9 +1322,19 @@ fn raw_open(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    let response_flags = raw_open_response_flags(flags, trunc);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
-        Ok(fh) => reply_open(fd, header.unique, fh, 0, Some(accounting)),
+        Ok(fh) => reply_open(fd, header.unique, fh, response_flags, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
+}
+
+fn raw_open_response_flags(flags: i32, trunc: bool) -> u32 {
+    let access_mode = flags & libc::O_ACCMODE;
+    if !trunc && access_mode == libc::O_RDONLY && flags & libc::O_APPEND == 0 {
+        FOPEN_KEEP_CACHE
+    } else {
+        0
     }
 }
 
@@ -2099,7 +2112,12 @@ struct RawDirent {
 }
 
 fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntryOut {
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        raw_attr_blksize(inode_attr),
+    );
     RawEntryOut {
         nodeid: inode_attr.ino,
         generation: 0,
@@ -2125,6 +2143,13 @@ fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntr
             blksize: bridge.blksize,
             padding: 0,
         },
+    }
+}
+
+fn raw_attr_blksize(inode_attr: &InodeAttr) -> u32 {
+    match inode_attr.kind {
+        FileType::RegularFile => RAW_REGULAR_FILE_PREFERRED_IO_SIZE,
+        FileType::Directory | FileType::Symlink => RAW_DEFAULT_ATTR_BLKSIZE,
     }
 }
 
@@ -2204,7 +2229,12 @@ fn reply_getattr(
     let attr = if let Some(vfs) = &context.vfs {
         match vfs.getattr(ino) {
             Ok(attr) => {
-                let bridge = to_bridge_attr(&attr, context.ids.uid, context.ids.gid, 4096);
+                let bridge = to_bridge_attr(
+                    &attr,
+                    context.ids.uid,
+                    context.ids.gid,
+                    raw_attr_blksize(&attr),
+                );
                 AttrOut {
                     attr_valid: 1,
                     attr_valid_nsec: 0,
@@ -2251,7 +2281,7 @@ fn reply_getattr(
                 uid: context.ids.uid,
                 gid: context.ids.gid,
                 rdev: 0,
-                blksize: 4096,
+                blksize: RAW_DEFAULT_ATTR_BLKSIZE,
                 padding: 0,
             },
         }
@@ -2337,7 +2367,12 @@ fn reply_attr(
         dummy: u32,
         attr: Attr,
     }
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        raw_attr_blksize(inode_attr),
+    );
     let out = AttrOut {
         attr_valid: 1,
         attr_valid_nsec: 0,
@@ -3303,6 +3338,46 @@ mod tests {
                 RawDispatchClass::Metadata
             );
         }
+    }
+
+    #[test]
+    fn raw_open_response_keeps_kernel_cache_only_for_read_only_handles() {
+        assert_eq!(
+            raw_open_response_flags(libc::O_RDONLY, false),
+            FOPEN_KEEP_CACHE
+        );
+        assert_eq!(raw_open_response_flags(libc::O_WRONLY, false), 0);
+        assert_eq!(raw_open_response_flags(libc::O_RDWR, false), 0);
+        assert_eq!(
+            raw_open_response_flags(libc::O_RDONLY | libc::O_APPEND, false),
+            0
+        );
+        assert_eq!(raw_open_response_flags(libc::O_RDONLY, true), 0);
+    }
+
+    #[test]
+    fn raw_regular_file_attrs_advertise_large_preferred_io_size() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds {
+                uid: 1000,
+                gid: 1000,
+            },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(DashMap::new()),
+        };
+        let file = InodeAttr::new_file(9, FUSE_ROOT_ID, 1000, 1000, 0o644);
+        let dir = InodeAttr::new_dir(10, FUSE_ROOT_ID, 1000, 1000, 0o755);
+
+        assert_eq!(
+            raw_entry_out(&file, &context).attr.blksize,
+            RAW_REGULAR_FILE_PREFERRED_IO_SIZE
+        );
+        assert_eq!(
+            raw_entry_out(&dir, &context).attr.blksize,
+            RAW_DEFAULT_ATTR_BLKSIZE
+        );
     }
 
     #[test]
