@@ -231,6 +231,7 @@ mod tests {
                 | FUSE_MAX_PAGES
                 | FUSE_PARALLEL_DIROPS
                 | FUSE_READDIRPLUS
+                | FUSE_READDIRPLUS_AUTO
                 | FUSE_FILE_OPS
                 | FUSE_AUTO_INVAL_DATA
                 | FUSE_EXPLICIT_INVAL_DATA
@@ -253,12 +254,17 @@ mod tests {
                 | FUSE_BIG_WRITES
                 | FUSE_MAX_PAGES
                 | FUSE_PARALLEL_DIROPS
+                | FUSE_READDIRPLUS
+                | FUSE_READDIRPLUS_AUTO
                 | FUSE_FILE_OPS
                 | FUSE_EXPLICIT_INVAL_DATA
                 | FUSE_WRITEBACK_CACHE
         );
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, FUSE_READDIRPLUS);
+        assert_eq!(
+            negotiated.out.flags & FUSE_READDIRPLUS_AUTO,
+            FUSE_READDIRPLUS_AUTO
+        );
     }
 
     #[test]
@@ -282,7 +288,8 @@ mod tests {
         );
         assert!(negotiated.degraded.contains(&FUSE_MAX_PAGES));
         assert!(negotiated.degraded.contains(&FUSE_PARALLEL_DIROPS));
-        assert!(!negotiated.degraded.contains(&FUSE_READDIRPLUS));
+        assert!(negotiated.degraded.contains(&FUSE_READDIRPLUS));
+        assert!(negotiated.degraded.contains(&FUSE_READDIRPLUS_AUTO));
         assert!(negotiated.degraded.contains(&FUSE_FILE_OPS));
     }
 }

@@ -23,7 +23,8 @@ use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot,
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs,
+    VfsFuseAsyncWriteSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
@@ -83,6 +84,9 @@ const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const LINUX_DEFAULT_IO_SIZE: u32 = 4096;
+const LINUX_REGULAR_FILE_IO_SIZE: u32 = 4 * 1024 * 1024;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -98,20 +102,20 @@ pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_FILE_OPS: u32 = 1 << 2;
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
 pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
-#[cfg(test)]
 pub const FUSE_READDIRPLUS: u32 = 1 << 13;
-#[cfg(test)]
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 
-const WANTED_CAPS: [u32; 6] = [
+const WANTED_CAPS: [u32; 8] = [
     FUSE_ASYNC_READ,
     FUSE_BIG_WRITES,
     FUSE_MAX_PAGES,
     FUSE_PARALLEL_DIROPS,
+    FUSE_READDIRPLUS,
+    FUSE_READDIRPLUS_AUTO,
     FUSE_FILE_OPS,
     FUSE_EXPLICIT_INVAL_DATA,
 ];
@@ -1181,13 +1185,14 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
             let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
             let data = &payload[size_of::<WriteIn>()..];
             let write_len = (input.size as usize).min(data.len());
+            let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
             match vfs
                 .write_fh_with_deferred_materialize(
                     input.fh,
                     header.nodeid,
                     input.offset,
                     &data[..write_len],
-                    LocalSyncPolicy::Opportunistic,
+                    local_sync_policy,
                 )
                 .await
             {
@@ -1320,7 +1325,13 @@ fn raw_open(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
-        Ok(fh) => reply_open(fd, header.unique, fh, 0, Some(accounting)),
+        Ok(fh) => reply_open(
+            fd,
+            header.unique,
+            fh,
+            linux_open_flags_for_posix(flags, trunc),
+            Some(accounting),
+        ),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1357,7 +1368,15 @@ fn raw_create(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(attr.ino, open_flags, trunc) {
-        Ok(fh) => reply_create(fd, header.unique, &attr, fh, 0, context, Some(accounting)),
+        Ok(fh) => reply_create(
+            fd,
+            header.unique,
+            &attr,
+            fh,
+            linux_open_flags_for_posix(flags, trunc),
+            context,
+            Some(accounting),
+        ),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1610,12 +1629,13 @@ fn raw_write(
     let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
     let data = &payload[size_of::<WriteIn>()..];
     let write_len = (input.size as usize).min(data.len());
+    let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
     match rt.block_on(vfs.write_fh_with_deferred_materialize(
         input.fh,
         header.nodeid,
         input.offset,
         &data[..write_len],
-        LocalSyncPolicy::Opportunistic,
+        local_sync_policy,
     )) {
         Ok(written) => reply_write(fd, header.unique, written, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
@@ -2098,8 +2118,42 @@ struct RawDirent {
     dtype: u32,
 }
 
+fn linux_open_flags_for_posix(flags: i32, trunc: bool) -> u32 {
+    let access = flags & libc::O_ACCMODE;
+    let read_only = access == libc::O_RDONLY;
+    let append = flags & libc::O_APPEND != 0;
+    if read_only && !append && !trunc {
+        FOPEN_KEEP_CACHE
+    } else {
+        0
+    }
+}
+
+fn linux_attr_blksize(attr: &InodeAttr) -> u32 {
+    match attr.kind {
+        FileType::RegularFile => LINUX_REGULAR_FILE_IO_SIZE,
+        FileType::Directory | FileType::Symlink => LINUX_DEFAULT_IO_SIZE,
+    }
+}
+
+fn linux_write_sync_policy(vfs: &StudioVfs, fh: u64) -> LocalSyncPolicy {
+    if vfs
+        .get_open_file(fh)
+        .is_some_and(|open_file| open_file.flags.contains(OpenFlags::SYNC))
+    {
+        LocalSyncPolicy::WriteThrough
+    } else {
+        LocalSyncPolicy::Opportunistic
+    }
+}
+
 fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntryOut {
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        linux_attr_blksize(inode_attr),
+    );
     RawEntryOut {
         nodeid: inode_attr.ino,
         generation: 0,
@@ -2204,7 +2258,12 @@ fn reply_getattr(
     let attr = if let Some(vfs) = &context.vfs {
         match vfs.getattr(ino) {
             Ok(attr) => {
-                let bridge = to_bridge_attr(&attr, context.ids.uid, context.ids.gid, 4096);
+                let bridge = to_bridge_attr(
+                    &attr,
+                    context.ids.uid,
+                    context.ids.gid,
+                    linux_attr_blksize(&attr),
+                );
                 AttrOut {
                     attr_valid: 1,
                     attr_valid_nsec: 0,
@@ -2337,7 +2396,12 @@ fn reply_attr(
         dummy: u32,
         attr: Attr,
     }
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        linux_attr_blksize(inode_attr),
+    );
     let out = AttrOut {
         attr_valid: 1,
         attr_valid_nsec: 0,
@@ -3372,7 +3436,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_does_not_advertise_readdirplus_without_direntplus_support() {
+    fn raw_init_advertises_readdirplus_when_kernel_supports_it() {
         let negotiated = LinuxRawFuseProfile::juicefs_like().negotiate_init(InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
@@ -3380,8 +3444,11 @@ mod tests {
             flags: u32::MAX,
         });
 
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, FUSE_READDIRPLUS);
+        assert_eq!(
+            negotiated.out.flags & FUSE_READDIRPLUS_AUTO,
+            FUSE_READDIRPLUS_AUTO
+        );
     }
 
     #[test]
@@ -3450,6 +3517,39 @@ mod tests {
             (second.ino, second.off, &out[second_name..second_name + 2]),
             (FUSE_ROOT_ID, 2, &b".."[..])
         );
+    }
+
+    #[test]
+    fn raw_read_only_open_keeps_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDONLY, false);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
+    fn raw_write_capable_open_does_not_keep_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDWR, false);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+    }
+
+    #[test]
+    fn raw_regular_file_attrs_report_four_mib_preferred_io_size() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            ids: SessionIds {
+                uid: 1000,
+                gid: 1000,
+            },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(DashMap::new()),
+        };
+        let attr = InodeAttr::new_file(9, FUSE_ROOT_ID, 1000, 1000, 0o644);
+
+        let out = raw_entry_out(&attr, &context);
+
+        assert_eq!(out.attr.blksize, 4 * 1024 * 1024);
     }
 
     #[test]
