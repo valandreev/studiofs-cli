@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -987,7 +987,7 @@ fn serve_minimal_session(
             .send(vec![0_u8; buffer_size])
             .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))?;
     }
-    let mut buf = recv_request_buffer(&recycled_buffers)?;
+    let mut buf = recv_request_buffer(&recycled_buffers, buffer_size)?;
     let ids = SessionIds {
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         uid: unsafe { libc::geteuid() },
@@ -1041,7 +1041,10 @@ fn serve_minimal_session(
             )?;
             continue;
         }
-        let request_buf = std::mem::replace(&mut buf, recv_request_buffer(&recycled_buffers)?);
+        let request_buf = std::mem::replace(
+            &mut buf,
+            recv_request_buffer(&recycled_buffers, buffer_size)?,
+        );
         dispatch_minimal_request(
             fd,
             header,
@@ -1056,10 +1059,18 @@ fn serve_minimal_session(
     session_result
 }
 
-fn recv_request_buffer(receiver: &Receiver<Vec<u8>>) -> io::Result<Vec<u8>> {
-    receiver
-        .recv()
-        .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))
+fn recv_request_buffer(receiver: &Receiver<Vec<u8>>, buffer_size: usize) -> io::Result<Vec<u8>> {
+    match receiver.try_recv() {
+        Ok(buffer) => Ok(buffer),
+        Err(TryRecvError::Empty) => {
+            debug!(
+                buffer_size,
+                "raw FUSE request buffer pool empty; allocating spillover buffer"
+            );
+            Ok(vec![0_u8; buffer_size])
+        }
+        Err(TryRecvError::Disconnected) => Err(io::Error::other("raw FUSE buffer pool closed")),
+    }
 }
 
 struct RecycledRequestBuffer {
@@ -3661,6 +3672,20 @@ mod tests {
         drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
 
         assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn raw_recv_request_buffer_spills_over_when_pool_is_empty() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(vec![1, 2, 3]).unwrap();
+
+        assert_eq!(recv_request_buffer(&receiver, 8).unwrap(), vec![1, 2, 3]);
+
+        let spillover = recv_request_buffer(&receiver, 8).unwrap();
+        assert_eq!(spillover, vec![0; 8]);
+
+        drop(sender);
+        assert!(recv_request_buffer(&receiver, 8).is_err());
     }
 
     #[test]

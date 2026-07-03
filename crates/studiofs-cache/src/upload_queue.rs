@@ -5,7 +5,7 @@
 //! startup replay is reconstructed from the local backend + metadata mapping.
 
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -53,10 +53,10 @@ pub struct UploadQueue {
 ///
 /// Both maps are guarded by the same mutex so that `has_pending_for_ino`
 /// never observes an inconsistent state where a payload object exists in the
-/// object-id index but the per-inode counter has not yet been bumped.
+/// object-id index but the per-inode index has not yet been updated.
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
-    by_inode: BTreeMap<Ino, BTreeMap<u64, PendingUpload>>,
+    by_inode: BTreeMap<Ino, BTreeSet<u64>>,
 }
 
 enum PendingSubmit {
@@ -237,7 +237,12 @@ impl UploadQueue {
         let mut ops: Vec<_> = state
             .by_inode
             .get(&ino)
-            .map(|ops| ops.values().cloned().collect())
+            .map(|object_ids| {
+                object_ids
+                    .iter()
+                    .filter_map(|object_id| state.by_object.get(object_id).cloned())
+                    .collect()
+            })
             .unwrap_or_default();
         ops.sort_by_key(|op: &PendingUpload| (op.created_unix_ms, op.object_id));
         ops
@@ -255,7 +260,8 @@ impl UploadQueue {
             .by_inode
             .get(&ino)
             .into_iter()
-            .flat_map(|ops| ops.values())
+            .flat_map(|object_ids| object_ids.iter())
+            .filter_map(|object_id| state.by_object.get(object_id))
             .any(|op| op.content_epoch > content_epoch)
     }
 
@@ -297,7 +303,7 @@ impl UploadQueue {
                     .by_inode
                     .entry(op.ino)
                     .or_default()
-                    .insert(op.object_id, op);
+                    .insert(op.object_id);
                 return PendingSubmit::Updated(previous);
             }
             return PendingSubmit::Ignored;
@@ -305,11 +311,7 @@ impl UploadQueue {
 
         let ino = op.ino;
         state.by_object.insert(op.object_id, op.clone());
-        state
-            .by_inode
-            .entry(ino)
-            .or_default()
-            .insert(op.object_id, op);
+        state.by_inode.entry(ino).or_default().insert(op.object_id);
         PendingSubmit::New
     }
 
@@ -356,7 +358,7 @@ impl UploadQueue {
             .by_inode
             .entry(op.ino)
             .or_default()
-            .insert(op.object_id, op.clone());
+            .insert(op.object_id);
         Some(previous)
     }
 
@@ -381,7 +383,7 @@ impl UploadQueue {
                 .by_inode
                 .entry(previous.ino)
                 .or_default()
-                .insert(previous.object_id, previous);
+                .insert(previous.object_id);
         }
     }
 

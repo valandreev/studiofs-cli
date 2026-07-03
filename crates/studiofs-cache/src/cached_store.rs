@@ -1381,12 +1381,13 @@ impl CachedStoreWriterSlice {
                 self.dirty_len += take;
                 continue;
             }
+            if data.len() <= self.config.page_size {
+                self.dirty_len += data.len();
+                self.pages.push_back(WriterPage::Owned(data));
+                break;
+            }
             let take = data.len().min(self.config.page_size);
-            let page = if take == data.len() {
-                std::mem::take(&mut data)
-            } else {
-                data.split_to(take)
-            };
+            let page = data.split_to(take);
             self.dirty_len += page.len();
             self.pages.push_back(WriterPage::Owned(page));
         }
