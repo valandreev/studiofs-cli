@@ -191,6 +191,12 @@ impl StudioVfs {
         }
 
         if changed {
+            if attr.kind == FileType::RegularFile
+                && attr.upload_state == studiofs_meta::UploadState::Ready
+            {
+                attr.content_epoch = attr.content_epoch.saturating_add(1);
+                attr.upload_state = studiofs_meta::UploadState::Updating;
+            }
             attr.touch_ctime();
             self.state
                 .namespace
@@ -198,8 +204,6 @@ impl StudioVfs {
                 .lock()
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.sync_meta().set_attr(&attr)?;
-            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
@@ -218,7 +222,8 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
-            let candidate_old_attr = if defer_handle_growth_flush {
+            let full_truncate_to_zero = args.size == Some(0);
+            let candidate_old_attr = if defer_handle_growth_flush || full_truncate_to_zero {
                 Some(self.getattr_async(ino).await?)
             } else {
                 None
@@ -236,8 +241,8 @@ impl StudioVfs {
                                 )
                                 && !self.inode_has_unmaterialized_overlay_for_finalize(ino)))
                 });
-            let old_attr = if defer_strict_flush_for_growth {
-                candidate_old_attr.expect("candidate attr present for deferred growth")
+            let old_attr = if defer_strict_flush_for_growth || full_truncate_to_zero {
+                candidate_old_attr.expect("candidate attr present for deferred size change")
             } else {
                 let persisted_slice_bytes_before_flush =
                     self.total_pending_persisted_local_dirty_slice_bytes();
@@ -329,6 +334,9 @@ impl StudioVfs {
             if !defer_strict_flush_for_growth {
                 let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
                     Ok(()) => {
+                        if full_truncate_to_zero {
+                            self.discard_full_truncate_buffered_state(ino);
+                        }
                         self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
                             .await
                     }
@@ -358,6 +366,9 @@ impl StudioVfs {
                 }
             }
             self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
+            if full_truncate_to_zero {
+                self.discard_full_truncate_buffered_state(ino);
+            }
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
             Ok(attr)
         }
@@ -365,6 +376,18 @@ impl StudioVfs {
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
+    }
+
+    fn discard_full_truncate_buffered_state(&self, ino: Ino) {
+        self.cancel_pending_uploads_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
+        self.state.writer_stack.clear_inode(ino);
+        self.state.deferred_materialize_inflight.remove(ino);
+        self.remove_pending_epoch_finalizations_for_inode(ino);
+        self.state
+            .writer_stack_prefetched_object_ids
+            .lock()
+            .retain(|range| range.ino != ino);
     }
 
     fn inode_has_materialized_publish_work(&self, ino: Ino, content_epoch: u64) -> bool {

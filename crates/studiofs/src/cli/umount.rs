@@ -266,8 +266,18 @@ fn unmount_unix_with_detach(
 
     detach(mount_point, timing.detach_timeout)?;
 
-    // Send SIGTERM after detaching the kernel mount so the FUSE background
-    // thread can return naturally instead of unmounting from inside shutdown.
+    let deadline = Instant::now() + timing.timeout;
+    loop {
+        std::thread::sleep(timing.poll_interval);
+        if !is_mount_active(mount_point)? {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+
+    tracing::warn!("mount process did not release lifecycle lock after detach — sending SIGTERM");
     if let Err(err) = signal(pid, libc::SIGTERM) {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(()); // already gone
@@ -291,7 +301,7 @@ fn unmount_unix_with_detach(
             break; // gone
         }
         if Instant::now() > deadline {
-            tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
+            tracing::warn!("mount process did not exit after SIGTERM — sending SIGKILL");
             let _ = signal(pid, libc::SIGKILL);
             std::thread::sleep(timing.poll_interval);
             if is_mount_active(mount_point)? {
@@ -506,8 +516,8 @@ mod tests {
         );
         assert_eq!(
             *unix_signal_log().lock().unwrap(),
-            vec![libc::SIGTERM],
-            "inactive mountpoint should not wait for kill(pid, 0) or send SIGKILL"
+            Vec::<libc::c_int>::new(),
+            "inactive mountpoint should not signal a process that is already tearing down cleanly"
         );
     }
 
@@ -541,7 +551,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_unmount_detaches_mount_before_signaling_mount_process() {
+    fn unix_unmount_waits_for_detached_mount_before_signaling_mount_process() {
         use std::time::Duration;
 
         let _guard = unix_test_lock();
@@ -567,8 +577,8 @@ mod tests {
         );
         assert_eq!(
             *unix_event_log().lock().unwrap(),
-            vec!["detach", "signal"],
-            "FUSE mount must be detached before the mount process receives SIGTERM"
+            vec!["detach"],
+            "FUSE detach should be allowed to drive graceful teardown without SIGTERM"
         );
     }
 }

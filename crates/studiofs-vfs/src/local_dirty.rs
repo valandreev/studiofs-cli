@@ -750,34 +750,33 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .cloned();
         }
 
-        if let Some(attr) = dirty_attr
-            && (!matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
-                || !self
-                    .vfs
-                    .has_pending_local_dirty_payloads_for_inode(self.ino))
-        {
-            if self
-                .vfs
-                .discard_stale_zero_size_dirty_attr_after_current_publish(self.ino, &attr)
-                .await?
-            {
-                return Ok(());
-            }
-            let _ = self
-                .drain
-                .execute_drain(
-                    self.ino,
-                    Vec::new(),
-                    Default::default(),
-                    attr.content_epoch,
-                    Some(attr),
-                    PayloadPersistConfig {
-                        put_concurrency: self.drain.put_concurrency,
-                        local_sync_policy,
-                    },
-                )
-                .await?;
+        let Some(attr) = dirty_attr else {
+            return Ok(());
+        };
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            return Ok(());
         }
+        if self
+            .vfs
+            .discard_stale_zero_size_dirty_attr_after_current_publish(self.ino, &attr)
+            .await?
+        {
+            return Ok(());
+        }
+        let _ = self
+            .drain
+            .execute_drain(
+                self.ino,
+                Vec::new(),
+                Default::default(),
+                attr.content_epoch,
+                Some(attr),
+                PayloadPersistConfig {
+                    put_concurrency: self.drain.put_concurrency,
+                    local_sync_policy,
+                },
+            )
+            .await?;
 
         Ok(())
     }
@@ -1412,6 +1411,10 @@ impl StudioVfs {
         ordered
     }
 
+    pub(super) fn background_dirty_inodes_by_priority(&self) -> Vec<Ino> {
+        self.snapshot_pending_local_dirty_inodes()
+    }
+
     pub(super) fn total_pending_persisted_local_dirty_slice_bytes(&self) -> usize {
         self.state
             .local_dirty
@@ -1847,6 +1850,9 @@ impl StudioVfs {
 
     pub(super) fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
         if self.has_pending_local_dirty_payloads_for_inode(ino) {
+            return;
+        }
+        if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
             return;
         }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();

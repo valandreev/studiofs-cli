@@ -205,6 +205,8 @@ const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const DEFERRED_MATERIALIZATION_START_GRACE_MS: u64 = 60_000;
+const DEFERRED_RELEASE_START_GRACE_MS: u64 = 250;
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 200;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
@@ -214,7 +216,7 @@ const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
-const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DELAY_START_MS: u64 = 0;
 const SUSTAINED_WRITE_DELAY_STEP_MS: u64 = 1_500;
 const SUSTAINED_WRITE_MAX_DELAY_MS: u64 = 8;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
@@ -309,11 +311,15 @@ impl SustainedWriteState {
         self.last_end_offset = end_offset;
 
         let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
+        let drain_pressure = dirty_bytes_after_write > drain_chunk_bytes;
         SustainedWriteAdmission {
             duration_ms,
-            delay_ms: sustained_write_delay_ms(duration_ms),
-            pre_drain: duration_ms >= SUSTAINED_WRITE_DELAY_START_MS
-                && dirty_bytes_after_write > drain_chunk_bytes,
+            delay_ms: if drain_pressure {
+                sustained_write_delay_ms(duration_ms)
+            } else {
+                0
+            },
+            pre_drain: drain_pressure,
         }
     }
 }
@@ -476,9 +482,6 @@ impl WriteAdmissionGovernor {
 }
 
 fn sustained_write_delay_ms(duration_ms: u64) -> u64 {
-    if duration_ms < SUSTAINED_WRITE_DELAY_START_MS {
-        return 0;
-    }
     duration_ms
         .saturating_sub(SUSTAINED_WRITE_DELAY_START_MS)
         .saturating_div(SUSTAINED_WRITE_DELAY_STEP_MS)
@@ -2764,6 +2767,17 @@ impl DeferredInodeGate {
 
     fn contains(&self, ino: Ino) -> bool {
         self.entries.lock().contains_key(&ino)
+    }
+
+    fn is_current(&self, current_entry: &DeferredInodeGateEntry) -> bool {
+        self.entries
+            .lock()
+            .get(&current_entry.ino)
+            .is_some_and(|task_lock| Arc::ptr_eq(task_lock, &current_entry.task_lock))
+    }
+
+    fn remove(&self, ino: Ino) -> bool {
+        self.entries.lock().remove(&ino).is_some()
     }
 
     #[cfg(test)]
@@ -8292,6 +8306,7 @@ impl StudioVfs {
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
+            self.cancel_deferred_release_for_truncate(ino);
             read_context = ReadRequestContext::from_attr(
                 self,
                 ino,

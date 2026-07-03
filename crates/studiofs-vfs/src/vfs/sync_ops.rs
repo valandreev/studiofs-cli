@@ -155,6 +155,12 @@ impl StudioVfs {
         (entry, guard)
     }
 
+    pub(super) fn cancel_deferred_release_for_truncate(&self, ino: Ino) {
+        if self.state.deferred_release_inflight.remove(ino) {
+            debug!(ino, "canceled deferred last-handle release before truncate");
+        }
+    }
+
     fn observe_sustained_write_admission(
         &self,
         ino: Ino,
@@ -301,7 +307,25 @@ impl StudioVfs {
             let ino = entry.ino;
             let mut allow_reschedule_on_exit = true;
             let mut no_progress_retries = 0usize;
+            let mut remaining_grace_ms = super::DEFERRED_MATERIALIZATION_START_GRACE_MS;
+            while remaining_grace_ms > 0
+                && vfs.total_pending_write_buffer_bytes() <= vfs.write_eager_flush_drain_chunk_bytes
+            {
+                if vfs.shutdown_requested()
+                    || !vfs.state.deferred_materialize_inflight.is_current(&entry)
+                {
+                    allow_reschedule_on_exit = false;
+                    break;
+                }
+                let sleep_ms = remaining_grace_ms.min(25);
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                remaining_grace_ms = remaining_grace_ms.saturating_sub(sleep_ms);
+            }
             loop {
+                if !vfs.state.deferred_materialize_inflight.is_current(&entry) {
+                    allow_reschedule_on_exit = false;
+                    break;
+                }
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let dirty_before = writer_stack_dirty_before;
                 let total_before = vfs.total_pending_write_buffer_bytes();
@@ -459,7 +483,14 @@ impl StudioVfs {
                     .await;
                     continue;
                 }
-                if !made_progress || !completed_blocks_remain {
+                if !made_progress {
+                    break;
+                }
+                if !completed_blocks_remain {
+                    if vfs.should_linger_clean_deferred_materialization(ino) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -718,7 +749,15 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(
+                super::DEFERRED_RELEASE_START_GRACE_MS,
+            ))
+            .await;
+            if !vfs.state.deferred_release_inflight.is_current(&barrier) {
+                drop(barrier);
+                drop(guard);
+                return;
+            }
             let session = vfs
                 .state
                 .file_session
@@ -742,6 +781,73 @@ impl StudioVfs {
         ReleaseFhOutcome {
             closed_last_handle: true,
             flushed_local_dirty_state,
+        }
+    }
+
+    /// Release a FUSE writeback handle without turning close into a per-file
+    /// local-sync barrier.
+    ///
+    /// Linux sends FUSE_FLUSH/RELEASE for ordinary close(2). In writeback mode
+    /// that must stay local-first: data already accepted into the writer stack
+    /// is drained by the shared materialization workers or by explicit fsync,
+    /// not by every close callback.
+    pub fn release_fh_with_fuse_writeback_release(
+        self: &Arc<Self>,
+        fh: u64,
+        runtime: &tokio::runtime::Handle,
+    ) -> ReleaseFhOutcome {
+        let Some(context) = self.close_handle_for_release(fh) else {
+            return ReleaseFhOutcome::default();
+        };
+        let ino = context.ino;
+        let action = self.take_last_handle_release_action(&context);
+        match action {
+            LastHandleReleaseAction::IgnoredEntry => {
+                self.state.file_session.gc_if_idle(ino);
+                ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                }
+            }
+            LastHandleReleaseAction::Clean => {
+                self.state.file_session.gc_if_idle(ino);
+                ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                }
+            }
+            LastHandleReleaseAction::LocalSync { .. } => {
+                if self.state.writer_stack.has_dirty_writers(ino) {
+                    let vfs = Arc::clone(self);
+                    self.track_background_task(runtime.spawn(async move {
+                        vfs.spawn_deferred_materialization_if_needed(ino).await;
+                        vfs.state.file_session.gc_if_idle(ino);
+                    }));
+                } else {
+                    self.state.file_session.gc_if_idle(ino);
+                }
+                ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                }
+            }
+            LastHandleReleaseAction::OrphanCleanup => {
+                let vfs = Arc::clone(self);
+                self.track_background_task(runtime.spawn(async move {
+                    if let Err(error) = vfs.cleanup_orphan_on_last_handle_close(ino).await {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "deferred FUSE orphan cleanup failed"
+                        );
+                    }
+                    vfs.state.file_session.gc_if_idle(ino);
+                }));
+                ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                }
+            }
         }
     }
 

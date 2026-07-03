@@ -68,14 +68,12 @@ impl PgMetaEngine {
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        let event_start = state.event_start.unwrap_or(before_seq);
-        let events = self.local.read_events_range(event_start, after_seq)?;
+        let events = self.local.read_events_range(before_seq, after_seq)?;
         let projected = RemoteApplyCoordinator::project_local_batch(&events);
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
-                state.ops = 0;
-                state.force_flush = false;
-                state.event_start = Some(event_start);
+                state.event_start = Some(state.event_start.unwrap_or(before_seq));
+                state.ops = state.ops.max(1);
                 state.event_end = state.event_end.max(after_seq);
                 state.last_mutation_at = Some(now);
                 if state.started_at.is_none() {
@@ -101,11 +99,11 @@ impl PgMetaEngine {
         if state.ops == 0 {
             state.started_at = Some(now);
         }
-        state.ops = projected.visible_ops;
+        state.ops = state.ops.saturating_add(projected.visible_ops);
         state.last_mutation_at = Some(now);
-        state.event_start = Some(event_start);
+        state.event_start = Some(state.event_start.unwrap_or(before_seq));
         state.event_end = state.event_end.max(after_seq);
-        state.force_flush = projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
+        state.force_flush |= projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
         Ok(projected.needs_eager_flush)
     }
 

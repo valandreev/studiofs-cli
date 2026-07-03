@@ -211,7 +211,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-            let dirty_inodes = self.snapshot_pending_local_dirty_inodes();
+            let dirty_inodes = self.background_dirty_inodes_by_priority();
             if dirty_inodes.is_empty() {
                 continue;
             }
@@ -222,11 +222,6 @@ impl StudioVfs {
                 if !self.should_background_flush_pending_local_dirty_inode(ino) {
                     continue;
                 }
-                let session = self
-                    .state
-                    .file_session
-                    .enter_op(ino, FileSessionOperation::Materialize)
-                    .await;
                 let flush_result = async {
                     if self.shutdown_requested()
                         || !self.should_background_flush_pending_local_dirty_inode(ino)
@@ -237,8 +232,6 @@ impl StudioVfs {
                         .await
                 }
                 .await;
-                drop(session);
-                self.state.file_session.gc_if_idle(ino);
                 if let Err(error) = flush_result {
                     warn!(
                         ino,
@@ -893,6 +886,13 @@ impl StudioVfs {
                     pending_uploads = %pending_uploads_human,
                     active_uploads,
                     pending_metadata_ops,
+                    inflight_metadata_ops = metadata_backlog.inflight_ops,
+                    writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes(),
+                    dirty_mem_bytes = ingress.dirty_mem_bytes,
+                    write_backpressure_events = ingress.write_backpressure_events,
+                    write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
+                    upload_scheduler_penalty_ms = self.upload_scheduler.adaptive_penalty_ms(),
+                    upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
                     "upload pipeline"
                 );
                 match upload_trouble_signal {
