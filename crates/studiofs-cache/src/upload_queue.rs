@@ -56,7 +56,7 @@ pub struct UploadQueue {
 /// object-id index but the per-inode counter has not yet been bumped.
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
-    ino_counts: BTreeMap<Ino, usize>,
+    by_inode: BTreeMap<Ino, BTreeMap<u64, PendingUpload>>,
 }
 
 enum PendingSubmit {
@@ -84,7 +84,7 @@ impl UploadQueue {
             pending_count: AtomicUsize::new(0),
             pending_state: Mutex::new(PendingState {
                 by_object: BTreeMap::new(),
-                ino_counts: BTreeMap::new(),
+                by_inode: BTreeMap::new(),
             }),
             idle_notify,
             shutdown_requested: AtomicBool::new(false),
@@ -231,17 +231,31 @@ impl UploadQueue {
         ops
     }
 
+    /// Snapshot currently pending upload ops for one inode.
+    pub fn snapshot_pending_for_ino(&self, ino: Ino) -> Vec<PendingUpload> {
+        let state = self.pending_state.lock();
+        let mut ops: Vec<_> = state
+            .by_inode
+            .get(&ino)
+            .map(|ops| ops.values().cloned().collect())
+            .unwrap_or_default();
+        ops.sort_by_key(|op: &PendingUpload| (op.created_unix_ms, op.object_id));
+        ops
+    }
+
     /// O(1) check whether any pending uploads reference the given inode.
     pub fn has_pending_for_ino(&self, ino: Ino) -> bool {
-        self.pending_state.lock().ino_counts.contains_key(&ino)
+        self.pending_state.lock().by_inode.contains_key(&ino)
     }
 
     /// Check whether any pending upload for `ino` belongs to a newer content epoch.
     pub fn has_pending_for_ino_newer_than(&self, ino: Ino, content_epoch: u64) -> bool {
         let state = self.pending_state.lock();
         state
-            .by_object
-            .values()
+            .by_inode
+            .get(&ino)
+            .into_iter()
+            .flat_map(|ops| ops.values())
             .any(|op| op.ino == ino && op.content_epoch > content_epoch)
     }
 
@@ -277,28 +291,31 @@ impl UploadQueue {
                 && op.content_epoch > current.content_epoch
             {
                 let previous = current.clone();
-                *current = op;
+                *current = op.clone();
+                state
+                    .by_inode
+                    .entry(op.ino)
+                    .or_default()
+                    .insert(op.object_id, op);
                 return PendingSubmit::Updated(previous);
             }
             return PendingSubmit::Ignored;
         }
 
         let ino = op.ino;
-        state.by_object.insert(op.object_id, op);
-        *state.ino_counts.entry(ino).or_insert(0) += 1;
+        state.by_object.insert(op.object_id, op.clone());
+        state
+            .by_inode
+            .entry(ino)
+            .or_default()
+            .insert(op.object_id, op);
         PendingSubmit::New
     }
 
     fn remove_pending(&self, object_id: u64) -> bool {
         let mut state = self.pending_state.lock();
-        if let Some(removed) = state.by_object.remove(&object_id)
-            && let std::collections::btree_map::Entry::Occupied(mut e) =
-                state.ino_counts.entry(removed.ino)
-        {
-            *e.get_mut() -= 1;
-            if *e.get() == 0 {
-                e.remove_entry();
-            }
+        if let Some(removed) = state.by_object.remove(&object_id) {
+            Self::remove_inode_index_entry(&mut state, removed.ino, object_id);
             return true;
         }
         false
@@ -315,14 +332,8 @@ impl UploadQueue {
         {
             return false;
         }
-        if let Some(removed) = state.by_object.remove(&op.object_id)
-            && let std::collections::btree_map::Entry::Occupied(mut e) =
-                state.ino_counts.entry(removed.ino)
-        {
-            *e.get_mut() -= 1;
-            if *e.get() == 0 {
-                e.remove_entry();
-            }
+        if let Some(removed) = state.by_object.remove(&op.object_id) {
+            Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
             return true;
         }
         false
@@ -339,6 +350,11 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
+        state
+            .by_inode
+            .entry(op.ino)
+            .or_default()
+            .insert(op.object_id, op.clone());
         Some(previous)
     }
 
@@ -357,7 +373,21 @@ impl UploadQueue {
             && current.retry_count == failed_op.retry_count
             && current.not_before_unix_ms == failed_op.not_before_unix_ms
         {
-            *current = previous;
+            *current = previous.clone();
+            state
+                .by_inode
+                .entry(previous.ino)
+                .or_default()
+                .insert(previous.object_id, previous);
+        }
+    }
+
+    fn remove_inode_index_entry(state: &mut PendingState, ino: Ino, object_id: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = state.by_inode.entry(ino) {
+            entry.get_mut().remove(&object_id);
+            if entry.get().is_empty() {
+                entry.remove_entry();
+            }
         }
     }
 }
@@ -444,6 +474,34 @@ mod tests {
 
         assert!(queue.complete(&updated));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_pending_for_ino_tracks_only_that_inode() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        queue.submit(11, 0, 101, 1);
+        queue.submit(10, 4096, 102, 1);
+
+        let pending = queue.snapshot_pending_for_ino(10);
+        assert_eq!(
+            pending.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![100, 102]
+        );
+
+        let first = rx.recv().await.unwrap();
+        assert!(queue.complete(&first));
+        assert_eq!(
+            queue
+                .snapshot_pending_for_ino(10)
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![102]
+        );
+        assert!(!queue.snapshot_pending_for_ino(11).is_empty());
     }
 
     #[tokio::test]

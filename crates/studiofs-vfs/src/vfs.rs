@@ -3247,6 +3247,10 @@ impl StudioVfs {
         self.cached_store.snapshot_pending_uploads()
     }
 
+    pub(crate) fn pending_uploads_snapshot_for_inode(&self, ino: Ino) -> Vec<PendingUpload> {
+        self.cached_store.snapshot_pending_uploads_for_ino(ino)
+    }
+
     fn attr_read_cache_snapshot(metrics: AttrReadCacheMetrics) -> VfsAttrReadCacheSnapshot {
         VfsAttrReadCacheSnapshot {
             hits: metrics.hits,
@@ -5216,9 +5220,8 @@ impl StudioVfs {
     /// Return pending uploads for an inode as `(offset, object_id, content_epoch)`.
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
-            .pending_uploads_snapshot()
+            .pending_uploads_snapshot_for_inode(ino)
             .into_iter()
-            .filter(|op| op.ino == ino)
             .map(|op| (op.offset, op.object_id, op.content_epoch))
             .collect();
         out.sort_by_key(|(offset, _, _)| *offset);

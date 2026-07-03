@@ -454,7 +454,7 @@ impl<'a> DataReader<'a> {
                     && pending_upload_index.is_none()
                     && vfs.cached_store.has_pending_uploads_for_ino(ino)
                 {
-                    pending_upload_index = Some(vfs.snapshot_pending_upload_index());
+                    pending_upload_index = Some(vfs.snapshot_pending_upload_index_for_inode(ino));
                     source = vfs.pending_overlay_block_source(
                         ino,
                         block_index,

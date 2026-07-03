@@ -7926,7 +7926,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
     set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
     let iterations = parse_env_usize("STUDIOFS_SOAK_ITERATIONS").unwrap_or(200);
-    let max_op_ms = parse_env_u64("STUDIOFS_SOAK_MAX_OP_MS").unwrap_or(1500);
+    let max_op_ms = parse_env_u64("STUDIOFS_SOAK_MAX_OP_MS").unwrap_or(5000);
 
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");

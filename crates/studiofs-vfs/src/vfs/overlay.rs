@@ -139,6 +139,10 @@ impl StudioVfs {
         PendingUploadCatalog::from_ops(self.pending_uploads_snapshot())
     }
 
+    pub(super) fn snapshot_pending_upload_index_for_inode(&self, ino: Ino) -> PendingUploadCatalog {
+        PendingUploadCatalog::from_ops(self.pending_uploads_snapshot_for_inode(ino))
+    }
+
     pub(super) fn pending_live_extent_record(
         &self,
         ino: Ino,

@@ -189,6 +189,38 @@ struct HandleShard {
     ino_by_handle: HashMap<u64, Ino>,
 }
 
+enum WriterPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl WriterPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            Self::Owned(data) => data.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn borrowed_slice(&self, range: std::ops::Range<usize>) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => &data[range],
+            Self::Owned(data) => &data[range],
+        }
+    }
+
+    fn owned_slice(&self, range: std::ops::Range<usize>) -> Bytes {
+        match self {
+            Self::Borrowed(data) => Bytes::copy_from_slice(&data[range]),
+            Self::Owned(data) => data.slice(range),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(super) struct MountedWriterStack {
     cached_store: Arc<CachedStore>,
@@ -230,8 +262,23 @@ impl MountedWriterStack {
     where
         D: AsRef<[u8]>,
     {
+        self.write_payload(spec, WriterPayload::Borrowed(data.as_ref()))
+    }
+
+    pub(super) fn write_owned_bytes(
+        &self,
+        spec: WriterWriteSpec,
+        data: Bytes,
+    ) -> Result<WriterAccept, WriterStackError> {
+        self.write_payload(spec, WriterPayload::Owned(data))
+    }
+
+    fn write_payload(
+        &self,
+        spec: WriterWriteSpec,
+        data: WriterPayload<'_>,
+    ) -> Result<WriterAccept, WriterStackError> {
         self.validate_geometry()?;
-        let data = data.as_ref();
         if data.is_empty() {
             let next_object_id =
                 self.next_object_id_for_empty_write(spec.ino, spec.first_object_id);
@@ -287,7 +334,7 @@ impl MountedWriterStack {
             let chunk_start = chunk_start_offset(chunk_id, self.config.chunk_size);
             let chunk_end = chunk_start.saturating_add(u64::from(self.config.chunk_size));
             let take = (chunk_end - cursor).min((data.len() - data_offset) as u64) as usize;
-            let segment = &data[data_offset..data_offset + take];
+            let segment_range = data_offset..data_offset + take;
             let end = cursor
                 .checked_add(take as u64)
                 .ok_or(WriterStackError::OffsetOverflow)?;
@@ -303,7 +350,14 @@ impl MountedWriterStack {
                 }) {
                     let before_objects =
                         staged_object_count(slice.writer.dirty_bytes(), self.config.block_size);
-                    let result = slice.writer.write_at(cursor, segment)?;
+                    let result = match &data {
+                        WriterPayload::Borrowed(_) => slice
+                            .writer
+                            .write_at(cursor, data.borrowed_slice(segment_range))?,
+                        WriterPayload::Owned(_) => slice
+                            .writer
+                            .write_owned_at(cursor, data.owned_slice(segment_range))?,
+                    };
                     let after_objects =
                         staged_object_count(result.dirty_bytes, self.config.block_size);
                     slice.end = end;
@@ -327,7 +381,14 @@ impl MountedWriterStack {
                             max_buffer_bytes: self.config.max_buffer_bytes,
                             submit_upload: false,
                         });
-                    let result = writer.write_at(cursor, segment)?;
+                    let result = match &data {
+                        WriterPayload::Borrowed(_) => {
+                            writer.write_at(cursor, data.borrowed_slice(segment_range))?
+                        }
+                        WriterPayload::Owned(_) => {
+                            writer.write_owned_at(cursor, data.owned_slice(segment_range))?
+                        }
+                    };
                     let object_ids_used =
                         staged_object_count(result.dirty_bytes, self.config.block_size);
                     chunk.slices.push(SliceWriter {
@@ -1679,6 +1740,19 @@ mod tests {
         let spans = stack.snapshot_read_spans(7, 0, 14);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].data.as_ref(), b"borrowed-input");
+    }
+
+    #[test]
+    fn writer_stack_accepts_owned_bytes_without_borrowed_source() {
+        let (_dir, stack, _rx) = temp_stack(64, 8);
+        let payload = Bytes::from(Vec::from(&b"owned-input"[..]));
+
+        stack
+            .write_owned_bytes(write_spec(1, 7, 0, 100), payload)
+            .expect("owned write");
+
+        let spans = stack.snapshot_read_spans(7, 0, 11);
+        assert_eq!(spans[0].data.as_ref(), b"owned-input");
     }
 
     #[test]

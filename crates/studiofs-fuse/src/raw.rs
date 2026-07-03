@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{SignalHandling, signal_handlers_for_policy};
+use bytes::Bytes;
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
@@ -1089,6 +1090,56 @@ impl Drop for RecycledRequestBuffer {
     }
 }
 
+struct RecyclableRequestPayload {
+    buffer: Option<Vec<u8>>,
+    payload_start: usize,
+    payload_end: usize,
+    recycler: SyncSender<Vec<u8>>,
+}
+
+impl RecyclableRequestPayload {
+    fn new(buffer: Vec<u8>, request_len: usize, recycler: SyncSender<Vec<u8>>) -> io::Result<Self> {
+        let payload_start = size_of::<InHeader>();
+        if request_len < payload_start || request_len > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid raw FUSE request length",
+            ));
+        }
+        Ok(Self {
+            buffer: Some(buffer),
+            payload_start,
+            payload_end: request_len,
+            recycler,
+        })
+    }
+}
+
+impl AsRef<[u8]> for RecyclableRequestPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.as_ref().expect("request buffer present")[self.payload_start..self.payload_end]
+    }
+}
+
+impl Drop for RecyclableRequestPayload {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if self.recycler.try_send(buffer).is_err() {
+            warn!("raw FUSE request buffer recycler is full or closed");
+        }
+    }
+}
+
+fn owned_request_payload(
+    buffer: Vec<u8>,
+    request_len: usize,
+    recycler: SyncSender<Vec<u8>>,
+) -> io::Result<Bytes> {
+    RecyclableRequestPayload::new(buffer, request_len, recycler).map(Bytes::from_owner)
+}
+
 struct RawRequestJob {
     fd: RawFd,
     header: InHeader,
@@ -1169,12 +1220,24 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
         accounting,
         buffer_recycler,
     } = job;
-    let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
     let guard = accounting.admit_blocking(RawDispatchClass::Stream);
     runtime_handle.spawn(async move {
         let _guard = guard;
         let started = Instant::now();
-        let payload = request_buf.payload(request_len);
+        let payload = match owned_request_payload(request_buf, request_len, buffer_recycler) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(
+                    opcode = header.opcode,
+                    unique = header.unique,
+                    error = %err,
+                    "raw FUSE async write received invalid request buffer"
+                );
+                let _ = reply_error(fd, header.unique, libc::EINVAL, Some(&accounting));
+                accounting.record_latency(header.opcode, started.elapsed());
+                return;
+            }
+        };
         let reply_result = async {
             let Some(vfs) = &context.vfs else {
                 return reply_error(fd, header.unique, libc::ENOSYS, Some(&accounting));
@@ -1183,15 +1246,15 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
                 return reply_error(fd, header.unique, libc::EINVAL, Some(&accounting));
             }
             let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
-            let data = &payload[size_of::<WriteIn>()..];
+            let data = payload.slice(size_of::<WriteIn>()..);
             let write_len = (input.size as usize).min(data.len());
             let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
             match vfs
-                .write_fh_with_deferred_materialize(
+                .write_fh_owned_with_deferred_materialize(
                     input.fh,
                     header.nodeid,
                     input.offset,
-                    &data[..write_len],
+                    data.slice(..write_len),
                     local_sync_policy,
                 )
                 .await
@@ -3575,6 +3638,28 @@ mod tests {
         drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
 
         assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn raw_owned_request_payload_returns_buffer_after_last_bytes_drop() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut buffer = vec![0; size_of::<InHeader>() + 4];
+        buffer[size_of::<InHeader>()..].copy_from_slice(b"data");
+
+        let payload = owned_request_payload(buffer, size_of::<InHeader>() + 4, sender)
+            .expect("payload bytes");
+        let view = payload.slice(1..3);
+
+        assert_eq!(&payload[..], b"data");
+        assert_eq!(&view[..], b"at");
+        assert!(receiver.try_recv().is_err());
+
+        drop(payload);
+        assert!(receiver.try_recv().is_err());
+
+        drop(view);
+        let recycled = receiver.try_recv().expect("request buffer recycled");
+        assert_eq!(&recycled[size_of::<InHeader>()..], b"data");
     }
 
     #[test]

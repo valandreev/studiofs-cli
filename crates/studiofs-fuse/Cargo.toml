@@ -15,6 +15,7 @@ studiofs-data.workspace = true
 studiofs-bridge.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+bytes.workspace = true
 dashmap.workspace = true
 libc.workspace = true
 smallvec.workspace = true
