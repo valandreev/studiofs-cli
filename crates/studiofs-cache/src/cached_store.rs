@@ -273,9 +273,11 @@ impl WriterPage {
         }
     }
 
-    fn make_mut(&mut self) -> &mut BytesMut {
+    fn make_mut(&mut self, capacity: usize) -> &mut BytesMut {
         if let Self::Owned(page) = self {
-            *self = Self::Mutable(BytesMut::from(page.as_ref()));
+            let mut mutable = BytesMut::with_capacity(capacity.max(page.len()));
+            mutable.extend_from_slice(page.as_ref());
+            *self = Self::Mutable(mutable);
         }
         match self {
             Self::Mutable(page) => page,
@@ -1332,7 +1334,7 @@ impl CachedStoreWriterSlice {
                 .pages
                 .back_mut()
                 .expect("page exists after push")
-                .make_mut();
+                .make_mut(self.config.page_size);
             let remaining = target_len - self.dirty_len;
             let append = remaining.min(self.config.page_size - page.len());
             page.resize(page.len() + append, 0);
@@ -1362,7 +1364,7 @@ impl CachedStoreWriterSlice {
                 .pages
                 .back_mut()
                 .expect("page exists after push")
-                .make_mut();
+                .make_mut(self.config.page_size);
             let take = data.len().min(self.config.page_size - page.len());
             page.extend_from_slice(&data[..take]);
             self.dirty_len += take;
@@ -1404,7 +1406,7 @@ impl CachedStoreWriterSlice {
                 continue;
             }
             let start = write_pos.saturating_sub(page_base);
-            let page = page.make_mut();
+            let page = page.make_mut(self.config.page_size);
             let take = (page.len() - start).min(data.len() - copied);
             page[start..start + take].copy_from_slice(&data[copied..copied + take]);
             copied += take;

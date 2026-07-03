@@ -341,6 +341,39 @@ struct RawDispatchAccountingInner {
     write_latency_nanos: AtomicU64,
 }
 
+#[derive(Debug)]
+struct RawBufferSpilloverAccounting {
+    max_inflight: usize,
+    inflight: AtomicUsize,
+}
+
+impl RawBufferSpilloverAccounting {
+    fn new(max_inflight: usize) -> Self {
+        Self {
+            max_inflight: max_inflight.max(1),
+            inflight: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<RawBufferSpilloverGuard> {
+        increment_bounded(&self.inflight, self.max_inflight).ok()?;
+        Some(RawBufferSpilloverGuard {
+            accounting: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RawBufferSpilloverGuard {
+    accounting: Arc<RawBufferSpilloverAccounting>,
+}
+
+impl Drop for RawBufferSpilloverGuard {
+    fn drop(&mut self) {
+        self.accounting.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl RawDispatchAccounting {
     fn new(max_inflight: usize, max_stream_inflight: usize) -> Self {
         Self {
@@ -982,12 +1015,13 @@ fn serve_minimal_session(
     let buffer_size = profile.max_write as usize + 4096;
     let buffer_count = usize::from(profile.max_background.max(1));
     let (buffer_recycler, recycled_buffers) = mpsc::sync_channel(buffer_count);
+    let spillover_accounting = Arc::new(RawBufferSpilloverAccounting::new(buffer_count));
     for _ in 0..buffer_count {
         buffer_recycler
             .send(vec![0_u8; buffer_size])
             .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))?;
     }
-    let mut buf = recv_request_buffer(&recycled_buffers, buffer_size)?;
+    let mut buf = recv_request_buffer(&recycled_buffers, buffer_size, &spillover_accounting)?;
     let ids = SessionIds {
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         uid: unsafe { libc::geteuid() },
@@ -1007,7 +1041,7 @@ fn serve_minimal_session(
         open_dir_handles: Arc::new(DashMap::new()),
     };
     let session_result = loop {
-        let len = match read_next_fuse_request(fd, &mut buf, shutdown) {
+        let len = match read_next_fuse_request(fd, buf.as_mut_slice(), shutdown) {
             Ok(Some(len)) => len,
             Ok(None) => break Ok(()),
             Err(err)
@@ -1029,13 +1063,13 @@ fn serve_minimal_session(
                 "short FUSE request header",
             ));
         }
-        let header = read_struct::<InHeader>(&buf[..size_of::<InHeader>()])?;
+        let header = read_struct::<InHeader>(&buf.as_slice()[..size_of::<InHeader>()])?;
         accounting.record_request();
         if header.opcode == OP_INIT {
             handle_init(
                 fd,
                 header,
-                &buf[size_of::<InHeader>()..len],
+                &buf.as_slice()[size_of::<InHeader>()..len],
                 profile,
                 Some(&accounting),
             )?;
@@ -1043,7 +1077,7 @@ fn serve_minimal_session(
         }
         let request_buf = std::mem::replace(
             &mut buf,
-            recv_request_buffer(&recycled_buffers, buffer_size)?,
+            recv_request_buffer(&recycled_buffers, buffer_size, &spillover_accounting)?,
         );
         dispatch_minimal_request(
             fd,
@@ -1059,29 +1093,75 @@ fn serve_minimal_session(
     session_result
 }
 
-fn recv_request_buffer(receiver: &Receiver<Vec<u8>>, buffer_size: usize) -> io::Result<Vec<u8>> {
-    match receiver.try_recv() {
-        Ok(buffer) => Ok(buffer),
-        Err(TryRecvError::Empty) => {
-            debug!(
-                buffer_size,
-                "raw FUSE request buffer pool empty; allocating spillover buffer"
-            );
-            Ok(vec![0_u8; buffer_size])
+struct RawRequestBuffer {
+    buffer: Vec<u8>,
+    _spillover: Option<RawBufferSpilloverGuard>,
+}
+
+impl RawRequestBuffer {
+    fn pooled(buffer: Vec<u8>) -> Self {
+        Self {
+            buffer,
+            _spillover: None,
         }
+    }
+
+    fn spillover(buffer_size: usize, guard: RawBufferSpilloverGuard) -> Self {
+        Self {
+            buffer: vec![0_u8; buffer_size],
+            _spillover: Some(guard),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    fn into_parts(self) -> (Vec<u8>, Option<RawBufferSpilloverGuard>) {
+        (self.buffer, self._spillover)
+    }
+}
+
+fn recv_request_buffer(
+    receiver: &Receiver<Vec<u8>>,
+    buffer_size: usize,
+    spillover_accounting: &Arc<RawBufferSpilloverAccounting>,
+) -> io::Result<RawRequestBuffer> {
+    match receiver.try_recv() {
+        Ok(buffer) => Ok(RawRequestBuffer::pooled(buffer)),
+        Err(TryRecvError::Empty) => match spillover_accounting.try_acquire() {
+            Some(guard) => {
+                debug!(
+                    buffer_size,
+                    "raw FUSE request buffer pool empty; allocating spillover buffer"
+                );
+                Ok(RawRequestBuffer::spillover(buffer_size, guard))
+            }
+            None => receiver
+                .recv()
+                .map(RawRequestBuffer::pooled)
+                .map_err(|_| io::Error::other("raw FUSE buffer pool closed")),
+        },
         Err(TryRecvError::Disconnected) => Err(io::Error::other("raw FUSE buffer pool closed")),
     }
 }
 
 struct RecycledRequestBuffer {
     buffer: Option<Vec<u8>>,
+    _spillover: Option<RawBufferSpilloverGuard>,
     recycler: SyncSender<Vec<u8>>,
 }
 
 impl RecycledRequestBuffer {
-    fn new(buffer: Vec<u8>, recycler: SyncSender<Vec<u8>>) -> Self {
+    fn new(buffer: RawRequestBuffer, recycler: SyncSender<Vec<u8>>) -> Self {
+        let (buffer, spillover) = buffer.into_parts();
         Self {
             buffer: Some(buffer),
+            _spillover: spillover,
             recycler,
         }
     }
@@ -1097,20 +1177,26 @@ impl Drop for RecycledRequestBuffer {
             return;
         };
         if self.recycler.try_send(buffer).is_err() {
-            warn!("raw FUSE request buffer recycler is full or closed");
+            debug!("raw FUSE request buffer recycler is full or closed; dropping request buffer");
         }
     }
 }
 
 struct RecyclableRequestPayload {
     buffer: Option<Vec<u8>>,
+    _spillover: Option<RawBufferSpilloverGuard>,
     payload_start: usize,
     payload_end: usize,
     recycler: SyncSender<Vec<u8>>,
 }
 
 impl RecyclableRequestPayload {
-    fn new(buffer: Vec<u8>, request_len: usize, recycler: SyncSender<Vec<u8>>) -> io::Result<Self> {
+    fn new(
+        buffer: RawRequestBuffer,
+        request_len: usize,
+        recycler: SyncSender<Vec<u8>>,
+    ) -> io::Result<Self> {
+        let (buffer, spillover) = buffer.into_parts();
         let payload_start = size_of::<InHeader>();
         if request_len < payload_start || request_len > buffer.len() {
             return Err(io::Error::new(
@@ -1120,6 +1206,7 @@ impl RecyclableRequestPayload {
         }
         Ok(Self {
             buffer: Some(buffer),
+            _spillover: spillover,
             payload_start,
             payload_end: request_len,
             recycler,
@@ -1139,13 +1226,13 @@ impl Drop for RecyclableRequestPayload {
             return;
         };
         if self.recycler.try_send(buffer).is_err() {
-            warn!("raw FUSE request buffer recycler is full or closed");
+            debug!("raw FUSE request buffer recycler is full or closed; dropping request buffer");
         }
     }
 }
 
 fn owned_request_payload(
-    buffer: Vec<u8>,
+    buffer: RawRequestBuffer,
     request_len: usize,
     recycler: SyncSender<Vec<u8>>,
 ) -> io::Result<Bytes> {
@@ -1163,7 +1250,7 @@ fn linux_should_use_owned_write(context: &RawRequestContext, write_len: usize) -
 struct RawRequestJob {
     fd: RawFd,
     header: InHeader,
-    request_buf: Vec<u8>,
+    request_buf: RawRequestBuffer,
     request_len: usize,
     context: RawRequestContext,
     accounting: RawDispatchAccounting,
@@ -1173,7 +1260,7 @@ struct RawRequestJob {
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
-    request_buf: Vec<u8>,
+    request_buf: RawRequestBuffer,
     request_len: usize,
     context: RawRequestContext,
     accounting: &RawDispatchAccounting,
@@ -3669,23 +3756,39 @@ mod tests {
     fn raw_request_buffer_returns_to_pool_on_drop() {
         let (sender, receiver) = mpsc::sync_channel(1);
 
-        drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
+        drop(RecycledRequestBuffer::new(
+            RawRequestBuffer::pooled(vec![7, 8, 9]),
+            sender,
+        ));
 
         assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
     }
 
     #[test]
-    fn raw_recv_request_buffer_spills_over_when_pool_is_empty() {
+    fn raw_recv_request_buffer_bounds_spillover_when_pool_is_empty() {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let spillover_accounting = Arc::new(RawBufferSpilloverAccounting::new(1));
         sender.send(vec![1, 2, 3]).unwrap();
 
-        assert_eq!(recv_request_buffer(&receiver, 8).unwrap(), vec![1, 2, 3]);
+        let pooled = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(pooled.as_slice(), &[1, 2, 3]);
 
-        let spillover = recv_request_buffer(&receiver, 8).unwrap();
-        assert_eq!(spillover, vec![0; 8]);
+        let spillover = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(spillover.as_slice(), vec![0; 8]);
+
+        let sender_for_blocked_recv = sender.clone();
+        let join = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            sender_for_blocked_recv.send(vec![4, 5, 6]).unwrap();
+        });
+
+        let blocked = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(blocked.as_slice(), &[4, 5, 6]);
+        join.join().unwrap();
 
         drop(sender);
-        assert!(recv_request_buffer(&receiver, 8).is_err());
+        drop(spillover);
+        assert!(recv_request_buffer(&receiver, 8, &spillover_accounting).is_err());
     }
 
     #[test]
@@ -3694,8 +3797,12 @@ mod tests {
         let mut buffer = vec![0; size_of::<InHeader>() + 4];
         buffer[size_of::<InHeader>()..].copy_from_slice(b"data");
 
-        let payload = owned_request_payload(buffer, size_of::<InHeader>() + 4, sender)
-            .expect("payload bytes");
+        let payload = owned_request_payload(
+            RawRequestBuffer::pooled(buffer),
+            size_of::<InHeader>() + 4,
+            sender,
+        )
+        .expect("payload bytes");
         let view = payload.slice(1..3);
 
         assert_eq!(&payload[..], b"data");

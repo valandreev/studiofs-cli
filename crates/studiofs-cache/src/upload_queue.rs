@@ -298,12 +298,6 @@ impl UploadQueue {
             {
                 let previous = current.clone();
                 *current = op.clone();
-                Self::remove_inode_index_entry(&mut state, previous.ino, previous.object_id);
-                state
-                    .by_inode
-                    .entry(op.ino)
-                    .or_default()
-                    .insert(op.object_id);
                 return PendingSubmit::Updated(previous);
             }
             return PendingSubmit::Ignored;
@@ -353,12 +347,6 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
-        Self::remove_inode_index_entry(&mut state, previous.ino, previous.object_id);
-        state
-            .by_inode
-            .entry(op.ino)
-            .or_default()
-            .insert(op.object_id);
         Some(previous)
     }
 
@@ -378,12 +366,6 @@ impl UploadQueue {
             && current.not_before_unix_ms == failed_op.not_before_unix_ms
         {
             *current = previous.clone();
-            Self::remove_inode_index_entry(&mut state, failed_op.ino, failed_op.object_id);
-            state
-                .by_inode
-                .entry(previous.ino)
-                .or_default()
-                .insert(previous.object_id);
         }
     }
 
