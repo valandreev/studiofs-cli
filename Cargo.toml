@@ -43,7 +43,7 @@ webpki-roots = "1"
 opendal = { version = "0.55", features = ["services-memory", "services-s3"] }
 
 # Metadata
-redb = "3"
+redb = "4.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
