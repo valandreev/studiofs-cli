@@ -6841,7 +6841,7 @@ fn foreground_user_io_active_respects_idle_grace_after_last_write() {
     assert!(!state.foreground_user_io_active(last_write + 51, grace));
     assert!(
         !state.foreground_read_active(last_write + 49, grace),
-        "upload disk rereads should not throttle purely because foreground writes are active"
+        "write activity should be tracked separately from foreground read scopes"
     );
 }
 
