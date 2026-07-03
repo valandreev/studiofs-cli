@@ -750,31 +750,33 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .cloned();
         }
 
-        if let Some(attr) = dirty_attr
-            && !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
-        {
-            if self
-                .vfs
-                .discard_stale_zero_size_dirty_attr_after_current_publish(self.ino, &attr)
-                .await?
-            {
-                return Ok(());
-            }
-            let _ = self
-                .drain
-                .execute_drain(
-                    self.ino,
-                    Vec::new(),
-                    Default::default(),
-                    attr.content_epoch,
-                    Some(attr),
-                    PayloadPersistConfig {
-                        put_concurrency: self.drain.put_concurrency,
-                        local_sync_policy,
-                    },
-                )
-                .await?;
+        let Some(attr) = dirty_attr else {
+            return Ok(());
+        };
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            return Ok(());
         }
+        if self
+            .vfs
+            .discard_stale_zero_size_dirty_attr_after_current_publish(self.ino, &attr)
+            .await?
+        {
+            return Ok(());
+        }
+        let _ = self
+            .drain
+            .execute_drain(
+                self.ino,
+                Vec::new(),
+                Default::default(),
+                attr.content_epoch,
+                Some(attr),
+                PayloadPersistConfig {
+                    put_concurrency: self.drain.put_concurrency,
+                    local_sync_policy,
+                },
+            )
+            .await?;
 
         Ok(())
     }

@@ -142,6 +142,32 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
 }
 
 #[test]
+fn local_replay_only_mutation_counts_as_claimable_pending_work() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"local-replay-only.bin", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 4096, 1);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack setup events");
+    {
+        let mut state = pg.pending_state.lock().expect("pending_state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_004, 4096))
+        .expect("stage local-only payload");
+
+    assert_eq!(
+        pg.replication_backlog().pending_ops,
+        1,
+        "local serving replay work should be claimable even without remote-visible ops"
+    );
+}
+
+#[test]
 fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

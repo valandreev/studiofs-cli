@@ -72,10 +72,8 @@ impl PgMetaEngine {
         let projected = RemoteApplyCoordinator::project_local_batch(&events);
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
-                if state.event_start.is_some() {
-                    state.ops = state.ops.max(1);
-                }
                 state.event_start = Some(state.event_start.unwrap_or(before_seq));
+                state.ops = state.ops.max(1);
                 state.event_end = state.event_end.max(after_seq);
                 state.last_mutation_at = Some(now);
                 if state.started_at.is_none() {

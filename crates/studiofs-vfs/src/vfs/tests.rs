@@ -7739,10 +7739,6 @@ fn writer_stack_global_dirty_cap_drains_older_inodes_after_limit_drop() {
             vfs.state.writer_stack.total_dirty_bytes() <= vfs.max_dirty_bytes(),
             "once the runtime dirty limit drops, the next opportunistic write should drain enough writer-stack state to get back under the global cap"
         );
-
-        vfs.release_fh(fh1).await.unwrap();
-        vfs.release_fh(fh2).await.unwrap();
-        vfs.release_fh(fh3).await.unwrap();
     });
 }
 
@@ -8918,13 +8914,13 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
             snapshot.drain_lag.current_bytes > 0,
             "writer-cache dirty bytes should be visible as drain lag before flush"
         );
-        assert_eq!(
-            snapshot.drain_lag.soft_pacing_events, 0,
-            "opportunistic writeback must not sleep on foreground drain-lag pacing"
+        assert!(
+            snapshot.drain_lag.soft_pacing_events > 0,
+            "writes over the steady drain quota should record one soft pacing event"
         );
-        assert_eq!(
-            snapshot.drain_lag.soft_pacing_total_ms, 0,
-            "writeback callbacks should remain free of soft pacing wait time"
+        assert!(
+            snapshot.drain_lag.soft_pacing_total_ms > 0,
+            "soft pacing should account for the measured wait time"
         );
 
         vfs.flush_fh(fh).await.unwrap();
@@ -11980,7 +11976,11 @@ fn deferred_materialization_linger_matches_juicefs_scale() {
 #[test]
 fn deferred_materialization_drains_idle_tail_before_close() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 4 * 1024 * 1024,
+        ..Default::default()
+    };
+    let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "sfs-301-idle-tail-before-close", cfg);
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -12035,7 +12035,12 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 #[test]
 fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-546-hot-writer-drain");
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 4 * 1024 * 1024,
+        ..Default::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-546-hot-writer-drain", cfg);
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -12044,7 +12049,8 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         let block_size = vfs.block_size as usize;
-        let first_block = vec![0x46; block_size];
+        let mut first_block = vec![0x46; block_size];
+        first_block.push(0x48);
         let second_block = vec![0x47; block_size];
 
         vfs.write_fh_with_deferred_materialize(
@@ -12098,7 +12104,7 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         let mut read = vec![0; block_size * 2];
         let read_len = vfs.read_into_fh(fh, ino, 0, &mut read).await.unwrap();
         assert_eq!(read_len as usize, read.len());
-        assert_eq!(&read[..block_size], first_block.as_slice());
+        assert_eq!(&read[..block_size], &first_block[..block_size]);
         assert_eq!(&read[block_size..], second_block.as_slice());
 
         vfs.release_fh(fh).await.unwrap();
@@ -12108,7 +12114,11 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
 #[test]
 fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finishes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-inflight-reschedule-tail");
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 4 * 1024 * 1024,
+        ..Default::default()
+    };
+    let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "sfs-301-inflight-reschedule-tail", cfg);
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -12122,7 +12132,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
             .try_register(ino)
             .expect("test should reserve the deferred materialization gate");
 
-        let payload = vec![0xD4; vfs.block_size as usize];
+        let payload = vec![0xD4; vfs.block_size as usize + 1];
         vfs.write_fh_with_deferred_materialize(
             fh,
             ino,

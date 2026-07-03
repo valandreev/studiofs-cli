@@ -311,6 +311,12 @@ impl StudioVfs {
             while remaining_grace_ms > 0
                 && vfs.total_pending_write_buffer_bytes() <= vfs.write_eager_flush_drain_chunk_bytes
             {
+                if vfs.shutdown_requested()
+                    || !vfs.state.deferred_materialize_inflight.is_current(&entry)
+                {
+                    allow_reschedule_on_exit = false;
+                    break;
+                }
                 let sleep_ms = remaining_grace_ms.min(25);
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 remaining_grace_ms = remaining_grace_ms.saturating_sub(sleep_ms);
@@ -477,7 +483,14 @@ impl StudioVfs {
                     .await;
                     continue;
                 }
-                if !made_progress || !completed_blocks_remain {
+                if !made_progress {
+                    break;
+                }
+                if !completed_blocks_remain {
+                    if vfs.should_linger_clean_deferred_materialization(ino) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     break;
                 }
                 tokio::task::yield_now().await;

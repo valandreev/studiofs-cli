@@ -482,9 +482,6 @@ impl WriteAdmissionGovernor {
 }
 
 fn sustained_write_delay_ms(duration_ms: u64) -> u64 {
-    if duration_ms < SUSTAINED_WRITE_DELAY_START_MS {
-        return 0;
-    }
     duration_ms
         .saturating_sub(SUSTAINED_WRITE_DELAY_START_MS)
         .saturating_div(SUSTAINED_WRITE_DELAY_STEP_MS)
