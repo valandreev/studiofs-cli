@@ -26,7 +26,7 @@ use studiofs_vfs::{
     DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 thread_local! {
     static RAW_READ_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -118,6 +118,18 @@ const WANTED_CAPS: [u32; 6] = [
     FUSE_FILE_OPS,
     FUSE_EXPLICIT_INVAL_DATA,
 ];
+
+fn fuse_cap_name(cap: u32) -> &'static str {
+    match cap {
+        FUSE_ASYNC_READ => "FUSE_ASYNC_READ",
+        FUSE_BIG_WRITES => "FUSE_BIG_WRITES",
+        FUSE_MAX_PAGES => "FUSE_MAX_PAGES",
+        FUSE_PARALLEL_DIROPS => "FUSE_PARALLEL_DIROPS",
+        FUSE_FILE_OPS => "FUSE_FILE_OPS",
+        FUSE_EXPLICIT_INVAL_DATA => "FUSE_EXPLICIT_INVAL_DATA",
+        _ => "UNKNOWN",
+    }
+}
 
 /// Mount request for the Linux raw `/dev/fuse` backend.
 pub struct RawFuseMountRequest {
@@ -698,7 +710,7 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
 
     let mount_point = PathBuf::from(mount_point);
     let dev_fuse = mount_dev_fuse(&mount_point, &volume_name, read_only, profile)?;
-    info!(
+    debug!(
         mount_point = %mount_point.display(),
         max_write = profile.max_write,
         max_read = profile.max_read,
@@ -2037,8 +2049,9 @@ fn handle_init(
     }
     let negotiated = profile.negotiate_init(input);
     for cap in negotiated.degraded {
-        warn!(
-            cap,
+        debug!(
+            cap = fuse_cap_name(cap),
+            raw_cap = cap,
             "raw FUSE kernel did not advertise requested capability; degrading"
         );
     }
