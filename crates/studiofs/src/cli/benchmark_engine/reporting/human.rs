@@ -33,23 +33,6 @@ fn public_bench_large_write_throughput(report: &BenchmarkReport) -> Option<f64> 
         .map(|operation| operation.throughput_bytes_per_sec)
 }
 
-fn public_bench_slowest_large_write(report: &BenchmarkReport) -> Option<(f64, u64, f64)> {
-    report
-        .writes
-        .operations_log
-        .iter()
-        .filter(|operation| operation.size_class == "large")
-        .filter(|operation| operation.elapsed_ms.is_finite())
-        .max_by(|left, right| left.elapsed_ms.total_cmp(&right.elapsed_ms))
-        .map(|operation| {
-            (
-                operation.elapsed_ms,
-                operation.bytes,
-                operation.throughput_bytes_per_sec,
-            )
-        })
-}
-
 fn op_report_size_class_throughput(report: &OpReport, size_class: &str) -> Option<f64> {
     let mut bytes = 0u64;
     let mut elapsed_ms = 0.0f64;
@@ -183,15 +166,6 @@ pub(crate) fn render_public_bench_summary(report: &BenchmarkReport) -> String {
             &mut out,
             "Mixed-write speed: {}",
             format_throughput(report.writes.throughput_bytes_per_sec)
-        );
-    }
-    if let Some((elapsed_ms, bytes, throughput)) = public_bench_slowest_large_write(report) {
-        let _ = writeln!(
-            &mut out,
-            "Slowest large write: {} in {} ({})",
-            format_bytes(bytes),
-            format_duration_ms(elapsed_ms),
-            format_throughput(throughput),
         );
     }
     let _ = writeln!(
@@ -1229,7 +1203,6 @@ mod tests {
         assert!(summary.starts_with("StudioFS bench result\n"));
         assert!(summary.contains("Write speed: 1.37GiB/s (large file)"));
         assert!(summary.contains("Mixed-write speed: 52.00MiB/s"));
-        assert!(summary.contains("Slowest large write: 4.0GiB in 2.93 s (1.37GiB/s)"));
         assert!(summary.contains("First-read speed:"));
         assert!(summary.contains("Hot-read speed:"));
         assert!(summary.contains("Large hot-read: 2.15GiB/s (best 4 of 10)"));

@@ -2178,7 +2178,7 @@ mod tests {
         let background_ready = std::sync::Arc::clone(&ready);
         let join = std::thread::spawn(move || {
             background_ready.wait();
-            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT * 3);
+            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT * 2);
             background.mark_uploaded(11);
         });
         ready.wait();

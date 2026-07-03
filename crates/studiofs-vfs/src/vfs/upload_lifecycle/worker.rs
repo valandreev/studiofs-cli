@@ -153,7 +153,7 @@ fn upload_reread_idle_wait_window(
     adaptive_penalty: Duration,
     idle_grace: Duration,
 ) -> Duration {
-    if !foreground_active {
+    if !foreground_active || adaptive_penalty.is_zero() {
         Duration::ZERO
     } else {
         adaptive_penalty.max(idle_grace)
@@ -1048,62 +1048,6 @@ struct VfsUploadLocalPayloadPort {
     vfs: Arc<StudioVfs>,
 }
 
-impl VfsUploadLocalPayloadPort {
-    async fn wait_for_foreground_user_io_idle_before_reread(
-        &self,
-        object_id: u64,
-        payload_len: u64,
-    ) {
-        let mut logged = false;
-        loop {
-            if self.vfs.uploader_shutdown_requested() {
-                return;
-            }
-            let foreground_active = self
-                .vfs
-                .state
-                .read
-                .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-            if !foreground_active {
-                return;
-            }
-
-            let adaptive_penalty =
-                Duration::from_millis(self.vfs.upload_scheduler.adaptive_penalty_ms());
-            let idle_delay = upload_reread_idle_wait_window(
-                true,
-                adaptive_penalty,
-                self.vfs.upload_user_idle_grace,
-            );
-            let pacing_delay = foreground_upload_reread_pacing_delay(true, payload_len as usize);
-            let delay = idle_delay.max(pacing_delay);
-            let sleep_for = delay
-                .min(Duration::from_millis(25))
-                .max(Duration::from_millis(1));
-
-            if !logged {
-                self.vfs.debug_write_probe(
-                    "H5",
-                    concat!(file!(), ":", line!()),
-                    "upload reread waiting for foreground user I/O idle",
-                    serde_json::json!({
-                        "object_id": object_id,
-                        "payload_len": payload_len,
-                        "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "idle_delay_ms": idle_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "sleep_ms": sleep_for.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
-                    }),
-                );
-                logged = true;
-            }
-
-            tokio::time::sleep(sleep_for).await;
-        }
-    }
-}
-
 impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
     fn mark_uploading(&self, object_id: u64) {
         self.vfs.local_payload_backend.mark_uploading(object_id);
@@ -1157,7 +1101,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .vfs
             .state
             .read
-            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let defer_delay = upload_disk_reread_defer_delay(
             foreground_active,
             false,
@@ -1174,7 +1118,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                     "object_id": object_id,
                     "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
                     "would_defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "foreground_user_io_active": foreground_active,
                     "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
                 }),
             );
@@ -1216,13 +1159,11 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             );
             return Ok(Some(hot_payload));
         }
-        self.wait_for_foreground_user_io_idle_before_reread(object_id, payload_len)
-            .await;
         let foreground_active = self
             .vfs
             .state
             .read
-            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let foreground_cost = self
             .vfs
             .state
@@ -3917,7 +3858,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_reread_idle_wait_window_requires_foreground_pressure() {
+    fn upload_reread_idle_wait_window_requires_penalty_and_foreground_pressure() {
         assert_eq!(
             upload_reread_idle_wait_window(
                 false,
@@ -3926,13 +3867,9 @@ mod tests {
             ),
             Duration::ZERO
         );
-    }
-
-    #[test]
-    fn upload_reread_idle_wait_window_uses_idle_grace_without_penalty() {
         assert_eq!(
             upload_reread_idle_wait_window(true, Duration::ZERO, Duration::from_millis(50)),
-            Duration::from_millis(50)
+            Duration::ZERO
         );
     }
 
