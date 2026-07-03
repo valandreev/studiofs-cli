@@ -155,6 +155,12 @@ impl StudioVfs {
         (entry, guard)
     }
 
+    pub(super) fn cancel_deferred_release_for_truncate(&self, ino: Ino) {
+        if self.state.deferred_release_inflight.remove(ino) {
+            debug!(ino, "canceled deferred last-handle release before truncate");
+        }
+    }
+
     fn observe_sustained_write_admission(
         &self,
         ino: Ino,
@@ -301,7 +307,15 @@ impl StudioVfs {
             let ino = entry.ino;
             let mut allow_reschedule_on_exit = true;
             let mut no_progress_retries = 0usize;
+            tokio::time::sleep(Duration::from_millis(
+                super::DEFERRED_MATERIALIZATION_START_GRACE_MS,
+            ))
+            .await;
             loop {
+                if !vfs.state.deferred_materialize_inflight.is_current(&entry) {
+                    allow_reschedule_on_exit = false;
+                    break;
+                }
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let dirty_before = writer_stack_dirty_before;
                 let total_before = vfs.total_pending_write_buffer_bytes();
@@ -718,7 +732,15 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(
+                super::DEFERRED_RELEASE_START_GRACE_MS,
+            ))
+            .await;
+            if !vfs.state.deferred_release_inflight.is_current(&barrier) {
+                drop(barrier);
+                drop(guard);
+                return;
+            }
             let session = vfs
                 .state
                 .file_session

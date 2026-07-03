@@ -1849,6 +1849,9 @@ impl StudioVfs {
         if self.has_pending_local_dirty_payloads_for_inode(ino) {
             return;
         }
+        if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+            return;
+        }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
         let should_clear = dirty_attrs.get(&ino).is_some_and(|current| {
             current.content_epoch == attr.content_epoch

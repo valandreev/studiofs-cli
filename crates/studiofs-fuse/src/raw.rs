@@ -1365,7 +1365,7 @@ fn raw_create(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     let response_flags = raw_open_response_flags(trunc);
-    match vfs.open_file(attr.ino, open_flags, trunc) {
+    match vfs.open_created_file_with_known_attr(&attr, open_flags, trunc) {
         Ok(fh) => reply_create(
             fd,
             header.unique,
