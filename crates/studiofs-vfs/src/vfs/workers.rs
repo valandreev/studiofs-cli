@@ -211,7 +211,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-            let dirty_inodes = self.snapshot_pending_local_dirty_inodes();
+            let dirty_inodes = self.background_dirty_inodes_by_priority();
             if dirty_inodes.is_empty() {
                 continue;
             }

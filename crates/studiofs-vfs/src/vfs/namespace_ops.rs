@@ -191,6 +191,12 @@ impl StudioVfs {
         }
 
         if changed {
+            if attr.kind == FileType::RegularFile
+                && attr.upload_state == studiofs_meta::UploadState::Ready
+            {
+                attr.content_epoch = attr.content_epoch.saturating_add(1);
+                attr.upload_state = studiofs_meta::UploadState::Updating;
+            }
             attr.touch_ctime();
             self.state
                 .namespace
@@ -198,8 +204,6 @@ impl StudioVfs {
                 .lock()
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.sync_meta().set_attr(&attr)?;
-            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 

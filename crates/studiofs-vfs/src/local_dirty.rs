@@ -751,10 +751,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
         }
 
         if let Some(attr) = dirty_attr
-            && (!matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
-                || !self
-                    .vfs
-                    .has_pending_local_dirty_payloads_for_inode(self.ino))
+            && !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
         {
             if self
                 .vfs
@@ -1410,6 +1407,10 @@ impl StudioVfs {
             Self::append_unique_dirty_inodes(&mut ordered, &mut seen, dirty_attrs.keys().copied());
         }
         ordered
+    }
+
+    pub(super) fn background_dirty_inodes_by_priority(&self) -> Vec<Ino> {
+        self.snapshot_pending_local_dirty_inodes()
     }
 
     pub(super) fn total_pending_persisted_local_dirty_slice_bytes(&self) -> usize {

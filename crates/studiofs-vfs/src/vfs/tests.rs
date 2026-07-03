@@ -10123,45 +10123,40 @@ fn test_flush_fh_retries_inline_dirty_attr_persist_after_transient_failure() {
 }
 
 #[test]
-fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
+fn metadata_only_setattr_defers_persist_until_full_fsync() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "datasync-outcome-persisted-metadata");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "metadata-setattr-deferred");
     let _guard = rt.enter();
     rt.block_on(async {
-            let attr = vfs
-                .create(1, b"datasync-outcome-persisted-metadata.txt", 0, 0, 0o644)
-                .unwrap();
-            let ino = attr.ino;
-
-            vfs.setattr(
-                ino,
-                SetattrArgs {
-                    mtime: studiofs_meta::types::TimeSpec::Now,
-                    ..Default::default()
-                },
-            )
+        let attr = vfs
+            .create(1, b"metadata-setattr-deferred.txt", 0, 0, 0o644)
             .unwrap();
+        let ino = attr.ino;
 
-            let datasync = vfs.fsync_with_outcome(ino, true).await.unwrap();
-            assert!(
-                !datasync.flushed_file_data,
-                "metadata-only datasync should not report a file-data barrier"
-            );
-            assert!(
-                !datasync.persisted_dirty_attrs,
-                "datasync should not report metadata persistence when setattr already committed it"
-            );
+        vfs.setattr(
+            ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-            let full = vfs.fsync_with_outcome(ino, false).await.unwrap();
-            assert!(
-                !full.flushed_file_data,
-                "full fsync after already-persisted metadata should stay data-clean"
-            );
-            assert!(
-                !full.persisted_dirty_attrs,
-                "full fsync should not invent metadata persistence work after setattr already committed it"
-            );
-        });
+        assert_eq!(vfs.getattr(ino).unwrap().mode & 0o777, 0o600);
+        assert_eq!(meta.get_attr(ino).unwrap().mode & 0o777, 0o644);
+        assert!(vfs.state.namespace.dirty_attrs.lock().contains_key(&ino));
+
+        let full = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            !full.flushed_file_data,
+            "full fsync after metadata-only setattr should stay data-clean"
+        );
+        assert!(
+            full.persisted_dirty_attrs,
+            "full fsync should persist deferred metadata-only dirty attrs"
+        );
+        assert_eq!(meta.get_attr(ino).unwrap().mode & 0o777, 0o600);
+    });
 }
 
 #[test]
@@ -12487,6 +12482,54 @@ fn deferred_release_clean_entry_skips_release_barrier() {
         assert!(
             !vfs.state.deferred_release_inflight.contains(ino),
             "clean last-handle release should not block follow-up reads on a no-op barrier"
+        );
+    });
+}
+
+#[test]
+fn fuse_writeback_release_keeps_dirty_state_local_first() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fuse-writeback-release-local-first");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"fuse-writeback-release-local-first.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"dirty bytes",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(vfs.inode_has_local_dirty_state(ino));
+        let flush_barriers_before = vfs
+            .state
+            .metrics
+            .flush_barrier_calls
+            .load(Ordering::Relaxed);
+
+        let outcome =
+            vfs.release_fh_with_fuse_writeback_release(fh, &tokio::runtime::Handle::current());
+
+        assert!(outcome.closed_last_handle);
+        assert!(!outcome.flushed_local_dirty_state);
+        assert!(vfs.get_open_file(fh).is_none());
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "FUSE writeback close must not drain dirty state inline"
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .flush_barrier_calls
+                .load(Ordering::Relaxed),
+            flush_barriers_before,
+            "FUSE writeback close must not count as a foreground local-sync barrier"
         );
     });
 }

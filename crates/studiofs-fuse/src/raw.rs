@@ -1710,9 +1710,9 @@ fn raw_release(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
-    // The deferred helper owns final-handle errors by logging them out of band;
-    // raw FUSE release must not park the dispatch loop on the local barrier.
-    vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
+    // FUSE writeback close is not an fsync. Keep close local-first and let
+    // explicit fsync or the shared background drain own local durability.
+    vfs.release_fh_with_fuse_writeback_release(input.fh, rt);
     reply_empty(fd, header.unique, Some(accounting))
 }
 
