@@ -444,52 +444,15 @@ impl<'a> DataReader<'a> {
                 if planner.is_complete() {
                     break;
                 }
-                let mut source = if let (Some(_), Some(resolved)) =
-                    (pending_content_epoch, resolved_regular_file_slices)
-                {
-                    Self::pending_overlay_block_source_from_resolved(
-                        vfs,
-                        ino,
-                        block_index,
-                        pending_content_epoch,
-                        pending_upload_index.as_ref(),
-                        resolved,
-                        planner.requested,
-                    )
-                } else {
-                    vfs.pending_overlay_block_source(
-                        ino,
-                        block_index,
-                        pending_content_epoch,
-                        pending_upload_index.as_ref(),
-                    )
-                };
-                if source.is_none()
-                    && pending_upload_index.is_none()
-                    && vfs.cached_store.has_pending_uploads_for_ino(ino)
-                {
-                    pending_upload_index = Some(vfs.snapshot_pending_upload_index_for_inode(ino));
-                    source = if let (Some(_), Some(resolved)) =
-                        (pending_content_epoch, resolved_regular_file_slices)
-                    {
-                        Self::pending_overlay_block_source_from_resolved(
-                            vfs,
-                            ino,
-                            block_index,
-                            pending_content_epoch,
-                            pending_upload_index.as_ref(),
-                            resolved,
-                            planner.requested,
-                        )
-                    } else {
-                        vfs.pending_overlay_block_source(
-                            ino,
-                            block_index,
-                            pending_content_epoch,
-                            pending_upload_index.as_ref(),
-                        )
-                    };
-                }
+                let source = Self::resolve_pending_overlay_block_source(
+                    vfs,
+                    ino,
+                    block_index,
+                    pending_content_epoch,
+                    resolved_regular_file_slices,
+                    &mut pending_upload_index,
+                    planner.requested,
+                );
                 let Some(source) = source else { continue };
                 if matches!(
                     &source,
@@ -548,6 +511,71 @@ impl<'a> DataReader<'a> {
         Ok(planner.finish())
     }
 
+    fn resolve_pending_overlay_block_source(
+        vfs: &StudioVfs,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+        resolved: Option<&[ResolvedSliceSpan]>,
+        pending_upload_index: &mut Option<crate::vfs::overlay::PendingUploadCatalog>,
+        requested: ReadRange,
+    ) -> Option<PendingOverlayBlockSource> {
+        let mut source = Self::pending_overlay_block_source_from_index(
+            vfs,
+            ino,
+            block_index,
+            pending_content_epoch,
+            resolved,
+            pending_upload_index.as_ref(),
+            requested,
+        );
+        if source.is_none()
+            && pending_upload_index.is_none()
+            && vfs.cached_store.has_pending_uploads_for_ino(ino)
+        {
+            *pending_upload_index = Some(vfs.snapshot_pending_upload_index_for_inode(ino));
+            source = Self::pending_overlay_block_source_from_index(
+                vfs,
+                ino,
+                block_index,
+                pending_content_epoch,
+                resolved,
+                pending_upload_index.as_ref(),
+                requested,
+            );
+        }
+        source
+    }
+
+    fn pending_overlay_block_source_from_index(
+        vfs: &StudioVfs,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+        resolved: Option<&[ResolvedSliceSpan]>,
+        pending_upload_index: Option<&crate::vfs::overlay::PendingUploadCatalog>,
+        requested: ReadRange,
+    ) -> Option<PendingOverlayBlockSource> {
+        if let (Some(_), Some(resolved)) = (pending_content_epoch, resolved) {
+            Self::pending_overlay_block_source_from_resolved(
+                vfs,
+                ino,
+                block_index,
+                pending_content_epoch,
+                pending_upload_index,
+                resolved,
+                requested,
+            )
+        } else {
+            vfs.pending_overlay_block_source(
+                ino,
+                block_index,
+                pending_content_epoch,
+                pending_upload_index,
+            )
+        }
+    }
+
     fn pending_overlay_block_source_from_resolved(
         vfs: &StudioVfs,
         ino: Ino,
@@ -592,7 +620,11 @@ impl<'a> DataReader<'a> {
             return false;
         };
         let mut cursor = target.start();
-        for span in resolved {
+        let start_index = resolved.partition_point(|span| {
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            chunk_base.saturating_add(u64::from(span.range.end)) <= target.start()
+        });
+        for span in &resolved[start_index..] {
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
             let span_start = chunk_base.saturating_add(u64::from(span.range.start));
             if span_start >= target.end() {
