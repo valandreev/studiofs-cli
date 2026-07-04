@@ -290,23 +290,27 @@ fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> 
     }
 }
 
-fn write_all_fuse(device: &mut File, mut bytes: &[u8]) -> io::Result<()> {
-    while !bytes.is_empty() {
+fn write_all_fuse(device: &mut File, bytes: &[u8]) -> io::Result<()> {
+    loop {
         match device.write(bytes) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "FUSE device accepted zero reply bytes",
-                ));
-            }
-            Ok(written) => bytes = &bytes[written..],
+            Ok(written) => return check_fuse_write_len(written, bytes.len()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 poll_fd(device.as_raw_fd(), libc::POLLOUT)?;
             }
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+}
+
+fn check_fuse_write_len(written: usize, expected: usize) -> io::Result<()> {
+    if written == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short FUSE reply write: wrote {written} of {expected} bytes"),
+        ))
+    }
 }
 
 fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
@@ -520,12 +524,21 @@ fn apply_read_ahead_kb_best_effort(mount_point: &Path, kb: u32) {
     match mountinfo_bdi_path(mount_point) {
         Ok(Some(path)) => {
             if let Err(error) = std::fs::write(&path, kb.to_string()) {
-                tracing::warn!(
-                    path = %mount_point.display(),
-                    bdi = %path.display(),
-                    %error,
-                    "linux fuse BDI read_ahead_kb tuning skipped"
-                );
+                if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                    tracing::debug!(
+                        path = %mount_point.display(),
+                        bdi = %path.display(),
+                        %error,
+                        "linux fuse BDI read_ahead_kb tuning skipped"
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %mount_point.display(),
+                        bdi = %path.display(),
+                        %error,
+                        "linux fuse BDI read_ahead_kb tuning skipped"
+                    );
+                }
             }
         }
         Ok(None) => tracing::warn!(
@@ -549,10 +562,14 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBu
     let target = mount_point.to_string_lossy();
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
-        let Some(majmin) = fields.nth(2) else {
-            continue;
-        };
-        let Some(mounted_at) = fields.nth(1) else {
+        // mountinfo starts with: id parent major:minor root mountpoint ...
+        let (Some(_id), Some(_parent), Some(majmin), Some(_root), Some(mounted_at)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             continue;
         };
         if unescape_mountinfo_field(mounted_at) == target {
@@ -674,6 +691,13 @@ mod tests {
     #[test]
     fn pollout_keeps_bounded_timeout() {
         assert_eq!(poll_timeout_ms(libc::POLLOUT), 30_000);
+    }
+
+    #[test]
+    fn fuse_reply_write_rejects_partial_syscall() {
+        let error = check_fuse_write_len(8, FUSE_OUT_HEADER_SIZE).expect_err("partial write");
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
     #[test]
