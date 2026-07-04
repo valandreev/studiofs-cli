@@ -556,12 +556,12 @@ impl<'a> DataReader<'a> {
         pending_upload_index: Option<&crate::vfs::overlay::PendingUploadCatalog>,
         requested: ReadRange,
     ) -> Option<PendingOverlayBlockSource> {
-        if let (Some(_), Some(resolved)) = (pending_content_epoch, resolved) {
+        if let (Some(epoch), Some(resolved)) = (pending_content_epoch, resolved) {
             Self::pending_overlay_block_source_from_resolved(
                 vfs,
                 ino,
                 block_index,
-                pending_content_epoch,
+                epoch,
                 pending_upload_index,
                 resolved,
                 requested,
@@ -580,7 +580,7 @@ impl<'a> DataReader<'a> {
         vfs: &StudioVfs,
         ino: Ino,
         block_index: u32,
-        pending_content_epoch: Option<u64>,
+        pending_content_epoch: u64,
         pending_upload_index: Option<&crate::vfs::overlay::PendingUploadCatalog>,
         resolved: &[ResolvedSliceSpan],
         requested: ReadRange,
@@ -588,7 +588,7 @@ impl<'a> DataReader<'a> {
         let extent = vfs.pending_live_extent_record(
             ino,
             block_index,
-            pending_content_epoch,
+            Some(pending_content_epoch),
             pending_upload_index,
         )?;
         if Self::resolved_slices_match_pending_extent(
@@ -631,9 +631,6 @@ impl<'a> DataReader<'a> {
                 break;
             }
             let span_end = chunk_base.saturating_add(u64::from(span.range.end));
-            if span_end <= target.start() {
-                continue;
-            }
             let Some(span_range) = ReadRange::new(span_start, span_end) else {
                 continue;
             };
