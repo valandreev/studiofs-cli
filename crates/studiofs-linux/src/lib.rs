@@ -3,6 +3,7 @@
 //! This crate owns the Linux-only `/dev/fuse` boundary and enough shell
 //! operations to prove the new path is isolated from the deleted legacy backend.
 
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -24,8 +25,6 @@ const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
-const FUSE_INIT_IN_FLAGS2_OFFSET: usize = FUSE_INIT_IN_BASE_SIZE;
-const FUSE_INIT_IN_FLAGS2_SIZE: usize = FUSE_INIT_IN_FLAGS2_OFFSET + 4;
 const FUSE_INIT_OUT_SIZE: usize = 64;
 const FUSE_INIT_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE;
 const FUSE_FORGET: u32 = 2;
@@ -526,11 +525,6 @@ fn parse_init_in(bytes: &[u8]) -> io::Result<FuseInitIn> {
         minor: read_u32(bytes, 4),
         max_readahead: read_u32(bytes, 8),
         flags: read_u32(bytes, 12),
-        flags2: if bytes.len() >= FUSE_INIT_IN_FLAGS2_SIZE {
-            read_u32(bytes, FUSE_INIT_IN_FLAGS2_OFFSET)
-        } else {
-            0
-        },
     })
 }
 
@@ -612,12 +606,17 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBu
     None
 }
 
-fn unescape_mountinfo_field(value: &str) -> String {
-    value
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
+fn unescape_mountinfo_field(value: &str) -> Cow<'_, str> {
+    if !value.contains('\\') {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\"),
+    )
 }
 
 #[derive(Debug)]
@@ -633,17 +632,14 @@ struct FuseInHeader {
     unique: u64,
 }
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct FuseInitIn {
     major: u32,
     minor: u32,
     max_readahead: u32,
     flags: u32,
-    flags2: u32,
 }
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct FuseInitOut {
     major: u32,
@@ -673,7 +669,6 @@ mod tests {
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 768 * 1024,
             flags: FUSE_MAX_PAGES | FUSE_ASYNC_READ,
-            flags2: 0,
         };
 
         let negotiated = negotiate_init(&init, 4096).expect("negotiate init");
@@ -691,7 +686,6 @@ mod tests {
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 256 * 1024,
             flags: FUSE_ASYNC_READ,
-            flags2: 0,
         };
 
         let negotiated = negotiate_init(&init, 4096).expect("negotiate init");
@@ -728,6 +722,15 @@ mod tests {
                 "/sys/class/bdi/0:114/read_ahead_kb"
             ))
         );
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_borrows_plain_paths() {
+        assert!(matches!(
+            unescape_mountinfo_field("/mnt/studiofs"),
+            Cow::Borrowed("/mnt/studiofs")
+        ));
+        assert_eq!(unescape_mountinfo_field("/mnt/a\\040b"), "/mnt/a b");
     }
 
     #[test]
@@ -772,7 +775,6 @@ mod tests {
                 minor: FUSE_KERNEL_MINOR_VERSION,
                 max_readahead: 512 * 1024,
                 flags: FUSE_ASYNC_READ,
-                flags2: 0,
             },
             4096,
         )
