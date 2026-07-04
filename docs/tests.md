@@ -316,8 +316,8 @@ rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 rwx run .rwx/e2e.yml --target e2e-full --wait --open
 ```
 
-Both targets exit early with the SFS-600 disabled-backend message. Re-enable
-them when the new Linux bridge exists.
+Both targets exit early with the unsupported Linux mount message. Re-enable them
+when the new Linux bridge exists.
 
 Focused runner skeleton check:
 
@@ -345,7 +345,9 @@ after SFS-600.
 2. **Do not use `#[ignore]` to skip platform unit tests.**
    Platform-gated tests that would be useless on other OSes must use `cfg`
    guards, not `#[ignore]`. CI command details per platform:
-   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
+
+   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only).
+
    Only the relevant runner runs each step; the other platforms skip it entirely
    via `cfg` guards in the test code.
 

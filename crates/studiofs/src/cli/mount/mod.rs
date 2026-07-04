@@ -53,7 +53,7 @@ impl MountCommand {
 #[command(long_about = "\
 Mount a previously initialized volume. On Windows, the mount point is a drive \
 letter (e.g. Z:). On macOS, it is an existing directory path. Linux mount is \
-not implemented after the SFS-600 legacy raw FUSE removal.
+currently unsupported.
 
 The local client uses its cached metadata database while synchronizing shared \
 state through PostgreSQL. Same-mount reads observe accepted writes \

@@ -7,7 +7,14 @@ use tokio::runtime::Handle;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+// Linux builds still construct the launch request before the unsupported backend rejects it.
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        dead_code,
+        reason = "Linux mount currently routes to an unsupported backend"
+    )
+)]
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
     pub(crate) runtime_handle: Handle,
@@ -81,7 +88,7 @@ struct UnsupportedUnixMountBackend;
 #[cfg(unix)]
 fn unsupported_unix_backend_error_message() -> &'static str {
     if cfg!(target_os = "linux") {
-        "StudioFS Linux mount is not implemented; the legacy raw FUSE backend was removed in SFS-600"
+        "StudioFS Linux mount is not implemented on this platform."
     } else if cfg!(target_os = "macos") {
         "StudioFS mount backend selector is unsupported; macOS uses the native macFUSE bridge by default; clear or set STUDIOFS_MOUNT_BACKEND=macfuse to use it"
     } else {
