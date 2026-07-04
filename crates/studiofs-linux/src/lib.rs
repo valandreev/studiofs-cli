@@ -725,11 +725,17 @@ where
 fn join_fuse_workers(workers: Vec<thread::JoinHandle<io::Result<()>>>) -> io::Result<()> {
     let mut first_error = None;
     for worker in workers {
-        let result = worker
-            .join()
-            .map_err(|panic| io::Error::other(thread_panic_message("linux fuse worker", panic)))?;
         if first_error.is_none() {
-            first_error = result.err();
+            first_error = match worker.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(panic) => Some(io::Error::other(thread_panic_message(
+                    "linux fuse worker",
+                    panic,
+                ))),
+            };
+        } else {
+            let _ = worker.join();
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -1936,6 +1942,24 @@ mod tests {
             .expect("scheduler should return after worker panic");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn join_fuse_workers_joins_remaining_workers_after_error() {
+        let slow_worker_finished = Arc::new(AtomicBool::new(false));
+        let slow_worker_finished_for_thread = Arc::clone(&slow_worker_finished);
+        let failing_worker =
+            std::thread::spawn(|| -> io::Result<()> { Err(io::Error::other("worker failed")) });
+        let slow_worker = std::thread::spawn(move || -> io::Result<()> {
+            std::thread::sleep(Duration::from_millis(50));
+            slow_worker_finished_for_thread.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let result = join_fuse_workers(vec![failing_worker, slow_worker]);
+
+        assert!(result.is_err());
+        assert!(slow_worker_finished.load(Ordering::SeqCst));
     }
 
     #[test]
