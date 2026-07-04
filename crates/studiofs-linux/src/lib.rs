@@ -13,7 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
@@ -65,7 +65,7 @@ const FUSE_MAX_PAGES_DEFAULT: u16 = 256;
 const FUSE_REQUEST_BUFFER_SIZE: usize = 1024 * 1024 + 4096;
 const FUSE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const FUSE_RECEIVE_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-const FUSE_WORK_QUEUE_DEPTH: usize = 1024;
+const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
@@ -377,7 +377,7 @@ fn run_fuse_shell(
     metrics: Arc<LinuxFuseLoopMetrics>,
 ) -> io::Result<LinuxFuseLoopStats> {
     let (work_tx, work_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH);
-    let (reply_tx, reply_rx) = sync_channel(FUSE_REPLY_QUEUE_DEPTH);
+    let (reply_tx, reply_rx) = work_channel(FUSE_REPLY_QUEUE_DEPTH);
     let (done_tx, done_rx) = channel();
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -460,7 +460,7 @@ fn receive_loop_until_shutdown(
 
 fn work_loop(
     work_rx: WorkReceiver<FuseWorkItem>,
-    reply_tx: SyncSender<FuseReply>,
+    reply_tx: WorkSender<FuseReply>,
     metrics: Arc<LinuxFuseLoopMetrics>,
 ) -> io::Result<()> {
     scheduled_work_loop(work_rx, reply_tx, metrics, handle_fuse_request)
@@ -468,7 +468,7 @@ fn work_loop(
 
 fn scheduled_work_loop<H>(
     work_rx: WorkReceiver<FuseWorkItem>,
-    reply_tx: SyncSender<FuseReply>,
+    reply_tx: WorkSender<FuseReply>,
     metrics: Arc<LinuxFuseLoopMetrics>,
     handler: H,
 ) -> io::Result<()>
@@ -572,7 +572,7 @@ where
 
 fn run_scheduled_item<H>(
     item: FuseWorkItem,
-    reply_tx: &SyncSender<FuseReply>,
+    reply_tx: &WorkSender<FuseReply>,
     metrics: &LinuxFuseLoopMetrics,
     handler: &H,
 ) -> io::Result<()>
@@ -589,7 +589,7 @@ where
 
 fn reply_loop(
     mut device: File,
-    reply_rx: Receiver<[u8; FUSE_OUT_HEADER_SIZE]>,
+    reply_rx: WorkReceiver<FuseReply>,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     while let Ok(reply) = reply_rx.recv() {
@@ -662,14 +662,14 @@ fn enqueue_work(
 }
 
 fn enqueue_reply(
-    tx: &SyncSender<FuseReply>,
+    tx: &WorkSender<FuseReply>,
     reply: FuseReply,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     metrics.reply_enqueued();
     match tx.try_send(reply) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(reply)) => {
+        Err(WorkTrySendError::Full(reply)) => {
             metrics
                 .reply_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -678,7 +678,7 @@ fn enqueue_reply(
                 io::Error::new(io::ErrorKind::BrokenPipe, "FUSE reply queue closed")
             })
         }
-        Err(TrySendError::Disconnected(_)) => {
+        Err(WorkTrySendError::Disconnected(_)) => {
             metrics.reply_dequeued();
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -744,11 +744,18 @@ fn stream_key_for(item: &FuseWorkItem) -> Option<(u64, Option<u64>)> {
 }
 
 fn stream_worker_index(key: (u64, Option<u64>), workers: usize) -> usize {
+    (stream_worker_hash(key) as usize) % workers
+}
+
+fn stream_worker_hash(key: (u64, Option<u64>)) -> u64 {
     let mut hash = key.0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    hash ^= key.1.unwrap_or(0).rotate_left(32);
+    hash ^= match key.1 {
+        Some(fh) => fh.rotate_left(32),
+        None => 0x517c_c1b7_2722_0a95,
+    };
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    (hash ^ (hash >> 33)) as usize % workers
+    hash ^ (hash >> 33)
 }
 
 fn fuse_request_fh(item: &FuseWorkItem) -> Option<u64> {
@@ -758,7 +765,7 @@ fn fuse_request_fh(item: &FuseWorkItem) -> Option<u64> {
         .map(u64::from_ne_bytes)
 }
 
-fn handle_fuse_request(item: &FuseWorkItem) -> Option<[u8; FUSE_OUT_HEADER_SIZE]> {
+fn handle_fuse_request(item: &FuseWorkItem) -> Option<FuseReply> {
     let header = item.header;
     let _payload_len = item.message.len();
     if !fuse_opcode_expects_reply(header.opcode) {
@@ -1006,7 +1013,7 @@ fn init_out_payload_size(minor: u32) -> usize {
     }
 }
 
-fn encode_error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_SIZE] {
+fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
     let mut reply = [0_u8; FUSE_OUT_HEADER_SIZE];
     let mut offset = 0;
     push_out_header(
@@ -1809,7 +1816,7 @@ mod tests {
     #[test]
     fn scheduler_reuses_fixed_stream_worker_after_release() {
         let (work_tx, work_rx) = work_channel(4);
-        let (reply_tx, _reply_rx) = std::sync::mpsc::sync_channel(4);
+        let (reply_tx, _reply_rx) = work_channel(4);
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(LinuxFuseLoopMetrics::default());
         let scheduler = std::thread::spawn(move || {
@@ -1853,7 +1860,7 @@ mod tests {
     #[test]
     fn scheduler_applies_backpressure_when_one_stream_queue_fills() {
         let (work_tx, work_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH + 4);
-        let (reply_tx, _reply_rx) = std::sync::mpsc::sync_channel(1);
+        let (reply_tx, _reply_rx) = work_channel(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let block_slow_stream = Arc::new(std::sync::Barrier::new(2));
         let release_slow_stream = Arc::new(std::sync::Barrier::new(2));
@@ -1900,9 +1907,17 @@ mod tests {
     }
 
     #[test]
+    fn stream_worker_hash_distinguishes_missing_and_zero_fh() {
+        assert_ne!(
+            stream_worker_hash((7, None)),
+            stream_worker_hash((7, Some(0)))
+        );
+    }
+
+    #[test]
     fn scheduler_returns_when_worker_panics() {
         let (work_tx, work_rx) = work_channel(1);
-        let (reply_tx, _reply_rx) = std::sync::mpsc::sync_channel(1);
+        let (reply_tx, _reply_rx) = work_channel(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(LinuxFuseLoopMetrics::default());
         std::thread::spawn(move || {
@@ -2007,7 +2022,7 @@ mod tests {
         std::thread::JoinHandle<io::Result<()>>,
     ) {
         let (work_tx, work_rx) = work_channel(items.len().max(1));
-        let (reply_tx, _reply_rx) = std::sync::mpsc::sync_channel(items.len().max(1));
+        let (reply_tx, _reply_rx) = work_channel(items.len().max(1));
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let metrics = Arc::new(LinuxFuseLoopMetrics::default());
         for item in items {
