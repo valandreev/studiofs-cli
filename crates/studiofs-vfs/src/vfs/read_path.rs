@@ -3748,6 +3748,85 @@ mod tests {
     }
 
     #[test]
+    fn prepared_pending_extent_read_prefers_newer_dirty_payload() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "pending-extent-dirty-over-snapshot");
+        rt.block_on(async {
+            let attr = vfs
+                .create(
+                    ROOT_INO,
+                    b"pending-extent-dirty-over-snapshot.bin",
+                    0,
+                    0,
+                    0o644,
+                )
+                .expect("create test file");
+            let ino = attr.ino;
+            let object_id = 0xDD44;
+
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"snapshot"), false)
+                .await
+                .expect("seed pending payload object");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Updating;
+            staged_attr.committed_content_epoch = 1;
+            staged_attr.content_epoch = 2;
+            meta.set_attr(&staged_attr).expect("persist staged attr");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
+                .expect("persist prepared pending payload slice");
+
+            let resolved_slices = meta
+                .lookup_regular_file_slices(ino, 0, 8)
+                .expect("resolve prepared slice snapshot");
+            vfs.state.incarnation.live_extent_records.lock().insert(
+                (ino, 0),
+                crate::vfs::overlay::ExtentRecordId {
+                    object_id,
+                    content_epoch: staged_attr.content_epoch,
+                },
+            );
+            vfs.state.local_dirty.pending_payloads.lock().insert(
+                (ino, 0),
+                PendingPayload {
+                    data: BytesMut::from(&b"dirty!!!"[..]),
+                    dirty: true,
+                    reserved_object_id: None,
+                    persisted_len: None,
+                },
+            );
+            vfs.state
+                .local_dirty
+                .pending_payload_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(0);
+
+            let segments = DataReader::new(
+                &vfs,
+                ino,
+                0,
+                8,
+                Some(staged_attr.content_epoch),
+                Some(resolved_slices.as_slice()),
+            )
+            .build_segments()
+            .await
+            .expect("resolve data reader segments");
+
+            assert!(
+                segments
+                    .iter()
+                    .any(|segment| matches!(segment.source, ReadSegmentSource::Dirty { .. })),
+                "newer dirty payload must stay ahead of prepared pending extents: {segments:?}"
+            );
+        });
+    }
+
+    #[test]
     fn prepared_pending_extent_read_requires_full_requested_coverage() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "pending-extent-prepared-partial");
