@@ -6,12 +6,15 @@
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::thread;
 use std::time::Duration;
 
 use studiofs_bridge::posix::{BridgeFileAttr, to_bridge_attr, vfs_err_to_errno};
@@ -20,6 +23,7 @@ use studiofs_vfs::StudioVfs;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 const FUSE_DEVICE: &str = "/dev/fuse";
+const FUSE_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NONBLOCK;
 const FUSE_MOUNT_TYPE: &str = "fuse";
 const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
@@ -48,6 +52,9 @@ const FUSE_COMPAT_MAX_WRITE: u32 = 128 * 1024;
 const FUSE_MAX_PAGES_DEFAULT: u16 = 256;
 const FUSE_REQUEST_BUFFER_SIZE: usize = 1024 * 1024 + 4096;
 const FUSE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const FUSE_RECEIVE_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+const FUSE_WORK_QUEUE_DEPTH: usize = 1024;
+const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
@@ -71,15 +78,92 @@ pub struct LinuxDirEntry {
     pub name: Vec<u8>,
 }
 
+/// Snapshot of Linux FUSE loop queue and error counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinuxFuseLoopStats {
+    /// Requests waiting for operation work.
+    pub work_queue_depth: usize,
+    /// Replies waiting for the dedicated FUSE writer.
+    pub reply_queue_depth: usize,
+    /// Times the receive loop hit a full work queue.
+    pub work_backpressure_count: usize,
+    /// Times operation work hit a full reply queue.
+    pub reply_backpressure_count: usize,
+    /// Receive path errors.
+    pub receive_error_count: usize,
+    /// Operation path errors.
+    pub work_error_count: usize,
+    /// Reply writer errors.
+    pub reply_error_count: usize,
+}
+
+/// Shared counters for the isolated Linux FUSE loops.
+#[derive(Default)]
+pub struct LinuxFuseLoopMetrics {
+    work_queue_depth: AtomicUsize,
+    reply_queue_depth: AtomicUsize,
+    work_backpressure_count: AtomicUsize,
+    reply_backpressure_count: AtomicUsize,
+    receive_error_count: AtomicUsize,
+    work_error_count: AtomicUsize,
+    reply_error_count: AtomicUsize,
+}
+
+impl LinuxFuseLoopMetrics {
+    /// Return a point-in-time snapshot of queue depth and error counters.
+    pub fn snapshot(&self) -> LinuxFuseLoopStats {
+        LinuxFuseLoopStats {
+            work_queue_depth: self.work_queue_depth.load(Ordering::Relaxed),
+            reply_queue_depth: self.reply_queue_depth.load(Ordering::Relaxed),
+            work_backpressure_count: self.work_backpressure_count.load(Ordering::Relaxed),
+            reply_backpressure_count: self.reply_backpressure_count.load(Ordering::Relaxed),
+            receive_error_count: self.receive_error_count.load(Ordering::Relaxed),
+            work_error_count: self.work_error_count.load(Ordering::Relaxed),
+            reply_error_count: self.reply_error_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn work_enqueued(&self) {
+        self.work_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn work_dequeued(&self) {
+        decrement_counter(&self.work_queue_depth);
+    }
+
+    fn reply_enqueued(&self) {
+        self.reply_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reply_dequeued(&self) {
+        decrement_counter(&self.reply_queue_depth);
+    }
+}
+
+fn decrement_counter(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_sub(1)
+    });
+}
+
 /// Mount `/dev/fuse`, negotiate the kernel session, then hold the single-fd shell.
 pub fn mount_with_request(request: LinuxMountRequest) -> io::Result<()> {
+    mount_with_request_and_metrics(request, Arc::new(LinuxFuseLoopMetrics::default())).map(|_| ())
+}
+
+/// Mount `/dev/fuse` with externally observable loop metrics.
+pub fn mount_with_request_and_metrics(
+    request: LinuxMountRequest,
+    metrics: Arc<LinuxFuseLoopMetrics>,
+) -> io::Result<LinuxFuseLoopStats> {
     let mut device = open_fuse_device()?;
     let bdi_mount_point = mountinfo_lookup_mount_point(&request.mount_point);
     mount_fuse_device(&request.mount_point, device.as_raw_fd())?;
     let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
     let negotiated = read_and_reply_init(&mut device, &mut buffer)?;
     apply_read_ahead_kb_best_effort(&bdi_mount_point, negotiated.out.max_readahead / 1024);
-    run_single_fd_shell(device, &mut buffer)
+    let reply_device = device.try_clone()?;
+    run_fuse_shell(device, reply_device, buffer, metrics)
 }
 
 impl LinuxMountShell {
@@ -150,7 +234,7 @@ fn open_fuse_device() -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(FUSE_OPEN_FLAGS)
         .open(FUSE_DEVICE)
         .map_err(|error| {
             io::Error::new(
@@ -271,19 +355,221 @@ fn read_and_reply_init(device: &mut File, buffer: &mut [u8]) -> io::Result<Negot
     Ok(negotiated)
 }
 
-fn run_single_fd_shell(mut device: File, buffer: &mut [u8]) -> io::Result<()> {
-    // ponytail: single-fd ENOSYS loop; SFS-584 replaces this with real receive/work/reply loops.
+fn run_fuse_shell(
+    device: File,
+    reply_device: File,
+    buffer: Vec<u8>,
+    metrics: Arc<LinuxFuseLoopMetrics>,
+) -> io::Result<LinuxFuseLoopStats> {
+    let (work_tx, work_rx) = sync_channel(FUSE_WORK_QUEUE_DEPTH);
+    let (reply_tx, reply_rx) = sync_channel(FUSE_REPLY_QUEUE_DEPTH);
+    let (done_tx, done_rx) = channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let receive_metrics = Arc::clone(&metrics);
+    let receive_shutdown = Arc::clone(&shutdown);
+    let receiver = spawn_loop("linux fuse receiver", done_tx.clone(), move || {
+        receive_loop_until_shutdown(device, buffer, work_tx, &receive_metrics, &receive_shutdown)
+    })?;
+
+    let work_metrics = Arc::clone(&metrics);
+    let worker = spawn_loop("linux fuse worker", done_tx.clone(), move || {
+        work_loop(work_rx, reply_tx, &work_metrics)
+    })?;
+
+    let reply_metrics = Arc::clone(&metrics);
+    let replier = spawn_loop("linux fuse replier", done_tx, move || {
+        reply_loop(reply_device, reply_rx, &reply_metrics)
+    })?;
+
+    let mut first_error = None;
+    let mut completed = 0;
+    while completed < 3 {
+        match done_rx.recv() {
+            Ok(Ok(())) => completed += 1,
+            Ok(Err(error)) => {
+                shutdown.store(true, Ordering::Relaxed);
+                first_error = Some(error);
+                completed += 1;
+                break;
+            }
+            Err(_) => {
+                shutdown.store(true, Ordering::Relaxed);
+                first_error = Some(io::Error::other("linux fuse loop status channel closed"));
+                break;
+            }
+        }
+    }
+    while completed < 3 {
+        let _ = done_rx.recv();
+        completed += 1;
+    }
+
+    join_loop(receiver, "linux fuse receiver")?;
+    join_loop(worker, "linux fuse worker")?;
+    join_loop(replier, "linux fuse replier")?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(metrics.snapshot())
+}
+
+fn receive_loop_until_shutdown(
+    mut device: impl Read + AsRawFd,
+    mut buffer: impl AsMut<[u8]>,
+    work_tx: SyncSender<FuseWorkItem>,
+    metrics: &LinuxFuseLoopMetrics,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
     loop {
-        let len = read_fuse_message(&mut device, buffer)?;
-        let header = parse_in_header(&buffer[..len])?;
+        let Some(len) = read_fuse_message_until_shutdown(&mut device, buffer.as_mut(), shutdown)
+            .inspect_err(|_| {
+                metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
+            })?
+        else {
+            return Ok(());
+        };
+        let message = buffer.as_mut()[..len].to_vec();
+        let header = parse_in_header(&message).inspect_err(|_| {
+            metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
+        })?;
+        // ponytail: per-request copy; swap in a buffer pool once real payload ops are profiled.
+        enqueue_work(&work_tx, FuseWorkItem { header, message }, metrics).inspect_err(|_| {
+            metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
+        })?;
         if header.opcode == FUSE_DESTROY {
             return Ok(());
         }
-        if !fuse_opcode_expects_reply(header.opcode) {
-            continue;
-        }
-        write_error_reply(&mut device, header.unique, libc::ENOSYS)?;
     }
+}
+
+fn work_loop(
+    work_rx: Receiver<FuseWorkItem>,
+    reply_tx: SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
+    metrics: &LinuxFuseLoopMetrics,
+) -> io::Result<()> {
+    while let Ok(item) = work_rx.recv() {
+        metrics.work_dequeued();
+        if item.header.opcode == FUSE_DESTROY {
+            return Ok(());
+        }
+        if let Some(reply) = handle_fuse_request(&item) {
+            enqueue_reply(&reply_tx, reply, metrics).inspect_err(|_| {
+                metrics.work_error_count.fetch_add(1, Ordering::Relaxed);
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn reply_loop(
+    mut device: File,
+    reply_rx: Receiver<[u8; FUSE_OUT_HEADER_SIZE]>,
+    metrics: &LinuxFuseLoopMetrics,
+) -> io::Result<()> {
+    while let Ok(reply) = reply_rx.recv() {
+        metrics.reply_dequeued();
+        let slices = [IoSlice::new(&reply)];
+        write_vectored_fuse(&mut device, &slices).inspect_err(|_| {
+            metrics.reply_error_count.fetch_add(1, Ordering::Relaxed);
+        })?;
+    }
+    Ok(())
+}
+
+fn spawn_loop<F>(
+    name: &'static str,
+    tx: Sender<io::Result<()>>,
+    f: F,
+) -> io::Result<thread::JoinHandle<()>>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .unwrap_or_else(|panic| Err(io::Error::other(thread_panic_message(name, panic))));
+        let _ = tx.send(result);
+    })
+}
+
+fn join_loop(handle: thread::JoinHandle<()>, name: &str) -> io::Result<()> {
+    match handle.join() {
+        Ok(()) => Ok(()),
+        Err(panic) => Err(io::Error::other(thread_panic_message(name, panic))),
+    }
+}
+
+fn thread_panic_message(name: &str, panic: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        format!("{name} panicked: {message}")
+    } else if let Some(message) = panic.downcast_ref::<&'static str>() {
+        format!("{name} panicked: {message}")
+    } else {
+        format!("{name} panicked")
+    }
+}
+
+fn enqueue_work(
+    tx: &SyncSender<FuseWorkItem>,
+    item: FuseWorkItem,
+    metrics: &LinuxFuseLoopMetrics,
+) -> io::Result<()> {
+    metrics.work_enqueued();
+    match tx.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(item)) => {
+            metrics
+                .work_backpressure_count
+                .fetch_add(1, Ordering::Relaxed);
+            tx.send(item).map_err(|_| {
+                metrics.work_dequeued();
+                io::Error::new(io::ErrorKind::BrokenPipe, "FUSE work queue closed")
+            })
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            metrics.work_dequeued();
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "FUSE work queue closed",
+            ))
+        }
+    }
+}
+
+fn enqueue_reply(
+    tx: &SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
+    reply: [u8; FUSE_OUT_HEADER_SIZE],
+    metrics: &LinuxFuseLoopMetrics,
+) -> io::Result<()> {
+    metrics.reply_enqueued();
+    match tx.try_send(reply) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(reply)) => {
+            metrics
+                .reply_backpressure_count
+                .fetch_add(1, Ordering::Relaxed);
+            tx.send(reply).map_err(|_| {
+                metrics.reply_dequeued();
+                io::Error::new(io::ErrorKind::BrokenPipe, "FUSE reply queue closed")
+            })
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            metrics.reply_dequeued();
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "FUSE reply queue closed",
+            ))
+        }
+    }
+}
+
+fn handle_fuse_request(item: &FuseWorkItem) -> Option<[u8; FUSE_OUT_HEADER_SIZE]> {
+    let header = item.header;
+    let _payload_len = item.message.len();
+    if !fuse_opcode_expects_reply(header.opcode) {
+        return None;
+    }
+    Some(encode_error_reply(header.unique, libc::ENOSYS))
 }
 
 fn fuse_opcode_expects_reply(opcode: u32) -> bool {
@@ -309,10 +595,50 @@ fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> 
     }
 }
 
+fn read_fuse_message_until_shutdown(
+    device: &mut (impl Read + AsRawFd),
+    buffer: &mut [u8],
+    shutdown: &AtomicBool,
+) -> io::Result<Option<usize>> {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match device.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "FUSE device closed while waiting for request",
+                ));
+            }
+            Ok(len) => return Ok(Some(len)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let _ = poll_fd_for(device.as_raw_fd(), libc::POLLIN, FUSE_RECEIVE_SHUTDOWN_POLL)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn write_all_fuse(device: &mut File, bytes: &[u8]) -> io::Result<()> {
     loop {
         match device.write(bytes) {
             Ok(written) => return check_fuse_write_len(written, bytes.len()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_fd(device.as_raw_fd(), libc::POLLOUT)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn write_vectored_fuse(device: &mut File, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let expected = slices.iter().map(|slice| slice.len()).sum();
+    loop {
+        match device.write_vectored(slices) {
+            Ok(written) => return check_fuse_write_len(written, expected),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 poll_fd(device.as_raw_fd(), libc::POLLOUT)?;
@@ -351,6 +677,29 @@ fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
                 ));
             }
             n if n > 0 => return Ok(()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn poll_fd_for(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::Result<bool> {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: `pollfd` points to one initialized poll descriptor.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        match rc {
+            0 => return Ok(false),
+            n if n > 0 => return Ok(true),
             _ => {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
@@ -424,10 +773,6 @@ fn negotiate_init(init: &FuseInitIn, page_size: u32) -> io::Result<NegotiatedIni
 
 fn write_init_reply(device: &mut File, unique: u64, init: &FuseInitOut) -> io::Result<()> {
     write_all_fuse(device, &encode_init_reply(unique, init))
-}
-
-fn write_error_reply(device: &mut File, unique: u64, errno: i32) -> io::Result<()> {
-    write_all_fuse(device, &encode_error_reply(unique, errno))
 }
 
 fn encode_init_reply(unique: u64, init: &FuseInitOut) -> Vec<u8> {
@@ -708,6 +1053,12 @@ struct FuseInHeader {
     unique: u64,
 }
 
+#[derive(Debug, Clone)]
+struct FuseWorkItem {
+    header: FuseInHeader,
+    message: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FuseInitIn {
     major: u32,
@@ -978,5 +1329,243 @@ mod tests {
             -libc::ENOSYS
         );
         assert_eq!(read_u64(&reply, 8).expect("unique"), 7);
+    }
+
+    #[test]
+    fn work_path_builds_error_reply_without_writer() {
+        let reply = handle_fuse_request(&FuseWorkItem {
+            header: FuseInHeader {
+                opcode: 999,
+                unique: 44,
+            },
+            message: Vec::new(),
+        })
+        .expect("reply");
+
+        assert_eq!(reply, encode_error_reply(44, libc::ENOSYS));
+    }
+
+    #[test]
+    fn error_reply_work_item_stays_inline() {
+        let reply = handle_fuse_request(&FuseWorkItem {
+            header: FuseInHeader {
+                opcode: 999,
+                unique: 45,
+            },
+            message: Vec::new(),
+        })
+        .expect("reply");
+
+        assert_eq!(std::mem::size_of_val(&reply), FUSE_OUT_HEADER_SIZE);
+    }
+
+    #[test]
+    fn queue_depth_decrement_does_not_underflow() {
+        let metrics = LinuxFuseLoopMetrics::default();
+
+        metrics.work_dequeued();
+        metrics.reply_dequeued();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.work_queue_depth, 0);
+        assert_eq!(snapshot.reply_queue_depth, 0);
+    }
+
+    #[test]
+    fn fuse_device_open_flags_include_nonblocking() {
+        assert_ne!(FUSE_OPEN_FLAGS & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn bounded_work_enqueue_records_backpressure() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        enqueue_work(
+            &tx,
+            FuseWorkItem {
+                header: FuseInHeader {
+                    opcode: 999,
+                    unique: 1,
+                },
+                message: Vec::new(),
+            },
+            &metrics,
+        )
+        .expect("first enqueue");
+
+        let metrics_for_thread = Arc::clone(&metrics);
+        let sender = std::thread::spawn(move || {
+            enqueue_work(
+                &tx,
+                FuseWorkItem {
+                    header: FuseInHeader {
+                        opcode: 999,
+                        unique: 2,
+                    },
+                    message: Vec::new(),
+                },
+                &metrics_for_thread,
+            )
+        });
+
+        while metrics.snapshot().work_backpressure_count == 0 {
+            std::thread::yield_now();
+        }
+        let _first = rx.recv().expect("first work item");
+        sender
+            .join()
+            .expect("sender thread")
+            .expect("second enqueue");
+
+        assert_eq!(metrics.snapshot().work_backpressure_count, 1);
+    }
+
+    #[test]
+    fn shell_routes_request_through_reply_loop() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+
+        let (mut kernel, device) = UnixStream::pair().expect("socket pair");
+        let reply_device = device.try_clone().expect("clone device");
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        let metrics_for_shell = Arc::clone(&metrics);
+        let shell = std::thread::spawn(move || {
+            let device = unsafe {
+                // SAFETY: `device.into_raw_fd()` transfers ownership to `File`.
+                File::from_raw_fd(device.into_raw_fd())
+            };
+            let reply_device = unsafe {
+                // SAFETY: `reply_device.into_raw_fd()` transfers ownership to `File`.
+                File::from_raw_fd(reply_device.into_raw_fd())
+            };
+            run_fuse_shell(
+                device,
+                reply_device,
+                vec![0_u8; FUSE_REQUEST_BUFFER_SIZE],
+                metrics_for_shell,
+            )
+        });
+
+        kernel
+            .write_all(&fuse_request_for_test(999, 55))
+            .expect("write request");
+        let mut reply = [0_u8; FUSE_OUT_HEADER_SIZE];
+        kernel.read_exact(&mut reply).expect("read reply");
+        kernel
+            .write_all(&fuse_request_for_test(FUSE_DESTROY, 56))
+            .expect("write destroy");
+        shell.join().expect("shell thread").expect("shell result");
+
+        assert_eq!(read_u64(&reply, 8).expect("unique"), 55);
+        assert_eq!(metrics.snapshot().reply_error_count, 0);
+    }
+
+    #[test]
+    fn receive_loop_passes_full_request_message_to_worker() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+
+        let (mut kernel, device) = UnixStream::pair().expect("socket pair");
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let metrics_for_receiver = Arc::clone(&metrics);
+        let shutdown_for_receiver = Arc::clone(&shutdown);
+        let receiver = std::thread::spawn(move || {
+            let device = unsafe {
+                // SAFETY: `device.into_raw_fd()` transfers ownership to `File`.
+                File::from_raw_fd(device.into_raw_fd())
+            };
+            receive_loop_until_shutdown(
+                device,
+                vec![0_u8; FUSE_REQUEST_BUFFER_SIZE],
+                tx,
+                &metrics_for_receiver,
+                &shutdown_for_receiver,
+            )
+        });
+        let request = fuse_request_with_payload_for_test(999, 77, b"payload");
+
+        kernel.write_all(&request).expect("write request");
+        let item = rx.recv().expect("work item");
+        kernel
+            .write_all(&fuse_request_for_test(FUSE_DESTROY, 78))
+            .expect("write destroy");
+        receiver.join().expect("receiver thread").expect("receiver");
+
+        assert_eq!(item.message, request);
+    }
+
+    #[test]
+    fn shell_returns_when_reply_path_fails_while_receiver_is_idle() {
+        use std::net::Shutdown;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut kernel, device) = UnixStream::pair().expect("socket pair");
+        device.set_nonblocking(true).expect("nonblocking device");
+        let reply_device = device.try_clone().expect("clone device");
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let device = unsafe {
+                // SAFETY: `device.into_raw_fd()` transfers ownership to `File`.
+                File::from_raw_fd(device.into_raw_fd())
+            };
+            let reply_device = unsafe {
+                // SAFETY: `reply_device.into_raw_fd()` transfers ownership to `File`.
+                File::from_raw_fd(reply_device.into_raw_fd())
+            };
+            let _ = done_tx.send(run_fuse_shell(
+                device,
+                reply_device,
+                vec![0_u8; FUSE_REQUEST_BUFFER_SIZE],
+                metrics,
+            ));
+        });
+
+        kernel
+            .write_all(&fuse_request_for_test(999, 79))
+            .expect("write request");
+        kernel.shutdown(Shutdown::Read).expect("shutdown read half");
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shell should return after reply failure");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn spawn_loop_assigns_thread_name() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let handle = spawn_loop("studiofs-test-loop", done_tx, move || {
+            let name = std::thread::current().name().unwrap_or("").to_owned();
+            name_tx.send(name).expect("send thread name");
+            Ok(())
+        })
+        .expect("spawn loop");
+
+        join_loop(handle, "studiofs-test-loop").expect("join");
+        done_rx.recv().expect("loop result").expect("loop ok");
+
+        assert_eq!(name_rx.recv().expect("thread name"), "studiofs-test-loop");
+    }
+
+    fn fuse_request_for_test(opcode: u32, unique: u64) -> [u8; FUSE_IN_HEADER_SIZE] {
+        let mut request = [0_u8; FUSE_IN_HEADER_SIZE];
+        request[0..4].copy_from_slice(&(FUSE_IN_HEADER_SIZE as u32).to_ne_bytes());
+        request[4..8].copy_from_slice(&opcode.to_ne_bytes());
+        request[8..16].copy_from_slice(&unique.to_ne_bytes());
+        request
+    }
+
+    fn fuse_request_with_payload_for_test(opcode: u32, unique: u64, payload: &[u8]) -> Vec<u8> {
+        let mut request = Vec::from(fuse_request_for_test(opcode, unique));
+        let len = request.len() + payload.len();
+        request[0..4].copy_from_slice(&(len as u32).to_ne_bytes());
+        request.extend_from_slice(payload);
+        request
     }
 }
