@@ -196,6 +196,11 @@ impl StudioVfs {
         );
         for (name, unit, value) in [
             (
+                "fuse_shared_buffer_budget_bytes",
+                "bytes",
+                write_path.fuse_async_write.shared_buffer_budget_bytes,
+            ),
+            (
                 "fuse_read_buffer_budget_bytes",
                 "bytes",
                 write_path.fuse_async_write.read_buffer_budget_bytes,

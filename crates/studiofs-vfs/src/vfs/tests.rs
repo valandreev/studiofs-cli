@@ -12698,8 +12698,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
-        read_buffer_budget_bytes: Some(150 * 1024 * 1024),
-        write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        shared_buffer_budget_bytes: Some(300 * 1024 * 1024),
         prefetch_concurrency: Some(1),
         upload_concurrency: Some(20),
         download_concurrency: Some(200),
@@ -12717,6 +12716,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         admission_wait_total_ms: 6.5,
         barrier_waits: 7,
         barrier_wait_total_ms: 8.5,
+        ..Default::default()
     });
 
     let snapshot = vfs.write_path_observability_snapshot();
@@ -12742,8 +12742,8 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
     assert_eq!(
-        snapshot.fuse_async_write.read_buffer_budget_bytes,
-        Some(150 * 1024 * 1024)
+        snapshot.fuse_async_write.shared_buffer_budget_bytes,
+        Some(300 * 1024 * 1024)
     );
     assert_eq!(snapshot.fuse_async_write.upload_concurrency, Some(20));
     assert_eq!(
@@ -12763,8 +12763,7 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         fuse_max_readahead_bytes: 128 * 1024,
         fuse_max_background: Some(128),
         fuse_congestion_threshold: Some(96),
-        read_buffer_budget_bytes: Some(150 * 1024 * 1024),
-        write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+        shared_buffer_budget_bytes: Some(300 * 1024 * 1024),
         prefetch_concurrency: Some(1),
         upload_concurrency: Some(20),
         download_concurrency: Some(200),
@@ -12788,8 +12787,8 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         128 * 1024
     );
     assert_eq!(
-        snapshot.bridge.gauges["fuse_read_buffer_budget_bytes"].value,
-        150 * 1024 * 1024
+        snapshot.bridge.gauges["fuse_shared_buffer_budget_bytes"].value,
+        300 * 1024 * 1024
     );
     assert_eq!(snapshot.bridge.gauges["fuse_upload_concurrency"].value, 20);
     assert_eq!(
@@ -12809,6 +12808,12 @@ fn runtime_stats_surface_skips_absent_fuse_profile_knobs() {
 
     let snapshot = vfs.runtime_stats_snapshot();
 
+    assert!(
+        !snapshot
+            .bridge
+            .gauges
+            .contains_key("fuse_shared_buffer_budget_bytes")
+    );
     assert!(
         !snapshot
             .bridge

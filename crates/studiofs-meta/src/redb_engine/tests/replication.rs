@@ -1572,3 +1572,46 @@ fn replica_serving_remove_attr_clears_regular_file_overlay_payload() {
         "remote remove attr must not leave serving overlay payload for the removed inode"
     );
 }
+
+#[test]
+fn replica_serving_remove_attr_clears_regular_file_base_payload() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-remove-attr-base.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let base_payload = PayloadRef::new_full(92_201, DEFAULT_BLOCK_SIZE);
+    let base_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&base_payload),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: file.ino,
+            chunk_slices: base_slices,
+        }])
+        .unwrap();
+
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveAttr { ino: file.ino }])
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert!(
+        object_ids.is_empty(),
+        "remote remove attr must not leave base payload graph for the removed inode"
+    );
+}
