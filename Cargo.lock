@@ -4907,7 +4907,6 @@ dependencies = [
  "studiofs-test-support",
  "studiofs-vfs",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

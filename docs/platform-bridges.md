@@ -176,15 +176,12 @@ Current signature includes additional policy controls:
 ## Linux Mount
 
 Linux mount starts from a clean raw `/dev/fuse` transport. SFS-600 removed the
-legacy macFUSE-like backend and there is no hidden compatibility fallback. The
-`studiofs-linux` crate owns a small clean shell that can answer lifecycle,
-root `lookup/getattr`, `readdir`, and `destroy` smoke calls through explicit
-`StudioVfs` boundaries. On a real mount, startup opens `/dev/fuse` with
-`O_NONBLOCK`, mounts with `fd=...`, negotiates kernel capabilities, logs the
-requested/accepted capability sets and `max_write` / `max_pages` /
-`max_readahead`, and treats BDI `read_ahead_kb` tuning as best-effort only.
-Non-init requests currently receive `ENOSYS` from the single-fd shell until
-SFS-584 adds the real Linux receive/work/reply loops.
+legacy macFUSE-like backend and there is no hidden compatibility fallback. On a
+real mount, startup opens `/dev/fuse` with `O_NONBLOCK`, mounts with `fd=...`,
+negotiates kernel capabilities, logs the requested/accepted capability sets and
+`max_write` / `max_pages` / `max_readahead`, and treats BDI `read_ahead_kb`
+tuning as best-effort only. Non-init requests currently receive `ENOSYS` from
+the single-fd shell until SFS-584 adds the real Linux receive/work/reply loops.
 
 ### Requirements
 

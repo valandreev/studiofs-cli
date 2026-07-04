@@ -25,8 +25,9 @@ const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
+const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
+const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 const FUSE_INIT_OUT_SIZE: usize = 64;
-const FUSE_INIT_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE;
 const FUSE_FORGET: u32 = 2;
 const FUSE_INIT: u32 = 26;
 const FUSE_DESTROY: u32 = 38;
@@ -73,10 +74,11 @@ pub struct LinuxDirEntry {
 /// Mount `/dev/fuse`, negotiate the kernel session, then hold the single-fd shell.
 pub fn mount_with_request(request: LinuxMountRequest) -> io::Result<()> {
     let mut device = open_fuse_device()?;
+    let bdi_mount_point = mountinfo_lookup_mount_point(&request.mount_point);
     mount_fuse_device(&request.mount_point, device.as_raw_fd())?;
     let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
     let negotiated = read_and_reply_init(&mut device, &mut buffer)?;
-    apply_read_ahead_kb_best_effort(&request.mount_point, negotiated.out.max_readahead / 1024);
+    apply_read_ahead_kb_best_effort(&bdi_mount_point, negotiated.out.max_readahead / 1024);
     run_single_fd_shell(device, &mut buffer)
 }
 
@@ -423,10 +425,12 @@ fn write_error_reply(device: &mut File, unique: u64, errno: i32) -> io::Result<(
     write_all_fuse(device, &encode_error_reply(unique, errno))
 }
 
-fn encode_init_reply(unique: u64, init: &FuseInitOut) -> [u8; FUSE_INIT_REPLY_SIZE] {
-    let mut reply = [0_u8; FUSE_INIT_REPLY_SIZE];
+fn encode_init_reply(unique: u64, init: &FuseInitOut) -> Vec<u8> {
+    let payload_size = init_out_payload_size(init.minor);
+    let reply_size = FUSE_OUT_HEADER_SIZE + payload_size;
+    let mut reply = vec![0_u8; FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE];
     let mut offset = 0;
-    push_out_header(&mut reply, &mut offset, unique, 0, FUSE_INIT_REPLY_SIZE);
+    push_out_header(&mut reply, &mut offset, unique, 0, reply_size);
     push_u32(&mut reply, &mut offset, init.major);
     push_u32(&mut reply, &mut offset, init.minor);
     push_u32(&mut reply, &mut offset, init.max_readahead);
@@ -443,7 +447,18 @@ fn encode_init_reply(unique: u64, init: &FuseInitOut) -> [u8; FUSE_INIT_REPLY_SI
     for value in init.unused {
         push_u16(&mut reply, &mut offset, value);
     }
+    reply.truncate(reply_size);
     reply
+}
+
+fn init_out_payload_size(minor: u32) -> usize {
+    if minor < 5 {
+        FUSE_COMPAT_INIT_OUT_SIZE
+    } else if minor < 23 {
+        FUSE_COMPAT_22_INIT_OUT_SIZE
+    } else {
+        FUSE_INIT_OUT_SIZE
+    }
 }
 
 fn encode_error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_SIZE] {
@@ -494,7 +509,7 @@ fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
             "short FUSE request header",
         ));
     }
-    let len = read_u32(bytes, 0);
+    let len = read_u32(bytes, 0)?;
     if len < FUSE_IN_HEADER_SIZE as u32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -508,8 +523,8 @@ fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
         ));
     }
     Ok(FuseInHeader {
-        opcode: read_u32(bytes, 4),
-        unique: read_u64(bytes, 8),
+        opcode: read_u32(bytes, 4)?,
+        unique: read_u64(bytes, 8)?,
     })
 }
 
@@ -521,23 +536,34 @@ fn parse_init_in(bytes: &[u8]) -> io::Result<FuseInitIn> {
         ));
     }
     Ok(FuseInitIn {
-        major: read_u32(bytes, 0),
-        minor: read_u32(bytes, 4),
-        max_readahead: read_u32(bytes, 8),
-        flags: read_u32(bytes, 12),
+        major: read_u32(bytes, 0)?,
+        minor: read_u32(bytes, 4)?,
+        max_readahead: read_u32(bytes, 8)?,
+        flags: read_u32(bytes, 12)?,
     })
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    let mut value = [0_u8; 4];
-    value.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_ne_bytes(value)
+fn read_u32(bytes: &[u8], offset: usize) -> io::Result<u32> {
+    read_bytes(bytes, offset).map(u32::from_ne_bytes)
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    let mut value = [0_u8; 8];
-    value.copy_from_slice(&bytes[offset..offset + 8]);
-    u64::from_ne_bytes(value)
+fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
+    read_bytes(bytes, offset).map(u64::from_ne_bytes)
+}
+
+fn read_bytes<const N: usize>(bytes: &[u8], offset: usize) -> io::Result<[u8; N]> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FUSE field offset overflow"))?;
+    let slice = bytes.get(offset..end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE field extends beyond message",
+        )
+    })?;
+    let mut value = [0_u8; N];
+    value.copy_from_slice(slice);
+    Ok(value)
 }
 
 fn apply_read_ahead_kb_best_effort(mount_point: &Path, kb: u32) {
@@ -581,8 +607,8 @@ fn mountinfo_bdi_path(mount_point: &Path) -> io::Result<Option<PathBuf>> {
         .map(|mountinfo| mountinfo_bdi_path_from(&mountinfo, mount_point))
 }
 
-fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBuf> {
-    let mount_point = match std::fs::canonicalize(mount_point) {
+fn mountinfo_lookup_mount_point(mount_point: &Path) -> PathBuf {
+    match std::fs::canonicalize(mount_point) {
         Ok(path) => path,
         Err(error) => {
             tracing::debug!(
@@ -592,7 +618,10 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBu
             );
             mount_point.to_path_buf()
         }
-    };
+    }
+}
+
+fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBuf> {
     let target = mount_point.to_string_lossy();
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
@@ -720,7 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn mountinfo_bdi_path_from_canonicalizes_relative_mount_point() {
+    fn mountinfo_lookup_mount_point_canonicalizes_relative_mount_point() {
+        let cwd = std::env::current_dir().expect("current dir");
+        assert_eq!(mountinfo_lookup_mount_point(std::path::Path::new(".")), cwd);
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_expects_precanonical_mount_point() {
         let cwd = std::env::current_dir().expect("current dir");
         let mountinfo = format!(
             "126 32 0:114 / {} rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n",
@@ -728,10 +763,14 @@ mod tests {
         );
 
         assert_eq!(
-            mountinfo_bdi_path_from(&mountinfo, std::path::Path::new(".")),
+            mountinfo_bdi_path_from(&mountinfo, &cwd),
             Some(std::path::PathBuf::from(
                 "/sys/class/bdi/0:114/read_ahead_kb"
             ))
+        );
+        assert_eq!(
+            mountinfo_bdi_path_from(&mountinfo, std::path::Path::new(".")),
+            None
         );
     }
 
@@ -779,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn init_reply_encoding_uses_fixed_wire_size() {
+    fn init_reply_encoding_uses_negotiated_wire_size() {
         let init = negotiate_init(
             &FuseInitIn {
                 major: FUSE_KERNEL_VERSION,
@@ -794,16 +833,68 @@ mod tests {
         let reply = encode_init_reply(99, &init.out);
 
         assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE);
-        assert_eq!(read_u32(&reply, 0), reply.len() as u32);
-        assert_eq!(read_u64(&reply, 8), 99);
-        assert_eq!(read_u32(&reply, FUSE_OUT_HEADER_SIZE), FUSE_KERNEL_VERSION);
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+        assert_eq!(read_u64(&reply, 8).expect("unique"), 99);
+        assert_eq!(
+            read_u32(&reply, FUSE_OUT_HEADER_SIZE).expect("major"),
+            FUSE_KERNEL_VERSION
+        );
         assert_eq!(
             read_u32(
                 &reply,
                 FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_MAX_WRITE_OFFSET
-            ),
+            )
+            .expect("max write"),
             128 * 1024
         );
+    }
+
+    #[test]
+    fn init_reply_encoding_truncates_legacy_wire_sizes() {
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: 22,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(
+            reply.len(),
+            FUSE_OUT_HEADER_SIZE + FUSE_COMPAT_22_INIT_OUT_SIZE
+        );
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: 4,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(
+            reply.len(),
+            FUSE_OUT_HEADER_SIZE + FUSE_COMPAT_INIT_OUT_SIZE
+        );
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+    }
+
+    #[test]
+    fn read_u32_rejects_out_of_bounds_offset() {
+        let error = read_u32(&[0_u8; 3], 0).expect_err("short u32");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -811,11 +902,14 @@ mod tests {
         let reply = encode_error_reply(7, libc::ENOSYS);
 
         assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
-        assert_eq!(read_u32(&reply, 0), FUSE_OUT_HEADER_SIZE as u32);
+        assert_eq!(
+            read_u32(&reply, 0).expect("reply len"),
+            FUSE_OUT_HEADER_SIZE as u32
+        );
         assert_eq!(
             i32::from_ne_bytes(reply[4..8].try_into().expect("i32")),
             -libc::ENOSYS
         );
-        assert_eq!(read_u64(&reply, 8), 7);
+        assert_eq!(read_u64(&reply, 8).expect("unique"), 7);
     }
 }
