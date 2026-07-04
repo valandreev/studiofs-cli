@@ -49,7 +49,7 @@ reads for recently written data without an upstream data store.
 | **Driver** | `/dev/fuse` (present on GitHub-hosted Ubuntu runners) |
 | **Mount mode** | StudioFS raw `/dev/fuse`, no `libfuse3` link |
 | **Mount options** | raw macFUSE-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
-| **Feasibility** | **High** — `/dev/fuse` exists on hosted runners and raw FUSE can mount without libfuse |
+| **Feasibility** | **Disabled** — SFS-600 removed the legacy raw FUSE bridge |
 | **Gating** | Manual dispatch only |
 
 ### macOS — `macos-latest` (GitHub-hosted)
@@ -142,7 +142,7 @@ If self-hosted runners are provisioned:
 
 ## Test Architecture
 
-### FUSE smoke tests (`crates/studiofs-fuse/tests/mount_sanity.rs`)
+### Linux smoke tests
 
 - **Session control**: uses the raw `/dev/fuse` session loop in a background
   thread.
@@ -200,7 +200,7 @@ online coverage when a reachable S3 endpoint is configured.
 
 ```bash
 STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 \
-  cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+  echo "Linux mounted smoke is disabled after SFS-600"
 ```
 
 ### Windows (PowerShell)

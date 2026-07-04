@@ -6,7 +6,7 @@
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
 - Cache: RAM + disk + runtime upload queue
-- Bridges: WinFSP (Windows), FUSE (Linux), macFUSE stub (macOS opt-in)
+- Bridges: WinFSP (Windows), macFUSE (macOS). Linux mount is intentionally not implemented after the SFS-600 raw FUSE removal.
 
 ## Project Structure
 
@@ -18,7 +18,6 @@ studiofs-cli/
   │   ├── studiofs-data/      # S3 object I/O
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
-  │   ├── studiofs-fuse/      # Linux FUSE bridge
   │   ├── studiofs-macfuse/   # macOS native bridge stub
   │   ├── studiofs-winfsp/    # Windows bridge
   │   └── studiofs-e2e/       # real mounted E2E runner
@@ -86,27 +85,18 @@ not currently provide, and those workflows are also manual-only.
 | Job | Runner | Purpose |
 |-----|--------|---------|
 | **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
-| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS fast checks, explicit `studiofs-fuse` Linux unit step |
-| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests, explicit `studiofs-fuse` Linux unit step, `mount_sanity` compile check |
-| **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates; `studiofs-fuse` is Linux-only |
+| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests and local-first VFS fast checks; no mounted Linux backend |
+| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; no mounted Linux backend |
+| **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
-Each platform job includes a named step for the backend-specific crate so
-regressions in `studiofs-fuse` (Linux paths), `studiofs-macfuse` (macOS paths),
-or `studiofs-winfsp`
-are immediately attributable in the CI job log rather than buried inside the
-broad workspace run. Failures that originate from platform-specific code
-should call out the backend step name directly.
+macOS and Windows jobs include named steps for backend-specific crates so
+regressions in `studiofs-macfuse` or `studiofs-winfsp` are immediately
+attributable in the CI job log rather than buried inside the broad workspace
+run. Linux has no mounted backend until the next bridge is built.
 
-The macOS CLI keeps the native bridge behind an explicit development selector
-until the low-level macFUSE session is production-ready:
-
-```bash
-STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
-```
-
-Without that selector, macOS fails through the explicit unsupported backend
-instead of silently falling back to Linux FUSE behavior.
+Linux `studiofs mount` fails with a clear "not implemented" error. There is no
+legacy raw FUSE fallback.
 
 The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
 RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows
@@ -118,7 +108,7 @@ RWX workflow definitions live in `.rwx/`:
 
 - `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
 - `.rwx/rocky.yml` — Rocky Linux tests.
-- `.rwx/e2e.yml` — manual-only hosted Linux real mounted E2E smoke and full scenario run.
+- `.rwx/e2e.yml` — disabled Linux mounted E2E targets kept as placeholders until a new Linux bridge exists.
 
 When diagnosing RWX failures locally, keep the RWX CLI binary under
 `.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
@@ -139,24 +129,9 @@ Downloaded logs belong under `.rwx/downloads/`; that directory has its own
 the matching RWX CLI release binary from the official RWX GitHub release before
 running `rwx logs`.
 
-Run the hosted real mounted E2E smoke manually through RWX:
-
-```powershell
-rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
-```
-
-Run the full hosted real mounted E2E scenario set manually through RWX:
-
-```powershell
-rwx run .rwx/e2e.yml --target e2e-full --wait --open
-```
-
-The workflow is Linux-only and uses RWX Docker support plus `/dev/fuse`. It
-builds `studiofs`, runs `studiofs-e2e` with Docker Compose infrastructure from
-`docker/compose.e2e.yml`, and uploads `target/e2e-runs/<run-id>/` as the
-`e2e-run` or `e2e-full-run` artifact. The run output prints the scenario name, run ID, report
-path, failed invariant when the runner reports one, and the artifact path to
-inspect.
+The hosted Linux real mounted E2E targets currently exit early because SFS-600
+removed the legacy raw FUSE bridge. Re-enable them only when a new Linux bridge
+exists.
 
 ## Tests
 

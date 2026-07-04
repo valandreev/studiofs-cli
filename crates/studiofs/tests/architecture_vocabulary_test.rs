@@ -680,7 +680,7 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
         "cleanup",
         "## Preflight Gates",
         "Docker",
-        "/dev/fuse",
+        "Linux mounted runs are disabled after SFS-600",
         "WinFSP",
         "macFUSE",
         "floating RustFS tag",

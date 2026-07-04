@@ -79,25 +79,13 @@ tasks:
       set -euo pipefail
 
       export PATH="$HOME/.cargo/bin:$PATH"
-      cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+      cargo test --workspace --all-targets -- --nocapture
     env:
       RUSTFLAGS: "-Dwarnings"
     agent:
       cpus: 8
 
-  - key: cargo-test-studiofs-fuse-rocky
-    use: [code, rust, cargo-fetch]
-    run: |
-      set -euo pipefail
-
-      export PATH="$HOME/.cargo/bin:$PATH"
-      cargo test -p studiofs-fuse --lib -- --nocapture
-      cargo test -p studiofs-fuse --test mount_sanity --no-run
-    env:
-      RUSTFLAGS: "-Dwarnings"
-
   - key: rocky
     use:
       - cargo-test-rocky-workspace
-      - cargo-test-studiofs-fuse-rocky
     run: echo "Rocky Linux checks passed"

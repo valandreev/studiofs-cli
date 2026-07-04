@@ -6,7 +6,6 @@ members = [
     "crates/studiofs-cache",
     "crates/studiofs-vfs",
     "crates/studiofs-bridge",
-    "crates/studiofs-fuse",
     "crates/studiofs-macfuse",
     "crates/studiofs-winfsp",
     "crates/studiofs-e2e",
@@ -69,7 +68,7 @@ lru = "0.16"
 thiserror = "2"
 anyhow = "1"
 
-# Platform - FUSE (Linux/macOS)
+# Platform - macFUSE (macOS)
 libc = "0.2"
 
 # Platform - WinFSP (Windows)
@@ -96,7 +95,6 @@ studiofs-data = { path = "crates/studiofs-data" }
 studiofs-cache = { path = "crates/studiofs-cache" }
 studiofs-vfs = { path = "crates/studiofs-vfs" }
 studiofs-bridge = { path = "crates/studiofs-bridge" }
-studiofs-fuse = { path = "crates/studiofs-fuse" }
 studiofs-macfuse = { path = "crates/studiofs-macfuse" }
 studiofs-winfsp = { path = "crates/studiofs-winfsp" }
 studiofs-e2e = { path = "crates/studiofs-e2e" }

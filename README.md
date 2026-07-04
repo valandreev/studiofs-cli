@@ -114,7 +114,7 @@ studiofs (CLI)
   ├── studiofs-data       S3 object I/O + object format
   ├── studiofs-cache      local payload backend + upload queue
   ├── studiofs-vfs        filesystem core
-  ├── studiofs-fuse       Linux/macOS bridge
+  ├── studiofs-macfuse    macOS bridge
   ├── studiofs-winfsp     Windows bridge
   └── studiofs-e2e        real mounted E2E runner
 ```
@@ -235,10 +235,10 @@ GitHub Actions remains available for hosted macOS and Windows lanes. See
 [`docs/development.md`](docs/development.md), and
 [`docs/contributing.md`](docs/contributing.md) for the full verification
 matrix (Quality Gates, Linux, macOS, Windows) and the contributor rules for
-platform-specific changes. Each platform job includes an explicit named
-step for its backend crate (`studiofs-fuse` on Linux, `studiofs-macfuse`
-on macOS, `studiofs-winfsp` on Windows) so regressions in
-platform-specific code are immediately attributable in the CI log.
+platform-specific changes. macOS and Windows jobs include explicit named steps
+for their backend crates (`studiofs-macfuse` on macOS, `studiofs-winfsp` on
+Windows) so regressions in platform-specific code are immediately attributable
+in the CI log. Linux mount is not implemented after SFS-600.
 
 Infra-heavy ignored suite:
 

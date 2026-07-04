@@ -1,16 +1,16 @@
 # Platform Bridges
 
-StudioFS supports two platforms through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls.
+StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux mount is intentionally not implemented after SFS-600 removed the legacy raw FUSE path.
 
 ## Overview
 
 ```
 ┌──────────────────────┐     ┌──────────────────────┐
-│   studiofs-winfsp    │     │   studiofs-fuse       │
-│   (Windows only)     │     │   (Linux / macOS)     │
+│   studiofs-winfsp    │     │   studiofs-macfuse    │
+│   (Windows only)     │     │   (macOS only)        │
 ├──────────────────────┤     ├──────────────────────┤
-│  winfsp crate (0.12) │     │  raw /dev/fuse       │
-│  FileSystemContext    │     │  FUSE protocol       │
+│  winfsp crate (0.12) │     │  macFUSE low-level   │
+│  FileSystemContext    │     │  callback API        │
 ├──────────────────────┤     ├──────────────────────┤
 │     StudioVfs        │     │     StudioVfs         │
 └──────────────────────┘     └──────────────────────┘
@@ -24,7 +24,7 @@ Both bridges follow the same pattern:
 
 Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
-- FUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
+- macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
 - Bridge-local namespace traversal should not bypass VFS runtime filtering.
 
 ## WinFSP Bridge (`studiofs-winfsp`)
@@ -167,15 +167,15 @@ Current signature includes additional policy controls:
 - `shutdown_event_name` allows external graceful shutdown signal integration.
 - WinFSP forwards caller buffers into the shared buffered VFS read/write paths; there is no Windows-specific alternate data path.
 
-## FUSE Bridge (`studiofs-fuse`)
+## Linux Mount
 
-Linux uses the macFUSE-like raw `/dev/fuse` backend. It opens `/dev/fuse`
-directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse
-high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
+Linux mount is not implemented. SFS-600 removed the legacy macFUSE-like raw
+`/dev/fuse` backend and there is no hidden compatibility fallback. `studiofs
+mount` on Linux returns a clear unsupported error until the new Linux bridge is
+built.
 
 ### Requirements
 
-- Linux: `libfuse3-dev` (or `fuse3`)
 - macOS: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/)
 
 ### Mount Options
@@ -184,46 +184,16 @@ high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 |--------|-------|
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
-| `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | Linux raw: `131072` bytes. macOS: `131072` bytes by default |
-| Kernel `max_read` | Linux raw: `4194304` bytes. macOS mount option: `4194304` bytes |
-| Kernel `max_readahead` | Linux raw: `1 MiB`. macOS: `1048576` bytes by default |
-| Kernel `max_background` | Linux raw: `50`. macOS: `50` by default |
-| Kernel `congestion_threshold` | Linux raw: `40`. macOS: `40` by default |
-| Linux: `writeback_cache` capability | Disabled in the raw macFUSE-like profile |
+| `allow_other` | macOS: yes |
+| Kernel `max_write` | macOS: `131072` bytes by default |
+| Kernel `max_read` | macOS mount option: `4194304` bytes |
+| Kernel `max_readahead` | macOS: `1048576` bytes by default |
+| Kernel `max_background` | macOS: `50` by default |
+| Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `direct` by default |
 | macOS: validated macFUSE | 5.2.0 |
-
-The raw Linux backend uses one macFUSE-like runtime profile by default:
-`max_write=128 KiB`, `max_read=4 MiB`, `max_readahead=1 MiB`,
-`max_background=50`, `congestion_threshold=40`, shared buffer budget `800 MiB`,
-prefetch concurrency `1`, upload concurrency
-`20`, download concurrency `200`, and cache sizing delegated to the existing
-operator cache budget. Kernel writeback cache is not requested in this profile.
-The resolved raw profile is logged at mount startup and published through the
-bridge diagnostics gauges.
-
-On Linux, `allow_other` also requires `user_allow_other` to be enabled in
-`/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
-
-### Linux cache and I/O policy
-
-Linux FUSE follows the macFUSE direct cache policy by default. Regular file opens
-return `FOPEN_DIRECT_IO` and do not return `FOPEN_KEEP_CACHE`, so the kernel does
-not retain an extra page-cache layer while StudioFS is already buffering and
-materializing writes locally.
-Regular file attributes report a 4 MiB preferred I/O size to match the bridge
-read/write sizing policy instead of advertising a 512-byte block size.
-
-The VFS invalidator remains responsible for dropping kernel pages after unsafe
-transitions such as local writes, truncation, sparse size changes, and remote
-metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
-`LocalSyncPolicy::WriteThrough`; ordinary writes remain opportunistic.
-The raw Linux bridge registers a VFS `KernelInvalidator` for the mounted
-session and emits `FUSE_NOTIFY_INVAL_INODE` to `/dev/fuse` for full-inode and
-attribute-only invalidations.
 
 ### macOS cache and I/O policy
 
@@ -321,93 +291,14 @@ Current policy:
   so NFC/NFD variants of the same visible name map to the same directory entry when unique
 - when multiple byte-distinct entries would normalize to the same key, StudioFS
   does not guess; it falls back to byte-exact behavior
-- Linux and Windows behavior is unchanged
+- Windows behavior is unchanged; Linux has no mounted bridge
 
 This scope keeps macOS interoperability predictable without broad
 cross-platform name-semantics changes.
 
-### Linux Raw Callback Mappings
-
-Linux production mounts use only the raw `/dev/fuse` callback loop. There is no
-high-level Filesystem fallback and `STUDIOFS_MOUNT_BACKEND` is not a Linux
-selector.
-
-**Key mappings:**
-
-| FUSE Callback | VFS Method |
-|---------------|------------|
-| `lookup` | `lookup()` |
-| `getattr` | `getattr()` |
-| `setattr` | `setattr()` |
-| `open` | `open()` |
-| `release` | `release()` |
-| `read` | `read_into_fh()` |
-| `write` | `write_fh_with_deferred_materialize()` |
-| `flush` | `flush()` |
-| `readdir` | `readdir()` |
-| `mkdir` | `mkdir()` |
-| `create` | `create_file()` |
-| `unlink` | `unlink()` |
-| `rmdir` | `rmdir()` |
-| `rename` | `rename()` |
-| `link` | `link()` |
-| `symlink` | `symlink()` |
-| `readlink` | `readlink()` |
-| `statfs` | `statfs()` |
-
-`unlink()` and cache-only rename cleanup still present a synchronous bridge API,
-but the internal payload-object eviction work is batched and routed through the
-background local-I/O pool.
-
-FUSE callback barrier semantics:
-- `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
-- `fsync` with a file handle follows the handle-backed local barrier used by `flush`; inode-only `fsync` persists local unpublished state for the inode, including dirty writer-stack state. Neither path forces remote publication.
-- `release` becomes the strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, using the deferred last-handle barrier on Linux raw FUSE. It must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
-- Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
-
-FUSE data-buffer behavior:
-- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS writer-stack path; the bridge does not allocate a second full payload buffer before VFS acceptance.
-- `read`: raw FUSE reads fill the reply buffer from `read_into_fh()` without the old high-level reply-data boundary.
-
-**UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.
-
-**errno mappings:**
-- `InodeNotFound` → `ENOENT`
-- `EntryNotFound` → `ENOENT`
-- `EntryExists` → `EEXIST`
-- `NotADirectory` → `ENOTDIR`
-- `DirNotEmpty` → `ENOTEMPTY`
-- `IsADirectory` → `EISDIR`
-- Other → `EIO`
-
-### Linux Mount Lifecycle
-
-```
-mount_raw_with_request(request)
-  │
-  ├─ Open /dev/fuse
-  ├─ Mount directly with mount(2), falling back to fusermount only for FUSE fd setup
-  ├─ Negotiate INIT with the raw macFUSE-like profile
-  ├─ Serve raw FUSE opcodes until shutdown or unmount
-  │
-  └─ Shutdown:
-       ├─ Attempt bounded drain of pending uploads (`STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS`)
-       ├─ Cancel in-flight uploader network I/O (CancellationToken)
-       └─ Persist cache checkpoint
-```
-
-Signal ownership is explicit. The reusable FUSE library path defaults to
-`SignalHandling::Disabled` and does not install process-global `SIGINT` /
-`SIGTERM` handlers. The StudioFS CLI opts into
-`SignalHandling::InstallForCli` so Ctrl+C/SIGTERM request raw-session shutdown;
-that CLI-only path restores the previously installed signal dispositions during
-cleanup instead of resetting them to `SIG_DFL`. Because Unix signal disposition
-is process-global, only one active FUSE mount in a process may use
-`InstallForCli` at a time.
-
 ## Platform Differences
 
-| Feature | Windows (WinFSP) | Linux/macOS (FUSE) |
+| Feature | Windows (WinFSP) | macOS (macFUSE) |
 |---------|-------------------|---------------------|
 | Mount point | Drive letter (`Z:`) only | Directory |
 | Case sensitivity | Configurable (default: sensitive) | Always sensitive |

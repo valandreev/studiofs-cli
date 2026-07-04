@@ -4800,7 +4800,6 @@ dependencies = [
  "sha2",
  "studiofs-cache",
  "studiofs-data",
- "studiofs-fuse",
  "studiofs-macfuse",
  "studiofs-meta",
  "studiofs-test-support",
@@ -4894,27 +4893,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "studiofs-fuse"
-version = "0.1.1"
-dependencies = [
- "bytes",
- "dashmap",
- "dotenvy",
- "libc",
- "parking_lot",
- "smallvec",
- "studiofs-bridge",
- "studiofs-data",
- "studiofs-meta",
- "studiofs-test-support",
- "studiofs-vfs",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
