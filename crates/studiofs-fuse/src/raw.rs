@@ -38,17 +38,19 @@ const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
 const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
-const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
-const JFS_LIKE_READ_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
-const JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES: u64 = JFS_LIKE_BUFFER_BUDGET_BYTES / 2;
-const JFS_LIKE_MAX_BACKGROUND: u16 = 200;
-const JFS_LIKE_CONGESTION_THRESHOLD: u16 = 150;
-const JFS_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
-const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
-const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
-const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
+const MACFUSE_LIKE_MAX_WRITE: u32 = 128 * 1024;
+const MACFUSE_LIKE_MAX_READ: u32 = 4 * 1024 * 1024;
+const MACFUSE_LIKE_MAX_READAHEAD: u32 = 1024 * 1024;
+const MACFUSE_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
+const MACFUSE_LIKE_MAX_BACKGROUND: u16 = 50;
+const MACFUSE_LIKE_CONGESTION_THRESHOLD: u16 = 40;
+const MACFUSE_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
+const MACFUSE_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
+const MACFUSE_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
+const MACFUSE_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
 const RAW_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RAW_INVALIDATION_QUEUE_CAPACITY: usize = 4096;
+const RAW_INITIAL_REQUEST_BUFFER_POOL_MAX: usize = 8;
 
 const OP_LOOKUP: u32 = 1;
 const OP_FORGET: u32 = 2;
@@ -85,7 +87,7 @@ const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
-const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const LINUX_DEFAULT_IO_SIZE: u32 = 4096;
 const LINUX_REGULAR_FILE_IO_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -140,13 +142,13 @@ pub struct RawFuseMountRequest {
 }
 
 impl RawFuseMountRequest {
-    /// Create a raw FUSE mount request with JuiceFS-like Linux defaults.
+    /// Create a raw FUSE mount request with macFUSE-like Linux defaults.
     pub fn new(mount_point: impl Into<String>, volume_name: impl Into<String>) -> Self {
         Self {
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
             read_only: false,
-            profile: LinuxRawFuseProfile::juicefs_like(),
+            profile: LinuxRawFuseProfile::macfuse_like(),
             vfs: None,
             runtime_handle: None,
             signal_handling: SignalHandling::default(),
@@ -190,10 +192,12 @@ pub struct LinuxRawFuseProfile {
     pub congestion_threshold: u16,
     /// Requested FUSE INIT kernel readahead.
     pub max_readahead: u32,
-    /// Read-side userspace buffer budget represented by this profile.
-    pub read_buffer_budget_bytes: u64,
-    /// Write-side userspace buffer budget represented by this profile.
-    pub write_buffer_budget_bytes: u64,
+    /// Shared userspace buffer budget represented by this profile.
+    pub shared_buffer_budget_bytes: u64,
+    /// Legacy read-side userspace buffer budget represented by this profile.
+    pub read_buffer_budget_bytes: Option<u64>,
+    /// Legacy write-side userspace buffer budget represented by this profile.
+    pub write_buffer_budget_bytes: Option<u64>,
     /// Number of read-ahead fetches to run in parallel.
     pub prefetch_concurrency: u16,
     /// Number of object uploads to run in parallel.
@@ -208,26 +212,30 @@ pub struct LinuxRawFuseProfile {
 
 impl LinuxRawFuseProfile {
     pub fn label(&self) -> &'static str {
-        "raw-juicefs-like"
+        "raw-macfuse-like"
+    }
+
+    pub fn macfuse_like() -> Self {
+        Self {
+            max_write: MACFUSE_LIKE_MAX_WRITE,
+            max_read: MACFUSE_LIKE_MAX_READ,
+            max_pages: (MACFUSE_LIKE_MAX_WRITE / 4096) as u16,
+            max_background: MACFUSE_LIKE_MAX_BACKGROUND,
+            congestion_threshold: MACFUSE_LIKE_CONGESTION_THRESHOLD,
+            max_readahead: MACFUSE_LIKE_MAX_READAHEAD,
+            shared_buffer_budget_bytes: MACFUSE_LIKE_BUFFER_BUDGET_BYTES,
+            read_buffer_budget_bytes: None,
+            write_buffer_budget_bytes: None,
+            prefetch_concurrency: MACFUSE_LIKE_PREFETCH_CONCURRENCY,
+            upload_concurrency: MACFUSE_LIKE_UPLOAD_CONCURRENCY,
+            download_concurrency: MACFUSE_LIKE_DOWNLOAD_CONCURRENCY,
+            cache_size_policy: MACFUSE_LIKE_CACHE_SIZE_POLICY,
+            kernel_writeback_cache: false,
+        }
     }
 
     pub fn juicefs_like() -> Self {
-        let max_write = 1024 * 1024;
-        Self {
-            max_write,
-            max_read: max_write,
-            max_pages: (max_write / 4096) as u16,
-            max_background: JFS_LIKE_MAX_BACKGROUND,
-            congestion_threshold: JFS_LIKE_CONGESTION_THRESHOLD,
-            max_readahead: 1024 * 1024,
-            read_buffer_budget_bytes: JFS_LIKE_READ_BUFFER_BUDGET_BYTES,
-            write_buffer_budget_bytes: JFS_LIKE_WRITE_BUFFER_BUDGET_BYTES,
-            prefetch_concurrency: JFS_LIKE_PREFETCH_CONCURRENCY,
-            upload_concurrency: JFS_LIKE_UPLOAD_CONCURRENCY,
-            download_concurrency: JFS_LIKE_DOWNLOAD_CONCURRENCY,
-            cache_size_policy: JFS_LIKE_CACHE_SIZE_POLICY,
-            kernel_writeback_cache: true,
-        }
+        Self::macfuse_like()
     }
 
     pub fn negotiate_init(self, input: InitIn) -> NegotiatedInit {
@@ -285,11 +293,12 @@ enum RawDispatchClass {
 impl RawDispatchClass {
     fn for_opcode(opcode: u32) -> Self {
         match opcode {
-            OP_READ | OP_WRITE | OP_FLUSH | OP_FSYNC | OP_RELEASE => Self::Stream,
+            OP_WRITE => Self::Stream,
             OP_LOOKUP | OP_GETATTR | OP_SETATTR | OP_READLINK | OP_SYMLINK | OP_MKNOD
             | OP_MKDIR | OP_UNLINK | OP_RMDIR | OP_RENAME | OP_LINK | OP_STATFS | OP_OPENDIR
-            | OP_READDIR | OP_RELEASEDIR | OP_ACCESS | OP_CREATE | OP_SETXATTR | OP_GETXATTR
-            | OP_LISTXATTR | OP_REMOVEXATTR | OP_IOCTL | OP_READDIRPLUS | OP_OPEN => Self::Metadata,
+            | OP_READ | OP_READDIR | OP_RELEASEDIR | OP_ACCESS | OP_CREATE | OP_FLUSH
+            | OP_FSYNC | OP_RELEASE | OP_SETXATTR | OP_GETXATTR | OP_LISTXATTR | OP_REMOVEXATTR
+            | OP_IOCTL | OP_READDIRPLUS | OP_OPEN => Self::Metadata,
             _ => Self::Metadata,
         }
     }
@@ -740,6 +749,7 @@ pub fn mount_raw_with_request(request: RawFuseMountRequest) -> io::Result<()> {
         max_readahead = profile.max_readahead,
         max_background = profile.max_background,
         congestion_threshold = profile.congestion_threshold,
+        shared_buffer_budget_bytes = profile.shared_buffer_budget_bytes,
         read_buffer_budget_bytes = profile.read_buffer_budget_bytes,
         write_buffer_budget_bytes = profile.write_buffer_budget_bytes,
         prefetch_concurrency = profile.prefetch_concurrency,
@@ -774,8 +784,9 @@ fn publish_raw_profile_diagnostics(vfs: &StudioVfs, profile: &LinuxRawFuseProfil
         fuse_max_readahead_bytes: profile.max_readahead,
         fuse_max_background: Some(profile.max_background),
         fuse_congestion_threshold: Some(profile.congestion_threshold),
-        read_buffer_budget_bytes: Some(profile.read_buffer_budget_bytes),
-        write_buffer_budget_bytes: Some(profile.write_buffer_budget_bytes),
+        shared_buffer_budget_bytes: Some(profile.shared_buffer_budget_bytes),
+        read_buffer_budget_bytes: profile.read_buffer_budget_bytes,
+        write_buffer_budget_bytes: profile.write_buffer_budget_bytes,
         prefetch_concurrency: Some(profile.prefetch_concurrency),
         upload_concurrency: Some(profile.upload_concurrency),
         download_concurrency: Some(profile.download_concurrency),
@@ -1016,7 +1027,7 @@ fn serve_minimal_session(
     let buffer_count = usize::from(profile.max_background.max(1));
     let (buffer_recycler, recycled_buffers) = mpsc::sync_channel(buffer_count);
     let spillover_accounting = Arc::new(RawBufferSpilloverAccounting::new(buffer_count));
-    for _ in 0..buffer_count {
+    for _ in 0..initial_request_buffer_pool_count(profile.max_background) {
         buffer_recycler
             .send(vec![0_u8; buffer_size])
             .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))?;
@@ -1092,6 +1103,10 @@ fn serve_minimal_session(
     };
     accounting.wait_for_idle();
     session_result
+}
+
+fn initial_request_buffer_pool_count(max_background: u16) -> usize {
+    usize::from(max_background.max(1)).min(RAW_INITIAL_REQUEST_BUFFER_POOL_MAX)
 }
 
 struct RawRequestBuffer {
@@ -1330,8 +1345,24 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
         accounting,
         buffer_recycler,
     } = job;
-    let guard = accounting.admit_blocking(RawDispatchClass::Stream);
     runtime_handle.spawn(async move {
+        let accounting_for_admission = accounting.clone();
+        let guard = match tokio::task::spawn_blocking(move || {
+            accounting_for_admission.admit_blocking(RawDispatchClass::Stream)
+        })
+        .await
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    opcode = header.opcode,
+                    unique = header.unique,
+                    error = %err,
+                    "raw FUSE async write admission task failed"
+                );
+                return;
+            }
+        };
         let _guard = guard;
         let started = Instant::now();
         let payload = match owned_request_payload(request_buf, request_len, buffer_recycler) {
@@ -1907,10 +1938,19 @@ fn raw_release(
     }
     let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
     context.write_sync_policies.remove(&input.fh);
-    // The deferred helper owns final-handle errors by logging them out of band;
-    // raw FUSE release must not park the dispatch loop on the local barrier.
-    vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
-    reply_empty(fd, header.unique, Some(accounting))
+    let result = if vfs.inode_has_local_dirty_state(header.nodeid) {
+        rt.block_on(vfs.release_fh_with_outcome(input.fh))
+            .map(|_| ())
+    } else {
+        // Keep the macFUSE clean-close behavior: clean final-handle barriers are
+        // deferred, while dirty closes drain before the kernel sees RELEASE done.
+        vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
+        Ok(())
+    };
+    match result {
+        Ok(()) => reply_empty(fd, header.unique, Some(accounting)),
+        Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
+    }
 }
 
 fn raw_opendir(
@@ -2315,14 +2355,8 @@ struct RawDirent {
 }
 
 fn linux_open_flags_for_posix(flags: i32, trunc: bool) -> u32 {
-    let access = flags & libc::O_ACCMODE;
-    let read_only = access == libc::O_RDONLY;
-    let append = flags & libc::O_APPEND != 0;
-    if read_only && !append && !trunc {
-        FOPEN_KEEP_CACHE
-    } else {
-        0
-    }
+    let _ = (flags, trunc);
+    FOPEN_DIRECT_IO
 }
 
 fn linux_attr_blksize(attr: &InodeAttr) -> u32 {
@@ -3503,6 +3537,7 @@ unsafe impl FuseBytes for OutHeader {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
 
     #[test]
     fn raw_notify_inval_inode_header_uses_kernel_notify_opcode() {
@@ -3561,11 +3596,16 @@ mod tests {
     }
 
     #[test]
-    fn raw_dispatch_classifies_stream_heavy_operations() {
-        for opcode in [OP_READ, OP_WRITE, OP_FLUSH, OP_FSYNC, OP_RELEASE] {
+    fn raw_dispatch_stream_slots_are_reserved_for_bulk_writes() {
+        assert_eq!(
+            RawDispatchClass::for_opcode(OP_WRITE),
+            RawDispatchClass::Stream
+        );
+
+        for opcode in [OP_READ, OP_FLUSH, OP_FSYNC, OP_RELEASE] {
             assert_eq!(
                 RawDispatchClass::for_opcode(opcode),
-                RawDispatchClass::Stream
+                RawDispatchClass::Metadata
             );
         }
     }
@@ -3601,6 +3641,138 @@ mod tests {
     }
 
     #[test]
+    fn raw_dispatch_write_backlog_does_not_block_reads_or_barriers() {
+        let accounting = RawDispatchAccounting::new(8, 1);
+        let write = accounting
+            .try_admit(RawDispatchClass::for_opcode(OP_WRITE))
+            .unwrap();
+
+        for opcode in [OP_READ, OP_FLUSH, OP_FSYNC, OP_RELEASE] {
+            let guard = accounting
+                .try_admit(RawDispatchClass::for_opcode(opcode))
+                .unwrap();
+            drop(guard);
+        }
+
+        assert_eq!(
+            accounting.try_admit(RawDispatchClass::Stream).unwrap_err(),
+            RawDispatchAdmissionError::StreamQueueFull
+        );
+        drop(write);
+        assert_eq!(accounting.snapshot().inflight_total, 0);
+    }
+
+    #[test]
+    fn dispatch_write_async_does_not_block_caller_when_stream_queue_is_full() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let accounting = RawDispatchAccounting::new(8, 1);
+        let stream = accounting.try_admit(RawDispatchClass::Stream).unwrap();
+        let (buffer_recycler, _recycled_buffers) = mpsc::sync_channel(1);
+        let header = InHeader {
+            len: size_of::<InHeader>() as u32,
+            opcode: OP_WRITE,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            ..InHeader::default()
+        };
+        let job = RawRequestJob {
+            fd: -1,
+            header,
+            request_buf: RawRequestBuffer::pooled(vec![0; size_of::<InHeader>()]),
+            request_len: size_of::<InHeader>(),
+            context: RawRequestContext {
+                vfs: None,
+                runtime_handle: Some(runtime.handle().clone()),
+                max_write: 1024 * 1024,
+                ids: SessionIds { uid: 0, gid: 0 },
+                next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+                open_dir_handles: Arc::new(DashMap::new()),
+                write_sync_policies: Arc::new(DashMap::new()),
+            },
+            accounting: accounting.clone(),
+            buffer_recycler,
+        };
+        let (returned_tx, returned_rx) = mpsc::channel();
+
+        let caller = thread::spawn(move || {
+            dispatch_write_async(job, runtime.handle().clone());
+            returned_tx.send(()).unwrap();
+        });
+
+        returned_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("dispatch_write_async must not wait for a stream slot on the caller");
+        drop(stream);
+        caller.join().unwrap();
+        accounting.wait_for_idle();
+    }
+
+    #[test]
+    fn raw_release_drains_dirty_last_handle_before_replying_like_macfuse() {
+        let fixture =
+            ContractVfsFixture::new("linux-raw-release-drains-dirty").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"dirty-release.bin", 501, 20, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        fixture
+            .runtime()
+            .block_on(vfs.write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"dirty release payload",
+                LocalSyncPolicy::Opportunistic,
+            ))
+            .expect("write dirty payload");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "test setup should leave local dirty state before raw release"
+        );
+        let context = RawRequestContext {
+            vfs: Some(vfs.clone()),
+            runtime_handle: Some(fixture.runtime().handle().clone()),
+            max_write: 1024 * 1024,
+            ids: SessionIds { uid: 501, gid: 20 },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
+        };
+        let accounting = RawDispatchAccounting::new(8, 1);
+        let sink = OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open reply sink");
+        let header = InHeader {
+            opcode: OP_RELEASE,
+            unique: 1,
+            nodeid: attr.ino,
+            ..InHeader::default()
+        };
+        let release = ReleaseIn {
+            fh,
+            ..ReleaseIn::default()
+        };
+
+        raw_release(
+            sink.as_raw_fd(),
+            header,
+            as_bytes(&release),
+            &context,
+            &accounting,
+        )
+        .expect("raw release");
+
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "dirty Linux raw release should drain the last-handle barrier before replying"
+        );
+    }
+
+    #[test]
     fn raw_dispatch_accounting_records_request_reply_and_io_latency_counters() {
         let accounting = RawDispatchAccounting::new(8, 2);
 
@@ -3621,34 +3793,38 @@ mod tests {
     }
 
     #[test]
-    fn raw_juicefs_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
-        let profile = LinuxRawFuseProfile::juicefs_like();
+    fn raw_macfuse_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
+        let profile = LinuxRawFuseProfile::macfuse_like();
 
-        assert_eq!(profile.label(), "raw-juicefs-like");
-        assert_eq!(profile.read_buffer_budget_bytes, 400 * 1024 * 1024);
-        assert_eq!(profile.write_buffer_budget_bytes, 400 * 1024 * 1024);
-        assert_eq!(profile.max_background, 200);
-        assert_eq!(profile.congestion_threshold, 150);
+        assert_eq!(profile.label(), "raw-macfuse-like");
+        assert_eq!(profile.max_write, 128 * 1024);
+        assert_eq!(profile.max_read, 4 * 1024 * 1024);
+        assert_eq!(profile.max_readahead, 1024 * 1024);
+        assert_eq!(profile.shared_buffer_budget_bytes, 800 * 1024 * 1024);
+        assert_eq!(profile.read_buffer_budget_bytes, None);
+        assert_eq!(profile.write_buffer_budget_bytes, None);
+        assert_eq!(profile.max_background, 50);
+        assert_eq!(profile.congestion_threshold, 40);
         assert_eq!(profile.prefetch_concurrency, 1);
         assert_eq!(profile.upload_concurrency, 20);
         assert_eq!(profile.download_concurrency, 200);
         assert_eq!(profile.cache_size_policy, "operator-cache-budget");
-        assert!(profile.kernel_writeback_cache);
+        assert!(!profile.kernel_writeback_cache);
     }
 
     #[test]
     fn raw_fusermount_options_match_direct_mount_identity() {
-        let options = fusermount_options("studio", true, LinuxRawFuseProfile::juicefs_like());
+        let options = fusermount_options("studio", true, LinuxRawFuseProfile::macfuse_like());
 
         assert_eq!(
             options,
-            "fsname=studio,subtype=studiofs,max_read=1048576,ro"
+            "fsname=studio,subtype=studiofs,max_read=4194304,ro"
         );
     }
 
     #[test]
     fn raw_init_advertises_readdirplus_when_kernel_supports_it() {
-        let negotiated = LinuxRawFuseProfile::juicefs_like().negotiate_init(InitIn {
+        let negotiated = LinuxRawFuseProfile::macfuse_like().negotiate_init(InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
             max_readahead: 1024 * 1024,
@@ -3663,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_advertises_writeback_cache_for_juicefs_like_profile_when_kernel_supports_it() {
+    fn raw_init_does_not_advertise_writeback_cache_for_macfuse_like_profile() {
         let input = InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
@@ -3671,18 +3847,9 @@ mod tests {
             flags: FUSE_ASYNC_READ | FUSE_WRITEBACK_CACHE,
         };
 
-        let enabled = LinuxRawFuseProfile::juicefs_like().negotiate_init(input);
-        let disabled = LinuxRawFuseProfile {
-            kernel_writeback_cache: false,
-            ..LinuxRawFuseProfile::juicefs_like()
-        }
-        .negotiate_init(input);
+        let negotiated = LinuxRawFuseProfile::macfuse_like().negotiate_init(input);
 
-        assert_eq!(
-            enabled.out.flags & FUSE_WRITEBACK_CACHE,
-            FUSE_WRITEBACK_CACHE
-        );
-        assert_eq!(disabled.out.flags & FUSE_WRITEBACK_CACHE, 0);
+        assert_eq!(negotiated.out.flags & FUSE_WRITEBACK_CACHE, 0);
     }
 
     #[test]
@@ -3698,7 +3865,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3733,24 +3900,27 @@ mod tests {
     }
 
     #[test]
-    fn raw_read_only_open_keeps_kernel_page_cache() {
+    fn raw_read_only_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDONLY, false);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
-    fn raw_read_only_truncate_open_does_not_keep_kernel_page_cache() {
+    fn raw_read_only_truncate_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDONLY | libc::O_TRUNC, true);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
-    fn raw_write_capable_open_does_not_keep_kernel_page_cache() {
+    fn raw_write_capable_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDWR, false);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
@@ -3770,7 +3940,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3791,7 +3961,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
@@ -3841,6 +4011,13 @@ mod tests {
         drop(sender);
         drop(spillover);
         assert!(recv_request_buffer(&receiver, 8, &spillover_accounting).is_err());
+    }
+
+    #[test]
+    fn raw_initial_request_buffer_pool_is_lazy_for_macfuse_like_profile() {
+        let profile = LinuxRawFuseProfile::macfuse_like();
+
+        assert_eq!(initial_request_buffer_pool_count(profile.max_background), 8);
     }
 
     #[test]

@@ -48,7 +48,7 @@ reads for recently written data without an upstream data store.
 | **Runner** | `ubuntu-latest` |
 | **Driver** | `/dev/fuse` (present on GitHub-hosted Ubuntu runners) |
 | **Mount mode** | StudioFS raw `/dev/fuse`, no `libfuse3` link |
-| **Mount options** | raw JuiceFS-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
+| **Mount options** | raw macFUSE-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
 | **Feasibility** | **High** — `/dev/fuse` exists on hosted runners and raw FUSE can mount without libfuse |
 | **Gating** | Manual dispatch only |
 

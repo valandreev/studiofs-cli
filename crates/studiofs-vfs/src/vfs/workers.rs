@@ -159,6 +159,13 @@ fn metadata_token_changes(
     )
 }
 
+fn initial_metadata_invalidation_tokens(
+    initial_namespace_token: Option<String>,
+    initial_metadata_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    (initial_namespace_token, initial_metadata_token)
+}
+
 impl StudioVfs {
     pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
         let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
@@ -614,25 +621,10 @@ impl StudioVfs {
         let metadata_notifier = meta.metadata_invalidation_notifier();
         let initial_namespace_token = meta.namespace_version_token();
         let initial_metadata_token = meta.metadata_version_token();
-        // Do not mark the startup tokens as already invalidated. PG notify/sync
-        // can advance local metadata before this task reaches its first wait;
-        // the first wake must still clear VFS and kernel caches for that state.
-        let mut last_namespace_token = None;
-        let mut last_metadata_token = None;
-        let mut last_snapshot: HashSet<Ino> = HashSet::new();
-        let mut last_payload_snapshot = HashMap::<Ino, Vec<u64>>::new();
-
-        if initial_namespace_token.is_some() || initial_metadata_token.is_some() {
-            let meta = self.meta.clone();
-            if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                Self::collect_metadata_snapshot(engine.as_ref())
-            })
-            .await
-            {
-                last_snapshot = snapshot.inodes;
-                last_payload_snapshot = snapshot.payloads;
-            }
-        }
+        let (mut last_namespace_token, mut last_metadata_token) =
+            initial_metadata_invalidation_tokens(initial_namespace_token, initial_metadata_token);
+        let mut last_snapshot: Option<HashSet<Ino>> = None;
+        let mut last_payload_snapshot: Option<HashMap<Ino, Vec<u64>>> = None;
 
         loop {
             let wake_reason = tokio::select! {
@@ -702,12 +694,20 @@ impl StudioVfs {
                 continue;
             };
 
-            let changed_payload_inodes = Self::changed_metadata_payload_inodes(
-                &last_payload_snapshot,
-                &current_snapshot.payloads,
-            );
-            let removed_payloads =
-                Self::removed_metadata_payloads(&last_payload_snapshot, &current_snapshot.payloads);
+            let changed_payload_inodes = match &last_payload_snapshot {
+                Some(last_payload_snapshot) => Self::changed_metadata_payload_inodes(
+                    last_payload_snapshot,
+                    &current_snapshot.payloads,
+                ),
+                None => current_snapshot.payloads.keys().copied().collect(),
+            };
+            let removed_payloads = match &last_payload_snapshot {
+                Some(last_payload_snapshot) => Self::removed_metadata_payloads(
+                    last_payload_snapshot,
+                    &current_snapshot.payloads,
+                ),
+                None => HashMap::new(),
+            };
             self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
                 .await;
 
@@ -716,12 +716,21 @@ impl StudioVfs {
             } else {
                 HashSet::new()
             };
-            let attr_cache_inodes = metadata_attr_cache_invalidation_set(
-                &last_snapshot,
-                &current_snapshot.inodes,
-                namespace_changed,
-                runtime_inodes,
-            );
+            let attr_cache_inodes = match &last_snapshot {
+                Some(last_snapshot) => metadata_attr_cache_invalidation_set(
+                    last_snapshot,
+                    &current_snapshot.inodes,
+                    namespace_changed,
+                    runtime_inodes,
+                ),
+                None => {
+                    let mut inodes = current_snapshot.inodes.clone();
+                    if namespace_changed {
+                        inodes.extend(runtime_inodes);
+                    }
+                    inodes
+                }
+            };
             let read_cache_inodes =
                 Self::read_cache_invalidation_set(&attr_cache_inodes, &changed_payload_inodes);
             self.invalidate_attr_read_cache(read_cache_inodes);
@@ -737,8 +746,8 @@ impl StudioVfs {
             if namespace_changed || metadata_changed {
                 self.bump_acl_namespace_epoch();
             }
-            last_snapshot = current_snapshot.inodes;
-            last_payload_snapshot = current_snapshot.payloads;
+            last_snapshot = Some(current_snapshot.inodes);
+            last_payload_snapshot = Some(current_snapshot.payloads);
         }
     }
 
@@ -1607,6 +1616,21 @@ mod tests {
             metadata_changed,
             "startup metadata token must be treated as pending until the first worker wake"
         );
+    }
+
+    #[test]
+    fn startup_metadata_tokens_are_primed_without_forcing_full_invalidation() {
+        let (last_namespace_token, last_metadata_token) =
+            initial_metadata_invalidation_tokens(token("7"), token("9"));
+        let (namespace_changed, metadata_changed) = metadata_token_changes(
+            &last_namespace_token,
+            &last_metadata_token,
+            &token("7"),
+            &token("9"),
+        );
+
+        assert!(!namespace_changed);
+        assert!(!metadata_changed);
     }
 
     #[test]

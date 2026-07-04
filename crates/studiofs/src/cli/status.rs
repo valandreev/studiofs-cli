@@ -160,12 +160,25 @@ fn format_optional_switch(value: Option<bool>) -> &'static str {
 }
 
 fn has_raw_fuse_profile_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> bool {
-    snapshot.read_buffer_budget_bytes.is_some()
+    snapshot.shared_buffer_budget_bytes.is_some()
+        || snapshot.read_buffer_budget_bytes.is_some()
         || snapshot.write_buffer_budget_bytes.is_some()
         || snapshot.prefetch_concurrency.is_some()
         || snapshot.upload_concurrency.is_some()
         || snapshot.download_concurrency.is_some()
         || snapshot.kernel_writeback_cache.is_some()
+}
+
+fn format_fuse_profile_buffer_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> String {
+    if let Some(bytes) = snapshot.shared_buffer_budget_bytes {
+        format!("shared {}", format_bytes(bytes))
+    } else {
+        format!(
+            "read {}, write {}",
+            format_optional_profile_bytes(snapshot.read_buffer_budget_bytes),
+            format_optional_profile_bytes(snapshot.write_buffer_budget_bytes)
+        )
+    }
 }
 
 fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> Vec<String> {
@@ -182,9 +195,8 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     ));
     if has_profile_knobs {
         lines.push(format!(
-            "  FUSE profile knobs:       read {}, write {}, prefetch {}, upload {}, download {}, writeback {}",
-            format_optional_profile_bytes(snapshot.read_buffer_budget_bytes),
-            format_optional_profile_bytes(snapshot.write_buffer_budget_bytes),
+            "  FUSE profile knobs:       {}, prefetch {}, upload {}, download {}, writeback {}",
+            format_fuse_profile_buffer_knobs(snapshot),
             format_optional_profile_count(snapshot.prefetch_concurrency),
             format_optional_profile_count(snapshot.upload_concurrency),
             format_optional_profile_count(snapshot.download_concurrency),
@@ -1070,13 +1082,12 @@ mod tests {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
             enabled: true,
-            linux_fuse_profile: "raw-juicefs-like".into(),
+            linux_fuse_profile: "raw-macfuse-like".into(),
             fuse_max_write_bytes: 16 * 1024 * 1024,
             fuse_max_readahead_bytes: 128 * 1024,
             fuse_max_background: Some(128),
             fuse_congestion_threshold: Some(96),
-            read_buffer_budget_bytes: Some(150 * 1024 * 1024),
-            write_buffer_budget_bytes: Some(150 * 1024 * 1024),
+            shared_buffer_budget_bytes: Some(300 * 1024 * 1024),
             prefetch_concurrency: Some(1),
             upload_concurrency: Some(20),
             download_concurrency: Some(200),
@@ -1094,6 +1105,7 @@ mod tests {
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
             barrier_wait_total_ms: 8.5,
+            ..Default::default()
         };
 
         let lines = format_fuse_async_write_diagnostics(&snapshot);
@@ -1101,8 +1113,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  FUSE async writes:        enabled (profile: raw-juicefs-like)",
-                "  FUSE profile knobs:       read 150.0MiB, write 150.0MiB, prefetch 1, upload 20, download 200, writeback off",
+                "  FUSE async writes:        enabled (profile: raw-macfuse-like)",
+                "  FUSE profile knobs:       shared 300.0MiB, prefetch 1, upload 20, download 200, writeback off",
                 "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
@@ -1114,7 +1126,7 @@ mod tests {
     #[test]
     fn mounted_status_formats_fuse_writeback_when_it_is_the_only_profile_knob() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
-            linux_fuse_profile: "raw-juicefs-like".into(),
+            linux_fuse_profile: "raw-macfuse-like".into(),
             kernel_writeback_cache: Some(true),
             ..Default::default()
         };

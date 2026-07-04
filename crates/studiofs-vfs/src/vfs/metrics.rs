@@ -970,6 +970,8 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub fuse_max_background: Option<u16>,
     /// Requested kernel `congestion_threshold` value.
     pub fuse_congestion_threshold: Option<u16>,
+    /// Shared buffer budget selected by the Linux FUSE profile.
+    pub shared_buffer_budget_bytes: Option<u64>,
     /// Read buffer budget selected by the Linux FUSE profile.
     pub read_buffer_budget_bytes: Option<u64>,
     /// Write buffer budget selected by the Linux FUSE profile.

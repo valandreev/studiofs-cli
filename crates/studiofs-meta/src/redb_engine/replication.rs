@@ -856,6 +856,7 @@ impl RedbMetaEngine {
                     for key in acl_rule_keys {
                         let _ = acl_rules.remove(key.as_slice());
                     }
+                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                     Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry {

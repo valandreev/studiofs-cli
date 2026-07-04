@@ -169,7 +169,7 @@ Current signature includes additional policy controls:
 
 ## FUSE Bridge (`studiofs-fuse`)
 
-Linux uses the JuiceFS-like raw `/dev/fuse` backend. It opens `/dev/fuse`
+Linux uses the macFUSE-like raw `/dev/fuse` backend. It opens `/dev/fuse`
 directly, mounts with `mount(2)`, and owns INIT negotiation without libfuse
 high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 
@@ -185,23 +185,23 @@ high-level callbacks. `STUDIOFS_MOUNT_BACKEND` is not a Linux selector.
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | Linux raw: `1 MiB`. macOS: `131072` bytes by default |
+| Kernel `max_write` | Linux raw: `131072` bytes. macOS: `131072` bytes by default |
+| Kernel `max_read` | Linux raw: `4194304` bytes. macOS mount option: `4194304` bytes |
 | Kernel `max_readahead` | Linux raw: `1 MiB`. macOS: `1048576` bytes by default |
-| Kernel `max_background` | Linux raw: `200`. macOS: `50` by default |
-| Kernel `congestion_threshold` | Linux raw: `150`. macOS: `40` by default |
-| Linux: `writeback_cache` capability | Enabled in the raw JuiceFS-like profile when the kernel advertises `FUSE_WRITEBACK_CACHE` |
+| Kernel `max_background` | Linux raw: `50`. macOS: `50` by default |
+| Kernel `congestion_threshold` | Linux raw: `40`. macOS: `40` by default |
+| Linux: `writeback_cache` capability | Disabled in the raw macFUSE-like profile |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `direct` by default |
 | macOS: validated macFUSE | 5.2.0 |
 
-The raw Linux backend uses one JuiceFS-like runtime profile by default:
-`max_write=1 MiB`, `max_read=1 MiB`, `max_readahead=1 MiB`,
-`max_background=200`, `congestion_threshold=150`, read buffer budget `400 MiB`,
-write buffer budget `400 MiB`, prefetch concurrency `1`, upload concurrency
+The raw Linux backend uses one macFUSE-like runtime profile by default:
+`max_write=128 KiB`, `max_read=4 MiB`, `max_readahead=1 MiB`,
+`max_background=50`, `congestion_threshold=40`, shared buffer budget `800 MiB`,
+prefetch concurrency `1`, upload concurrency
 `20`, download concurrency `200`, and cache sizing delegated to the existing
-operator cache budget. Kernel writeback cache is requested in this profile when
-the kernel supports it.
+operator cache budget. Kernel writeback cache is not requested in this profile.
 The resolved raw profile is logged at mount startup and published through the
 bridge diagnostics gauges.
 
@@ -210,10 +210,10 @@ On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 
 ### Linux cache and I/O policy
 
-Linux FUSE keeps buffered I/O as the default. Read-only regular file opens
-return `FOPEN_KEEP_CACHE`, while write-capable, append, and truncate opens leave
-the flag clear so the kernel does not keep potentially stale cached pages across
-write-capable handles. Opens do not request `FOPEN_DIRECT_IO`.
+Linux FUSE follows the macFUSE direct cache policy by default. Regular file opens
+return `FOPEN_DIRECT_IO` and do not return `FOPEN_KEEP_CACHE`, so the kernel does
+not retain an extra page-cache layer while StudioFS is already buffering and
+materializing writes locally.
 Regular file attributes report a 4 MiB preferred I/O size to match the bridge
 read/write sizing policy instead of advertising a 512-byte block size.
 
@@ -387,7 +387,7 @@ mount_raw_with_request(request)
   │
   ├─ Open /dev/fuse
   ├─ Mount directly with mount(2), falling back to fusermount only for FUSE fd setup
-  ├─ Negotiate INIT with the raw JuiceFS-like profile
+  ├─ Negotiate INIT with the raw macFUSE-like profile
   ├─ Serve raw FUSE opcodes until shutdown or unmount
   │
   └─ Shutdown:

@@ -220,8 +220,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_negotiation_uses_juicefs_like_linux_profile() {
-        let profile = LinuxRawFuseProfile::juicefs_like();
+    fn raw_init_negotiation_uses_macfuse_like_linux_profile() {
+        let profile = LinuxRawFuseProfile::macfuse_like();
         let input = InitIn {
             major: 7,
             minor: 38,
@@ -258,7 +258,6 @@ mod tests {
                 | FUSE_READDIRPLUS_AUTO
                 | FUSE_FILE_OPS
                 | FUSE_EXPLICIT_INVAL_DATA
-                | FUSE_WRITEBACK_CACHE
         );
         assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, FUSE_READDIRPLUS);
         assert_eq!(
@@ -269,7 +268,7 @@ mod tests {
 
     #[test]
     fn raw_init_negotiation_degrades_unadvertised_capabilities() {
-        let profile = LinuxRawFuseProfile::juicefs_like();
+        let profile = LinuxRawFuseProfile::macfuse_like();
         let input = InitIn {
             major: 7,
             minor: 23,
