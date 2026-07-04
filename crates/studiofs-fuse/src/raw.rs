@@ -1330,8 +1330,24 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
         accounting,
         buffer_recycler,
     } = job;
-    let guard = accounting.admit_blocking(RawDispatchClass::Stream);
     runtime_handle.spawn(async move {
+        let accounting_for_admission = accounting.clone();
+        let guard = match tokio::task::spawn_blocking(move || {
+            accounting_for_admission.admit_blocking(RawDispatchClass::Stream)
+        })
+        .await
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    opcode = header.opcode,
+                    unique = header.unique,
+                    error = %err,
+                    "raw FUSE async write admission task failed"
+                );
+                return;
+            }
+        };
         let _guard = guard;
         let started = Instant::now();
         let payload = match owned_request_payload(request_buf, request_len, buffer_recycler) {
@@ -3598,6 +3614,51 @@ mod tests {
         assert_eq!(accounting.snapshot().inflight_stream, 0);
         drop(metadata);
         assert_eq!(accounting.snapshot().inflight_total, 0);
+    }
+
+    #[test]
+    fn dispatch_write_async_does_not_block_caller_when_stream_queue_is_full() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let accounting = RawDispatchAccounting::new(8, 1);
+        let stream = accounting.try_admit(RawDispatchClass::Stream).unwrap();
+        let (buffer_recycler, _recycled_buffers) = mpsc::sync_channel(1);
+        let header = InHeader {
+            len: size_of::<InHeader>() as u32,
+            opcode: OP_WRITE,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            ..InHeader::default()
+        };
+        let job = RawRequestJob {
+            fd: -1,
+            header,
+            request_buf: RawRequestBuffer::pooled(vec![0; size_of::<InHeader>()]),
+            request_len: size_of::<InHeader>(),
+            context: RawRequestContext {
+                vfs: None,
+                runtime_handle: Some(runtime.handle().clone()),
+                max_write: 1024 * 1024,
+                ids: SessionIds { uid: 0, gid: 0 },
+                next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+                open_dir_handles: Arc::new(DashMap::new()),
+                write_sync_policies: Arc::new(DashMap::new()),
+            },
+            accounting: accounting.clone(),
+            buffer_recycler,
+        };
+        let (returned_tx, returned_rx) = mpsc::channel();
+
+        let caller = thread::spawn(move || {
+            dispatch_write_async(job, runtime.handle().clone());
+            returned_tx.send(()).unwrap();
+        });
+
+        returned_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("dispatch_write_async must not wait for a stream slot on the caller");
+        drop(stream);
+        caller.join().unwrap();
+        accounting.wait_for_idle();
     }
 
     #[test]
