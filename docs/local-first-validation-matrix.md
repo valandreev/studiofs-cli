@@ -90,7 +90,7 @@ real mounted I/O behavior.
 
 | Platform | Focus | Primary checks | Command |
 |---|---|---|---|
-| Linux mount | Not implemented after SFS-600 | n/a | n/a |
+| Linux mount shell | Clean shell only; real `/dev/fuse` transport still unsupported | `shell_answers_root_lifecycle_callbacks`; `unsupported_requests_return_enosys` | `cargo test -p studiofs-linux -- --nocapture` |
 | Windows WinFSP | mounted create/write/read/readdir/delete/unmount lifecycle | `winfsp_mount_write_read_unmount_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP sequential writer | AJA-style large sequential writer must use WinFSP cleanup flush/purge while keeping StudioFS non-delete cleanup callback handling observational | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
 
@@ -187,12 +187,6 @@ Operator acceptance commands:
 cargo test --workspace --all-targets -- --nocapture
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-vfs --test vfs_test encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache -- --ignored --nocapture --test-threads=1
-```
-
-Platform smoke checks:
-
-```bash
-Linux mounted validation is disabled after SFS-600 until a new Linux bridge exists.
 ```
 
 ```powershell
@@ -520,12 +514,6 @@ cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
 ### Mounted Bridge Smokes
-
-Linux / macOS:
-
-```bash
-Linux mounted validation is disabled after SFS-600 until a new Linux bridge exists.
-```
 
 Windows PowerShell:
 

@@ -5,7 +5,7 @@ This file stores detailed project instructions that do not belong in the root `A
 ## Repository structure
 
 - Workspace root: `studiofs-cli/`
-- Core crates: `studiofs`, `studiofs-meta`, `studiofs-data`, `studiofs-cache`, `studiofs-vfs`, `studiofs-macfuse`, `studiofs-winfsp`
+- Core crates: `studiofs`, `studiofs-meta`, `studiofs-data`, `studiofs-cache`, `studiofs-vfs`, `studiofs-linux`, `studiofs-macfuse`, `studiofs-winfsp`
 
 ## Naming conventions
 

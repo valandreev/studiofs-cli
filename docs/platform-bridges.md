@@ -1,6 +1,6 @@
 # Platform Bridges
 
-StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux mount is intentionally not implemented after SFS-600 removed the legacy raw FUSE path.
+StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux has a clean bridge shell after SFS-600 removed the legacy raw FUSE path; the real `/dev/fuse` transport is still not implemented.
 
 ## Overview
 
@@ -16,7 +16,10 @@ StudioFS supports Windows and macOS through thin bridge crates that translate OS
 └──────────────────────┘     └──────────────────────┘
 ```
 
-Both bridges follow the same pattern:
+Linux currently has a shell-only `studiofs-linux` crate without a `/dev/fuse`
+transport.
+
+Implemented transport bridges follow the same pattern:
 1. Receive a filesystem callback from the OS
 2. Convert OS-specific arguments to VFS types
 3. Call `StudioVfs` (via `rt.block_on()`)
@@ -170,9 +173,12 @@ Current signature includes additional policy controls:
 ## Linux Mount
 
 Linux mount is not implemented. SFS-600 removed the legacy macFUSE-like raw
-`/dev/fuse` backend and there is no hidden compatibility fallback. `studiofs
-mount` on Linux returns a clear unsupported error until the new Linux bridge is
-built.
+`/dev/fuse` backend and there is no hidden compatibility fallback. The
+`studiofs-linux` crate owns a small clean shell that can answer lifecycle,
+root `lookup/getattr`, `readdir`, and `destroy` smoke calls through explicit
+`StudioVfs` boundaries. `studiofs mount` on Linux enters that shell and then
+returns a clear unsupported transport error until the real `/dev/fuse` path is
+added.
 
 ### Requirements
 
