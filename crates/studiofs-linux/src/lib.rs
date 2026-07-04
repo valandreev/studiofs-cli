@@ -13,10 +13,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{
+    Receiver as WorkReceiver, Sender as WorkSender, TrySendError as WorkTrySendError,
+    bounded as work_channel, select,
+};
 use studiofs_bridge::posix::{BridgeFileAttr, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::ROOT_INO;
 use studiofs_vfs::StudioVfs;
@@ -27,6 +31,7 @@ const FUSE_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NONBLOCK;
 const FUSE_MOUNT_TYPE: &str = "fuse";
 const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
+const FUSE_FH_SIZE: usize = 8;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
@@ -34,8 +39,15 @@ const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 const FUSE_INIT_OUT_SIZE: usize = 64;
 const FUSE_FORGET: u32 = 2;
 const FUSE_INIT: u32 = 26;
+const FUSE_READ: u32 = 15;
+const FUSE_WRITE: u32 = 16;
+const FUSE_RELEASE: u32 = 18;
+const FUSE_FSYNC: u32 = 20;
+const FUSE_FLUSH: u32 = 25;
+const FUSE_READDIR: u32 = 28;
 const FUSE_DESTROY: u32 = 38;
 const FUSE_BATCH_FORGET: u32 = 42;
+const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 const FUSE_ASYNC_READ: u32 = 1 << 0;
@@ -53,8 +65,11 @@ const FUSE_MAX_PAGES_DEFAULT: u16 = 256;
 const FUSE_REQUEST_BUFFER_SIZE: usize = 1024 * 1024 + 4096;
 const FUSE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const FUSE_RECEIVE_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-const FUSE_WORK_QUEUE_DEPTH: usize = 1024;
+const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
+const FUSE_METADATA_WORKERS: usize = 4;
+const FUSE_STREAM_WORKERS: usize = 8;
+type FuseReply = [u8; FUSE_OUT_HEADER_SIZE];
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
@@ -361,8 +376,8 @@ fn run_fuse_shell(
     buffer: Vec<u8>,
     metrics: Arc<LinuxFuseLoopMetrics>,
 ) -> io::Result<LinuxFuseLoopStats> {
-    let (work_tx, work_rx) = sync_channel(FUSE_WORK_QUEUE_DEPTH);
-    let (reply_tx, reply_rx) = sync_channel(FUSE_REPLY_QUEUE_DEPTH);
+    let (work_tx, work_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH);
+    let (reply_tx, reply_rx) = work_channel(FUSE_REPLY_QUEUE_DEPTH);
     let (done_tx, done_rx) = channel();
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -374,7 +389,7 @@ fn run_fuse_shell(
 
     let work_metrics = Arc::clone(&metrics);
     let worker = spawn_loop("linux fuse worker", done_tx.clone(), move || {
-        work_loop(work_rx, reply_tx, &work_metrics)
+        work_loop(work_rx, reply_tx, work_metrics)
     })?;
 
     let reply_metrics = Arc::clone(&metrics);
@@ -417,7 +432,7 @@ fn run_fuse_shell(
 fn receive_loop_until_shutdown(
     mut device: impl Read + AsRawFd,
     mut buffer: impl AsMut<[u8]>,
-    work_tx: SyncSender<FuseWorkItem>,
+    work_tx: WorkSender<FuseWorkItem>,
     metrics: &LinuxFuseLoopMetrics,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -444,27 +459,137 @@ fn receive_loop_until_shutdown(
 }
 
 fn work_loop(
-    work_rx: Receiver<FuseWorkItem>,
-    reply_tx: SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
-    metrics: &LinuxFuseLoopMetrics,
+    work_rx: WorkReceiver<FuseWorkItem>,
+    reply_tx: WorkSender<FuseReply>,
+    metrics: Arc<LinuxFuseLoopMetrics>,
 ) -> io::Result<()> {
-    while let Ok(item) = work_rx.recv() {
+    scheduled_work_loop(work_rx, reply_tx, metrics, handle_fuse_request)
+}
+
+fn scheduled_work_loop<H>(
+    work_rx: WorkReceiver<FuseWorkItem>,
+    reply_tx: WorkSender<FuseReply>,
+    metrics: Arc<LinuxFuseLoopMetrics>,
+    handler: H,
+) -> io::Result<()>
+where
+    H: Fn(&FuseWorkItem) -> Option<FuseReply> + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    let (metadata_tx, metadata_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH);
+    let mut stream_txs = Vec::with_capacity(FUSE_STREAM_WORKERS);
+    let mut workers = Vec::with_capacity(FUSE_METADATA_WORKERS + FUSE_STREAM_WORKERS);
+    let (fatal_tx, fatal_rx) = work_channel(FUSE_METADATA_WORKERS + FUSE_STREAM_WORKERS);
+
+    for _ in 0..FUSE_METADATA_WORKERS {
+        let worker_rx = metadata_rx.clone();
+        let worker_reply_tx = reply_tx.clone();
+        let worker_metrics = Arc::clone(&metrics);
+        let worker_handler = Arc::clone(&handler);
+        let worker_fatal_tx = fatal_tx.clone();
+        workers.push(spawn_fuse_worker(
+            "linux fuse metadata worker",
+            worker_fatal_tx,
+            move || {
+                while let Ok(item) = worker_rx.recv() {
+                    run_scheduled_item(
+                        item,
+                        &worker_reply_tx,
+                        &worker_metrics,
+                        worker_handler.as_ref(),
+                    )?;
+                }
+                Ok(())
+            },
+        )?);
+    }
+
+    for _ in 0..FUSE_STREAM_WORKERS {
+        let (stream_tx, stream_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH);
+        let worker_reply_tx = reply_tx.clone();
+        let worker_metrics = Arc::clone(&metrics);
+        let worker_handler = Arc::clone(&handler);
+        let worker_fatal_tx = fatal_tx.clone();
+        stream_txs.push(stream_tx);
+        workers.push(spawn_fuse_worker(
+            "linux fuse stream worker",
+            worker_fatal_tx,
+            move || {
+                while let Ok(item) = stream_rx.recv() {
+                    run_scheduled_item(
+                        item,
+                        &worker_reply_tx,
+                        &worker_metrics,
+                        worker_handler.as_ref(),
+                    )?;
+                }
+                Ok(())
+            },
+        )?);
+    }
+    drop(fatal_tx);
+
+    loop {
+        let item = select! {
+            recv(fatal_rx) -> fatal => {
+                drop(metadata_tx);
+                drop(stream_txs);
+                let _ = join_fuse_workers(workers);
+                return match fatal {
+                    Ok(error) => Err(error),
+                    Err(_) => Err(io::Error::other("linux fuse worker fatal channel closed")),
+                };
+            }
+            recv(work_rx) -> item => match item {
+                Ok(item) => item,
+                Err(_) => break,
+            },
+        };
         metrics.work_dequeued();
         if item.header.opcode == FUSE_DESTROY {
-            return Ok(());
+            break;
         }
-        if let Some(reply) = handle_fuse_request(&item) {
-            enqueue_reply(&reply_tx, reply, metrics).inspect_err(|_| {
-                metrics.work_error_count.fetch_add(1, Ordering::Relaxed);
-            })?;
+        let send_result = match stream_key_for(&item) {
+            None => send_scheduled_work(&metadata_tx, &fatal_rx, item),
+            Some(key) => send_scheduled_work(
+                &stream_txs[stream_worker_index(key, stream_txs.len())],
+                &fatal_rx,
+                item,
+            ),
+        };
+        if let Err(error) = send_result {
+            drop(metadata_tx);
+            drop(stream_txs);
+            let _ = join_fuse_workers(workers);
+            return Err(error);
         }
+    }
+
+    drop(metadata_tx);
+    drop(stream_txs);
+    join_fuse_workers(workers)
+}
+
+fn run_scheduled_item<H>(
+    item: FuseWorkItem,
+    reply_tx: &WorkSender<FuseReply>,
+    metrics: &LinuxFuseLoopMetrics,
+    handler: &H,
+) -> io::Result<()>
+where
+    H: Fn(&FuseWorkItem) -> Option<FuseReply> + Send + Sync,
+{
+    if let Some(reply) = handler(&item) {
+        enqueue_reply(reply_tx, reply, metrics).inspect_err(|_| {
+            metrics.work_error_count.fetch_add(1, Ordering::Relaxed);
+        })?;
     }
     Ok(())
 }
 
 fn reply_loop(
     mut device: File,
-    reply_rx: Receiver<[u8; FUSE_OUT_HEADER_SIZE]>,
+    reply_rx: WorkReceiver<FuseReply>,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     while let Ok(reply) = reply_rx.recv() {
@@ -510,14 +635,14 @@ fn thread_panic_message(name: &str, panic: Box<dyn std::any::Any + Send + 'stati
 }
 
 fn enqueue_work(
-    tx: &SyncSender<FuseWorkItem>,
+    tx: &WorkSender<FuseWorkItem>,
     item: FuseWorkItem,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     metrics.work_enqueued();
     match tx.try_send(item) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(item)) => {
+        Err(WorkTrySendError::Full(item)) => {
             metrics
                 .work_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -526,7 +651,7 @@ fn enqueue_work(
                 io::Error::new(io::ErrorKind::BrokenPipe, "FUSE work queue closed")
             })
         }
-        Err(TrySendError::Disconnected(_)) => {
+        Err(WorkTrySendError::Disconnected(_)) => {
             metrics.work_dequeued();
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -537,14 +662,14 @@ fn enqueue_work(
 }
 
 fn enqueue_reply(
-    tx: &SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
-    reply: [u8; FUSE_OUT_HEADER_SIZE],
+    tx: &WorkSender<FuseReply>,
+    reply: FuseReply,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     metrics.reply_enqueued();
     match tx.try_send(reply) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(reply)) => {
+        Err(WorkTrySendError::Full(reply)) => {
             metrics
                 .reply_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -553,7 +678,7 @@ fn enqueue_reply(
                 io::Error::new(io::ErrorKind::BrokenPipe, "FUSE reply queue closed")
             })
         }
-        Err(TrySendError::Disconnected(_)) => {
+        Err(WorkTrySendError::Disconnected(_)) => {
             metrics.reply_dequeued();
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -563,7 +688,90 @@ fn enqueue_reply(
     }
 }
 
-fn handle_fuse_request(item: &FuseWorkItem) -> Option<[u8; FUSE_OUT_HEADER_SIZE]> {
+fn send_scheduled_work(
+    tx: &WorkSender<FuseWorkItem>,
+    fatal_rx: &WorkReceiver<io::Error>,
+    item: FuseWorkItem,
+) -> io::Result<()> {
+    select! {
+        send(tx, item) -> result => result.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "FUSE scheduled work queue closed")
+        }),
+        recv(fatal_rx) -> fatal => match fatal {
+            Ok(error) => Err(error),
+            Err(_) => Err(io::Error::other("linux fuse worker fatal channel closed")),
+        },
+    }
+}
+
+fn spawn_fuse_worker<F>(
+    name: &'static str,
+    fatal_tx: WorkSender<io::Error>,
+    f: F,
+) -> io::Result<thread::JoinHandle<io::Result<()>>>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .unwrap_or_else(|panic| Err(io::Error::other(thread_panic_message(name, panic))));
+        if let Err(error) = &result {
+            let _ = fatal_tx.send(io::Error::new(error.kind(), error.to_string()));
+        }
+        result
+    })
+}
+
+fn join_fuse_workers(workers: Vec<thread::JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let mut first_error = None;
+    for worker in workers {
+        if first_error.is_none() {
+            first_error = match worker.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(panic) => Some(io::Error::other(thread_panic_message(
+                    "linux fuse worker",
+                    panic,
+                ))),
+            };
+        } else {
+            let _ = worker.join();
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn stream_key_for(item: &FuseWorkItem) -> Option<(u64, Option<u64>)> {
+    match item.header.opcode {
+        FUSE_READ | FUSE_WRITE | FUSE_RELEASE | FUSE_FSYNC | FUSE_FLUSH | FUSE_READDIR
+        | FUSE_READDIRPLUS => Some((item.header.nodeid, fuse_request_fh(item))),
+        _ => None,
+    }
+}
+
+fn stream_worker_index(key: (u64, Option<u64>), workers: usize) -> usize {
+    (stream_worker_hash(key) as usize) % workers
+}
+
+fn stream_worker_hash(key: (u64, Option<u64>)) -> u64 {
+    let mut hash = key.0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    hash ^= match key.1 {
+        Some(fh) => fh.rotate_left(32),
+        None => 0x517c_c1b7_2722_0a95,
+    };
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^ (hash >> 33)
+}
+
+fn fuse_request_fh(item: &FuseWorkItem) -> Option<u64> {
+    item.message
+        .get(FUSE_IN_HEADER_SIZE..FUSE_IN_HEADER_SIZE + FUSE_FH_SIZE)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_ne_bytes)
+}
+
+fn handle_fuse_request(item: &FuseWorkItem) -> Option<FuseReply> {
     let header = item.header;
     let _payload_len = item.message.len();
     if !fuse_opcode_expects_reply(header.opcode) {
@@ -811,7 +1019,7 @@ fn init_out_payload_size(minor: u32) -> usize {
     }
 }
 
-fn encode_error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_SIZE] {
+fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
     let mut reply = [0_u8; FUSE_OUT_HEADER_SIZE];
     let mut offset = 0;
     push_out_header(
@@ -875,6 +1083,7 @@ fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
     Ok(FuseInHeader {
         opcode: read_u32(bytes, 4)?,
         unique: read_u64(bytes, 8)?,
+        nodeid: read_u64(bytes, 16)?,
     })
 }
 
@@ -1051,6 +1260,7 @@ struct NegotiatedInit {
 struct FuseInHeader {
     opcode: u32,
     unique: u64,
+    nodeid: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1090,6 +1300,7 @@ mod tests {
     use super::*;
 
     const FUSE_INIT_OUT_MAX_WRITE_OFFSET: usize = 20;
+    const FUSE_LOOKUP: u32 = 1;
 
     #[test]
     fn negotiate_init_uses_kernel_readahead_and_supported_pages() {
@@ -1337,6 +1548,7 @@ mod tests {
             header: FuseInHeader {
                 opcode: 999,
                 unique: 44,
+                nodeid: 1,
             },
             message: Vec::new(),
         })
@@ -1351,6 +1563,7 @@ mod tests {
             header: FuseInHeader {
                 opcode: 999,
                 unique: 45,
+                nodeid: 1,
             },
             message: Vec::new(),
         })
@@ -1378,7 +1591,7 @@ mod tests {
 
     #[test]
     fn bounded_work_enqueue_records_backpressure() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = work_channel(1);
         let metrics = Arc::new(LinuxFuseLoopMetrics::default());
         enqueue_work(
             &tx,
@@ -1386,6 +1599,7 @@ mod tests {
                 header: FuseInHeader {
                     opcode: 999,
                     unique: 1,
+                    nodeid: 1,
                 },
                 message: Vec::new(),
             },
@@ -1401,6 +1615,7 @@ mod tests {
                     header: FuseInHeader {
                         opcode: 999,
                         unique: 2,
+                        nodeid: 1,
                     },
                     message: Vec::new(),
                 },
@@ -1466,7 +1681,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (mut kernel, device) = UnixStream::pair().expect("socket pair");
-        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let (tx, rx) = work_channel(2);
         let metrics = Arc::new(LinuxFuseLoopMetrics::default());
         let shutdown = Arc::new(AtomicBool::new(false));
         let metrics_for_receiver = Arc::clone(&metrics);
@@ -1537,6 +1752,267 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_orders_writes_on_same_handle() {
+        let items = vec![
+            work_item_with_fh(FUSE_WRITE, 1, 7, 10),
+            work_item_with_fh(FUSE_WRITE, 2, 7, 10),
+            work_item_with_fh(FUSE_WRITE, 3, 7, 10),
+        ];
+
+        let seen = run_scheduled_work_for_test(items, |_item| {}).expect("scheduled work");
+
+        assert_eq!(seen, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scheduler_runs_unrelated_handles_concurrently() {
+        let first_started = Arc::new(std::sync::Barrier::new(2));
+        let release_first = Arc::new(std::sync::Barrier::new(2));
+        let first_started_for_handler = Arc::clone(&first_started);
+        let release_first_for_handler = Arc::clone(&release_first);
+        let items = vec![
+            work_item_with_fh(FUSE_WRITE, 1, 7, 10),
+            work_item_with_fh(FUSE_WRITE, 2, 8, 10),
+        ];
+
+        let (seen_rx, worker) = spawn_scheduled_work_for_test(items, move |item| {
+            if item.header.unique == 1 {
+                first_started_for_handler.wait();
+                release_first_for_handler.wait();
+            }
+        });
+
+        first_started.wait();
+        let observed = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second handle should not wait for first");
+        release_first.wait();
+        worker
+            .join()
+            .expect("scheduler thread")
+            .expect("scheduled work");
+
+        assert_eq!(observed, 2);
+    }
+
+    #[test]
+    fn scheduler_barriers_wait_for_same_handle_writes() {
+        let items = vec![
+            work_item_with_fh(FUSE_WRITE, 1, 7, 10),
+            work_item_with_fh(FUSE_FLUSH, 2, 7, 10),
+        ];
+
+        let seen = run_scheduled_work_for_test(items, |_item| {}).expect("scheduled work");
+
+        assert_eq!(seen, vec![1, 2]);
+    }
+
+    #[test]
+    fn scheduler_routes_directory_reads_as_stream_work() {
+        assert_eq!(
+            stream_key_for(&work_item_with_fh(FUSE_READDIR, 1, 7, 10)),
+            Some((10, Some(7)))
+        );
+        assert_eq!(
+            stream_key_for(&work_item_with_fh(FUSE_READDIRPLUS, 2, 8, 11)),
+            Some((11, Some(8)))
+        );
+    }
+
+    #[test]
+    fn scheduler_reuses_fixed_stream_worker_after_release() {
+        let (work_tx, work_rx) = work_channel(4);
+        let (reply_tx, _reply_rx) = work_channel(4);
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        let scheduler = std::thread::spawn(move || {
+            scheduled_work_loop(work_rx, reply_tx, metrics, move |item| {
+                seen_tx
+                    .send((item.header.unique, std::thread::current().id()))
+                    .expect("record worker thread");
+                None
+            })
+        });
+
+        enqueue_work(
+            &work_tx,
+            work_item_with_fh(FUSE_RELEASE, 1, 7, 10),
+            &LinuxFuseLoopMetrics::default(),
+        )
+        .expect("release enqueue");
+        let (release_unique, release_thread) = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release should run");
+        std::thread::sleep(Duration::from_millis(10));
+        enqueue_work(
+            &work_tx,
+            work_item_with_fh(FUSE_WRITE, 2, 7, 10),
+            &LinuxFuseLoopMetrics::default(),
+        )
+        .expect("write enqueue");
+        let (write_unique, write_thread) = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write should run");
+        drop(work_tx);
+        scheduler
+            .join()
+            .expect("scheduler thread")
+            .expect("scheduled work");
+
+        assert_eq!((release_unique, write_unique), (1, 2));
+        assert_eq!(release_thread, write_thread);
+    }
+
+    #[test]
+    fn scheduler_applies_backpressure_when_one_stream_queue_fills() {
+        let (work_tx, work_rx) = work_channel(FUSE_WORK_QUEUE_DEPTH + 4);
+        let (reply_tx, _reply_rx) = work_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let block_slow_stream = Arc::new(std::sync::Barrier::new(2));
+        let release_slow_stream = Arc::new(std::sync::Barrier::new(2));
+        let block_slow_stream_for_handler = Arc::clone(&block_slow_stream);
+        let release_slow_stream_for_handler = Arc::clone(&release_slow_stream);
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        std::thread::spawn(move || {
+            let result = scheduled_work_loop(work_rx, reply_tx, metrics, move |item| {
+                if item.header.unique == 1 {
+                    block_slow_stream_for_handler.wait();
+                    release_slow_stream_for_handler.wait();
+                }
+                None
+            });
+            done_tx.send(result).expect("send scheduler result");
+        });
+
+        for unique in 1..=(FUSE_WORK_QUEUE_DEPTH as u64 + 2) {
+            if work_tx
+                .send(work_item_with_fh(FUSE_WRITE, unique, 7, 10))
+                .is_err()
+            {
+                break;
+            }
+        }
+        block_slow_stream.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        release_slow_stream.wait();
+        drop(work_tx);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scheduler should finish after backpressure releases");
+
+        result.expect("scheduler result");
+    }
+
+    #[test]
+    fn stream_worker_hash_distributes_equal_nodeid_and_fh() {
+        let workers = (1..=16)
+            .map(|value| stream_worker_index((value, Some(value)), FUSE_STREAM_WORKERS))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(workers.len() > 1);
+    }
+
+    #[test]
+    fn stream_worker_hash_distinguishes_missing_and_zero_fh() {
+        assert_ne!(
+            stream_worker_hash((7, None)),
+            stream_worker_hash((7, Some(0)))
+        );
+    }
+
+    #[test]
+    fn scheduler_returns_when_worker_panics() {
+        let (work_tx, work_rx) = work_channel(1);
+        let (reply_tx, _reply_rx) = work_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        std::thread::spawn(move || {
+            let result =
+                scheduled_work_loop(work_rx, reply_tx, metrics, |_item| -> Option<FuseReply> {
+                    panic!("worker panic for test");
+                });
+            done_tx.send(result).expect("send scheduler result");
+        });
+
+        work_tx
+            .send(work_item_with_fh(FUSE_WRITE, 1, 7, 10))
+            .expect("enqueue work");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scheduler should return after worker panic");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn join_fuse_workers_joins_remaining_workers_after_error() {
+        let slow_worker_finished = Arc::new(AtomicBool::new(false));
+        let slow_worker_finished_for_thread = Arc::clone(&slow_worker_finished);
+        let failing_worker =
+            std::thread::spawn(|| -> io::Result<()> { Err(io::Error::other("worker failed")) });
+        let slow_worker = std::thread::spawn(move || -> io::Result<()> {
+            std::thread::sleep(Duration::from_millis(50));
+            slow_worker_finished_for_thread.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let result = join_fuse_workers(vec![failing_worker, slow_worker]);
+
+        assert!(result.is_err());
+        assert!(slow_worker_finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn scheduler_uses_fixed_stream_worker_count() {
+        let items = (0..16)
+            .map(|index| work_item_with_fh(FUSE_WRITE, index + 1, index + 1, 10))
+            .collect::<Vec<_>>();
+        let seen_threads = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let seen_threads_for_handler = Arc::clone(&seen_threads);
+
+        run_scheduled_work_for_test(items, move |_item| {
+            seen_threads_for_handler
+                .lock()
+                .expect("seen threads")
+                .insert(std::thread::current().id());
+        })
+        .expect("scheduled work");
+
+        assert!(seen_threads.lock().expect("seen threads").len() <= 8);
+    }
+
+    #[test]
+    fn scheduler_keeps_metadata_from_blocking_stream_work() {
+        let metadata_started = Arc::new(std::sync::Barrier::new(2));
+        let release_metadata = Arc::new(std::sync::Barrier::new(2));
+        let metadata_started_for_handler = Arc::clone(&metadata_started);
+        let release_metadata_for_handler = Arc::clone(&release_metadata);
+        let items = vec![
+            work_item_for_test(FUSE_LOOKUP, 1),
+            work_item_with_fh(FUSE_WRITE, 2, 7, 10),
+        ];
+
+        let (seen_rx, worker) = spawn_scheduled_work_for_test(items, move |item| {
+            if item.header.unique == 1 {
+                metadata_started_for_handler.wait();
+                release_metadata_for_handler.wait();
+            }
+        });
+
+        metadata_started.wait();
+        let observed = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stream work should not wait for metadata");
+        release_metadata.wait();
+        worker
+            .join()
+            .expect("scheduler thread")
+            .expect("scheduled work");
+
+        assert_eq!(observed, 2);
+    }
+
+    #[test]
     fn spawn_loop_assigns_thread_name() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let (name_tx, name_rx) = std::sync::mpsc::channel();
@@ -1553,12 +2029,64 @@ mod tests {
         assert_eq!(name_rx.recv().expect("thread name"), "studiofs-test-loop");
     }
 
+    fn run_scheduled_work_for_test(
+        items: Vec<FuseWorkItem>,
+        handler: impl Fn(&FuseWorkItem) + Send + Sync + 'static,
+    ) -> io::Result<Vec<u64>> {
+        let (seen_rx, worker) = spawn_scheduled_work_for_test(items, handler);
+        worker.join().expect("scheduler thread")?;
+        Ok(seen_rx.try_iter().collect())
+    }
+
+    fn spawn_scheduled_work_for_test(
+        items: Vec<FuseWorkItem>,
+        handler: impl Fn(&FuseWorkItem) + Send + Sync + 'static,
+    ) -> (
+        std::sync::mpsc::Receiver<u64>,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        let (work_tx, work_rx) = work_channel(items.len().max(1));
+        let (reply_tx, _reply_rx) = work_channel(items.len().max(1));
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let metrics = Arc::new(LinuxFuseLoopMetrics::default());
+        for item in items {
+            enqueue_work(&work_tx, item, &metrics).expect("enqueue work");
+        }
+        drop(work_tx);
+        let worker = std::thread::spawn(move || {
+            scheduled_work_loop(work_rx, reply_tx, metrics, move |item| {
+                handler(item);
+                seen_tx.send(item.header.unique).expect("record seen");
+                None
+            })
+        });
+        (seen_rx, worker)
+    }
+
     fn fuse_request_for_test(opcode: u32, unique: u64) -> [u8; FUSE_IN_HEADER_SIZE] {
         let mut request = [0_u8; FUSE_IN_HEADER_SIZE];
         request[0..4].copy_from_slice(&(FUSE_IN_HEADER_SIZE as u32).to_ne_bytes());
         request[4..8].copy_from_slice(&opcode.to_ne_bytes());
         request[8..16].copy_from_slice(&unique.to_ne_bytes());
         request
+    }
+
+    fn work_item_for_test(opcode: u32, unique: u64) -> FuseWorkItem {
+        FuseWorkItem {
+            header: FuseInHeader {
+                opcode,
+                unique,
+                nodeid: 1,
+            },
+            message: Vec::from(fuse_request_for_test(opcode, unique)),
+        }
+    }
+
+    fn work_item_with_fh(opcode: u32, unique: u64, fh: u64, nodeid: u64) -> FuseWorkItem {
+        let mut item = work_item_for_test(opcode, unique);
+        item.header.nodeid = nodeid;
+        item.message.extend_from_slice(&fh.to_ne_bytes());
+        item
     }
 
     fn fuse_request_with_payload_for_test(opcode: u32, unique: u64, payload: &[u8]) -> Vec<u8> {
