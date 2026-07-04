@@ -395,11 +395,10 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
-Crash-style remounts do not run `studiofs umount` for the killed client. On
-Linux, before spawning the replacement mount process, the controller attempts a
-lazy stale-mount cleanup for leftover FUSE mountpoints with `fusermount3 -u -z`,
-`fusermount -u -z`, or `umount -l`. Other platforms keep the existing remount
-path unless a platform-specific stale-mount cleanup is added.
+Crash-style remounts do not run `studiofs umount` for the killed client. Linux
+mounted runs are disabled after SFS-600 until a new Linux bridge exists. Other
+platforms keep the existing remount path unless a platform-specific stale-mount
+cleanup is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
 three peer remote volumes, one from each client, then discovers each peer-owned
@@ -762,8 +761,7 @@ Required checks:
   `docker compose up --detach --wait` with a project-scoped name and records the
   copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
-  - Linux requires a usable `/dev/fuse`, mountpoint creation rights, and the
-    FUSE backend expected by `studiofs-fuse`.
+  - Linux mounted runs are disabled after SFS-600 until a new Linux bridge exists.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured
     WinFSP registry setting such as `MountUseMountmgrFromFSD=1`.

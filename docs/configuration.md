@@ -174,8 +174,8 @@ Notes:
 - Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - AIMD fetch/upload windows reset to their initial window after an idle gap by default. Advanced tuning can set `fetch_idle_reset_secs` and `upload_idle_reset_secs` independently; `0` disables idle reset for that traffic class.
-- On Windows and Linux, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
-- Linux mounts use the raw `/dev/fuse` bridge with one built-in runtime profile; the removed `STUDIOFS_FUSE_ASYNC_*` bridge toggles are no longer supported.
+- On Windows and macOS, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
+- Linux mount is not implemented after SFS-600; the legacy raw `/dev/fuse` bridge and `STUDIOFS_FUSE_ASYNC_*` toggles are removed.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
@@ -553,7 +553,7 @@ Important families supported in code:
   `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`,
   `STUDIOFS_WRITER_PAGE_SIZE_BYTES`
 - janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
-- bridge-specific knobs: `STUDIOFS_FUSE_*`, `STUDIOFS_WINFSP_*`
+- bridge-specific knobs: `STUDIOFS_WINFSP_*`
 
 If an override is still needed regularly by ordinary operators, promote it to a
 documented CLI/config flag instead of teaching the whole env matrix again.

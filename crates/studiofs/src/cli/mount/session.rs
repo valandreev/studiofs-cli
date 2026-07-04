@@ -2485,7 +2485,7 @@ mod tests {
     fn default_mount_backend_matches_platform() {
         let backend = default_mount_backend();
         #[cfg(target_os = "linux")]
-        assert_eq!(backend.name(), "raw-fuse");
+        assert_eq!(backend.name(), "unsupported-unix");
         #[cfg(target_os = "macos")]
         assert_eq!(backend.name(), "macFUSE");
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]

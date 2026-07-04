@@ -7,7 +7,7 @@ use tokio::runtime::Handle;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
-#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
     pub(crate) runtime_handle: Handle,
@@ -23,14 +23,17 @@ pub(crate) trait MountBackend: Send + Sync {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
-    Box::new(RawFuseMountBackend)
-}
+    #[cfg(target_os = "linux")]
+    {
+        return Box::new(UnsupportedUnixMountBackend);
+    }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
-    mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
+    }
 }
 
 #[cfg(windows)]
@@ -50,25 +53,6 @@ pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn Moun
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn mount_backend_for_selector(_selector: Option<&str>) -> Box<dyn MountBackend> {
     Box::new(UnsupportedUnixMountBackend)
-}
-
-#[cfg(target_os = "linux")]
-struct RawFuseMountBackend;
-
-#[cfg(target_os = "linux")]
-impl MountBackend for RawFuseMountBackend {
-    fn name(&self) -> &'static str {
-        "raw-fuse"
-    }
-
-    fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
-        let mut request =
-            studiofs_fuse::RawFuseMountRequest::new(launch.mount_point, launch.volume_name)
-                .with_vfs(launch.vfs, launch.runtime_handle)
-                .with_signal_handling(studiofs_fuse::SignalHandling::InstallForCli);
-        request.read_only = launch.read_only;
-        studiofs_fuse::mount_raw_with_request(request)
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -94,19 +78,21 @@ impl MountBackend for MacFuseMountBackend {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 struct UnsupportedUnixMountBackend;
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 fn unsupported_unix_backend_error_message() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "linux") {
+        "StudioFS Linux mount is not implemented; the legacy raw FUSE backend was removed in SFS-600"
+    } else if cfg!(target_os = "macos") {
         "StudioFS FUSE backend is Linux-only; macOS uses the native macFUSE bridge by default; clear or set STUDIOFS_MOUNT_BACKEND=macfuse to use it"
     } else {
         "StudioFS FUSE backend is Linux-only; macOS and Windows are supported via their respective native bridges"
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 impl MountBackend for UnsupportedUnixMountBackend {
     fn name(&self) -> &'static str {
         "unsupported-unix"
@@ -189,9 +175,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_default_backend_is_raw_fuse() {
+    fn linux_default_backend_is_explicitly_unsupported() {
         let backend = super::default_mount_backend();
 
-        assert_eq!(backend.name(), "raw-fuse");
+        assert_eq!(backend.name(), "unsupported-unix");
     }
 }

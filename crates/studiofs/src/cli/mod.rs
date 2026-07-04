@@ -55,7 +55,7 @@ disk) and a distributed metadata backend for multi-client mounts.
 
 Supported platforms:
   • Windows  (via WinFSP)
-  • Linux    (via FUSE / libfuse3)
+  • Linux    (mount bridge not implemented)
   • macOS    (via macFUSE)
 
 Supported S3 backends:
@@ -77,7 +77,7 @@ EXAMPLES:
   Mount in background (daemon mode):
     studiofs mount myvolume Z: -d
 
-  Mount on Linux/macOS (directory):
+  Mount on macOS (directory):
     studiofs mount myvolume /mnt/studio --cache-size 500GB
 
   Unmount:

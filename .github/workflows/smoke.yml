@@ -5,7 +5,7 @@ name: Backend Smoke Tests
 #  Manual dispatch:       always runs all platforms
 #
 #  Smoke tests validate real mount/unmount + file I/O through the
-#  platform backends (Linux FUSE, macFUSE, WinFSP). They are separate
+#  platform backends (macFUSE, WinFSP). They are separate
 #  from the main rust.yml pipeline because they require kernel drivers
 #  and may be flaky on hosted runners. This workflow is intentionally
 #  manual-only.
@@ -25,46 +25,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # ─── Linux FUSE ────────────────────────────────────────────────────
-  linux-fuse:
-    name: Linux FUSE Smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: stable
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Verify /dev/fuse availability
-        run: |
-          if [ ! -e /dev/fuse ]; then
-            echo "::error::/dev/fuse not available on this runner"
-            exit 1
-          fi
-          echo "/dev/fuse is available"
-          ls -la /dev/fuse
-
-      - name: Build FUSE smoke tests
-        run: cargo test -p studiofs-fuse --test mount_sanity --no-run
-
-      - name: Run FUSE smoke tests
-        run: cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
-        timeout-minutes: 5
-
-      - name: Capture test output on failure
-        if: failure()
-        run: |
-          echo '### FUSE Smoke Test Failure' >> $GITHUB_STEP_SUMMARY
-          echo 'Test output is available in the "Run FUSE smoke tests" step log above.' >> $GITHUB_STEP_SUMMARY
-          echo 'stdout/stderr from `--nocapture` is captured by GitHub Actions natively.' >> $GITHUB_STEP_SUMMARY
-
   # ─── macOS macFUSE ─────────────────────────────────────────────────
   #
   # continue-on-error: macFUSE system extension may not be loadable on
@@ -115,26 +75,12 @@ jobs:
         run: cargo test -p studiofs-macfuse --lib -- --nocapture
         timeout-minutes: 5
 
-      - name: Build legacy macOS FUSE compatibility smoke tests
-        run: cargo test -p studiofs-fuse --test mount_sanity --no-run
-
-      - name: Run legacy macOS FUSE compatibility logic smoke
-        run: cargo test -p studiofs-fuse --test virtual_mount_test -- --nocapture
-        timeout-minutes: 5
-
-      - name: Run optional legacy Kernel FUSE smoke tests
-        if: steps.macfuse-check.outputs.loaded == 'true'
-        run: |
-          echo "Kernel extension loaded. Running legacy system-level FUSE smoke test."
-          cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
-        timeout-minutes: 5
-
       - name: Report macOS Kernel Limitation
         if: steps.macfuse-check.outputs.loaded == 'false'
         run: |
           echo "### macOS macFUSE CI Notice" >> $GITHUB_STEP_SUMMARY
           echo "Standard GitHub-hosted macOS runners do not support third-party kernel extensions (KEXTs)." >> $GITHUB_STEP_SUMMARY
-          echo "The **macFUSE native bridge smoke tests** and legacy compatibility logic smoke were executed instead." >> $GITHUB_STEP_SUMMARY
+          echo "The **macFUSE native bridge smoke tests** were executed instead." >> $GITHUB_STEP_SUMMARY
           echo "System-level mount tests are recommended for local or self-hosted environments." >> $GITHUB_STEP_SUMMARY
 
       - name: Capture test output on failure

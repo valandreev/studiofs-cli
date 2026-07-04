@@ -25,8 +25,7 @@ workflows are manual-only while Windows work is primarily validated locally.
 | `cargo audit` ¹ | Auto (RWX Ubuntu quality) | — | — |
 | Workspace unit + compile tests | Auto (Ubuntu + Rocky) | Manual GitHub Action | Manual GitHub Action |
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
-| `studiofs-fuse` Linux unit tests | Auto (Ubuntu + Rocky) | — | — |
-| `studiofs-fuse` Linux mount-smoke compile check | Auto (Rocky) | — | — |
+| Linux mount bridge | Not implemented after SFS-600 | — | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
 ### What is NOT verified automatically (manual / self-hosted only)
@@ -49,7 +48,7 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 - **Portable compile + clippy** — `cargo clippy` runs automatically in the RWX Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from RWX Ubuntu and Rocky workspace `cargo test` runs.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
-- **Platform unit tests** — the named backend step in each platform lane (`studiofs-fuse` on RWX Ubuntu/Rocky, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
+- **Platform unit tests** — the named backend step in each platform lane (`studiofs-macfuse` on manual macOS, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
 - **Infra integration tests** — all `#[ignore]` tests requiring live S3 + PostgreSQL. Not a PR gate.
 
@@ -110,9 +109,7 @@ for the local CLI location and `.rwx/downloads/` log layout.
 - **RWX quality failed** → fix formatting, clippy, doc, or audit issue.
 - **RWX Ubuntu failed** → a regression in portable Linux behavior, Ubuntu package/runtime compatibility, or the explicit local-first VFS fast checks.
 - **RWX Rocky failed** → a regression in Rocky/RHEL-family package/runtime compatibility or a Linux backend compile/unit path that differs from Ubuntu.
-- **Linux failed, platform step** → a regression in a `cfg(target_os = "linux")` path
-  inside `studiofs-fuse`. The named RWX `cargo-test-studiofs-fuse-*` step will
-  identify whether the failure is Ubuntu-only, Rocky-only, or shared.
+- **Linux failed, mounted backend** → unexpected; Linux mount is not implemented after SFS-600.
 - **Manual Windows failed, platform step** → a regression in `studiofs-winfsp` (the entire
   crate is `#![cfg(windows)]`). The named step `cargo test (studiofs-winfsp)` will
   identify it.
@@ -162,8 +159,8 @@ any other host-OS conditional that routes to platform-specific behavior.
 A PR that adds or meaningfully changes a `cfg`-guarded branch **must** include
 one of the following in the PR description:
 
-- "Manual GitHub Actions macOS verification covers this — the macOS job runs `cargo test -p studiofs-fuse --lib --tests` which exercises this path."
-- "This path requires a live FUSE mount. I validated locally with `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored`."
+- "Manual GitHub Actions macOS verification covers this — the macOS job runs `cargo test -p studiofs-macfuse --lib` which exercises this path."
+- "This path requires a live WinFSP mount. I validated locally with `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-winfsp --test mount_sanity -- --ignored`."
 - "This path is Windows-only. I validated it locally, or by manually running the GitHub Actions Windows job, via the `studiofs-winfsp` unit step on `windows-latest`."
 
 Do not say "CI will catch it" without identifying *which* CI step exercises the new path.
@@ -225,7 +222,7 @@ silence is not.
 |-----------|-----------------|
 | Platform unit test (no OS driver needed, no mounts) | `src/` with `#[cfg(target_os = "...")]` guard |
 | Platform test requiring external crate or heavy setup | `tests/` with `#[cfg(target_os = "...")]` guard |
-| Platform test requiring FUSE or WinFSP driver | `tests/mount_sanity.rs` with `#[ignore]` |
+| Platform test requiring WinFSP driver | `tests/mount_sanity.rs` with `#[ignore]` |
 | Portable test | `src/` or `tests/` without platform guard |
 
 The CI coverage table in [tests.md](tests.md#ci-coverage-per-platform) maps

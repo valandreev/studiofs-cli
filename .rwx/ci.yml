@@ -106,7 +106,7 @@ tasks:
 
   - key: cargo-test-linux-workspace
     use: [code, rust, linux-packages, cargo-fetch]
-    run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+    run: cargo test --workspace --all-targets -- --nocapture
     env:
       RUSTFLAGS: "-Dwarnings"
     agent:
@@ -125,18 +125,11 @@ tasks:
     env:
       RUSTFLAGS: "-Dwarnings"
 
-  - key: cargo-test-studiofs-fuse-linux
-    use: [code, rust, linux-packages, cargo-fetch]
-    run: cargo test -p studiofs-fuse --lib -- --nocapture
-    env:
-      RUSTFLAGS: "-Dwarnings"
-
   - key: ubuntu-linux
     use:
       - quality
       - cargo-test-linux-workspace
       - cargo-test-local-first-offline-vfs-fast
-      - cargo-test-studiofs-fuse-linux
     run: echo "Ubuntu Linux checks passed"
 
   - key: rocky-linux

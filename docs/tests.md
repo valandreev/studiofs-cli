@@ -149,7 +149,7 @@ Local loopback examples remain available as development/test examples.
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
-| Linux raw FUSE unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity raw_fuse -- --ignored --nocapture --test-threads=1` |
+| Linux mount | Not implemented after SFS-600; no raw FUSE unit or smoke target exists |
 | macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
@@ -172,18 +172,12 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 
 | Test | Backend | Verifies |
 |------|---------|----------|
-| `raw_fuse_mount_and_unmount_smoke` | Linux raw FUSE | Mount → read root directory → unmount through OS FUSE tooling |
-| `raw_fuse_write_read_unmount_smoke` | Linux raw FUSE | Mounted write/readback through the raw transport |
-| `raw_fuse_flush_readback_smoke` | Linux raw FUSE | Mounted write → flush → close → readback |
-| `raw_fuse_fsync_readback_smoke` | Linux raw FUSE | Mounted write → fsync → close → readback |
-| `raw_fuse_close_reopen_readback_smoke` | Linux raw FUSE | Mounted write → close/reopen readback |
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 
 The full-lifecycle tests (`*_write_read_unmount_smoke`) exercise file I/O
-through the real OS filesystem layer, not just session creation. Linux keeps a
-focused raw `/dev/fuse` mount/unmount smoke because raw FUSE is the only Linux
-bridge.
+through the real OS filesystem layer, not just session creation. Linux has no
+mounted bridge until the next implementation lands.
 
 The WinFSP suite also contains post-upload/finalization cases. Those require a
 reachable S3 backend and return early when the resolved test endpoint is not
@@ -315,20 +309,15 @@ behavior must converge through mounted reads and the mounted-tree validator. It
 writes `operations.ndjson`, `symlink-attribute-summary.json`, and
 `validation.json`.
 
-Hosted Linux real mounted E2E is available as a manual RWX workflow:
+Hosted Linux real mounted E2E is disabled while Linux has no mounted bridge:
 
 ```powershell
 rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 rwx run .rwx/e2e.yml --target e2e-full --wait --open
 ```
 
-The smoke target runs `basic-multi-client-smoke` only. The full target runs
-the `1-23` scenario selector. Both require RWX Docker support, `/dev/fuse`,
-`fusermount3`, and readable FUSE configuration on the hosted Linux task. They
-do not add a GitHub Actions workflow, PR trigger, or schedule. RWX uploads
-`target/e2e-runs/<run-id>/` as an artifact so `report.json`, `preflight.json`,
-Docker diagnostics, scenario artifacts, and client logs remain available on
-failure.
+Both targets exit early with the SFS-600 disabled-backend message. Re-enable
+them when the new Linux bridge exists.
 
 Focused runner skeleton check:
 
@@ -343,28 +332,21 @@ cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reus
 
 ## Platform-Gated Unit Tests
 
-`studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only
-meaningful on the OS they target. `studiofs-fuse` targets Linux only; macOS
-bridge tests belong to the future macOS bridge crate. These tests must be run
-on the correct host — cross-compilation does not count.
+`studiofs-winfsp` contains unit tests that are only meaningful on Windows.
+macOS bridge tests belong to `studiofs-macfuse`. Linux has no bridge crate
+after SFS-600.
 
 ### Rules for writing platform-gated unit tests
 
 1. **Use the narrowest `cfg` guard that reflects the real constraint.**
-   - Tests that validate Linux-specific behavior (e.g., `fusermount3` semantics): `#[cfg(target_os = "linux")]`
-     Prefer this over `#[cfg(not(target_os = "macos"))]` — the latter would also fire on
-     FreeBSD and other Unix variants where `fusermount3` is not present and the
-     behavior would be undefined.
    - Tests that validate WinFSP behavior (drive letters, timeout parsing):
      no extra `cfg` needed — the crate root already has `#![cfg(windows)]`
 
 2. **Do not use `#[ignore]` to skip platform unit tests.**
    Platform-gated tests that would be useless on other OSes must use `cfg`
    guards, not `#[ignore]`. CI command details per platform:
-   - Linux: `cargo test -p studiofs-fuse --lib` (unit tests only).
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
-   Only the relevant runner runs each step; the other platforms skip it entirely
-     `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
+   Only the relevant runner runs each step; the other platforms skip it entirely.
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
    Only the relevant runner runs each step; the other platforms skip it entirely
    via `cfg` guards in the test code.
@@ -400,7 +382,6 @@ artifact is no longer needed.
 
 | Crate | CI step | Runner |
 |-------|---------|--------|
-| `studiofs-fuse` (Linux paths) | `cargo-test-studiofs-fuse-linux` / `cargo-test-studiofs-fuse-rocky` | RWX `ubuntu:24.04` + `rockylinux:9` |
 | `studiofs-winfsp` | `cargo test (studiofs-winfsp)` | `windows-latest` |
 
 Each step is separate from the workspace run so a failure directly identifies
@@ -482,12 +463,8 @@ runtime that is already shutting down.
 ## Platform Bridge Smoke Tests
 
 The bridge mount/unmount smoke tests are intentionally `#[ignore]` because they
-require host platform support (`/dev/fuse` or WinFSP driver/runtime). Enable
-them only when validating platform bridge changes:
-
-```bash
-STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
-```
+require host platform support (WinFSP driver/runtime). Enable them only when
+validating platform bridge changes:
 
 ```powershell
 $env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
@@ -521,8 +498,7 @@ Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:
 | `workflow_dispatch` | Manual run — all platforms |
 
 The workflow runs independently of the main `rust.yml` pipeline and never
-starts automatically. macOS smoke coverage belongs to the future macOS bridge
-track and must not be treated as `studiofs-fuse` coverage.
+starts automatically.
 
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full
 strategy document covering hosted vs self-hosted responsibilities.

@@ -4,6 +4,10 @@ Date: 2026-06-02
 
 Tracking issue: [SFS-475](https://linear.app/valandreev/issue/SFS-475/define-macos-native-bridge-split-from-main)
 
+Historical note: this SFS-475 split predates SFS-600. References below to
+`studiofs-fuse` describe the removed legacy Linux raw FUSE path and are kept as
+the original macOS split rationale, not as current Linux mount guidance.
+
 ## Decision
 
 StudioFS should split the macOS mount implementation out of the current

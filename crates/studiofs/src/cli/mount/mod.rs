@@ -52,7 +52,8 @@ impl MountCommand {
 #[command(about = "Mount a filesystem volume as a local drive")]
 #[command(long_about = "\
 Mount a previously initialized volume. On Windows, the mount point is a drive \
-letter (e.g. Z:). On Linux/macOS, it is an existing directory path.
+letter (e.g. Z:). On macOS, it is an existing directory path. Linux mount is \
+not implemented after the SFS-600 legacy raw FUSE removal.
 
 The local client uses its cached metadata database while synchronizing shared \
 state through PostgreSQL. Same-mount reads observe accepted writes \
@@ -70,7 +71,7 @@ EXAMPLES:
   Basic mount (Windows):
     studiofs mount myvolume Z:
 
-  Basic mount (Linux/macOS):
+  Basic mount (macOS):
     studiofs mount myvolume /mnt/studio
 
   Local data cache mount (location + size):
