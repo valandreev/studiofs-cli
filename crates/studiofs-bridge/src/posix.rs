@@ -71,6 +71,9 @@ pub fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
     if flags & libc::O_APPEND != 0 {
         open_flags |= OpenFlags::APPEND;
     }
+    if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
+        open_flags |= OpenFlags::SYNC;
+    }
     let trunc = flags & libc::O_TRUNC != 0;
     (open_flags, trunc)
 }
@@ -172,6 +175,15 @@ mod tests {
         let (rdwr, trunc) = posix_flags_to_open_flags(libc::O_RDWR | libc::O_TRUNC);
         assert!(rdwr.contains(OpenFlags::RDWR));
         assert!(trunc);
+    }
+
+    #[test]
+    fn posix_open_flags_translate_sync_bits() {
+        let (sync, _trunc) = posix_flags_to_open_flags(libc::O_WRONLY | libc::O_SYNC);
+        let (dsync, _trunc) = posix_flags_to_open_flags(libc::O_WRONLY | libc::O_DSYNC);
+
+        assert!(sync.contains(OpenFlags::SYNC));
+        assert!(dsync.contains(OpenFlags::SYNC));
     }
 
     #[test]

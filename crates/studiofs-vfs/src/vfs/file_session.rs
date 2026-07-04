@@ -58,6 +58,8 @@ impl OpenFlags {
     pub const RDWR: Self = Self(0x04);
     /// Open with append-only semantics.
     pub const APPEND: Self = Self(0x08);
+    /// Open with synchronous write-through semantics.
+    pub const SYNC: Self = Self(0x10);
 
     /// Returns an empty set of flags.
     pub const fn empty() -> Self {

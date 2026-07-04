@@ -13,17 +13,19 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{SignalHandling, signal_handlers_for_policy};
+use bytes::Bytes;
 use dashmap::DashMap;
 use studiofs_bridge::posix::{posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, StudioVfs, VfsFuseAsyncWriteSnapshot,
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs,
+    VfsFuseAsyncWriteSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
@@ -83,6 +85,9 @@ const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const LINUX_DEFAULT_IO_SIZE: u32 = 4096;
+const LINUX_REGULAR_FILE_IO_SIZE: u32 = 4 * 1024 * 1024;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -98,20 +103,20 @@ pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_FILE_OPS: u32 = 1 << 2;
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
 pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
-#[cfg(test)]
 pub const FUSE_READDIRPLUS: u32 = 1 << 13;
-#[cfg(test)]
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 
-const WANTED_CAPS: [u32; 6] = [
+const WANTED_CAPS: [u32; 8] = [
     FUSE_ASYNC_READ,
     FUSE_BIG_WRITES,
     FUSE_MAX_PAGES,
     FUSE_PARALLEL_DIROPS,
+    FUSE_READDIRPLUS,
+    FUSE_READDIRPLUS_AUTO,
     FUSE_FILE_OPS,
     FUSE_EXPLICIT_INVAL_DATA,
 ];
@@ -334,6 +339,39 @@ struct RawDispatchAccountingInner {
     read_latency_nanos: AtomicU64,
     write_latency_count: AtomicU64,
     write_latency_nanos: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RawBufferSpilloverAccounting {
+    max_inflight: usize,
+    inflight: AtomicUsize,
+}
+
+impl RawBufferSpilloverAccounting {
+    fn new(max_inflight: usize) -> Self {
+        Self {
+            max_inflight: max_inflight.max(1),
+            inflight: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<RawBufferSpilloverGuard> {
+        increment_bounded(&self.inflight, self.max_inflight).ok()?;
+        Some(RawBufferSpilloverGuard {
+            accounting: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RawBufferSpilloverGuard {
+    accounting: Arc<RawBufferSpilloverAccounting>,
+}
+
+impl Drop for RawBufferSpilloverGuard {
+    fn drop(&mut self) {
+        self.accounting.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl RawDispatchAccounting {
@@ -977,12 +1015,13 @@ fn serve_minimal_session(
     let buffer_size = profile.max_write as usize + 4096;
     let buffer_count = usize::from(profile.max_background.max(1));
     let (buffer_recycler, recycled_buffers) = mpsc::sync_channel(buffer_count);
+    let spillover_accounting = Arc::new(RawBufferSpilloverAccounting::new(buffer_count));
     for _ in 0..buffer_count {
         buffer_recycler
             .send(vec![0_u8; buffer_size])
             .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))?;
     }
-    let mut buf = recv_request_buffer(&recycled_buffers)?;
+    let mut buf = recv_request_buffer(&recycled_buffers, buffer_size, &spillover_accounting)?;
     let ids = SessionIds {
         // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
         uid: unsafe { libc::geteuid() },
@@ -996,12 +1035,14 @@ fn serve_minimal_session(
     let context = RawRequestContext {
         vfs,
         runtime_handle,
+        max_write: profile.max_write as usize,
         ids,
         next_open_dir_fh: Arc::new(AtomicU64::new(1)),
         open_dir_handles: Arc::new(DashMap::new()),
+        write_sync_policies: Arc::new(DashMap::new()),
     };
     let session_result = loop {
-        let len = match read_next_fuse_request(fd, &mut buf, shutdown) {
+        let len = match read_next_fuse_request(fd, buf.as_mut_slice(), shutdown) {
             Ok(Some(len)) => len,
             Ok(None) => break Ok(()),
             Err(err)
@@ -1023,19 +1064,22 @@ fn serve_minimal_session(
                 "short FUSE request header",
             ));
         }
-        let header = read_struct::<InHeader>(&buf[..size_of::<InHeader>()])?;
+        let header = read_struct::<InHeader>(&buf.as_slice()[..size_of::<InHeader>()])?;
         accounting.record_request();
         if header.opcode == OP_INIT {
             handle_init(
                 fd,
                 header,
-                &buf[size_of::<InHeader>()..len],
+                &buf.as_slice()[size_of::<InHeader>()..len],
                 profile,
                 Some(&accounting),
             )?;
             continue;
         }
-        let request_buf = std::mem::replace(&mut buf, recv_request_buffer(&recycled_buffers)?);
+        let request_buf = std::mem::replace(
+            &mut buf,
+            recv_request_buffer(&recycled_buffers, buffer_size, &spillover_accounting)?,
+        );
         dispatch_minimal_request(
             fd,
             header,
@@ -1050,21 +1094,75 @@ fn serve_minimal_session(
     session_result
 }
 
-fn recv_request_buffer(receiver: &Receiver<Vec<u8>>) -> io::Result<Vec<u8>> {
-    receiver
-        .recv()
-        .map_err(|_| io::Error::other("raw FUSE buffer pool closed"))
+struct RawRequestBuffer {
+    buffer: Vec<u8>,
+    _spillover: Option<RawBufferSpilloverGuard>,
+}
+
+impl RawRequestBuffer {
+    fn pooled(buffer: Vec<u8>) -> Self {
+        Self {
+            buffer,
+            _spillover: None,
+        }
+    }
+
+    fn spillover(buffer_size: usize, guard: RawBufferSpilloverGuard) -> Self {
+        Self {
+            buffer: vec![0_u8; buffer_size],
+            _spillover: Some(guard),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    fn into_parts(self) -> (Vec<u8>, Option<RawBufferSpilloverGuard>) {
+        (self.buffer, self._spillover)
+    }
+}
+
+fn recv_request_buffer(
+    receiver: &Receiver<Vec<u8>>,
+    buffer_size: usize,
+    spillover_accounting: &Arc<RawBufferSpilloverAccounting>,
+) -> io::Result<RawRequestBuffer> {
+    match receiver.try_recv() {
+        Ok(buffer) => Ok(RawRequestBuffer::pooled(buffer)),
+        Err(TryRecvError::Empty) => match spillover_accounting.try_acquire() {
+            Some(guard) => {
+                debug!(
+                    buffer_size,
+                    "raw FUSE request buffer pool empty; allocating spillover buffer"
+                );
+                Ok(RawRequestBuffer::spillover(buffer_size, guard))
+            }
+            None => receiver
+                .recv()
+                .map(RawRequestBuffer::pooled)
+                .map_err(|_| io::Error::other("raw FUSE buffer pool closed")),
+        },
+        Err(TryRecvError::Disconnected) => Err(io::Error::other("raw FUSE buffer pool closed")),
+    }
 }
 
 struct RecycledRequestBuffer {
     buffer: Option<Vec<u8>>,
+    _spillover: Option<RawBufferSpilloverGuard>,
     recycler: SyncSender<Vec<u8>>,
 }
 
 impl RecycledRequestBuffer {
-    fn new(buffer: Vec<u8>, recycler: SyncSender<Vec<u8>>) -> Self {
+    fn new(buffer: RawRequestBuffer, recycler: SyncSender<Vec<u8>>) -> Self {
+        let (buffer, spillover) = buffer.into_parts();
         Self {
             buffer: Some(buffer),
+            _spillover: spillover,
             recycler,
         }
     }
@@ -1080,15 +1178,82 @@ impl Drop for RecycledRequestBuffer {
             return;
         };
         if self.recycler.try_send(buffer).is_err() {
-            warn!("raw FUSE request buffer recycler is full or closed");
+            debug!("raw FUSE request buffer recycler is full or closed; dropping request buffer");
         }
     }
+}
+
+struct RecyclableRequestPayload {
+    buffer: Option<Vec<u8>>,
+    _spillover: Option<RawBufferSpilloverGuard>,
+    payload_start: usize,
+    payload_end: usize,
+    recycler: SyncSender<Vec<u8>>,
+}
+
+impl RecyclableRequestPayload {
+    fn new(
+        buffer: RawRequestBuffer,
+        request_len: usize,
+        recycler: SyncSender<Vec<u8>>,
+    ) -> io::Result<Self> {
+        let payload_start = size_of::<InHeader>();
+        if request_len < payload_start || request_len > buffer.as_slice().len() {
+            let (buffer, _spillover) = buffer.into_parts();
+            let _ = recycler.try_send(buffer);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid raw FUSE request length",
+            ));
+        }
+        let (buffer, spillover) = buffer.into_parts();
+        Ok(Self {
+            buffer: Some(buffer),
+            _spillover: spillover,
+            payload_start,
+            payload_end: request_len,
+            recycler,
+        })
+    }
+}
+
+impl AsRef<[u8]> for RecyclableRequestPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.as_ref().expect("request buffer present")[self.payload_start..self.payload_end]
+    }
+}
+
+impl Drop for RecyclableRequestPayload {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if self.recycler.try_send(buffer).is_err() {
+            debug!("raw FUSE request buffer recycler is full or closed; dropping request buffer");
+        }
+    }
+}
+
+fn owned_request_payload(
+    buffer: RawRequestBuffer,
+    request_len: usize,
+    recycler: SyncSender<Vec<u8>>,
+) -> io::Result<Bytes> {
+    RecyclableRequestPayload::new(buffer, request_len, recycler).map(Bytes::from_owner)
+}
+
+fn linux_should_use_owned_write_for_block(write_len: usize, block_size: usize) -> bool {
+    block_size > 0 && write_len >= block_size
+}
+
+fn linux_should_use_owned_write(context: &RawRequestContext, write_len: usize) -> bool {
+    linux_should_use_owned_write_for_block(write_len, context.max_write)
 }
 
 struct RawRequestJob {
     fd: RawFd,
     header: InHeader,
-    request_buf: Vec<u8>,
+    request_buf: RawRequestBuffer,
     request_len: usize,
     context: RawRequestContext,
     accounting: RawDispatchAccounting,
@@ -1098,7 +1263,7 @@ struct RawRequestJob {
 fn dispatch_minimal_request(
     fd: RawFd,
     header: InHeader,
-    request_buf: Vec<u8>,
+    request_buf: RawRequestBuffer,
     request_len: usize,
     context: RawRequestContext,
     accounting: &RawDispatchAccounting,
@@ -1165,12 +1330,24 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
         accounting,
         buffer_recycler,
     } = job;
-    let request_buf = RecycledRequestBuffer::new(request_buf, buffer_recycler);
     let guard = accounting.admit_blocking(RawDispatchClass::Stream);
     runtime_handle.spawn(async move {
         let _guard = guard;
         let started = Instant::now();
-        let payload = request_buf.payload(request_len);
+        let payload = match owned_request_payload(request_buf, request_len, buffer_recycler) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(
+                    opcode = header.opcode,
+                    unique = header.unique,
+                    error = %err,
+                    "raw FUSE async write received invalid request buffer"
+                );
+                let _ = reply_error(fd, header.unique, libc::EINVAL, Some(&accounting));
+                accounting.record_latency(header.opcode, started.elapsed());
+                return;
+            }
+        };
         let reply_result = async {
             let Some(vfs) = &context.vfs else {
                 return reply_error(fd, header.unique, libc::ENOSYS, Some(&accounting));
@@ -1179,18 +1356,29 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
                 return reply_error(fd, header.unique, libc::EINVAL, Some(&accounting));
             }
             let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
-            let data = &payload[size_of::<WriteIn>()..];
+            let data = payload.slice(size_of::<WriteIn>()..);
             let write_len = (input.size as usize).min(data.len());
-            match vfs
-                .write_fh_with_deferred_materialize(
+            let local_sync_policy = linux_write_sync_policy(&context, vfs, input.fh);
+            let result = if linux_should_use_owned_write(&context, write_len) {
+                vfs.write_fh_owned_with_deferred_materialize(
+                    input.fh,
+                    header.nodeid,
+                    input.offset,
+                    data.slice(..write_len),
+                    local_sync_policy,
+                )
+                .await
+            } else {
+                vfs.write_fh_with_deferred_materialize(
                     input.fh,
                     header.nodeid,
                     input.offset,
                     &data[..write_len],
-                    LocalSyncPolicy::Opportunistic,
+                    local_sync_policy,
                 )
                 .await
-            {
+            };
+            match result {
                 Ok(written) => reply_write(fd, header.unique, written, Some(&accounting)),
                 Err(err) => {
                     reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(&accounting))
@@ -1320,7 +1508,18 @@ fn raw_open(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
-        Ok(fh) => reply_open(fd, header.unique, fh, 0, Some(accounting)),
+        Ok(fh) => {
+            context
+                .write_sync_policies
+                .insert(fh, linux_write_sync_policy_for_open_flags(open_flags));
+            reply_open(
+                fd,
+                header.unique,
+                fh,
+                linux_open_flags_for_posix(flags, trunc),
+                Some(accounting),
+            )
+        }
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1357,7 +1556,20 @@ fn raw_create(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(attr.ino, open_flags, trunc) {
-        Ok(fh) => reply_create(fd, header.unique, &attr, fh, 0, context, Some(accounting)),
+        Ok(fh) => {
+            context
+                .write_sync_policies
+                .insert(fh, linux_write_sync_policy_for_open_flags(open_flags));
+            reply_create(
+                fd,
+                header.unique,
+                &attr,
+                fh,
+                linux_open_flags_for_posix(flags, trunc),
+                context,
+                Some(accounting),
+            )
+        }
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1610,12 +1822,13 @@ fn raw_write(
     let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
     let data = &payload[size_of::<WriteIn>()..];
     let write_len = (input.size as usize).min(data.len());
+    let local_sync_policy = linux_write_sync_policy(context, vfs, input.fh);
     match rt.block_on(vfs.write_fh_with_deferred_materialize(
         input.fh,
         header.nodeid,
         input.offset,
         &data[..write_len],
-        LocalSyncPolicy::Opportunistic,
+        local_sync_policy,
     )) {
         Ok(written) => reply_write(fd, header.unique, written, Some(accounting)),
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
@@ -1693,6 +1906,7 @@ fn raw_release(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
+    context.write_sync_policies.remove(&input.fh);
     // The deferred helper owns final-handle errors by logging them out of band;
     // raw FUSE release must not park the dispatch loop on the local barrier.
     vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
@@ -2038,9 +2252,11 @@ struct SessionIds {
 struct RawRequestContext {
     vfs: Option<Arc<StudioVfs>>,
     runtime_handle: Option<Handle>,
+    max_write: usize,
     ids: SessionIds,
     next_open_dir_fh: Arc<AtomicU64>,
     open_dir_handles: Arc<DashMap<u64, RawOpenDirState>>,
+    write_sync_policies: Arc<DashMap<u64, LocalSyncPolicy>>,
 }
 
 #[derive(Clone)]
@@ -2098,8 +2314,57 @@ struct RawDirent {
     dtype: u32,
 }
 
+fn linux_open_flags_for_posix(flags: i32, trunc: bool) -> u32 {
+    let access = flags & libc::O_ACCMODE;
+    let read_only = access == libc::O_RDONLY;
+    let append = flags & libc::O_APPEND != 0;
+    if read_only && !append && !trunc {
+        FOPEN_KEEP_CACHE
+    } else {
+        0
+    }
+}
+
+fn linux_attr_blksize(attr: &InodeAttr) -> u32 {
+    match attr.kind {
+        FileType::RegularFile => LINUX_REGULAR_FILE_IO_SIZE,
+        FileType::Directory | FileType::Symlink => LINUX_DEFAULT_IO_SIZE,
+    }
+}
+
+fn linux_write_sync_policy_for_open_flags(flags: OpenFlags) -> LocalSyncPolicy {
+    if flags.contains(OpenFlags::SYNC) {
+        LocalSyncPolicy::WriteThrough
+    } else {
+        LocalSyncPolicy::Opportunistic
+    }
+}
+
+fn linux_write_sync_policy(
+    context: &RawRequestContext,
+    vfs: &StudioVfs,
+    fh: u64,
+) -> LocalSyncPolicy {
+    if let Some(policy) = context.write_sync_policies.get(&fh) {
+        return *policy;
+    }
+    if vfs
+        .get_open_file(fh)
+        .is_some_and(|open_file| open_file.flags.contains(OpenFlags::SYNC))
+    {
+        LocalSyncPolicy::WriteThrough
+    } else {
+        LocalSyncPolicy::Opportunistic
+    }
+}
+
 fn raw_entry_out(inode_attr: &InodeAttr, context: &RawRequestContext) -> RawEntryOut {
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        linux_attr_blksize(inode_attr),
+    );
     RawEntryOut {
         nodeid: inode_attr.ino,
         generation: 0,
@@ -2204,7 +2469,12 @@ fn reply_getattr(
     let attr = if let Some(vfs) = &context.vfs {
         match vfs.getattr(ino) {
             Ok(attr) => {
-                let bridge = to_bridge_attr(&attr, context.ids.uid, context.ids.gid, 4096);
+                let bridge = to_bridge_attr(
+                    &attr,
+                    context.ids.uid,
+                    context.ids.gid,
+                    linux_attr_blksize(&attr),
+                );
                 AttrOut {
                     attr_valid: 1,
                     attr_valid_nsec: 0,
@@ -2337,7 +2607,12 @@ fn reply_attr(
         dummy: u32,
         attr: Attr,
     }
-    let bridge = to_bridge_attr(inode_attr, context.ids.uid, context.ids.gid, 4096);
+    let bridge = to_bridge_attr(
+        inode_attr,
+        context.ids.uid,
+        context.ids.gid,
+        linux_attr_blksize(inode_attr),
+    );
     let out = AttrOut {
         attr_valid: 1,
         attr_valid_nsec: 0,
@@ -3372,7 +3647,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_does_not_advertise_readdirplus_without_direntplus_support() {
+    fn raw_init_advertises_readdirplus_when_kernel_supports_it() {
         let negotiated = LinuxRawFuseProfile::juicefs_like().negotiate_init(InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
@@ -3380,8 +3655,11 @@ mod tests {
             flags: u32::MAX,
         });
 
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, 0);
-        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS_AUTO, 0);
+        assert_eq!(negotiated.out.flags & FUSE_READDIRPLUS, FUSE_READDIRPLUS);
+        assert_eq!(
+            negotiated.out.flags & FUSE_READDIRPLUS_AUTO,
+            FUSE_READDIRPLUS_AUTO
+        );
     }
 
     #[test]
@@ -3420,12 +3698,14 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
             },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
         };
         let current = InodeAttr::new_dir(7, FUSE_ROOT_ID, 1000, 1000, 0o755);
         let parent = InodeAttr::new_dir(FUSE_ROOT_ID, 0, 1000, 1000, 0o755);
@@ -3453,13 +3733,69 @@ mod tests {
     }
 
     #[test]
+    fn raw_read_only_open_keeps_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDONLY, false);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
+    fn raw_read_only_truncate_open_does_not_keep_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDONLY | libc::O_TRUNC, true);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+    }
+
+    #[test]
+    fn raw_write_capable_open_does_not_keep_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDWR, false);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+    }
+
+    #[test]
+    fn raw_sync_open_flags_use_write_through_policy() {
+        assert_eq!(
+            linux_write_sync_policy_for_open_flags(OpenFlags::SYNC),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            linux_write_sync_policy_for_open_flags(OpenFlags::empty()),
+            LocalSyncPolicy::Opportunistic
+        );
+    }
+
+    #[test]
+    fn raw_regular_file_attrs_report_four_mib_preferred_io_size() {
+        let context = RawRequestContext {
+            vfs: None,
+            runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            ids: SessionIds {
+                uid: 1000,
+                gid: 1000,
+            },
+            next_open_dir_fh: Arc::new(AtomicU64::new(1)),
+            open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
+        };
+        let attr = InodeAttr::new_file(9, FUSE_ROOT_ID, 1000, 1000, 0o644);
+
+        let out = raw_entry_out(&attr, &context);
+
+        assert_eq!(out.attr.blksize, 4 * 1024 * 1024);
+    }
+
+    #[test]
     fn raw_open_dir_handle_state_rejects_unknown_nonzero_fh() {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
+            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
         };
 
         assert!(matches!(
@@ -3472,9 +3808,101 @@ mod tests {
     fn raw_request_buffer_returns_to_pool_on_drop() {
         let (sender, receiver) = mpsc::sync_channel(1);
 
-        drop(RecycledRequestBuffer::new(vec![7, 8, 9], sender));
+        drop(RecycledRequestBuffer::new(
+            RawRequestBuffer::pooled(vec![7, 8, 9]),
+            sender,
+        ));
 
         assert_eq!(receiver.try_recv().unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn raw_recv_request_buffer_bounds_spillover_when_pool_is_empty() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let spillover_accounting = Arc::new(RawBufferSpilloverAccounting::new(1));
+        sender.send(vec![1, 2, 3]).unwrap();
+
+        let pooled = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(pooled.as_slice(), &[1, 2, 3]);
+
+        let spillover = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(spillover.as_slice(), vec![0; 8]);
+
+        let sender_for_blocked_recv = sender.clone();
+        let join = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            sender_for_blocked_recv.send(vec![4, 5, 6]).unwrap();
+        });
+
+        let blocked = recv_request_buffer(&receiver, 8, &spillover_accounting).unwrap();
+        assert_eq!(blocked.as_slice(), &[4, 5, 6]);
+        join.join().unwrap();
+
+        drop(sender);
+        drop(spillover);
+        assert!(recv_request_buffer(&receiver, 8, &spillover_accounting).is_err());
+    }
+
+    #[test]
+    fn raw_owned_request_payload_returns_buffer_after_last_bytes_drop() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut buffer = vec![0; size_of::<InHeader>() + 4];
+        buffer[size_of::<InHeader>()..].copy_from_slice(b"data");
+
+        let payload = owned_request_payload(
+            RawRequestBuffer::pooled(buffer),
+            size_of::<InHeader>() + 4,
+            sender,
+        )
+        .expect("payload bytes");
+        let view = payload.slice(1..3);
+
+        assert_eq!(&payload[..], b"data");
+        assert_eq!(&view[..], b"at");
+        assert!(receiver.try_recv().is_err());
+
+        drop(payload);
+        assert!(receiver.try_recv().is_err());
+
+        drop(view);
+        let recycled = receiver.try_recv().expect("request buffer recycled");
+        assert_eq!(&recycled[size_of::<InHeader>()..], b"data");
+    }
+
+    #[test]
+    fn raw_owned_request_payload_recycles_buffer_when_length_is_invalid() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let buffer = vec![0; size_of::<InHeader>() + 4];
+
+        let err = owned_request_payload(
+            RawRequestBuffer::pooled(buffer),
+            size_of::<InHeader>() - 1,
+            sender,
+        )
+        .expect_err("invalid payload length");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            receiver.try_recv().expect("request buffer recycled").len(),
+            size_of::<InHeader>() + 4
+        );
+    }
+
+    #[test]
+    fn raw_owned_write_is_reserved_for_full_fuse_writes() {
+        assert!(!linux_should_use_owned_write_for_block(0, 0));
+        assert!(!linux_should_use_owned_write_for_block(
+            4 * 1024,
+            1024 * 1024
+        ));
+        assert!(!linux_should_use_owned_write_for_block(
+            1024 * 1024 - 1,
+            1024 * 1024
+        ));
+        assert!(linux_should_use_owned_write_for_block(
+            1024 * 1024,
+            1024 * 1024
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use super::{
     OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
     VfsResult,
 };
+use bytes::Bytes;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -17,6 +18,31 @@ use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
+
+enum VfsWritePayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl VfsWritePayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            Self::Owned(data) => data.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
 
 impl StudioVfs {
     /// Spawn a background task that replays landing-zone segments left from a previous run.
@@ -1377,6 +1403,45 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        self.write_fh_payload_with_deferred_materialize(
+            fh,
+            ino,
+            offset,
+            VfsWritePayload::Borrowed(data),
+            local_sync_policy,
+        )
+        .await
+    }
+
+    /// Write owned file data using the deferred-materialization path.
+    ///
+    /// This is the owned-buffer variant of [`Self::write_fh_with_deferred_materialize`].
+    pub async fn write_fh_owned_with_deferred_materialize(
+        self: &Arc<Self>,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: Bytes,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
+        self.write_fh_payload_with_deferred_materialize(
+            fh,
+            ino,
+            offset,
+            VfsWritePayload::Owned(data),
+            local_sync_policy,
+        )
+        .await
+    }
+
+    async fn write_fh_payload_with_deferred_materialize(
+        self: &Arc<Self>,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: VfsWritePayload<'_>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
         // dangerously high, fall back to the fully-synchronous path so we
@@ -1386,8 +1451,16 @@ impl StudioVfs {
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
             self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
             if local_sync_policy.requires_write_path_durability() {
+                // Slow-path durability backpressure may copy owned payloads;
+                // keeping memory bounded wins over preserving zero-copy here.
                 return self
-                    .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                    .write_fh_with_local_sync_policy(
+                        fh,
+                        ino,
+                        offset,
+                        data.as_slice(),
+                        local_sync_policy,
+                    )
                     .await;
             }
         }
@@ -1418,8 +1491,16 @@ impl StudioVfs {
             if local_sync_policy.requires_write_path_durability() {
                 drop(session);
                 self.state.file_session.gc_if_idle(ino);
+                // Slow-path durability backpressure may copy owned payloads;
+                // keeping memory bounded wins over preserving zero-copy here.
                 return self
-                    .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                    .write_fh_with_local_sync_policy(
+                        fh,
+                        ino,
+                        offset,
+                        data.as_slice(),
+                        local_sync_policy,
+                    )
                     .await;
             }
         }
@@ -1443,9 +1524,16 @@ impl StudioVfs {
             self.note_vfs_write_call(data.len());
 
             let record_writer_stack_started = Instant::now();
-            let written = self
-                .record_writer_stack_state_bytes(fh, ino, offset, data)
-                .await;
+            let written = match data {
+                VfsWritePayload::Borrowed(data) => {
+                    self.record_writer_stack_state_bytes(fh, ino, offset, data)
+                        .await
+                }
+                VfsWritePayload::Owned(data) => {
+                    self.record_writer_stack_state_owned_bytes(fh, ino, offset, data)
+                        .await
+                }
+            };
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
             written
         }
@@ -1516,6 +1604,28 @@ impl StudioVfs {
         offset: u64,
         data: &[u8],
     ) -> VfsResult<u32> {
+        self.record_writer_stack_state_payload(fh, ino, offset, VfsWritePayload::Borrowed(data))
+            .await
+    }
+
+    pub(super) async fn record_writer_stack_state_owned_bytes(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: Bytes,
+    ) -> VfsResult<u32> {
+        self.record_writer_stack_state_payload(fh, ino, offset, VfsWritePayload::Owned(data))
+            .await
+    }
+
+    async fn record_writer_stack_state_payload(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: VfsWritePayload<'_>,
+    ) -> VfsResult<u32> {
         let mut base_attr;
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
             base_attr = attr;
@@ -1545,21 +1655,19 @@ impl StudioVfs {
             self.begin_pending_incarnation(ino, &mut base_attr);
         }
 
-        let accepted = self
-            .state
-            .writer_stack
-            .write_bytes(
-                super::writer_stack::WriterWriteSpec {
-                    fh,
-                    ino,
-                    current_size: base_attr.size,
-                    content_epoch: base_attr.content_epoch,
-                    first_object_id: 0,
-                    offset,
-                },
-                data,
-            )
-            .map_err(|err| VfsError::Other(format!("writer stack write failed: {err}")))?;
+        let spec = super::writer_stack::WriterWriteSpec {
+            fh,
+            ino,
+            current_size: base_attr.size,
+            content_epoch: base_attr.content_epoch,
+            first_object_id: 0,
+            offset,
+        };
+        let accepted = match data {
+            VfsWritePayload::Borrowed(data) => self.state.writer_stack.write_bytes(spec, data),
+            VfsWritePayload::Owned(data) => self.state.writer_stack.write_owned_bytes(spec, data),
+        }
+        .map_err(|err| VfsError::Other(format!("writer stack write failed: {err}")))?;
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());

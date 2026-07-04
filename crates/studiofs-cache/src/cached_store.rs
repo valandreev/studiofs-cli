@@ -236,9 +236,68 @@ pub struct CachedStoreWriterSlice {
     /// Timestamp when this writer slice was created.
     created_at: Instant,
     /// Buffered write pages pending staging or flushing.
-    pages: VecDeque<BytesMut>,
+    pages: VecDeque<WriterPage>,
     /// Current number of bytes buffered as dirty in this writer.
     dirty_len: usize,
+}
+
+enum WriterPage {
+    Mutable(BytesMut),
+    Owned(Bytes),
+}
+
+impl WriterPage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Mutable(page) => page.len(),
+            Self::Owned(page) => page.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Mutable(page) => page.capacity(),
+            Self::Owned(page) => page.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mutable(page) => page.as_ref(),
+            Self::Owned(page) => page.as_ref(),
+        }
+    }
+
+    fn make_mut(&mut self, capacity: usize) -> &mut BytesMut {
+        if let Self::Owned(page) = self {
+            let mut mutable = BytesMut::with_capacity(capacity.max(page.len()));
+            mutable.extend_from_slice(page.as_ref());
+            *self = Self::Mutable(mutable);
+        }
+        match self {
+            Self::Mutable(page) => page,
+            Self::Owned(_) => unreachable!("owned page converted to mutable"),
+        }
+    }
+
+    fn split_to_bytes(&mut self, len: usize) -> Bytes {
+        match self {
+            Self::Mutable(page) => page.split_to(len).freeze(),
+            Self::Owned(page) => page.split_to(len),
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Mutable(page) => page.freeze(),
+            Self::Owned(page) => page,
+        }
+    }
 }
 
 impl CachedStoreConfig {
@@ -848,6 +907,12 @@ impl CachedStore {
         self.upload_queue.snapshot_pending()
     }
 
+    /// Returns a snapshot of pending uploads for `ino`.
+    pub fn snapshot_pending_uploads_for_ino(&self, ino: u64) -> Vec<PendingUpload> {
+        self.metrics.upload_queue.record_snapshot_pending();
+        self.upload_queue.snapshot_pending_for_ino(ino)
+    }
+
     /// Returns whether the upload queue has any pending uploads for `ino`.
     pub fn has_pending_uploads_for_ino(&self, ino: u64) -> bool {
         self.upload_queue.has_pending_for_ino(ino)
@@ -929,6 +994,39 @@ impl CachedStoreWriterSlice {
         offset: u64,
         data: &[u8],
     ) -> Result<WriterWriteResult, CachedStoreWriterError> {
+        self.write_at_inner(offset, data.len(), |writer, relative, old_len| {
+            if relative == old_len {
+                writer.append_to_dirty(data);
+            } else {
+                writer.ensure_len(relative + data.len());
+                writer.copy_into_dirty(relative, data);
+            }
+        })
+    }
+
+    /// Writes owned `data` at absolute `offset`, retaining append pages without copying.
+    pub fn write_owned_at(
+        &mut self,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<WriterWriteResult, CachedStoreWriterError> {
+        self.write_at_inner(offset, data.len(), |writer, relative, old_len| {
+            if relative >= old_len {
+                writer.ensure_len(relative);
+                writer.append_owned_to_dirty(data);
+            } else {
+                writer.ensure_len(relative + data.len());
+                writer.copy_into_dirty(relative, data.as_ref());
+            }
+        })
+    }
+
+    fn write_at_inner(
+        &mut self,
+        offset: u64,
+        data_len: usize,
+        write: impl FnOnce(&mut Self, usize, usize),
+    ) -> Result<WriterWriteResult, CachedStoreWriterError> {
         self.validate_geometry()?;
         if offset < self.active_start {
             return Err(CachedStoreWriterError::WriteBeforeFrozen {
@@ -941,17 +1039,12 @@ impl CachedStoreWriterSlice {
             .map_err(|_| CachedStoreWriterError::OffsetTooLarge)?;
         let old_len = self.dirty_bytes();
         let end = relative
-            .checked_add(data.len())
+            .checked_add(data_len)
             .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
         let absolute_end = end;
         let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
         self.validate_buffer_limit(target_capacity)?;
-        if relative == old_len {
-            self.append_to_dirty(data);
-        } else {
-            self.ensure_len(absolute_end);
-            self.copy_into_dirty(relative, data);
-        }
+        write(self, relative, old_len);
 
         let dirty_delta = end.saturating_sub(old_len);
         if dirty_delta > 0 {
@@ -967,7 +1060,7 @@ impl CachedStoreWriterSlice {
         }
 
         Ok(WriterWriteResult {
-            accepted_bytes: data.len(),
+            accepted_bytes: data_len,
             dirty_bytes,
             throttled,
         })
@@ -1194,7 +1287,7 @@ impl CachedStoreWriterSlice {
         let mut copied = 0usize;
         while copied < payload.len() {
             let take = (payload.len() - copied).min(self.config.page_size);
-            restored.push_back(BytesMut::from(&payload[copied..copied + take]));
+            restored.push_back(WriterPage::Owned(payload.slice(copied..copied + take)));
             copied += take;
         }
         restored.append(&mut self.pages);
@@ -1227,9 +1320,10 @@ impl CachedStoreWriterSlice {
                 .is_none_or(|page| page.len() >= self.config.page_size)
             {
                 let remaining = target_len - self.dirty_len;
-                self.pages.push_back(BytesMut::with_capacity(
-                    remaining.min(self.config.page_size),
-                ));
+                self.pages
+                    .push_back(WriterPage::Mutable(BytesMut::with_capacity(
+                        remaining.min(self.config.page_size),
+                    )));
             }
             // INVARIANT: the branch above creates a page whenever the deque is
             // empty or the previous tail cannot accept more bytes.
@@ -1237,7 +1331,11 @@ impl CachedStoreWriterSlice {
                 clippy::expect_used,
                 reason = "page deque is populated by the preceding branch"
             )]
-            let page = self.pages.back_mut().expect("page exists after push");
+            let page = self
+                .pages
+                .back_mut()
+                .expect("page exists after push")
+                .make_mut(self.config.page_size);
             let remaining = target_len - self.dirty_len;
             let append = remaining.min(self.config.page_size - page.len());
             page.resize(page.len() + append, 0);
@@ -1256,17 +1354,49 @@ impl CachedStoreWriterSlice {
                     .config
                     .page_size
                     .min(data.len().max(MIN_WRITER_PAGE_ALLOCATION));
-                self.pages.push_back(BytesMut::with_capacity(capacity));
+                self.pages
+                    .push_back(WriterPage::Mutable(BytesMut::with_capacity(capacity)));
             }
             #[expect(
                 clippy::expect_used,
                 reason = "page deque is populated by the preceding branch"
             )]
-            let page = self.pages.back_mut().expect("page exists after push");
+            let page = self
+                .pages
+                .back_mut()
+                .expect("page exists after push")
+                .make_mut(self.config.page_size);
             let take = data.len().min(self.config.page_size - page.len());
             page.extend_from_slice(&data[..take]);
             self.dirty_len += take;
             data = &data[take..];
+        }
+    }
+
+    fn append_owned_to_dirty(&mut self, mut data: Bytes) {
+        while !data.is_empty() {
+            match self.pages.back_mut() {
+                Some(page) if page.len() < self.config.page_size => {
+                    let page = page.make_mut(self.config.page_size);
+                    let take = data.len().min(self.config.page_size - page.len());
+                    let prefix = data.split_to(take);
+                    page.extend_from_slice(prefix.as_ref());
+                    self.dirty_len += take;
+                    continue;
+                }
+                _ => {}
+            }
+            if data.len() <= self.config.page_size {
+                self.dirty_len += data.len();
+                self.pages.push_back(WriterPage::Owned(data));
+                break;
+            }
+            // Keep page boundaries stable while Bytes::split_to shares the
+            // original allocation instead of copying the payload.
+            let take = data.len().min(self.config.page_size);
+            let page = data.split_to(take);
+            self.dirty_len += page.len();
+            self.pages.push_back(WriterPage::Owned(page));
         }
     }
 
@@ -1281,6 +1411,7 @@ impl CachedStoreWriterSlice {
                 continue;
             }
             let start = write_pos.saturating_sub(page_base);
+            let page = page.make_mut(self.config.page_size);
             let take = (page.len() - start).min(data.len() - copied);
             page[start..start + take].copy_from_slice(&data[copied..copied + take]);
             copied += take;
@@ -1305,7 +1436,7 @@ impl CachedStoreWriterSlice {
             }
             let start = read_pos.saturating_sub(page_base);
             let take = (page.len() - start).min(out.len() - copied);
-            out[copied..copied + take].copy_from_slice(&page[start..start + take]);
+            out[copied..copied + take].copy_from_slice(&page.as_slice()[start..start + take]);
             copied += take;
             read_pos += take;
             if copied == out.len() {
@@ -1321,7 +1452,7 @@ impl CachedStoreWriterSlice {
         let mut remaining = len;
         for page in &self.pages {
             let take = remaining.min(page.len());
-            payload.extend_from_slice(&page[..take]);
+            payload.extend_from_slice(&page.as_slice()[..take]);
             remaining -= take;
             if remaining == 0 {
                 break;
@@ -1338,13 +1469,13 @@ impl CachedStoreWriterSlice {
             };
             let front_len = front.len();
             if len < front_len {
-                let _ = front.split_to(len);
+                let _ = front.split_to_bytes(len);
                 break;
             }
             self.pages.pop_front();
             len -= front_len;
         }
-        while self.pages.front().is_some_and(BytesMut::is_empty) {
+        while self.pages.front().is_some_and(WriterPage::is_empty) {
             self.pages.pop_front();
         }
     }
@@ -1354,14 +1485,17 @@ impl CachedStoreWriterSlice {
         if len == 0 {
             return Bytes::new();
         }
-        let payload = match self.pages.front().map(BytesMut::len) {
+        let payload = match self.pages.front().map(WriterPage::len) {
             Some(front_len) if len == front_len => {
                 // INVARIANT: front_len came from the current front page.
                 #[expect(
                     clippy::expect_used,
                     reason = "front length was read from the current front page"
                 )]
-                self.pages.pop_front().expect("front page exists").freeze()
+                self.pages
+                    .pop_front()
+                    .expect("front page exists")
+                    .into_bytes()
             }
             Some(front_len) if len < front_len => {
                 // INVARIANT: front_len came from the current front page.
@@ -1372,8 +1506,7 @@ impl CachedStoreWriterSlice {
                 self.pages
                     .front_mut()
                     .expect("front page exists")
-                    .split_to(len)
-                    .freeze()
+                    .split_to_bytes(len)
             }
             _ => {
                 let payload = self.copy_prefix_to_bytes(len);
@@ -1381,7 +1514,7 @@ impl CachedStoreWriterSlice {
                 payload
             }
         };
-        while self.pages.front().is_some_and(BytesMut::is_empty) {
+        while self.pages.front().is_some_and(WriterPage::is_empty) {
             self.pages.pop_front();
         }
         self.dirty_len = self.dirty_len.saturating_sub(len);
@@ -1643,6 +1776,42 @@ mod tests {
     }
 
     #[test]
+    fn writer_slice_owned_append_detaches_without_copying_single_page() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+        let payload = Bytes::from(Vec::from(&b"page"[..]));
+        let payload_ptr = payload.as_ptr();
+
+        writer
+            .write_owned_at(0, payload)
+            .expect("write owned payload");
+        let detached = writer.detach_finish().expect("detach payload");
+
+        assert_eq!(detached[0].payload.as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn writer_slice_consecutive_owned_appends_merge_tail_page() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer
+            .write_owned_at(0, Bytes::from(Vec::from(&b"ab"[..])))
+            .expect("first owned append");
+        writer
+            .write_owned_at(2, Bytes::from(Vec::from(&b"cd"[..])))
+            .expect("second owned append");
+
+        assert_eq!(writer.pages.len(), 1);
+        assert!(matches!(writer.pages.front(), Some(WriterPage::Mutable(_))));
+        let mut out = [0; 4];
+        assert_eq!(writer.read_accepted(0, &mut out), 4);
+        assert_eq!(&out, b"abcd");
+    }
+
+    #[test]
     fn writer_slice_zero_fills_sparse_gap_before_offset() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
@@ -1654,6 +1823,28 @@ mod tests {
         assert_eq!(writer.read_accepted(0, &mut out), 8);
         assert_eq!(&out[..4], &[0, 0, 0, 0]);
         assert_eq!(&out[4..], b"tail");
+    }
+
+    #[test]
+    fn writer_slice_owned_sparse_append_keeps_payload_page() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+        let payload = Bytes::from(Vec::from(&b"tail"[..]));
+        let payload_ptr = payload.as_ptr();
+
+        writer
+            .write_owned_at(8, payload)
+            .expect("owned sparse write");
+
+        let mut out = [0xff; 12];
+        assert_eq!(writer.read_accepted(0, &mut out), 12);
+        assert_eq!(&out[..8], &[0; 8]);
+        assert_eq!(&out[8..], b"tail");
+        let Some(WriterPage::Owned(page)) = writer.pages.back() else {
+            panic!("sparse owned append should keep an owned tail page");
+        };
+        assert_eq!(page.as_ptr(), payload_ptr);
     }
 
     #[tokio::test]
