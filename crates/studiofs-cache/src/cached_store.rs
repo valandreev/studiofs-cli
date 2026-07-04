@@ -1011,7 +1011,8 @@ impl CachedStoreWriterSlice {
         data: Bytes,
     ) -> Result<WriterWriteResult, CachedStoreWriterError> {
         self.write_at_inner(offset, data.len(), |writer, relative, old_len| {
-            if relative == old_len {
+            if relative >= old_len {
+                writer.ensure_len(relative);
                 writer.append_owned_to_dirty(data);
             } else {
                 writer.ensure_len(relative + data.len());
@@ -1388,6 +1389,8 @@ impl CachedStoreWriterSlice {
                 self.pages.push_back(WriterPage::Owned(data));
                 break;
             }
+            // Keep page boundaries stable while Bytes::split_to shares the
+            // original allocation instead of copying the payload.
             let take = data.len().min(self.config.page_size);
             let page = data.split_to(take);
             self.dirty_len += page.len();
@@ -1798,6 +1801,28 @@ mod tests {
         assert_eq!(writer.read_accepted(0, &mut out), 8);
         assert_eq!(&out[..4], &[0, 0, 0, 0]);
         assert_eq!(&out[4..], b"tail");
+    }
+
+    #[test]
+    fn writer_slice_owned_sparse_append_keeps_payload_page() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+        let payload = Bytes::from(Vec::from(&b"tail"[..]));
+        let payload_ptr = payload.as_ptr();
+
+        writer
+            .write_owned_at(8, payload)
+            .expect("owned sparse write");
+
+        let mut out = [0xff; 12];
+        assert_eq!(writer.read_accepted(0, &mut out), 12);
+        assert_eq!(&out[..8], &[0; 8]);
+        assert_eq!(&out[8..], b"tail");
+        let Some(WriterPage::Owned(page)) = writer.pages.back() else {
+            panic!("sparse owned append should keep an owned tail page");
+        };
+        assert_eq!(page.as_ptr(), payload_ptr);
     }
 
     #[tokio::test]

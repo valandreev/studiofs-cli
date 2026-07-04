@@ -1039,6 +1039,7 @@ fn serve_minimal_session(
         ids,
         next_open_dir_fh: Arc::new(AtomicU64::new(1)),
         open_dir_handles: Arc::new(DashMap::new()),
+        write_sync_policies: Arc::new(DashMap::new()),
     };
     let session_result = loop {
         let len = match read_next_fuse_request(fd, buf.as_mut_slice(), shutdown) {
@@ -1355,7 +1356,7 @@ fn dispatch_write_async(job: RawRequestJob, runtime_handle: Handle) {
             let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
             let data = payload.slice(size_of::<WriteIn>()..);
             let write_len = (input.size as usize).min(data.len());
-            let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
+            let local_sync_policy = linux_write_sync_policy(&context, vfs, input.fh);
             let result = if linux_should_use_owned_write(&context, write_len) {
                 vfs.write_fh_owned_with_deferred_materialize(
                     input.fh,
@@ -1505,13 +1506,18 @@ fn raw_open(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(header.nodeid, open_flags, trunc) {
-        Ok(fh) => reply_open(
-            fd,
-            header.unique,
-            fh,
-            linux_open_flags_for_posix(flags, trunc),
-            Some(accounting),
-        ),
+        Ok(fh) => {
+            context
+                .write_sync_policies
+                .insert(fh, linux_write_sync_policy_for_open_flags(open_flags));
+            reply_open(
+                fd,
+                header.unique,
+                fh,
+                linux_open_flags_for_posix(flags, trunc),
+                Some(accounting),
+            )
+        }
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1548,15 +1554,20 @@ fn raw_create(
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     match vfs.open_file(attr.ino, open_flags, trunc) {
-        Ok(fh) => reply_create(
-            fd,
-            header.unique,
-            &attr,
-            fh,
-            linux_open_flags_for_posix(flags, trunc),
-            context,
-            Some(accounting),
-        ),
+        Ok(fh) => {
+            context
+                .write_sync_policies
+                .insert(fh, linux_write_sync_policy_for_open_flags(open_flags));
+            reply_create(
+                fd,
+                header.unique,
+                &attr,
+                fh,
+                linux_open_flags_for_posix(flags, trunc),
+                context,
+                Some(accounting),
+            )
+        }
         Err(err) => reply_error(fd, header.unique, vfs_err_to_errno(&err), Some(accounting)),
     }
 }
@@ -1809,7 +1820,7 @@ fn raw_write(
     let input = read_struct::<WriteIn>(&payload[..size_of::<WriteIn>()])?;
     let data = &payload[size_of::<WriteIn>()..];
     let write_len = (input.size as usize).min(data.len());
-    let local_sync_policy = linux_write_sync_policy(vfs, input.fh);
+    let local_sync_policy = linux_write_sync_policy(context, vfs, input.fh);
     match rt.block_on(vfs.write_fh_with_deferred_materialize(
         input.fh,
         header.nodeid,
@@ -1893,6 +1904,7 @@ fn raw_release(
         return reply_error(fd, header.unique, libc::EINVAL, Some(accounting));
     }
     let input = read_struct::<ReleaseIn>(&payload[..size_of::<ReleaseIn>()])?;
+    context.write_sync_policies.remove(&input.fh);
     // The deferred helper owns final-handle errors by logging them out of band;
     // raw FUSE release must not park the dispatch loop on the local barrier.
     vfs.release_fh_with_deferred_last_handle_barrier(input.fh, rt);
@@ -2242,6 +2254,7 @@ struct RawRequestContext {
     ids: SessionIds,
     next_open_dir_fh: Arc<AtomicU64>,
     open_dir_handles: Arc<DashMap<u64, RawOpenDirState>>,
+    write_sync_policies: Arc<DashMap<u64, LocalSyncPolicy>>,
 }
 
 #[derive(Clone)]
@@ -2317,7 +2330,22 @@ fn linux_attr_blksize(attr: &InodeAttr) -> u32 {
     }
 }
 
-fn linux_write_sync_policy(vfs: &StudioVfs, fh: u64) -> LocalSyncPolicy {
+fn linux_write_sync_policy_for_open_flags(flags: OpenFlags) -> LocalSyncPolicy {
+    if flags.contains(OpenFlags::SYNC) {
+        LocalSyncPolicy::WriteThrough
+    } else {
+        LocalSyncPolicy::Opportunistic
+    }
+}
+
+fn linux_write_sync_policy(
+    context: &RawRequestContext,
+    vfs: &StudioVfs,
+    fh: u64,
+) -> LocalSyncPolicy {
+    if let Some(policy) = context.write_sync_policies.get(&fh) {
+        return *policy;
+    }
     if vfs
         .get_open_file(fh)
         .is_some_and(|open_file| open_file.flags.contains(OpenFlags::SYNC))
@@ -3675,6 +3703,7 @@ mod tests {
             },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
         };
         let current = InodeAttr::new_dir(7, FUSE_ROOT_ID, 1000, 1000, 0o755);
         let parent = InodeAttr::new_dir(FUSE_ROOT_ID, 0, 1000, 1000, 0o755);
@@ -3709,10 +3738,29 @@ mod tests {
     }
 
     #[test]
+    fn raw_read_only_truncate_open_does_not_keep_kernel_page_cache() {
+        let open_flags = linux_open_flags_for_posix(libc::O_RDONLY | libc::O_TRUNC, true);
+
+        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+    }
+
+    #[test]
     fn raw_write_capable_open_does_not_keep_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDWR, false);
 
         assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+    }
+
+    #[test]
+    fn raw_sync_open_flags_use_write_through_policy() {
+        assert_eq!(
+            linux_write_sync_policy_for_open_flags(OpenFlags::SYNC),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            linux_write_sync_policy_for_open_flags(OpenFlags::empty()),
+            LocalSyncPolicy::Opportunistic
+        );
     }
 
     #[test]
@@ -3727,6 +3775,7 @@ mod tests {
             },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
         };
         let attr = InodeAttr::new_file(9, FUSE_ROOT_ID, 1000, 1000, 0o644);
 
@@ -3744,6 +3793,7 @@ mod tests {
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
+            write_sync_policies: Arc::new(DashMap::new()),
         };
 
         assert!(matches!(

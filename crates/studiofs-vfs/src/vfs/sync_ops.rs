@@ -1451,6 +1451,8 @@ impl StudioVfs {
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
             self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
             if local_sync_policy.requires_write_path_durability() {
+                // Slow-path durability backpressure may copy owned payloads;
+                // keeping memory bounded wins over preserving zero-copy here.
                 return self
                     .write_fh_with_local_sync_policy(
                         fh,
@@ -1489,6 +1491,8 @@ impl StudioVfs {
             if local_sync_policy.requires_write_path_durability() {
                 drop(session);
                 self.state.file_session.gc_if_idle(ino);
+                // Slow-path durability backpressure may copy owned payloads;
+                // keeping memory bounded wins over preserving zero-copy here.
                 return self
                     .write_fh_with_local_sync_policy(
                         fh,
