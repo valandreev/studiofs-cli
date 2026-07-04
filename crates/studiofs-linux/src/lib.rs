@@ -23,10 +23,15 @@ const FUSE_MOUNT_TYPE: &str = "fuse";
 const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
+const FUSE_INIT_IN_BASE_SIZE: usize = 16;
+const FUSE_INIT_IN_FLAGS2_OFFSET: usize = FUSE_INIT_IN_BASE_SIZE;
+const FUSE_INIT_IN_FLAGS2_SIZE: usize = FUSE_INIT_IN_FLAGS2_OFFSET + 4;
 const FUSE_INIT_OUT_SIZE: usize = 64;
 const FUSE_INIT_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE;
+const FUSE_FORGET: u32 = 2;
 const FUSE_INIT: u32 = 26;
 const FUSE_DESTROY: u32 = 38;
+const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 const FUSE_ASYNC_READ: u32 = 1 << 0;
@@ -268,8 +273,15 @@ fn run_single_fd_shell(mut device: File, buffer: &mut [u8]) -> io::Result<()> {
         if header.opcode == FUSE_DESTROY {
             return Ok(());
         }
+        if !fuse_opcode_expects_reply(header.opcode) {
+            continue;
+        }
         write_error_reply(&mut device, header.unique, libc::ENOSYS)?;
     }
+}
+
+fn fuse_opcode_expects_reply(opcode: u32) -> bool {
+    !matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET)
 }
 
 fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
@@ -282,6 +294,7 @@ fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> 
                 ));
             }
             Ok(len) => return Ok(len),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 poll_fd(device.as_raw_fd(), libc::POLLIN)?;
             }
@@ -294,6 +307,7 @@ fn write_all_fuse(device: &mut File, bytes: &[u8]) -> io::Result<()> {
     loop {
         match device.write(bytes) {
             Ok(written) => return check_fuse_write_len(written, bytes.len()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 poll_fd(device.as_raw_fd(), libc::POLLOUT)?;
             }
@@ -307,28 +321,37 @@ fn check_fuse_write_len(written: usize, expected: usize) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::new(
-            io::ErrorKind::WriteZero,
+            io::ErrorKind::InvalidData,
             format!("short FUSE reply write: wrote {written} of {expected} bytes"),
         ))
     }
 }
 
 fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events,
-        revents: 0,
-    };
-    let timeout_ms = poll_timeout_ms(events);
-    // SAFETY: `pollfd` points to one initialized poll descriptor.
-    let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-    match rc {
-        0 => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out waiting for FUSE device readiness",
-        )),
-        n if n > 0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let timeout_ms = poll_timeout_ms(events);
+        // SAFETY: `pollfd` points to one initialized poll descriptor.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        match rc {
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for FUSE device readiness",
+                ));
+            }
+            n if n > 0 => return Ok(()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -473,6 +496,12 @@ fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
         ));
     }
     let len = read_u32(bytes, 0);
+    if len < FUSE_IN_HEADER_SIZE as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE request length shorter than header",
+        ));
+    }
     if usize::try_from(len).map_or(true, |len| len > bytes.len()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -486,7 +515,7 @@ fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
 }
 
 fn parse_init_in(bytes: &[u8]) -> io::Result<FuseInitIn> {
-    if bytes.len() < 16 {
+    if bytes.len() < FUSE_INIT_IN_BASE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "short FUSE_INIT request",
@@ -497,8 +526,8 @@ fn parse_init_in(bytes: &[u8]) -> io::Result<FuseInitIn> {
         minor: read_u32(bytes, 4),
         max_readahead: read_u32(bytes, 8),
         flags: read_u32(bytes, 12),
-        flags2: if bytes.len() >= 20 {
-            read_u32(bytes, 16)
+        flags2: if bytes.len() >= FUSE_INIT_IN_FLAGS2_SIZE {
+            read_u32(bytes, FUSE_INIT_IN_FLAGS2_OFFSET)
         } else {
             0
         },
@@ -559,6 +588,8 @@ fn mountinfo_bdi_path(mount_point: &Path) -> io::Result<Option<PathBuf>> {
 }
 
 fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBuf> {
+    let mount_point =
+        std::fs::canonicalize(mount_point).unwrap_or_else(|_| mount_point.to_path_buf());
     let target = mount_point.to_string_lossy();
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
@@ -684,6 +715,22 @@ mod tests {
     }
 
     #[test]
+    fn mountinfo_bdi_path_from_canonicalizes_relative_mount_point() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let mountinfo = format!(
+            "126 32 0:114 / {} rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n",
+            cwd.display()
+        );
+
+        assert_eq!(
+            mountinfo_bdi_path_from(&mountinfo, std::path::Path::new(".")),
+            Some(std::path::PathBuf::from(
+                "/sys/class/bdi/0:114/read_ahead_kb"
+            ))
+        );
+    }
+
+    #[test]
     fn pollin_waits_without_idle_timeout() {
         assert_eq!(poll_timeout_ms(libc::POLLIN), -1);
     }
@@ -694,10 +741,27 @@ mod tests {
     }
 
     #[test]
+    fn forget_opcodes_do_not_expect_replies() {
+        assert!(!fuse_opcode_expects_reply(FUSE_FORGET));
+        assert!(!fuse_opcode_expects_reply(FUSE_BATCH_FORGET));
+        assert!(fuse_opcode_expects_reply(FUSE_INIT));
+    }
+
+    #[test]
+    fn parse_in_header_rejects_len_shorter_than_header() {
+        let mut bytes = [0_u8; FUSE_IN_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&(FUSE_IN_HEADER_SIZE as u32 - 1).to_ne_bytes());
+
+        let error = parse_in_header(&bytes).expect_err("short header len");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn fuse_reply_write_rejects_partial_syscall() {
         let error = check_fuse_write_len(8, FUSE_OUT_HEADER_SIZE).expect_err("partial write");
 
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
