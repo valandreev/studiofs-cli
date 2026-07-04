@@ -161,19 +161,7 @@ fn open_fuse_device() -> io::Result<File> {
 }
 
 fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
-    let mode = std::fs::metadata(mount_point)
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "read mount point {} metadata failed: {error}",
-                    mount_point.display()
-                ),
-            )
-        })?
-        .permissions()
-        .mode()
-        & 0o7777;
+    let mode = fuse_rootmode(mount_point)?;
     let options = format!(
         "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions,fsname=studiofs,subtype=studiofs",
         current_uid(),
@@ -214,6 +202,23 @@ fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
             mount_point.display()
         ),
     ))
+}
+
+fn fuse_rootmode(mount_point: &Path) -> io::Result<u32> {
+    let permissions = std::fs::metadata(mount_point)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "read mount point {} metadata failed: {error}",
+                    mount_point.display()
+                ),
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o7777;
+    Ok(libc::S_IFDIR | permissions)
 }
 
 fn current_uid() -> libc::uid_t {
@@ -652,12 +657,41 @@ fn unescape_mountinfo_field(value: &str) -> Cow<'_, str> {
     if !value.contains('\\') {
         return Cow::Borrowed(value);
     }
+    let bytes = value.as_bytes();
+    let mut unescaped = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            match &bytes[index + 1..index + 4] {
+                b"040" => {
+                    unescaped.push(b' ');
+                    index += 4;
+                    continue;
+                }
+                b"011" => {
+                    unescaped.push(b'\t');
+                    index += 4;
+                    continue;
+                }
+                b"012" => {
+                    unescaped.push(b'\n');
+                    index += 4;
+                    continue;
+                }
+                b"134" => {
+                    unescaped.push(b'\\');
+                    index += 4;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        unescaped.push(bytes[index]);
+        index += 1;
+    }
     Cow::Owned(
-        value
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\"),
+        String::from_utf8(unescaped)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
     )
 }
 
@@ -753,6 +787,18 @@ mod tests {
     }
 
     #[test]
+    fn fuse_rootmode_includes_directory_type_bits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("set mode");
+
+        let mode = fuse_rootmode(tmp.path()).expect("rootmode");
+
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(mode & 0o7777, 0o750);
+    }
+
+    #[test]
     fn mountinfo_lookup_mount_point_canonicalizes_relative_mount_point() {
         let cwd = std::env::current_dir().expect("current dir");
         assert_eq!(mountinfo_lookup_mount_point(std::path::Path::new(".")), cwd);
@@ -797,6 +843,11 @@ mod tests {
             Cow::Borrowed("/mnt/studiofs")
         ));
         assert_eq!(unescape_mountinfo_field("/mnt/a\\040b"), "/mnt/a b");
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_decodes_each_escape_once() {
+        assert_eq!(unescape_mountinfo_field("/mnt/a\\134040b"), "/mnt/a\\040b");
     }
 
     #[test]
