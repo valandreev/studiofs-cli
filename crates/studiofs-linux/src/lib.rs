@@ -23,6 +23,7 @@ use studiofs_vfs::StudioVfs;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 const FUSE_DEVICE: &str = "/dev/fuse";
+const FUSE_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NONBLOCK;
 const FUSE_MOUNT_TYPE: &str = "fuse";
 const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
@@ -233,7 +234,7 @@ fn open_fuse_device() -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(FUSE_OPEN_FLAGS)
         .open(FUSE_DEVICE)
         .map_err(|error| {
             io::Error::new(
@@ -1364,6 +1365,11 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.work_queue_depth, 0);
         assert_eq!(snapshot.reply_queue_depth, 0);
+    }
+
+    #[test]
+    fn fuse_device_open_flags_include_nonblocking() {
+        assert_ne!(FUSE_OPEN_FLAGS & libc::O_NONBLOCK, 0);
     }
 
     #[test]
