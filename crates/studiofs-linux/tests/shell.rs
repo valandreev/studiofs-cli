@@ -57,7 +57,10 @@ fn make_vfs(tmp: &tempfile::TempDir) -> (Runtime, Arc<StudioVfs>) {
 fn shell_answers_root_lifecycle_callbacks() {
     let tmp = studiofs_test_support::workspace_target_tempdir("linux-shell-");
     let (runtime, vfs) = make_vfs(&tmp);
-    let mut shell = LinuxMountShell::new(LinuxMountRequest { vfs: vfs.clone() });
+    let mut shell = LinuxMountShell::new(LinuxMountRequest {
+        vfs: vfs.clone(),
+        mount_point: tmp.path().join("mnt"),
+    });
 
     shell.init().expect("init");
     let root = shell.getattr(ROOT_INO).expect("root getattr");

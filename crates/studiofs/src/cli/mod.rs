@@ -55,7 +55,7 @@ disk) and a distributed metadata backend for multi-client mounts.
 
 Supported platforms:
   • Windows  (via WinFSP)
-  • Linux    (mount bridge not implemented)
+  • Linux    (raw /dev/fuse startup bridge)
   • macOS    (via macFUSE)
 
 Supported S3 backends:

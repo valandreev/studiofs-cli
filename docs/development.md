@@ -6,7 +6,7 @@
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
 - Cache: RAM + disk + runtime upload queue
-- Bridges: WinFSP (Windows), macFUSE (macOS). Linux mount is intentionally not implemented after the SFS-600 raw FUSE removal.
+- Bridges: WinFSP (Windows), macFUSE (macOS), and Linux raw FUSE.
 
 ## Project Structure
 
@@ -85,18 +85,15 @@ not currently provide, and those workflows are also manual-only.
 | Job | Runner | Purpose |
 |-----|--------|---------|
 | **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
-| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests and local-first VFS fast checks; no mounted Linux backend |
-| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; no mounted Linux backend |
+| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests and local-first VFS fast checks |
+| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
 macOS and Windows jobs include named steps for backend-specific crates so
 regressions in `studiofs-macfuse` or `studiofs-winfsp` are immediately
 attributable in the CI job log rather than buried inside the broad workspace
-run. Linux has no mounted backend until the next bridge is built.
-
-Linux `studiofs mount` fails with a clear "not implemented" error. There is no
-legacy raw FUSE fallback.
+run. Linux bridge details live in [Platform Bridges](platform-bridges.md#linux-mount).
 
 The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
 RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows
@@ -129,9 +126,7 @@ Downloaded logs belong under `.rwx/downloads/`; that directory has its own
 the matching RWX CLI release binary from the official RWX GitHub release before
 running `rwx logs`.
 
-The hosted Linux real mounted E2E targets currently exit early because SFS-600
-removed the legacy raw FUSE bridge. Re-enable them only when a new Linux bridge
-exists.
+Linux mounted E2E runner requirements live in [Platform Bridges](platform-bridges.md#linux-mount).
 
 ## Tests
 
