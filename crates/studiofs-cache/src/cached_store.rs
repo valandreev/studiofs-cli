@@ -1375,14 +1375,16 @@ impl CachedStoreWriterSlice {
 
     fn append_owned_to_dirty(&mut self, mut data: Bytes) {
         while !data.is_empty() {
-            if let Some(WriterPage::Mutable(page)) = self.pages.back_mut()
-                && page.len() < self.config.page_size
-            {
-                let take = data.len().min(self.config.page_size - page.len());
-                let prefix = data.split_to(take);
-                page.extend_from_slice(prefix.as_ref());
-                self.dirty_len += take;
-                continue;
+            match self.pages.back_mut() {
+                Some(page) if page.len() < self.config.page_size => {
+                    let page = page.make_mut(self.config.page_size);
+                    let take = data.len().min(self.config.page_size - page.len());
+                    let prefix = data.split_to(take);
+                    page.extend_from_slice(prefix.as_ref());
+                    self.dirty_len += take;
+                    continue;
+                }
+                _ => {}
             }
             if data.len() <= self.config.page_size {
                 self.dirty_len += data.len();
@@ -1787,6 +1789,26 @@ mod tests {
         let detached = writer.detach_finish().expect("detach payload");
 
         assert_eq!(detached[0].payload.as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn writer_slice_consecutive_owned_appends_merge_tail_page() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer
+            .write_owned_at(0, Bytes::from(Vec::from(&b"ab"[..])))
+            .expect("first owned append");
+        writer
+            .write_owned_at(2, Bytes::from(Vec::from(&b"cd"[..])))
+            .expect("second owned append");
+
+        assert_eq!(writer.pages.len(), 1);
+        assert!(matches!(writer.pages.front(), Some(WriterPage::Mutable(_))));
+        let mut out = [0; 4];
+        assert_eq!(writer.read_accepted(0, &mut out), 4);
+        assert_eq!(&out, b"abcd");
     }
 
     #[test]

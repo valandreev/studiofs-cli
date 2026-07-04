@@ -1197,14 +1197,16 @@ impl RecyclableRequestPayload {
         request_len: usize,
         recycler: SyncSender<Vec<u8>>,
     ) -> io::Result<Self> {
-        let (buffer, spillover) = buffer.into_parts();
         let payload_start = size_of::<InHeader>();
-        if request_len < payload_start || request_len > buffer.len() {
+        if request_len < payload_start || request_len > buffer.as_slice().len() {
+            let (buffer, _spillover) = buffer.into_parts();
+            let _ = recycler.try_send(buffer);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid raw FUSE request length",
             ));
         }
+        let (buffer, spillover) = buffer.into_parts();
         Ok(Self {
             buffer: Some(buffer),
             _spillover: spillover,
@@ -3865,6 +3867,25 @@ mod tests {
         drop(view);
         let recycled = receiver.try_recv().expect("request buffer recycled");
         assert_eq!(&recycled[size_of::<InHeader>()..], b"data");
+    }
+
+    #[test]
+    fn raw_owned_request_payload_recycles_buffer_when_length_is_invalid() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let buffer = vec![0; size_of::<InHeader>() + 4];
+
+        let err = owned_request_payload(
+            RawRequestBuffer::pooled(buffer),
+            size_of::<InHeader>() - 1,
+            sender,
+        )
+        .expect_err("invalid payload length");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            receiver.try_recv().expect("request buffer recycled").len(),
+            size_of::<InHeader>() + 4
+        );
     }
 
     #[test]
