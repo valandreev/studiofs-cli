@@ -454,6 +454,7 @@ impl<'a> DataReader<'a> {
                         pending_content_epoch,
                         pending_upload_index.as_ref(),
                         resolved,
+                        planner.requested,
                     )
                 } else {
                     vfs.pending_overlay_block_source(
@@ -478,6 +479,7 @@ impl<'a> DataReader<'a> {
                             pending_content_epoch,
                             pending_upload_index.as_ref(),
                             resolved,
+                            planner.requested,
                         )
                     } else {
                         vfs.pending_overlay_block_source(
@@ -553,6 +555,7 @@ impl<'a> DataReader<'a> {
         pending_content_epoch: Option<u64>,
         pending_upload_index: Option<&crate::vfs::overlay::PendingUploadCatalog>,
         resolved: &[ResolvedSliceSpan],
+        requested: ReadRange,
     ) -> Option<PendingOverlayBlockSource> {
         let extent = vfs.pending_live_extent_record(
             ino,
@@ -565,6 +568,7 @@ impl<'a> DataReader<'a> {
             block_index,
             extent.object_id,
             resolved,
+            requested,
         ) {
             Some(PendingOverlayBlockSource::Extent(extent.object_id))
         } else {
@@ -577,25 +581,36 @@ impl<'a> DataReader<'a> {
         block_index: u32,
         object_id: u64,
         resolved: &[ResolvedSliceSpan],
+        requested: ReadRange,
     ) -> bool {
         let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
         let block_end = block_start.saturating_add(u64::from(block_size));
         let Some(block_range) = ReadRange::new(block_start, block_end) else {
             return false;
         };
-        let mut matched = false;
+        let Some(target) = block_range.intersection(requested) else {
+            return false;
+        };
+        let mut cursor = target.start();
         for span in resolved {
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let Some(span_range) = ReadRange::new(
-                chunk_base.saturating_add(u64::from(span.range.start)),
-                chunk_base.saturating_add(u64::from(span.range.end)),
-            ) else {
+            let span_start = chunk_base.saturating_add(u64::from(span.range.start));
+            if span_start >= target.end() {
+                break;
+            }
+            let span_end = chunk_base.saturating_add(u64::from(span.range.end));
+            if span_end <= target.start() {
+                continue;
+            }
+            let Some(span_range) = ReadRange::new(span_start, span_end) else {
                 continue;
             };
-            let Some(overlap) = span_range.intersection(block_range) else {
+            let Some(overlap) = span_range.intersection(target) else {
                 continue;
             };
-            matched = true;
+            if overlap.start() != cursor {
+                return false;
+            }
             if !matches!(
                 span.source,
                 ResolvedSliceSource::Overlay | ResolvedSliceSource::Base
@@ -606,18 +621,16 @@ impl<'a> DataReader<'a> {
                 return false;
             };
             let span_delta = overlap.start().saturating_sub(span_range.start());
-            let Ok(span_delta) = u32::try_from(span_delta) else {
-                return false;
-            };
-            let Some(payload_offset) = payload.offset.checked_add(span_delta) else {
+            let Some(payload_offset) = u64::from(payload.offset).checked_add(span_delta) else {
                 return false;
             };
             let expected_offset = overlap.start().saturating_sub(block_start);
-            if payload.object_id != object_id || u64::from(payload_offset) != expected_offset {
+            if payload.object_id != object_id || payload_offset != expected_offset {
                 return false;
             }
+            cursor = overlap.end();
         }
-        matched
+        cursor == target.end()
     }
 
     #[cfg(test)]
@@ -1916,7 +1929,8 @@ mod tests {
     };
     use studiofs_meta::schema::{
         CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, MetadataConfig,
-        PayloadRefState, ROOT_INO, ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord,
+        PayloadRefState, ROOT_INO, ResolvedSliceSource, ResolvedSliceSpan, SliceId, SliceOrder,
+        SliceRange, SliceRecord,
     };
     use studiofs_meta::types::BlockFlags as MetaBlockFlags;
     use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
@@ -3700,6 +3714,68 @@ mod tests {
                         if object_id == pending_object_id
                 )),
                 "prepared pending reads should keep the pending extent classification from their resolved slice snapshot: {segments:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_pending_extent_read_requires_full_requested_coverage() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "pending-extent-prepared-partial");
+        rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"pending-extent-prepared-partial.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            let object_id = 0xCC33;
+
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed pending payload object");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Updating;
+            staged_attr.committed_content_epoch = 1;
+            staged_attr.content_epoch = 2;
+            meta.set_attr(&staged_attr).expect("persist staged attr");
+            vfs.state.incarnation.live_extent_records.lock().insert(
+                (ino, 0),
+                crate::vfs::overlay::ExtentRecordId {
+                    object_id,
+                    content_epoch: staged_attr.content_epoch,
+                },
+            );
+
+            let resolved_slices = vec![ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(0, 4).expect("slice range"),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: None,
+                slice_order: None,
+                payload: Some(PayloadRef::new_partial(object_id, 4)),
+            }];
+
+            let segments = DataReader::new(
+                &vfs,
+                ino,
+                0,
+                8,
+                Some(staged_attr.content_epoch),
+                Some(resolved_slices.as_slice()),
+            )
+            .build_segments()
+            .await
+            .expect("resolve data reader segments");
+
+            assert!(
+                !segments.iter().any(|segment| matches!(
+                    segment.source,
+                    ReadSegmentSource::PendingExtent { object_id: pending, .. }
+                        if pending == object_id
+                )),
+                "partial prepared coverage must not promote the whole block to a pending extent: {segments:?}"
             );
         });
     }
