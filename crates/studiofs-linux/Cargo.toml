@@ -1,0 +1,23 @@
+[package]
+name = "studiofs-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+studiofs-bridge.workspace = true
+studiofs-vfs.workspace = true
+studiofs-meta.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+studiofs-data.workspace = true
+studiofs-test-support.workspace = true
+studiofs-meta.workspace = true
+tempfile.workspace = true

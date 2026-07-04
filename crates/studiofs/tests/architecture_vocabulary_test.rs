@@ -29,7 +29,7 @@ fn workspace_path_exists<P: AsRef<Path>>(path: P) -> bool {
     repo_root().join(path).exists()
 }
 
-fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
+fn workspace_member_paths(root_manifest: &str) -> Vec<String> {
     let manifest =
         toml::from_str::<toml::Table>(root_manifest).expect("root Cargo.toml should be valid TOML");
     let members = manifest
@@ -41,11 +41,18 @@ fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
     members
         .iter()
         .map(|member| {
-            let member = member
+            member
                 .as_str()
-                .expect("workspace member entries should be strings");
-            format!("{member}/Cargo.toml")
+                .expect("workspace member entries should be strings")
+                .to_string()
         })
+        .collect()
+}
+
+fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
+    workspace_member_paths(root_manifest)
+        .into_iter()
+        .map(|member| format!("{member}/Cargo.toml"))
         .collect()
 }
 
@@ -1807,17 +1814,8 @@ fn access_tracking_surface_drops_classifier_wording() {
 
 #[test]
 fn active_code_drops_flat_block_contract_vocabulary() {
-    let files = [
-        "crates/studiofs-cache/src",
-        "crates/studiofs-data/src",
-        "crates/studiofs-meta/src",
-        "crates/studiofs-vfs/src",
-        "crates/studiofs-vfs/tests",
-        "crates/studiofs/src",
-        "crates/studiofs/tests",
-        "crates/studiofs-winfsp/src",
-        "crates/studiofs-fuse/src",
-    ];
+    let root_manifest = read_workspace_file("Cargo.toml");
+    let files = workspace_member_paths(&root_manifest);
     let forbidden_terms = [
         "block_projection",
         "block projection",

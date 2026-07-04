@@ -6,6 +6,7 @@ members = [
     "crates/studiofs-cache",
     "crates/studiofs-vfs",
     "crates/studiofs-bridge",
+    "crates/studiofs-linux",
     "crates/studiofs-macfuse",
     "crates/studiofs-winfsp",
     "crates/studiofs-e2e",
@@ -95,6 +96,7 @@ studiofs-data = { path = "crates/studiofs-data" }
 studiofs-cache = { path = "crates/studiofs-cache" }
 studiofs-vfs = { path = "crates/studiofs-vfs" }
 studiofs-bridge = { path = "crates/studiofs-bridge" }
+studiofs-linux = { path = "crates/studiofs-linux" }
 studiofs-macfuse = { path = "crates/studiofs-macfuse" }
 studiofs-winfsp = { path = "crates/studiofs-winfsp" }
 studiofs-e2e = { path = "crates/studiofs-e2e" }
