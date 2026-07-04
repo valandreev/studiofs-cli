@@ -6,7 +6,6 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -23,6 +22,9 @@ const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_MOUNT_TYPE: &str = "fuse";
 const FUSE_SOURCE: &str = "studiofs";
 const FUSE_IN_HEADER_SIZE: usize = 40;
+const FUSE_OUT_HEADER_SIZE: usize = 16;
+const FUSE_INIT_OUT_SIZE: usize = 64;
+const FUSE_INIT_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE;
 const FUSE_INIT: u32 = 26;
 const FUSE_DESTROY: u32 = 38;
 const FUSE_KERNEL_VERSION: u32 = 7;
@@ -68,9 +70,10 @@ pub struct LinuxDirEntry {
 pub fn mount_with_request(request: LinuxMountRequest) -> io::Result<()> {
     let mut device = open_fuse_device()?;
     mount_fuse_device(&request.mount_point, device.as_raw_fd())?;
-    let negotiated = read_and_reply_init(&mut device)?;
+    let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
+    let negotiated = read_and_reply_init(&mut device, &mut buffer)?;
     apply_read_ahead_kb_best_effort(&request.mount_point, negotiated.out.max_readahead / 1024);
-    run_single_fd_shell(device)
+    run_single_fd_shell(device, &mut buffer)
 }
 
 impl LinuxMountShell {
@@ -231,9 +234,8 @@ fn cstring_path(path: &Path) -> io::Result<CString> {
     })
 }
 
-fn read_and_reply_init(device: &mut File) -> io::Result<NegotiatedInit> {
-    let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
-    let len = read_fuse_message(device, &mut buffer)?;
+fn read_and_reply_init(device: &mut File, buffer: &mut [u8]) -> io::Result<NegotiatedInit> {
+    let len = read_fuse_message(device, buffer)?;
     let header = parse_in_header(&buffer[..len])?;
     if header.opcode != FUSE_INIT {
         return Err(io::Error::new(
@@ -258,11 +260,10 @@ fn read_and_reply_init(device: &mut File) -> io::Result<NegotiatedInit> {
     Ok(negotiated)
 }
 
-fn run_single_fd_shell(mut device: File) -> io::Result<()> {
+fn run_single_fd_shell(mut device: File, buffer: &mut [u8]) -> io::Result<()> {
     // ponytail: single-fd ENOSYS loop; SFS-584 replaces this with real receive/work/reply loops.
-    let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
     loop {
-        let len = read_fuse_message(&mut device, &mut buffer)?;
+        let len = read_fuse_message(&mut device, buffer)?;
         let header = parse_in_header(&buffer[..len])?;
         if header.opcode == FUSE_DESTROY {
             return Ok(());
@@ -314,7 +315,7 @@ fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
         events,
         revents: 0,
     };
-    let timeout_ms = i32::try_from(FUSE_POLL_TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+    let timeout_ms = poll_timeout_ms(events);
     // SAFETY: `pollfd` points to one initialized poll descriptor.
     let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
     match rc {
@@ -327,13 +328,22 @@ fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
     }
 }
 
+fn poll_timeout_ms(events: libc::c_short) -> i32 {
+    if events & libc::POLLIN != 0 {
+        -1
+    } else {
+        i32::try_from(FUSE_POLL_TIMEOUT.as_millis()).unwrap_or(i32::MAX)
+    }
+}
+
 fn page_size() -> io::Result<u32> {
     // SAFETY: sysconf has no preconditions for `_SC_PAGESIZE`.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u32::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(io::Error::last_os_error)
+    if value > 0 {
+        Ok(value as u32)
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn negotiate_init(init: &FuseInitIn, page_size: u32) -> io::Result<NegotiatedInit> {
@@ -380,28 +390,75 @@ fn negotiate_init(init: &FuseInitIn, page_size: u32) -> io::Result<NegotiatedIni
 }
 
 fn write_init_reply(device: &mut File, unique: u64, init: &FuseInitOut) -> io::Result<()> {
-    let header = FuseOutHeader {
-        len: (mem::size_of::<FuseOutHeader>() + mem::size_of::<FuseInitOut>()) as u32,
-        error: 0,
-        unique,
-    };
-    write_all_fuse(device, struct_bytes(&header))?;
-    write_all_fuse(device, struct_bytes(init))
+    write_all_fuse(device, &encode_init_reply(unique, init))
 }
 
 fn write_error_reply(device: &mut File, unique: u64, errno: i32) -> io::Result<()> {
-    let header = FuseOutHeader {
-        len: mem::size_of::<FuseOutHeader>() as u32,
-        error: -errno,
-        unique,
-    };
-    write_all_fuse(device, struct_bytes(&header))
+    write_all_fuse(device, &encode_error_reply(unique, errno))
 }
 
-fn struct_bytes<T>(value: &T) -> &[u8] {
-    // SAFETY: `value` is a valid reference and the returned byte slice is
-    // bounded to its exact in-memory size for immediate kernel writes.
-    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast(), mem::size_of::<T>()) }
+fn encode_init_reply(unique: u64, init: &FuseInitOut) -> [u8; FUSE_INIT_REPLY_SIZE] {
+    let mut reply = [0_u8; FUSE_INIT_REPLY_SIZE];
+    let mut offset = 0;
+    push_out_header(&mut reply, &mut offset, unique, 0, FUSE_INIT_REPLY_SIZE);
+    push_u32(&mut reply, &mut offset, init.major);
+    push_u32(&mut reply, &mut offset, init.minor);
+    push_u32(&mut reply, &mut offset, init.max_readahead);
+    push_u32(&mut reply, &mut offset, init.flags);
+    push_u16(&mut reply, &mut offset, init.max_background);
+    push_u16(&mut reply, &mut offset, init.congestion_threshold);
+    push_u32(&mut reply, &mut offset, init.max_write);
+    push_u32(&mut reply, &mut offset, init.time_gran);
+    push_u16(&mut reply, &mut offset, init.max_pages);
+    push_u16(&mut reply, &mut offset, init.map_alignment);
+    push_u32(&mut reply, &mut offset, init.flags2);
+    push_u32(&mut reply, &mut offset, init.max_stack_depth);
+    push_u16(&mut reply, &mut offset, init.request_timeout);
+    for value in init.unused {
+        push_u16(&mut reply, &mut offset, value);
+    }
+    reply
+}
+
+fn encode_error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_SIZE] {
+    let mut reply = [0_u8; FUSE_OUT_HEADER_SIZE];
+    let mut offset = 0;
+    push_out_header(
+        &mut reply,
+        &mut offset,
+        unique,
+        -errno,
+        FUSE_OUT_HEADER_SIZE,
+    );
+    reply
+}
+
+fn push_out_header(reply: &mut [u8], offset: &mut usize, unique: u64, error: i32, len: usize) {
+    push_u32(reply, offset, len as u32);
+    push_i32(reply, offset, error);
+    push_u64(reply, offset, unique);
+}
+
+fn push_u16(reply: &mut [u8], offset: &mut usize, value: u16) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_u32(reply: &mut [u8], offset: &mut usize, value: u32) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_i32(reply: &mut [u8], offset: &mut usize, value: i32) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_u64(reply: &mut [u8], offset: &mut usize, value: u64) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_bytes(reply: &mut [u8], offset: &mut usize, bytes: &[u8]) {
+    let end = *offset + bytes.len();
+    reply[*offset..end].copy_from_slice(bytes);
+    *offset = end;
 }
 
 fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
@@ -530,14 +587,6 @@ struct FuseInHeader {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FuseOutHeader {
-    len: u32,
-    error: i32,
-    unique: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
 struct FuseInitIn {
     major: u32,
     minor: u32,
@@ -615,5 +664,51 @@ mod tests {
                 "/sys/class/bdi/0:114/read_ahead_kb"
             ))
         );
+    }
+
+    #[test]
+    fn pollin_waits_without_idle_timeout() {
+        assert_eq!(poll_timeout_ms(libc::POLLIN), -1);
+    }
+
+    #[test]
+    fn pollout_keeps_bounded_timeout() {
+        assert_eq!(poll_timeout_ms(libc::POLLOUT), 30_000);
+    }
+
+    #[test]
+    fn init_reply_encoding_uses_fixed_wire_size() {
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+                flags2: 0,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE);
+        assert_eq!(read_u32(&reply, 0), reply.len() as u32);
+        assert_eq!(read_u64(&reply, 8), 99);
+        assert_eq!(read_u32(&reply, FUSE_OUT_HEADER_SIZE), FUSE_KERNEL_VERSION);
+        assert_eq!(read_u32(&reply, FUSE_OUT_HEADER_SIZE + 20), 128 * 1024);
+    }
+
+    #[test]
+    fn error_reply_encoding_is_header_only() {
+        let reply = encode_error_reply(7, libc::ENOSYS);
+
+        assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
+        assert_eq!(read_u32(&reply, 0), FUSE_OUT_HEADER_SIZE as u32);
+        assert_eq!(
+            i32::from_ne_bytes(reply[4..8].try_into().expect("i32")),
+            -libc::ENOSYS
+        );
+        assert_eq!(read_u64(&reply, 8), 7);
     }
 }
