@@ -7,7 +7,7 @@ use tokio::runtime::Handle;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
     pub(crate) runtime_handle: Handle,
@@ -23,17 +23,14 @@ pub(crate) trait MountBackend: Send + Sync {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()>;
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        return Box::new(UnsupportedUnixMountBackend);
-    }
+    Box::new(UnsupportedUnixMountBackend)
+}
 
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
-    }
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
+    mount_backend_for_selector(std::env::var(MOUNT_BACKEND_ENV).ok().as_deref())
 }
 
 #[cfg(windows)]
@@ -86,9 +83,9 @@ fn unsupported_unix_backend_error_message() -> &'static str {
     if cfg!(target_os = "linux") {
         "StudioFS Linux mount is not implemented; the legacy raw FUSE backend was removed in SFS-600"
     } else if cfg!(target_os = "macos") {
-        "StudioFS FUSE backend is Linux-only; macOS uses the native macFUSE bridge by default; clear or set STUDIOFS_MOUNT_BACKEND=macfuse to use it"
+        "StudioFS mount backend selector is unsupported; macOS uses the native macFUSE bridge by default; clear or set STUDIOFS_MOUNT_BACKEND=macfuse to use it"
     } else {
-        "StudioFS FUSE backend is Linux-only; macOS and Windows are supported via their respective native bridges"
+        "StudioFS mount is not implemented on this Unix platform; macOS and Windows are supported via their native bridges"
     }
 }
 

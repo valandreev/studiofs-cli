@@ -346,8 +346,6 @@ after SFS-600.
    Platform-gated tests that would be useless on other OSes must use `cfg`
    guards, not `#[ignore]`. CI command details per platform:
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
-   Only the relevant runner runs each step; the other platforms skip it entirely.
-   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
    Only the relevant runner runs each step; the other platforms skip it entirely
    via `cfg` guards in the test code.
 
@@ -355,7 +353,7 @@ after SFS-600.
    tests belong in ignored integration tests.**
    Non-mount platform tests that are too heavy or too coupled to other crates
    for a `src/` unit-test module are allowed in `tests/` — CI picks them up via
-   `--tests`. Tests that require `FUSE` or `WinFSP` kernel interaction must be
+   `--tests`. Tests that require `WinFSP` kernel interaction must be
    placed in dedicated smoke-test files (e.g. `mount_sanity.rs`) and marked
    `#[ignore]` to keep them out of the standard `cargo test -p <crate>` run.
 
