@@ -4900,6 +4900,7 @@ dependencies = [
 name = "studiofs-linux"
 version = "0.1.1"
 dependencies = [
+ "crossbeam-channel",
  "libc",
  "studiofs-bridge",
  "studiofs-data",

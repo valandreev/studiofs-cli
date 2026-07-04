@@ -76,6 +76,7 @@ libc = "0.2"
 winfsp = "0.12"
 
 # Utils
+crossbeam-channel = "0.5"
 parking_lot = "0.12"
 dashmap = "6"
 mimalloc = "0.1"

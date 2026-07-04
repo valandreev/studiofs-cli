@@ -15,6 +15,7 @@ studiofs-meta.workspace = true
 tokio.workspace = true
 libc.workspace = true
 tracing.workspace = true
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 studiofs-data.workspace = true
