@@ -127,7 +127,7 @@ impl LinuxFuseLoopMetrics {
     }
 
     fn work_dequeued(&self) {
-        self.work_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        decrement_counter(&self.work_queue_depth);
     }
 
     fn reply_enqueued(&self) {
@@ -135,8 +135,14 @@ impl LinuxFuseLoopMetrics {
     }
 
     fn reply_dequeued(&self) {
-        self.reply_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        decrement_counter(&self.reply_queue_depth);
     }
+}
+
+fn decrement_counter(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_sub(1)
+    });
 }
 
 /// Mount `/dev/fuse`, negotiate the kernel session, then hold the single-fd shell.
@@ -438,7 +444,7 @@ fn receive_loop_until_shutdown(
 
 fn work_loop(
     work_rx: Receiver<FuseWorkItem>,
-    reply_tx: SyncSender<Vec<u8>>,
+    reply_tx: SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     while let Ok(item) = work_rx.recv() {
@@ -457,7 +463,7 @@ fn work_loop(
 
 fn reply_loop(
     mut device: File,
-    reply_rx: Receiver<Vec<u8>>,
+    reply_rx: Receiver<[u8; FUSE_OUT_HEADER_SIZE]>,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
     while let Ok(reply) = reply_rx.recv() {
@@ -503,61 +509,62 @@ fn enqueue_work(
     item: FuseWorkItem,
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
+    metrics.work_enqueued();
     match tx.try_send(item) {
-        Ok(()) => {
-            metrics.work_enqueued();
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(TrySendError::Full(item)) => {
             metrics
                 .work_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
-            tx.send(item)
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "FUSE work queue closed"))?;
-            metrics.work_enqueued();
-            Ok(())
+            tx.send(item).map_err(|_| {
+                metrics.work_dequeued();
+                io::Error::new(io::ErrorKind::BrokenPipe, "FUSE work queue closed")
+            })
         }
-        Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "FUSE work queue closed",
-        )),
+        Err(TrySendError::Disconnected(_)) => {
+            metrics.work_dequeued();
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "FUSE work queue closed",
+            ))
+        }
     }
 }
 
 fn enqueue_reply(
-    tx: &SyncSender<Vec<u8>>,
-    reply: Vec<u8>,
+    tx: &SyncSender<[u8; FUSE_OUT_HEADER_SIZE]>,
+    reply: [u8; FUSE_OUT_HEADER_SIZE],
     metrics: &LinuxFuseLoopMetrics,
 ) -> io::Result<()> {
+    metrics.reply_enqueued();
     match tx.try_send(reply) {
-        Ok(()) => {
-            metrics.reply_enqueued();
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(TrySendError::Full(reply)) => {
             metrics
                 .reply_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
             tx.send(reply).map_err(|_| {
+                metrics.reply_dequeued();
                 io::Error::new(io::ErrorKind::BrokenPipe, "FUSE reply queue closed")
-            })?;
-            metrics.reply_enqueued();
-            Ok(())
+            })
         }
-        Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "FUSE reply queue closed",
-        )),
+        Err(TrySendError::Disconnected(_)) => {
+            metrics.reply_dequeued();
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "FUSE reply queue closed",
+            ))
+        }
     }
 }
 
-fn handle_fuse_request(item: &FuseWorkItem) -> Option<Vec<u8>> {
+fn handle_fuse_request(item: &FuseWorkItem) -> Option<[u8; FUSE_OUT_HEADER_SIZE]> {
     let header = item.header;
     let _payload_len = item.message.len();
     if !fuse_opcode_expects_reply(header.opcode) {
         return None;
     }
-    Some(encode_error_reply(header.unique, libc::ENOSYS).to_vec())
+    Some(encode_error_reply(header.unique, libc::ENOSYS))
 }
 
 fn fuse_opcode_expects_reply(opcode: u32) -> bool {
@@ -1331,6 +1338,32 @@ mod tests {
         .expect("reply");
 
         assert_eq!(reply, encode_error_reply(44, libc::ENOSYS));
+    }
+
+    #[test]
+    fn error_reply_work_item_stays_inline() {
+        let reply = handle_fuse_request(&FuseWorkItem {
+            header: FuseInHeader {
+                opcode: 999,
+                unique: 45,
+            },
+            message: Vec::new(),
+        })
+        .expect("reply");
+
+        assert_eq!(std::mem::size_of_val(&reply), FUSE_OUT_HEADER_SIZE);
+    }
+
+    #[test]
+    fn queue_depth_decrement_does_not_underflow() {
+        let metrics = LinuxFuseLoopMetrics::default();
+
+        metrics.work_dequeued();
+        metrics.reply_dequeued();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.work_queue_depth, 0);
+        assert_eq!(snapshot.reply_queue_depth, 0);
     }
 
     #[test]
