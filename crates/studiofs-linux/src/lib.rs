@@ -322,7 +322,7 @@ fn check_fuse_write_len(written: usize, expected: usize) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::WriteZero,
             format!("short FUSE reply write: wrote {written} of {expected} bytes"),
         ))
     }
@@ -603,8 +603,8 @@ fn apply_read_ahead_kb_best_effort(mount_point: &Path, kb: u32) {
 }
 
 fn mountinfo_bdi_path(mount_point: &Path) -> io::Result<Option<PathBuf>> {
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .map(|mountinfo| mountinfo_bdi_path_from(&mountinfo, mount_point))
+    std::fs::read("/proc/self/mountinfo")
+        .map(|mountinfo| mountinfo_bdi_path_from_bytes(&mountinfo, mount_point))
 }
 
 fn mountinfo_lookup_mount_point(mount_point: &Path) -> PathBuf {
@@ -642,6 +642,10 @@ fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBu
         }
     }
     None
+}
+
+fn mountinfo_bdi_path_from_bytes(mountinfo: &[u8], mount_point: &Path) -> Option<PathBuf> {
+    mountinfo_bdi_path_from(&String::from_utf8_lossy(mountinfo), mount_point)
 }
 
 fn unescape_mountinfo_field(value: &str) -> Cow<'_, str> {
@@ -775,6 +779,18 @@ mod tests {
     }
 
     #[test]
+    fn mountinfo_bdi_path_from_bytes_ignores_unrelated_invalid_utf8() {
+        let mountinfo = b"1 0 0:1 / /bad\xff rw - tmpfs tmpfs rw\n126 32 0:114 / /mnt/studiofs rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n";
+
+        assert_eq!(
+            mountinfo_bdi_path_from_bytes(mountinfo, std::path::Path::new("/mnt/studiofs")),
+            Some(std::path::PathBuf::from(
+                "/sys/class/bdi/0:114/read_ahead_kb"
+            ))
+        );
+    }
+
+    #[test]
     fn unescape_mountinfo_field_borrows_plain_paths() {
         assert!(matches!(
             unescape_mountinfo_field("/mnt/studiofs"),
@@ -814,7 +830,7 @@ mod tests {
     fn fuse_reply_write_rejects_partial_syscall() {
         let error = check_fuse_write_len(8, FUSE_OUT_HEADER_SIZE).expect_err("partial write");
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
     #[test]
