@@ -1126,7 +1126,7 @@ impl<'a> ReadMetadataResolver<'a> {
         if let Some(attr) = self.dirty_attr() {
             return Ok(attr);
         }
-        if let Some(attr) = self.cached_attr() {
+        if let Some(attr) = self.cached_attr()? {
             return Ok(attr);
         }
         self.load_attr_from_meta_sync()
@@ -1278,14 +1278,17 @@ impl<'a> ReadMetadataResolver<'a> {
         Ok(Some(dirty_attr))
     }
 
-    fn cached_attr(&self) -> Option<InodeAttr> {
+    fn cached_attr(&self) -> VfsResult<Option<InodeAttr>> {
         let cached_attr = self
             .vfs
             .state
             .namespace
             .attr_read_cache
             .lock()
-            .get(self.ino, Instant::now())?;
+            .get(self.ino, Instant::now());
+        let Some(cached_attr) = cached_attr else {
+            return Ok(None);
+        };
 
         if MetadataRefreshDecision::for_local_attr(
             &cached_attr,
@@ -1295,18 +1298,19 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs.inode_has_pending_uploads(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
-            return Some(cached_attr);
+            return Ok(Some(cached_attr));
         }
 
         let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(remote_attr) => remote_attr,
+            Err(MetaError::InodeNotFound(_)) => return Err(self.stale_inode_not_found()),
             Err(error) => {
                 warn!(
                     ino = self.ino,
                     error = %error,
                     "failed to refresh cached pending attr from authoritative metadata"
                 );
-                return Some(cached_attr);
+                return Ok(Some(cached_attr));
             }
         };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
@@ -1316,10 +1320,10 @@ impl<'a> ReadMetadataResolver<'a> {
                 false,
             );
             self.cache_attr(&remote_attr);
-            return Some(remote_attr);
+            return Ok(Some(remote_attr));
         }
 
-        Some(cached_attr)
+        Ok(Some(cached_attr))
     }
 
     async fn cached_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
@@ -1350,6 +1354,9 @@ impl<'a> ReadMetadataResolver<'a> {
         let remote_attr =
             match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
                 Ok(remote_attr) => remote_attr,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    return Err(self.stale_inode_not_found());
+                }
                 Err(error) => {
                     warn!(
                         ino = self.ino,
@@ -1373,6 +1380,22 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
+        if self
+            .vfs
+            .state
+            .upload
+            .deleted_inodes
+            .lock()
+            .contains(&self.ino)
+        {
+            self.vfs
+                .state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .remove(self.ino);
+            return;
+        }
         self.vfs.state.namespace.attr_read_cache.lock().put(
             self.ino,
             attr.clone(),
@@ -1943,8 +1966,8 @@ mod tests {
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{
-        DataReader, MetadataRefreshDecision, ReadClaimBuffers, ReadDataPlanner, ReadRange,
-        ReadRangeList, ReadSegment, ReadSegmentSource,
+        DataReader, MetadataRefreshDecision, ReadClaimBuffers, ReadDataPlanner,
+        ReadMetadataResolver, ReadRange, ReadRangeList, ReadSegment, ReadSegmentSource,
     };
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
@@ -3393,6 +3416,60 @@ mod tests {
 
         let resolved_attr = vfs.getattr_unchecked(ino).expect("getattr_unchecked");
         assert_eq!(resolved_attr.size, 7);
+    }
+
+    #[test]
+    fn cache_attr_skips_deleted_inode_tombstones() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "cache-attr-deleted");
+        let ino = 9_201;
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+        attr.upload_state = MetaUploadState::Updating;
+        attr.content_epoch = attr.committed_content_epoch + 1;
+
+        vfs.mark_inode_deleted_for_uploads(ino);
+        ReadMetadataResolver::new(&vfs, ino).cache_attr(&attr);
+
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(ino),
+            "deleted inode tombstones must reject late attr-cache fills"
+        );
+    }
+
+    #[test]
+    fn getattr_unchecked_rejects_cached_pending_attr_after_inode_delete() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "getattr-stale-cache-delete");
+        let created = vfs
+            .create(
+                ROOT_INO,
+                b"getattr-stale-cache-delete.txt",
+                1000,
+                1000,
+                0o644,
+            )
+            .expect("create file");
+        let ino = created.ino;
+        let mut cached_attr = meta.get_attr(ino).expect("load attr");
+        cached_attr.upload_state = MetaUploadState::Updating;
+        cached_attr.content_epoch = cached_attr.committed_content_epoch + 1;
+        vfs.state.namespace.attr_read_cache.lock().put(
+            ino,
+            cached_attr,
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+        meta.remove_attr(ino).expect("remove inode attr");
+
+        let err = vfs
+            .getattr_unchecked(ino)
+            .expect_err("stale pending cache should not hide deleted metadata");
+
+        assert!(matches!(
+            err,
+            VfsError::Meta(MetaError::InodeNotFound(found)) if found == ino
+        ));
+        assert!(!vfs.state.namespace.attr_read_cache.lock().contains(ino));
     }
 
     #[test]
