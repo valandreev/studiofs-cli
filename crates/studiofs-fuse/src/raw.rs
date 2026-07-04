@@ -38,13 +38,16 @@ const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_MINOR_VERSION: u32 = 38;
 const FUSE_ROOT_ID: u64 = 1;
 const READDIR_REPLY_INITIAL_CAPACITY: usize = 4096;
-const JFS_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
-const JFS_LIKE_MAX_BACKGROUND: u16 = 200;
-const JFS_LIKE_CONGESTION_THRESHOLD: u16 = 150;
-const JFS_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
-const JFS_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
-const JFS_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
-const JFS_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
+const MACFUSE_LIKE_MAX_WRITE: u32 = 128 * 1024;
+const MACFUSE_LIKE_MAX_READ: u32 = 4 * 1024 * 1024;
+const MACFUSE_LIKE_MAX_READAHEAD: u32 = 1024 * 1024;
+const MACFUSE_LIKE_BUFFER_BUDGET_BYTES: u64 = 800 * 1024 * 1024;
+const MACFUSE_LIKE_MAX_BACKGROUND: u16 = 50;
+const MACFUSE_LIKE_CONGESTION_THRESHOLD: u16 = 40;
+const MACFUSE_LIKE_PREFETCH_CONCURRENCY: u16 = 1;
+const MACFUSE_LIKE_UPLOAD_CONCURRENCY: u16 = 20;
+const MACFUSE_LIKE_DOWNLOAD_CONCURRENCY: u16 = 200;
+const MACFUSE_LIKE_CACHE_SIZE_POLICY: &str = "operator-cache-budget";
 const RAW_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RAW_INVALIDATION_QUEUE_CAPACITY: usize = 4096;
 const RAW_INITIAL_REQUEST_BUFFER_POOL_MAX: usize = 8;
@@ -84,7 +87,7 @@ const OP_READDIRPLUS: u32 = 44;
 
 const FUSE_FSYNC_FDATASYNC: u32 = 1;
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
-const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const LINUX_DEFAULT_IO_SIZE: u32 = 4096;
 const LINUX_REGULAR_FILE_IO_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -139,13 +142,13 @@ pub struct RawFuseMountRequest {
 }
 
 impl RawFuseMountRequest {
-    /// Create a raw FUSE mount request with JuiceFS-like Linux defaults.
+    /// Create a raw FUSE mount request with macFUSE-like Linux defaults.
     pub fn new(mount_point: impl Into<String>, volume_name: impl Into<String>) -> Self {
         Self {
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
             read_only: false,
-            profile: LinuxRawFuseProfile::juicefs_like(),
+            profile: LinuxRawFuseProfile::macfuse_like(),
             vfs: None,
             runtime_handle: None,
             signal_handling: SignalHandling::default(),
@@ -209,27 +212,30 @@ pub struct LinuxRawFuseProfile {
 
 impl LinuxRawFuseProfile {
     pub fn label(&self) -> &'static str {
-        "raw-juicefs-like"
+        "raw-macfuse-like"
+    }
+
+    pub fn macfuse_like() -> Self {
+        Self {
+            max_write: MACFUSE_LIKE_MAX_WRITE,
+            max_read: MACFUSE_LIKE_MAX_READ,
+            max_pages: (MACFUSE_LIKE_MAX_WRITE / 4096) as u16,
+            max_background: MACFUSE_LIKE_MAX_BACKGROUND,
+            congestion_threshold: MACFUSE_LIKE_CONGESTION_THRESHOLD,
+            max_readahead: MACFUSE_LIKE_MAX_READAHEAD,
+            shared_buffer_budget_bytes: MACFUSE_LIKE_BUFFER_BUDGET_BYTES,
+            read_buffer_budget_bytes: None,
+            write_buffer_budget_bytes: None,
+            prefetch_concurrency: MACFUSE_LIKE_PREFETCH_CONCURRENCY,
+            upload_concurrency: MACFUSE_LIKE_UPLOAD_CONCURRENCY,
+            download_concurrency: MACFUSE_LIKE_DOWNLOAD_CONCURRENCY,
+            cache_size_policy: MACFUSE_LIKE_CACHE_SIZE_POLICY,
+            kernel_writeback_cache: false,
+        }
     }
 
     pub fn juicefs_like() -> Self {
-        let max_write = 1024 * 1024;
-        Self {
-            max_write,
-            max_read: max_write,
-            max_pages: (max_write / 4096) as u16,
-            max_background: JFS_LIKE_MAX_BACKGROUND,
-            congestion_threshold: JFS_LIKE_CONGESTION_THRESHOLD,
-            max_readahead: 1024 * 1024,
-            shared_buffer_budget_bytes: JFS_LIKE_BUFFER_BUDGET_BYTES,
-            read_buffer_budget_bytes: None,
-            write_buffer_budget_bytes: None,
-            prefetch_concurrency: JFS_LIKE_PREFETCH_CONCURRENCY,
-            upload_concurrency: JFS_LIKE_UPLOAD_CONCURRENCY,
-            download_concurrency: JFS_LIKE_DOWNLOAD_CONCURRENCY,
-            cache_size_policy: JFS_LIKE_CACHE_SIZE_POLICY,
-            kernel_writeback_cache: true,
-        }
+        Self::macfuse_like()
     }
 
     pub fn negotiate_init(self, input: InitIn) -> NegotiatedInit {
@@ -2349,14 +2355,8 @@ struct RawDirent {
 }
 
 fn linux_open_flags_for_posix(flags: i32, trunc: bool) -> u32 {
-    let access = flags & libc::O_ACCMODE;
-    let read_only = access == libc::O_RDONLY;
-    let append = flags & libc::O_APPEND != 0;
-    if read_only && !append && !trunc {
-        FOPEN_KEEP_CACHE
-    } else {
-        0
-    }
+    let _ = (flags, trunc);
+    FOPEN_DIRECT_IO
 }
 
 fn linux_attr_blksize(attr: &InodeAttr) -> u32 {
@@ -3793,35 +3793,38 @@ mod tests {
     }
 
     #[test]
-    fn raw_juicefs_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
-        let profile = LinuxRawFuseProfile::juicefs_like();
+    fn raw_macfuse_like_profile_centralizes_buffer_cache_and_concurrency_defaults() {
+        let profile = LinuxRawFuseProfile::macfuse_like();
 
-        assert_eq!(profile.label(), "raw-juicefs-like");
+        assert_eq!(profile.label(), "raw-macfuse-like");
+        assert_eq!(profile.max_write, 128 * 1024);
+        assert_eq!(profile.max_read, 4 * 1024 * 1024);
+        assert_eq!(profile.max_readahead, 1024 * 1024);
         assert_eq!(profile.shared_buffer_budget_bytes, 800 * 1024 * 1024);
         assert_eq!(profile.read_buffer_budget_bytes, None);
         assert_eq!(profile.write_buffer_budget_bytes, None);
-        assert_eq!(profile.max_background, 200);
-        assert_eq!(profile.congestion_threshold, 150);
+        assert_eq!(profile.max_background, 50);
+        assert_eq!(profile.congestion_threshold, 40);
         assert_eq!(profile.prefetch_concurrency, 1);
         assert_eq!(profile.upload_concurrency, 20);
         assert_eq!(profile.download_concurrency, 200);
         assert_eq!(profile.cache_size_policy, "operator-cache-budget");
-        assert!(profile.kernel_writeback_cache);
+        assert!(!profile.kernel_writeback_cache);
     }
 
     #[test]
     fn raw_fusermount_options_match_direct_mount_identity() {
-        let options = fusermount_options("studio", true, LinuxRawFuseProfile::juicefs_like());
+        let options = fusermount_options("studio", true, LinuxRawFuseProfile::macfuse_like());
 
         assert_eq!(
             options,
-            "fsname=studio,subtype=studiofs,max_read=1048576,ro"
+            "fsname=studio,subtype=studiofs,max_read=4194304,ro"
         );
     }
 
     #[test]
     fn raw_init_advertises_readdirplus_when_kernel_supports_it() {
-        let negotiated = LinuxRawFuseProfile::juicefs_like().negotiate_init(InitIn {
+        let negotiated = LinuxRawFuseProfile::macfuse_like().negotiate_init(InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
             max_readahead: 1024 * 1024,
@@ -3836,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_init_advertises_writeback_cache_for_juicefs_like_profile_when_kernel_supports_it() {
+    fn raw_init_does_not_advertise_writeback_cache_for_macfuse_like_profile() {
         let input = InitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_MINOR_VERSION,
@@ -3844,18 +3847,9 @@ mod tests {
             flags: FUSE_ASYNC_READ | FUSE_WRITEBACK_CACHE,
         };
 
-        let enabled = LinuxRawFuseProfile::juicefs_like().negotiate_init(input);
-        let disabled = LinuxRawFuseProfile {
-            kernel_writeback_cache: false,
-            ..LinuxRawFuseProfile::juicefs_like()
-        }
-        .negotiate_init(input);
+        let negotiated = LinuxRawFuseProfile::macfuse_like().negotiate_init(input);
 
-        assert_eq!(
-            enabled.out.flags & FUSE_WRITEBACK_CACHE,
-            FUSE_WRITEBACK_CACHE
-        );
-        assert_eq!(disabled.out.flags & FUSE_WRITEBACK_CACHE, 0);
+        assert_eq!(negotiated.out.flags & FUSE_WRITEBACK_CACHE, 0);
     }
 
     #[test]
@@ -3871,7 +3865,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3906,24 +3900,27 @@ mod tests {
     }
 
     #[test]
-    fn raw_read_only_open_keeps_kernel_page_cache() {
+    fn raw_read_only_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDONLY, false);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, FOPEN_KEEP_CACHE);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
-    fn raw_read_only_truncate_open_does_not_keep_kernel_page_cache() {
+    fn raw_read_only_truncate_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDONLY | libc::O_TRUNC, true);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
-    fn raw_write_capable_open_does_not_keep_kernel_page_cache() {
+    fn raw_write_capable_open_uses_direct_io_without_kernel_page_cache() {
         let open_flags = linux_open_flags_for_posix(libc::O_RDWR, false);
 
-        assert_eq!(open_flags & FOPEN_KEEP_CACHE, 0);
+        assert_eq!(open_flags & FOPEN_DIRECT_IO, FOPEN_DIRECT_IO);
+        assert_eq!(open_flags & (1 << 1), 0);
     }
 
     #[test]
@@ -3943,7 +3940,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds {
                 uid: 1000,
                 gid: 1000,
@@ -3964,7 +3961,7 @@ mod tests {
         let context = RawRequestContext {
             vfs: None,
             runtime_handle: None,
-            max_write: LinuxRawFuseProfile::juicefs_like().max_write as usize,
+            max_write: LinuxRawFuseProfile::macfuse_like().max_write as usize,
             ids: SessionIds { uid: 0, gid: 0 },
             next_open_dir_fh: Arc::new(AtomicU64::new(1)),
             open_dir_handles: Arc::new(DashMap::new()),
@@ -4017,8 +4014,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_initial_request_buffer_pool_is_lazy_for_juicefs_like_profile() {
-        let profile = LinuxRawFuseProfile::juicefs_like();
+    fn raw_initial_request_buffer_pool_is_lazy_for_macfuse_like_profile() {
+        let profile = LinuxRawFuseProfile::macfuse_like();
 
         assert_eq!(initial_request_buffer_pool_count(profile.max_background), 8);
     }

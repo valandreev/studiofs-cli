@@ -1082,7 +1082,7 @@ mod tests {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
             enabled: true,
-            linux_fuse_profile: "raw-juicefs-like".into(),
+            linux_fuse_profile: "raw-macfuse-like".into(),
             fuse_max_write_bytes: 16 * 1024 * 1024,
             fuse_max_readahead_bytes: 128 * 1024,
             fuse_max_background: Some(128),
@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  FUSE async writes:        enabled (profile: raw-juicefs-like)",
+                "  FUSE async writes:        enabled (profile: raw-macfuse-like)",
                 "  FUSE profile knobs:       shared 300.0MiB, prefetch 1, upload 20, download 200, writeback off",
                 "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn mounted_status_formats_fuse_writeback_when_it_is_the_only_profile_knob() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
-            linux_fuse_profile: "raw-juicefs-like".into(),
+            linux_fuse_profile: "raw-macfuse-like".into(),
             kernel_writeback_cache: Some(true),
             ..Default::default()
         };

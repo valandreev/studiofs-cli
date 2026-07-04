@@ -51,7 +51,7 @@ Responsibilities that stay in `studiofs-fuse`:
 
 - Linux FUSE3 session creation and callback translation.
 - Linux-only mount options and capability negotiation.
-- Linux cache policy, including `FOPEN_KEEP_CACHE` behavior and explicit kernel
+- Linux cache policy, including `FOPEN_DIRECT_IO` behavior and explicit kernel
   invalidation.
 - Linux async write and async DIO experiment controls.
 - Linux mounted smoke tests and Linux performance probes.
