@@ -370,17 +370,17 @@ fn run_fuse_shell(
     let receive_shutdown = Arc::clone(&shutdown);
     let receiver = spawn_loop("linux fuse receiver", done_tx.clone(), move || {
         receive_loop_until_shutdown(device, buffer, work_tx, &receive_metrics, &receive_shutdown)
-    });
+    })?;
 
     let work_metrics = Arc::clone(&metrics);
     let worker = spawn_loop("linux fuse worker", done_tx.clone(), move || {
         work_loop(work_rx, reply_tx, &work_metrics)
-    });
+    })?;
 
     let reply_metrics = Arc::clone(&metrics);
     let replier = spawn_loop("linux fuse replier", done_tx, move || {
         reply_loop(reply_device, reply_rx, &reply_metrics)
-    });
+    })?;
 
     let mut first_error = None;
     let mut completed = 0;
@@ -477,11 +477,15 @@ fn reply_loop(
     Ok(())
 }
 
-fn spawn_loop<F>(name: &'static str, tx: Sender<io::Result<()>>, f: F) -> thread::JoinHandle<()>
+fn spawn_loop<F>(
+    name: &'static str,
+    tx: Sender<io::Result<()>>,
+    f: F,
+) -> io::Result<thread::JoinHandle<()>>
 where
     F: FnOnce() -> io::Result<()> + Send + 'static,
 {
-    thread::spawn(move || {
+    thread::Builder::new().name(name.to_owned()).spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
             .unwrap_or_else(|panic| Err(io::Error::other(thread_panic_message(name, panic))));
         let _ = tx.send(result);
@@ -1530,6 +1534,23 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("shell should return after reply failure");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn spawn_loop_assigns_thread_name() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        let handle = spawn_loop("studiofs-test-loop", done_tx, move || {
+            let name = std::thread::current().name().unwrap_or("").to_owned();
+            name_tx.send(name).expect("send thread name");
+            Ok(())
+        })
+        .expect("spawn loop");
+
+        join_loop(handle, "studiofs-test-loop").expect("join");
+        done_rx.recv().expect("loop result").expect("loop ok");
+
+        assert_eq!(name_rx.recv().expect("thread name"), "studiofs-test-loop");
     }
 
     fn fuse_request_for_test(opcode: u32, unique: u64) -> [u8; FUSE_IN_HEADER_SIZE] {
