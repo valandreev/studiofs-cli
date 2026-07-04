@@ -582,8 +582,17 @@ fn mountinfo_bdi_path(mount_point: &Path) -> io::Result<Option<PathBuf>> {
 }
 
 fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBuf> {
-    let mount_point =
-        std::fs::canonicalize(mount_point).unwrap_or_else(|_| mount_point.to_path_buf());
+    let mount_point = match std::fs::canonicalize(mount_point) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(
+                path = %mount_point.display(),
+                %error,
+                "linux fuse BDI mountinfo lookup using non-canonical mount path"
+            );
+            mount_point.to_path_buf()
+        }
+    };
     let target = mount_point.to_string_lossy();
     for line in mountinfo.lines() {
         let mut fields = line.split_whitespace();
@@ -661,6 +670,8 @@ struct FuseInitOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FUSE_INIT_OUT_MAX_WRITE_OFFSET: usize = 20;
 
     #[test]
     fn negotiate_init_uses_kernel_readahead_and_supported_pages() {
@@ -786,7 +797,13 @@ mod tests {
         assert_eq!(read_u32(&reply, 0), reply.len() as u32);
         assert_eq!(read_u64(&reply, 8), 99);
         assert_eq!(read_u32(&reply, FUSE_OUT_HEADER_SIZE), FUSE_KERNEL_VERSION);
-        assert_eq!(read_u32(&reply, FUSE_OUT_HEADER_SIZE + 20), 128 * 1024);
+        assert_eq!(
+            read_u32(
+                &reply,
+                FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_MAX_WRITE_OFFSET
+            ),
+            128 * 1024
+        );
     }
 
     #[test]
