@@ -149,7 +149,7 @@ Local loopback examples remain available as development/test examples.
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
-| Linux mount | Not implemented after SFS-600; no raw FUSE unit or smoke target exists |
+| Linux mount | `cargo test -p studiofs-linux`; see [Linux Mount](platform-bridges.md#linux-mount) for real smoke requirements |
 | macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
@@ -176,8 +176,7 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 
 The full-lifecycle tests (`*_write_read_unmount_smoke`) exercise file I/O
-through the real OS filesystem layer, not just session creation. Linux has no
-mounted bridge until the next implementation lands.
+through the real OS filesystem layer, not just session creation.
 
 The WinFSP suite also contains post-upload/finalization cases. Those require a
 reachable S3 backend and return early when the resolved test endpoint is not

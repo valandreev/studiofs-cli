@@ -1,6 +1,6 @@
 # Platform Bridges
 
-StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux has a clean bridge shell after SFS-600 removed the legacy raw FUSE path; the real `/dev/fuse` transport is still not implemented.
+StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux has a clean raw `/dev/fuse` startup bridge after SFS-600 removed the legacy raw FUSE path.
 
 ## Overview
 
@@ -16,8 +16,11 @@ StudioFS supports Windows and macOS through thin bridge crates that translate OS
 └──────────────────────┘     └──────────────────────┘
 ```
 
-Linux currently has a shell-only `studiofs-linux` crate without a `/dev/fuse`
-transport.
+Linux currently has a clean `studiofs-linux` crate with a raw `/dev/fuse`
+startup path. It opens the FUSE device in nonblocking mode, performs the mount
+syscall, negotiates `FUSE_INIT`, logs requested/accepted capabilities plus the
+actual startup geometry, and keeps a single-fd shell alive until the dedicated
+receive/work/reply loops are added.
 
 Implemented transport bridges follow the same pattern:
 1. Receive a filesystem callback from the OS
@@ -172,16 +175,17 @@ Current signature includes additional policy controls:
 
 ## Linux Mount
 
-Linux mount is not implemented. SFS-600 removed the legacy macFUSE-like raw
-`/dev/fuse` backend and there is no hidden compatibility fallback. The
-`studiofs-linux` crate owns a small clean shell that can answer lifecycle,
-root `lookup/getattr`, `readdir`, and `destroy` smoke calls through explicit
-`StudioVfs` boundaries. `studiofs mount` on Linux enters that shell and then
-returns a clear unsupported transport error until the real `/dev/fuse` path is
-added.
+Linux mount starts from a clean raw `/dev/fuse` transport. SFS-600 removed the
+legacy macFUSE-like backend and there is no hidden compatibility fallback. On a
+real mount, startup opens `/dev/fuse` with `O_NONBLOCK`, mounts with `fd=...`,
+negotiates kernel capabilities, logs the requested/accepted capability sets and
+`max_write` / `max_pages` / `max_readahead`, and treats BDI `read_ahead_kb`
+tuning as best-effort only. Non-init requests currently receive `ENOSYS` from
+the single-fd shell until SFS-584 adds the real Linux receive/work/reply loops.
 
 ### Requirements
 
+- Linux: `/dev/fuse` access and host permission for the FUSE `mount(2)` path.
 - macOS: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/)
 
 ### Mount Options

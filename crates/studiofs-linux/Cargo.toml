@@ -13,8 +13,8 @@ studiofs-bridge.workspace = true
 studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
 tokio.workspace = true
-thiserror.workspace = true
 libc.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 studiofs-data.workspace = true

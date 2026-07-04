@@ -1,24 +1,60 @@
 //! Clean Linux bridge shell for StudioFS.
 //!
-//! This crate intentionally stops before the real `/dev/fuse` transport. It
-//! owns the Linux-only boundary shape and enough lifecycle/root operations to
-//! prove the new path is isolated from the deleted legacy backend.
+//! This crate owns the Linux-only `/dev/fuse` boundary and enough shell
+//! operations to prove the new path is isolated from the deleted legacy backend.
 
-#![forbid(unsafe_code)]
-
-use std::io;
+use std::borrow::Cow;
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use studiofs_bridge::posix::{BridgeFileAttr, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::ROOT_INO;
 use studiofs_vfs::StudioVfs;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
+const FUSE_DEVICE: &str = "/dev/fuse";
+const FUSE_MOUNT_TYPE: &str = "fuse";
+const FUSE_SOURCE: &str = "studiofs";
+const FUSE_IN_HEADER_SIZE: usize = 40;
+const FUSE_OUT_HEADER_SIZE: usize = 16;
+const FUSE_INIT_IN_BASE_SIZE: usize = 16;
+const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
+const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
+const FUSE_INIT_OUT_SIZE: usize = 64;
+const FUSE_FORGET: u32 = 2;
+const FUSE_INIT: u32 = 26;
+const FUSE_DESTROY: u32 = 38;
+const FUSE_BATCH_FORGET: u32 = 42;
+const FUSE_KERNEL_VERSION: u32 = 7;
+const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
+const FUSE_ASYNC_READ: u32 = 1 << 0;
+const FUSE_BIG_WRITES: u32 = 1 << 5;
+const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
+const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
+const FUSE_MAX_PAGES: u32 = 1 << 22;
+const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
+    | FUSE_BIG_WRITES
+    | FUSE_AUTO_INVAL_DATA
+    | FUSE_PARALLEL_DIROPS
+    | FUSE_MAX_PAGES;
+const FUSE_COMPAT_MAX_WRITE: u32 = 128 * 1024;
+const FUSE_MAX_PAGES_DEFAULT: u16 = 256;
+const FUSE_REQUEST_BUFFER_SIZE: usize = 1024 * 1024 + 4096;
+const FUSE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
     /// Shared VFS instance used by the Linux bridge boundary.
     pub vfs: Arc<StudioVfs>,
+    /// Directory where the Linux FUSE filesystem should be mounted.
+    pub mount_point: PathBuf,
 }
 
 /// Minimal Linux mount shell for lifecycle and root namespace smoke checks.
@@ -35,12 +71,15 @@ pub struct LinuxDirEntry {
     pub name: Vec<u8>,
 }
 
-/// Start the Linux shell and return the clear unsupported transport error.
-pub fn mount_with_request(_request: LinuxMountRequest) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "StudioFS Linux /dev/fuse transport is not implemented yet",
-    ))
+/// Mount `/dev/fuse`, negotiate the kernel session, then hold the single-fd shell.
+pub fn mount_with_request(request: LinuxMountRequest) -> io::Result<()> {
+    let mut device = open_fuse_device()?;
+    let bdi_mount_point = mountinfo_lookup_mount_point(&request.mount_point);
+    mount_fuse_device(&request.mount_point, device.as_raw_fd())?;
+    let mut buffer = vec![0_u8; FUSE_REQUEST_BUFFER_SIZE];
+    let negotiated = read_and_reply_init(&mut device, &mut buffer)?;
+    apply_read_ahead_kb_best_effort(&bdi_mount_point, negotiated.out.max_readahead / 1024);
+    run_single_fd_shell(device, &mut buffer)
 }
 
 impl LinuxMountShell {
@@ -105,4 +144,839 @@ impl LinuxMountShell {
 
 fn io_error_from_vfs(error: studiofs_vfs::VfsError) -> io::Error {
     io::Error::from_raw_os_error(vfs_err_to_errno(&error))
+}
+
+fn open_fuse_device() -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(FUSE_DEVICE)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open {FUSE_DEVICE} failed: {error}; check FUSE device permissions"),
+            )
+        })
+}
+
+fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
+    let mode = fuse_rootmode(mount_point)?;
+    let options = format!(
+        "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions,fsname=studiofs,subtype=studiofs",
+        current_uid(),
+        current_gid()
+    );
+    let source = cstring(FUSE_SOURCE)?;
+    let target = cstring_path(mount_point)?;
+    let fstype = cstring(FUSE_MOUNT_TYPE)?;
+    let data = cstring(&options)?;
+
+    // SAFETY: all pointers are valid NUL-terminated C strings for the duration
+    // of the call, and `data` points to the mount option string expected by the
+    // Linux `mount(2)` FUSE filesystem type.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong,
+            data.as_ptr().cast(),
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    let hint = match error.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM) => {
+            "; FUSE mount requires host permission for /dev/fuse and mount(2)"
+        }
+        _ => "",
+    };
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "mount {FUSE_DEVICE} at {} failed: {error}{hint}",
+            mount_point.display()
+        ),
+    ))
+}
+
+fn fuse_rootmode(mount_point: &Path) -> io::Result<u32> {
+    let permissions = std::fs::metadata(mount_point)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "read mount point {} metadata failed: {error}",
+                    mount_point.display()
+                ),
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o7777;
+    Ok(libc::S_IFDIR | permissions)
+}
+
+fn current_uid() -> libc::uid_t {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+fn current_gid() -> libc::gid_t {
+    // SAFETY: getgid has no preconditions.
+    unsafe { libc::getgid() }
+}
+
+fn cstring(value: &str) -> io::Result<CString> {
+    CString::new(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "string contains NUL byte"))
+}
+
+fn cstring_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path {} contains NUL byte", path.display()),
+        )
+    })
+}
+
+fn read_and_reply_init(device: &mut File, buffer: &mut [u8]) -> io::Result<NegotiatedInit> {
+    let len = read_fuse_message(device, buffer)?;
+    let header = parse_in_header(&buffer[..len])?;
+    if header.opcode != FUSE_INIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected FUSE_INIT as first request, got opcode {}",
+                header.opcode
+            ),
+        ));
+    }
+    let init = parse_init_in(&buffer[FUSE_IN_HEADER_SIZE..len])?;
+    let negotiated = negotiate_init(&init, page_size()?)?;
+    write_init_reply(device, header.unique, &negotiated.out)?;
+    tracing::info!(
+        requested_caps = format_args!("0x{:08x}", negotiated.requested_caps),
+        accepted_caps = format_args!("0x{:08x}", negotiated.accepted_caps),
+        max_write = negotiated.out.max_write,
+        max_pages = negotiated.out.max_pages,
+        max_readahead = negotiated.out.max_readahead,
+        "linux fuse init negotiated"
+    );
+    Ok(negotiated)
+}
+
+fn run_single_fd_shell(mut device: File, buffer: &mut [u8]) -> io::Result<()> {
+    // ponytail: single-fd ENOSYS loop; SFS-584 replaces this with real receive/work/reply loops.
+    loop {
+        let len = read_fuse_message(&mut device, buffer)?;
+        let header = parse_in_header(&buffer[..len])?;
+        if header.opcode == FUSE_DESTROY {
+            return Ok(());
+        }
+        if !fuse_opcode_expects_reply(header.opcode) {
+            continue;
+        }
+        write_error_reply(&mut device, header.unique, libc::ENOSYS)?;
+    }
+}
+
+fn fuse_opcode_expects_reply(opcode: u32) -> bool {
+    !matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET)
+}
+
+fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match device.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "FUSE device closed while waiting for request",
+                ));
+            }
+            Ok(len) => return Ok(len),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_fd(device.as_raw_fd(), libc::POLLIN)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn write_all_fuse(device: &mut File, bytes: &[u8]) -> io::Result<()> {
+    loop {
+        match device.write(bytes) {
+            Ok(written) => return check_fuse_write_len(written, bytes.len()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_fd(device.as_raw_fd(), libc::POLLOUT)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn check_fuse_write_len(written: usize, expected: usize) -> io::Result<()> {
+    if written == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short FUSE reply write: wrote {written} of {expected} bytes"),
+        ))
+    }
+}
+
+fn poll_fd(fd: RawFd, events: libc::c_short) -> io::Result<()> {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let timeout_ms = poll_timeout_ms(events);
+        // SAFETY: `pollfd` points to one initialized poll descriptor.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        match rc {
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for FUSE device readiness",
+                ));
+            }
+            n if n > 0 => return Ok(()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn poll_timeout_ms(events: libc::c_short) -> i32 {
+    if events & libc::POLLIN != 0 {
+        -1
+    } else {
+        i32::try_from(FUSE_POLL_TIMEOUT.as_millis()).unwrap_or(i32::MAX)
+    }
+}
+
+fn page_size() -> io::Result<u32> {
+    // SAFETY: sysconf has no preconditions for `_SC_PAGESIZE`.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 {
+        Ok(value as u32)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn negotiate_init(init: &FuseInitIn, page_size: u32) -> io::Result<NegotiatedInit> {
+    if init.major != FUSE_KERNEL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported FUSE ABI major version {}", init.major),
+        ));
+    }
+    let requested_caps = STUDIOFS_REQUESTED_CAPS;
+    let mut accepted = init.flags & STUDIOFS_REQUESTED_CAPS;
+    let max_pages = if init.flags & FUSE_MAX_PAGES == 0 {
+        accepted &= !FUSE_MAX_PAGES;
+        0
+    } else {
+        FUSE_MAX_PAGES_DEFAULT
+    };
+    let max_write = if max_pages == 0 {
+        FUSE_COMPAT_MAX_WRITE
+    } else {
+        page_size.saturating_mul(u32::from(max_pages))
+    };
+    let out = FuseInitOut {
+        major: FUSE_KERNEL_VERSION,
+        minor: FUSE_KERNEL_MINOR_VERSION.min(init.minor),
+        max_readahead: init.max_readahead,
+        flags: accepted,
+        max_background: 0,
+        congestion_threshold: 0,
+        max_write,
+        time_gran: 1,
+        max_pages,
+        map_alignment: 0,
+        flags2: 0,
+        max_stack_depth: 0,
+        request_timeout: 0,
+        unused: [0; 11],
+    };
+    Ok(NegotiatedInit {
+        out,
+        requested_caps,
+        accepted_caps: accepted,
+    })
+}
+
+fn write_init_reply(device: &mut File, unique: u64, init: &FuseInitOut) -> io::Result<()> {
+    write_all_fuse(device, &encode_init_reply(unique, init))
+}
+
+fn write_error_reply(device: &mut File, unique: u64, errno: i32) -> io::Result<()> {
+    write_all_fuse(device, &encode_error_reply(unique, errno))
+}
+
+fn encode_init_reply(unique: u64, init: &FuseInitOut) -> Vec<u8> {
+    let payload_size = init_out_payload_size(init.minor);
+    let reply_size = FUSE_OUT_HEADER_SIZE + payload_size;
+    let mut reply = vec![0_u8; FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE];
+    let mut offset = 0;
+    push_out_header(&mut reply, &mut offset, unique, 0, reply_size);
+    push_u32(&mut reply, &mut offset, init.major);
+    push_u32(&mut reply, &mut offset, init.minor);
+    push_u32(&mut reply, &mut offset, init.max_readahead);
+    push_u32(&mut reply, &mut offset, init.flags);
+    push_u16(&mut reply, &mut offset, init.max_background);
+    push_u16(&mut reply, &mut offset, init.congestion_threshold);
+    push_u32(&mut reply, &mut offset, init.max_write);
+    push_u32(&mut reply, &mut offset, init.time_gran);
+    push_u16(&mut reply, &mut offset, init.max_pages);
+    push_u16(&mut reply, &mut offset, init.map_alignment);
+    push_u32(&mut reply, &mut offset, init.flags2);
+    push_u32(&mut reply, &mut offset, init.max_stack_depth);
+    push_u16(&mut reply, &mut offset, init.request_timeout);
+    for value in init.unused {
+        push_u16(&mut reply, &mut offset, value);
+    }
+    reply.truncate(reply_size);
+    reply
+}
+
+fn init_out_payload_size(minor: u32) -> usize {
+    if minor < 5 {
+        FUSE_COMPAT_INIT_OUT_SIZE
+    } else if minor < 23 {
+        FUSE_COMPAT_22_INIT_OUT_SIZE
+    } else {
+        FUSE_INIT_OUT_SIZE
+    }
+}
+
+fn encode_error_reply(unique: u64, errno: i32) -> [u8; FUSE_OUT_HEADER_SIZE] {
+    let mut reply = [0_u8; FUSE_OUT_HEADER_SIZE];
+    let mut offset = 0;
+    push_out_header(
+        &mut reply,
+        &mut offset,
+        unique,
+        -errno,
+        FUSE_OUT_HEADER_SIZE,
+    );
+    reply
+}
+
+fn push_out_header(reply: &mut [u8], offset: &mut usize, unique: u64, error: i32, len: usize) {
+    push_u32(reply, offset, len as u32);
+    push_i32(reply, offset, error);
+    push_u64(reply, offset, unique);
+}
+
+fn push_u16(reply: &mut [u8], offset: &mut usize, value: u16) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_u32(reply: &mut [u8], offset: &mut usize, value: u32) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_i32(reply: &mut [u8], offset: &mut usize, value: i32) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_u64(reply: &mut [u8], offset: &mut usize, value: u64) {
+    push_bytes(reply, offset, &value.to_ne_bytes());
+}
+
+fn push_bytes(reply: &mut [u8], offset: &mut usize, bytes: &[u8]) {
+    let end = *offset + bytes.len();
+    reply[*offset..end].copy_from_slice(bytes);
+    *offset = end;
+}
+
+fn parse_in_header(bytes: &[u8]) -> io::Result<FuseInHeader> {
+    if bytes.len() < FUSE_IN_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE request header",
+        ));
+    }
+    let len = read_u32(bytes, 0)?;
+    if len < FUSE_IN_HEADER_SIZE as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE request length shorter than header",
+        ));
+    }
+    if usize::try_from(len).map_or(true, |len| len > bytes.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE request length exceeds received bytes",
+        ));
+    }
+    Ok(FuseInHeader {
+        opcode: read_u32(bytes, 4)?,
+        unique: read_u64(bytes, 8)?,
+    })
+}
+
+fn parse_init_in(bytes: &[u8]) -> io::Result<FuseInitIn> {
+    if bytes.len() < FUSE_INIT_IN_BASE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_INIT request",
+        ));
+    }
+    Ok(FuseInitIn {
+        major: read_u32(bytes, 0)?,
+        minor: read_u32(bytes, 4)?,
+        max_readahead: read_u32(bytes, 8)?,
+        flags: read_u32(bytes, 12)?,
+    })
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> io::Result<u32> {
+    read_bytes(bytes, offset).map(u32::from_ne_bytes)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
+    read_bytes(bytes, offset).map(u64::from_ne_bytes)
+}
+
+fn read_bytes<const N: usize>(bytes: &[u8], offset: usize) -> io::Result<[u8; N]> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FUSE field offset overflow"))?;
+    let slice = bytes.get(offset..end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE field extends beyond message",
+        )
+    })?;
+    let mut value = [0_u8; N];
+    value.copy_from_slice(slice);
+    Ok(value)
+}
+
+fn apply_read_ahead_kb_best_effort(mount_point: &Path, kb: u32) {
+    if kb == 0 {
+        return;
+    }
+    match mountinfo_bdi_path(mount_point) {
+        Ok(Some(path)) => {
+            if let Err(error) = std::fs::write(&path, kb.to_string()) {
+                if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                    tracing::debug!(
+                        path = %mount_point.display(),
+                        bdi = %path.display(),
+                        %error,
+                        "linux fuse BDI read_ahead_kb tuning skipped"
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %mount_point.display(),
+                        bdi = %path.display(),
+                        %error,
+                        "linux fuse BDI read_ahead_kb tuning skipped"
+                    );
+                }
+            }
+        }
+        Ok(None) => tracing::warn!(
+            path = %mount_point.display(),
+            "linux fuse BDI read_ahead_kb tuning skipped: mountinfo entry not found"
+        ),
+        Err(error) => tracing::warn!(
+            path = %mount_point.display(),
+            %error,
+            "linux fuse BDI read_ahead_kb tuning skipped: mountinfo unreadable"
+        ),
+    }
+}
+
+fn mountinfo_bdi_path(mount_point: &Path) -> io::Result<Option<PathBuf>> {
+    std::fs::read("/proc/self/mountinfo")
+        .map(|mountinfo| mountinfo_bdi_path_from_bytes(&mountinfo, mount_point))
+}
+
+fn mountinfo_lookup_mount_point(mount_point: &Path) -> PathBuf {
+    match std::fs::canonicalize(mount_point) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(
+                path = %mount_point.display(),
+                %error,
+                "linux fuse BDI mountinfo lookup using non-canonical mount path"
+            );
+            mount_point.to_path_buf()
+        }
+    }
+}
+
+fn mountinfo_bdi_path_from(mountinfo: &str, mount_point: &Path) -> Option<PathBuf> {
+    let target = mount_point.to_string_lossy();
+    for line in mountinfo.lines() {
+        let mut fields = line.split_whitespace();
+        // mountinfo starts with: id parent major:minor root mountpoint ...
+        let (Some(_id), Some(_parent), Some(majmin), Some(_root), Some(mounted_at)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if unescape_mountinfo_field(mounted_at) == target {
+            return Some(PathBuf::from(format!(
+                "/sys/class/bdi/{majmin}/read_ahead_kb"
+            )));
+        }
+    }
+    None
+}
+
+fn mountinfo_bdi_path_from_bytes(mountinfo: &[u8], mount_point: &Path) -> Option<PathBuf> {
+    mountinfo_bdi_path_from(&String::from_utf8_lossy(mountinfo), mount_point)
+}
+
+fn unescape_mountinfo_field(value: &str) -> Cow<'_, str> {
+    if !value.contains('\\') {
+        return Cow::Borrowed(value);
+    }
+    let bytes = value.as_bytes();
+    let mut unescaped = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            match &bytes[index + 1..index + 4] {
+                b"040" => {
+                    unescaped.push(b' ');
+                    index += 4;
+                    continue;
+                }
+                b"011" => {
+                    unescaped.push(b'\t');
+                    index += 4;
+                    continue;
+                }
+                b"012" => {
+                    unescaped.push(b'\n');
+                    index += 4;
+                    continue;
+                }
+                b"134" => {
+                    unescaped.push(b'\\');
+                    index += 4;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        unescaped.push(bytes[index]);
+        index += 1;
+    }
+    Cow::Owned(
+        String::from_utf8(unescaped)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    )
+}
+
+#[derive(Debug)]
+struct NegotiatedInit {
+    out: FuseInitOut,
+    requested_caps: u32,
+    accepted_caps: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FuseInHeader {
+    opcode: u32,
+    unique: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FuseInitIn {
+    major: u32,
+    minor: u32,
+    max_readahead: u32,
+    flags: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FuseInitOut {
+    major: u32,
+    minor: u32,
+    max_readahead: u32,
+    flags: u32,
+    max_background: u16,
+    congestion_threshold: u16,
+    max_write: u32,
+    time_gran: u32,
+    max_pages: u16,
+    map_alignment: u16,
+    flags2: u32,
+    max_stack_depth: u32,
+    request_timeout: u16,
+    unused: [u16; 11],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FUSE_INIT_OUT_MAX_WRITE_OFFSET: usize = 20;
+
+    #[test]
+    fn negotiate_init_uses_kernel_readahead_and_supported_pages() {
+        let init = FuseInitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 768 * 1024,
+            flags: FUSE_MAX_PAGES | FUSE_ASYNC_READ,
+        };
+
+        let negotiated = negotiate_init(&init, 4096).expect("negotiate init");
+
+        assert_eq!(negotiated.out.max_readahead, 768 * 1024);
+        assert_eq!(negotiated.out.max_pages, 256);
+        assert_eq!(negotiated.out.max_write, 1024 * 1024);
+        assert_ne!(negotiated.accepted_caps & FUSE_MAX_PAGES, 0);
+    }
+
+    #[test]
+    fn negotiate_init_omits_pages_when_kernel_does_not_offer_it() {
+        let init = FuseInitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 256 * 1024,
+            flags: FUSE_ASYNC_READ,
+        };
+
+        let negotiated = negotiate_init(&init, 4096).expect("negotiate init");
+
+        assert_eq!(negotiated.out.max_readahead, 256 * 1024);
+        assert_eq!(negotiated.out.max_pages, 0);
+        assert_eq!(negotiated.out.max_write, 128 * 1024);
+        assert_eq!(negotiated.accepted_caps & FUSE_MAX_PAGES, 0);
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_returns_read_ahead_path() {
+        let mountinfo = "126 32 0:114 / /mnt/studiofs rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n";
+
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, std::path::Path::new("/mnt/studiofs")),
+            Some(std::path::PathBuf::from(
+                "/sys/class/bdi/0:114/read_ahead_kb"
+            ))
+        );
+    }
+
+    #[test]
+    fn fuse_rootmode_includes_directory_type_bits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("set mode");
+
+        let mode = fuse_rootmode(tmp.path()).expect("rootmode");
+
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(mode & 0o7777, 0o750);
+    }
+
+    #[test]
+    fn mountinfo_lookup_mount_point_canonicalizes_relative_mount_point() {
+        let cwd = std::env::current_dir().expect("current dir");
+        assert_eq!(mountinfo_lookup_mount_point(std::path::Path::new(".")), cwd);
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_expects_precanonical_mount_point() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let mountinfo = format!(
+            "126 32 0:114 / {} rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n",
+            cwd.display()
+        );
+
+        assert_eq!(
+            mountinfo_bdi_path_from(&mountinfo, &cwd),
+            Some(std::path::PathBuf::from(
+                "/sys/class/bdi/0:114/read_ahead_kb"
+            ))
+        );
+        assert_eq!(
+            mountinfo_bdi_path_from(&mountinfo, std::path::Path::new(".")),
+            None
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_bytes_ignores_unrelated_invalid_utf8() {
+        let mountinfo = b"1 0 0:1 / /bad\xff rw - tmpfs tmpfs rw\n126 32 0:114 / /mnt/studiofs rw,relatime shared:98 - fuse studiofs rw,user_id=1000,group_id=1000\n";
+
+        assert_eq!(
+            mountinfo_bdi_path_from_bytes(mountinfo, std::path::Path::new("/mnt/studiofs")),
+            Some(std::path::PathBuf::from(
+                "/sys/class/bdi/0:114/read_ahead_kb"
+            ))
+        );
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_borrows_plain_paths() {
+        assert!(matches!(
+            unescape_mountinfo_field("/mnt/studiofs"),
+            Cow::Borrowed("/mnt/studiofs")
+        ));
+        assert_eq!(unescape_mountinfo_field("/mnt/a\\040b"), "/mnt/a b");
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_decodes_each_escape_once() {
+        assert_eq!(unescape_mountinfo_field("/mnt/a\\134040b"), "/mnt/a\\040b");
+    }
+
+    #[test]
+    fn pollin_waits_without_idle_timeout() {
+        assert_eq!(poll_timeout_ms(libc::POLLIN), -1);
+    }
+
+    #[test]
+    fn pollout_keeps_bounded_timeout() {
+        assert_eq!(poll_timeout_ms(libc::POLLOUT), 30_000);
+    }
+
+    #[test]
+    fn forget_opcodes_do_not_expect_replies() {
+        assert!(!fuse_opcode_expects_reply(FUSE_FORGET));
+        assert!(!fuse_opcode_expects_reply(FUSE_BATCH_FORGET));
+        assert!(fuse_opcode_expects_reply(FUSE_INIT));
+    }
+
+    #[test]
+    fn parse_in_header_rejects_len_shorter_than_header() {
+        let mut bytes = [0_u8; FUSE_IN_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&(FUSE_IN_HEADER_SIZE as u32 - 1).to_ne_bytes());
+
+        let error = parse_in_header(&bytes).expect_err("short header len");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fuse_reply_write_rejects_partial_syscall() {
+        let error = check_fuse_write_len(8, FUSE_OUT_HEADER_SIZE).expect_err("partial write");
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn init_reply_encoding_uses_negotiated_wire_size() {
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE);
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+        assert_eq!(read_u64(&reply, 8).expect("unique"), 99);
+        assert_eq!(
+            read_u32(&reply, FUSE_OUT_HEADER_SIZE).expect("major"),
+            FUSE_KERNEL_VERSION
+        );
+        assert_eq!(
+            read_u32(
+                &reply,
+                FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_MAX_WRITE_OFFSET
+            )
+            .expect("max write"),
+            128 * 1024
+        );
+    }
+
+    #[test]
+    fn init_reply_encoding_truncates_legacy_wire_sizes() {
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: 22,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(
+            reply.len(),
+            FUSE_OUT_HEADER_SIZE + FUSE_COMPAT_22_INIT_OUT_SIZE
+        );
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+
+        let init = negotiate_init(
+            &FuseInitIn {
+                major: FUSE_KERNEL_VERSION,
+                minor: 4,
+                max_readahead: 512 * 1024,
+                flags: FUSE_ASYNC_READ,
+            },
+            4096,
+        )
+        .expect("negotiate init");
+
+        let reply = encode_init_reply(99, &init.out);
+
+        assert_eq!(
+            reply.len(),
+            FUSE_OUT_HEADER_SIZE + FUSE_COMPAT_INIT_OUT_SIZE
+        );
+        assert_eq!(read_u32(&reply, 0).expect("reply len"), reply.len() as u32);
+    }
+
+    #[test]
+    fn read_u32_rejects_out_of_bounds_offset() {
+        let error = read_u32(&[0_u8; 3], 0).expect_err("short u32");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn error_reply_encoding_is_header_only() {
+        let reply = encode_error_reply(7, libc::ENOSYS);
+
+        assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
+        assert_eq!(
+            read_u32(&reply, 0).expect("reply len"),
+            FUSE_OUT_HEADER_SIZE as u32
+        );
+        assert_eq!(
+            i32::from_ne_bytes(reply[4..8].try_into().expect("i32")),
+            -libc::ENOSYS
+        );
+        assert_eq!(read_u64(&reply, 8).expect("unique"), 7);
+    }
 }
