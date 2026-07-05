@@ -162,6 +162,24 @@ fn regular_file_stats(path: &Path) -> io::Result<TreeStats> {
     Ok(stats)
 }
 
+fn zero_byte_dotfiles(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = entry_path.symlink_metadata()?;
+        if metadata.is_dir() {
+            files.extend(zero_byte_dotfiles(&entry_path)?);
+        } else if metadata.is_file()
+            && metadata.len() == 0
+            && entry.file_name().as_encoded_bytes().starts_with(b".")
+        {
+            files.push(entry_path);
+        }
+    }
+    Ok(files)
+}
+
 fn make_repo_tree(root: &Path) -> io::Result<()> {
     std::fs::create_dir_all(root.join("src"))?;
     std::fs::create_dir_all(root.join("target/debug"))?;
@@ -231,4 +249,38 @@ fn mounted_cp_a_repo_copy_preserves_regular_file_count_and_bytes() {
     runtime.block_on(vfs.shutdown(Duration::ZERO));
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount(2) permission"]
+fn mounted_rsync_a_repo_copy_preserves_regular_files_without_zero_byte_temp_leftovers() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("linux-mount-rsync-a-");
+    let source = tmp.path().join("source-repo");
+    let mount_point = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_point).expect("create mount point");
+    make_repo_tree(&source).expect("create source repo");
+    let expected = regular_file_stats(&source).expect("source stats");
+
+    let (runtime, vfs) = make_vfs(&tmp);
+    let mount = mount_background(vfs.clone(), &runtime, mount_point.clone()).expect("mount FUSE");
+    let copy = mount_point.join("rsync-copy");
+    std::fs::create_dir(&copy).expect("mkdir through FUSE");
+    let status = std::process::Command::new("rsync")
+        .arg("-a")
+        .arg(format!("{}/", source.display()))
+        .arg(&copy)
+        .status()
+        .expect("run rsync -a");
+    assert!(status.success(), "rsync -a exited with {status}");
+    let actual = regular_file_stats(&copy).expect("copied stats");
+    let leftovers = zero_byte_dotfiles(&copy).expect("temp leftovers");
+
+    drop(mount);
+    runtime.block_on(vfs.shutdown(Duration::ZERO));
+
+    assert_eq!(actual, expected);
+    assert!(
+        leftovers.is_empty(),
+        "zero-byte temp leftovers: {leftovers:?}"
+    );
 }
