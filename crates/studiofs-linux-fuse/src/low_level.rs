@@ -769,6 +769,9 @@ impl SessionState {
         offset: off_t,
         fi: *const raw::FuseFileInfo,
     ) -> Result<u32, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         if buf.is_null() && size > 0 {
@@ -1354,6 +1357,20 @@ mod tests {
         assert_eq!(
             state.local_sync_policy_for_handle(fh),
             studiofs_vfs::LocalSyncPolicy::WriteThrough
+        );
+    }
+
+    #[test]
+    fn read_only_write_rejects_before_using_file_info() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-write")
+                .expect("create VFS fixture");
+        let state =
+            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), true);
+
+        assert_eq!(
+            state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
+            Err(libc::EROFS)
         );
     }
 
