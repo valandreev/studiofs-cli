@@ -89,10 +89,12 @@ impl OwnedFuseArgs {
             .iter()
             .map(|arg| arg.as_ptr().cast_mut())
             .collect::<Vec<_>>();
+        let argc = argv.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many Linux FUSE arguments")
+        })?;
+        argv.push(std::ptr::null_mut());
         let raw = raw::FuseArgs {
-            argc: argv.len().try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "too many Linux FUSE arguments")
-            })?,
+            argc,
             argv: argv.as_mut_ptr(),
             allocated: 0,
         };
@@ -168,7 +170,11 @@ impl Session {
     pub(crate) fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
         let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
-        if result == 0 || result == libc::SIGINT || result == libc::SIGTERM {
+        if result == 0
+            || result == libc::SIGINT
+            || result == libc::SIGTERM
+            || result == libc::SIGHUP
+        {
             Ok(())
         } else if result < 0 {
             Err(io::Error::from_raw_os_error(-result))
@@ -205,6 +211,14 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+    }
+
+    #[test]
+    fn owned_fuse_args_are_null_terminated_without_counting_sentinel() {
+        let args = super::OwnedFuseArgs::new(super::argv_strings("demo")).expect("build args");
+
+        assert_eq!(args.raw.argc as usize, args._strings.len());
+        assert!(args._argv.last().is_some_and(|arg| arg.is_null()));
     }
 
     #[test]
