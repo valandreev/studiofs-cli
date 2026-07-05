@@ -14,7 +14,7 @@ use tokio::runtime::Handle;
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
-const LINUX_FUSE_MAX_READ_SIZE: usize = 64 * 1024 * 1024;
+const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -1410,6 +1410,15 @@ mod tests {
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            struct UnmountGuard(std::path::PathBuf);
+
+            impl Drop for UnmountGuard {
+                fn drop(&mut self) {
+                    let _ = Command::new("fusermount3").arg("-u").arg(&self.0).status();
+                }
+            }
+
+            let guard = UnmountGuard(mount_point_for_worker.clone());
             let path = mount_point_for_worker.join("regular.txt");
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
@@ -1432,10 +1441,12 @@ mod tests {
             drop(file);
             assert_eq!(std::fs::read_to_string(&path)?, "hello");
 
-            Command::new("fusermount3")
+            let status = Command::new("fusermount3")
                 .arg("-u")
                 .arg(&mount_point_for_worker)
-                .status()
+                .status();
+            std::mem::forget(guard);
+            status
         });
 
         session.run().expect("run libfuse3 session");

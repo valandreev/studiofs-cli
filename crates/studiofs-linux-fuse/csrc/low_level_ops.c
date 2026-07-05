@@ -1,5 +1,4 @@
 #include <stddef.h>
-#include <string.h>
 #include <fuse_lowlevel.h>
 
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
@@ -59,14 +58,12 @@ struct fuse_session *studiofs_linux_fuse_session_new(struct fuse_args *args,
 }
 
 void studiofs_linux_fuse_dir_file_info_init(struct fuse_file_info *info, uint64_t fh) {
-    memset(info, 0, sizeof(*info));
     info->fh = fh;
     info->keep_cache = 1;
     info->cache_readdir = 1;
 }
 
 void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info, uint64_t fh) {
-    memset(info, 0, sizeof(*info));
     info->fh = fh;
     info->direct_io = 1;
 }
@@ -90,7 +87,7 @@ int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fu
 }
 
 int studiofs_linux_fuse_file_info_direct_io_after_init(void) {
-    struct fuse_file_info info;
+    struct fuse_file_info info = {0};
     studiofs_linux_fuse_file_info_init(&info, 7);
     return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0;
 }
