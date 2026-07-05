@@ -418,6 +418,10 @@ pub extern "C" fn studiofs_linux_fuse_create(
         reply_error(req, libc::EIO);
         return;
     };
+    if require_file_info(fi).is_err() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
     let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
@@ -436,6 +440,10 @@ pub extern "C" fn studiofs_linux_fuse_open(
         reply_error(req, libc::EIO);
         return;
     };
+    if require_file_info(fi).is_err() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
     match state.open(ino, fi) {
         Ok(fh) => reply_file_open(req, fi, fh),
         Err(errno) => reply_error(req, errno),
@@ -743,7 +751,7 @@ impl SessionState {
     ) -> Result<Vec<u8>, i32> {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        validate_read_size(size)?;
+        let size = clamp_read_size(size);
         let mut buffer = vec![0; size];
         let read = self
             .runtime_handle
@@ -1062,12 +1070,16 @@ fn timespec_nanos(sec: libc::time_t, nsec: libc::c_long) -> Result<i64, i32> {
     i64::try_from(nanos).map_err(|_| libc::EOVERFLOW)
 }
 
-fn validate_read_size(size: usize) -> Result<(), i32> {
-    if size > LINUX_FUSE_MAX_READ_SIZE {
+fn require_file_info(fi: *const raw::FuseFileInfo) -> Result<(), i32> {
+    if fi.is_null() {
         Err(libc::EINVAL)
     } else {
         Ok(())
     }
+}
+
+fn clamp_read_size(size: usize) -> usize {
+    size.min(LINUX_FUSE_MAX_READ_SIZE)
 }
 
 fn reply_entry_result(
@@ -1303,10 +1315,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_read_size_rejects_oversized_request() {
+    fn require_file_info_rejects_null_pointer() {
         assert_eq!(
-            super::validate_read_size(super::LINUX_FUSE_MAX_READ_SIZE + 1),
+            super::require_file_info(std::ptr::null()),
             Err(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn clamp_read_size_caps_oversized_request() {
+        assert_eq!(
+            super::clamp_read_size(super::LINUX_FUSE_MAX_READ_SIZE + 1),
+            super::LINUX_FUSE_MAX_READ_SIZE
         );
     }
 
