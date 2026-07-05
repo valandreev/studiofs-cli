@@ -37,11 +37,14 @@ const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_FH_SIZE: usize = 8;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
+const FUSE_GETATTR_IN_SIZE: usize = 16;
+const FUSE_OPEN_IN_SIZE: usize = 8;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
 const FUSE_MKDIR_IN_SIZE: usize = 8;
 const FUSE_RENAME_IN_SIZE: usize = 8;
+const FUSE_ATTR_OUT_SIZE: usize = 104;
 const FUSE_CREATE_IN_SIZE: usize = 16;
 const FUSE_ENTRY_OUT_SIZE: usize = 128;
 const FUSE_OPEN_OUT_SIZE: usize = 16;
@@ -51,10 +54,13 @@ const FUSE_FSYNC_IN_SIZE: usize = 16;
 const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 const FUSE_INIT_OUT_SIZE: usize = 64;
+const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
+const FUSE_GETATTR: u32 = 3;
 const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RENAME: u32 = 12;
+const FUSE_OPEN: u32 = 14;
 const FUSE_INIT: u32 = 26;
 const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
@@ -89,6 +95,8 @@ const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
+const FUSE_ATTR_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE;
+const FUSE_OPEN_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE;
 const FUSE_WRITE_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE;
 const FUSE_CREATE_REPLY_SIZE: usize =
     FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE;
@@ -874,9 +882,12 @@ fn handle_vfs_fuse_request(
     }
     let started = Instant::now();
     Some(match header.opcode {
+        FUSE_LOOKUP => handle_fuse_lookup(vfs, item),
+        FUSE_GETATTR => handle_fuse_getattr(vfs, item),
         FUSE_MKDIR => handle_fuse_mkdir(vfs, item),
         FUSE_UNLINK => handle_fuse_unlink(vfs, item),
         FUSE_RENAME => handle_fuse_rename(vfs, item),
+        FUSE_OPEN => handle_fuse_open(vfs, item),
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
         FUSE_CREATE => handle_fuse_create(vfs, item),
@@ -885,6 +896,32 @@ fn handle_vfs_fuse_request(
         FUSE_RELEASE => handle_fuse_release(vfs, runtime_handle, item),
         _ => encode_error_reply(header.unique, libc::ENOSYS),
     })
+}
+
+fn handle_fuse_lookup(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_LOOKUP request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.lookup(item.header.nodeid, name) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_getattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    if fuse_payload(item).len() < FUSE_GETATTR_IN_SIZE {
+        return encode_error_reply(unique, libc::EINVAL);
+    }
+    match vfs.getattr(item.header.nodeid) {
+        Ok(attr) => encode_attr_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
 }
 
 fn handle_fuse_mkdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
@@ -922,6 +959,19 @@ fn handle_fuse_rename(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     };
     match vfs.rename(item.header.nodeid, name, new_parent, new_name) {
         Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_open(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let flags = match parse_open_in(fuse_payload(item)) {
+        Ok(flags) => flags,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags as i32);
+    match vfs.open_file(item.header.nodeid, open_flags, trunc) {
+        Ok(fh) => encode_open_reply(unique, fh),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -1318,9 +1368,43 @@ fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
     FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
 }
 
+fn encode_open_reply(unique: u64, fh: u64) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_OPEN_OUT_SIZE];
+    let mut offset = 0;
+    push_open_out(&mut data, &mut offset, fh);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_OPEN_REPLY_SIZE),
+        data,
+    }
+}
+
+fn encode_attr_reply(unique: u64, attr: &BridgeFileAttr) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_ATTR_OUT_SIZE];
+    let mut offset = 0;
+    push_u64(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_fuse_attr(&mut data, &mut offset, attr);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_ATTR_REPLY_SIZE),
+        data,
+    }
+}
+
 fn encode_entry_payload(attr: &BridgeFileAttr) -> Vec<u8> {
     let mut data = vec![0_u8; FUSE_ENTRY_OUT_SIZE];
     let mut offset = 0;
+    push_u64(&mut data, &mut offset, attr.ino);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_fuse_attr(&mut data, &mut offset, attr);
+    data
+}
+
+fn push_fuse_attr(reply: &mut [u8], offset: &mut usize, attr: &BridgeFileAttr) {
     let time_parts = |time: std::time::SystemTime| {
         let duration = time
             .duration_since(std::time::UNIX_EPOCH)
@@ -1336,38 +1420,35 @@ fn encode_entry_payload(attr: &BridgeFileAttr) -> Vec<u8> {
         studiofs_bridge::posix::BridgeFileType::Symlink => libc::S_IFLNK,
     };
 
-    push_u64(&mut data, &mut offset, attr.ino);
-    push_u64(&mut data, &mut offset, 0);
-    push_u64(&mut data, &mut offset, 0);
-    push_u64(&mut data, &mut offset, 0);
-    push_u32(&mut data, &mut offset, 0);
-    push_u32(&mut data, &mut offset, 0);
-    push_u64(&mut data, &mut offset, attr.ino);
-    push_u64(&mut data, &mut offset, attr.size);
-    push_u64(&mut data, &mut offset, attr.blocks);
-    push_u64(&mut data, &mut offset, atime);
-    push_u64(&mut data, &mut offset, mtime);
-    push_u64(&mut data, &mut offset, ctime);
-    push_u32(&mut data, &mut offset, atimensec);
-    push_u32(&mut data, &mut offset, mtimensec);
-    push_u32(&mut data, &mut offset, ctimensec);
-    push_u32(&mut data, &mut offset, file_type | u32::from(attr.perm));
-    push_u32(&mut data, &mut offset, attr.nlink);
-    push_u32(&mut data, &mut offset, attr.uid);
-    push_u32(&mut data, &mut offset, attr.gid);
-    push_u32(&mut data, &mut offset, attr.rdev);
-    push_u32(&mut data, &mut offset, attr.blksize);
-    push_u32(&mut data, &mut offset, 0);
-    data
+    push_u64(reply, offset, attr.ino);
+    push_u64(reply, offset, attr.size);
+    push_u64(reply, offset, attr.blocks);
+    push_u64(reply, offset, atime);
+    push_u64(reply, offset, mtime);
+    push_u64(reply, offset, ctime);
+    push_u32(reply, offset, atimensec);
+    push_u32(reply, offset, mtimensec);
+    push_u32(reply, offset, ctimensec);
+    push_u32(reply, offset, file_type | u32::from(attr.perm));
+    push_u32(reply, offset, attr.nlink);
+    push_u32(reply, offset, attr.uid);
+    push_u32(reply, offset, attr.gid);
+    push_u32(reply, offset, attr.rdev);
+    push_u32(reply, offset, attr.blksize);
+    push_u32(reply, offset, 0);
+}
+
+fn push_open_out(reply: &mut [u8], offset: &mut usize, fh: u64) {
+    push_u64(reply, offset, fh);
+    push_u32(reply, offset, 0);
+    push_u32(reply, offset, 0);
 }
 
 fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply {
     let mut data = encode_entry_payload(attr);
     let mut offset = FUSE_ENTRY_OUT_SIZE;
     data.resize(FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE, 0);
-    push_u64(&mut data, &mut offset, fh);
-    push_u32(&mut data, &mut offset, 0);
-    push_u32(&mut data, &mut offset, 0);
+    push_open_out(&mut data, &mut offset, fh);
     FuseReply::Data {
         header: encode_reply_header(unique, 0, FUSE_CREATE_REPLY_SIZE),
         data,
@@ -1450,6 +1531,16 @@ fn parse_write_in(bytes: &[u8]) -> io::Result<FuseWriteIn<'_>> {
         flags: read_u32(bytes, 32)?,
         data,
     })
+}
+
+fn parse_open_in(bytes: &[u8]) -> io::Result<u32> {
+    if bytes.len() < FUSE_OPEN_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_OPEN request",
+        ));
+    }
+    read_u32(bytes, 0)
 }
 
 fn parse_mkdir_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
@@ -2204,6 +2295,44 @@ mod tests {
         .expect("unlink reply");
         assert_ok_reply(&unlink, 91);
         assert!(vfs.lookup(ROOT_INO, b"final.txt").is_err());
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_lookup_getattr_and_open() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-lookup-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "lookup-open");
+        let attr = vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644).unwrap();
+
+        let lookup = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LOOKUP, 92, ROOT_INO, b"existing.txt\0"),
+        )
+        .expect("lookup reply");
+        assert_ok_reply(&lookup, 92);
+        assert_eq!(read_u64(lookup.payload_slice(), 0).unwrap(), attr.ino);
+
+        let getattr = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETATTR, 93, attr.ino, &[0_u8; 16]),
+        )
+        .expect("getattr reply");
+        assert_ok_reply(&getattr, 93);
+        assert_eq!(read_u64(getattr.payload_slice(), 16).unwrap(), attr.ino);
+
+        let mut open_payload = Vec::from((libc::O_RDONLY as u32).to_ne_bytes());
+        open_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let open = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_OPEN, 94, attr.ino, &open_payload),
+        )
+        .expect("open reply");
+        assert_ok_reply(&open, 94);
+        assert_ne!(read_u64(open.payload_slice(), 0).unwrap(), 0);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
