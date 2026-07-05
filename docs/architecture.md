@@ -40,7 +40,7 @@ studiofs (CLI)
   ├── studiofs-data       S3 object I/O + object format
   ├── studiofs-cache      local cache backend + upload runtime
   ├── studiofs-vfs        filesystem core
-  ├── studiofs-linux      Linux clean bridge shell
+  ├── studiofs-linux      Linux raw /dev/fuse bridge
   ├── studiofs-macfuse    macOS native bridge
   ├── studiofs-winfsp     Windows bridge
   └── studiofs-e2e        real mounted E2E runner

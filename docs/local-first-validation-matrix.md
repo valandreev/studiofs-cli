@@ -90,7 +90,7 @@ real mounted I/O behavior.
 
 | Platform | Focus | Primary checks | Command |
 |---|---|---|---|
-| Linux mount shell | Clean shell only; real `/dev/fuse` transport still unsupported | `shell_answers_root_lifecycle_callbacks`; `unsupported_requests_return_enosys` | `cargo test -p studiofs-linux -- --nocapture` |
+| Linux mount bridge | Raw `/dev/fuse` startup plus read/write/flush/fsync/release VFS wiring | `shell_answers_root_lifecycle_callbacks`; `unsupported_requests_return_enosys`; `vfs_handler_wires_read_write_flush_fsync_and_release` | `cargo test -p studiofs-linux -- --nocapture` |
 | Windows WinFSP | mounted create/write/read/readdir/delete/unmount lifecycle | `winfsp_mount_write_read_unmount_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP sequential writer | AJA-style large sequential writer must use WinFSP cleanup flush/purge while keeping StudioFS non-delete cleanup callback handling observational | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
 

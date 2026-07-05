@@ -9,13 +9,6 @@ pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
-    #[cfg_attr(
-        all(target_os = "linux", not(test)),
-        expect(
-            dead_code,
-            reason = "Linux shell does not use the full transport launch surface yet"
-        )
-    )]
     pub(crate) runtime_handle: Handle,
     pub(crate) mount_point: String,
     #[cfg_attr(
@@ -133,6 +126,7 @@ impl MountBackend for LinuxMountBackend {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         studiofs_linux::mount_with_request(studiofs_linux::LinuxMountRequest {
             vfs: launch.vfs,
+            runtime_handle: launch.runtime_handle,
             mount_point: launch.mount_point.into(),
         })
     }
