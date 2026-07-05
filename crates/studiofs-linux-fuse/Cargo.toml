@@ -13,6 +13,9 @@ workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+studiofs-bridge.workspace = true
+studiofs-meta.workspace = true
+studiofs-vfs.workspace = true
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 cc = "1"

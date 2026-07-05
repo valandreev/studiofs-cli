@@ -1226,6 +1226,7 @@ impl PreparedMount {
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
+            #[cfg(not(target_os = "linux"))]
             runtime_handle: runtime.handle().clone(),
             mount_point: self.plan.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
