@@ -14,7 +14,8 @@ struct HandleCounts {
 
 /// Per-VFS handle table tracking all open file descriptors.
 pub(super) struct HandleTable {
-    /// Monotonically increasing file handle counter.
+    /// Monotonically increasing file handle counter. Zero is reserved for
+    /// bridge callbacks that use `fh == 0` as "no VFS handle".
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
     handles: RwLock<HashMap<u64, OpenFile>>,

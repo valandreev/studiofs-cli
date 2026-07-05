@@ -105,7 +105,7 @@ unsafe extern "C" {
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
     fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
-    fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64, direct_io: c_int);
+    fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
     fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
     fn studiofs_linux_fuse_file_info_flags(info: *const raw::FuseFileInfo) -> c_int;
     #[cfg(test)]
@@ -715,8 +715,10 @@ impl SessionState {
 
     fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
         let attr = self.getattr_attr(ino)?;
-        if attr.kind != FileType::RegularFile {
-            return Err(libc::EISDIR);
+        match attr.kind {
+            FileType::RegularFile => {}
+            FileType::Directory => return Err(libc::EISDIR),
+            FileType::Symlink => return Err(libc::EINVAL),
         }
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
         if self.read_only
@@ -1098,7 +1100,7 @@ fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) 
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, fh, 1);
+        studiofs_linux_fuse_file_info_init(fi, fh);
         raw::fuse_reply_open(req, fi);
     }
 }
@@ -1124,7 +1126,7 @@ fn reply_create(
     };
     // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, fh, 1);
+        studiofs_linux_fuse_file_info_init(fi, fh);
         raw::fuse_reply_create(req, &entry, fi);
     }
 }
