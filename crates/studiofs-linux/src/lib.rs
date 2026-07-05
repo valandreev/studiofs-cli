@@ -40,6 +40,8 @@ const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
+const FUSE_MKDIR_IN_SIZE: usize = 8;
+const FUSE_RENAME_IN_SIZE: usize = 8;
 const FUSE_CREATE_IN_SIZE: usize = 16;
 const FUSE_ENTRY_OUT_SIZE: usize = 128;
 const FUSE_OPEN_OUT_SIZE: usize = 16;
@@ -50,6 +52,9 @@ const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 const FUSE_INIT_OUT_SIZE: usize = 64;
 const FUSE_FORGET: u32 = 2;
+const FUSE_MKDIR: u32 = 9;
+const FUSE_UNLINK: u32 = 10;
+const FUSE_RENAME: u32 = 12;
 const FUSE_INIT: u32 = 26;
 const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
@@ -869,6 +874,9 @@ fn handle_vfs_fuse_request(
     }
     let started = Instant::now();
     Some(match header.opcode {
+        FUSE_MKDIR => handle_fuse_mkdir(vfs, item),
+        FUSE_UNLINK => handle_fuse_unlink(vfs, item),
+        FUSE_RENAME => handle_fuse_rename(vfs, item),
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
         FUSE_CREATE => handle_fuse_create(vfs, item),
@@ -877,6 +885,45 @@ fn handle_vfs_fuse_request(
         FUSE_RELEASE => handle_fuse_release(vfs, runtime_handle, item),
         _ => encode_error_reply(header.unique, libc::ENOSYS),
     })
+}
+
+fn handle_fuse_mkdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (mode, name) = match parse_mkdir_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.mkdir(item.header.nodeid, name, 0, 0, mode as u16 & 0o7777) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_unlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_UNLINK request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.unlink(item.header.nodeid, name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_rename(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (new_parent, name, new_name) = match parse_rename_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.rename(item.header.nodeid, name, new_parent, new_name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
 }
 
 fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
@@ -1271,8 +1318,8 @@ fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
     FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
 }
 
-fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply {
-    let mut data = vec![0_u8; FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE];
+fn encode_entry_payload(attr: &BridgeFileAttr) -> Vec<u8> {
+    let mut data = vec![0_u8; FUSE_ENTRY_OUT_SIZE];
     let mut offset = 0;
     let time_parts = |time: std::time::SystemTime| {
         let duration = time
@@ -1311,6 +1358,13 @@ fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply
     push_u32(&mut data, &mut offset, attr.rdev);
     push_u32(&mut data, &mut offset, attr.blksize);
     push_u32(&mut data, &mut offset, 0);
+    data
+}
+
+fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply {
+    let mut data = encode_entry_payload(attr);
+    let mut offset = FUSE_ENTRY_OUT_SIZE;
+    data.resize(FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE, 0);
     push_u64(&mut data, &mut offset, fh);
     push_u32(&mut data, &mut offset, 0);
     push_u32(&mut data, &mut offset, 0);
@@ -1398,6 +1452,45 @@ fn parse_write_in(bytes: &[u8]) -> io::Result<FuseWriteIn<'_>> {
     })
 }
 
+fn parse_mkdir_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
+    if bytes.len() <= FUSE_MKDIR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_MKDIR request",
+        ));
+    }
+    Ok((
+        read_u32(bytes, 0)?,
+        parse_name(bytes, FUSE_MKDIR_IN_SIZE, "short FUSE_MKDIR request")?,
+    ))
+}
+
+fn parse_rename_in(bytes: &[u8]) -> io::Result<(u64, &[u8], &[u8])> {
+    if bytes.len() <= FUSE_RENAME_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_RENAME request",
+        ));
+    }
+    let names = &bytes[FUSE_RENAME_IN_SIZE..];
+    let old_end = names.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE_RENAME old name is not nul-terminated",
+        )
+    })?;
+    let new_name = names[old_end + 1..]
+        .strip_suffix(&[0])
+        .unwrap_or(&names[old_end + 1..]);
+    if new_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_RENAME new name",
+        ));
+    }
+    Ok((read_u64(bytes, 0)?, &names[..old_end], new_name))
+}
+
 fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
     if bytes.len() <= FUSE_CREATE_IN_SIZE {
         return Err(io::Error::new(
@@ -1405,10 +1498,23 @@ fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
             "short FUSE_CREATE request",
         ));
     }
-    let name = bytes[FUSE_CREATE_IN_SIZE..]
-        .strip_suffix(&[0])
-        .unwrap_or(&bytes[FUSE_CREATE_IN_SIZE..]);
-    Ok((read_u32(bytes, 0)?, read_u32(bytes, 4)?, name))
+    Ok((
+        read_u32(bytes, 0)?,
+        read_u32(bytes, 4)?,
+        parse_name(bytes, FUSE_CREATE_IN_SIZE, "short FUSE_CREATE request")?,
+    ))
+}
+
+fn parse_name<'a>(bytes: &'a [u8], offset: usize, short: &str) -> io::Result<&'a [u8]> {
+    let name = bytes
+        .get(offset..)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, short))?;
+    let name = name.strip_suffix(&[0]).unwrap_or(name);
+    if name.is_empty() {
+        Err(io::Error::new(io::ErrorKind::InvalidData, short))
+    } else {
+        Ok(name)
+    }
 }
 
 fn write_sync_policy(flags: u32) -> LocalSyncPolicy {
@@ -2057,6 +2163,47 @@ mod tests {
         )
         .expect("duplicate create reply");
         assert_error_reply(&duplicate, 88, libc::EEXIST);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_namespace_mutations() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-namespace-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "namespace");
+
+        let mut mkdir_payload = Vec::from(0o755_u32.to_ne_bytes());
+        mkdir_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        mkdir_payload.extend_from_slice(b"repo\0");
+        let mkdir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_MKDIR, 89, ROOT_INO, &mkdir_payload),
+        )
+        .expect("mkdir reply");
+        assert_ok_reply(&mkdir, 89);
+        vfs.lookup(ROOT_INO, b"repo").expect("created directory");
+
+        vfs.create(ROOT_INO, b".tmp-file", 0, 0, 0o644).unwrap();
+        let mut rename_payload = Vec::from(ROOT_INO.to_ne_bytes());
+        rename_payload.extend_from_slice(b".tmp-file\0final.txt\0");
+        let rename = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_RENAME, 90, ROOT_INO, &rename_payload),
+        )
+        .expect("rename reply");
+        assert_ok_reply(&rename, 90);
+        vfs.lookup(ROOT_INO, b"final.txt").expect("renamed file");
+
+        let unlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_UNLINK, 91, ROOT_INO, b"final.txt\0"),
+        )
+        .expect("unlink reply");
+        assert_ok_reply(&unlink, 91);
+        assert!(vfs.lookup(ROOT_INO, b"final.txt").is_err());
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
