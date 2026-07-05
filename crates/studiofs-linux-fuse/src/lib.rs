@@ -11,11 +11,13 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
+use tokio::runtime::Handle;
 mod low_level;
 
 /// Request used by the CLI backend router to launch the Linux libfuse3 bridge.
 pub struct LinuxFuseMountRequest {
     vfs: Arc<StudioVfs>,
+    runtime_handle: Handle,
     mount_point: PathBuf,
     volume_name: String,
     read_only: bool,
@@ -25,12 +27,14 @@ impl LinuxFuseMountRequest {
     /// Create a Linux libfuse3 mount request.
     pub fn new(
         vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
         mount_point: impl Into<PathBuf>,
         volume_name: impl Into<String>,
         read_only: bool,
     ) -> Self {
         Self {
             vfs,
+            runtime_handle,
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
             read_only,
@@ -43,12 +47,13 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
     ensure_fusermount3_available()?;
     let LinuxFuseMountRequest {
         vfs,
+        runtime_handle,
         mount_point,
         volume_name,
         read_only,
     } = request;
     let mut session = low_level::Session::mount(
-        low_level::SessionState::new(vfs, read_only),
+        low_level::SessionState::new(vfs, runtime_handle, read_only),
         mount_point,
         volume_name,
     )?;

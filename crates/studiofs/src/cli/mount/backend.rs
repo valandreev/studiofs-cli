@@ -86,13 +86,14 @@ impl MountBackend for LinuxFuseMountBackend {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         let BackendLaunch {
             vfs,
-            runtime_handle: _runtime_handle,
+            runtime_handle,
             mount_point,
             volume_name,
             read_only,
         } = launch;
         let request = studiofs_linux_fuse::LinuxFuseMountRequest::new(
             vfs,
+            runtime_handle,
             mount_point,
             volume_name,
             read_only,
