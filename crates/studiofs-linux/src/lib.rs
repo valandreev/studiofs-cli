@@ -1938,11 +1938,12 @@ fn parse_setxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8], &[u8])> {
     let value_start = bytes[FUSE_SETXATTR_IN_SIZE..]
         .iter()
         .position(|byte| *byte == 0)
+        .filter(|end| *end > 0)
         .map(|end| FUSE_SETXATTR_IN_SIZE + end + 1)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "FUSE_SETXATTR name is not nul-terminated",
+                "FUSE_SETXATTR name is empty or not nul-terminated",
             )
         })?;
     let value_end = value_start
@@ -2653,6 +2654,19 @@ mod tests {
         let (_, old_name, new_name) = parse_rename_in(&rename).expect("rename");
         assert_eq!(old_name, b"old.txt");
         assert_eq!(new_name, b"new.txt");
+    }
+
+    #[test]
+    fn parse_setxattr_in_rejects_empty_name() {
+        let mut payload = Vec::from(0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.push(0);
+
+        let error = parse_setxattr_in(&payload).expect_err("empty name");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

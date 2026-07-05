@@ -147,7 +147,13 @@ fn mountinfo_contains(mount_point: &Path) -> io::Result<bool> {
     let target = target.to_string_lossy();
     Ok(std::fs::read_to_string("/proc/self/mountinfo")?
         .lines()
-        .any(|line| line.split_whitespace().nth(4) == Some(target.as_ref())))
+        .any(|line| mountinfo_line_matches(line, target.as_ref())))
+}
+
+fn mountinfo_line_matches(line: &str, target: &str) -> bool {
+    line.split_whitespace()
+        .nth(4)
+        .is_some_and(|mounted_at| mounted_at.replace("\\040", " ") == target)
 }
 
 fn unmount(mount_point: &Path) -> io::Result<()> {
@@ -246,6 +252,13 @@ fn unsupported_requests_return_enosys() {
     let err = LinuxMountShell::unsupported().expect_err("read unsupported");
 
     assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+}
+
+#[test]
+fn mountinfo_line_matches_escaped_spaces() {
+    let line = "36 25 0:32 / /tmp/studiofs\\040mount rw,nosuid,nodev - fuse studiofs rw";
+
+    assert!(mountinfo_line_matches(line, "/tmp/studiofs mount"));
 }
 
 #[test]
