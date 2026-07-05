@@ -128,21 +128,6 @@ const FATTR_MTIME: u32 = 1 << 5;
 const FATTR_FH: u32 = 1 << 6;
 const FATTR_ATIME_NOW: u32 = 1 << 7;
 const FATTR_MTIME_NOW: u32 = 1 << 8;
-const FATTR_LOCKOWNER: u32 = 1 << 9;
-const FATTR_CTIME: u32 = 1 << 10;
-const FATTR_KILL_SUIDGID: u32 = 1 << 11;
-const FATTR_SUPPORTED: u32 = FATTR_MODE
-    | FATTR_UID
-    | FATTR_GID
-    | FATTR_SIZE
-    | FATTR_ATIME
-    | FATTR_MTIME
-    | FATTR_FH
-    | FATTR_ATIME_NOW
-    | FATTR_MTIME_NOW
-    | FATTR_LOCKOWNER
-    | FATTR_CTIME
-    | FATTR_KILL_SUIDGID;
 const FS_IOC_GETFLAGS: u32 = 2_148_034_049;
 const FS_IOC32_GETFLAGS: u32 = 2_147_771_905;
 const FS_IOC_FSGETXATTR: u32 = 2_149_341_215;
@@ -1210,9 +1195,11 @@ fn handle_fuse_listxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     };
     match vfs.list_xattrs(item.header.nodeid) {
         Ok(names) => {
-            if names.is_empty()
-                && let Some(errno) = xattr_missing_value_errno(vfs, item.header.nodeid)
-            {
+            let missing_errno = names
+                .is_empty()
+                .then(|| xattr_missing_value_errno(vfs, item.header.nodeid))
+                .flatten();
+            if let Some(errno) = missing_errno {
                 return encode_error_reply(unique, errno);
             }
             let data = format_xattr_name_list(&names);
@@ -1890,9 +1877,6 @@ fn parse_setattr_in(bytes: &[u8]) -> io::Result<(Option<u64>, SetattrArgs)> {
         ));
     }
     let valid = read_u32(bytes, FUSE_SETATTR_VALID_OFFSET)?;
-    if valid & !FATTR_SUPPORTED != 0 {
-        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
-    }
     let mut args = SetattrArgs::default();
     if valid & FATTR_SIZE != 0 {
         args.size = Some(read_u64(bytes, FUSE_SETATTR_SIZE_OFFSET)?);
@@ -2925,7 +2909,7 @@ mod tests {
         let attr = vfs.create(ROOT_INO, b"metadata.txt", 0, 0, 0o644).unwrap();
         let mut payload = vec![0_u8; FUSE_SETATTR_IN_SIZE];
         payload[FUSE_SETATTR_VALID_OFFSET..FUSE_SETATTR_VALID_OFFSET + 4]
-            .copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME).to_ne_bytes());
+            .copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME | (1 << 31)).to_ne_bytes());
         payload[FUSE_SETATTR_SIZE_OFFSET..FUSE_SETATTR_SIZE_OFFSET + 8]
             .copy_from_slice(&3_u64.to_ne_bytes());
         payload[FUSE_SETATTR_MTIME_OFFSET..FUSE_SETATTR_MTIME_OFFSET + 8]
