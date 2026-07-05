@@ -594,9 +594,7 @@ fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
 }
 
 fn fuse_mount_options(fd: RawFd, mode: u32, uid: libc::uid_t, gid: libc::gid_t) -> String {
-    format!(
-        "fd={fd},rootmode={mode:o},user_id={uid},group_id={gid},default_permissions,fsname={FUSE_SOURCE},subtype={FUSE_SOURCE}"
-    )
+    format!("fd={fd},rootmode={mode:o},user_id={uid},group_id={gid},default_permissions")
 }
 
 fn fuse_rootmode(mount_point: &Path) -> io::Result<u32> {
@@ -1529,6 +1527,12 @@ fn handle_fuse_read(
         return encode_error_reply(unique, libc::EINVAL);
     }
     let mut out = vec![0_u8; read_size];
+    if vfs.is_runtime_stats_file_ino(item.header.nodeid) {
+        let read = vfs.read_runtime_stats_file(input.offset, &mut out);
+        out.truncate(read as usize);
+        vfs.record_fuse_read_callback(out.len(), started.elapsed(), false);
+        return encode_data_reply(unique, out);
+    }
     let result = runtime_handle.block_on(vfs.read_into_fh(
         input.fh,
         item.header.nodeid,
@@ -2811,10 +2815,10 @@ mod tests {
     }
 
     #[test]
-    fn fuse_mount_options_preserve_display_name() {
+    fn fuse_mount_options_use_kernel_supported_raw_fuse_keys() {
         assert_eq!(
             fuse_mount_options(7, 0o40755, 1000, 1000),
-            "fd=7,rootmode=40755,user_id=1000,group_id=1000,default_permissions,fsname=studiofs,subtype=studiofs"
+            "fd=7,rootmode=40755,user_id=1000,group_id=1000,default_permissions"
         );
     }
 
@@ -3241,6 +3245,28 @@ mod tests {
         assert_eq!(updated.mode, 0o600);
         assert_eq!(updated.size, 3);
         assert_eq!(updated.mtime, 10_000_000_020);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_reads_runtime_stats_surface() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-runtime-stats-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "runtime-stats");
+        let stats_attr = vfs
+            .lookup(ROOT_INO, studiofs_vfs::RUNTIME_STATS_FILE_NAME)
+            .expect("runtime stats attr");
+
+        let reply = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_READ, 94, stats_attr.ino, &read_in(0, 0, 4096)),
+        )
+        .expect("runtime stats read reply");
+
+        assert_ok_reply(&reply, 94);
+        let text = std::str::from_utf8(reply.payload_slice()).expect("stats text is utf-8");
+        assert!(text.starts_with("# studiofs_runtime_stats schema_version=1"));
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
