@@ -1199,11 +1199,10 @@ fn handle_fuse_removexattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseRep
 
 fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
-    let input = match parse_create_in(fuse_payload(item)) {
+    let (flags, mode, name) = match parse_create_in(fuse_payload(item)) {
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    let (flags, mode, name) = input;
     let attr = match vfs.create(item.header.nodeid, name, 0, 0, mode as u16 & 0o7777) {
         Ok(attr) => attr,
         Err(error) => return encode_error_reply(unique, vfs_err_to_errno(&error)),
