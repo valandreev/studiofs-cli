@@ -76,7 +76,7 @@ const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
-type FuseReply = Vec<u8>;
+const FUSE_WRITE_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE;
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
@@ -624,6 +624,27 @@ fn reply_loop(
     Ok(())
 }
 
+enum FuseReply {
+    Inline {
+        bytes: [u8; FUSE_WRITE_REPLY_SIZE],
+        len: usize,
+    },
+    Owned(Vec<u8>),
+}
+
+impl FuseReply {
+    fn inline(bytes: [u8; FUSE_WRITE_REPLY_SIZE], len: usize) -> Self {
+        Self::Inline { bytes, len }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
 fn spawn_loop<F>(
     name: &'static str,
     tx: Sender<io::Result<()>>,
@@ -1163,36 +1184,31 @@ fn init_out_payload_size(minor: u32) -> usize {
 }
 
 fn encode_data_reply(unique: u64, data: &[u8]) -> FuseReply {
-    let mut reply = vec![0_u8; FUSE_OUT_HEADER_SIZE + data.len()];
-    let mut offset = 0;
-    push_out_header(
-        &mut reply,
-        &mut offset,
-        unique,
-        0,
-        FUSE_OUT_HEADER_SIZE + data.len(),
-    );
-    reply[offset..].copy_from_slice(data);
-    reply
+    let reply_size = FUSE_OUT_HEADER_SIZE + data.len();
+    let header = encode_reply_header(unique, 0, reply_size);
+    if data.is_empty() {
+        let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
+        reply[..FUSE_OUT_HEADER_SIZE].copy_from_slice(&header);
+        return FuseReply::inline(reply, FUSE_OUT_HEADER_SIZE);
+    }
+
+    let mut reply = Vec::with_capacity(reply_size);
+    reply.extend_from_slice(&header);
+    reply.extend_from_slice(data);
+    FuseReply::Owned(reply)
 }
 
 fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
-    let mut reply = vec![0_u8; FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE];
+    let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
     let mut offset = 0;
-    push_out_header(
-        &mut reply,
-        &mut offset,
-        unique,
-        0,
-        FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE,
-    );
+    push_out_header(&mut reply, &mut offset, unique, 0, FUSE_WRITE_REPLY_SIZE);
     push_u32(&mut reply, &mut offset, written);
     push_u32(&mut reply, &mut offset, 0);
-    reply
+    FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
 }
 
 fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
-    let mut reply = vec![0_u8; FUSE_OUT_HEADER_SIZE];
+    let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
     let mut offset = 0;
     push_out_header(
         &mut reply,
@@ -1201,7 +1217,14 @@ fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
         -errno,
         FUSE_OUT_HEADER_SIZE,
     );
-    reply
+    FuseReply::inline(reply, FUSE_OUT_HEADER_SIZE)
+}
+
+fn encode_reply_header(unique: u64, error: i32, len: usize) -> [u8; FUSE_OUT_HEADER_SIZE] {
+    let mut header = [0_u8; FUSE_OUT_HEADER_SIZE];
+    let mut offset = 0;
+    push_out_header(&mut header, &mut offset, unique, error, len);
+    header
 }
 
 fn fuse_payload(item: &FuseWorkItem) -> &[u8] {
@@ -1797,17 +1820,18 @@ mod tests {
     #[test]
     fn error_reply_encoding_is_header_only() {
         let reply = encode_error_reply(7, libc::ENOSYS);
+        let reply = reply.as_slice();
 
         assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
         assert_eq!(
-            read_u32(&reply, 0).expect("reply len"),
+            read_u32(reply, 0).expect("reply len"),
             FUSE_OUT_HEADER_SIZE as u32
         );
         assert_eq!(
             i32::from_ne_bytes(reply[4..8].try_into().expect("i32")),
             -libc::ENOSYS
         );
-        assert_eq!(read_u64(&reply, 8).expect("unique"), 7);
+        assert_eq!(read_u64(reply, 8).expect("unique"), 7);
     }
 
     #[test]
@@ -1826,9 +1850,10 @@ mod tests {
             &work_item_with_payload(FUSE_WRITE, 80, attr.ino, &write_in(fh, 0, payload)),
         )
         .expect("write reply");
-        assert_ok_reply(&write, 80);
+        let write = write.as_slice();
+        assert_ok_reply(write, 80);
         assert_eq!(
-            read_u32(&write, FUSE_OUT_HEADER_SIZE).unwrap(),
+            read_u32(write, FUSE_OUT_HEADER_SIZE).unwrap(),
             payload.len() as u32
         );
 
@@ -1843,7 +1868,8 @@ mod tests {
             ),
         )
         .expect("read reply");
-        assert_ok_reply(&read, 81);
+        let read = read.as_slice();
+        assert_ok_reply(read, 81);
         assert_eq!(&read[FUSE_OUT_HEADER_SIZE..], payload);
 
         for (opcode, unique, body) in [
@@ -1857,7 +1883,8 @@ mod tests {
                 &work_item_with_payload(opcode, unique, attr.ino, &body),
             )
             .expect("barrier reply");
-            assert_ok_reply(&reply, unique);
+            let reply = reply.as_slice();
+            assert_ok_reply(reply, unique);
             assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
         }
 
