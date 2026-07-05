@@ -1134,6 +1134,8 @@ fn handle_fuse_ioctl(item: &FuseWorkItem) -> FuseReply {
     if out_size < expected {
         return encode_error_reply(unique, libc::EINVAL);
     }
+    // Linux copy/build tools use these as metadata probes; StudioFS has no
+    // ext-style inode flags or fsxattr project state to report.
     encode_ioctl_reply(unique, vec![0_u8; expected as usize])
 }
 
@@ -2006,39 +2008,15 @@ fn parse_rename_in(bytes: &[u8]) -> io::Result<(u64, &[u8], &[u8])> {
         ));
     }
     let names = &bytes[FUSE_RENAME_IN_SIZE..];
-    let old_end = names.iter().position(|byte| *byte == 0).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "FUSE_RENAME old name is not nul-terminated",
-        )
-    })?;
-    let new_name = names[old_end + 1..]
-        .strip_suffix(&[0])
-        .unwrap_or(&names[old_end + 1..]);
-    if new_name.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short FUSE_RENAME new name",
-        ));
-    }
-    Ok((read_u64(bytes, 0)?, &names[..old_end], new_name))
+    let (old_name, rest) = parse_nul_name(names, "FUSE_RENAME old name is not nul-terminated")?;
+    let (new_name, _) = parse_nul_name(rest, "short FUSE_RENAME new name")?;
+    Ok((read_u64(bytes, 0)?, old_name, new_name))
 }
 
 fn parse_two_names<'a>(bytes: &'a [u8], short: &str) -> io::Result<(&'a [u8], &'a [u8])> {
-    let first_end = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "first name is not nul-terminated",
-        )
-    })?;
-    let second = bytes[first_end + 1..]
-        .strip_suffix(&[0])
-        .unwrap_or(&bytes[first_end + 1..]);
-    if first_end == 0 || second.is_empty() {
-        Err(io::Error::new(io::ErrorKind::InvalidData, short))
-    } else {
-        Ok((&bytes[..first_end], second))
-    }
+    let (first, rest) = parse_nul_name(bytes, short)?;
+    let (second, _) = parse_nul_name(rest, short)?;
+    Ok((first, second))
 }
 
 fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
@@ -2056,14 +2034,23 @@ fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
 }
 
 fn parse_name<'a>(bytes: &'a [u8], offset: usize, short: &str) -> io::Result<&'a [u8]> {
-    let name = bytes
+    let bytes = bytes
         .get(offset..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, short))?;
-    let name = name.strip_suffix(&[0]).unwrap_or(name);
+    let (name, _) = parse_nul_name(bytes, short)?;
+    Ok(name)
+}
+
+fn parse_nul_name<'a>(bytes: &'a [u8], short: &str) -> io::Result<(&'a [u8], &'a [u8])> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, short))?;
+    let name = &bytes[..end];
     if name.is_empty() {
         Err(io::Error::new(io::ErrorKind::InvalidData, short))
     } else {
-        Ok(name)
+        Ok((name, &bytes[end + 1..]))
     }
 }
 
@@ -2618,6 +2605,25 @@ mod tests {
         let error = read_u32(&[0_u8; 3], 0).expect_err("short u32");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn nul_name_parsing_stops_at_first_terminator_before_padding() {
+        assert_eq!(
+            parse_name(b"child.txt\0\0\0", 0, "short name").expect("name"),
+            b"child.txt"
+        );
+        assert_eq!(
+            parse_two_names(b"link\0target\0\0\0", "short symlink").expect("two names"),
+            (&b"link"[..], &b"target"[..])
+        );
+
+        let mut rename = Vec::from(ROOT_INO.to_ne_bytes());
+        rename.extend_from_slice(b"old.txt\0new.txt\0\0\0");
+
+        let (_, old_name, new_name) = parse_rename_in(&rename).expect("rename");
+        assert_eq!(old_name, b"old.txt");
+        assert_eq!(new_name, b"new.txt");
     }
 
     #[test]
