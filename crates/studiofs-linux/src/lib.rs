@@ -24,7 +24,7 @@ use crossbeam_channel::{
 use studiofs_bridge::posix::{
     BridgeFileAttr, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::ROOT_INO;
+use studiofs_meta::{DirEntry, FileType, ROOT_INO};
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 
@@ -45,6 +45,7 @@ const FUSE_WRITE_OUT_SIZE: usize = 8;
 const FUSE_MKDIR_IN_SIZE: usize = 8;
 const FUSE_RENAME_IN_SIZE: usize = 8;
 const FUSE_ATTR_OUT_SIZE: usize = 104;
+const FUSE_DIRENT_SIZE: usize = 24;
 const FUSE_CREATE_IN_SIZE: usize = 16;
 const FUSE_ENTRY_OUT_SIZE: usize = 128;
 const FUSE_OPEN_OUT_SIZE: usize = 16;
@@ -67,7 +68,9 @@ const FUSE_WRITE: u32 = 16;
 const FUSE_RELEASE: u32 = 18;
 const FUSE_FSYNC: u32 = 20;
 const FUSE_FLUSH: u32 = 25;
+const FUSE_OPENDIR: u32 = 27;
 const FUSE_READDIR: u32 = 28;
+const FUSE_RELEASEDIR: u32 = 29;
 const FUSE_CREATE: u32 = 35;
 const FUSE_DESTROY: u32 = 38;
 const FUSE_BATCH_FORGET: u32 = 42;
@@ -844,7 +847,7 @@ fn join_fuse_workers(workers: Vec<thread::JoinHandle<io::Result<()>>>) -> io::Re
 fn stream_key_for(item: &FuseWorkItem) -> Option<(u64, Option<u64>)> {
     match item.header.opcode {
         FUSE_READ | FUSE_WRITE | FUSE_RELEASE | FUSE_FSYNC | FUSE_FLUSH | FUSE_READDIR
-        | FUSE_READDIRPLUS => Some((item.header.nodeid, fuse_request_fh(item))),
+        | FUSE_READDIRPLUS | FUSE_RELEASEDIR => Some((item.header.nodeid, fuse_request_fh(item))),
         _ => None,
     }
 }
@@ -888,6 +891,9 @@ fn handle_vfs_fuse_request(
         FUSE_UNLINK => handle_fuse_unlink(vfs, item),
         FUSE_RENAME => handle_fuse_rename(vfs, item),
         FUSE_OPEN => handle_fuse_open(vfs, item),
+        FUSE_OPENDIR => handle_fuse_opendir(item),
+        FUSE_READDIR => handle_fuse_readdir(vfs, item),
+        FUSE_RELEASEDIR => handle_fuse_releasedir(item),
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
         FUSE_CREATE => handle_fuse_create(vfs, item),
@@ -973,6 +979,41 @@ fn handle_fuse_open(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     match vfs.open_file(item.header.nodeid, open_flags, trunc) {
         Ok(fh) => encode_open_reply(unique, fh),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_opendir(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    if let Err(error) = parse_open_in(fuse_payload(item)) {
+        return encode_error_reply(unique, io_error_errno(&error));
+    }
+    encode_open_reply(unique, item.header.nodeid)
+}
+
+fn handle_fuse_readdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let input = match parse_read_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let offset = match usize::try_from(input.offset) {
+        Ok(offset) => offset,
+        Err(_) => return encode_error_reply(unique, libc::EINVAL),
+    };
+    match vfs.readdir(item.header.nodeid) {
+        Ok(entries) => encode_data_reply(
+            unique,
+            encode_dirents(item.header.nodeid, entries, offset, input.size as usize),
+        ),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_releasedir(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    match parse_release_in(fuse_payload(item)) {
+        Ok(_) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, io_error_errno(&error)),
     }
 }
 
@@ -1389,6 +1430,66 @@ fn encode_attr_reply(unique: u64, attr: &BridgeFileAttr) -> FuseReply {
         header: encode_reply_header(unique, 0, FUSE_ATTR_REPLY_SIZE),
         data,
     }
+}
+
+fn encode_dirents(ino: u64, entries: Vec<DirEntry>, offset: usize, size: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    if offset == 0 && !push_dirent(&mut data, size, ino, 1, FileType::Directory, b".") {
+        return data;
+    }
+    if offset <= 1 && !push_dirent(&mut data, size, ino, 2, FileType::Directory, b"..") {
+        return data;
+    }
+    for (index, entry) in entries
+        .into_iter()
+        .enumerate()
+        .skip(offset.saturating_sub(2))
+    {
+        let next_offset = (index + 3) as u64;
+        if !push_dirent(
+            &mut data,
+            size,
+            entry.ino,
+            next_offset,
+            entry.kind,
+            &entry.name,
+        ) {
+            break;
+        }
+    }
+    data
+}
+
+fn push_dirent(
+    data: &mut Vec<u8>,
+    size: usize,
+    ino: u64,
+    next_offset: u64,
+    kind: FileType,
+    name: &[u8],
+) -> bool {
+    let len = (FUSE_DIRENT_SIZE + name.len() + 7) & !7;
+    if data.len() + len > size {
+        return false;
+    }
+    let start = data.len();
+    data.resize(start + len, 0);
+    let mut offset = start;
+    push_u64(data, &mut offset, ino);
+    push_u64(data, &mut offset, next_offset);
+    push_u32(data, &mut offset, name.len() as u32);
+    push_u32(
+        data,
+        &mut offset,
+        match kind {
+            FileType::RegularFile => libc::DT_REG,
+            FileType::Directory => libc::DT_DIR,
+            FileType::Symlink => libc::DT_LNK,
+        }
+        .into(),
+    );
+    data[offset..offset + name.len()].copy_from_slice(name);
+    true
 }
 
 fn encode_entry_payload(attr: &BridgeFileAttr) -> Vec<u8> {
@@ -2333,6 +2434,55 @@ mod tests {
         .expect("open reply");
         assert_ok_reply(&open, 94);
         assert_ne!(read_u64(open.payload_slice(), 0).unwrap(), 0);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_readdir() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-readdir-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "readdir");
+        vfs.mkdir(ROOT_INO, b"subdir", 0, 0, 0o755).unwrap();
+        vfs.create(ROOT_INO, b"child.txt", 0, 0, 0o644).unwrap();
+
+        let mut opendir_payload = Vec::from((libc::O_RDONLY as u32).to_ne_bytes());
+        opendir_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let opendir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_OPENDIR, 95, ROOT_INO, &opendir_payload),
+        )
+        .expect("opendir reply");
+        assert_ok_reply(&opendir, 95);
+        let fh = read_u64(opendir.payload_slice(), 0).unwrap();
+
+        let readdir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_READDIR, 96, ROOT_INO, &read_in(fh, 0, 512)),
+        )
+        .expect("readdir reply");
+        assert_ok_reply(&readdir, 96);
+        assert!(
+            readdir
+                .payload_slice()
+                .windows(b"subdir".len())
+                .any(|window| window == b"subdir")
+        );
+        assert!(
+            readdir
+                .payload_slice()
+                .windows(b"child.txt".len())
+                .any(|window| window == b"child.txt")
+        );
+
+        let releasedir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_RELEASEDIR, 97, ROOT_INO, &release_in(fh)),
+        )
+        .expect("releasedir reply");
+        assert_ok_reply(&releasedir, 97);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
