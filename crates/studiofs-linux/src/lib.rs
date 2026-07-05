@@ -40,6 +40,8 @@ const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_GETATTR_IN_SIZE: usize = 16;
 const FUSE_OPEN_IN_SIZE: usize = 8;
 const FUSE_SETATTR_IN_SIZE: usize = 88;
+const FUSE_IOCTL_IN_SIZE: usize = 32;
+const FUSE_IOCTL_OUT_SIZE: usize = 16;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -75,6 +77,7 @@ const FUSE_READDIR: u32 = 28;
 const FUSE_RELEASEDIR: u32 = 29;
 const FUSE_CREATE: u32 = 35;
 const FUSE_DESTROY: u32 = 38;
+const FUSE_IOCTL: u32 = 39;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_KERNEL_VERSION: u32 = 7;
@@ -110,6 +113,11 @@ const FATTR_SUPPORTED: u32 = FATTR_MODE
     | FATTR_LOCKOWNER
     | FATTR_CTIME
     | FATTR_KILL_SUIDGID;
+const FS_IOC_GETFLAGS: u32 = 2_148_034_049;
+const FS_IOC32_GETFLAGS: u32 = 2_147_771_905;
+const FS_IOC_FSGETXATTR: u32 = 2_149_341_215;
+const FS_IOC_FLAGS_SIZE: u32 = 4;
+const FSXATTR_SIZE: u32 = 28;
 const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_AUTO_INVAL_DATA
@@ -921,6 +929,7 @@ fn handle_vfs_fuse_request(
         FUSE_OPENDIR => handle_fuse_opendir(item),
         FUSE_READDIR => handle_fuse_readdir(vfs, item),
         FUSE_RELEASEDIR => handle_fuse_releasedir(item),
+        FUSE_IOCTL => handle_fuse_ioctl(item),
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
         FUSE_CREATE => handle_fuse_create(vfs, item),
@@ -1054,6 +1063,23 @@ fn handle_fuse_releasedir(item: &FuseWorkItem) -> FuseReply {
         Ok(_) => encode_data_reply(unique, Vec::new()),
         Err(error) => encode_error_reply(unique, io_error_errno(&error)),
     }
+}
+
+fn handle_fuse_ioctl(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (cmd, out_size) = match parse_ioctl_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let expected = match cmd {
+        FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => FS_IOC_FLAGS_SIZE,
+        FS_IOC_FSGETXATTR => FSXATTR_SIZE,
+        _ => return encode_error_reply(unique, libc::ENOTTY),
+    };
+    if out_size < expected {
+        return encode_error_reply(unique, libc::EINVAL);
+    }
+    encode_ioctl_reply(unique, vec![0_u8; expected as usize])
 }
 
 fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
@@ -1471,6 +1497,20 @@ fn encode_attr_reply(unique: u64, attr: &BridgeFileAttr) -> FuseReply {
     }
 }
 
+fn encode_ioctl_reply(unique: u64, output: Vec<u8>) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_IOCTL_OUT_SIZE];
+    let mut offset = 0;
+    push_i32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    data.extend_from_slice(&output);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + data.len()),
+        data,
+    }
+}
+
 fn encode_dirents(ino: u64, entries: Vec<DirEntry>, offset: usize, size: usize) -> Vec<u8> {
     let mut data = Vec::new();
     if offset == 0 && !push_dirent(&mut data, size, ino, 1, FileType::Directory, b".") {
@@ -1729,6 +1769,16 @@ fn parse_setattr_in(bytes: &[u8]) -> io::Result<(Option<u64>, SetattrArgs)> {
         None
     };
     Ok((fh, args))
+}
+
+fn parse_ioctl_in(bytes: &[u8]) -> io::Result<(u32, u32)> {
+    if bytes.len() < FUSE_IOCTL_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_IOCTL request",
+        ));
+    }
+    Ok((read_u32(bytes, 12)?, read_u32(bytes, 28)?))
 }
 
 fn fuse_time_to_nanos(seconds: u64, nanos: u32) -> io::Result<i64> {
@@ -2609,6 +2659,35 @@ mod tests {
         assert_eq!(updated.mode, 0o600);
         assert_eq!(updated.size, 3);
         assert_eq!(updated.mtime, 10_000_000_020);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_answers_common_linux_ioctl_metadata_probes() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-ioctl-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "ioctl");
+        let attr = vfs.create(ROOT_INO, b"probe.txt", 0, 0, 0o644).unwrap();
+
+        for (cmd, out_size, unique) in [
+            (FS_IOC_GETFLAGS, FS_IOC_FLAGS_SIZE, 99_u64),
+            (FS_IOC32_GETFLAGS, FS_IOC_FLAGS_SIZE, 100_u64),
+            (FS_IOC_FSGETXATTR, FSXATTR_SIZE, 101_u64),
+        ] {
+            let mut payload = vec![0_u8; FUSE_IOCTL_IN_SIZE];
+            payload[12..16].copy_from_slice(&cmd.to_ne_bytes());
+            payload[28..32].copy_from_slice(&out_size.to_ne_bytes());
+            let reply = handle_vfs_fuse_request(
+                &vfs,
+                runtime.handle(),
+                &work_item_with_payload(FUSE_IOCTL, unique, attr.ino, &payload),
+            )
+            .expect("ioctl reply");
+
+            assert_ok_reply(&reply, unique);
+            assert_eq!(read_u32(reply.payload_slice(), 0).unwrap(), 0);
+            assert_eq!(&reply.payload_slice()[16..], vec![0_u8; out_size as usize]);
+        }
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
