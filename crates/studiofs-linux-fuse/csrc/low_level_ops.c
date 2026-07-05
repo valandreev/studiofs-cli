@@ -51,6 +51,10 @@ void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info, uint64_t fh
     info->cache_readdir = 1;
 }
 
+uint64_t studiofs_linux_fuse_file_info_fh(const struct fuse_file_info *info) {
+    return info->fh;
+}
+
 int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->lookup && ops->getattr && ops->setattr && ops->opendir &&
            ops->readdir && ops->releasedir && ops->statfs && ops->access;

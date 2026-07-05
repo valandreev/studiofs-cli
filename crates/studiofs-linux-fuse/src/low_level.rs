@@ -7,7 +7,7 @@ use std::sync::Arc;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{BridgeFileAttr, BridgeFileType, to_bridge_attr, vfs_err_to_errno};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{StatFs, StudioVfs};
+use studiofs_vfs::{DirEntryWithAttr, StatFs, StudioVfs};
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
@@ -96,6 +96,7 @@ unsafe extern "C" {
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
     fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
+    fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
     #[cfg(test)]
     fn studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(
         ops: *const raw::FuseLowLevelOps,
@@ -207,6 +208,7 @@ impl Drop for OwnedFuseArgs {
 
 pub(crate) struct Session {
     raw: NonNull<raw::FuseSession>,
+    _state: Option<Box<SessionState>>,
     signal_handlers_installed: bool,
 }
 
@@ -218,9 +220,10 @@ impl Session {
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(&mount_point.into())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
-        let userdata = Box::into_raw(Box::new(state)).cast::<c_void>();
+        let mut state = Box::new(state);
+        let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
         // SAFETY: the C shim expands libfuse's versioned session constructor.
-        // The ops table is static, and userdata is owned by libfuse until destroy.
+        // The ops table is static, and userdata points to state owned by Session.
         let raw = NonNull::new(unsafe {
             studiofs_linux_fuse_session_new(
                 args.as_mut_ptr(),
@@ -230,8 +233,6 @@ impl Session {
             )
         });
         let Some(raw) = raw else {
-            // SAFETY: session creation failed, so libfuse did not take userdata.
-            unsafe { drop(Box::from_raw(userdata.cast::<SessionState>())) };
             return Err(io::Error::other(
                 "libfuse3 failed to create low-level session",
             ));
@@ -242,6 +243,7 @@ impl Session {
         if mount_result == 0 {
             Ok(Self {
                 raw,
+                _state: Some(state),
                 signal_handlers_installed: false,
             })
         } else {
@@ -285,6 +287,7 @@ impl Session {
         if mount_result == 0 {
             Ok(Self {
                 raw,
+                _state: None,
                 signal_handlers_installed: false,
             })
         } else {
@@ -313,11 +316,7 @@ impl Session {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_destroy(userdata: *mut c_void) {
-    if !userdata.is_null() {
-        // SAFETY: userdata was allocated with `Box::into_raw` in `Session::mount`
-        // and libfuse calls destroy at most once for this session.
-        unsafe { drop(Box::from_raw(userdata.cast::<SessionState>())) };
-    }
+    let _ = userdata;
 }
 
 #[unsafe(no_mangle)]
@@ -401,7 +400,10 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
         return;
     };
     match state.getattr_attr(ino) {
-        Ok(attr) if attr.kind == FileType::Directory => reply_open(req, fi),
+        Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino) {
+            Ok(handle) => reply_open(req, fi, handle),
+            Err(errno) => reply_error(req, errno),
+        },
         Ok(_) => reply_error(req, libc::ENOTDIR),
         Err(errno) => reply_error(req, errno),
     }
@@ -413,13 +415,17 @@ pub extern "C" fn studiofs_linux_fuse_readdir(
     ino: raw::FuseIno,
     size: size_t,
     off: off_t,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    match state.readdir(req, ino, off, size) {
+    let Some(handle) = dir_handle(fi) else {
+        reply_error(req, libc::EBADF);
+        return;
+    };
+    match state.readdir(req, ino, handle, off, size) {
         Ok(buffer) => {
             let bytes = buffer.as_slice();
             // SAFETY: `bytes` is valid for this synchronous reply.
@@ -433,8 +439,13 @@ pub extern "C" fn studiofs_linux_fuse_readdir(
 pub extern "C" fn studiofs_linux_fuse_releasedir(
     req: *mut raw::FuseReq,
     _ino: raw::FuseIno,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
+    if let Some(handle) = dir_handle(fi) {
+        // SAFETY: `opendir` created this pointer with `Box::into_raw`, and
+        // libfuse calls `releasedir` once for each successful directory open.
+        unsafe { drop(Box::from_raw(handle.as_ptr())) };
+    }
     reply_error(req, 0);
 }
 
@@ -520,10 +531,20 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn open_dir(&self, ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
+        let entries = self
+            .vfs
+            .readdir_with_attrs(ino)
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        let raw = Box::into_raw(Box::new(DirectoryHandle { entries }));
+        NonNull::new(raw).ok_or(libc::ENOMEM)
+    }
+
     fn readdir(
         &self,
         req: *mut raw::FuseReq,
         ino: u64,
+        handle: NonNull<DirectoryHandle>,
         offset: off_t,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
@@ -543,10 +564,9 @@ impl SessionState {
             idx = 2;
         }
 
-        let entries = self
-            .vfs
-            .readdir_with_attrs(ino)
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        // SAFETY: `handle` comes from `opendir` and remains owned by the
+        // matching directory handle until `releasedir`.
+        let entries = unsafe { &handle.as_ref().entries };
         for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
             let attr = entry.attr.as_ref().map_or_else(
@@ -603,6 +623,20 @@ impl SessionState {
             LINUX_FUSE_BLOCK_SIZE,
         ))
     }
+}
+
+struct DirectoryHandle {
+    entries: Vec<DirEntryWithAttr>,
+}
+
+fn dir_handle(fi: *const raw::FuseFileInfo) -> Option<NonNull<DirectoryHandle>> {
+    if fi.is_null() {
+        return None;
+    }
+    // SAFETY: libfuse passes a live `fuse_file_info`; the C shim reads only
+    // the `fh` field using the system header layout.
+    let fh = unsafe { studiofs_linux_fuse_file_info_fh(fi) };
+    NonNull::new(fh as *mut DirectoryHandle)
 }
 
 fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {
@@ -737,15 +771,21 @@ fn reply_entry_result(
     }
 }
 
-fn reply_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo) {
+fn reply_open(
+    req: *mut raw::FuseReq,
+    fi: *mut raw::FuseFileInfo,
+    handle: NonNull<DirectoryHandle>,
+) {
     if fi.is_null() {
+        // SAFETY: ownership has not been handed to libfuse because `fi` is invalid.
+        unsafe { drop(Box::from_raw(handle.as_ptr())) };
         reply_error(req, libc::EINVAL);
         return;
     }
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, 0);
+        studiofs_linux_fuse_file_info_init(fi, handle.as_ptr() as u64);
         raw::fuse_reply_open(req, fi);
     }
 }
