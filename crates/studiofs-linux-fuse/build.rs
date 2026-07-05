@@ -1,3 +1,5 @@
+//! Build script for the Linux libfuse3 C shim.
+
 #[cfg(not(target_os = "linux"))]
 fn main() {}
 

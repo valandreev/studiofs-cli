@@ -1226,7 +1226,6 @@ impl PreparedMount {
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
-            #[cfg(not(target_os = "linux"))]
             runtime_handle: runtime.handle().clone(),
             mount_point: self.plan.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
@@ -2486,7 +2485,7 @@ mod tests {
     fn default_mount_backend_matches_platform() {
         let backend = default_mount_backend();
         #[cfg(target_os = "linux")]
-        assert_eq!(backend.name(), "unsupported-unix");
+        assert_eq!(backend.name(), "libfuse3");
         #[cfg(target_os = "macos")]
         assert_eq!(backend.name(), "macFUSE");
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]

@@ -2,7 +2,6 @@ use std::io;
 use std::sync::Arc;
 
 use studiofs_vfs::StudioVfs;
-#[cfg(not(target_os = "linux"))]
 use tokio::runtime::Handle;
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -10,7 +9,6 @@ pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
-    #[cfg(not(target_os = "linux"))]
     pub(crate) runtime_handle: Handle,
     pub(crate) mount_point: String,
     pub(crate) volume_name: String,
@@ -88,6 +86,7 @@ impl MountBackend for LinuxFuseMountBackend {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         let BackendLaunch {
             vfs,
+            runtime_handle: _runtime_handle,
             mount_point,
             volume_name,
             read_only,
