@@ -348,7 +348,7 @@ fn open_fuse_device() -> io::Result<File> {
 fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
     let mode = fuse_rootmode(mount_point)?;
     let options = format!(
-        "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions,fsname=studiofs,subtype=studiofs",
+        "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions",
         current_uid(),
         current_gid()
     );
