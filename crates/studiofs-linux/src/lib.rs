@@ -63,6 +63,14 @@ const FUSE_WRITE_OUT_SIZE: usize = 8;
 const FUSE_MKDIR_IN_SIZE: usize = 8;
 const FUSE_RENAME_IN_SIZE: usize = 8;
 const FUSE_ATTR_OUT_SIZE: usize = 104;
+#[cfg(test)]
+const FUSE_ATTR_OUT_ATTR_OFFSET: usize = 16;
+#[cfg(test)]
+const FUSE_ENTRY_OUT_ATTR_OFFSET: usize = 40;
+#[cfg(test)]
+const FUSE_ATTR_UID_OFFSET: usize = 68;
+#[cfg(test)]
+const FUSE_ATTR_GID_OFFSET: usize = 72;
 const FUSE_DIRENT_SIZE: usize = 24;
 const FUSE_CREATE_IN_SIZE: usize = 16;
 const FUSE_ENTRY_OUT_SIZE: usize = 128;
@@ -295,7 +303,7 @@ impl LinuxMountShell {
         self.request
             .vfs
             .getattr(ino)
-            .map(|attr| to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE))
+            .map(|attr| to_mount_bridge_attr(&attr))
             .map_err(io_error_from_vfs)
     }
 
@@ -307,7 +315,7 @@ impl LinuxMountShell {
         self.request
             .vfs
             .lookup(parent, name)
-            .map(|attr| to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE))
+            .map(|attr| to_mount_bridge_attr(&attr))
             .map_err(io_error_from_vfs)
     }
 
@@ -426,6 +434,15 @@ fn current_uid() -> libc::uid_t {
 fn current_gid() -> libc::gid_t {
     // SAFETY: getgid has no preconditions.
     unsafe { libc::getgid() }
+}
+
+fn mount_owner() -> (u32, u32) {
+    (current_uid(), current_gid())
+}
+
+fn to_mount_bridge_attr(attr: &studiofs_meta::InodeAttr) -> BridgeFileAttr {
+    let (uid, gid) = mount_owner();
+    to_bridge_attr(attr, uid, gid, DEFAULT_BLOCK_SIZE)
 }
 
 fn cstring(value: &str) -> io::Result<CString> {
@@ -978,7 +995,7 @@ fn handle_fuse_lookup(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     match vfs.lookup(item.header.nodeid, name) {
         Ok(attr) => FuseReply::Data {
             header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
-            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
         },
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
@@ -990,7 +1007,7 @@ fn handle_fuse_getattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         return encode_error_reply(unique, libc::EINVAL);
     }
     match vfs.getattr(item.header.nodeid) {
-        Ok(attr) => encode_attr_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        Ok(attr) => encode_attr_reply(unique, &to_mount_bridge_attr(&attr)),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -1002,7 +1019,7 @@ fn handle_fuse_setattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
     match vfs.setattr_with_handle(fh, item.header.nodeid, args) {
-        Ok(attr) => encode_attr_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        Ok(attr) => encode_attr_reply(unique, &to_mount_bridge_attr(&attr)),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -1021,10 +1038,11 @@ fn handle_fuse_symlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    match vfs.symlink(item.header.nodeid, name, target, 0, 0) {
+    let (uid, gid) = mount_owner();
+    match vfs.symlink(item.header.nodeid, name, target, uid, gid) {
         Ok(attr) => FuseReply::Data {
             header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
-            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
         },
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
@@ -1036,10 +1054,11 @@ fn handle_fuse_mkdir(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    match vfs.mkdir(item.header.nodeid, name, 0, 0, mode as u16 & 0o7777) {
+    let (uid, gid) = mount_owner();
+    match vfs.mkdir(item.header.nodeid, name, uid, gid, mode as u16 & 0o7777) {
         Ok(attr) => FuseReply::Data {
             header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
-            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
         },
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
@@ -1078,7 +1097,7 @@ fn handle_fuse_link(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     match vfs.link(source_ino, item.header.nodeid, name) {
         Ok(attr) => FuseReply::Data {
             header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
-            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
         },
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
@@ -1217,13 +1236,14 @@ fn handle_fuse_create(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    let attr = match vfs.create(item.header.nodeid, name, 0, 0, mode as u16 & 0o7777) {
+    let (uid, gid) = mount_owner();
+    let attr = match vfs.create(item.header.nodeid, name, uid, gid, mode as u16 & 0o7777) {
         Ok(attr) => attr,
         Err(error) => return encode_error_reply(unique, vfs_err_to_errno(&error)),
     };
     let (open_flags, trunc) = posix_flags_to_open_flags(flags as i32);
     match vfs.open_created_file_with_known_attr(&attr, open_flags, trunc) {
-        Ok(fh) => encode_create_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE), fh),
+        Ok(fh) => encode_create_reply(unique, &to_mount_bridge_attr(&attr), fh),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -2725,6 +2745,12 @@ mod tests {
         )
         .expect("create reply");
         assert_ok_reply(&create, 87);
+        assert_attr_owner(create.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let created = vfs
+            .lookup(ROOT_INO, b"exclusive.txt")
+            .expect("created file");
+        assert_eq!(created.uid, current_uid());
+        assert_eq!(created.gid, current_gid());
 
         let duplicate = handle_vfs_fuse_request(
             &vfs,
@@ -2752,7 +2778,10 @@ mod tests {
         )
         .expect("mkdir reply");
         assert_ok_reply(&mkdir, 89);
-        vfs.lookup(ROOT_INO, b"repo").expect("created directory");
+        assert_attr_owner(mkdir.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let dir = vfs.lookup(ROOT_INO, b"repo").expect("created directory");
+        assert_eq!(dir.uid, current_uid());
+        assert_eq!(dir.gid, current_gid());
 
         vfs.create(ROOT_INO, b".tmp-file", 0, 0, 0o644).unwrap();
         let mut rename_payload = Vec::from(ROOT_INO.to_ne_bytes());
@@ -2792,6 +2821,7 @@ mod tests {
         .expect("lookup reply");
         assert_ok_reply(&lookup, 92);
         assert_eq!(read_u64(lookup.payload_slice(), 0).unwrap(), attr.ino);
+        assert_attr_owner(lookup.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
 
         let getattr = handle_vfs_fuse_request(
             &vfs,
@@ -2801,6 +2831,7 @@ mod tests {
         .expect("getattr reply");
         assert_ok_reply(&getattr, 93);
         assert_eq!(read_u64(getattr.payload_slice(), 16).unwrap(), attr.ino);
+        assert_attr_owner(getattr.payload_slice(), FUSE_ATTR_OUT_ATTR_OFFSET);
 
         let mut open_payload = Vec::from((libc::O_RDONLY as u32).to_ne_bytes());
         open_payload.extend_from_slice(&0_u32.to_ne_bytes());
@@ -2889,6 +2920,7 @@ mod tests {
         )
         .expect("setattr reply");
         assert_ok_reply(&setattr, 98);
+        assert_attr_owner(setattr.payload_slice(), FUSE_ATTR_OUT_ATTR_OFFSET);
 
         let updated = vfs.getattr(attr.ino).unwrap();
         assert_eq!(updated.mode, 0o600);
@@ -3044,6 +3076,10 @@ mod tests {
         .expect("symlink reply");
         assert_ok_reply(&symlink, 109);
         let link_ino = read_u64(symlink.payload_slice(), 0).unwrap();
+        assert_attr_owner(symlink.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let link_attr = vfs.getattr(link_ino).expect("symlink attr");
+        assert_eq!(link_attr.uid, current_uid());
+        assert_eq!(link_attr.gid, current_gid());
 
         let readlink = handle_vfs_fuse_request(
             &vfs,
@@ -3063,6 +3099,7 @@ mod tests {
         )
         .expect("hardlink reply");
         assert_ok_reply(&hardlink, 111);
+        assert_attr_owner(hardlink.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
         assert_eq!(
             vfs.lookup(ROOT_INO, b"hard.txt").expect("hardlink").ino,
             file.ino
@@ -3780,6 +3817,17 @@ mod tests {
         assert_eq!(
             i32::from_ne_bytes(header[4..8].try_into().expect("reply error")),
             -errno
+        );
+    }
+
+    fn assert_attr_owner(payload: &[u8], attr_offset: usize) {
+        assert_eq!(
+            read_u32(payload, attr_offset + FUSE_ATTR_UID_OFFSET).unwrap(),
+            current_uid()
+        );
+        assert_eq!(
+            read_u32(payload, attr_offset + FUSE_ATTR_GID_OFFSET).unwrap(),
+            current_gid()
         );
     }
 }
