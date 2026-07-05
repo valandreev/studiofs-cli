@@ -215,10 +215,10 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn mount(
         state: SessionState,
-        mount_point: impl Into<PathBuf>,
+        mount_point: impl AsRef<std::path::Path>,
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
-        let mount_point = path_to_cstring(&mount_point.into())?;
+        let mount_point = path_to_cstring(mount_point.as_ref())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
         let mut state = Box::new(state);
         let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
@@ -266,10 +266,10 @@ impl Session {
 
     #[cfg(test)]
     fn mount_empty_for_test(
-        mount_point: impl Into<PathBuf>,
+        mount_point: impl AsRef<std::path::Path>,
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
-        let mount_point = path_to_cstring(&mount_point.into())?;
+        let mount_point = path_to_cstring(mount_point.as_ref())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
         // SAFETY: the C shim returns a static empty ops table; userdata is null
         // because no callbacks are installed in this lifecycle-only smoke.
@@ -329,10 +329,8 @@ pub extern "C" fn studiofs_linux_fuse_lookup(
         reply_error(req, libc::EIO);
         return;
     };
-    let name = name_bytes(name);
-    let result = name
-        .ok_or(libc::EINVAL)
-        .and_then(|name| state.lookup(parent, name));
+    let result =
+        with_name_bytes(name, |name| state.lookup(parent, name)).unwrap_or(Err(libc::EINVAL));
     reply_entry_result(req, state, result);
 }
 
@@ -494,13 +492,13 @@ fn callback_state(req: *mut raw::FuseReq) -> Option<&'static SessionState> {
     }
 }
 
-fn name_bytes(name: *const c_char) -> Option<&'static [u8]> {
+fn with_name_bytes<T>(name: *const c_char, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     if name.is_null() {
         return None;
     }
     // SAFETY: libfuse passes callback names as NUL-terminated strings valid
     // for the duration of the callback.
-    Some(unsafe { CStr::from_ptr(name) }.to_bytes())
+    Some(f(unsafe { CStr::from_ptr(name) }.to_bytes()))
 }
 
 impl SessionState {
@@ -532,6 +530,9 @@ impl SessionState {
     }
 
     fn open_dir(&self, ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
+        // SFS-604 snapshots each directory handle eagerly so Linux readdir offsets
+        // stay stable across chunked kernel reads. Replace with VFS cursors if
+        // huge-directory memory use shows up in workload evidence.
         let entries = self
             .vfs
             .readdir_with_attrs(ino)
@@ -690,6 +691,8 @@ fn file_type_mode(kind: BridgeFileType) -> mode_t {
 }
 
 fn system_time_parts(time: std::time::SystemTime) -> (libc::time_t, libc::c_long) {
+    // StudioFS metadata normally stores Unix-epoch times; clamp pre-epoch values
+    // to zero rather than reporting negative timestamps through this first Linux bridge slice.
     let duration = time
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
