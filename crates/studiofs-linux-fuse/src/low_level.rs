@@ -747,9 +747,11 @@ fn setattr_args(attr: *const stat, to_set: c_int) -> Result<SetattrArgs, i32> {
 }
 
 fn timespec_nanos(sec: libc::time_t, nsec: libc::c_long) -> Result<i64, i32> {
-    sec.checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(nsec))
-        .ok_or(libc::EOVERFLOW)
+    let nanos = i128::from(sec)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(nsec)))
+        .ok_or(libc::EOVERFLOW)?;
+    i64::try_from(nanos).map_err(|_| libc::EOVERFLOW)
 }
 
 fn reply_entry_result(
