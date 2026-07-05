@@ -40,7 +40,19 @@ const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_GETATTR_IN_SIZE: usize = 16;
 const FUSE_OPEN_IN_SIZE: usize = 8;
 const FUSE_SETATTR_IN_SIZE: usize = 88;
+const FUSE_SETATTR_VALID_OFFSET: usize = 0;
+const FUSE_SETATTR_FH_OFFSET: usize = 8;
+const FUSE_SETATTR_SIZE_OFFSET: usize = 16;
+const FUSE_SETATTR_ATIME_OFFSET: usize = 32;
+const FUSE_SETATTR_MTIME_OFFSET: usize = 40;
+const FUSE_SETATTR_ATIMENSEC_OFFSET: usize = 56;
+const FUSE_SETATTR_MTIMENSEC_OFFSET: usize = 60;
+const FUSE_SETATTR_MODE_OFFSET: usize = 68;
+const FUSE_SETATTR_UID_OFFSET: usize = 76;
+const FUSE_SETATTR_GID_OFFSET: usize = 80;
 const FUSE_IOCTL_IN_SIZE: usize = 32;
+const FUSE_IOCTL_CMD_OFFSET: usize = 12;
+const FUSE_IOCTL_OUT_SIZE_OFFSET: usize = 28;
 const FUSE_IOCTL_OUT_SIZE: usize = 16;
 const FUSE_GETXATTR_IN_SIZE: usize = 8;
 const FUSE_SETXATTR_IN_SIZE: usize = 16;
@@ -1855,41 +1867,41 @@ fn parse_setattr_in(bytes: &[u8]) -> io::Result<(Option<u64>, SetattrArgs)> {
             "short FUSE_SETATTR request",
         ));
     }
-    let valid = read_u32(bytes, 0)?;
+    let valid = read_u32(bytes, FUSE_SETATTR_VALID_OFFSET)?;
     if valid & !FATTR_SUPPORTED != 0 {
         return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     let mut args = SetattrArgs::default();
     if valid & FATTR_SIZE != 0 {
-        args.size = Some(read_u64(bytes, 16)?);
+        args.size = Some(read_u64(bytes, FUSE_SETATTR_SIZE_OFFSET)?);
     }
     if valid & FATTR_MODE != 0 {
-        args.mode = Some((read_u32(bytes, 68)? & 0o7777) as u16);
+        args.mode = Some((read_u32(bytes, FUSE_SETATTR_MODE_OFFSET)? & 0o7777) as u16);
     }
     if valid & FATTR_UID != 0 {
-        args.uid = Some(read_u32(bytes, 76)?);
+        args.uid = Some(read_u32(bytes, FUSE_SETATTR_UID_OFFSET)?);
     }
     if valid & FATTR_GID != 0 {
-        args.gid = Some(read_u32(bytes, 80)?);
+        args.gid = Some(read_u32(bytes, FUSE_SETATTR_GID_OFFSET)?);
     }
     if valid & FATTR_ATIME_NOW != 0 {
         args.atime = TimeSpec::Now;
     } else if valid & FATTR_ATIME != 0 {
         args.atime = TimeSpec::Set(fuse_time_to_nanos(
-            read_u64(bytes, 32)?,
-            read_u32(bytes, 56)?,
+            read_u64(bytes, FUSE_SETATTR_ATIME_OFFSET)?,
+            read_u32(bytes, FUSE_SETATTR_ATIMENSEC_OFFSET)?,
         )?);
     }
     if valid & FATTR_MTIME_NOW != 0 {
         args.mtime = TimeSpec::Now;
     } else if valid & FATTR_MTIME != 0 {
         args.mtime = TimeSpec::Set(fuse_time_to_nanos(
-            read_u64(bytes, 40)?,
-            read_u32(bytes, 60)?,
+            read_u64(bytes, FUSE_SETATTR_MTIME_OFFSET)?,
+            read_u32(bytes, FUSE_SETATTR_MTIMENSEC_OFFSET)?,
         )?);
     }
     let fh = if valid & FATTR_FH != 0 {
-        Some(read_u64(bytes, 8)?)
+        Some(read_u64(bytes, FUSE_SETATTR_FH_OFFSET)?)
     } else {
         None
     };
@@ -1903,7 +1915,10 @@ fn parse_ioctl_in(bytes: &[u8]) -> io::Result<(u32, u32)> {
             "short FUSE_IOCTL request",
         ));
     }
-    Ok((read_u32(bytes, 12)?, read_u32(bytes, 28)?))
+    Ok((
+        read_u32(bytes, FUSE_IOCTL_CMD_OFFSET)?,
+        read_u32(bytes, FUSE_IOCTL_OUT_SIZE_OFFSET)?,
+    ))
 }
 
 fn parse_setxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8], &[u8])> {
@@ -2868,11 +2883,16 @@ mod tests {
         let (runtime, vfs) = make_test_vfs(&tmp, "setattr");
         let attr = vfs.create(ROOT_INO, b"metadata.txt", 0, 0, 0o644).unwrap();
         let mut payload = vec![0_u8; FUSE_SETATTR_IN_SIZE];
-        payload[0..4].copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME).to_ne_bytes());
-        payload[16..24].copy_from_slice(&3_u64.to_ne_bytes());
-        payload[40..48].copy_from_slice(&10_u64.to_ne_bytes());
-        payload[60..64].copy_from_slice(&20_u32.to_ne_bytes());
-        payload[68..72].copy_from_slice(&0o600_u32.to_ne_bytes());
+        payload[FUSE_SETATTR_VALID_OFFSET..FUSE_SETATTR_VALID_OFFSET + 4]
+            .copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME).to_ne_bytes());
+        payload[FUSE_SETATTR_SIZE_OFFSET..FUSE_SETATTR_SIZE_OFFSET + 8]
+            .copy_from_slice(&3_u64.to_ne_bytes());
+        payload[FUSE_SETATTR_MTIME_OFFSET..FUSE_SETATTR_MTIME_OFFSET + 8]
+            .copy_from_slice(&10_u64.to_ne_bytes());
+        payload[FUSE_SETATTR_MTIMENSEC_OFFSET..FUSE_SETATTR_MTIMENSEC_OFFSET + 4]
+            .copy_from_slice(&20_u32.to_ne_bytes());
+        payload[FUSE_SETATTR_MODE_OFFSET..FUSE_SETATTR_MODE_OFFSET + 4]
+            .copy_from_slice(&0o600_u32.to_ne_bytes());
 
         let setattr = handle_vfs_fuse_request(
             &vfs,
@@ -2902,8 +2922,10 @@ mod tests {
             (FS_IOC_FSGETXATTR, FSXATTR_SIZE, 101_u64),
         ] {
             let mut payload = vec![0_u8; FUSE_IOCTL_IN_SIZE];
-            payload[12..16].copy_from_slice(&cmd.to_ne_bytes());
-            payload[28..32].copy_from_slice(&out_size.to_ne_bytes());
+            payload[FUSE_IOCTL_CMD_OFFSET..FUSE_IOCTL_CMD_OFFSET + 4]
+                .copy_from_slice(&cmd.to_ne_bytes());
+            payload[FUSE_IOCTL_OUT_SIZE_OFFSET..FUSE_IOCTL_OUT_SIZE_OFFSET + 4]
+                .copy_from_slice(&out_size.to_ne_bytes());
             let reply = handle_vfs_fuse_request(
                 &vfs,
                 runtime.handle(),
