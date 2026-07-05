@@ -21,7 +21,9 @@ use crossbeam_channel::{
     Receiver as WorkReceiver, Sender as WorkSender, TrySendError as WorkTrySendError,
     bounded as work_channel, select,
 };
-use studiofs_bridge::posix::{BridgeFileAttr, to_bridge_attr, vfs_err_to_errno};
+use studiofs_bridge::posix::{
+    BridgeFileAttr, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
+};
 use studiofs_meta::ROOT_INO;
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
@@ -38,6 +40,9 @@ const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
+const FUSE_CREATE_IN_SIZE: usize = 16;
+const FUSE_ENTRY_OUT_SIZE: usize = 128;
+const FUSE_OPEN_OUT_SIZE: usize = 16;
 const FUSE_FLUSH_IN_SIZE: usize = 24;
 const FUSE_RELEASE_IN_SIZE: usize = 24;
 const FUSE_FSYNC_IN_SIZE: usize = 16;
@@ -52,6 +57,7 @@ const FUSE_RELEASE: u32 = 18;
 const FUSE_FSYNC: u32 = 20;
 const FUSE_FLUSH: u32 = 25;
 const FUSE_READDIR: u32 = 28;
+const FUSE_CREATE: u32 = 35;
 const FUSE_DESTROY: u32 = 38;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_READDIRPLUS: u32 = 44;
@@ -79,6 +85,8 @@ const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
 const FUSE_WRITE_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE;
+const FUSE_CREATE_REPLY_SIZE: usize =
+    FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE;
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
@@ -863,11 +871,30 @@ fn handle_vfs_fuse_request(
     Some(match header.opcode {
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
+        FUSE_CREATE => handle_fuse_create(vfs, item),
         FUSE_FLUSH => handle_fuse_flush(vfs, runtime_handle, item),
         FUSE_FSYNC => handle_fuse_fsync(vfs, runtime_handle, item),
         FUSE_RELEASE => handle_fuse_release(vfs, runtime_handle, item),
         _ => encode_error_reply(header.unique, libc::ENOSYS),
     })
+}
+
+fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let input = match parse_create_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (flags, mode, name) = input;
+    let attr = match vfs.create(item.header.nodeid, name, 0, 0, mode as u16 & 0o7777) {
+        Ok(attr) => attr,
+        Err(error) => return encode_error_reply(unique, vfs_err_to_errno(&error)),
+    };
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags as i32);
+    match vfs.open_created_file_with_known_attr(&attr, open_flags, trunc) {
+        Ok(fh) => encode_create_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE), fh),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
 }
 
 fn handle_fuse_read(
@@ -1244,6 +1271,55 @@ fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
     FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
 }
 
+fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE];
+    let mut offset = 0;
+    let time_parts = |time: std::time::SystemTime| {
+        let duration = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (duration.as_secs(), duration.subsec_nanos())
+    };
+    let (atime, atimensec) = time_parts(attr.atime);
+    let (mtime, mtimensec) = time_parts(attr.mtime);
+    let (ctime, ctimensec) = time_parts(attr.ctime);
+    let file_type = match attr.kind {
+        studiofs_bridge::posix::BridgeFileType::RegularFile => libc::S_IFREG,
+        studiofs_bridge::posix::BridgeFileType::Directory => libc::S_IFDIR,
+        studiofs_bridge::posix::BridgeFileType::Symlink => libc::S_IFLNK,
+    };
+
+    push_u64(&mut data, &mut offset, attr.ino);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, attr.ino);
+    push_u64(&mut data, &mut offset, attr.size);
+    push_u64(&mut data, &mut offset, attr.blocks);
+    push_u64(&mut data, &mut offset, atime);
+    push_u64(&mut data, &mut offset, mtime);
+    push_u64(&mut data, &mut offset, ctime);
+    push_u32(&mut data, &mut offset, atimensec);
+    push_u32(&mut data, &mut offset, mtimensec);
+    push_u32(&mut data, &mut offset, ctimensec);
+    push_u32(&mut data, &mut offset, file_type | u32::from(attr.perm));
+    push_u32(&mut data, &mut offset, attr.nlink);
+    push_u32(&mut data, &mut offset, attr.uid);
+    push_u32(&mut data, &mut offset, attr.gid);
+    push_u32(&mut data, &mut offset, attr.rdev);
+    push_u32(&mut data, &mut offset, attr.blksize);
+    push_u32(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, fh);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_CREATE_REPLY_SIZE),
+        data,
+    }
+}
+
 fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
     let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
     let mut offset = 0;
@@ -1320,6 +1396,19 @@ fn parse_write_in(bytes: &[u8]) -> io::Result<FuseWriteIn<'_>> {
         flags: read_u32(bytes, 32)?,
         data,
     })
+}
+
+fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
+    if bytes.len() <= FUSE_CREATE_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_CREATE request",
+        ));
+    }
+    let name = bytes[FUSE_CREATE_IN_SIZE..]
+        .strip_suffix(&[0])
+        .unwrap_or(&bytes[FUSE_CREATE_IN_SIZE..]);
+    Ok((read_u32(bytes, 0)?, read_u32(bytes, 4)?, name))
 }
 
 fn write_sync_policy(flags: u32) -> LocalSyncPolicy {
@@ -1939,6 +2028,35 @@ mod tests {
         assert_eq!(snapshot.vfs_write_path.calls, 1);
         assert_eq!(snapshot.vfs_write_path.write_bytes, payload.len() as u64);
         assert!(snapshot.flush_barrier_calls >= 1);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_create_enforces_exclusive_create() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-create-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "create-exclusive");
+        let mut create_payload = vec![0_u8; FUSE_CREATE_IN_SIZE];
+        create_payload[0..4]
+            .copy_from_slice(&((libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u32).to_ne_bytes());
+        create_payload[4..8].copy_from_slice(&0o644_u32.to_ne_bytes());
+        create_payload.extend_from_slice(b"exclusive.txt\0");
+
+        let create = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_CREATE, 87, ROOT_INO, &create_payload),
+        )
+        .expect("create reply");
+        assert_ok_reply(&create, 87);
+
+        let duplicate = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_CREATE, 88, ROOT_INO, &create_payload),
+        )
+        .expect("duplicate create reply");
+        assert_error_reply(&duplicate, 88, libc::EEXIST);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
