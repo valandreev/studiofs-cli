@@ -616,8 +616,7 @@ fn reply_loop(
 ) -> io::Result<()> {
     while let Ok(reply) = reply_rx.recv() {
         metrics.reply_dequeued();
-        let slices = [IoSlice::new(reply.as_slice())];
-        write_vectored_fuse(&mut device, &slices).inspect_err(|_| {
+        reply.write_to(&mut device).inspect_err(|_| {
             metrics.reply_error_count.fetch_add(1, Ordering::Relaxed);
         })?;
     }
@@ -629,7 +628,10 @@ enum FuseReply {
         bytes: [u8; FUSE_WRITE_REPLY_SIZE],
         len: usize,
     },
-    Owned(Vec<u8>),
+    Data {
+        header: [u8; FUSE_OUT_HEADER_SIZE],
+        data: Vec<u8>,
+    },
 }
 
 impl FuseReply {
@@ -637,10 +639,42 @@ impl FuseReply {
         Self::Inline { bytes, len }
     }
 
-    fn as_slice(&self) -> &[u8] {
+    fn write_to(&self, device: &mut File) -> io::Result<()> {
         match self {
-            Self::Inline { bytes, len } => &bytes[..*len],
-            Self::Owned(bytes) => bytes.as_slice(),
+            Self::Inline { bytes, len } => {
+                write_vectored_fuse(device, &[IoSlice::new(&bytes[..*len])])
+            }
+            Self::Data { header, data } => {
+                let slices = [IoSlice::new(header), IoSlice::new(data)];
+                write_vectored_fuse(device, &slices)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wire_len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Data { data, .. } => FUSE_OUT_HEADER_SIZE + data.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn header_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, .. } => &bytes[..FUSE_OUT_HEADER_SIZE],
+            Self::Data { header, .. } => header,
+        }
+    }
+
+    #[cfg(test)]
+    fn payload_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } if *len > FUSE_OUT_HEADER_SIZE => {
+                &bytes[FUSE_OUT_HEADER_SIZE..*len]
+            }
+            Self::Inline { .. } => &[],
+            Self::Data { data, .. } => data,
         }
     }
 }
@@ -856,7 +890,7 @@ fn handle_fuse_read(
         Ok(read) => {
             out.truncate(read as usize);
             vfs.record_fuse_read_callback(out.len(), started.elapsed(), false);
-            encode_data_reply(unique, &out)
+            encode_data_reply(unique, out)
         }
         Err(error) => {
             vfs.record_fuse_read_callback(input.size as usize, started.elapsed(), true);
@@ -906,7 +940,7 @@ fn handle_fuse_flush(
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
     match runtime_handle.block_on(vfs.flush_fh(input)) {
-        Ok(()) => encode_data_reply(unique, &[]),
+        Ok(()) => encode_data_reply(unique, Vec::new()),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -923,7 +957,7 @@ fn handle_fuse_fsync(
     };
     let datasync = input & 1 != 0;
     match runtime_handle.block_on(vfs.fsync(item.header.nodeid, datasync)) {
-        Ok(()) => encode_data_reply(unique, &[]),
+        Ok(()) => encode_data_reply(unique, Vec::new()),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -939,7 +973,7 @@ fn handle_fuse_release(
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
     match runtime_handle.block_on(vfs.release_fh_with_outcome(input)) {
-        Ok(_) => encode_data_reply(unique, &[]),
+        Ok(_) => encode_data_reply(unique, Vec::new()),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -1183,7 +1217,7 @@ fn init_out_payload_size(minor: u32) -> usize {
     }
 }
 
-fn encode_data_reply(unique: u64, data: &[u8]) -> FuseReply {
+fn encode_data_reply(unique: u64, data: Vec<u8>) -> FuseReply {
     let reply_size = FUSE_OUT_HEADER_SIZE + data.len();
     let header = encode_reply_header(unique, 0, reply_size);
     if data.is_empty() {
@@ -1192,10 +1226,7 @@ fn encode_data_reply(unique: u64, data: &[u8]) -> FuseReply {
         return FuseReply::inline(reply, FUSE_OUT_HEADER_SIZE);
     }
 
-    let mut reply = Vec::with_capacity(reply_size);
-    reply.extend_from_slice(&header);
-    reply.extend_from_slice(data);
-    FuseReply::Owned(reply)
+    FuseReply::Data { header, data }
 }
 
 fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
@@ -1820,18 +1851,18 @@ mod tests {
     #[test]
     fn error_reply_encoding_is_header_only() {
         let reply = encode_error_reply(7, libc::ENOSYS);
-        let reply = reply.as_slice();
+        let header = reply.header_slice();
 
-        assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
+        assert_eq!(reply.wire_len(), FUSE_OUT_HEADER_SIZE);
         assert_eq!(
-            read_u32(reply, 0).expect("reply len"),
+            read_u32(header, 0).expect("reply len"),
             FUSE_OUT_HEADER_SIZE as u32
         );
         assert_eq!(
-            i32::from_ne_bytes(reply[4..8].try_into().expect("i32")),
+            i32::from_ne_bytes(header[4..8].try_into().expect("i32")),
             -libc::ENOSYS
         );
-        assert_eq!(read_u64(reply, 8).expect("unique"), 7);
+        assert_eq!(read_u64(header, 8).expect("unique"), 7);
     }
 
     #[test]
@@ -1850,10 +1881,9 @@ mod tests {
             &work_item_with_payload(FUSE_WRITE, 80, attr.ino, &write_in(fh, 0, payload)),
         )
         .expect("write reply");
-        let write = write.as_slice();
-        assert_ok_reply(write, 80);
+        assert_ok_reply(&write, 80);
         assert_eq!(
-            read_u32(write, FUSE_OUT_HEADER_SIZE).unwrap(),
+            read_u32(write.payload_slice(), 0).unwrap(),
             payload.len() as u32
         );
 
@@ -1868,9 +1898,8 @@ mod tests {
             ),
         )
         .expect("read reply");
-        let read = read.as_slice();
-        assert_ok_reply(read, 81);
-        assert_eq!(&read[FUSE_OUT_HEADER_SIZE..], payload);
+        assert_ok_reply(&read, 81);
+        assert_eq!(read.payload_slice(), payload);
 
         for (opcode, unique, body) in [
             (FUSE_FLUSH, 82, flush_in(fh)),
@@ -1883,9 +1912,8 @@ mod tests {
                 &work_item_with_payload(opcode, unique, attr.ino, &body),
             )
             .expect("barrier reply");
-            let reply = reply.as_slice();
-            assert_ok_reply(reply, unique);
-            assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE);
+            assert_ok_reply(&reply, unique);
+            assert_eq!(reply.wire_len(), FUSE_OUT_HEADER_SIZE);
         }
 
         let snapshot = vfs.write_path_observability_snapshot();
@@ -2535,11 +2563,12 @@ mod tests {
         bytes
     }
 
-    fn assert_ok_reply(reply: &[u8], unique: u64) {
-        assert_eq!(read_u32(reply, 0).unwrap() as usize, reply.len());
-        assert_eq!(read_u64(reply, 8).unwrap(), unique);
+    fn assert_ok_reply(reply: &FuseReply, unique: u64) {
+        let header = reply.header_slice();
+        assert_eq!(read_u32(header, 0).unwrap() as usize, reply.wire_len());
+        assert_eq!(read_u64(header, 8).unwrap(), unique);
         assert_eq!(
-            i32::from_ne_bytes(reply[4..8].try_into().expect("reply error")),
+            i32::from_ne_bytes(header[4..8].try_into().expect("reply error")),
             0
         );
     }
