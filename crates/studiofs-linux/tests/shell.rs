@@ -1,10 +1,16 @@
 //! Smoke tests for the clean Linux bridge shell.
 
+use std::ffi::CString;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use studiofs_data::DataStoreConfig;
-use studiofs_linux::{LinuxMountRequest, LinuxMountShell};
+use studiofs_linux::{LinuxMountRequest, LinuxMountShell, mount_with_request};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, ROOT_INO, RedbMetaEngine,
 };
@@ -35,7 +41,8 @@ fn make_vfs(tmp: &tempfile::TempDir) -> (Runtime, Arc<StudioVfs>) {
     let runtime = Runtime::new().expect("runtime");
     let _guard = runtime.enter();
     let meta = Arc::new(RedbMetaEngine::open(tmp.path().join("meta.redb")).expect("open redb"));
-    meta.init_root(0, 0).expect("init root");
+    meta.init_root(current_uid(), current_gid())
+        .expect("init root");
     let format_info = make_format_info("smoke");
     meta.set_format_info(&format_info).expect("set format info");
     let data_config = DataStoreConfig::from(&format_info);
@@ -51,6 +58,170 @@ fn make_vfs(tmp: &tempfile::TempDir) -> (Runtime, Arc<StudioVfs>) {
     .expect("create vfs");
     vfs.start().expect("start vfs");
     (runtime, vfs)
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+fn current_gid() -> u32 {
+    // SAFETY: getgid has no preconditions.
+    unsafe { libc::getgid() }
+}
+
+struct MountedFuse {
+    mount_point: PathBuf,
+    join: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl Drop for MountedFuse {
+    fn drop(&mut self) {
+        let _ = unmount(&self.mount_point);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn mount_background(
+    vfs: Arc<StudioVfs>,
+    runtime: &Runtime,
+    mount_point: PathBuf,
+) -> io::Result<MountedFuse> {
+    let request = LinuxMountRequest {
+        vfs,
+        runtime_handle: runtime.handle().clone(),
+        mount_point: mount_point.clone(),
+    };
+    let join = thread::spawn(move || mount_with_request(request));
+    for _ in 0..100 {
+        if mountinfo_contains(&mount_point)? {
+            return Ok(MountedFuse {
+                mount_point,
+                join: Some(join),
+            });
+        }
+        if join.is_finished() {
+            return match join.join() {
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(())) => Err(io::Error::other("FUSE mount exited before mountinfo")),
+                Err(_) => Err(io::Error::other("mount thread panicked")),
+            };
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mounted = MountedFuse {
+        mount_point,
+        join: Some(join),
+    };
+    drop(mounted);
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out waiting for FUSE mount",
+    ))
+}
+
+fn mount_background_or_skip(
+    vfs: Arc<StudioVfs>,
+    runtime: &Runtime,
+    mount_point: PathBuf,
+) -> Option<MountedFuse> {
+    match mount_background(vfs, runtime, mount_point) {
+        Ok(mount) => Some(mount),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            eprintln!("skipping real FUSE mount gate: {error}");
+            None
+        }
+        Err(error) => panic!("mount FUSE: {error}"),
+    }
+}
+
+fn mountinfo_contains(mount_point: &Path) -> io::Result<bool> {
+    let target = std::fs::canonicalize(mount_point)?;
+    let target = target.to_string_lossy();
+    Ok(std::fs::read_to_string("/proc/self/mountinfo")?
+        .lines()
+        .any(|line| mountinfo_line_matches(line, target.as_ref())))
+}
+
+fn mountinfo_line_matches(line: &str, target: &str) -> bool {
+    line.split_whitespace()
+        .nth(4)
+        .is_some_and(|mounted_at| mounted_at.replace("\\040", " ") == target)
+}
+
+fn unmount(mount_point: &Path) -> io::Result<()> {
+    let target = CString::new(mount_point.as_os_str().as_bytes())?;
+    let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeStats {
+    files: usize,
+    bytes: u64,
+}
+
+fn regular_file_stats(path: &Path) -> io::Result<TreeStats> {
+    let mut stats = TreeStats::default();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.is_dir() {
+            let child = regular_file_stats(&entry.path())?;
+            stats.files += child.files;
+            stats.bytes += child.bytes;
+        } else if metadata.is_file() {
+            stats.files += 1;
+            stats.bytes += metadata.len();
+        }
+    }
+    Ok(stats)
+}
+
+fn zero_byte_dotfiles(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = entry_path.symlink_metadata()?;
+        if metadata.is_dir() {
+            files.extend(zero_byte_dotfiles(&entry_path)?);
+        } else if metadata.is_file()
+            && metadata.len() == 0
+            && entry.file_name().as_encoded_bytes().starts_with(b".")
+        {
+            files.push(entry_path);
+        }
+    }
+    Ok(files)
+}
+
+fn make_repo_tree(root: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::create_dir_all(root.join("target/debug"))?;
+    std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"sample\"\n")?;
+    std::fs::write(root.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n")?;
+    std::fs::write(root.join(".gitignore"), b"/target\n")?;
+    std::fs::write(root.join("target/debug/cache.bin"), vec![7_u8; 4096])?;
+    std::os::unix::fs::symlink("src/lib.rs", root.join("lib-link.rs"))?;
+    std::fs::hard_link(root.join("Cargo.toml"), root.join("Cargo.lock.link"))?;
+    Ok(())
+}
+
+fn assert_command_success(command: &mut Command, name: &str) {
+    let status = command.status().expect(name);
+    assert!(status.success(), "{name} exited with {status}");
 }
 
 #[test]
@@ -81,4 +252,129 @@ fn unsupported_requests_return_enosys() {
     let err = LinuxMountShell::unsupported().expect_err("read unsupported");
 
     assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+}
+
+#[test]
+fn mountinfo_line_matches_escaped_spaces() {
+    let line = "36 25 0:32 / /tmp/studiofs\\040mount rw,nosuid,nodev - fuse studiofs rw";
+
+    assert!(mountinfo_line_matches(line, "/tmp/studiofs mount"));
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount(2) permission"]
+fn mounted_cp_a_repo_copy_preserves_regular_file_count_and_bytes() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("linux-mount-cp-a-");
+    let source = tmp.path().join("source-repo");
+    let mount_point = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_point).expect("create mount point");
+    make_repo_tree(&source).expect("create source repo");
+    let expected = regular_file_stats(&source).expect("source stats");
+
+    let (runtime, vfs) = make_vfs(&tmp);
+    let Some(mount) = mount_background_or_skip(vfs.clone(), &runtime, mount_point.clone()) else {
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+        return;
+    };
+    let copies = mount_point.join("copies");
+    std::fs::create_dir(&copies).expect("mkdir through FUSE");
+    assert_command_success(
+        Command::new("cp").arg("-a").arg(&source).arg(&copies),
+        "cp -a",
+    );
+    let actual = regular_file_stats(&copies.join("source-repo")).expect("copied stats");
+
+    drop(mount);
+    runtime.block_on(vfs.shutdown(Duration::ZERO));
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount(2) permission"]
+fn mounted_rsync_a_repo_copy_preserves_regular_files_without_zero_byte_temp_leftovers() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("linux-mount-rsync-a-");
+    let source = tmp.path().join("source-repo");
+    let mount_point = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_point).expect("create mount point");
+    make_repo_tree(&source).expect("create source repo");
+    let expected = regular_file_stats(&source).expect("source stats");
+
+    let (runtime, vfs) = make_vfs(&tmp);
+    let Some(mount) = mount_background_or_skip(vfs.clone(), &runtime, mount_point.clone()) else {
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+        return;
+    };
+    let copy = mount_point.join("rsync-copy");
+    std::fs::create_dir(&copy).expect("mkdir through FUSE");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "rsync -a",
+    );
+    let actual = regular_file_stats(&copy).expect("copied stats");
+    let leftovers = zero_byte_dotfiles(&copy).expect("temp leftovers");
+
+    drop(mount);
+    runtime.block_on(vfs.shutdown(Duration::ZERO));
+
+    assert_eq!(actual, expected);
+    assert!(
+        leftovers.is_empty(),
+        "zero-byte temp leftovers: {leftovers:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount(2) permission"]
+fn mounted_rsync_inplace_updates_existing_files() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("linux-mount-rsync-inplace-");
+    let source = tmp.path().join("source-repo");
+    let mount_point = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_point).expect("create mount point");
+    make_repo_tree(&source).expect("create source repo");
+
+    let (runtime, vfs) = make_vfs(&tmp);
+    let Some(mount) = mount_background_or_skip(vfs.clone(), &runtime, mount_point.clone()) else {
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+        return;
+    };
+    let copy = mount_point.join("rsync-inplace-copy");
+    std::fs::create_dir(&copy).expect("mkdir through FUSE");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "seed rsync -a",
+    );
+
+    let updated_lib = b"pub fn answer() -> u16 { 9001 }\n";
+    std::fs::write(source.join("src/lib.rs"), updated_lib).expect("update source file");
+    std::fs::write(source.join("target/debug/cache.bin"), vec![9_u8; 8192])
+        .expect("update source blob");
+    let expected = regular_file_stats(&source).expect("source stats");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg("--inplace")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "rsync --inplace",
+    );
+    let actual = regular_file_stats(&copy).expect("copied stats");
+    let copied_lib = std::fs::read(copy.join("src/lib.rs")).expect("read copied file");
+    let leftovers = zero_byte_dotfiles(&copy).expect("temp leftovers");
+
+    drop(mount);
+    runtime.block_on(vfs.shutdown(Duration::ZERO));
+
+    assert_eq!(actual, expected);
+    assert_eq!(copied_lib, updated_lib);
+    assert!(
+        leftovers.is_empty(),
+        "zero-byte temp leftovers: {leftovers:?}"
+    );
 }

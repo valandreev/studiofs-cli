@@ -21,8 +21,10 @@ use crossbeam_channel::{
     Receiver as WorkReceiver, Sender as WorkSender, TrySendError as WorkTrySendError,
     bounded as work_channel, select,
 };
-use studiofs_bridge::posix::{BridgeFileAttr, to_bridge_attr, vfs_err_to_errno};
-use studiofs_meta::ROOT_INO;
+use studiofs_bridge::posix::{
+    BridgeFileAttr, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
+};
+use studiofs_meta::{DirEntry, FileType, ROOT_INO, SetattrArgs, TimeSpec};
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 
@@ -35,24 +37,77 @@ const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_FH_SIZE: usize = 8;
 const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
+const FUSE_GETATTR_IN_SIZE: usize = 16;
+const FUSE_OPEN_IN_SIZE: usize = 8;
+const FUSE_SETATTR_IN_SIZE: usize = 88;
+const FUSE_SETATTR_VALID_OFFSET: usize = 0;
+const FUSE_SETATTR_FH_OFFSET: usize = 8;
+const FUSE_SETATTR_SIZE_OFFSET: usize = 16;
+const FUSE_SETATTR_ATIME_OFFSET: usize = 32;
+const FUSE_SETATTR_MTIME_OFFSET: usize = 40;
+const FUSE_SETATTR_ATIMENSEC_OFFSET: usize = 56;
+const FUSE_SETATTR_MTIMENSEC_OFFSET: usize = 60;
+const FUSE_SETATTR_MODE_OFFSET: usize = 68;
+const FUSE_SETATTR_UID_OFFSET: usize = 76;
+const FUSE_SETATTR_GID_OFFSET: usize = 80;
+const FUSE_IOCTL_IN_SIZE: usize = 32;
+const FUSE_IOCTL_CMD_OFFSET: usize = 12;
+const FUSE_IOCTL_OUT_SIZE_OFFSET: usize = 28;
+const FUSE_IOCTL_OUT_SIZE: usize = 16;
+const FUSE_GETXATTR_IN_SIZE: usize = 8;
+const FUSE_SETXATTR_IN_SIZE: usize = 16;
+const FUSE_LINK_IN_SIZE: usize = 8;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
+const FUSE_MKDIR_IN_SIZE: usize = 8;
+const FUSE_RENAME_IN_SIZE: usize = 8;
+const FUSE_ATTR_OUT_SIZE: usize = 104;
+#[cfg(test)]
+const FUSE_ATTR_OUT_ATTR_OFFSET: usize = 16;
+#[cfg(test)]
+const FUSE_ENTRY_OUT_ATTR_OFFSET: usize = 40;
+#[cfg(test)]
+const FUSE_ATTR_UID_OFFSET: usize = 68;
+#[cfg(test)]
+const FUSE_ATTR_GID_OFFSET: usize = 72;
+const FUSE_DIRENT_SIZE: usize = 24;
+const FUSE_CREATE_IN_SIZE: usize = 16;
+const FUSE_ENTRY_OUT_SIZE: usize = 128;
+const FUSE_OPEN_OUT_SIZE: usize = 16;
 const FUSE_FLUSH_IN_SIZE: usize = 24;
 const FUSE_RELEASE_IN_SIZE: usize = 24;
 const FUSE_FSYNC_IN_SIZE: usize = 16;
 const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 const FUSE_INIT_OUT_SIZE: usize = 64;
+const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
+const FUSE_GETATTR: u32 = 3;
+const FUSE_SETATTR: u32 = 4;
+const FUSE_READLINK: u32 = 5;
+const FUSE_SYMLINK: u32 = 6;
+const FUSE_MKDIR: u32 = 9;
+const FUSE_UNLINK: u32 = 10;
+const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
+const FUSE_OPEN: u32 = 14;
 const FUSE_INIT: u32 = 26;
 const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
 const FUSE_RELEASE: u32 = 18;
 const FUSE_FSYNC: u32 = 20;
+const FUSE_SETXATTR: u32 = 21;
+const FUSE_GETXATTR: u32 = 22;
+const FUSE_LISTXATTR: u32 = 23;
+const FUSE_REMOVEXATTR: u32 = 24;
 const FUSE_FLUSH: u32 = 25;
+const FUSE_OPENDIR: u32 = 27;
 const FUSE_READDIR: u32 = 28;
+const FUSE_RELEASEDIR: u32 = 29;
+const FUSE_CREATE: u32 = 35;
 const FUSE_DESTROY: u32 = 38;
+const FUSE_IOCTL: u32 = 39;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_KERNEL_VERSION: u32 = 7;
@@ -64,6 +119,20 @@ const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 const FUSE_MAX_PAGES: u32 = 1 << 22;
 const FUSE_FSYNC_DATASYNC: u32 = 1;
 const FUSE_WRITE_SYNC_FLAGS: u32 = (libc::O_SYNC | libc::O_DSYNC) as u32;
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_ATIME: u32 = 1 << 4;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_FH: u32 = 1 << 6;
+const FATTR_ATIME_NOW: u32 = 1 << 7;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
+const FS_IOC_GETFLAGS: u32 = 2_148_034_049;
+const FS_IOC32_GETFLAGS: u32 = 2_147_771_905;
+const FS_IOC_FSGETXATTR: u32 = 2_149_341_215;
+const FS_IOC_FLAGS_SIZE: u32 = 4;
+const FSXATTR_SIZE: u32 = 28;
 const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_AUTO_INVAL_DATA
@@ -78,7 +147,11 @@ const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
+const FUSE_ATTR_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE;
+const FUSE_OPEN_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE;
 const FUSE_WRITE_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE;
+const FUSE_CREATE_REPLY_SIZE: usize =
+    FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE;
 
 /// Linux bridge launch request owned by the CLI boundary.
 pub struct LinuxMountRequest {
@@ -215,7 +288,7 @@ impl LinuxMountShell {
         self.request
             .vfs
             .getattr(ino)
-            .map(|attr| to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE))
+            .map(|attr| to_mount_bridge_attr(&attr))
             .map_err(io_error_from_vfs)
     }
 
@@ -227,7 +300,7 @@ impl LinuxMountShell {
         self.request
             .vfs
             .lookup(parent, name)
-            .map(|attr| to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE))
+            .map(|attr| to_mount_bridge_attr(&attr))
             .map_err(io_error_from_vfs)
     }
 
@@ -279,11 +352,7 @@ fn open_fuse_device() -> io::Result<File> {
 
 fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
     let mode = fuse_rootmode(mount_point)?;
-    let options = format!(
-        "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions,fsname=studiofs,subtype=studiofs",
-        current_uid(),
-        current_gid()
-    );
+    let options = fuse_mount_options(fd, mode, current_uid(), current_gid());
     let source = cstring(FUSE_SOURCE)?;
     let target = cstring_path(mount_point)?;
     let fstype = cstring(FUSE_MOUNT_TYPE)?;
@@ -321,6 +390,12 @@ fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
     ))
 }
 
+fn fuse_mount_options(fd: RawFd, mode: u32, uid: libc::uid_t, gid: libc::gid_t) -> String {
+    format!(
+        "fd={fd},rootmode={mode:o},user_id={uid},group_id={gid},default_permissions,fsname={FUSE_SOURCE},subtype={FUSE_SOURCE}"
+    )
+}
+
 fn fuse_rootmode(mount_point: &Path) -> io::Result<u32> {
     let permissions = std::fs::metadata(mount_point)
         .map_err(|error| {
@@ -346,6 +421,15 @@ fn current_uid() -> libc::uid_t {
 fn current_gid() -> libc::gid_t {
     // SAFETY: getgid has no preconditions.
     unsafe { libc::getgid() }
+}
+
+fn mount_owner() -> (u32, u32) {
+    (current_uid(), current_gid())
+}
+
+fn to_mount_bridge_attr(attr: &studiofs_meta::InodeAttr) -> BridgeFileAttr {
+    let (uid, gid) = mount_owner();
+    to_bridge_attr(attr, uid, gid, DEFAULT_BLOCK_SIZE)
 }
 
 fn cstring(value: &str) -> io::Result<CString> {
@@ -823,7 +907,7 @@ fn join_fuse_workers(workers: Vec<thread::JoinHandle<io::Result<()>>>) -> io::Re
 fn stream_key_for(item: &FuseWorkItem) -> Option<(u64, Option<u64>)> {
     match item.header.opcode {
         FUSE_READ | FUSE_WRITE | FUSE_RELEASE | FUSE_FSYNC | FUSE_FLUSH | FUSE_READDIR
-        | FUSE_READDIRPLUS => Some((item.header.nodeid, fuse_request_fh(item))),
+        | FUSE_READDIRPLUS | FUSE_RELEASEDIR => Some((item.header.nodeid, fuse_request_fh(item))),
         _ => None,
     }
 }
@@ -861,17 +945,312 @@ fn handle_vfs_fuse_request(
     }
     let started = Instant::now();
     Some(match header.opcode {
-        FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
+        FUSE_LOOKUP => handle_fuse_lookup(vfs.as_ref(), item),
+        FUSE_GETATTR => handle_fuse_getattr(vfs.as_ref(), item),
+        FUSE_SETATTR => handle_fuse_setattr(vfs.as_ref(), item),
+        FUSE_READLINK => handle_fuse_readlink(vfs.as_ref(), item),
+        FUSE_SYMLINK => handle_fuse_symlink(vfs.as_ref(), item),
+        FUSE_MKDIR => handle_fuse_mkdir(vfs.as_ref(), item),
+        FUSE_UNLINK => handle_fuse_unlink(vfs.as_ref(), item),
+        FUSE_RENAME => handle_fuse_rename(vfs.as_ref(), item),
+        FUSE_LINK => handle_fuse_link(vfs.as_ref(), item),
+        FUSE_OPEN => handle_fuse_open(vfs.as_ref(), item),
+        FUSE_OPENDIR => handle_fuse_opendir(item),
+        FUSE_READDIR => handle_fuse_readdir(vfs.as_ref(), item),
+        FUSE_RELEASEDIR => handle_fuse_releasedir(item),
+        FUSE_IOCTL => handle_fuse_ioctl(item),
+        FUSE_SETXATTR => handle_fuse_setxattr(vfs.as_ref(), item),
+        FUSE_GETXATTR => handle_fuse_getxattr(vfs.as_ref(), item),
+        FUSE_LISTXATTR => handle_fuse_listxattr(vfs.as_ref(), item),
+        FUSE_REMOVEXATTR => handle_fuse_removexattr(vfs.as_ref(), item),
+        FUSE_READ => handle_fuse_read(vfs.as_ref(), runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
-        FUSE_FLUSH => handle_fuse_flush(vfs, runtime_handle, item),
-        FUSE_FSYNC => handle_fuse_fsync(vfs, runtime_handle, item),
-        FUSE_RELEASE => handle_fuse_release(vfs, runtime_handle, item),
+        FUSE_CREATE => handle_fuse_create(vfs.as_ref(), item),
+        FUSE_FLUSH => handle_fuse_flush(vfs.as_ref(), runtime_handle, item),
+        FUSE_FSYNC => handle_fuse_fsync(vfs.as_ref(), runtime_handle, item),
+        FUSE_RELEASE => handle_fuse_release(vfs.as_ref(), runtime_handle, item),
         _ => encode_error_reply(header.unique, libc::ENOSYS),
     })
 }
 
+fn handle_fuse_lookup(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_LOOKUP request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.lookup(item.header.nodeid, name) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_getattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    if fuse_payload(item).len() < FUSE_GETATTR_IN_SIZE {
+        return encode_error_reply(unique, libc::EINVAL);
+    }
+    match vfs.getattr(item.header.nodeid) {
+        Ok(attr) => encode_attr_reply(unique, &to_mount_bridge_attr(&attr)),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_setattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (fh, args) = match parse_setattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.setattr_with_handle(fh, item.header.nodeid, args) {
+        Ok(attr) => encode_attr_reply(unique, &to_mount_bridge_attr(&attr)),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_readlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    match vfs.readlink(item.header.nodeid) {
+        Ok(target) => encode_data_reply(unique, target),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_symlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (name, target) = match parse_two_names(fuse_payload(item), "short FUSE_SYMLINK request") {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (uid, gid) = mount_owner();
+    match vfs.symlink(item.header.nodeid, name, target, uid, gid) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_mkdir(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (mode, name) = match parse_mkdir_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (uid, gid) = mount_owner();
+    match vfs.mkdir(item.header.nodeid, name, uid, gid, mode as u16 & 0o7777) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_unlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_UNLINK request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.unlink(item.header.nodeid, name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_rename(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (new_parent, name, new_name) = match parse_rename_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.rename(item.header.nodeid, name, new_parent, new_name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_link(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (source_ino, name) = match parse_link_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.link(source_ino, item.header.nodeid, name) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_mount_bridge_attr(&attr)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_open(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let flags = match parse_open_in(fuse_payload(item)) {
+        Ok(flags) => flags,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags as i32);
+    match vfs.open_file(item.header.nodeid, open_flags, trunc) {
+        Ok(fh) => encode_open_reply(unique, fh),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_opendir(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    if let Err(error) = parse_open_in(fuse_payload(item)) {
+        return encode_error_reply(unique, io_error_errno(&error));
+    }
+    encode_open_reply(unique, item.header.nodeid)
+}
+
+fn handle_fuse_readdir(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let input = match parse_read_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let offset = match usize::try_from(input.offset) {
+        Ok(offset) => offset,
+        Err(_) => return encode_error_reply(unique, libc::EINVAL),
+    };
+    match vfs.readdir(item.header.nodeid) {
+        Ok(entries) => encode_data_reply(
+            unique,
+            encode_dirents(item.header.nodeid, entries, offset, input.size as usize),
+        ),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_releasedir(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    match parse_release_in(fuse_payload(item)) {
+        Ok(_) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, io_error_errno(&error)),
+    }
+}
+
+fn handle_fuse_ioctl(item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (cmd, out_size) = match parse_ioctl_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let expected = match cmd {
+        FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => FS_IOC_FLAGS_SIZE,
+        FS_IOC_FSGETXATTR => FSXATTR_SIZE,
+        _ => return encode_error_reply(unique, libc::ENOTTY),
+    };
+    if out_size < expected {
+        return encode_error_reply(unique, libc::EINVAL);
+    }
+    // Linux copy/build tools use these as metadata probes; StudioFS has no
+    // ext-style inode flags or fsxattr project state to report.
+    encode_ioctl_reply(unique, vec![0_u8; expected as usize])
+}
+
+fn handle_fuse_setxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (flags, name, value) = match parse_setxattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.set_xattr(item.header.nodeid, name, value, flags) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_getxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (size, name) = match parse_getxattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.get_xattr(item.header.nodeid, name) {
+        Ok(Some(value)) if size == 0 => encode_xattr_size_reply(unique, value.len()),
+        Ok(Some(value)) if value.len() <= size as usize => encode_data_reply(unique, value),
+        Ok(Some(_)) => encode_error_reply(unique, libc::ERANGE),
+        Ok(None) => encode_error_reply(
+            unique,
+            xattr_missing_value_errno(vfs, item.header.nodeid).unwrap_or(libc::ENODATA),
+        ),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_listxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let size = match parse_xattr_size_in(fuse_payload(item), "short FUSE_LISTXATTR request") {
+        Ok(size) => size,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.list_xattrs(item.header.nodeid) {
+        Ok(names) => {
+            let missing_errno = names
+                .is_empty()
+                .then(|| xattr_missing_value_errno(vfs, item.header.nodeid))
+                .flatten();
+            if let Some(errno) = missing_errno {
+                return encode_error_reply(unique, errno);
+            }
+            let data = format_xattr_name_list(&names);
+            if size == 0 {
+                encode_xattr_size_reply(unique, data.len())
+            } else if data.len() <= size as usize {
+                encode_data_reply(unique, data)
+            } else {
+                encode_error_reply(unique, libc::ERANGE)
+            }
+        }
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn xattr_missing_value_errno(vfs: &StudioVfs, ino: u64) -> Option<i32> {
+    vfs.getattr(ino).err().map(|error| vfs_err_to_errno(&error))
+}
+
+fn handle_fuse_removexattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_REMOVEXATTR request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.remove_xattr(item.header.nodeid, name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_create(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (flags, mode, name) = match parse_create_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    let (uid, gid) = mount_owner();
+    let attr = match vfs.create(item.header.nodeid, name, uid, gid, mode as u16 & 0o7777) {
+        Ok(attr) => attr,
+        Err(error) => return encode_error_reply(unique, vfs_err_to_errno(&error)),
+    };
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags as i32);
+    match vfs.open_created_file_with_known_attr(&attr, open_flags, trunc) {
+        Ok(fh) => encode_create_reply(unique, &to_mount_bridge_attr(&attr), fh),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
 fn handle_fuse_read(
-    vfs: &Arc<StudioVfs>,
+    vfs: &StudioVfs,
     runtime_handle: &Handle,
     item: &FuseWorkItem,
     started: Instant,
@@ -935,11 +1314,7 @@ fn handle_fuse_write(
     }
 }
 
-fn handle_fuse_flush(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_flush(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_flush_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -951,11 +1326,7 @@ fn handle_fuse_flush(
     }
 }
 
-fn handle_fuse_fsync(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_fsync(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_fsync_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -968,11 +1339,7 @@ fn handle_fuse_fsync(
     }
 }
 
-fn handle_fuse_release(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_release(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_release_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1244,6 +1611,176 @@ fn encode_write_reply(unique: u64, written: u32) -> FuseReply {
     FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
 }
 
+fn encode_open_reply(unique: u64, fh: u64) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_OPEN_OUT_SIZE];
+    let mut offset = 0;
+    push_open_out(&mut data, &mut offset, fh);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_OPEN_REPLY_SIZE),
+        data,
+    }
+}
+
+fn encode_attr_reply(unique: u64, attr: &BridgeFileAttr) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_ATTR_OUT_SIZE];
+    let mut offset = 0;
+    push_u64(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_fuse_attr(&mut data, &mut offset, attr);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_ATTR_REPLY_SIZE),
+        data,
+    }
+}
+
+fn encode_ioctl_reply(unique: u64, output: Vec<u8>) -> FuseReply {
+    let mut data = vec![0_u8; FUSE_IOCTL_OUT_SIZE];
+    let mut offset = 0;
+    push_i32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    data.extend_from_slice(&output);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + data.len()),
+        data,
+    }
+}
+
+fn encode_xattr_size_reply(unique: u64, size: usize) -> FuseReply {
+    let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
+    let mut offset = 0;
+    push_out_header(&mut reply, &mut offset, unique, 0, FUSE_WRITE_REPLY_SIZE);
+    push_u32(&mut reply, &mut offset, size as u32);
+    push_u32(&mut reply, &mut offset, 0);
+    FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
+}
+
+fn encode_dirents(ino: u64, entries: Vec<DirEntry>, offset: usize, size: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    if offset == 0 && !push_dirent(&mut data, size, ino, 1, FileType::Directory, b".") {
+        return data;
+    }
+    if offset <= 1 && !push_dirent(&mut data, size, ino, 2, FileType::Directory, b"..") {
+        return data;
+    }
+    for (index, entry) in entries
+        .into_iter()
+        .enumerate()
+        .skip(offset.saturating_sub(2))
+    {
+        let next_offset = (index + 3) as u64;
+        if !push_dirent(
+            &mut data,
+            size,
+            entry.ino,
+            next_offset,
+            entry.kind,
+            &entry.name,
+        ) {
+            break;
+        }
+    }
+    data
+}
+
+fn push_dirent(
+    data: &mut Vec<u8>,
+    size: usize,
+    ino: u64,
+    next_offset: u64,
+    kind: FileType,
+    name: &[u8],
+) -> bool {
+    let len = (FUSE_DIRENT_SIZE + name.len() + 7) & !7;
+    if data.len() + len > size {
+        return false;
+    }
+    let start = data.len();
+    data.resize(start + len, 0);
+    let mut offset = start;
+    push_u64(data, &mut offset, ino);
+    push_u64(data, &mut offset, next_offset);
+    push_u32(data, &mut offset, name.len() as u32);
+    push_u32(
+        data,
+        &mut offset,
+        match kind {
+            FileType::RegularFile => libc::DT_REG,
+            FileType::Directory => libc::DT_DIR,
+            FileType::Symlink => libc::DT_LNK,
+        }
+        .into(),
+    );
+    data[offset..offset + name.len()].copy_from_slice(name);
+    true
+}
+
+fn encode_entry_payload(attr: &BridgeFileAttr) -> Vec<u8> {
+    let mut data = vec![0_u8; FUSE_ENTRY_OUT_SIZE];
+    let mut offset = 0;
+    push_u64(&mut data, &mut offset, attr.ino);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u64(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_u32(&mut data, &mut offset, 0);
+    push_fuse_attr(&mut data, &mut offset, attr);
+    data
+}
+
+fn push_fuse_attr(reply: &mut [u8], offset: &mut usize, attr: &BridgeFileAttr) {
+    let time_parts = |time: std::time::SystemTime| {
+        let duration = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (duration.as_secs(), duration.subsec_nanos())
+    };
+    let (atime, atimensec) = time_parts(attr.atime);
+    let (mtime, mtimensec) = time_parts(attr.mtime);
+    let (ctime, ctimensec) = time_parts(attr.ctime);
+    let file_type = match attr.kind {
+        studiofs_bridge::posix::BridgeFileType::RegularFile => libc::S_IFREG,
+        studiofs_bridge::posix::BridgeFileType::Directory => libc::S_IFDIR,
+        studiofs_bridge::posix::BridgeFileType::Symlink => libc::S_IFLNK,
+    };
+
+    push_u64(reply, offset, attr.ino);
+    push_u64(reply, offset, attr.size);
+    push_u64(reply, offset, attr.blocks);
+    push_u64(reply, offset, atime);
+    push_u64(reply, offset, mtime);
+    push_u64(reply, offset, ctime);
+    push_u32(reply, offset, atimensec);
+    push_u32(reply, offset, mtimensec);
+    push_u32(reply, offset, ctimensec);
+    push_u32(reply, offset, file_type | u32::from(attr.perm));
+    push_u32(reply, offset, attr.nlink);
+    push_u32(reply, offset, attr.uid);
+    push_u32(reply, offset, attr.gid);
+    push_u32(reply, offset, attr.rdev);
+    push_u32(reply, offset, attr.blksize);
+    push_u32(reply, offset, 0);
+}
+
+fn push_open_out(reply: &mut [u8], offset: &mut usize, fh: u64) {
+    push_u64(reply, offset, fh);
+    push_u32(reply, offset, 0);
+    push_u32(reply, offset, 0);
+}
+
+fn encode_create_reply(unique: u64, attr: &BridgeFileAttr, fh: u64) -> FuseReply {
+    let mut data = encode_entry_payload(attr);
+    let mut offset = FUSE_ENTRY_OUT_SIZE;
+    data.resize(FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE, 0);
+    push_open_out(&mut data, &mut offset, fh);
+    FuseReply::Data {
+        header: encode_reply_header(unique, 0, FUSE_CREATE_REPLY_SIZE),
+        data,
+    }
+}
+
 fn encode_error_reply(unique: u64, errno: i32) -> FuseReply {
     let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
     let mut offset = 0;
@@ -1322,6 +1859,223 @@ fn parse_write_in(bytes: &[u8]) -> io::Result<FuseWriteIn<'_>> {
     })
 }
 
+fn parse_open_in(bytes: &[u8]) -> io::Result<u32> {
+    if bytes.len() < FUSE_OPEN_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_OPEN request",
+        ));
+    }
+    read_u32(bytes, 0)
+}
+
+fn parse_setattr_in(bytes: &[u8]) -> io::Result<(Option<u64>, SetattrArgs)> {
+    if bytes.len() < FUSE_SETATTR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_SETATTR request",
+        ));
+    }
+    let valid = read_u32(bytes, FUSE_SETATTR_VALID_OFFSET)?;
+    let mut args = SetattrArgs::default();
+    if valid & FATTR_SIZE != 0 {
+        args.size = Some(read_u64(bytes, FUSE_SETATTR_SIZE_OFFSET)?);
+    }
+    if valid & FATTR_MODE != 0 {
+        args.mode = Some((read_u32(bytes, FUSE_SETATTR_MODE_OFFSET)? & 0o7777) as u16);
+    }
+    if valid & FATTR_UID != 0 {
+        args.uid = Some(read_u32(bytes, FUSE_SETATTR_UID_OFFSET)?);
+    }
+    if valid & FATTR_GID != 0 {
+        args.gid = Some(read_u32(bytes, FUSE_SETATTR_GID_OFFSET)?);
+    }
+    if valid & FATTR_ATIME_NOW != 0 {
+        args.atime = TimeSpec::Now;
+    } else if valid & FATTR_ATIME != 0 {
+        args.atime = TimeSpec::Set(fuse_time_to_nanos(
+            read_u64(bytes, FUSE_SETATTR_ATIME_OFFSET)?,
+            read_u32(bytes, FUSE_SETATTR_ATIMENSEC_OFFSET)?,
+        )?);
+    }
+    if valid & FATTR_MTIME_NOW != 0 {
+        args.mtime = TimeSpec::Now;
+    } else if valid & FATTR_MTIME != 0 {
+        args.mtime = TimeSpec::Set(fuse_time_to_nanos(
+            read_u64(bytes, FUSE_SETATTR_MTIME_OFFSET)?,
+            read_u32(bytes, FUSE_SETATTR_MTIMENSEC_OFFSET)?,
+        )?);
+    }
+    let fh = if valid & FATTR_FH != 0 {
+        Some(read_u64(bytes, FUSE_SETATTR_FH_OFFSET)?)
+    } else {
+        None
+    };
+    Ok((fh, args))
+}
+
+fn parse_ioctl_in(bytes: &[u8]) -> io::Result<(u32, u32)> {
+    if bytes.len() < FUSE_IOCTL_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_IOCTL request",
+        ));
+    }
+    Ok((
+        read_u32(bytes, FUSE_IOCTL_CMD_OFFSET)?,
+        read_u32(bytes, FUSE_IOCTL_OUT_SIZE_OFFSET)?,
+    ))
+}
+
+fn parse_setxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8], &[u8])> {
+    if bytes.len() <= FUSE_SETXATTR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_SETXATTR request",
+        ));
+    }
+    let value_size = read_u32(bytes, 0)? as usize;
+    let value_start = bytes[FUSE_SETXATTR_IN_SIZE..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .filter(|end| *end > 0)
+        .map(|end| FUSE_SETXATTR_IN_SIZE + end + 1)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FUSE_SETXATTR name is empty or not nul-terminated",
+            )
+        })?;
+    let value_end = value_start
+        .checked_add(value_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FUSE_SETXATTR size overflow"))?;
+    let value = bytes.get(value_start..value_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE_SETXATTR payload shorter than declared size",
+        )
+    })?;
+    Ok((
+        read_u32(bytes, 4)?,
+        &bytes[FUSE_SETXATTR_IN_SIZE..value_start - 1],
+        value,
+    ))
+}
+
+fn parse_getxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
+    Ok((
+        parse_xattr_size_in(bytes, "short FUSE_GETXATTR request")?,
+        parse_name(bytes, FUSE_GETXATTR_IN_SIZE, "short FUSE_GETXATTR request")?,
+    ))
+}
+
+fn parse_xattr_size_in(bytes: &[u8], short: &str) -> io::Result<u32> {
+    if bytes.len() < FUSE_GETXATTR_IN_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, short));
+    }
+    read_u32(bytes, 0)
+}
+
+fn format_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(names.iter().map(|name| name.len() + 1).sum());
+    for name in names {
+        data.extend_from_slice(name);
+        data.push(0);
+    }
+    data
+}
+
+fn fuse_time_to_nanos(seconds: u64, nanos: u32) -> io::Result<i64> {
+    if nanos >= 1_000_000_000 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let total = u128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(u128::from(nanos)))
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    i64::try_from(total).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+}
+
+fn parse_mkdir_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
+    if bytes.len() <= FUSE_MKDIR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_MKDIR request",
+        ));
+    }
+    Ok((
+        read_u32(bytes, 0)?,
+        parse_name(bytes, FUSE_MKDIR_IN_SIZE, "short FUSE_MKDIR request")?,
+    ))
+}
+
+fn parse_link_in(bytes: &[u8]) -> io::Result<(u64, &[u8])> {
+    if bytes.len() <= FUSE_LINK_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_LINK request",
+        ));
+    }
+    Ok((
+        read_u64(bytes, 0)?,
+        parse_name(bytes, FUSE_LINK_IN_SIZE, "short FUSE_LINK request")?,
+    ))
+}
+
+fn parse_rename_in(bytes: &[u8]) -> io::Result<(u64, &[u8], &[u8])> {
+    if bytes.len() <= FUSE_RENAME_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_RENAME request",
+        ));
+    }
+    let names = &bytes[FUSE_RENAME_IN_SIZE..];
+    let (old_name, rest) = parse_nul_name(names, "FUSE_RENAME old name is not nul-terminated")?;
+    let (new_name, _) = parse_nul_name(rest, "short FUSE_RENAME new name")?;
+    Ok((read_u64(bytes, 0)?, old_name, new_name))
+}
+
+fn parse_two_names<'a>(bytes: &'a [u8], short: &str) -> io::Result<(&'a [u8], &'a [u8])> {
+    let (first, rest) = parse_nul_name(bytes, short)?;
+    let (second, _) = parse_nul_name(rest, short)?;
+    Ok((first, second))
+}
+
+fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
+    if bytes.len() <= FUSE_CREATE_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_CREATE request",
+        ));
+    }
+    Ok((
+        read_u32(bytes, 0)?,
+        read_u32(bytes, 4)?,
+        parse_name(bytes, FUSE_CREATE_IN_SIZE, "short FUSE_CREATE request")?,
+    ))
+}
+
+fn parse_name<'a>(bytes: &'a [u8], offset: usize, short: &str) -> io::Result<&'a [u8]> {
+    let bytes = bytes
+        .get(offset..)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, short))?;
+    let (name, _) = parse_nul_name(bytes, short)?;
+    Ok(name)
+}
+
+fn parse_nul_name<'a>(bytes: &'a [u8], short: &str) -> io::Result<(&'a [u8], &'a [u8])> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, short))?;
+    let name = &bytes[..end];
+    if name.is_empty() {
+        Err(io::Error::new(io::ErrorKind::InvalidData, short))
+    } else {
+        Ok((name, &bytes[end + 1..]))
+    }
+}
+
 fn write_sync_policy(flags: u32) -> LocalSyncPolicy {
     if flags & FUSE_WRITE_SYNC_FLAGS != 0 {
         LocalSyncPolicy::WriteThrough
@@ -1362,6 +2116,17 @@ fn parse_release_in(bytes: &[u8]) -> io::Result<u64> {
 
 fn io_error_errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(libc::EINVAL)
+}
+
+fn xattr_err_to_errno(error: &studiofs_vfs::VfsError) -> i32 {
+    if matches!(
+        error,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    ) {
+        libc::ENODATA
+    } else {
+        vfs_err_to_errno(error)
+    }
 }
 
 fn push_out_header(reply: &mut [u8], offset: &mut usize, unique: u64, error: i32, len: usize) {
@@ -1751,6 +2516,14 @@ mod tests {
     }
 
     #[test]
+    fn fuse_mount_options_preserve_display_name() {
+        assert_eq!(
+            fuse_mount_options(7, 0o40755, 1000, 1000),
+            "fd=7,rootmode=40755,user_id=1000,group_id=1000,default_permissions,fsname=studiofs,subtype=studiofs"
+        );
+    }
+
+    #[test]
     fn pollin_waits_without_idle_timeout() {
         assert_eq!(poll_timeout_ms(libc::POLLIN), -1);
     }
@@ -1865,6 +2638,38 @@ mod tests {
     }
 
     #[test]
+    fn nul_name_parsing_stops_at_first_terminator_before_padding() {
+        assert_eq!(
+            parse_name(b"child.txt\0\0\0", 0, "short name").expect("name"),
+            b"child.txt"
+        );
+        assert_eq!(
+            parse_two_names(b"link\0target\0\0\0", "short symlink").expect("two names"),
+            (&b"link"[..], &b"target"[..])
+        );
+
+        let mut rename = Vec::from(ROOT_INO.to_ne_bytes());
+        rename.extend_from_slice(b"old.txt\0new.txt\0\0\0");
+
+        let (_, old_name, new_name) = parse_rename_in(&rename).expect("rename");
+        assert_eq!(old_name, b"old.txt");
+        assert_eq!(new_name, b"new.txt");
+    }
+
+    #[test]
+    fn parse_setxattr_in_rejects_empty_name() {
+        let mut payload = Vec::from(0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload.push(0);
+
+        let error = parse_setxattr_in(&payload).expect_err("empty name");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn error_reply_encoding_is_header_only() {
         let reply = encode_error_reply(7, libc::ENOSYS);
         let header = reply.header_slice();
@@ -1939,6 +2744,407 @@ mod tests {
         assert_eq!(snapshot.vfs_write_path.calls, 1);
         assert_eq!(snapshot.vfs_write_path.write_bytes, payload.len() as u64);
         assert!(snapshot.flush_barrier_calls >= 1);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_create_enforces_exclusive_create() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-create-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "create-exclusive");
+        let mut create_payload = vec![0_u8; FUSE_CREATE_IN_SIZE];
+        create_payload[0..4]
+            .copy_from_slice(&((libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u32).to_ne_bytes());
+        create_payload[4..8].copy_from_slice(&0o644_u32.to_ne_bytes());
+        create_payload.extend_from_slice(b"exclusive.txt\0");
+
+        let create = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_CREATE, 87, ROOT_INO, &create_payload),
+        )
+        .expect("create reply");
+        assert_ok_reply(&create, 87);
+        assert_attr_owner(create.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let created = vfs
+            .lookup(ROOT_INO, b"exclusive.txt")
+            .expect("created file");
+        assert_eq!(created.uid, current_uid());
+        assert_eq!(created.gid, current_gid());
+
+        let duplicate = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_CREATE, 88, ROOT_INO, &create_payload),
+        )
+        .expect("duplicate create reply");
+        assert_error_reply(&duplicate, 88, libc::EEXIST);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_namespace_mutations() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-namespace-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "namespace");
+
+        let mut mkdir_payload = Vec::from(0o755_u32.to_ne_bytes());
+        mkdir_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        mkdir_payload.extend_from_slice(b"repo\0");
+        let mkdir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_MKDIR, 89, ROOT_INO, &mkdir_payload),
+        )
+        .expect("mkdir reply");
+        assert_ok_reply(&mkdir, 89);
+        assert_attr_owner(mkdir.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let dir = vfs.lookup(ROOT_INO, b"repo").expect("created directory");
+        assert_eq!(dir.uid, current_uid());
+        assert_eq!(dir.gid, current_gid());
+
+        vfs.create(ROOT_INO, b".tmp-file", 0, 0, 0o644).unwrap();
+        let mut rename_payload = Vec::from(ROOT_INO.to_ne_bytes());
+        rename_payload.extend_from_slice(b".tmp-file\0final.txt\0");
+        let rename = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_RENAME, 90, ROOT_INO, &rename_payload),
+        )
+        .expect("rename reply");
+        assert_ok_reply(&rename, 90);
+        vfs.lookup(ROOT_INO, b"final.txt").expect("renamed file");
+
+        let unlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_UNLINK, 91, ROOT_INO, b"final.txt\0"),
+        )
+        .expect("unlink reply");
+        assert_ok_reply(&unlink, 91);
+        assert!(vfs.lookup(ROOT_INO, b"final.txt").is_err());
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_lookup_getattr_and_open() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-lookup-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "lookup-open");
+        let attr = vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644).unwrap();
+
+        let lookup = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LOOKUP, 92, ROOT_INO, b"existing.txt\0"),
+        )
+        .expect("lookup reply");
+        assert_ok_reply(&lookup, 92);
+        assert_eq!(read_u64(lookup.payload_slice(), 0).unwrap(), attr.ino);
+        assert_attr_owner(lookup.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+
+        let getattr = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETATTR, 93, attr.ino, &[0_u8; 16]),
+        )
+        .expect("getattr reply");
+        assert_ok_reply(&getattr, 93);
+        assert_eq!(read_u64(getattr.payload_slice(), 16).unwrap(), attr.ino);
+        assert_attr_owner(getattr.payload_slice(), FUSE_ATTR_OUT_ATTR_OFFSET);
+
+        let mut open_payload = Vec::from((libc::O_RDONLY as u32).to_ne_bytes());
+        open_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let open = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_OPEN, 94, attr.ino, &open_payload),
+        )
+        .expect("open reply");
+        assert_ok_reply(&open, 94);
+        assert_ne!(read_u64(open.payload_slice(), 0).unwrap(), 0);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_readdir() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-readdir-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "readdir");
+        vfs.mkdir(ROOT_INO, b"subdir", 0, 0, 0o755).unwrap();
+        vfs.create(ROOT_INO, b"child.txt", 0, 0, 0o644).unwrap();
+
+        let mut opendir_payload = Vec::from((libc::O_RDONLY as u32).to_ne_bytes());
+        opendir_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let opendir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_OPENDIR, 95, ROOT_INO, &opendir_payload),
+        )
+        .expect("opendir reply");
+        assert_ok_reply(&opendir, 95);
+        let fh = read_u64(opendir.payload_slice(), 0).unwrap();
+
+        let readdir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_READDIR, 96, ROOT_INO, &read_in(fh, 0, 512)),
+        )
+        .expect("readdir reply");
+        assert_ok_reply(&readdir, 96);
+        assert!(
+            readdir
+                .payload_slice()
+                .windows(b"subdir".len())
+                .any(|window| window == b"subdir")
+        );
+        assert!(
+            readdir
+                .payload_slice()
+                .windows(b"child.txt".len())
+                .any(|window| window == b"child.txt")
+        );
+
+        let releasedir = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_RELEASEDIR, 97, ROOT_INO, &release_in(fh)),
+        )
+        .expect("releasedir reply");
+        assert_ok_reply(&releasedir, 97);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_setattr_mode_size_and_mtime() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-setattr-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "setattr");
+        let attr = vfs.create(ROOT_INO, b"metadata.txt", 0, 0, 0o644).unwrap();
+        let mut payload = vec![0_u8; FUSE_SETATTR_IN_SIZE];
+        payload[FUSE_SETATTR_VALID_OFFSET..FUSE_SETATTR_VALID_OFFSET + 4]
+            .copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME | (1 << 31)).to_ne_bytes());
+        payload[FUSE_SETATTR_SIZE_OFFSET..FUSE_SETATTR_SIZE_OFFSET + 8]
+            .copy_from_slice(&3_u64.to_ne_bytes());
+        payload[FUSE_SETATTR_MTIME_OFFSET..FUSE_SETATTR_MTIME_OFFSET + 8]
+            .copy_from_slice(&10_u64.to_ne_bytes());
+        payload[FUSE_SETATTR_MTIMENSEC_OFFSET..FUSE_SETATTR_MTIMENSEC_OFFSET + 4]
+            .copy_from_slice(&20_u32.to_ne_bytes());
+        payload[FUSE_SETATTR_MODE_OFFSET..FUSE_SETATTR_MODE_OFFSET + 4]
+            .copy_from_slice(&0o600_u32.to_ne_bytes());
+
+        let setattr = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SETATTR, 98, attr.ino, &payload),
+        )
+        .expect("setattr reply");
+        assert_ok_reply(&setattr, 98);
+        assert_attr_owner(setattr.payload_slice(), FUSE_ATTR_OUT_ATTR_OFFSET);
+
+        let updated = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(updated.mode, 0o600);
+        assert_eq!(updated.size, 3);
+        assert_eq!(updated.mtime, 10_000_000_020);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_answers_common_linux_ioctl_metadata_probes() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-ioctl-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "ioctl");
+        let attr = vfs.create(ROOT_INO, b"probe.txt", 0, 0, 0o644).unwrap();
+
+        for (cmd, out_size, unique) in [
+            (FS_IOC_GETFLAGS, FS_IOC_FLAGS_SIZE, 99_u64),
+            (FS_IOC32_GETFLAGS, FS_IOC_FLAGS_SIZE, 100_u64),
+            (FS_IOC_FSGETXATTR, FSXATTR_SIZE, 101_u64),
+        ] {
+            let mut payload = vec![0_u8; FUSE_IOCTL_IN_SIZE];
+            payload[FUSE_IOCTL_CMD_OFFSET..FUSE_IOCTL_CMD_OFFSET + 4]
+                .copy_from_slice(&cmd.to_ne_bytes());
+            payload[FUSE_IOCTL_OUT_SIZE_OFFSET..FUSE_IOCTL_OUT_SIZE_OFFSET + 4]
+                .copy_from_slice(&out_size.to_ne_bytes());
+            let reply = handle_vfs_fuse_request(
+                &vfs,
+                runtime.handle(),
+                &work_item_with_payload(FUSE_IOCTL, unique, attr.ino, &payload),
+            )
+            .expect("ioctl reply");
+
+            assert_ok_reply(&reply, unique);
+            assert_eq!(read_u32(reply.payload_slice(), 0).unwrap(), 0);
+            assert_eq!(&reply.payload_slice()[16..], vec![0_u8; out_size as usize]);
+        }
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_xattr_lifecycle() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-xattr-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "xattr");
+        let attr = vfs.create(ROOT_INO, b"xattr.txt", 0, 0, 0o644).unwrap();
+        let name = b"user.color";
+        let value = b"blue";
+        let mut set_payload = Vec::from((value.len() as u32).to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(name);
+        set_payload.push(0);
+        set_payload.extend_from_slice(value);
+        let set = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SETXATTR, 102, attr.ino, &set_payload),
+        )
+        .expect("setxattr reply");
+        assert_ok_reply(&set, 102);
+
+        let mut get_size_payload = Vec::from(0_u32.to_ne_bytes());
+        get_size_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        get_size_payload.extend_from_slice(name);
+        get_size_payload.push(0);
+        let get_size = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 103, attr.ino, &get_size_payload),
+        )
+        .expect("getxattr size reply");
+        assert_ok_reply(&get_size, 103);
+        assert_eq!(
+            read_u32(get_size.payload_slice(), 0).unwrap(),
+            value.len() as u32
+        );
+
+        let mut get_value_payload = Vec::from(16_u32.to_ne_bytes());
+        get_value_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        get_value_payload.extend_from_slice(name);
+        get_value_payload.push(0);
+        let get_value = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 104, attr.ino, &get_value_payload),
+        )
+        .expect("getxattr value reply");
+        assert_ok_reply(&get_value, 104);
+        assert_eq!(get_value.payload_slice(), value);
+
+        let list_size = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_LISTXATTR,
+                105,
+                attr.ino,
+                &[0_u8; FUSE_GETXATTR_IN_SIZE],
+            ),
+        )
+        .expect("listxattr size reply");
+        assert_ok_reply(&list_size, 105);
+        assert_eq!(
+            read_u32(list_size.payload_slice(), 0).unwrap(),
+            name.len() as u32 + 1
+        );
+
+        let mut list_payload = Vec::from(64_u32.to_ne_bytes());
+        list_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let list_value = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LISTXATTR, 106, attr.ino, &list_payload),
+        )
+        .expect("listxattr value reply");
+        assert_ok_reply(&list_value, 106);
+        assert_eq!(list_value.payload_slice(), b"user.color\0");
+
+        let mut remove_payload = Vec::from(&name[..]);
+        remove_payload.push(0);
+        let remove = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_REMOVEXATTR, 107, attr.ino, &remove_payload),
+        )
+        .expect("removexattr reply");
+        assert_ok_reply(&remove, 107);
+
+        let missing = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 108, attr.ino, &get_size_payload),
+        )
+        .expect("missing getxattr reply");
+        assert_error_reply(&missing, 108, libc::ENODATA);
+
+        let missing_inode = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 112, u64::MAX, &get_size_payload),
+        )
+        .expect("missing inode getxattr reply");
+        assert_error_reply(&missing_inode, 112, libc::ENOENT);
+
+        let missing_inode_list = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_LISTXATTR,
+                113,
+                u64::MAX,
+                &[0_u8; FUSE_GETXATTR_IN_SIZE],
+            ),
+        )
+        .expect("missing inode listxattr reply");
+        assert_error_reply(&missing_inode_list, 113, libc::ENOENT);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_symlink_readlink_and_hardlink() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-links-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "links");
+        let file = vfs.create(ROOT_INO, b"source.txt", 0, 0, 0o644).unwrap();
+        let symlink_payload = b"link.txt\0source.txt\0";
+
+        let symlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SYMLINK, 109, ROOT_INO, symlink_payload),
+        )
+        .expect("symlink reply");
+        assert_ok_reply(&symlink, 109);
+        let link_ino = read_u64(symlink.payload_slice(), 0).unwrap();
+        assert_attr_owner(symlink.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        let link_attr = vfs.getattr(link_ino).expect("symlink attr");
+        assert_eq!(link_attr.uid, current_uid());
+        assert_eq!(link_attr.gid, current_gid());
+
+        let readlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_READLINK, 110, link_ino, &[]),
+        )
+        .expect("readlink reply");
+        assert_ok_reply(&readlink, 110);
+        assert_eq!(readlink.payload_slice(), b"source.txt");
+
+        let mut link_payload = Vec::from(file.ino.to_ne_bytes());
+        link_payload.extend_from_slice(b"hard.txt\0");
+        let hardlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LINK, 111, ROOT_INO, &link_payload),
+        )
+        .expect("hardlink reply");
+        assert_ok_reply(&hardlink, 111);
+        assert_attr_owner(hardlink.payload_slice(), FUSE_ENTRY_OUT_ATTR_OFFSET);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"hard.txt").expect("hardlink").ino,
+            file.ino
+        );
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
@@ -2652,6 +3858,17 @@ mod tests {
         assert_eq!(
             i32::from_ne_bytes(header[4..8].try_into().expect("reply error")),
             -errno
+        );
+    }
+
+    fn assert_attr_owner(payload: &[u8], attr_offset: usize) {
+        assert_eq!(
+            read_u32(payload, attr_offset + FUSE_ATTR_UID_OFFSET).unwrap(),
+            current_uid()
+        );
+        assert_eq!(
+            read_u32(payload, attr_offset + FUSE_ATTR_GID_OFFSET).unwrap(),
+            current_gid()
         );
     }
 }
