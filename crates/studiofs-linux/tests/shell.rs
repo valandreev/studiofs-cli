@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -192,6 +193,11 @@ fn make_repo_tree(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn assert_command_success(command: &mut Command, name: &str) {
+    let status = command.status().expect(name);
+    assert!(status.success(), "{name} exited with {status}");
+}
+
 #[test]
 fn shell_answers_root_lifecycle_callbacks() {
     let tmp = studiofs_test_support::workspace_target_tempdir("linux-shell-");
@@ -236,13 +242,10 @@ fn mounted_cp_a_repo_copy_preserves_regular_file_count_and_bytes() {
     let mount = mount_background(vfs.clone(), &runtime, mount_point.clone()).expect("mount FUSE");
     let copies = mount_point.join("copies");
     std::fs::create_dir(&copies).expect("mkdir through FUSE");
-    let status = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(&source)
-        .arg(&copies)
-        .status()
-        .expect("run cp -a");
-    assert!(status.success(), "cp -a exited with {status}");
+    assert_command_success(
+        Command::new("cp").arg("-a").arg(&source).arg(&copies),
+        "cp -a",
+    );
     let actual = regular_file_stats(&copies.join("source-repo")).expect("copied stats");
 
     drop(mount);
@@ -265,13 +268,13 @@ fn mounted_rsync_a_repo_copy_preserves_regular_files_without_zero_byte_temp_left
     let mount = mount_background(vfs.clone(), &runtime, mount_point.clone()).expect("mount FUSE");
     let copy = mount_point.join("rsync-copy");
     std::fs::create_dir(&copy).expect("mkdir through FUSE");
-    let status = std::process::Command::new("rsync")
-        .arg("-a")
-        .arg(format!("{}/", source.display()))
-        .arg(&copy)
-        .status()
-        .expect("run rsync -a");
-    assert!(status.success(), "rsync -a exited with {status}");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "rsync -a",
+    );
     let actual = regular_file_stats(&copy).expect("copied stats");
     let leftovers = zero_byte_dotfiles(&copy).expect("temp leftovers");
 
@@ -279,6 +282,55 @@ fn mounted_rsync_a_repo_copy_preserves_regular_files_without_zero_byte_temp_left
     runtime.block_on(vfs.shutdown(Duration::ZERO));
 
     assert_eq!(actual, expected);
+    assert!(
+        leftovers.is_empty(),
+        "zero-byte temp leftovers: {leftovers:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount(2) permission"]
+fn mounted_rsync_inplace_updates_existing_files() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("linux-mount-rsync-inplace-");
+    let source = tmp.path().join("source-repo");
+    let mount_point = tmp.path().join("mnt");
+    std::fs::create_dir(&mount_point).expect("create mount point");
+    make_repo_tree(&source).expect("create source repo");
+
+    let (runtime, vfs) = make_vfs(&tmp);
+    let mount = mount_background(vfs.clone(), &runtime, mount_point.clone()).expect("mount FUSE");
+    let copy = mount_point.join("rsync-inplace-copy");
+    std::fs::create_dir(&copy).expect("mkdir through FUSE");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "seed rsync -a",
+    );
+
+    let updated_lib = b"pub fn answer() -> u16 { 9001 }\n";
+    std::fs::write(source.join("src/lib.rs"), updated_lib).expect("update source file");
+    std::fs::write(source.join("target/debug/cache.bin"), vec![9_u8; 8192])
+        .expect("update source blob");
+    let expected = regular_file_stats(&source).expect("source stats");
+    assert_command_success(
+        Command::new("rsync")
+            .arg("-a")
+            .arg("--inplace")
+            .arg(format!("{}/", source.display()))
+            .arg(&copy),
+        "rsync --inplace",
+    );
+    let actual = regular_file_stats(&copy).expect("copied stats");
+    let copied_lib = std::fs::read(copy.join("src/lib.rs")).expect("read copied file");
+    let leftovers = zero_byte_dotfiles(&copy).expect("temp leftovers");
+
+    drop(mount);
+    runtime.block_on(vfs.shutdown(Duration::ZERO));
+
+    assert_eq!(actual, expected);
+    assert_eq!(copied_lib, updated_lib);
     assert!(
         leftovers.is_empty(),
         "zero-byte temp leftovers: {leftovers:?}"
