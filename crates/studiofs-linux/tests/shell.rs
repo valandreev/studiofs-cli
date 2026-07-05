@@ -59,6 +59,7 @@ fn shell_answers_root_lifecycle_callbacks() {
     let (runtime, vfs) = make_vfs(&tmp);
     let mut shell = LinuxMountShell::new(LinuxMountRequest {
         vfs: vfs.clone(),
+        runtime_handle: runtime.handle().clone(),
         mount_point: tmp.path().join("mnt"),
     });
 
