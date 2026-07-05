@@ -1,0 +1,3 @@
+# Linux FUSE Bridge Uses libfuse3 Low-Level API
+
+StudioFS Linux mount targets the Linux VFX reference platforms: Ubuntu 24.04 LTS and above, plus Rocky Linux 9.4 and above, with Rocky Linux 8.6 and above treated as best-effort compatibility. We will build the Linux platform bridge on the libfuse3 low-level API first, because it keeps inode-based callback control while delegating mature FUSE mount/session transport to the reference userspace library. A custom raw `/dev/fuse` transport remains a fallback only if mounted performance evidence shows libfuse3 transport overhead is the blocker; `fuser` remains a baseline/comparison path, not the production candidate.

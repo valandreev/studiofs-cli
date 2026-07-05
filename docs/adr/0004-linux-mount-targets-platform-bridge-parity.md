@@ -1,0 +1,3 @@
+# Linux Mount Targets Platform Bridge Parity
+
+The Linux platform bridge must target parity with the existing Windows WinFSP and macOS macFUSE bridges, not a reduced first-use operation subset. Its callback surface should cover the union already exercised by the production bridges where Linux/libfuse3 supports it: lookup/getattr/setattr, create/mknod/open/read/write/flush/fsync/release, directory open/read/release, mkdir/unlink/rmdir/rename, symlink/readlink/link, statfs, xattr get/set/list/remove, access-style permission callbacks, kernel invalidation, and mount/unmount lifecycle. Missing operations should be explicit compatibility gaps backed by workload evidence, not silent v1 omissions.
