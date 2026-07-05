@@ -14,6 +14,7 @@ use tokio::runtime::Handle;
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
+const LINUX_FUSE_MAX_READ_SIZE: usize = 64 * 1024 * 1024;
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -742,6 +743,7 @@ impl SessionState {
     ) -> Result<Vec<u8>, i32> {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        validate_read_size(size)?;
         let mut buffer = vec![0; size];
         let read = self
             .runtime_handle
@@ -771,15 +773,24 @@ impl SessionState {
             // the duration of the callback.
             unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
         };
+        let local_sync_policy = self.local_sync_policy_for_handle(fh);
         self.runtime_handle
             .block_on(self.vfs.write_fh_with_deferred_materialize(
                 fh,
                 ino,
                 offset,
                 data,
-                LocalSyncPolicy::Opportunistic,
+                local_sync_policy,
             ))
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn local_sync_policy_for_handle(&self, fh: u64) -> LocalSyncPolicy {
+        self.vfs
+            .get_open_file(fh)
+            .filter(|open_file| open_file.flags.contains(OpenFlags::SYNC))
+            .map(|_| LocalSyncPolicy::WriteThrough)
+            .unwrap_or(LocalSyncPolicy::Opportunistic)
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
@@ -1051,6 +1062,14 @@ fn timespec_nanos(sec: libc::time_t, nsec: libc::c_long) -> Result<i64, i32> {
     i64::try_from(nanos).map_err(|_| libc::EOVERFLOW)
 }
 
+fn validate_read_size(size: usize) -> Result<(), i32> {
+    if size > LINUX_FUSE_MAX_READ_SIZE {
+        Err(libc::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
 fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
@@ -1281,6 +1300,38 @@ mod tests {
         let direct_io = unsafe { super::studiofs_linux_fuse_file_info_direct_io_after_init() };
 
         assert_eq!(direct_io, 1);
+    }
+
+    #[test]
+    fn validate_read_size_rejects_oversized_request() {
+        assert_eq!(
+            super::validate_read_size(super::LINUX_FUSE_MAX_READ_SIZE + 1),
+            Err(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn sync_open_handle_uses_write_through_policy() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-sync-policy")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"sync.dat", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file_with_known_attr(
+                &attr,
+                studiofs_vfs::OpenFlags::WRONLY | studiofs_vfs::OpenFlags::SYNC,
+                false,
+            )
+            .expect("open sync file");
+        let state = super::SessionState::new(vfs, fixture.runtime().handle().clone(), false);
+
+        assert_eq!(
+            state.local_sync_policy_for_handle(fh),
+            studiofs_vfs::LocalSyncPolicy::WriteThrough
+        );
     }
 
     #[test]
