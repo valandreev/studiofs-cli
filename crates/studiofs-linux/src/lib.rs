@@ -63,6 +63,7 @@ const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 const FUSE_MAX_PAGES: u32 = 1 << 22;
 const FUSE_FSYNC_DATASYNC: u32 = 1;
+const FUSE_WRITE_SYNC_FLAGS: u32 = (libc::O_SYNC | libc::O_DSYNC) as u32;
 const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_AUTO_INVAL_DATA
@@ -880,7 +881,11 @@ fn handle_fuse_read(
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    let mut out = vec![0_u8; input.size as usize];
+    let read_size = input.size as usize;
+    if read_size > FUSE_REQUEST_BUFFER_SIZE {
+        return encode_error_reply(unique, libc::EINVAL);
+    }
+    let mut out = vec![0_u8; read_size];
     let result = runtime_handle.block_on(vfs.read_into_fh(
         input.fh,
         item.header.nodeid,
@@ -916,7 +921,7 @@ fn handle_fuse_write(
         item.header.nodeid,
         input.offset,
         input.data,
-        LocalSyncPolicy::Opportunistic,
+        write_sync_policy(input.flags),
     ));
     match result {
         Ok(written) => {
@@ -1274,6 +1279,7 @@ struct FuseReadIn {
 struct FuseWriteIn<'a> {
     fh: u64,
     offset: u64,
+    flags: u32,
     data: &'a [u8],
 }
 
@@ -1311,8 +1317,17 @@ fn parse_write_in(bytes: &[u8]) -> io::Result<FuseWriteIn<'_>> {
     Ok(FuseWriteIn {
         fh: read_u64(bytes, 0)?,
         offset: read_u64(bytes, 8)?,
+        flags: read_u32(bytes, 32)?,
         data,
     })
+}
+
+fn write_sync_policy(flags: u32) -> LocalSyncPolicy {
+    if flags & FUSE_WRITE_SYNC_FLAGS != 0 {
+        LocalSyncPolicy::WriteThrough
+    } else {
+        LocalSyncPolicy::Opportunistic
+    }
 }
 
 fn parse_flush_in(bytes: &[u8]) -> io::Result<u64> {
@@ -1929,6 +1944,57 @@ mod tests {
     }
 
     #[test]
+    fn vfs_handler_rejects_oversized_read_before_allocating() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-read-limit-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "read-limit");
+
+        let reply = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_READ,
+                85,
+                ROOT_INO,
+                &read_in(0, 0, (FUSE_REQUEST_BUFFER_SIZE + 1) as u32),
+            ),
+        )
+        .expect("read limit reply");
+
+        assert_error_reply(&reply, 85, libc::EINVAL);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_maps_sync_write_flags_to_write_through() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-sync-write-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "sync-write");
+        let attr = vfs
+            .create(ROOT_INO, b"linux-sync-write.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let before = vfs.write_path_observability_snapshot();
+
+        let reply = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_WRITE,
+                86,
+                attr.ino,
+                &write_in_with_flags(fh, 0, libc::O_SYNC as u32, b"sync"),
+            ),
+        )
+        .expect("sync write reply");
+
+        assert_ok_reply(&reply, 86);
+        let after = vfs.write_path_observability_snapshot();
+        assert!(after.flush_barrier_calls > before.flush_barrier_calls);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
     fn queue_depth_decrement_does_not_underflow() {
         let metrics = LinuxFuseLoopMetrics::default();
 
@@ -2529,10 +2595,15 @@ mod tests {
     }
 
     fn write_in(fh: u64, offset: u64, payload: &[u8]) -> Vec<u8> {
+        write_in_with_flags(fh, offset, 0, payload)
+    }
+
+    fn write_in_with_flags(fh: u64, offset: u64, flags: u32, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0_u8; FUSE_WRITE_IN_SIZE];
         bytes[0..8].copy_from_slice(&fh.to_ne_bytes());
         bytes[8..16].copy_from_slice(&offset.to_ne_bytes());
         bytes[16..20].copy_from_slice(&(payload.len() as u32).to_ne_bytes());
+        bytes[32..36].copy_from_slice(&flags.to_ne_bytes());
         bytes.extend_from_slice(payload);
         bytes
     }
@@ -2571,6 +2642,16 @@ mod tests {
         assert_eq!(
             i32::from_ne_bytes(header[4..8].try_into().expect("reply error")),
             0
+        );
+    }
+
+    fn assert_error_reply(reply: &FuseReply, unique: u64, errno: i32) {
+        let header = reply.header_slice();
+        assert_eq!(read_u32(header, 0).unwrap() as usize, reply.wire_len());
+        assert_eq!(read_u64(header, 8).unwrap(), unique);
+        assert_eq!(
+            i32::from_ne_bytes(header[4..8].try_into().expect("reply error")),
+            -errno
         );
     }
 }
