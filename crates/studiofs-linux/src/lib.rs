@@ -24,7 +24,7 @@ use crossbeam_channel::{
 use studiofs_bridge::posix::{
     BridgeFileAttr, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, ROOT_INO};
+use studiofs_meta::{DirEntry, FileType, ROOT_INO, SetattrArgs, TimeSpec};
 use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
 use tokio::runtime::Handle;
 
@@ -39,6 +39,7 @@ const FUSE_OUT_HEADER_SIZE: usize = 16;
 const FUSE_INIT_IN_BASE_SIZE: usize = 16;
 const FUSE_GETATTR_IN_SIZE: usize = 16;
 const FUSE_OPEN_IN_SIZE: usize = 8;
+const FUSE_SETATTR_IN_SIZE: usize = 88;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -58,6 +59,7 @@ const FUSE_INIT_OUT_SIZE: usize = 64;
 const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
+const FUSE_SETATTR: u32 = 4;
 const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RENAME: u32 = 12;
@@ -84,6 +86,30 @@ const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 const FUSE_MAX_PAGES: u32 = 1 << 22;
 const FUSE_FSYNC_DATASYNC: u32 = 1;
 const FUSE_WRITE_SYNC_FLAGS: u32 = (libc::O_SYNC | libc::O_DSYNC) as u32;
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_ATIME: u32 = 1 << 4;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_FH: u32 = 1 << 6;
+const FATTR_ATIME_NOW: u32 = 1 << 7;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
+const FATTR_LOCKOWNER: u32 = 1 << 9;
+const FATTR_CTIME: u32 = 1 << 10;
+const FATTR_KILL_SUIDGID: u32 = 1 << 11;
+const FATTR_SUPPORTED: u32 = FATTR_MODE
+    | FATTR_UID
+    | FATTR_GID
+    | FATTR_SIZE
+    | FATTR_ATIME
+    | FATTR_MTIME
+    | FATTR_FH
+    | FATTR_ATIME_NOW
+    | FATTR_MTIME_NOW
+    | FATTR_LOCKOWNER
+    | FATTR_CTIME
+    | FATTR_KILL_SUIDGID;
 const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_AUTO_INVAL_DATA
@@ -887,6 +913,7 @@ fn handle_vfs_fuse_request(
     Some(match header.opcode {
         FUSE_LOOKUP => handle_fuse_lookup(vfs, item),
         FUSE_GETATTR => handle_fuse_getattr(vfs, item),
+        FUSE_SETATTR => handle_fuse_setattr(vfs, item),
         FUSE_MKDIR => handle_fuse_mkdir(vfs, item),
         FUSE_UNLINK => handle_fuse_unlink(vfs, item),
         FUSE_RENAME => handle_fuse_rename(vfs, item),
@@ -925,6 +952,18 @@ fn handle_fuse_getattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
         return encode_error_reply(unique, libc::EINVAL);
     }
     match vfs.getattr(item.header.nodeid) {
+        Ok(attr) => encode_attr_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_setattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (fh, args) = match parse_setattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.setattr_with_handle(fh, item.header.nodeid, args) {
         Ok(attr) => encode_attr_reply(unique, &to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
@@ -1642,6 +1681,65 @@ fn parse_open_in(bytes: &[u8]) -> io::Result<u32> {
         ));
     }
     read_u32(bytes, 0)
+}
+
+fn parse_setattr_in(bytes: &[u8]) -> io::Result<(Option<u64>, SetattrArgs)> {
+    if bytes.len() < FUSE_SETATTR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_SETATTR request",
+        ));
+    }
+    let valid = read_u32(bytes, 0)?;
+    if valid & !FATTR_SUPPORTED != 0 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let mut args = SetattrArgs::default();
+    if valid & FATTR_SIZE != 0 {
+        args.size = Some(read_u64(bytes, 16)?);
+    }
+    if valid & FATTR_MODE != 0 {
+        args.mode = Some((read_u32(bytes, 68)? & 0o7777) as u16);
+    }
+    if valid & FATTR_UID != 0 {
+        args.uid = Some(read_u32(bytes, 76)?);
+    }
+    if valid & FATTR_GID != 0 {
+        args.gid = Some(read_u32(bytes, 80)?);
+    }
+    if valid & FATTR_ATIME_NOW != 0 {
+        args.atime = TimeSpec::Now;
+    } else if valid & FATTR_ATIME != 0 {
+        args.atime = TimeSpec::Set(fuse_time_to_nanos(
+            read_u64(bytes, 32)?,
+            read_u32(bytes, 56)?,
+        )?);
+    }
+    if valid & FATTR_MTIME_NOW != 0 {
+        args.mtime = TimeSpec::Now;
+    } else if valid & FATTR_MTIME != 0 {
+        args.mtime = TimeSpec::Set(fuse_time_to_nanos(
+            read_u64(bytes, 40)?,
+            read_u32(bytes, 60)?,
+        )?);
+    }
+    let fh = if valid & FATTR_FH != 0 {
+        Some(read_u64(bytes, 8)?)
+    } else {
+        None
+    };
+    Ok((fh, args))
+}
+
+fn fuse_time_to_nanos(seconds: u64, nanos: u32) -> io::Result<i64> {
+    if nanos >= 1_000_000_000 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let total = u128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(u128::from(nanos)))
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    i64::try_from(total).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
 }
 
 fn parse_mkdir_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
@@ -2483,6 +2581,34 @@ mod tests {
         )
         .expect("releasedir reply");
         assert_ok_reply(&releasedir, 97);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_setattr_mode_size_and_mtime() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-setattr-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "setattr");
+        let attr = vfs.create(ROOT_INO, b"metadata.txt", 0, 0, 0o644).unwrap();
+        let mut payload = vec![0_u8; FUSE_SETATTR_IN_SIZE];
+        payload[0..4].copy_from_slice(&(FATTR_MODE | FATTR_SIZE | FATTR_MTIME).to_ne_bytes());
+        payload[16..24].copy_from_slice(&3_u64.to_ne_bytes());
+        payload[40..48].copy_from_slice(&10_u64.to_ne_bytes());
+        payload[60..64].copy_from_slice(&20_u32.to_ne_bytes());
+        payload[68..72].copy_from_slice(&0o600_u32.to_ne_bytes());
+
+        let setattr = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SETATTR, 98, attr.ino, &payload),
+        )
+        .expect("setattr reply");
+        assert_ok_reply(&setattr, 98);
+
+        let updated = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(updated.mode, 0o600);
+        assert_eq!(updated.size, 3);
+        assert_eq!(updated.mtime, 10_000_000_020);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
