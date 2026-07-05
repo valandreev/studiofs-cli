@@ -5,9 +5,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
-use studiofs_bridge::posix::{BridgeFileAttr, BridgeFileType, to_bridge_attr, vfs_err_to_errno};
+use studiofs_bridge::posix::{
+    BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
+};
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{DirEntryWithAttr, StatFs, StudioVfs};
+use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs};
+use tokio::runtime::Handle;
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
@@ -60,7 +63,13 @@ pub(crate) mod raw {
         pub(crate) fn fuse_reply_entry(req: *mut FuseReq, entry: *const FuseEntryParam) -> c_int;
         pub(crate) fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: f64) -> c_int;
         pub(crate) fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
+        pub(crate) fn fuse_reply_create(
+            req: *mut FuseReq,
+            entry: *const FuseEntryParam,
+            fi: *const FuseFileInfo,
+        ) -> c_int;
         pub(crate) fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
+        pub(crate) fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         pub(crate) fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
         pub(crate) fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
         pub(crate) fn fuse_add_direntry(
@@ -95,25 +104,35 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
-    fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
+    fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
+    fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64, direct_io: c_int);
     fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
+    fn studiofs_linux_fuse_file_info_flags(info: *const raw::FuseFileInfo) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
 
 pub(crate) struct SessionState {
     vfs: Arc<StudioVfs>,
+    runtime_handle: Handle,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
 }
 
 impl SessionState {
-    pub(crate) fn new(vfs: Arc<StudioVfs>, read_only: bool) -> Self {
+    pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
         Self {
             vfs,
+            runtime_handle,
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
@@ -376,13 +395,146 @@ pub extern "C" fn studiofs_linux_fuse_setattr(
             return;
         }
     };
-    let _ = fi;
-    match state.setattr(None, ino, args) {
+    match state.setattr(state.vfs_file_handle(fi), ino, args) {
         Ok(attr) => {
             let attr = state.attr_to_stat(&attr);
             // SAFETY: `attr` is initialized and valid for this synchronous reply.
             unsafe { raw::fuse_reply_attr(req, &attr, TTL_SECONDS) };
         }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_create(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
+        .unwrap_or(Err(libc::EINVAL));
+    match result {
+        Ok((attr, fh)) => reply_create(req, state, fi, &attr, fh),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_open(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.open(ino, fi) {
+        Ok(fh) => reply_file_open(req, fi, fh),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_read(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.read(ino, size, off, fi) {
+        Ok(buffer) => {
+            // SAFETY: `buffer` is valid for this synchronous reply.
+            unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_write(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    buf: *const c_char,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.write(ino, buf, size, off, fi) {
+        Ok(written) => {
+            // SAFETY: `req` is live and this consumes the callback reply.
+            unsafe { raw::fuse_reply_write(req, written as size_t) };
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_flush(
+    req: *mut raw::FuseReq,
+    _ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match file_handle(fi)
+        .ok_or(libc::EBADF)
+        .and_then(|fh| state.flush(fh))
+    {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_fsync(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    datasync: c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.fsync(file_handle(fi), ino, datasync != 0) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_release(
+    req: *mut raw::FuseReq,
+    _ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match file_handle(fi)
+        .ok_or(libc::EBADF)
+        .and_then(|fh| state.release(fh))
+    {
+        Ok(()) => reply_error(req, 0),
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -399,7 +551,7 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
     };
     match state.getattr_attr(ino) {
         Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino) {
-            Ok(handle) => reply_open(req, fi, handle),
+            Ok(handle) => reply_dir_open(req, fi, handle),
             Err(errno) => reply_error(req, errno),
         },
         Ok(_) => reply_error(req, libc::ENOTDIR),
@@ -529,6 +681,130 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn create(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<(InodeAttr, u64), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let file_type = mode & libc::S_IFMT as mode_t;
+        if file_type != 0 && file_type != libc::S_IFREG as mode_t {
+            return Err(libc::ENOTSUP);
+        }
+        let attr = self
+            .vfs
+            .create(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                (mode & 0o7777) as u16,
+            )
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        let fh = self
+            .vfs
+            .open_created_file_with_known_attr(&attr, open_flags, trunc)
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        Ok((attr, fh))
+    }
+
+    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
+        let attr = self.getattr_attr(ino)?;
+        if attr.kind != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        if self.read_only
+            && (trunc
+                || open_flags.contains(OpenFlags::WRONLY)
+                || open_flags.contains(OpenFlags::RDWR))
+        {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .open_file_with_known_attr(&attr, open_flags, trunc)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn read(
+        &self,
+        ino: u64,
+        size: usize,
+        offset: off_t,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<Vec<u8>, i32> {
+        let fh = file_handle(fi).ok_or(libc::EBADF)?;
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        let mut buffer = vec![0; size];
+        let read = self
+            .runtime_handle
+            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        buffer.truncate(read as usize);
+        Ok(buffer)
+    }
+
+    fn write(
+        &self,
+        ino: u64,
+        buf: *const c_char,
+        size: usize,
+        offset: off_t,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<u32, i32> {
+        let fh = file_handle(fi).ok_or(libc::EBADF)?;
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        if buf.is_null() && size > 0 {
+            return Err(libc::EINVAL);
+        }
+        let data = if size == 0 {
+            &[]
+        } else {
+            // SAFETY: libfuse passes `buf` as a request-owned byte slice valid for
+            // the duration of the callback.
+            unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
+        };
+        self.runtime_handle
+            .block_on(self.vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                offset,
+                data,
+                LocalSyncPolicy::Opportunistic,
+            ))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn flush(&self, fh: u64) -> Result<(), i32> {
+        self.runtime_handle
+            .block_on(self.vfs.flush_fh(fh))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
+        let result = if let Some(fh) = file_handle {
+            self.runtime_handle.block_on(self.vfs.flush_fh(fh))
+        } else {
+            self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn release(&self, fh: u64) -> Result<(), i32> {
+        self.runtime_handle
+            .block_on(self.vfs.release_fh(fh))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn vfs_file_handle(&self, fi: *const raw::FuseFileInfo) -> Option<u64> {
+        file_handle(fi).filter(|fh| self.vfs.get_open_file(*fh).is_some())
+    }
+
     fn open_dir(&self, ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
         // SFS-604 snapshots each directory handle eagerly so Linux readdir offsets
         // stay stable across chunked kernel reads. Replace with VFS cursors if
@@ -638,6 +914,25 @@ fn dir_handle(fi: *const raw::FuseFileInfo) -> Option<NonNull<DirectoryHandle>> 
     // the `fh` field using the system header layout.
     let fh = unsafe { studiofs_linux_fuse_file_info_fh(fi) };
     NonNull::new(fh as *mut DirectoryHandle)
+}
+
+fn file_handle(fi: *const raw::FuseFileInfo) -> Option<u64> {
+    if fi.is_null() {
+        return None;
+    }
+    // SAFETY: libfuse passes a live `fuse_file_info`; the C shim reads only
+    // the `fh` field using the system header layout.
+    let fh = unsafe { studiofs_linux_fuse_file_info_fh(fi) };
+    (fh != 0).then_some(fh)
+}
+
+fn file_info_flags(fi: *const raw::FuseFileInfo) -> c_int {
+    if fi.is_null() {
+        return 0;
+    }
+    // SAFETY: libfuse passes a live `fuse_file_info`; the C shim reads only
+    // the `flags` field using the system header layout.
+    unsafe { studiofs_linux_fuse_file_info_flags(fi) }
 }
 
 fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {
@@ -776,7 +1071,7 @@ fn reply_entry_result(
     }
 }
 
-fn reply_open(
+fn reply_dir_open(
     req: *mut raw::FuseReq,
     fi: *mut raw::FuseFileInfo,
     handle: NonNull<DirectoryHandle>,
@@ -790,8 +1085,47 @@ fn reply_open(
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, handle.as_ptr() as u64);
+        studiofs_linux_fuse_dir_file_info_init(fi, handle.as_ptr() as u64);
         raw::fuse_reply_open(req, fi);
+    }
+}
+
+fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) {
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
+    // using the exact system header layout.
+    unsafe {
+        studiofs_linux_fuse_file_info_init(fi, fh, 1);
+        raw::fuse_reply_open(req, fi);
+    }
+}
+
+fn reply_create(
+    req: *mut raw::FuseReq,
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    attr: &InodeAttr,
+    fh: u64,
+) {
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    let stat = state.attr_to_stat(attr);
+    let entry = raw::FuseEntryParam {
+        ino: attr.ino,
+        generation: 1,
+        attr: stat,
+        attr_timeout: TTL_SECONDS,
+        entry_timeout: TTL_SECONDS,
+    };
+    // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+    unsafe {
+        studiofs_linux_fuse_file_info_init(fi, fh, 1);
+        raw::fuse_reply_create(req, &entry, fi);
     }
 }
 
@@ -893,6 +1227,7 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::process::Command;
     use std::time::Duration;
 
@@ -924,6 +1259,26 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn low_level_ops_include_regular_file_callbacks() {
+        // SAFETY: the C shim only inspects callback pointers in a static table.
+        let has_callbacks = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn regular_file_info_defaults_to_direct_io() {
+        // SAFETY: the C shim initializes and inspects a stack-local fuse_file_info.
+        let direct_io = unsafe { super::studiofs_linux_fuse_file_info_direct_io_after_init() };
+
+        assert_eq!(direct_io, 1);
     }
 
     #[test]
@@ -980,6 +1335,64 @@ mod tests {
         session.run().expect("run libfuse3 session");
         assert!(unmount.join().expect("join unmount thread").success());
         drop(session);
+        std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_regular_file_io_is_visible_across_reopen() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-regular-io")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-regular-io-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
+
+        let state =
+            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let path = mount_point_for_worker.join("regular.txt");
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            file.write_all(b"hello local-first")?;
+            file.flush()?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut same_handle = String::new();
+            file.read_to_string(&mut same_handle)?;
+            assert_eq!(same_handle, "hello local-first");
+            file.sync_all()?;
+            drop(file);
+
+            assert_eq!(std::fs::read_to_string(&path)?, "hello local-first");
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            file.set_len(5)?;
+            file.sync_data()?;
+            drop(file);
+            assert_eq!(std::fs::read_to_string(&path)?, "hello");
+
+            Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount_point_for_worker)
+                .status()
+        });
+
+        session.run().expect("run libfuse3 session");
+        let unmount_status = worker
+            .join()
+            .expect("mounted I/O worker should not panic")
+            .expect("mounted I/O worker should complete");
+        assert!(unmount_status.success());
+        drop(session);
+        drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
     }
 }

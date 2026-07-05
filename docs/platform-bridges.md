@@ -174,23 +174,32 @@ Linux mount starts through a thin libfuse3 low-level bridge. The bridge uses
 the system libfuse3 development/runtime packages and `fusermount3`; StudioFS
 does not vendor, bundle, or build libfuse3.
 
-Current Linux metadata navigation callbacks:
+Current Linux callbacks:
 
 | libfuse3 Callback | VFS Method |
 |-------------------|------------|
 | `lookup` | `lookup()` |
 | `getattr` | `getattr()` |
 | `setattr` | `setattr_with_handle()` |
+| `create` | `create()` + `open_created_file_with_known_attr()` |
+| `open` | `open_file_with_known_attr()` |
+| `read` | `read_into_fh()` |
+| `write` | `write_fh_with_deferred_materialize()` |
+| `flush` | `flush_fh()` |
+| `fsync` | `flush_fh()` when handle-backed, otherwise `fsync()` |
+| `release` | `release_fh()` |
 | `statfs` | `statfs()` |
 | `access` | `getattr()` + POSIX mode check |
 | `opendir` | `getattr()` directory check |
 | `readdir` | `readdir_with_attrs()` |
 | `releasedir` | success reply |
 
-SFS-604 keeps regular-file I/O, namespace mutations, symlinks, xattrs, kernel
-invalidation, and bounded multithreaded callback dispatch as explicit follow-up
-compatibility gaps. Those operations are tracked by the subsequent Linux bridge
-slices and should not be treated as silent omissions.
+Linux regular-file opens use `direct_io` by default and keep kernel writeback
+caching out of the default path. Namespace mutations beyond regular-file create,
+symlinks, xattrs, kernel invalidation, and bounded multithreaded callback
+dispatch remain explicit follow-up compatibility gaps. Those operations are
+tracked by subsequent Linux bridge slices and should not be treated as silent
+omissions.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 9.4+. Rocky Linux 8.6+ remains best-effort.
