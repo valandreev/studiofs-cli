@@ -62,6 +62,7 @@ const FUSE_BIG_WRITES: u32 = 1 << 5;
 const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 const FUSE_MAX_PAGES: u32 = 1 << 22;
+const FUSE_FSYNC_DATASYNC: u32 = 1;
 const STUDIOFS_REQUESTED_CAPS: u32 = FUSE_ASYNC_READ
     | FUSE_BIG_WRITES
     | FUSE_AUTO_INVAL_DATA
@@ -955,7 +956,7 @@ fn handle_fuse_fsync(
         Ok(input) => input,
         Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
     };
-    let datasync = input & 1 != 0;
+    let datasync = input & FUSE_FSYNC_DATASYNC != 0;
     match runtime_handle.block_on(vfs.fsync(item.header.nodeid, datasync)) {
         Ok(()) => encode_data_reply(unique, Vec::new()),
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
