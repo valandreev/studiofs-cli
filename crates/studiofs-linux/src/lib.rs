@@ -44,6 +44,7 @@ const FUSE_IOCTL_IN_SIZE: usize = 32;
 const FUSE_IOCTL_OUT_SIZE: usize = 16;
 const FUSE_GETXATTR_IN_SIZE: usize = 8;
 const FUSE_SETXATTR_IN_SIZE: usize = 16;
+const FUSE_LINK_IN_SIZE: usize = 8;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -64,9 +65,12 @@ const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
 const FUSE_SETATTR: u32 = 4;
+const FUSE_READLINK: u32 = 5;
+const FUSE_SYMLINK: u32 = 6;
 const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
 const FUSE_OPEN: u32 = 14;
 const FUSE_INIT: u32 = 26;
 const FUSE_READ: u32 = 15;
@@ -928,9 +932,12 @@ fn handle_vfs_fuse_request(
         FUSE_LOOKUP => handle_fuse_lookup(vfs, item),
         FUSE_GETATTR => handle_fuse_getattr(vfs, item),
         FUSE_SETATTR => handle_fuse_setattr(vfs, item),
+        FUSE_READLINK => handle_fuse_readlink(vfs, item),
+        FUSE_SYMLINK => handle_fuse_symlink(vfs, item),
         FUSE_MKDIR => handle_fuse_mkdir(vfs, item),
         FUSE_UNLINK => handle_fuse_unlink(vfs, item),
         FUSE_RENAME => handle_fuse_rename(vfs, item),
+        FUSE_LINK => handle_fuse_link(vfs, item),
         FUSE_OPEN => handle_fuse_open(vfs, item),
         FUSE_OPENDIR => handle_fuse_opendir(item),
         FUSE_READDIR => handle_fuse_readdir(vfs, item),
@@ -988,6 +995,29 @@ fn handle_fuse_setattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
+fn handle_fuse_readlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    match vfs.readlink(item.header.nodeid) {
+        Ok(target) => encode_data_reply(unique, target),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_symlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (name, target) = match parse_two_names(fuse_payload(item), "short FUSE_SYMLINK request") {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.symlink(item.header.nodeid, name, target, 0, 0) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        },
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
 fn handle_fuse_mkdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (mode, name) = match parse_mkdir_in(fuse_payload(item)) {
@@ -1023,6 +1053,21 @@ fn handle_fuse_rename(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     };
     match vfs.rename(item.header.nodeid, name, new_parent, new_name) {
         Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_link(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (source_ino, name) = match parse_link_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.link(source_ino, item.header.nodeid, name) {
+        Ok(attr) => FuseReply::Data {
+            header: encode_reply_header(unique, 0, FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE),
+            data: encode_entry_payload(&to_bridge_attr(&attr, 0, 0, DEFAULT_BLOCK_SIZE)),
+        },
         Err(error) => encode_error_reply(unique, vfs_err_to_errno(&error)),
     }
 }
@@ -1941,6 +1986,19 @@ fn parse_mkdir_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
     ))
 }
 
+fn parse_link_in(bytes: &[u8]) -> io::Result<(u64, &[u8])> {
+    if bytes.len() <= FUSE_LINK_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_LINK request",
+        ));
+    }
+    Ok((
+        read_u64(bytes, 0)?,
+        parse_name(bytes, FUSE_LINK_IN_SIZE, "short FUSE_LINK request")?,
+    ))
+}
+
 fn parse_rename_in(bytes: &[u8]) -> io::Result<(u64, &[u8], &[u8])> {
     if bytes.len() <= FUSE_RENAME_IN_SIZE {
         return Err(io::Error::new(
@@ -1965,6 +2023,23 @@ fn parse_rename_in(bytes: &[u8]) -> io::Result<(u64, &[u8], &[u8])> {
         ));
     }
     Ok((read_u64(bytes, 0)?, &names[..old_end], new_name))
+}
+
+fn parse_two_names<'a>(bytes: &'a [u8], short: &str) -> io::Result<(&'a [u8], &'a [u8])> {
+    let first_end = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "first name is not nul-terminated",
+        )
+    })?;
+    let second = bytes[first_end + 1..]
+        .strip_suffix(&[0])
+        .unwrap_or(&bytes[first_end + 1..]);
+    if first_end == 0 || second.is_empty() {
+        Err(io::Error::new(io::ErrorKind::InvalidData, short))
+    } else {
+        Ok((&bytes[..first_end], second))
+    }
 }
 
 fn parse_create_in(bytes: &[u8]) -> io::Result<(u32, u32, &[u8])> {
@@ -2935,6 +3010,48 @@ mod tests {
         )
         .expect("missing getxattr reply");
         assert_error_reply(&missing, 108, libc::ENODATA);
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_symlink_readlink_and_hardlink() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-links-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "links");
+        let file = vfs.create(ROOT_INO, b"source.txt", 0, 0, 0o644).unwrap();
+        let symlink_payload = b"link.txt\0source.txt\0";
+
+        let symlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SYMLINK, 109, ROOT_INO, symlink_payload),
+        )
+        .expect("symlink reply");
+        assert_ok_reply(&symlink, 109);
+        let link_ino = read_u64(symlink.payload_slice(), 0).unwrap();
+
+        let readlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_READLINK, 110, link_ino, &[]),
+        )
+        .expect("readlink reply");
+        assert_ok_reply(&readlink, 110);
+        assert_eq!(readlink.payload_slice(), b"source.txt");
+
+        let mut link_payload = Vec::from(file.ino.to_ne_bytes());
+        link_payload.extend_from_slice(b"hard.txt\0");
+        let hardlink = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LINK, 111, ROOT_INO, &link_payload),
+        )
+        .expect("hardlink reply");
+        assert_ok_reply(&hardlink, 111);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"hard.txt").expect("hardlink").ino,
+            file.ino
+        );
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
