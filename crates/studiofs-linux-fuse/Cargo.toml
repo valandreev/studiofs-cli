@@ -1,0 +1,19 @@
+[package]
+name = "studiofs-linux-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+cc = "1"
+pkg-config = "0.3"
