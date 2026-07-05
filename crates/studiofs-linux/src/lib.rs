@@ -42,6 +42,8 @@ const FUSE_OPEN_IN_SIZE: usize = 8;
 const FUSE_SETATTR_IN_SIZE: usize = 88;
 const FUSE_IOCTL_IN_SIZE: usize = 32;
 const FUSE_IOCTL_OUT_SIZE: usize = 16;
+const FUSE_GETXATTR_IN_SIZE: usize = 8;
+const FUSE_SETXATTR_IN_SIZE: usize = 16;
 const FUSE_READ_IN_SIZE: usize = 40;
 const FUSE_WRITE_IN_SIZE: usize = 40;
 const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -71,6 +73,10 @@ const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
 const FUSE_RELEASE: u32 = 18;
 const FUSE_FSYNC: u32 = 20;
+const FUSE_SETXATTR: u32 = 21;
+const FUSE_GETXATTR: u32 = 22;
+const FUSE_LISTXATTR: u32 = 23;
+const FUSE_REMOVEXATTR: u32 = 24;
 const FUSE_FLUSH: u32 = 25;
 const FUSE_OPENDIR: u32 = 27;
 const FUSE_READDIR: u32 = 28;
@@ -930,6 +936,10 @@ fn handle_vfs_fuse_request(
         FUSE_READDIR => handle_fuse_readdir(vfs, item),
         FUSE_RELEASEDIR => handle_fuse_releasedir(item),
         FUSE_IOCTL => handle_fuse_ioctl(item),
+        FUSE_SETXATTR => handle_fuse_setxattr(vfs, item),
+        FUSE_GETXATTR => handle_fuse_getxattr(vfs, item),
+        FUSE_LISTXATTR => handle_fuse_listxattr(vfs, item),
+        FUSE_REMOVEXATTR => handle_fuse_removexattr(vfs, item),
         FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
         FUSE_CREATE => handle_fuse_create(vfs, item),
@@ -1080,6 +1090,66 @@ fn handle_fuse_ioctl(item: &FuseWorkItem) -> FuseReply {
         return encode_error_reply(unique, libc::EINVAL);
     }
     encode_ioctl_reply(unique, vec![0_u8; expected as usize])
+}
+
+fn handle_fuse_setxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (flags, name, value) = match parse_setxattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.set_xattr(item.header.nodeid, name, value, flags) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_getxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let (size, name) = match parse_getxattr_in(fuse_payload(item)) {
+        Ok(input) => input,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.get_xattr(item.header.nodeid, name) {
+        Ok(Some(value)) if size == 0 => encode_xattr_size_reply(unique, value.len()),
+        Ok(Some(value)) if value.len() <= size as usize => encode_data_reply(unique, value),
+        Ok(Some(_)) => encode_error_reply(unique, libc::ERANGE),
+        Ok(None) => encode_error_reply(unique, libc::ENODATA),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_listxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let size = match parse_xattr_size_in(fuse_payload(item), "short FUSE_LISTXATTR request") {
+        Ok(size) => size,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.list_xattrs(item.header.nodeid) {
+        Ok(names) => {
+            let data = format_xattr_name_list(&names);
+            if size == 0 {
+                encode_xattr_size_reply(unique, data.len())
+            } else if data.len() <= size as usize {
+                encode_data_reply(unique, data)
+            } else {
+                encode_error_reply(unique, libc::ERANGE)
+            }
+        }
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
+}
+
+fn handle_fuse_removexattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+    let unique = item.header.unique;
+    let name = match parse_name(fuse_payload(item), 0, "short FUSE_REMOVEXATTR request") {
+        Ok(name) => name,
+        Err(error) => return encode_error_reply(unique, io_error_errno(&error)),
+    };
+    match vfs.remove_xattr(item.header.nodeid, name) {
+        Ok(()) => encode_data_reply(unique, Vec::new()),
+        Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
+    }
 }
 
 fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
@@ -1511,6 +1581,15 @@ fn encode_ioctl_reply(unique: u64, output: Vec<u8>) -> FuseReply {
     }
 }
 
+fn encode_xattr_size_reply(unique: u64, size: usize) -> FuseReply {
+    let mut reply = [0_u8; FUSE_WRITE_REPLY_SIZE];
+    let mut offset = 0;
+    push_out_header(&mut reply, &mut offset, unique, 0, FUSE_WRITE_REPLY_SIZE);
+    push_u32(&mut reply, &mut offset, size as u32);
+    push_u32(&mut reply, &mut offset, 0);
+    FuseReply::inline(reply, FUSE_WRITE_REPLY_SIZE)
+}
+
 fn encode_dirents(ino: u64, entries: Vec<DirEntry>, offset: usize, size: usize) -> Vec<u8> {
     let mut data = Vec::new();
     if offset == 0 && !push_dirent(&mut data, size, ino, 1, FileType::Directory, b".") {
@@ -1781,6 +1860,63 @@ fn parse_ioctl_in(bytes: &[u8]) -> io::Result<(u32, u32)> {
     Ok((read_u32(bytes, 12)?, read_u32(bytes, 28)?))
 }
 
+fn parse_setxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8], &[u8])> {
+    if bytes.len() <= FUSE_SETXATTR_IN_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short FUSE_SETXATTR request",
+        ));
+    }
+    let value_size = read_u32(bytes, 0)? as usize;
+    let value_start = bytes[FUSE_SETXATTR_IN_SIZE..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|end| FUSE_SETXATTR_IN_SIZE + end + 1)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FUSE_SETXATTR name is not nul-terminated",
+            )
+        })?;
+    let value_end = value_start
+        .checked_add(value_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FUSE_SETXATTR size overflow"))?;
+    let value = bytes.get(value_start..value_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FUSE_SETXATTR payload shorter than declared size",
+        )
+    })?;
+    Ok((
+        read_u32(bytes, 4)?,
+        &bytes[FUSE_SETXATTR_IN_SIZE..value_start - 1],
+        value,
+    ))
+}
+
+fn parse_getxattr_in(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
+    Ok((
+        parse_xattr_size_in(bytes, "short FUSE_GETXATTR request")?,
+        parse_name(bytes, FUSE_GETXATTR_IN_SIZE, "short FUSE_GETXATTR request")?,
+    ))
+}
+
+fn parse_xattr_size_in(bytes: &[u8], short: &str) -> io::Result<u32> {
+    if bytes.len() < FUSE_GETXATTR_IN_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, short));
+    }
+    read_u32(bytes, 0)
+}
+
+fn format_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(names.iter().map(|name| name.len() + 1).sum());
+    for name in names {
+        data.extend_from_slice(name);
+        data.push(0);
+    }
+    data
+}
+
 fn fuse_time_to_nanos(seconds: u64, nanos: u32) -> io::Result<i64> {
     if nanos >= 1_000_000_000 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -1897,6 +2033,17 @@ fn parse_release_in(bytes: &[u8]) -> io::Result<u64> {
 
 fn io_error_errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(libc::EINVAL)
+}
+
+fn xattr_err_to_errno(error: &studiofs_vfs::VfsError) -> i32 {
+    if matches!(
+        error,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    ) {
+        libc::ENODATA
+    } else {
+        vfs_err_to_errno(error)
+    }
 }
 
 fn push_out_header(reply: &mut [u8], offset: &mut usize, unique: u64, error: i32, len: usize) {
@@ -2688,6 +2835,106 @@ mod tests {
             assert_eq!(read_u32(reply.payload_slice(), 0).unwrap(), 0);
             assert_eq!(&reply.payload_slice()[16..], vec![0_u8; out_size as usize]);
         }
+
+        runtime.block_on(vfs.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn vfs_handler_wires_xattr_lifecycle() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("linux-vfs-xattr-");
+        let (runtime, vfs) = make_test_vfs(&tmp, "xattr");
+        let attr = vfs.create(ROOT_INO, b"xattr.txt", 0, 0, 0o644).unwrap();
+        let name = b"user.color";
+        let value = b"blue";
+        let mut set_payload = Vec::from((value.len() as u32).to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        set_payload.extend_from_slice(name);
+        set_payload.push(0);
+        set_payload.extend_from_slice(value);
+        let set = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_SETXATTR, 102, attr.ino, &set_payload),
+        )
+        .expect("setxattr reply");
+        assert_ok_reply(&set, 102);
+
+        let mut get_size_payload = Vec::from(0_u32.to_ne_bytes());
+        get_size_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        get_size_payload.extend_from_slice(name);
+        get_size_payload.push(0);
+        let get_size = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 103, attr.ino, &get_size_payload),
+        )
+        .expect("getxattr size reply");
+        assert_ok_reply(&get_size, 103);
+        assert_eq!(
+            read_u32(get_size.payload_slice(), 0).unwrap(),
+            value.len() as u32
+        );
+
+        let mut get_value_payload = Vec::from(16_u32.to_ne_bytes());
+        get_value_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        get_value_payload.extend_from_slice(name);
+        get_value_payload.push(0);
+        let get_value = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 104, attr.ino, &get_value_payload),
+        )
+        .expect("getxattr value reply");
+        assert_ok_reply(&get_value, 104);
+        assert_eq!(get_value.payload_slice(), value);
+
+        let list_size = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_LISTXATTR,
+                105,
+                attr.ino,
+                &[0_u8; FUSE_GETXATTR_IN_SIZE],
+            ),
+        )
+        .expect("listxattr size reply");
+        assert_ok_reply(&list_size, 105);
+        assert_eq!(
+            read_u32(list_size.payload_slice(), 0).unwrap(),
+            name.len() as u32 + 1
+        );
+
+        let mut list_payload = Vec::from(64_u32.to_ne_bytes());
+        list_payload.extend_from_slice(&0_u32.to_ne_bytes());
+        let list_value = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_LISTXATTR, 106, attr.ino, &list_payload),
+        )
+        .expect("listxattr value reply");
+        assert_ok_reply(&list_value, 106);
+        assert_eq!(list_value.payload_slice(), b"user.color\0");
+
+        let mut remove_payload = Vec::from(&name[..]);
+        remove_payload.push(0);
+        let remove = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_REMOVEXATTR, 107, attr.ino, &remove_payload),
+        )
+        .expect("removexattr reply");
+        assert_ok_reply(&remove, 107);
+
+        let missing = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 108, attr.ino, &get_size_payload),
+        )
+        .expect("missing getxattr reply");
+        assert_error_reply(&missing, 108, libc::ENODATA);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
