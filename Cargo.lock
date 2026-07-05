@@ -4903,6 +4903,9 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+ "studiofs-bridge",
+ "studiofs-meta",
+ "studiofs-vfs",
 ]
 
 [[package]]

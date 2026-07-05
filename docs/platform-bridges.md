@@ -1,6 +1,7 @@
 # Platform Bridges
 
-StudioFS supports Windows and macOS through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. Linux mount is intentionally not implemented after SFS-600 removed the legacy raw FUSE path.
+StudioFS supports Windows, macOS, and Linux through thin bridge crates that
+translate OS-specific filesystem callbacks into `StudioVfs` method calls.
 
 ## Overview
 
@@ -173,10 +174,23 @@ Linux mount starts through a thin libfuse3 low-level bridge. The bridge uses
 the system libfuse3 development/runtime packages and `fusermount3`; StudioFS
 does not vendor, bundle, or build libfuse3.
 
-SFS-603 intentionally provides only the mount skeleton: a low-level session,
-process signal handling through libfuse3, clean unmount, and the shared VFS
-shutdown path owned by the CLI mount lifecycle. Metadata navigation and regular
-file I/O are follow-up Linux bridge slices.
+Current Linux metadata navigation callbacks:
+
+| libfuse3 Callback | VFS Method |
+|-------------------|------------|
+| `lookup` | `lookup()` |
+| `getattr` | `getattr()` |
+| `setattr` | `setattr_with_handle()` |
+| `statfs` | `statfs()` |
+| `access` | `getattr()` + POSIX mode check |
+| `opendir` | `getattr()` directory check |
+| `readdir` | `readdir_with_attrs()` |
+| `releasedir` | success reply |
+
+SFS-604 keeps regular-file I/O, namespace mutations, symlinks, xattrs, kernel
+invalidation, and bounded multithreaded callback dispatch as explicit follow-up
+compatibility gaps. Those operations are tracked by the subsequent Linux bridge
+slices and should not be treated as silent omissions.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 9.4+. Rocky Linux 8.6+ remains best-effort.
@@ -190,8 +204,11 @@ First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 
 | Option | Value |
 |--------|-------|
-| `fsname` | `"studiofs"` |
-| `auto_unmount` | Yes |
+| Linux `fsname` | volume name |
+| Linux `subtype` | `"studiofs"` |
+| Linux `auto_unmount` | Yes |
+| macOS `fsname` | `"studiofs"` |
+| macOS `auto_unmount` | Yes |
 | `allow_other` | macOS: yes |
 | Kernel `max_write` | macOS: `131072` bytes by default |
 | Kernel `max_read` | macOS mount option: `4194304` bytes |

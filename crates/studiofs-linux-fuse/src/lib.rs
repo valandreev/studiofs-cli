@@ -9,20 +9,31 @@ use std::io;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use studiofs_vfs::StudioVfs;
 mod low_level;
 
 /// Request used by the CLI backend router to launch the Linux libfuse3 bridge.
 pub struct LinuxFuseMountRequest {
+    vfs: Arc<StudioVfs>,
     mount_point: PathBuf,
     volume_name: String,
+    read_only: bool,
 }
 
 impl LinuxFuseMountRequest {
     /// Create a Linux libfuse3 mount request.
-    pub fn new(mount_point: impl Into<PathBuf>, volume_name: impl Into<String>) -> Self {
+    pub fn new(
+        vfs: Arc<StudioVfs>,
+        mount_point: impl Into<PathBuf>,
+        volume_name: impl Into<String>,
+        read_only: bool,
+    ) -> Self {
         Self {
+            vfs,
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
+            read_only,
         }
     }
 }
@@ -31,10 +42,16 @@ impl LinuxFuseMountRequest {
 pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
     ensure_fusermount3_available()?;
     let LinuxFuseMountRequest {
+        vfs,
         mount_point,
         volume_name,
+        read_only,
     } = request;
-    let mut session = low_level::Session::mount(mount_point, volume_name)?;
+    let mut session = low_level::Session::mount(
+        low_level::SessionState::new(vfs, read_only),
+        mount_point,
+        volume_name,
+    )?;
     session.install_signal_handlers()?;
     session.run()
 }

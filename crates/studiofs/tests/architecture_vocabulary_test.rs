@@ -1816,7 +1816,7 @@ fn active_code_drops_flat_block_contract_vocabulary() {
         "crates/studiofs/src",
         "crates/studiofs/tests",
         "crates/studiofs-winfsp/src",
-        "crates/studiofs-fuse/src",
+        "crates/studiofs-linux-fuse/src",
     ];
     let forbidden_terms = [
         "block_projection",
