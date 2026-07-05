@@ -367,11 +367,7 @@ fn open_fuse_device() -> io::Result<File> {
 
 fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
     let mode = fuse_rootmode(mount_point)?;
-    let options = format!(
-        "fd={fd},rootmode={mode:o},user_id={},group_id={},default_permissions",
-        current_uid(),
-        current_gid()
-    );
+    let options = fuse_mount_options(fd, mode, current_uid(), current_gid());
     let source = cstring(FUSE_SOURCE)?;
     let target = cstring_path(mount_point)?;
     let fstype = cstring(FUSE_MOUNT_TYPE)?;
@@ -407,6 +403,12 @@ fn mount_fuse_device(mount_point: &Path, fd: RawFd) -> io::Result<()> {
             mount_point.display()
         ),
     ))
+}
+
+fn fuse_mount_options(fd: RawFd, mode: u32, uid: libc::uid_t, gid: libc::gid_t) -> String {
+    format!(
+        "fd={fd},rootmode={mode:o},user_id={uid},group_id={gid},default_permissions,fsname={FUSE_SOURCE},subtype={FUSE_SOURCE}"
+    )
 }
 
 fn fuse_rootmode(mount_point: &Path) -> io::Result<u32> {
@@ -1192,7 +1194,10 @@ fn handle_fuse_getxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         Ok(Some(value)) if size == 0 => encode_xattr_size_reply(unique, value.len()),
         Ok(Some(value)) if value.len() <= size as usize => encode_data_reply(unique, value),
         Ok(Some(_)) => encode_error_reply(unique, libc::ERANGE),
-        Ok(None) => encode_error_reply(unique, libc::ENODATA),
+        Ok(None) => encode_error_reply(
+            unique,
+            xattr_missing_value_errno(vfs, item.header.nodeid).unwrap_or(libc::ENODATA),
+        ),
         Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
     }
 }
@@ -1205,6 +1210,11 @@ fn handle_fuse_listxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     };
     match vfs.list_xattrs(item.header.nodeid) {
         Ok(names) => {
+            if names.is_empty()
+                && let Some(errno) = xattr_missing_value_errno(vfs, item.header.nodeid)
+            {
+                return encode_error_reply(unique, errno);
+            }
             let data = format_xattr_name_list(&names);
             if size == 0 {
                 encode_xattr_size_reply(unique, data.len())
@@ -1216,6 +1226,10 @@ fn handle_fuse_listxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
         }
         Err(error) => encode_error_reply(unique, xattr_err_to_errno(&error)),
     }
+}
+
+fn xattr_missing_value_errno(vfs: &StudioVfs, ino: u64) -> Option<i32> {
+    vfs.getattr(ino).err().map(|error| vfs_err_to_errno(&error))
 }
 
 fn handle_fuse_removexattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
@@ -2517,6 +2531,14 @@ mod tests {
     }
 
     #[test]
+    fn fuse_mount_options_preserve_display_name() {
+        assert_eq!(
+            fuse_mount_options(7, 0o40755, 1000, 1000),
+            "fd=7,rootmode=40755,user_id=1000,group_id=1000,default_permissions,fsname=studiofs,subtype=studiofs"
+        );
+    }
+
+    #[test]
     fn pollin_waits_without_idle_timeout() {
         assert_eq!(poll_timeout_ms(libc::POLLIN), -1);
     }
@@ -3057,6 +3079,27 @@ mod tests {
         )
         .expect("missing getxattr reply");
         assert_error_reply(&missing, 108, libc::ENODATA);
+
+        let missing_inode = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(FUSE_GETXATTR, 112, u64::MAX, &get_size_payload),
+        )
+        .expect("missing inode getxattr reply");
+        assert_error_reply(&missing_inode, 112, libc::ENOENT);
+
+        let missing_inode_list = handle_vfs_fuse_request(
+            &vfs,
+            runtime.handle(),
+            &work_item_with_payload(
+                FUSE_LISTXATTR,
+                113,
+                u64::MAX,
+                &[0_u8; FUSE_GETXATTR_IN_SIZE],
+            ),
+        )
+        .expect("missing inode listxattr reply");
+        assert_error_reply(&missing_inode_list, 113, libc::ENOENT);
 
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
