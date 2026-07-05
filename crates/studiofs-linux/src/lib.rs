@@ -941,35 +941,35 @@ fn handle_vfs_fuse_request(
     }
     let started = Instant::now();
     Some(match header.opcode {
-        FUSE_LOOKUP => handle_fuse_lookup(vfs, item),
-        FUSE_GETATTR => handle_fuse_getattr(vfs, item),
-        FUSE_SETATTR => handle_fuse_setattr(vfs, item),
-        FUSE_READLINK => handle_fuse_readlink(vfs, item),
-        FUSE_SYMLINK => handle_fuse_symlink(vfs, item),
-        FUSE_MKDIR => handle_fuse_mkdir(vfs, item),
-        FUSE_UNLINK => handle_fuse_unlink(vfs, item),
-        FUSE_RENAME => handle_fuse_rename(vfs, item),
-        FUSE_LINK => handle_fuse_link(vfs, item),
-        FUSE_OPEN => handle_fuse_open(vfs, item),
+        FUSE_LOOKUP => handle_fuse_lookup(vfs.as_ref(), item),
+        FUSE_GETATTR => handle_fuse_getattr(vfs.as_ref(), item),
+        FUSE_SETATTR => handle_fuse_setattr(vfs.as_ref(), item),
+        FUSE_READLINK => handle_fuse_readlink(vfs.as_ref(), item),
+        FUSE_SYMLINK => handle_fuse_symlink(vfs.as_ref(), item),
+        FUSE_MKDIR => handle_fuse_mkdir(vfs.as_ref(), item),
+        FUSE_UNLINK => handle_fuse_unlink(vfs.as_ref(), item),
+        FUSE_RENAME => handle_fuse_rename(vfs.as_ref(), item),
+        FUSE_LINK => handle_fuse_link(vfs.as_ref(), item),
+        FUSE_OPEN => handle_fuse_open(vfs.as_ref(), item),
         FUSE_OPENDIR => handle_fuse_opendir(item),
-        FUSE_READDIR => handle_fuse_readdir(vfs, item),
+        FUSE_READDIR => handle_fuse_readdir(vfs.as_ref(), item),
         FUSE_RELEASEDIR => handle_fuse_releasedir(item),
         FUSE_IOCTL => handle_fuse_ioctl(item),
-        FUSE_SETXATTR => handle_fuse_setxattr(vfs, item),
-        FUSE_GETXATTR => handle_fuse_getxattr(vfs, item),
-        FUSE_LISTXATTR => handle_fuse_listxattr(vfs, item),
-        FUSE_REMOVEXATTR => handle_fuse_removexattr(vfs, item),
-        FUSE_READ => handle_fuse_read(vfs, runtime_handle, item, started),
+        FUSE_SETXATTR => handle_fuse_setxattr(vfs.as_ref(), item),
+        FUSE_GETXATTR => handle_fuse_getxattr(vfs.as_ref(), item),
+        FUSE_LISTXATTR => handle_fuse_listxattr(vfs.as_ref(), item),
+        FUSE_REMOVEXATTR => handle_fuse_removexattr(vfs.as_ref(), item),
+        FUSE_READ => handle_fuse_read(vfs.as_ref(), runtime_handle, item, started),
         FUSE_WRITE => handle_fuse_write(vfs, runtime_handle, item, started),
-        FUSE_CREATE => handle_fuse_create(vfs, item),
-        FUSE_FLUSH => handle_fuse_flush(vfs, runtime_handle, item),
-        FUSE_FSYNC => handle_fuse_fsync(vfs, runtime_handle, item),
-        FUSE_RELEASE => handle_fuse_release(vfs, runtime_handle, item),
+        FUSE_CREATE => handle_fuse_create(vfs.as_ref(), item),
+        FUSE_FLUSH => handle_fuse_flush(vfs.as_ref(), runtime_handle, item),
+        FUSE_FSYNC => handle_fuse_fsync(vfs.as_ref(), runtime_handle, item),
+        FUSE_RELEASE => handle_fuse_release(vfs.as_ref(), runtime_handle, item),
         _ => encode_error_reply(header.unique, libc::ENOSYS),
     })
 }
 
-fn handle_fuse_lookup(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_lookup(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let name = match parse_name(fuse_payload(item), 0, "short FUSE_LOOKUP request") {
         Ok(name) => name,
@@ -984,7 +984,7 @@ fn handle_fuse_lookup(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_getattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_getattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     if fuse_payload(item).len() < FUSE_GETATTR_IN_SIZE {
         return encode_error_reply(unique, libc::EINVAL);
@@ -995,7 +995,7 @@ fn handle_fuse_getattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_setattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_setattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (fh, args) = match parse_setattr_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1007,7 +1007,7 @@ fn handle_fuse_setattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_readlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_readlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     match vfs.readlink(item.header.nodeid) {
         Ok(target) => encode_data_reply(unique, target),
@@ -1015,7 +1015,7 @@ fn handle_fuse_readlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply 
     }
 }
 
-fn handle_fuse_symlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_symlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (name, target) = match parse_two_names(fuse_payload(item), "short FUSE_SYMLINK request") {
         Ok(input) => input,
@@ -1030,7 +1030,7 @@ fn handle_fuse_symlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_mkdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_mkdir(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (mode, name) = match parse_mkdir_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1045,7 +1045,7 @@ fn handle_fuse_mkdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_unlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_unlink(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let name = match parse_name(fuse_payload(item), 0, "short FUSE_UNLINK request") {
         Ok(name) => name,
@@ -1057,7 +1057,7 @@ fn handle_fuse_unlink(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_rename(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_rename(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (new_parent, name, new_name) = match parse_rename_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1069,7 +1069,7 @@ fn handle_fuse_rename(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_link(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_link(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (source_ino, name) = match parse_link_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1084,7 +1084,7 @@ fn handle_fuse_link(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
     }
 }
 
-fn handle_fuse_open(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_open(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let flags = match parse_open_in(fuse_payload(item)) {
         Ok(flags) => flags,
@@ -1105,7 +1105,7 @@ fn handle_fuse_opendir(item: &FuseWorkItem) -> FuseReply {
     encode_open_reply(unique, item.header.nodeid)
 }
 
-fn handle_fuse_readdir(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_readdir(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_read_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1151,7 +1151,7 @@ fn handle_fuse_ioctl(item: &FuseWorkItem) -> FuseReply {
     encode_ioctl_reply(unique, vec![0_u8; expected as usize])
 }
 
-fn handle_fuse_setxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_setxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (flags, name, value) = match parse_setxattr_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1163,7 +1163,7 @@ fn handle_fuse_setxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply 
     }
 }
 
-fn handle_fuse_getxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_getxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (size, name) = match parse_getxattr_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1178,7 +1178,7 @@ fn handle_fuse_getxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply 
     }
 }
 
-fn handle_fuse_listxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_listxattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let size = match parse_xattr_size_in(fuse_payload(item), "short FUSE_LISTXATTR request") {
         Ok(size) => size,
@@ -1199,7 +1199,7 @@ fn handle_fuse_listxattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply
     }
 }
 
-fn handle_fuse_removexattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_removexattr(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let name = match parse_name(fuse_payload(item), 0, "short FUSE_REMOVEXATTR request") {
         Ok(name) => name,
@@ -1211,7 +1211,7 @@ fn handle_fuse_removexattr(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseRep
     }
 }
 
-fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
+fn handle_fuse_create(vfs: &StudioVfs, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let (flags, mode, name) = match parse_create_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1229,7 +1229,7 @@ fn handle_fuse_create(vfs: &Arc<StudioVfs>, item: &FuseWorkItem) -> FuseReply {
 }
 
 fn handle_fuse_read(
-    vfs: &Arc<StudioVfs>,
+    vfs: &StudioVfs,
     runtime_handle: &Handle,
     item: &FuseWorkItem,
     started: Instant,
@@ -1293,11 +1293,7 @@ fn handle_fuse_write(
     }
 }
 
-fn handle_fuse_flush(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_flush(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_flush_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1309,11 +1305,7 @@ fn handle_fuse_flush(
     }
 }
 
-fn handle_fuse_fsync(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_fsync(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_fsync_in(fuse_payload(item)) {
         Ok(input) => input,
@@ -1326,11 +1318,7 @@ fn handle_fuse_fsync(
     }
 }
 
-fn handle_fuse_release(
-    vfs: &Arc<StudioVfs>,
-    runtime_handle: &Handle,
-    item: &FuseWorkItem,
-) -> FuseReply {
+fn handle_fuse_release(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWorkItem) -> FuseReply {
     let unique = item.header.unique;
     let input = match parse_release_in(fuse_payload(item)) {
         Ok(input) => input,
