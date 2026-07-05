@@ -65,7 +65,7 @@ Producers should prefer these names when the signal exists:
 
 | Section | Counters |
 | --- | --- |
-| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors` |
+| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors`, `linux_read_bytes`, `linux_writev_bytes`, `linux_splice_bytes`, `linux_work_backpressure_events`, `linux_reply_backpressure_events`, `linux_receive_errors`, `linux_work_errors`, `linux_reply_errors`, `linux_op_<name>_callbacks`, `linux_op_<name>_errors` |
 | `vfs_read` | `calls`, `requested_bytes`, `served_bytes`, `cache_hit_reads`, `cache_miss_reads`, `errors` |
 | `vfs_write` | `calls`, `accepted_bytes`, `synced_bytes`, `flush_barrier_calls`, `backpressure_events`, `errors` |
 | `cache` | `hits`, `misses`, `evictions`, `staged_payloads`, `staged_bytes`, `materialized_payloads`, `materialized_bytes` |
@@ -78,7 +78,7 @@ Recommended gauges:
 | Section | Gauges |
 | --- | --- |
 | `system` | `uptime_ms`, `rss_bytes`, `worker_threads` |
-| `bridge` | `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache` |
+| `bridge` | `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache`, `linux_fd_count`, `linux_work_queue_depth`, `linux_metadata_queue_depth`, `linux_stream_queue_depth`, `linux_reply_queue_depth` |
 | `cache` | `resident_bytes`, `dirty_bytes`, `evictable_bytes`, `prefetch_queue_depth` |
 | `upload_queue` | `pending_depth`, `pending_bytes`, `active_uploads`, `oldest_pending_age_ms` |
 | `metadata` | `pending_ops`, `inflight_ops` |
@@ -87,7 +87,7 @@ Recommended latency names:
 
 | Section | Latencies |
 | --- | --- |
-| `bridge` | `read_callback`, `write_callback`, `flush_callback` |
+| `bridge` | `read_callback`, `write_callback`, `flush_callback`, `linux_receive`, `linux_dispatch_wait`, `linux_vfs_time`, `linux_reply_queue_wait`, `linux_reply_write`, `linux_total_callback`, `linux_op_<name>` |
 | `vfs_read` | `read`, `fetch`, `local_cache_io` |
 | `vfs_write` | `write`, `sync_data`, `payload_persist` |
 | `cache` | `materialize_batch`, `cache_get`, `cache_put` |

@@ -76,15 +76,15 @@ pub use metrics::{
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsLinuxBridgeOperationStats, VfsLinuxBridgeStats, VfsMacFuseOpenCacheDecision,
+    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
+    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
+    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
+    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
+    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2608,6 +2608,7 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            linux_bridge_snapshot: Mutex::new(VfsLinuxBridgeStats::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2667,6 +2668,7 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    linux_bridge_snapshot: Mutex<VfsLinuxBridgeStats>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -7032,6 +7034,11 @@ impl StudioVfs {
     /// Replace the latest async FUSE read bridge diagnostics snapshot.
     pub fn record_fuse_async_read_snapshot(&self, snapshot: VfsFuseAsyncReadSnapshot) {
         *self.state.fuse_async_read_snapshot.lock() = snapshot;
+    }
+
+    /// Replace the latest Linux bridge diagnostics snapshot.
+    pub fn record_linux_bridge_snapshot(&self, snapshot: VfsLinuxBridgeStats) {
+        *self.state.linux_bridge_snapshot.lock() = snapshot;
     }
 
     fn apply_fuse_async_write_reset_baseline(

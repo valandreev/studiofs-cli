@@ -77,6 +77,7 @@ impl StudioVfs {
         let ingress = self.ingress_stats();
         let upload = self.upload_stats();
         let write_path = self.write_path_observability_snapshot();
+        let linux_bridge = self.state.linux_bridge_snapshot.lock().clone();
         let cache = self.cache_state_snapshot();
 
         let mut snapshot = RuntimeStatsSnapshot {
@@ -279,6 +280,75 @@ impl StudioVfs {
                 .saturating_add(write_path.winfsp_callbacks.read_total_ns)
                 .saturating_add(ms_sum_to_ns(write_path.winfsp_write_path.callback.total_ms)),
         );
+        if linux_bridge.enabled {
+            for (name, value) in [
+                (
+                    "linux_work_backpressure_events",
+                    linux_bridge.work_backpressure_count,
+                ),
+                (
+                    "linux_reply_backpressure_events",
+                    linux_bridge.reply_backpressure_count,
+                ),
+                ("linux_receive_errors", linux_bridge.receive_error_count),
+                ("linux_work_errors", linux_bridge.work_error_count),
+                ("linux_reply_errors", linux_bridge.reply_error_count),
+                ("linux_read_bytes", linux_bridge.read_bytes),
+                ("linux_writev_bytes", linux_bridge.writev_bytes),
+                ("linux_splice_bytes", linux_bridge.splice_bytes),
+            ] {
+                let unit = if name.ends_with("_bytes") {
+                    "bytes"
+                } else {
+                    "count"
+                };
+                insert_counter(&mut snapshot.bridge, name, unit, value);
+            }
+            for (name, value) in [
+                ("linux_fd_count", linux_bridge.fd_count),
+                ("linux_work_queue_depth", linux_bridge.work_queue_depth),
+                (
+                    "linux_metadata_queue_depth",
+                    linux_bridge.metadata_queue_depth,
+                ),
+                ("linux_stream_queue_depth", linux_bridge.stream_queue_depth),
+                ("linux_reply_queue_depth", linux_bridge.reply_queue_depth),
+            ] {
+                insert_gauge(&mut snapshot.bridge, name, "count", value);
+            }
+            for (name, histogram) in [
+                ("linux_receive", linux_bridge.receive),
+                ("linux_dispatch_wait", linux_bridge.dispatch_wait),
+                ("linux_vfs_time", linux_bridge.vfs_time),
+                ("linux_reply_queue_wait", linux_bridge.reply_queue_wait),
+                ("linux_reply_write", linux_bridge.reply_write),
+                ("linux_total_callback", linux_bridge.total_callback),
+            ] {
+                snapshot.bridge.latencies.insert(name.to_owned(), histogram);
+            }
+            for op in linux_bridge.operations {
+                let name = op.name.replace('-', "_");
+                insert_counter(
+                    &mut snapshot.bridge,
+                    &format!("linux_op_{name}_callbacks"),
+                    "count",
+                    op.count,
+                );
+                insert_counter(
+                    &mut snapshot.bridge,
+                    &format!("linux_op_{name}_errors"),
+                    "count",
+                    op.errors,
+                );
+                insert_latency(
+                    &mut snapshot.bridge,
+                    &format!("linux_op_{name}"),
+                    "ns",
+                    op.count,
+                    op.latency_sum_ns,
+                );
+            }
+        }
 
         insert_counter(
             &mut snapshot.vfs_read,

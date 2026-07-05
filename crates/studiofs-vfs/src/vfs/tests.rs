@@ -12802,6 +12802,83 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
 }
 
 #[test]
+fn runtime_stats_surface_reports_linux_bridge_snapshot() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-linux-bridge");
+
+    vfs.record_linux_bridge_snapshot(VfsLinuxBridgeStats {
+        enabled: true,
+        fd_count: 2,
+        work_queue_depth: 3,
+        metadata_queue_depth: 5,
+        stream_queue_depth: 7,
+        reply_queue_depth: 11,
+        read_bytes: 13,
+        writev_bytes: 17,
+        splice_bytes: 19,
+        work_backpressure_count: 23,
+        reply_backpressure_count: 29,
+        receive_error_count: 31,
+        work_error_count: 37,
+        reply_error_count: 41,
+        operations: vec![VfsLinuxBridgeOperationStats {
+            name: "read".into(),
+            count: 43,
+            errors: 47,
+            latency_sum_ns: 53,
+        }],
+        receive: RuntimeLatencyHistogram {
+            count: 2,
+            sum: 101,
+            ..Default::default()
+        },
+        dispatch_wait: RuntimeLatencyHistogram {
+            count: 3,
+            sum: 103,
+            ..Default::default()
+        },
+        vfs_time: RuntimeLatencyHistogram {
+            count: 4,
+            sum: 107,
+            ..Default::default()
+        },
+        reply_queue_wait: RuntimeLatencyHistogram {
+            count: 5,
+            sum: 109,
+            ..Default::default()
+        },
+        reply_write: RuntimeLatencyHistogram {
+            count: 6,
+            sum: 113,
+            ..Default::default()
+        },
+        total_callback: RuntimeLatencyHistogram {
+            count: 7,
+            sum: 127,
+            ..Default::default()
+        },
+    });
+
+    let snapshot = vfs.runtime_stats_snapshot();
+
+    assert_eq!(snapshot.bridge.gauges["linux_fd_count"].value, 2);
+    assert_eq!(snapshot.bridge.gauges["linux_stream_queue_depth"].value, 7);
+    assert_eq!(snapshot.bridge.counters["linux_read_bytes"].value, 13);
+    assert_eq!(
+        snapshot.bridge.counters["linux_reply_backpressure_events"].value,
+        29
+    );
+    assert_eq!(snapshot.bridge.latencies["linux_receive"].sum, 101);
+    assert_eq!(snapshot.bridge.latencies["linux_total_callback"].count, 7);
+    assert_eq!(
+        snapshot.bridge.counters["linux_op_read_callbacks"].value,
+        43
+    );
+    assert_eq!(snapshot.bridge.counters["linux_op_read_errors"].value, 47);
+    assert_eq!(snapshot.bridge.latencies["linux_op_read"].sum, 53);
+}
+
+#[test]
 fn runtime_stats_surface_skips_absent_fuse_profile_knobs() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-absent-fuse-profile-knobs");

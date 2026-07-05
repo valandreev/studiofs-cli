@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +25,10 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{DirEntry, FileType, ROOT_INO, SetattrArgs, TimeSpec};
-use studiofs_vfs::{LocalSyncPolicy, StudioVfs};
+use studiofs_vfs::{
+    LocalSyncPolicy, RuntimeLatencyHistogram, StudioVfs, VfsLinuxBridgeOperationStats,
+    VfsLinuxBridgeStats,
+};
 use tokio::runtime::Handle;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -147,6 +150,7 @@ const FUSE_WORK_QUEUE_DEPTH: usize = 128;
 const FUSE_REPLY_QUEUE_DEPTH: usize = 1024;
 const FUSE_METADATA_WORKERS: usize = 4;
 const FUSE_STREAM_WORKERS: usize = 8;
+const FUSE_OPCODE_TABLE_SIZE: usize = 64;
 const FUSE_ATTR_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE;
 const FUSE_OPEN_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE;
 const FUSE_WRITE_REPLY_SIZE: usize = FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE;
@@ -178,12 +182,24 @@ pub struct LinuxDirEntry {
 }
 
 /// Snapshot of Linux FUSE loop queue and error counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinuxFuseLoopStats {
+    /// Open FUSE file descriptors owned by the bridge.
+    pub fd_count: usize,
     /// Requests waiting for operation work.
     pub work_queue_depth: usize,
+    /// Requests waiting for metadata workers.
+    pub metadata_queue_depth: usize,
+    /// Requests waiting for stream workers.
+    pub stream_queue_depth: usize,
     /// Replies waiting for the dedicated FUSE writer.
     pub reply_queue_depth: usize,
+    /// Bytes read from `/dev/fuse`.
+    pub read_bytes: u64,
+    /// Bytes written via reply `writev`.
+    pub writev_bytes: u64,
+    /// Bytes moved via splice.
+    pub splice_bytes: u64,
     /// Times the receive loop hit a full work queue.
     pub work_backpressure_count: usize,
     /// Times operation work hit a full reply queue.
@@ -197,23 +213,97 @@ pub struct LinuxFuseLoopStats {
 }
 
 /// Shared counters for the isolated Linux FUSE loops.
-#[derive(Default)]
 pub struct LinuxFuseLoopMetrics {
+    fd_count: AtomicUsize,
     work_queue_depth: AtomicUsize,
+    metadata_queue_depth: AtomicUsize,
+    stream_queue_depth: AtomicUsize,
     reply_queue_depth: AtomicUsize,
+    read_bytes: AtomicU64,
+    writev_bytes: AtomicU64,
+    splice_bytes: AtomicU64,
     work_backpressure_count: AtomicUsize,
     reply_backpressure_count: AtomicUsize,
     receive_error_count: AtomicUsize,
     work_error_count: AtomicUsize,
     reply_error_count: AtomicUsize,
+    receive: LinuxLatencyMetrics,
+    dispatch_wait: LinuxLatencyMetrics,
+    vfs_time: LinuxLatencyMetrics,
+    reply_queue_wait: LinuxLatencyMetrics,
+    reply_write: LinuxLatencyMetrics,
+    total_callback: LinuxLatencyMetrics,
+    operations: [LinuxFuseOpMetrics; FUSE_OPCODE_TABLE_SIZE],
+}
+
+#[derive(Default)]
+struct LinuxLatencyMetrics {
+    count: AtomicU64,
+    total_ns: AtomicU64,
+}
+
+impl LinuxLatencyMetrics {
+    fn record(&self, elapsed: Duration) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_ns
+            .fetch_add(duration_ns_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RuntimeLatencyHistogram {
+        RuntimeLatencyHistogram {
+            count: self.count.load(Ordering::Relaxed),
+            sum: self.total_ns.load(Ordering::Relaxed),
+            ..RuntimeLatencyHistogram::default()
+        }
+    }
+}
+
+#[derive(Default)]
+struct LinuxFuseOpMetrics {
+    count: AtomicU64,
+    errors: AtomicU64,
+    latency_total_ns: AtomicU64,
+}
+
+impl Default for LinuxFuseLoopMetrics {
+    fn default() -> Self {
+        Self {
+            fd_count: AtomicUsize::default(),
+            work_queue_depth: AtomicUsize::default(),
+            metadata_queue_depth: AtomicUsize::default(),
+            stream_queue_depth: AtomicUsize::default(),
+            reply_queue_depth: AtomicUsize::default(),
+            read_bytes: AtomicU64::default(),
+            writev_bytes: AtomicU64::default(),
+            splice_bytes: AtomicU64::default(),
+            work_backpressure_count: AtomicUsize::default(),
+            reply_backpressure_count: AtomicUsize::default(),
+            receive_error_count: AtomicUsize::default(),
+            work_error_count: AtomicUsize::default(),
+            reply_error_count: AtomicUsize::default(),
+            receive: LinuxLatencyMetrics::default(),
+            dispatch_wait: LinuxLatencyMetrics::default(),
+            vfs_time: LinuxLatencyMetrics::default(),
+            reply_queue_wait: LinuxLatencyMetrics::default(),
+            reply_write: LinuxLatencyMetrics::default(),
+            total_callback: LinuxLatencyMetrics::default(),
+            operations: std::array::from_fn(|_| LinuxFuseOpMetrics::default()),
+        }
+    }
 }
 
 impl LinuxFuseLoopMetrics {
     /// Return a point-in-time snapshot of queue depth and error counters.
     pub fn snapshot(&self) -> LinuxFuseLoopStats {
         LinuxFuseLoopStats {
+            fd_count: self.fd_count.load(Ordering::Relaxed),
             work_queue_depth: self.work_queue_depth.load(Ordering::Relaxed),
+            metadata_queue_depth: self.metadata_queue_depth.load(Ordering::Relaxed),
+            stream_queue_depth: self.stream_queue_depth.load(Ordering::Relaxed),
             reply_queue_depth: self.reply_queue_depth.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            writev_bytes: self.writev_bytes.load(Ordering::Relaxed),
+            splice_bytes: self.splice_bytes.load(Ordering::Relaxed),
             work_backpressure_count: self.work_backpressure_count.load(Ordering::Relaxed),
             reply_backpressure_count: self.reply_backpressure_count.load(Ordering::Relaxed),
             receive_error_count: self.receive_error_count.load(Ordering::Relaxed),
@@ -222,12 +312,117 @@ impl LinuxFuseLoopMetrics {
         }
     }
 
+    /// Return the snapshot shape consumed by the mounted runtime stats surface.
+    pub fn runtime_stats_snapshot(&self) -> VfsLinuxBridgeStats {
+        VfsLinuxBridgeStats {
+            enabled: true,
+            fd_count: self.fd_count.load(Ordering::Relaxed) as u64,
+            work_queue_depth: self.work_queue_depth.load(Ordering::Relaxed) as u64,
+            metadata_queue_depth: self.metadata_queue_depth.load(Ordering::Relaxed) as u64,
+            stream_queue_depth: self.stream_queue_depth.load(Ordering::Relaxed) as u64,
+            reply_queue_depth: self.reply_queue_depth.load(Ordering::Relaxed) as u64,
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            writev_bytes: self.writev_bytes.load(Ordering::Relaxed),
+            splice_bytes: self.splice_bytes.load(Ordering::Relaxed),
+            work_backpressure_count: self.work_backpressure_count.load(Ordering::Relaxed) as u64,
+            reply_backpressure_count: self.reply_backpressure_count.load(Ordering::Relaxed) as u64,
+            receive_error_count: self.receive_error_count.load(Ordering::Relaxed) as u64,
+            work_error_count: self.work_error_count.load(Ordering::Relaxed) as u64,
+            reply_error_count: self.reply_error_count.load(Ordering::Relaxed) as u64,
+            operations: self.operation_snapshots(),
+            receive: self.receive.snapshot(),
+            dispatch_wait: self.dispatch_wait.snapshot(),
+            vfs_time: self.vfs_time.snapshot(),
+            reply_queue_wait: self.reply_queue_wait.snapshot(),
+            reply_write: self.reply_write.snapshot(),
+            total_callback: self.total_callback.snapshot(),
+        }
+    }
+
+    fn set_fd_count(&self, count: usize) {
+        self.fd_count.store(count, Ordering::Relaxed);
+    }
+
+    fn record_receive(&self, bytes: usize, elapsed: Duration) {
+        self.read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.receive.record(elapsed);
+    }
+
+    fn record_dispatch_wait(&self, elapsed: Duration) {
+        self.dispatch_wait.record(elapsed);
+    }
+
+    fn record_vfs_time(&self, opcode: u32, elapsed: Duration, errored: bool) {
+        self.vfs_time.record(elapsed);
+        let Some(metrics) = self
+            .operations
+            .get(usize::try_from(opcode).unwrap_or(FUSE_OPCODE_TABLE_SIZE))
+        else {
+            return;
+        };
+        metrics.count.fetch_add(1, Ordering::Relaxed);
+        if errored {
+            metrics.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        metrics
+            .latency_total_ns
+            .fetch_add(duration_ns_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_reply_queue_wait(&self, elapsed: Duration) {
+        self.reply_queue_wait.record(elapsed);
+    }
+
+    fn record_reply_write(&self, bytes: usize, elapsed: Duration) {
+        self.writev_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.reply_write.record(elapsed);
+    }
+
+    fn record_total_callback(&self, elapsed: Duration) {
+        self.total_callback.record(elapsed);
+    }
+
+    fn operation_snapshots(&self) -> Vec<VfsLinuxBridgeOperationStats> {
+        self.operations
+            .iter()
+            .enumerate()
+            .filter_map(|(opcode, metrics)| {
+                let count = metrics.count.load(Ordering::Relaxed);
+                if count == 0 {
+                    return None;
+                }
+                Some(VfsLinuxBridgeOperationStats {
+                    name: fuse_opcode_name(opcode as u32)?.into(),
+                    count,
+                    errors: metrics.errors.load(Ordering::Relaxed),
+                    latency_sum_ns: metrics.latency_total_ns.load(Ordering::Relaxed),
+                })
+            })
+            .collect()
+    }
+
     fn work_enqueued(&self) {
         self.work_queue_depth.fetch_add(1, Ordering::Relaxed);
     }
 
     fn work_dequeued(&self) {
         decrement_counter(&self.work_queue_depth);
+    }
+
+    fn metadata_enqueued(&self) {
+        self.metadata_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn metadata_dequeued(&self) {
+        decrement_counter(&self.metadata_queue_depth);
+    }
+
+    fn stream_enqueued(&self) {
+        self.stream_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stream_dequeued(&self) {
+        decrement_counter(&self.stream_queue_depth);
     }
 
     fn reply_enqueued(&self) {
@@ -239,10 +434,18 @@ impl LinuxFuseLoopMetrics {
     }
 }
 
+fn duration_ns_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 fn decrement_counter(counter: &AtomicUsize) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_sub(1)
     });
+}
+
+fn publish_linux_bridge_snapshot(vfs: &StudioVfs, metrics: &LinuxFuseLoopMetrics) {
+    vfs.record_linux_bridge_snapshot(metrics.runtime_stats_snapshot());
 }
 
 /// Mount `/dev/fuse`, negotiate the kernel session, then hold the single-fd shell.
@@ -484,7 +687,11 @@ fn run_fuse_shell(
     let (reply_tx, reply_rx) = work_channel(FUSE_REPLY_QUEUE_DEPTH);
     let (done_tx, done_rx) = channel();
     let shutdown = Arc::new(AtomicBool::new(false));
+    metrics.set_fd_count(2);
+    publish_linux_bridge_snapshot(&vfs, &metrics);
 
+    let work_vfs = Arc::clone(&vfs);
+    let reply_vfs = Arc::clone(&vfs);
     let receive_metrics = Arc::clone(&metrics);
     let receive_shutdown = Arc::clone(&shutdown);
     let receiver = spawn_loop("linux fuse receiver", done_tx.clone(), move || {
@@ -493,12 +700,12 @@ fn run_fuse_shell(
 
     let work_metrics = Arc::clone(&metrics);
     let worker = spawn_loop("linux fuse worker", done_tx.clone(), move || {
-        work_loop(work_rx, reply_tx, vfs, runtime_handle, work_metrics)
+        work_loop(work_rx, reply_tx, work_vfs, runtime_handle, work_metrics)
     })?;
 
     let reply_metrics = Arc::clone(&metrics);
     let replier = spawn_loop("linux fuse replier", done_tx, move || {
-        reply_loop(reply_device, reply_rx, &reply_metrics)
+        reply_loop(reply_device, reply_rx, &reply_metrics, &reply_vfs)
     })?;
 
     let mut first_error = None;
@@ -527,6 +734,7 @@ fn run_fuse_shell(
     join_loop(receiver, "linux fuse receiver")?;
     join_loop(worker, "linux fuse worker")?;
     join_loop(replier, "linux fuse replier")?;
+    publish_linux_bridge_snapshot(&vfs, &metrics);
     if let Some(error) = first_error {
         return Err(error);
     }
@@ -541,6 +749,7 @@ fn receive_loop_until_shutdown(
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     loop {
+        let started = Instant::now();
         let Some(len) = read_fuse_message_until_shutdown(&mut device, buffer.as_mut(), shutdown)
             .inspect_err(|_| {
                 metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
@@ -553,9 +762,19 @@ fn receive_loop_until_shutdown(
             metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
         })?;
         // ponytail: per-request copy; swap in a buffer pool once real payload ops are profiled.
-        enqueue_work(&work_tx, FuseWorkItem { header, message }, metrics).inspect_err(|_| {
+        enqueue_work(
+            &work_tx,
+            FuseWorkItem {
+                header,
+                message,
+                received_at: started,
+            },
+            metrics,
+        )
+        .inspect_err(|_| {
             metrics.receive_error_count.fetch_add(1, Ordering::Relaxed);
         })?;
+        metrics.record_receive(len, started.elapsed());
         if header.opcode == FUSE_DESTROY {
             return Ok(());
         }
@@ -564,19 +783,22 @@ fn receive_loop_until_shutdown(
 
 fn work_loop(
     work_rx: WorkReceiver<FuseWorkItem>,
-    reply_tx: WorkSender<FuseReply>,
+    reply_tx: WorkSender<QueuedFuseReply>,
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
     metrics: Arc<LinuxFuseLoopMetrics>,
 ) -> io::Result<()> {
+    let handler_vfs = Arc::clone(&vfs);
+    let handler_metrics = Arc::clone(&metrics);
     scheduled_work_loop(work_rx, reply_tx, metrics, move |item| {
+        publish_linux_bridge_snapshot(&handler_vfs, &handler_metrics);
         handle_vfs_fuse_request(&vfs, &runtime_handle, item)
     })
 }
 
 fn scheduled_work_loop<H>(
     work_rx: WorkReceiver<FuseWorkItem>,
-    reply_tx: WorkSender<FuseReply>,
+    reply_tx: WorkSender<QueuedFuseReply>,
     metrics: Arc<LinuxFuseLoopMetrics>,
     handler: H,
 ) -> io::Result<()>
@@ -600,6 +822,7 @@ where
             worker_fatal_tx,
             move || {
                 while let Ok(item) = worker_rx.recv() {
+                    worker_metrics.metadata_dequeued();
                     run_scheduled_item(
                         item,
                         &worker_reply_tx,
@@ -624,6 +847,7 @@ where
             worker_fatal_tx,
             move || {
                 while let Ok(item) = stream_rx.recv() {
+                    worker_metrics.stream_dequeued();
                     run_scheduled_item(
                         item,
                         &worker_reply_tx,
@@ -658,12 +882,23 @@ where
             break;
         }
         let send_result = match stream_key_for(&item) {
-            None => send_scheduled_work(&metadata_tx, &fatal_rx, item),
-            Some(key) => send_scheduled_work(
-                &stream_txs[stream_worker_index(key, stream_txs.len())],
-                &fatal_rx,
-                item,
-            ),
+            None => {
+                metrics.metadata_enqueued();
+                send_scheduled_work(&metadata_tx, &fatal_rx, item).inspect_err(|_| {
+                    metrics.metadata_dequeued();
+                })
+            }
+            Some(key) => {
+                metrics.stream_enqueued();
+                send_scheduled_work(
+                    &stream_txs[stream_worker_index(key, stream_txs.len())],
+                    &fatal_rx,
+                    item,
+                )
+                .inspect_err(|_| {
+                    metrics.stream_dequeued();
+                })
+            }
         };
         if let Err(error) = send_result {
             drop(metadata_tx);
@@ -680,15 +915,18 @@ where
 
 fn run_scheduled_item<H>(
     item: FuseWorkItem,
-    reply_tx: &WorkSender<FuseReply>,
+    reply_tx: &WorkSender<QueuedFuseReply>,
     metrics: &LinuxFuseLoopMetrics,
     handler: &H,
 ) -> io::Result<()>
 where
     H: Fn(&FuseWorkItem) -> Option<FuseReply> + Send + Sync,
 {
+    metrics.record_dispatch_wait(item.received_at.elapsed());
+    let vfs_started = Instant::now();
     if let Some(reply) = handler(&item) {
-        enqueue_reply(reply_tx, reply, metrics).inspect_err(|_| {
+        metrics.record_vfs_time(item.header.opcode, vfs_started.elapsed(), reply.is_error());
+        enqueue_reply(reply_tx, reply, metrics, item.received_at).inspect_err(|_| {
             metrics.work_error_count.fetch_add(1, Ordering::Relaxed);
         })?;
     }
@@ -697,14 +935,21 @@ where
 
 fn reply_loop(
     mut device: File,
-    reply_rx: WorkReceiver<FuseReply>,
+    reply_rx: WorkReceiver<QueuedFuseReply>,
     metrics: &LinuxFuseLoopMetrics,
+    vfs: &StudioVfs,
 ) -> io::Result<()> {
-    while let Ok(reply) = reply_rx.recv() {
+    while let Ok(queued) = reply_rx.recv() {
         metrics.reply_dequeued();
-        reply.write_to(&mut device).inspect_err(|_| {
+        metrics.record_reply_queue_wait(queued.enqueued_at.elapsed());
+        let write_started = Instant::now();
+        let wire_len = queued.reply.wire_len();
+        queued.reply.write_to(&mut device).inspect_err(|_| {
             metrics.reply_error_count.fetch_add(1, Ordering::Relaxed);
         })?;
+        metrics.record_reply_write(wire_len, write_started.elapsed());
+        metrics.record_total_callback(queued.request_started.elapsed());
+        publish_linux_bridge_snapshot(vfs, metrics);
     }
     Ok(())
 }
@@ -718,6 +963,12 @@ enum FuseReply {
         header: [u8; FUSE_OUT_HEADER_SIZE],
         data: Vec<u8>,
     },
+}
+
+struct QueuedFuseReply {
+    reply: FuseReply,
+    request_started: Instant,
+    enqueued_at: Instant,
 }
 
 impl FuseReply {
@@ -737,7 +988,6 @@ impl FuseReply {
         }
     }
 
-    #[cfg(test)]
     fn wire_len(&self) -> usize {
         match self {
             Self::Inline { len, .. } => *len,
@@ -745,7 +995,15 @@ impl FuseReply {
         }
     }
 
-    #[cfg(test)]
+    fn is_error(&self) -> bool {
+        let header = self.header_slice();
+        header
+            .get(4..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_ne_bytes)
+            .is_some_and(|error| error < 0)
+    }
+
     fn header_slice(&self) -> &[u8] {
         match self {
             Self::Inline { bytes, .. } => &bytes[..FUSE_OUT_HEADER_SIZE],
@@ -825,11 +1083,17 @@ fn enqueue_work(
 }
 
 fn enqueue_reply(
-    tx: &WorkSender<FuseReply>,
+    tx: &WorkSender<QueuedFuseReply>,
     reply: FuseReply,
     metrics: &LinuxFuseLoopMetrics,
+    request_started: Instant,
 ) -> io::Result<()> {
     metrics.reply_enqueued();
+    let reply = QueuedFuseReply {
+        reply,
+        request_started,
+        enqueued_at: Instant::now(),
+    };
     match tx.try_send(reply) {
         Ok(()) => Ok(()),
         Err(WorkTrySendError::Full(reply)) => {
@@ -1353,6 +1617,36 @@ fn handle_fuse_release(vfs: &StudioVfs, runtime_handle: &Handle, item: &FuseWork
 
 fn fuse_opcode_expects_reply(opcode: u32) -> bool {
     !matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET)
+}
+
+fn fuse_opcode_name(opcode: u32) -> Option<&'static str> {
+    Some(match opcode {
+        FUSE_LOOKUP => "lookup",
+        FUSE_GETATTR => "getattr",
+        FUSE_SETATTR => "setattr",
+        FUSE_READLINK => "readlink",
+        FUSE_SYMLINK => "symlink",
+        FUSE_MKDIR => "mkdir",
+        FUSE_UNLINK => "unlink",
+        FUSE_RENAME => "rename",
+        FUSE_LINK => "link",
+        FUSE_OPEN => "open",
+        FUSE_READ => "read",
+        FUSE_WRITE => "write",
+        FUSE_RELEASE => "release",
+        FUSE_FSYNC => "fsync",
+        FUSE_SETXATTR => "setxattr",
+        FUSE_GETXATTR => "getxattr",
+        FUSE_LISTXATTR => "listxattr",
+        FUSE_REMOVEXATTR => "removexattr",
+        FUSE_FLUSH => "flush",
+        FUSE_OPENDIR => "opendir",
+        FUSE_READDIR => "readdir",
+        FUSE_RELEASEDIR => "releasedir",
+        FUSE_CREATE => "create",
+        FUSE_IOCTL => "ioctl",
+        _ => return None,
+    })
 }
 
 fn read_fuse_message(device: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
@@ -2364,6 +2658,7 @@ struct FuseInHeader {
 struct FuseWorkItem {
     header: FuseInHeader,
     message: Vec<u8>,
+    received_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3213,6 +3508,35 @@ mod tests {
     }
 
     #[test]
+    fn loop_metrics_build_runtime_stats_snapshot() {
+        let metrics = LinuxFuseLoopMetrics::default();
+
+        metrics.set_fd_count(2);
+        metrics.record_receive(40, Duration::from_nanos(3));
+        metrics.record_dispatch_wait(Duration::from_nanos(5));
+        metrics.record_vfs_time(FUSE_READ, Duration::from_nanos(7), true);
+        metrics.record_reply_queue_wait(Duration::from_nanos(11));
+        metrics.record_reply_write(13, Duration::from_nanos(17));
+        metrics.record_total_callback(Duration::from_nanos(19));
+
+        let snapshot = metrics.runtime_stats_snapshot();
+
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.fd_count, 2);
+        assert_eq!(snapshot.read_bytes, 40);
+        assert_eq!(snapshot.writev_bytes, 13);
+        assert_eq!(snapshot.receive.sum, 3);
+        assert_eq!(snapshot.vfs_time.sum, 7);
+        assert_eq!(snapshot.reply_write.count, 1);
+        assert_eq!(snapshot.total_callback.sum, 19);
+        assert_eq!(snapshot.operations.len(), 1);
+        assert_eq!(snapshot.operations[0].name, "read");
+        assert_eq!(snapshot.operations[0].count, 1);
+        assert_eq!(snapshot.operations[0].errors, 1);
+        assert_eq!(snapshot.operations[0].latency_sum_ns, 7);
+    }
+
+    #[test]
     fn fuse_device_open_flags_include_nonblocking() {
         assert_ne!(FUSE_OPEN_FLAGS & libc::O_NONBLOCK, 0);
     }
@@ -3230,6 +3554,7 @@ mod tests {
                     nodeid: 1,
                 },
                 message: Vec::new(),
+                received_at: Instant::now(),
             },
             &metrics,
         )
@@ -3246,6 +3571,7 @@ mod tests {
                         nodeid: 1,
                     },
                     message: Vec::new(),
+                    received_at: Instant::now(),
                 },
                 &metrics_for_thread,
             )
@@ -3307,6 +3633,12 @@ mod tests {
 
         assert_eq!(read_u64(&reply, 8).expect("unique"), 55);
         assert_eq!(metrics.snapshot().reply_error_count, 0);
+        let runtime_stats = vfs.runtime_stats_snapshot();
+        assert_eq!(runtime_stats.bridge.gauges["linux_fd_count"].value, 2);
+        assert!(runtime_stats.bridge.counters["linux_read_bytes"].value > 0);
+        assert!(runtime_stats.bridge.counters["linux_writev_bytes"].value > 0);
+        assert!(runtime_stats.bridge.latencies["linux_dispatch_wait"].count > 0);
+        assert!(runtime_stats.bridge.latencies["linux_reply_write"].count > 0);
         runtime.block_on(vfs.shutdown(Duration::ZERO));
     }
 
@@ -3721,6 +4053,7 @@ mod tests {
                 nodeid: 1,
             },
             message: Vec::from(fuse_request_for_test(opcode, unique)),
+            received_at: Instant::now(),
         }
     }
 
@@ -3797,6 +4130,7 @@ mod tests {
                 nodeid,
             },
             message,
+            received_at: Instant::now(),
         }
     }
 

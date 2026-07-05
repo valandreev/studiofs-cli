@@ -1038,6 +1038,68 @@ pub struct VfsFuseAsyncReadSnapshot {
     pub admission_wait_total_ms: f64,
 }
 
+/// Latest Linux FUSE bridge counters published by the Linux adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct VfsLinuxBridgeStats {
+    /// Whether a Linux bridge snapshot has been published for this mount.
+    pub enabled: bool,
+    /// Open FUSE file descriptors owned by the bridge.
+    pub fd_count: u64,
+    /// Requests waiting in the receiver-to-dispatch queue.
+    pub work_queue_depth: u64,
+    /// Requests waiting in the metadata worker queue.
+    pub metadata_queue_depth: u64,
+    /// Requests waiting in stream worker queues.
+    pub stream_queue_depth: u64,
+    /// Replies waiting for the dedicated FUSE writer.
+    pub reply_queue_depth: u64,
+    /// Bytes read from `/dev/fuse`.
+    pub read_bytes: u64,
+    /// Bytes written via reply `writev`.
+    pub writev_bytes: u64,
+    /// Bytes moved via splice, if the bridge starts using splice.
+    pub splice_bytes: u64,
+    /// Receive path backpressure events.
+    pub work_backpressure_count: u64,
+    /// Reply queue backpressure events.
+    pub reply_backpressure_count: u64,
+    /// Receive path errors.
+    pub receive_error_count: u64,
+    /// Operation path errors.
+    pub work_error_count: u64,
+    /// Reply writer errors.
+    pub reply_error_count: u64,
+    /// Per-operation counters and latency totals.
+    pub operations: Vec<VfsLinuxBridgeOperationStats>,
+    /// Receive stage latency.
+    pub receive: RuntimeLatencyHistogram,
+    /// Dispatch wait latency.
+    pub dispatch_wait: RuntimeLatencyHistogram,
+    /// VFS operation latency.
+    pub vfs_time: RuntimeLatencyHistogram,
+    /// Reply queue wait latency.
+    pub reply_queue_wait: RuntimeLatencyHistogram,
+    /// Reply write latency.
+    pub reply_write: RuntimeLatencyHistogram,
+    /// End-to-end callback latency.
+    pub total_callback: RuntimeLatencyHistogram,
+}
+
+/// Per-operation Linux bridge counters.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct VfsLinuxBridgeOperationStats {
+    /// Stable operation name, for example `read` or `lookup`.
+    pub name: Cow<'static, str>,
+    /// Operation callback count.
+    pub count: u64,
+    /// Operation callbacks that returned an error reply or failed internally.
+    pub errors: u64,
+    /// Total operation latency in nanoseconds.
+    pub latency_sum_ns: u64,
+}
+
 /// FUSE I/O callback metrics for one direction.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsFuseIoStats {
