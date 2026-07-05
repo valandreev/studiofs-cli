@@ -167,15 +167,23 @@ Current signature includes additional policy controls:
 - `shutdown_event_name` allows external graceful shutdown signal integration.
 - WinFSP forwards caller buffers into the shared buffered VFS read/write paths; there is no Windows-specific alternate data path.
 
-## Linux Mount
+## Linux Bridge (`studiofs-linux-fuse`)
 
-Linux mount is not implemented. SFS-600 removed the legacy macFUSE-like raw
-`/dev/fuse` backend and there is no hidden compatibility fallback. `studiofs
-mount` on Linux returns a clear unsupported error until the new Linux bridge is
-built.
+Linux mount starts through a thin libfuse3 low-level bridge. The bridge uses
+the system libfuse3 development/runtime packages and `fusermount3`; StudioFS
+does not vendor, bundle, or build libfuse3.
+
+SFS-603 intentionally provides only the mount skeleton: a low-level session,
+process signal handling through libfuse3, clean unmount, and the shared VFS
+shutdown path owned by the CLI mount lifecycle. Metadata navigation and regular
+file I/O are follow-up Linux bridge slices.
+
+First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
+9.4+. Rocky Linux 8.6+ remains best-effort.
 
 ### Requirements
 
+- Linux: libfuse3 development/runtime packages and `fusermount3`
 - macOS: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/)
 
 ### Mount Options

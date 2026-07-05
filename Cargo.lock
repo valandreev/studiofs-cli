@@ -4800,6 +4800,7 @@ dependencies = [
  "sha2",
  "studiofs-cache",
  "studiofs-data",
+ "studiofs-linux-fuse",
  "studiofs-macfuse",
  "studiofs-meta",
  "studiofs-test-support",
@@ -4893,6 +4894,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "studiofs-linux-fuse"
+version = "0.1.1"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]
