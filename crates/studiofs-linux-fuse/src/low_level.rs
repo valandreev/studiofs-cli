@@ -809,6 +809,9 @@ impl SessionState {
 
     fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
         let result = if let Some(fh) = file_handle {
+            // Handle-backed sync must preserve pending handle-local write state;
+            // StudioVfs does not currently distinguish fdatasync from fsync on
+            // this path, so both use the handle flush barrier.
             self.runtime_handle.block_on(self.vfs.flush_fh(fh))
         } else {
             self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
