@@ -2,19 +2,23 @@ use super::*;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
-use studiofs_vfs::{DirEntryWithAttr, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs};
+use studiofs_vfs::{
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
+};
 use tokio::runtime::Handle;
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
+const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -106,6 +110,12 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_notify_inval_inode(
+        session: *mut raw::FuseSession,
+        ino: u64,
+        offset: off_t,
+        len: off_t,
+    ) -> c_int;
     fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
     fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
     fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
@@ -238,6 +248,7 @@ impl Drop for OwnedFuseArgs {
 pub(crate) struct Session {
     raw: NonNull<raw::FuseSession>,
     _state: Option<Box<SessionState>>,
+    invalidation_state: Arc<SessionInvalidationState>,
     signal_handlers_installed: bool,
 }
 
@@ -270,11 +281,19 @@ impl Session {
         // NUL-terminated path for this call.
         let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
         if mount_result == 0 {
-            Ok(Self {
+            let invalidation_state = Arc::new(SessionInvalidationState::new());
+            let session = Self {
                 raw,
                 _state: Some(state),
+                invalidation_state,
                 signal_handlers_installed: false,
-            })
+            };
+            if let Some(state) = &session._state {
+                state
+                    .vfs
+                    .set_kernel_invalidator(session.kernel_invalidator());
+            }
+            Ok(session)
         } else {
             // SAFETY: `raw` has not been returned and must be destroyed here.
             unsafe { raw::fuse_session_destroy(raw.as_ptr()) };
@@ -317,6 +336,7 @@ impl Session {
             Ok(Self {
                 raw,
                 _state: None,
+                invalidation_state: Arc::new(SessionInvalidationState::new()),
                 signal_handlers_installed: false,
             })
         } else {
@@ -340,6 +360,119 @@ impl Session {
         } else {
             Err(io::Error::from_raw_os_error(result))
         }
+    }
+
+    pub(crate) fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
+        Arc::new(LinuxFuseKernelInvalidator {
+            session: self.raw,
+            state: Arc::clone(&self.invalidation_state),
+        })
+    }
+}
+
+struct LinuxFuseKernelInvalidator {
+    session: NonNull<raw::FuseSession>,
+    state: Arc<SessionInvalidationState>,
+}
+
+#[derive(Debug)]
+struct SessionInvalidationState {
+    status: Mutex<SessionInvalidationStatus>,
+    idle: Condvar,
+}
+
+#[derive(Debug)]
+struct SessionInvalidationStatus {
+    closed: bool,
+    active: usize,
+}
+
+struct SessionInvalidationGuard<'a> {
+    state: &'a SessionInvalidationState,
+}
+
+impl SessionInvalidationState {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(SessionInvalidationStatus {
+                closed: false,
+                active: 0,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn begin_invalidation(&self) -> Option<SessionInvalidationGuard<'_>> {
+        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        if status.closed {
+            return None;
+        }
+        status.active += 1;
+        Some(SessionInvalidationGuard { state: self })
+    }
+
+    fn begin_shutdown(&self) {
+        self.status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .closed = true;
+    }
+
+    fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        let result = self
+            .idle
+            .wait_timeout_while(status, timeout, |status| status.active > 0)
+            .unwrap_or_else(|err| err.into_inner());
+        result.0.active == 0
+    }
+}
+
+impl Drop for SessionInvalidationGuard<'_> {
+    fn drop(&mut self) {
+        let mut status = self
+            .state
+            .status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        status.active -= 1;
+        if status.active == 0 {
+            self.state.idle.notify_all();
+        }
+    }
+}
+
+// SAFETY: invalidation calls are gated against `Session::drop`, and the raw
+// pointer is only used for libfuse notification calls while the session is live.
+unsafe impl Send for LinuxFuseKernelInvalidator {}
+// SAFETY: shared access only issues libfuse notification calls under the same gate.
+unsafe impl Sync for LinuxFuseKernelInvalidator {}
+
+impl KernelInvalidator for LinuxFuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.inval_inode_range(ino, 0, -1);
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        let (offset, len) = Self::attr_invalidation_range();
+        self.inval_inode_range(ino, offset, len);
+    }
+}
+
+impl LinuxFuseKernelInvalidator {
+    fn attr_invalidation_range() -> (off_t, off_t) {
+        (-1, 0)
+    }
+
+    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+        let Some(_active) = self.state.begin_invalidation() else {
+            return;
+        };
+        // SAFETY: `session` comes from a mounted libfuse3 session and the
+        // invalidation guard prevents teardown from destroying it during the call.
+        let _ = unsafe {
+            studiofs_linux_fuse_notify_inval_inode(self.session.as_ptr(), ino, offset, len)
+        };
     }
 }
 
@@ -1675,6 +1808,16 @@ impl DirectoryEntryBuffer {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(state) = &self._state {
+            state.vfs.clear_kernel_invalidator();
+        }
+        self.invalidation_state.begin_shutdown();
+        if !self
+            .invalidation_state
+            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
+        {
+            return;
+        }
         if self.signal_handlers_installed {
             // SAFETY: handlers were installed for this live session.
             unsafe { raw::fuse_remove_signal_handlers(self.raw.as_ptr()) };
@@ -1892,6 +2035,14 @@ mod tests {
         let direct_io = unsafe { super::studiofs_linux_fuse_file_info_direct_io_after_init() };
 
         assert_eq!(direct_io, 1);
+    }
+
+    #[test]
+    fn attr_invalidation_uses_attr_only_inode_range() {
+        assert_eq!(
+            super::LinuxFuseKernelInvalidator::attr_invalidation_range(),
+            (-1, 0)
+        );
     }
 
     #[test]
