@@ -90,9 +90,57 @@ real mounted I/O behavior.
 
 | Platform | Focus | Primary checks | Command |
 |---|---|---|---|
-| Linux mount | Not implemented after SFS-600 | n/a | n/a |
+| Linux libfuse3 | mounted bridge parity smoke; see SFS-610 below for distro release policy | `mounted_regular_file_io_is_visible_across_reopen`; `mounted_namespace_mutations_are_visible_through_readdir` | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP | mounted create/write/read/readdir/delete/unmount lifecycle | `winfsp_mount_write_read_unmount_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP sequential writer | AJA-style large sequential writer must use WinFSP cleanup flush/purge while keeping StudioFS non-delete cleanup callback handling observational | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
+
+### SFS-610 Linux Platform Release Gate
+
+SFS-610 is the Linux libfuse3 release gate after mounted correctness exists.
+Validate Ubuntu 24.04+ first, then Rocky Linux 9.4+. Rocky Linux 8.6+ is
+best-effort only and must not change the Ubuntu 24.04+ or Rocky Linux 9.4+
+release decision.
+
+Required correctness evidence:
+
+- create/write/read/close/reopen;
+- mkdir/readdir/rename/unlink/rmdir;
+- setattr/truncate;
+- symlink/readlink/link;
+- xattr get/set/list/remove;
+- statfs and access-style behavior;
+- flush/fsync/release local-only semantics;
+- kernel invalidation;
+- graceful unmount and VFS shutdown.
+
+Start with the current Linux mounted smoke surface on each target distro:
+
+```bash
+cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
+```
+
+Then collect mounted workload evidence from the active Linux mount. From the
+repo root, run the media gate; it must measure large sequential write, large
+sequential read, warm repeated read, flush/fsync latency, callback latency, CPU,
+memory, and upload/backpressure observability:
+
+```bash
+bash ./tools/perf/validate-bench-linux.sh \
+  --mount-point /mnt/studio/myvolume \
+  --profile write-path-gate \
+  --big-file-size 8GB \
+  --block-size 4MB \
+  --threads 1
+```
+
+Small-file gates must use Unity/Unreal-style project tree workloads: metadata
+operations, small reads/writes, directory scans, and reopen patterns. Use the
+mounted `studiofs devbench` small-file recipe above as the current evidence
+surface and archive command, stdout, environment, summary, and JSON report under
+`target/perf`.
+
+`fuser` is only a baseline/comparison path. Raw `/dev/fuse` remains only a
+fallback if mounted evidence proves libfuse3 transport overhead is the blocker.
 
 ## SFS-356 Encrypted remote object regression gate
 
@@ -136,9 +184,10 @@ cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_p
 ```
 
 Pair those data-plane checks with the platform bridge smoke rows above when
-validating mounted encrypted read/write behavior: run the
-`fuse_mount_write_read_unmount_smoke` and
-`winfsp_mount_write_read_unmount_smoke` rows from the Platform Bridge Matrix
+validating mounted encrypted read/write behavior: run the Linux
+`mounted_regular_file_io_is_visible_across_reopen` /
+`mounted_namespace_mutations_are_visible_through_readdir` rows and the
+`winfsp_mount_write_read_unmount_smoke` row from the Platform Bridge Matrix
 above instead of copying those commands into this section.
 
 ## SFS-357 Final encrypted-at-rest acceptance gate
@@ -192,7 +241,7 @@ cargo test -p studiofs-vfs --test vfs_test encrypted_remote_object_storage_keeps
 Platform smoke checks:
 
 ```bash
-Linux mounted validation is disabled after SFS-600 until a new Linux bridge exists.
+cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 ```
 
 ```powershell
@@ -524,7 +573,7 @@ cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 Linux / macOS:
 
 ```bash
-Linux mounted validation is disabled after SFS-600 until a new Linux bridge exists.
+cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 ```
 
 Windows PowerShell:

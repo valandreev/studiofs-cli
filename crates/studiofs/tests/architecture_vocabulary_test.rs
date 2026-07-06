@@ -911,7 +911,8 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
         "test_write_read_large_file",
         "foreground_read_baseline_during_and_post_upload_are_comparable",
         "warm_cache_sequential_read_bounded_latency_after_write",
-        "fuse_mount_write_read_unmount_smoke",
+        "mounted_regular_file_io_is_visible_across_reopen",
+        "mounted_namespace_mutations_are_visible_through_readdir",
         "winfsp_mount_write_read_unmount_smoke",
         "SFEC",
         "whole-file decrypt",
@@ -927,6 +928,71 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
     assert!(
         missing.is_empty(),
         "SFS-356 encrypted remote regression matrix is missing required gates:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
+    let matrix = read_workspace_file("docs/local-first-validation-matrix.md");
+    let tests = read_workspace_file("docs/tests.md");
+    let bridge = read_workspace_file("docs/platform-bridges.md");
+
+    let normalized_matrix = normalize_doc_whitespace(&matrix);
+    let normalized_tests = normalize_doc_whitespace(&tests);
+    let normalized_bridge = normalize_doc_whitespace(&bridge);
+
+    let matrix_terms = [
+        "SFS-610",
+        "Ubuntu 24.04+",
+        "Rocky Linux 9.4+",
+        "Rocky Linux 8.6+",
+        "best-effort only",
+        // Exact Linux smoke test names keep the documented gate tied to cargo.
+        "mounted_regular_file_io_is_visible_across_reopen",
+        "mounted_namespace_mutations_are_visible_through_readdir",
+        "create/write/read/close/reopen",
+        "xattr get/set/list/remove",
+        "flush/fsync/release local-only semantics",
+        "kernel invalidation",
+        "large sequential write",
+        "upload/backpressure observability",
+        "Unity/Unreal-style project tree workloads",
+        "fuser",
+        "is only a baseline/comparison path",
+        "/dev/fuse",
+        "remains only a fallback",
+        "validate-bench-linux.sh",
+        "studiofs devbench",
+        "target/perf",
+    ];
+    let tests_terms = [
+        "Hosted Linux real mounted E2E is operator-run",
+        "local-first-validation-matrix.md#sfs-610-linux-platform-release-gate",
+    ];
+    let bridge_terms = ["First validated target: Ubuntu 24.04+"];
+
+    let missing: Vec<String> = matrix_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&matrix, &normalized_matrix, term))
+        .map(|term| format!("docs/local-first-validation-matrix.md: {term}"))
+        .chain(
+            tests_terms
+                .into_iter()
+                .filter(|term| !contains_doc_term(&tests, &normalized_tests, term))
+                .map(|term| format!("docs/tests.md: {term}")),
+        )
+        .chain(
+            bridge_terms
+                .into_iter()
+                .filter(|term| !contains_doc_term(&bridge, &normalized_bridge, term))
+                .map(|term| format!("docs/platform-bridges.md: {term}")),
+        )
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-610 Linux platform gate docs are missing required surfaces:\n{}",
         missing.join("\n")
     );
 }

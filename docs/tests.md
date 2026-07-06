@@ -149,7 +149,7 @@ Local loopback examples remain available as development/test examples.
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
-| Linux mount | Not implemented after SFS-600; no raw FUSE unit or smoke target exists |
+| Linux libfuse3 mount | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
 | macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
@@ -309,15 +309,15 @@ behavior must converge through mounted reads and the mounted-tree validator. It
 writes `operations.ndjson`, `symlink-attribute-summary.json`, and
 `validation.json`.
 
-Hosted Linux real mounted E2E is disabled while Linux has no mounted bridge:
+Hosted Linux real mounted E2E is operator-run once the target host has
+`/dev/fuse`, `fusermount3`, libfuse3, Docker, PostgreSQL, and RustFS available.
+See the SFS-610 Linux Platform Release Gate in
+[docs/local-first-validation-matrix.md](local-first-validation-matrix.md#sfs-610-linux-platform-release-gate).
 
 ```powershell
 rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 rwx run .rwx/e2e.yml --target e2e-full --wait --open
 ```
-
-Both targets exit early with the unsupported Linux mount message. Re-enable them
-when the new Linux bridge exists.
 
 Focused runner skeleton check:
 
