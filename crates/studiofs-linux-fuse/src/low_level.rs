@@ -2,7 +2,7 @@ use super::*;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
@@ -248,7 +248,7 @@ impl Drop for OwnedFuseArgs {
 
 pub(crate) struct Session {
     raw: NonNull<raw::FuseSession>,
-    _state: Option<Box<SessionState>>,
+    state: Option<Box<SessionState>>,
     invalidation_state: Arc<SessionInvalidationState>,
     signal_handlers_installed: bool,
 }
@@ -285,11 +285,11 @@ impl Session {
             let invalidation_state = Arc::new(SessionInvalidationState::new());
             let session = Self {
                 raw,
-                _state: Some(state),
+                state: Some(state),
                 invalidation_state,
                 signal_handlers_installed: false,
             };
-            if let Some(state) = &session._state {
+            if let Some(state) = &session.state {
                 state
                     .vfs
                     .set_kernel_invalidator(session.kernel_invalidator());
@@ -336,7 +336,7 @@ impl Session {
         if mount_result == 0 {
             Ok(Self {
                 raw,
-                _state: None,
+                state: None,
                 invalidation_state: Arc::new(SessionInvalidationState::new()),
                 signal_handlers_installed: false,
             })
@@ -403,8 +403,14 @@ impl SessionInvalidationState {
         }
     }
 
+    fn lock_status(&self) -> MutexGuard<'_, SessionInvalidationStatus> {
+        // A panic while holding this gate should not prevent shutdown from
+        // closing the gate or observing active invalidations.
+        self.status.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     fn begin_invalidation(&self) -> Option<SessionInvalidationGuard<'_>> {
-        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        let mut status = self.lock_status();
         if status.closed {
             return None;
         }
@@ -413,14 +419,11 @@ impl SessionInvalidationState {
     }
 
     fn begin_shutdown(&self) {
-        self.status
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .closed = true;
+        self.lock_status().closed = true;
     }
 
     fn wait_for_idle(&self, timeout: Duration) -> bool {
-        let status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        let status = self.lock_status();
         let result = self
             .idle
             .wait_timeout_while(status, timeout, |status| status.active > 0)
@@ -431,11 +434,7 @@ impl SessionInvalidationState {
 
 impl Drop for SessionInvalidationGuard<'_> {
     fn drop(&mut self) {
-        let mut status = self
-            .state
-            .status
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let mut status = self.state.lock_status();
         status.active -= 1;
         if status.active == 0 {
             self.state.idle.notify_all();
@@ -1814,27 +1813,18 @@ impl DirectoryEntryBuffer {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(state) = &self._state {
+        if let Some(state) = &self.state {
             state.vfs.clear_kernel_invalidator();
         }
         self.invalidation_state.begin_shutdown();
-        if !self
+        let safe_to_destroy = self
             .invalidation_state
-            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
-        {
+            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
+        if !safe_to_destroy {
             warn!(
                 "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
                  unmounting and leaking raw session handles to avoid use-after-free"
             );
-            if self.signal_handlers_installed {
-                // SAFETY: handlers were installed for this live session.
-                unsafe { raw::fuse_remove_signal_handlers(self.raw.as_ptr()) };
-            }
-            // SAFETY: `self.raw` is still allocated. We intentionally skip
-            // `fuse_session_destroy` below because an active notification may
-            // still hold this session pointer.
-            unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
-            return;
         }
         if self.signal_handlers_installed {
             // SAFETY: handlers were installed for this live session.
@@ -1843,6 +1833,10 @@ impl Drop for Session {
         // SAFETY: libfuse tolerates unmount after regular kernel disconnects;
         // it is needed after signal-triggered exits to avoid a stuck mount.
         unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
+        if !safe_to_destroy {
+            // An active notification may still hold this session pointer.
+            return;
+        }
         // SAFETY: `self.raw` is owned by this wrapper and destroyed once.
         unsafe { raw::fuse_session_destroy(self.raw.as_ptr()) };
     }
