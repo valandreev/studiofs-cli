@@ -347,7 +347,8 @@ Current policy:
   so NFC/NFD variants of the same visible name map to the same directory entry when unique
 - when multiple byte-distinct entries would normalize to the same key, StudioFS
   does not guess; it falls back to byte-exact behavior
-- Windows behavior is unchanged; Linux has no mounted bridge
+- Windows and Linux behavior is unchanged; macOS applies the normalization
+  compatibility layer at the FUSE boundary
 
 This scope keeps macOS interoperability predictable without broad
 cross-platform name-semantics changes.

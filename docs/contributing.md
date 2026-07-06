@@ -25,7 +25,7 @@ workflows are manual-only while Windows work is primarily validated locally.
 | `cargo audit` ¹ | Auto (RWX Ubuntu quality) | — | — |
 | Workspace unit + compile tests | Auto (Ubuntu + Rocky) | Manual GitHub Action | Manual GitHub Action |
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
-| Linux mount bridge | Not implemented after SFS-600 | — | — |
+| Linux mount bridge | Manual RWX release gate (`studiofs-linux-fuse` ignored mounted tests) | — | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
 ### What is NOT verified automatically (manual / self-hosted only)

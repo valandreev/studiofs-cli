@@ -199,8 +199,7 @@ online coverage when a reachable S3 endpoint is configured.
 ### Linux / macOS
 
 ```bash
-STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 \
-  echo "Linux mounted smoke is disabled after SFS-600"
+cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 ```
 
 ### Windows (PowerShell)
@@ -218,7 +217,7 @@ cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --tes
 | Item | Status |
 |------|--------|
 | Strategy document | ✅ This file |
-| FUSE mount+I/O smoke test | ✅ `fuse_mount_write_read_unmount_smoke` |
+| Linux libfuse3 mount+I/O smoke test | ✅ `mounted_regular_file_io_is_visible_across_reopen` |
 | WinFSP mount+I/O smoke test | ✅ `winfsp_mount_write_read_unmount_smoke` |
 | CI workflow (`smoke.yml`) | ✅ `.github/workflows/smoke.yml` |
 | Self-hosted runner provisioning | Deferred — documented contract above |
