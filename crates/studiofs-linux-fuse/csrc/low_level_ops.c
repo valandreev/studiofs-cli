@@ -2,6 +2,7 @@
 #include <fuse_lowlevel.h>
 
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
+static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
 extern void studiofs_linux_fuse_destroy(void *userdata);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
@@ -32,6 +33,7 @@ extern void studiofs_linux_fuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t
 extern void studiofs_linux_fuse_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name);
 
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
+    .init = studiofs_linux_fuse_init,
     .destroy = studiofs_linux_fuse_destroy,
     .lookup = studiofs_linux_fuse_lookup,
     .getattr = studiofs_linux_fuse_getattr,
@@ -61,6 +63,12 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .listxattr = studiofs_linux_fuse_listxattr,
     .removexattr = studiofs_linux_fuse_removexattr,
 };
+
+static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn) {
+    (void)userdata;
+    conn->max_background = 16;
+    conn->congestion_threshold = 12;
+}
 
 const struct fuse_lowlevel_ops *studiofs_linux_fuse_empty_low_level_ops(void) {
     return &STUDIOFS_EMPTY_LOW_LEVEL_OPS;
@@ -110,6 +118,12 @@ int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
 int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->lookup && ops->getattr && ops->setattr && ops->opendir &&
            ops->readdir && ops->releasedir && ops->statfs && ops->access;
+}
+
+int studiofs_linux_fuse_init_sets_bounded_background(void) {
+    struct fuse_conn_info conn = {0};
+    studiofs_linux_fuse_init(NULL, &conn);
+    return conn.max_background == 16 && conn.congestion_threshold == 12;
 }
 
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {

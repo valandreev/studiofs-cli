@@ -92,7 +92,8 @@ pub(crate) mod raw {
             session: *mut FuseSession,
             mountpoint: *const c_char,
         ) -> c_int;
-        pub(crate) fn fuse_session_loop(session: *mut FuseSession) -> c_int;
+        #[link_name = "fuse_session_loop_mt_31"]
+        pub(crate) fn fuse_session_loop_mt(session: *mut FuseSession, clone_fd: c_int) -> c_int;
         pub(crate) fn fuse_session_unmount(session: *mut FuseSession);
         pub(crate) fn fuse_session_destroy(session: *mut FuseSession);
         pub(crate) fn fuse_set_signal_handlers(session: *mut FuseSession) -> c_int;
@@ -137,6 +138,8 @@ unsafe extern "C" {
     fn studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_init_sets_bounded_background() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
@@ -349,7 +352,9 @@ impl Session {
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
-        let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
+        // `clone_fd = 0` keeps libfuse transport ownership on the mounted session
+        // while the bounded kernel background queue applies callback backpressure.
+        let result = unsafe { raw::fuse_session_loop_mt(self.raw.as_ptr(), 0) };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -1990,6 +1995,8 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert!(!args.iter().any(|arg| arg.contains("max_background")));
+        assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
     }
 
     #[test]
@@ -2010,6 +2017,14 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn init_callback_sets_bounded_kernel_background_queue() {
+        // SAFETY: the C shim initializes a stack-local fuse_conn_info.
+        let has_bounds = unsafe { super::studiofs_linux_fuse_init_sets_bounded_background() };
+
+        assert_eq!(has_bounds, 1);
     }
 
     #[test]
