@@ -110,7 +110,11 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
-    fn studiofs_linux_fuse_session_loop_mt(session: *mut raw::FuseSession) -> c_int;
+    fn studiofs_linux_fuse_session_loop_mt(
+        session: *mut raw::FuseSession,
+        max_threads: c_uint,
+        max_idle_threads: c_uint,
+    ) -> c_int;
     fn studiofs_linux_fuse_notify_inval_inode(
         session: *mut raw::FuseSession,
         ino: u64,
@@ -179,6 +183,20 @@ impl SessionState {
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    linux_fuse_loop_thread_count_for_parallelism(parallelism, max_background)
+}
+
+fn linux_fuse_loop_thread_count_for_parallelism(parallelism: usize, max_background: u32) -> c_uint {
+    u32::try_from(parallelism)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(2)
+        .clamp(1, max_background.max(1))
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_max_background(
@@ -385,8 +403,16 @@ impl Session {
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
+        let max_background = self
+            .state
+            .as_ref()
+            .map(|state| state.connection_config.max_background)
+            .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background);
+        let loop_threads = linux_fuse_loop_thread_count(max_background);
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
-        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr()) };
+        let result = unsafe {
+            studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), loop_threads, loop_threads)
+        };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -2065,6 +2091,22 @@ mod tests {
         let uses_modern_api = unsafe { super::studiofs_linux_fuse_loop_config_uses_modern_api() };
 
         assert_eq!(uses_modern_api, 1);
+    }
+
+    #[test]
+    fn loop_thread_count_scales_with_parallelism_and_background_queue() {
+        assert_eq!(
+            super::linux_fuse_loop_thread_count_for_parallelism(4, 16),
+            8
+        );
+    }
+
+    #[test]
+    fn loop_thread_count_caps_at_background_queue() {
+        assert_eq!(
+            super::linux_fuse_loop_thread_count_for_parallelism(64, 16),
+            16
+        );
     }
 
     #[test]

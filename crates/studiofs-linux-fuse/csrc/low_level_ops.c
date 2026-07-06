@@ -94,22 +94,25 @@ struct fuse_session *studiofs_linux_fuse_session_new(struct fuse_args *args,
     return fuse_session_new(args, ops, ops_size, userdata);
 }
 
-int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session) {
+int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
+                                        unsigned int max_threads,
+                                        unsigned int max_idle_threads) {
 #if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 12)
     struct fuse_loop_config *config = fuse_loop_cfg_create();
     if (config == NULL) {
         return -ENOMEM;
     }
     fuse_loop_cfg_set_clone_fd(config, 0);
-    fuse_loop_cfg_set_idle_threads(config, 10);
-    fuse_loop_cfg_set_max_threads(config, 10);
+    fuse_loop_cfg_set_idle_threads(config, max_idle_threads);
+    fuse_loop_cfg_set_max_threads(config, max_threads);
     int result = fuse_session_loop_mt(session, config);
     fuse_loop_cfg_destroy(config);
     return result;
 #else
+    (void)max_threads;
     struct fuse_loop_config config = {
         .clone_fd = 0,
-        .max_idle_threads = 10,
+        .max_idle_threads = max_idle_threads,
     };
     return fuse_session_loop_mt(session, &config);
 #endif
