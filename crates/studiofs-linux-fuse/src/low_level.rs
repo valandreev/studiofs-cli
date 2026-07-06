@@ -513,7 +513,7 @@ pub extern "C" fn studiofs_linux_fuse_rename(
         return;
     };
     if flags != 0 {
-        reply_error(req, libc::EINVAL);
+        reply_error(req, libc::ENOTSUP);
         return;
     }
     let result = with_name_bytes(name, |name| {
@@ -1427,6 +1427,7 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
     use std::time::Duration;
 
@@ -1435,6 +1436,22 @@ mod tests {
     impl Drop for UnmountGuard {
         fn drop(&mut self) {
             let _ = Command::new("fusermount3").arg("-u").arg(&self.0).status();
+        }
+    }
+
+    fn mknod_regular_file(path: &std::path::Path) -> std::io::Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test path contains an interior NUL byte",
+            )
+        })?;
+        // SAFETY: `path` is NUL-terminated and valid for this syscall.
+        let result = unsafe { libc::mknod(path.as_ptr(), libc::S_IFREG | 0o644, 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
     }
 
@@ -1726,8 +1743,12 @@ mod tests {
             let guard = UnmountGuard(mount_point_for_worker.clone());
             let dir = mount_point_for_worker.join("dir");
             let file = dir.join("file.txt");
+            let mknod_file = dir.join("mknod.txt");
             let renamed = dir.join("renamed.txt");
             std::fs::create_dir(&dir)?;
+            mknod_regular_file(&mknod_file)?;
+            assert!(mknod_file.is_file());
+            std::fs::remove_file(&mknod_file)?;
             std::fs::write(&file, b"namespace")?;
             std::fs::rename(&file, &renamed)?;
             let names = std::fs::read_dir(&dir)?
