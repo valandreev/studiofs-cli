@@ -806,12 +806,9 @@ pub extern "C" fn studiofs_linux_fuse_setxattr(
         reply_error(req, libc::EIO);
         return;
     };
-    let flags = match u32::try_from(flags) {
-        Ok(flags) => flags,
-        Err(_) => {
-            reply_error(req, libc::EINVAL);
-            return;
-        }
+    let Ok(flags) = u32::try_from(flags) else {
+        reply_error(req, libc::EINVAL);
+        return;
     };
     let result = with_name_bytes(name, |name| {
         with_xattr_value(value, size, |value| {
@@ -837,6 +834,20 @@ pub extern "C" fn studiofs_linux_fuse_getxattr(
         reply_error(req, libc::EIO);
         return;
     };
+    if size == 0 {
+        let result = with_name_bytes(name, |name| state.get_xattr_size(ino, name))
+            .unwrap_or(Err(libc::EINVAL));
+        match result {
+            Ok(Some(value_size)) => {
+                // SAFETY: `req` is live and this consumes the callback reply.
+                unsafe { raw::fuse_reply_xattr(req, value_size) };
+            }
+            Ok(None) => reply_error(req, libc::ENODATA),
+            Err(errno) => reply_error(req, errno),
+        }
+        return;
+    }
+
     let result =
         with_name_bytes(name, |name| state.get_xattr(ino, name)).unwrap_or(Err(libc::EINVAL));
     match result {
@@ -857,6 +868,11 @@ pub extern "C" fn studiofs_linux_fuse_listxattr(
         return;
     };
     match state.list_xattrs(ino) {
+        Ok(names) if size == 0 => {
+            let value_size = names.iter().map(|name| name.len() + 1).sum();
+            // SAFETY: `req` is live and this consumes the callback reply.
+            unsafe { raw::fuse_reply_xattr(req, value_size) };
+        }
         Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
         Err(errno) => reply_error(req, errno),
     }
@@ -1271,6 +1287,12 @@ impl SessionState {
     fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, i32> {
         self.vfs
             .get_xattr(ino, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn get_xattr_size(&self, ino: u64, name: &[u8]) -> Result<Option<usize>, i32> {
+        self.vfs
+            .get_xattr_size(ino, name)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
