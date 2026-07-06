@@ -1,4 +1,4 @@
-#include <errno.h>
+#include <errno.h> /* IWYU pragma: keep */
 #include <stddef.h>
 #include <fuse_lowlevel.h>
 

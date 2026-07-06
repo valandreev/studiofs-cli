@@ -1,0 +1,10 @@
+# Editor-only clangd configuration for the Linux libfuse3 C shim.
+# Cargo still gets the authoritative build flags from crates/studiofs-linux-fuse/build.rs.
+---
+If:
+    PathMatch: crates/studiofs-linux-fuse/csrc/.*\.c
+CompileFlags:
+    Add:
+        - -I/usr/include/fuse3
+        - -DFUSE_USE_VERSION=312
+        - -D_FILE_OFFSET_BITS=64
