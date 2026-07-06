@@ -13,10 +13,24 @@ fn main() {
         .unwrap_or_else(|error| {
             panic!("pkg-config could not find fuse3; install libfuse3-dev: {error}")
         });
+    let mut version_parts = fuse3
+        .version
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    let fuse_api_version = if (
+        version_parts.next().unwrap_or(0),
+        version_parts.next().unwrap_or(0),
+    ) >= (3, 12)
+    {
+        "312"
+    } else {
+        "32"
+    };
+
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");
     build.define("_FILE_OFFSET_BITS", "64");
-    build.define("FUSE_USE_VERSION", "31");
+    build.define("FUSE_USE_VERSION", fuse_api_version);
     for include_path in fuse3.include_paths {
         build.include(include_path);
     }

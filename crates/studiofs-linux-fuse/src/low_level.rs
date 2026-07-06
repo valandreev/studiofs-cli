@@ -110,10 +110,7 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
-    fn studiofs_linux_fuse_session_loop_mt(
-        session: *mut raw::FuseSession,
-        clone_fd: c_int,
-    ) -> c_int;
+    fn studiofs_linux_fuse_session_loop_mt(session: *mut raw::FuseSession) -> c_int;
     fn studiofs_linux_fuse_notify_inval_inode(
         session: *mut raw::FuseSession,
         ino: u64,
@@ -146,6 +143,8 @@ unsafe extern "C" {
         max_background: u32,
         congestion_threshold: u32,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_loop_config_uses_modern_api() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
@@ -387,9 +386,7 @@ impl Session {
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
-        // `clone_fd = 0` keeps libfuse transport ownership on the mounted session
-        // while the bounded kernel background queue applies callback backpressure.
-        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), 0) };
+        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr()) };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -2060,6 +2057,14 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn multithread_loop_uses_fuse_loop_config_api() {
+        // SAFETY: the C shim returns its compile-time libfuse API selection.
+        let uses_modern_api = unsafe { super::studiofs_linux_fuse_loop_config_uses_modern_api() };
+
+        assert_eq!(uses_modern_api, 1);
     }
 
     #[test]
