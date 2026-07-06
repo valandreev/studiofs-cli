@@ -6,6 +6,8 @@ static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
 extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
 extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
+extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
+extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
 extern void studiofs_linux_fuse_destroy(void *userdata);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
@@ -73,6 +75,12 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
     }
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
+    if (studiofs_linux_fuse_connection_wants_async_dio(userdata)) {
+        (void)fuse_set_feature_flag(conn, FUSE_CAP_ASYNC_DIO);
+    }
+    if (studiofs_linux_fuse_connection_wants_writeback_cache(userdata)) {
+        (void)fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+    }
 }
 
 const struct fuse_lowlevel_ops *studiofs_linux_fuse_empty_low_level_ops(void) {
@@ -132,9 +140,15 @@ void studiofs_linux_fuse_dir_file_info_init(struct fuse_file_info *info, uint64_
     info->cache_readdir = 1;
 }
 
-void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info, uint64_t fh) {
+void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info,
+                                        uint64_t fh,
+                                        int direct_io,
+                                        int keep_cache,
+                                        int parallel_direct_writes) {
     info->fh = fh;
-    info->direct_io = 1;
+    info->direct_io = direct_io != 0;
+    info->keep_cache = keep_cache != 0;
+    info->parallel_direct_writes = parallel_direct_writes != 0;
 }
 
 uint64_t studiofs_linux_fuse_file_info_fh(const struct fuse_file_info *info) {
@@ -163,6 +177,20 @@ int studiofs_linux_fuse_loop_config_uses_loop_config_api(void) {
     return FUSE_USE_VERSION >= 32;
 }
 
+int studiofs_linux_fuse_conn_wants_writeback_cache_after_set(uint64_t capable_ext) {
+    struct fuse_conn_info conn = {0};
+    conn.capable_ext = capable_ext;
+    return fuse_set_feature_flag(&conn, FUSE_CAP_WRITEBACK_CACHE) &&
+           fuse_get_feature_flag(&conn, FUSE_CAP_WRITEBACK_CACHE);
+}
+
+int studiofs_linux_fuse_conn_wants_async_dio_after_set(uint64_t capable_ext) {
+    struct fuse_conn_info conn = {0};
+    conn.capable_ext = capable_ext;
+    return fuse_set_feature_flag(&conn, FUSE_CAP_ASYNC_DIO) &&
+           fuse_get_feature_flag(&conn, FUSE_CAP_ASYNC_DIO);
+}
+
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->create && ops->open && ops->read && ops->write &&
            ops->flush && ops->fsync && ops->release;
@@ -179,6 +207,16 @@ int studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(const struct fu
 
 int studiofs_linux_fuse_file_info_direct_io_after_init(void) {
     struct fuse_file_info info = {0};
-    studiofs_linux_fuse_file_info_init(&info, 7);
-    return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0;
+    studiofs_linux_fuse_file_info_init(&info, 7, 1, 0, 0);
+    return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0 &&
+           info.parallel_direct_writes == 0;
+}
+
+int studiofs_linux_fuse_file_info_flags_after_init(int direct_io,
+                                                   int keep_cache,
+                                                   int parallel_direct_writes) {
+    struct fuse_file_info info = {0};
+    studiofs_linux_fuse_file_info_init(&info, 7, direct_io, keep_cache, parallel_direct_writes);
+    return (info.direct_io ? 1 : 0) | (info.keep_cache ? 2 : 0) |
+           (info.parallel_direct_writes ? 4 : 0);
 }

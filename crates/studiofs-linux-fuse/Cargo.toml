@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+bytes.workspace = true
 libc.workspace = true
 studiofs-bridge.workspace = true
 studiofs-meta.workspace = true
