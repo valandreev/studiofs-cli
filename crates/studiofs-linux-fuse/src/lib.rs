@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;

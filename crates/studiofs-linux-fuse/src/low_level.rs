@@ -118,6 +118,10 @@ unsafe extern "C" {
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
 
@@ -431,6 +435,101 @@ pub extern "C" fn studiofs_linux_fuse_create(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_mkdir(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result =
+        with_name_bytes(name, |name| state.mkdir(parent, name, mode)).unwrap_or(Err(libc::EINVAL));
+    reply_entry_result(req, state, result);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_mknod(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    _rdev: libc::dev_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result =
+        with_name_bytes(name, |name| state.mknod(parent, name, mode)).unwrap_or(Err(libc::EINVAL));
+    reply_entry_result(req, state, result);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_unlink(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match with_name_bytes(name, |name| state.unlink(parent, name)).unwrap_or(Err(libc::EINVAL)) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_rmdir(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match with_name_bytes(name, |name| state.rmdir(parent, name)).unwrap_or(Err(libc::EINVAL)) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_rename(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+    flags: c_uint,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if flags != 0 {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    let result = with_name_bytes(name, |name| {
+        with_name_bytes(newname, |newname| {
+            state.rename(parent, name, newparent, newname)
+        })
+    })
+    .flatten()
+    .unwrap_or(Err(libc::EINVAL));
+    match result {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn studiofs_linux_fuse_open(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
@@ -720,6 +819,67 @@ impl SessionState {
             .open_created_file_with_known_attr(&attr, open_flags, trunc)
             .map_err(|error| vfs_err_to_errno(&error))?;
         Ok((attr, fh))
+    }
+
+    fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .mkdir(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                (mode & 0o7777) as u16,
+            )
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let file_type = mode & libc::S_IFMT as mode_t;
+        if file_type != 0 && file_type != libc::S_IFREG as mode_t {
+            return Err(libc::ENOTSUP);
+        }
+        self.vfs
+            .create(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                (mode & 0o7777) as u16,
+            )
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .unlink(parent, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .rmdir(parent, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn rename(&self, parent: u64, name: &[u8], newparent: u64, newname: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .rename(parent, name, newparent, newname)
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
@@ -1270,6 +1430,14 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    struct UnmountGuard(std::path::PathBuf);
+
+    impl Drop for UnmountGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3").arg("-u").arg(&self.0).status();
+        }
+    }
+
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
         let args = super::argv_strings("demo");
@@ -1305,6 +1473,18 @@ mod tests {
         // SAFETY: the C shim only inspects callback pointers in a static table.
         let has_callbacks = unsafe {
             super::studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn low_level_ops_include_namespace_mutation_callbacks() {
+        // SAFETY: the C shim only inspects callback pointers in a static table.
+        let has_callbacks = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(
                 super::studiofs_linux_fuse_low_level_ops(),
             )
         };
@@ -1371,6 +1551,38 @@ mod tests {
         assert_eq!(
             state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
             Err(libc::EROFS)
+        );
+    }
+
+    #[test]
+    fn read_only_namespace_mutations_reject_before_touching_vfs() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-mutate")
+                .expect("create VFS fixture");
+        let state =
+            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), true);
+
+        assert_eq!(state.mkdir(1, b"dir", 0o755).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            state.mknod(1, b"file", libc::S_IFREG | 0o644).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(state.unlink(1, b"file"), Err(libc::EROFS));
+        assert_eq!(state.rmdir(1, b"dir"), Err(libc::EROFS));
+        assert_eq!(state.rename(1, b"old", 1, b"new"), Err(libc::EROFS));
+    }
+
+    #[test]
+    fn mknod_reports_special_files_as_unsupported() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mknod-special")
+                .expect("create VFS fixture");
+        let state =
+            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+
+        assert_eq!(
+            state.mknod(1, b"fifo", libc::S_IFIFO | 0o644).unwrap_err(),
+            libc::ENOTSUP
         );
     }
 
@@ -1450,14 +1662,6 @@ mod tests {
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            struct UnmountGuard(std::path::PathBuf);
-
-            impl Drop for UnmountGuard {
-                fn drop(&mut self) {
-                    let _ = Command::new("fusermount3").arg("-u").arg(&self.0).status();
-                }
-            }
-
             let guard = UnmountGuard(mount_point_for_worker.clone());
             let path = mount_point_for_worker.join("regular.txt");
             let mut file = std::fs::OpenOptions::new()
@@ -1494,6 +1698,58 @@ mod tests {
             .join()
             .expect("mounted I/O worker should not panic")
             .expect("mounted I/O worker should complete");
+        assert!(unmount_status.success());
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_namespace_mutations_are_visible_through_readdir() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-namespace-mutate")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-namespace-mutate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
+
+        let state =
+            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-namespace-mutate").expect("mount");
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard(mount_point_for_worker.clone());
+            let dir = mount_point_for_worker.join("dir");
+            let file = dir.join("file.txt");
+            let renamed = dir.join("renamed.txt");
+            std::fs::create_dir(&dir)?;
+            std::fs::write(&file, b"namespace")?;
+            std::fs::rename(&file, &renamed)?;
+            let names = std::fs::read_dir(&dir)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(names, vec![std::ffi::OsString::from("renamed.txt")]);
+            std::fs::remove_file(&renamed)?;
+            std::fs::remove_dir(&dir)?;
+
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount_point_for_worker)
+                .status();
+            std::mem::forget(guard);
+            status
+        });
+
+        session.run().expect("run libfuse3 session");
+        let unmount_status = worker
+            .join()
+            .expect("mounted namespace worker should not panic")
+            .expect("mounted namespace worker should complete");
         assert!(unmount_status.success());
         drop(session);
         drop(fixture);
