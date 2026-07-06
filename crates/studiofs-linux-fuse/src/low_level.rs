@@ -92,7 +92,6 @@ pub(crate) mod raw {
             session: *mut FuseSession,
             mountpoint: *const c_char,
         ) -> c_int;
-        pub(crate) fn fuse_session_loop(session: *mut FuseSession) -> c_int;
         pub(crate) fn fuse_session_unmount(session: *mut FuseSession);
         pub(crate) fn fuse_session_destroy(session: *mut FuseSession);
         pub(crate) fn fuse_set_signal_handlers(session: *mut FuseSession) -> c_int;
@@ -111,6 +110,10 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_session_loop_mt(
+        session: *mut raw::FuseSession,
+        clone_fd: c_int,
+    ) -> c_int;
     fn studiofs_linux_fuse_notify_inval_inode(
         session: *mut raw::FuseSession,
         ino: u64,
@@ -138,6 +141,12 @@ unsafe extern "C" {
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_init_sets_bounded_background(
+        userdata: *mut c_void,
+        max_background: u32,
+        congestion_threshold: u32,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
 
@@ -147,18 +156,47 @@ pub(crate) struct SessionState {
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
+    connection_config: LinuxFuseConnectionConfig,
 }
 
+const _: fn() = assert_send_sync_static::<SessionState>;
+
 impl SessionState {
-    pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
+    pub(crate) fn new(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+        connection_config: LinuxFuseConnectionConfig,
+    ) -> Self {
         Self {
             vfs,
             runtime_handle,
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
+            connection_config,
         }
     }
+}
+
+fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_connection_max_background(
+    userdata: *mut c_void,
+) -> u32 {
+    callback_state_from_userdata(userdata)
+        .map(|state| state.connection_config.max_background)
+        .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
+    userdata: *mut c_void,
+) -> u32 {
+    callback_state_from_userdata(userdata)
+        .map(|state| state.connection_config.congestion_threshold)
+        .unwrap_or_else(|| LinuxFuseConnectionConfig::default().congestion_threshold)
 }
 
 fn current_uid() -> u32 {
@@ -349,7 +387,9 @@ impl Session {
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
-        let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
+        // `clone_fd = 0` keeps libfuse transport ownership on the mounted session
+        // while the bounded kernel background queue applies callback backpressure.
+        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), 0) };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -1045,6 +1085,10 @@ fn callback_state(req: *mut raw::FuseReq) -> Option<&'static SessionState> {
     }
     // SAFETY: libfuse returns the userdata pointer supplied at session creation.
     let userdata = unsafe { raw::fuse_req_userdata(req) };
+    callback_state_from_userdata(userdata)
+}
+
+fn callback_state_from_userdata(userdata: *mut c_void) -> Option<&'static SessionState> {
     if userdata.is_null() {
         None
     } else {
@@ -1982,6 +2026,10 @@ mod tests {
         }
     }
 
+    fn default_connection_config() -> super::LinuxFuseConnectionConfig {
+        super::LinuxFuseConnectionConfig::default()
+    }
+
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
         let args = super::argv_strings("demo");
@@ -1990,6 +2038,8 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert!(!args.iter().any(|arg| arg.contains("max_background")));
+        assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
     }
 
     #[test]
@@ -2010,6 +2060,57 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn init_callback_sets_bounded_kernel_background_queue() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-default-bounds")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let config = default_connection_config();
+        // SAFETY: the C shim initializes a stack-local fuse_conn_info.
+        let has_bounds = unsafe {
+            super::studiofs_linux_fuse_init_sets_bounded_background(
+                (&mut state as *mut super::SessionState).cast(),
+                config.max_background,
+                config.congestion_threshold,
+            )
+        };
+
+        assert_eq!(has_bounds, 1);
+    }
+
+    #[test]
+    fn init_callback_uses_request_background_queue_config() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-custom-bounds")
+                .expect("create VFS fixture");
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: 32,
+            congestion_threshold: 24,
+        };
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            config,
+        );
+        // SAFETY: the C shim initializes a stack-local fuse_conn_info.
+        let has_bounds = unsafe {
+            super::studiofs_linux_fuse_init_sets_bounded_background(
+                (&mut state as *mut super::SessionState).cast(),
+                config.max_background,
+                config.congestion_threshold,
+            )
+        };
+
+        assert_eq!(has_bounds, 1);
     }
 
     #[test]
@@ -2146,7 +2247,12 @@ mod tests {
                 false,
             )
             .expect("open sync file");
-        let state = super::SessionState::new(vfs, fixture.runtime().handle().clone(), false);
+        let state = super::SessionState::new(
+            vfs,
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
 
         assert_eq!(
             state.local_sync_policy_for_handle(fh),
@@ -2159,8 +2265,12 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-write")
                 .expect("create VFS fixture");
-        let state =
-            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), true);
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+            default_connection_config(),
+        );
 
         assert_eq!(
             state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
@@ -2173,8 +2283,12 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-mutate")
                 .expect("create VFS fixture");
-        let state =
-            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), true);
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+            default_connection_config(),
+        );
 
         assert_eq!(state.mkdir(1, b"dir", 0o755).unwrap_err(), libc::EROFS);
         assert_eq!(
@@ -2201,8 +2315,12 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mknod-special")
                 .expect("create VFS fixture");
-        let state =
-            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
 
         assert_eq!(
             state.mknod(1, b"fifo", libc::S_IFIFO | 0o644).unwrap_err(),
@@ -2307,8 +2425,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
 
-        let state =
-            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
@@ -2368,8 +2490,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
 
-        let state =
-            super::SessionState::new(fixture.vfs(), fixture.runtime().handle().clone(), false);
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-namespace-mutate").expect("mount");
         let mount_point_for_worker = mount_point.clone();

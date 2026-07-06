@@ -11919,7 +11919,12 @@ fn deferred_materialization_drains_idle_tail_before_close() {
         .await
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let idle_tail_timeout = Duration::from_millis(
+            DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
+                * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
+                * 3,
+        );
+        tokio::time::timeout(idle_tail_timeout, async {
             loop {
                 if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
                     && vfs.total_pending_persisted_local_dirty_slice_bytes() == 0

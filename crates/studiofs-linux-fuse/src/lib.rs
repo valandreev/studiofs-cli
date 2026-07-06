@@ -14,6 +14,42 @@ use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 mod low_level;
 
+/// Linux libfuse3 connection-level queue bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxFuseConnectionConfig {
+    /// Maximum number of background kernel requests queued to the daemon.
+    pub max_background: u32,
+    /// Kernel congestion threshold for applying request backpressure.
+    pub congestion_threshold: u32,
+}
+
+impl Default for LinuxFuseConnectionConfig {
+    fn default() -> Self {
+        Self {
+            max_background: 16,
+            congestion_threshold: 12,
+        }
+    }
+}
+
+impl LinuxFuseConnectionConfig {
+    fn validate(self) -> io::Result<Self> {
+        if self.max_background == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux FUSE max_background must be greater than 0",
+            ));
+        }
+        if self.congestion_threshold == 0 || self.congestion_threshold > self.max_background {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux FUSE congestion_threshold must be in 1..=max_background",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 /// Request used by the CLI backend router to launch the Linux libfuse3 bridge.
 pub struct LinuxFuseMountRequest {
     vfs: Arc<StudioVfs>,
@@ -21,6 +57,7 @@ pub struct LinuxFuseMountRequest {
     mount_point: PathBuf,
     volume_name: String,
     read_only: bool,
+    connection_config: LinuxFuseConnectionConfig,
 }
 
 impl LinuxFuseMountRequest {
@@ -38,7 +75,14 @@ impl LinuxFuseMountRequest {
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
             read_only,
+            connection_config: LinuxFuseConnectionConfig::default(),
         }
+    }
+
+    /// Override Linux libfuse3 connection-level queue bounds.
+    pub fn with_connection_config(mut self, config: LinuxFuseConnectionConfig) -> Self {
+        self.connection_config = config;
+        self
     }
 }
 
@@ -51,9 +95,11 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         mount_point,
         volume_name,
         read_only,
+        connection_config,
     } = request;
+    let connection_config = connection_config.validate()?;
     let mut session = low_level::Session::mount(
-        low_level::SessionState::new(vfs, runtime_handle, read_only),
+        low_level::SessionState::new(vfs, runtime_handle, read_only, connection_config),
         mount_point,
         volume_name,
     )?;
@@ -103,5 +149,31 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains("fusermount3"));
+    }
+
+    #[test]
+    fn connection_config_rejects_zero_max_background() {
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: 0,
+            congestion_threshold: 1,
+        };
+
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn connection_config_rejects_threshold_above_max_background() {
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: 8,
+            congestion_threshold: 9,
+        };
+
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

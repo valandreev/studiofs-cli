@@ -210,9 +210,15 @@ Linux regular-file opens use `direct_io` by default and keep kernel writeback
 caching out of the default path. The bridge installs the shared VFS
 `KernelInvalidator` through libfuse3 low-level inode notifications, so
 StudioFS attr/data invalidation signals still reach the kernel even when
-regular files use direct I/O. Bounded multithreaded callback dispatch remains
-an explicit follow-up compatibility gap and should not be treated as a silent
-omission.
+regular files use direct I/O. Callback dispatch runs through libfuse3's
+multithreaded low-level loop while the connection init callback caps the kernel
+background queue (`max_background=16`, `congestion_threshold=12`) so heavy
+callback workloads apply backpressure instead of growing unbounded request
+memory. The Linux bridge request can override those queue bounds before
+mounting. StudioFS currently uses the libfuse 3.1 multithreaded loop ABI
+(`clone_fd=0`) for distro compatibility; moving to the newer
+`fuse_loop_config` ABI for explicit worker-pool sizing remains a follow-up once
+the Linux target matrix is ready for that binding.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 9.4+. Rocky Linux 8.6+ remains best-effort.
