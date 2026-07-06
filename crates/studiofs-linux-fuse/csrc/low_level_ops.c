@@ -93,6 +93,10 @@ struct fuse_session *studiofs_linux_fuse_session_new(struct fuse_args *args,
     return fuse_session_new(args, ops, ops_size, userdata);
 }
 
+int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session, int clone_fd) {
+    return fuse_session_loop_mt(session, clone_fd);
+}
+
 int studiofs_linux_fuse_notify_inval_inode(struct fuse_session *session,
                                            uint64_t ino,
                                            off_t offset,

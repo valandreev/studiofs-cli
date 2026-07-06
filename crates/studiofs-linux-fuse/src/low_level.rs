@@ -92,8 +92,6 @@ pub(crate) mod raw {
             session: *mut FuseSession,
             mountpoint: *const c_char,
         ) -> c_int;
-        #[link_name = "fuse_session_loop_mt_31"]
-        pub(crate) fn fuse_session_loop_mt(session: *mut FuseSession, clone_fd: c_int) -> c_int;
         pub(crate) fn fuse_session_unmount(session: *mut FuseSession);
         pub(crate) fn fuse_session_destroy(session: *mut FuseSession);
         pub(crate) fn fuse_set_signal_handlers(session: *mut FuseSession) -> c_int;
@@ -112,6 +110,10 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_session_loop_mt(
+        session: *mut raw::FuseSession,
+        clone_fd: c_int,
+    ) -> c_int;
     fn studiofs_linux_fuse_notify_inval_inode(
         session: *mut raw::FuseSession,
         ino: u64,
@@ -387,7 +389,7 @@ impl Session {
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
         // `clone_fd = 0` keeps libfuse transport ownership on the mounted session
         // while the bounded kernel background queue applies callback backpressure.
-        let result = unsafe { raw::fuse_session_loop_mt(self.raw.as_ptr(), 0) };
+        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), 0) };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
