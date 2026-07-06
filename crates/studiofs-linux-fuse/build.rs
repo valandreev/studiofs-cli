@@ -13,10 +13,13 @@ fn main() {
         .unwrap_or_else(|error| {
             panic!("pkg-config could not find fuse3; install libfuse3-dev: {error}")
         });
-    let mut version_parts = fuse3
-        .version
-        .split('.')
-        .map(|part| part.parse::<u32>().unwrap_or(0));
+    let mut version_parts = fuse3.version.split('.').map(|part| {
+        part.split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .unwrap_or("0")
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
     let fuse_version = (
         version_parts.next().unwrap_or(0),
         version_parts.next().unwrap_or(0),
