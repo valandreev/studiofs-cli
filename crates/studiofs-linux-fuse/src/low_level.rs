@@ -14,6 +14,7 @@ use studiofs_vfs::{
     DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
 };
 use tokio::runtime::Handle;
+use tracing::{debug, warn};
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
@@ -454,25 +455,30 @@ impl KernelInvalidator for LinuxFuseKernelInvalidator {
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        let (offset, len) = Self::attr_invalidation_range();
-        self.inval_inode_range(ino, offset, len);
+        self.inval_inode_range(ino, -1, 0);
     }
 }
 
 impl LinuxFuseKernelInvalidator {
-    fn attr_invalidation_range() -> (off_t, off_t) {
-        (-1, 0)
-    }
-
     fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
         let Some(_active) = self.state.begin_invalidation() else {
+            debug!(
+                ino,
+                offset, len, "Linux FUSE inode invalidation skipped after session shutdown"
+            );
             return;
         };
         // SAFETY: `session` comes from a mounted libfuse3 session and the
         // invalidation guard prevents teardown from destroying it during the call.
-        let _ = unsafe {
+        let result = unsafe {
             studiofs_linux_fuse_notify_inval_inode(self.session.as_ptr(), ino, offset, len)
         };
+        if result != 0 && result != -libc::ENOENT {
+            debug!(
+                ino,
+                offset, len, result, "Linux FUSE inode invalidation failed"
+            );
+        }
     }
 }
 
@@ -1816,6 +1822,18 @@ impl Drop for Session {
             .invalidation_state
             .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
         {
+            warn!(
+                "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
+                 unmounting and leaking raw session handles to avoid use-after-free"
+            );
+            if self.signal_handlers_installed {
+                // SAFETY: handlers were installed for this live session.
+                unsafe { raw::fuse_remove_signal_handlers(self.raw.as_ptr()) };
+            }
+            // SAFETY: `self.raw` is still allocated. We intentionally skip
+            // `fuse_session_destroy` below because an active notification may
+            // still hold this session pointer.
+            unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
             return;
         }
         if self.signal_handlers_installed {
@@ -1836,6 +1854,9 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     struct UnmountGuard(Option<std::path::PathBuf>);
@@ -2038,11 +2059,46 @@ mod tests {
     }
 
     #[test]
-    fn attr_invalidation_uses_attr_only_inode_range() {
-        assert_eq!(
-            super::LinuxFuseKernelInvalidator::attr_invalidation_range(),
-            (-1, 0)
+    fn invalidation_state_wait_for_idle_returns_true_when_idle() {
+        let state = super::SessionInvalidationState::new();
+
+        assert!(state.wait_for_idle(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn invalidation_state_wait_for_idle_wakes_when_last_guard_drops() {
+        let state = Arc::new(super::SessionInvalidationState::new());
+        let guard = state.begin_invalidation().expect("begin invalidation");
+        let waiter_state = Arc::clone(&state);
+        let (tx, rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let idle = waiter_state.wait_for_idle(Duration::from_secs(1));
+            tx.send(idle).expect("send idle result");
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("idle result")
         );
+        waiter.join().expect("join idle waiter");
+    }
+
+    #[test]
+    fn invalidation_state_wait_for_idle_returns_false_on_timeout() {
+        let state = super::SessionInvalidationState::new();
+        let _guard = state.begin_invalidation().expect("begin invalidation");
+
+        assert!(!state.wait_for_idle(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn invalidation_state_rejects_new_invalidations_after_shutdown() {
+        let state = super::SessionInvalidationState::new();
+        state.begin_shutdown();
+
+        assert!(state.begin_invalidation().is_none());
     }
 
     #[test]
