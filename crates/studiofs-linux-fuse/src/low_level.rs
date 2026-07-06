@@ -513,7 +513,7 @@ pub extern "C" fn studiofs_linux_fuse_rename(
         return;
     };
     if flags != 0 {
-        reply_error(req, libc::ENOTSUP);
+        reply_error(req, libc::EINVAL);
         return;
     }
     let result = with_name_bytes(name, |name| {

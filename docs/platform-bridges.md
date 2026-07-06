@@ -186,7 +186,7 @@ Current Linux callbacks:
 | `mknod` | `create()` for regular files; special files return `ENOTSUP` |
 | `unlink` | `unlink()` |
 | `rmdir` | `rmdir()` |
-| `rename` | `rename()`; non-zero libfuse3 rename flags return `ENOTSUP` |
+| `rename` | `rename()`; non-zero libfuse3 rename flags return `EINVAL` |
 | `open` | `open_file_with_known_attr()` |
 | `read` | `read_into_fh()` |
 | `write` | `write_fh_with_deferred_materialize()` |
