@@ -3,6 +3,8 @@
 
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
+extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
+extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
 extern void studiofs_linux_fuse_destroy(void *userdata);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
@@ -65,9 +67,8 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
 };
 
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn) {
-    (void)userdata;
-    conn->max_background = 16;
-    conn->congestion_threshold = 12;
+    conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
+    conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
 }
 
 const struct fuse_lowlevel_ops *studiofs_linux_fuse_empty_low_level_ops(void) {
@@ -120,10 +121,13 @@ int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_l
            ops->readdir && ops->releasedir && ops->statfs && ops->access;
 }
 
-int studiofs_linux_fuse_init_sets_bounded_background(void) {
+int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
+                                                    uint32_t max_background,
+                                                    uint32_t congestion_threshold) {
     struct fuse_conn_info conn = {0};
-    studiofs_linux_fuse_init(NULL, &conn);
-    return conn.max_background == 16 && conn.congestion_threshold == 12;
+    studiofs_linux_fuse_init(userdata, &conn);
+    return conn.max_background == max_background &&
+           conn.congestion_threshold == congestion_threshold;
 }
 
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {
