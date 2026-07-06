@@ -81,6 +81,13 @@ struct fuse_session *studiofs_linux_fuse_session_new(struct fuse_args *args,
     return fuse_session_new(args, ops, ops_size, userdata);
 }
 
+int studiofs_linux_fuse_notify_inval_inode(struct fuse_session *session,
+                                           uint64_t ino,
+                                           off_t offset,
+                                           off_t len) {
+    return fuse_lowlevel_notify_inval_inode(session, ino, offset, len);
+}
+
 void studiofs_linux_fuse_dir_file_info_init(struct fuse_file_info *info, uint64_t fh) {
     info->fh = fh;
     info->keep_cache = 1;
