@@ -67,6 +67,9 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
 };
 
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn) {
+    if (conn == NULL) {
+        return;
+    }
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
 }
