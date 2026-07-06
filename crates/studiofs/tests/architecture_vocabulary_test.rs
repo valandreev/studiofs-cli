@@ -934,19 +934,21 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
 
 #[test]
 fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
-    let docs = [
-        read_workspace_file("docs/local-first-validation-matrix.md"),
-        read_workspace_file("docs/tests.md"),
-        read_workspace_file("docs/platform-bridges.md"),
-    ]
-    .join("\n");
-    let normalized_docs = normalize_doc_whitespace(&docs);
-    let required_terms = [
+    let matrix = read_workspace_file("docs/local-first-validation-matrix.md");
+    let tests = read_workspace_file("docs/tests.md");
+    let bridge = read_workspace_file("docs/platform-bridges.md");
+
+    let normalized_matrix = normalize_doc_whitespace(&matrix);
+    let normalized_tests = normalize_doc_whitespace(&tests);
+    let normalized_bridge = normalize_doc_whitespace(&bridge);
+
+    let matrix_terms = [
         "SFS-610",
         "Ubuntu 24.04+",
         "Rocky Linux 9.4+",
         "Rocky Linux 8.6+",
         "best-effort only",
+        // Exact Linux smoke test names keep the documented gate tied to cargo.
         "mounted_regular_file_io_is_visible_across_reopen",
         "mounted_namespace_mutations_are_visible_through_readdir",
         "create/write/read/close/reopen",
@@ -962,11 +964,29 @@ fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
         "studiofs devbench",
         "target/perf",
     ];
+    let tests_terms = [
+        "Hosted Linux real mounted E2E is operator-run",
+        "local-first-validation-matrix.md#sfs-610-linux-platform-release-gate",
+    ];
+    let bridge_terms = ["First validated target: Ubuntu 24.04+"];
 
-    let missing: Vec<_> = required_terms
+    let mut missing: Vec<String> = matrix_terms
         .into_iter()
-        .filter(|term| !contains_doc_term(&docs, &normalized_docs, term))
+        .filter(|term| !contains_doc_term(&matrix, &normalized_matrix, term))
+        .map(|term| format!("docs/local-first-validation-matrix.md: {term}"))
         .collect();
+    missing.extend(
+        tests_terms
+            .into_iter()
+            .filter(|term| !contains_doc_term(&tests, &normalized_tests, term))
+            .map(|term| format!("docs/tests.md: {term}")),
+    );
+    missing.extend(
+        bridge_terms
+            .into_iter()
+            .filter(|term| !contains_doc_term(&bridge, &normalized_bridge, term))
+            .map(|term| format!("docs/platform-bridges.md: {term}")),
+    );
 
     assert!(
         missing.is_empty(),

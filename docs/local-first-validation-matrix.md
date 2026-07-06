@@ -119,10 +119,10 @@ Start with the current Linux mounted smoke surface on each target distro:
 cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 ```
 
-Then collect mounted workload evidence from the active Linux mount. Media gates
-must measure large sequential write, large sequential read, warm repeated read,
-flush/fsync latency, callback latency, CPU, memory, and upload/backpressure
-observability:
+Then collect mounted workload evidence from the active Linux mount. From the
+repo root, run the media gate; it must measure large sequential write, large
+sequential read, warm repeated read, flush/fsync latency, callback latency, CPU,
+memory, and upload/backpressure observability:
 
 ```bash
 bash ./tools/perf/validate-bench-linux.sh \
