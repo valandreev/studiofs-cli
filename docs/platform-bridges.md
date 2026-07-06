@@ -215,13 +215,16 @@ multithreaded low-level loop while the connection init callback caps the kernel
 background queue (`max_background=16`, `congestion_threshold=12`) so heavy
 callback workloads apply backpressure instead of growing unbounded request
 memory. The Linux bridge request can override those queue bounds before
-mounting. StudioFS currently uses the libfuse 3.1 multithreaded loop ABI
-(`clone_fd=0`) for distro compatibility; moving to the newer
-`fuse_loop_config` ABI for explicit worker-pool sizing remains a follow-up once
-the Linux target matrix is ready for that binding.
+mounting. StudioFS uses the libfuse3 `fuse_loop_config` multithreaded loop API:
+libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and an
+adaptive worker-pool limit based on available CPU parallelism, capped by the
+configured `max_background` queue. Older supported 3.x headers use the public
+pre-3.12 `struct fuse_loop_config` fallback with the same `clone_fd=0` and
+adaptive `max_idle_threads` cap.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
-9.4+. Rocky Linux 8.6+ remains best-effort.
+9.4+ (system `fuse3-devel` is currently 3.10.x, so it uses the pre-3.12
+fallback). Rocky Linux 8.6+ remains best-effort.
 
 ### Requirements
 

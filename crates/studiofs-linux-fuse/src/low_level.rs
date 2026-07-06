@@ -112,7 +112,8 @@ unsafe extern "C" {
     ) -> *mut raw::FuseSession;
     fn studiofs_linux_fuse_session_loop_mt(
         session: *mut raw::FuseSession,
-        clone_fd: c_int,
+        max_threads: c_uint,
+        max_idle_threads: c_uint,
     ) -> c_int;
     fn studiofs_linux_fuse_notify_inval_inode(
         session: *mut raw::FuseSession,
@@ -147,6 +148,8 @@ unsafe extern "C" {
         congestion_threshold: u32,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
 
@@ -180,6 +183,22 @@ impl SessionState {
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    linux_fuse_loop_thread_count_for_parallelism(parallelism, max_background)
+}
+
+fn linux_fuse_loop_thread_count_for_parallelism(parallelism: usize, max_background: u32) -> c_uint {
+    u32::try_from(parallelism)
+        .unwrap_or(u32::MAX)
+        // FUSE callbacks can block on local disk and remote object I/O, so keep
+        // a small surplus over CPU count without exceeding kernel queue bounds.
+        .saturating_mul(2)
+        .clamp(1, max_background.max(1))
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_max_background(
@@ -386,10 +405,18 @@ impl Session {
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
+        let max_background = self
+            .state
+            .as_ref()
+            .map(|state| state.connection_config.max_background)
+            .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background);
+        let loop_threads = linux_fuse_loop_thread_count(max_background);
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
-        // `clone_fd = 0` keeps libfuse transport ownership on the mounted session
-        // while the bounded kernel background queue applies callback backpressure.
-        let result = unsafe { studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), 0) };
+        // Keep idle workers equal to the cap so bursty filesystem I/O does not
+        // pay thread create/destroy overhead between request spikes.
+        let result = unsafe {
+            studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), loop_threads, loop_threads)
+        };
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -2060,6 +2087,31 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn multithread_loop_uses_fuse_loop_config_api() {
+        // SAFETY: the C shim returns its compile-time libfuse API selection.
+        let uses_loop_config_api =
+            unsafe { super::studiofs_linux_fuse_loop_config_uses_loop_config_api() };
+
+        assert_eq!(uses_loop_config_api, 1);
+    }
+
+    #[test]
+    fn loop_thread_count_scales_with_parallelism_and_background_queue() {
+        assert_eq!(
+            super::linux_fuse_loop_thread_count_for_parallelism(4, 16),
+            8
+        );
+    }
+
+    #[test]
+    fn loop_thread_count_caps_at_background_queue() {
+        assert_eq!(
+            super::linux_fuse_loop_thread_count_for_parallelism(64, 16),
+            16
+        );
     }
 
     #[test]
