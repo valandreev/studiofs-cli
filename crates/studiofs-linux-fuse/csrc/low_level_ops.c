@@ -7,6 +7,11 @@ extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const 
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi);
+extern void studiofs_linux_fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
+extern void studiofs_linux_fuse_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev);
+extern void studiofs_linux_fuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_linux_fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_linux_fuse_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent, const char *newname, unsigned int flags);
 extern void studiofs_linux_fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi);
@@ -25,6 +30,11 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .getattr = studiofs_linux_fuse_getattr,
     .setattr = studiofs_linux_fuse_setattr,
     .create = studiofs_linux_fuse_create,
+    .mkdir = studiofs_linux_fuse_mkdir,
+    .mknod = studiofs_linux_fuse_mknod,
+    .unlink = studiofs_linux_fuse_unlink,
+    .rmdir = studiofs_linux_fuse_rmdir,
+    .rename = studiofs_linux_fuse_rename,
     .open = studiofs_linux_fuse_open,
     .read = studiofs_linux_fuse_read,
     .write = studiofs_linux_fuse_write,
@@ -84,6 +94,10 @@ int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_l
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->create && ops->open && ops->read && ops->write &&
            ops->flush && ops->fsync && ops->release;
+}
+
+int studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(const struct fuse_lowlevel_ops *ops) {
+    return ops->mkdir && ops->mknod && ops->unlink && ops->rmdir && ops->rename;
 }
 
 int studiofs_linux_fuse_file_info_direct_io_after_init(void) {
