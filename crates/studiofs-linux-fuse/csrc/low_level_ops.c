@@ -9,11 +9,14 @@ extern void studiofs_linux_fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct s
 extern void studiofs_linux_fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
 extern void studiofs_linux_fuse_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev);
+extern void studiofs_linux_fuse_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent, const char *newname, unsigned int flags);
+extern void studiofs_linux_fuse_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newname);
 extern void studiofs_linux_fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
+extern void studiofs_linux_fuse_readlink(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_linux_fuse_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi);
@@ -23,6 +26,10 @@ extern void studiofs_linux_fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t s
 extern void studiofs_linux_fuse_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_statfs(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_linux_fuse_access(fuse_req_t req, fuse_ino_t ino, int mask);
+extern void studiofs_linux_fuse_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags);
+extern void studiofs_linux_fuse_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size);
+extern void studiofs_linux_fuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
+extern void studiofs_linux_fuse_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name);
 
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .destroy = studiofs_linux_fuse_destroy,
@@ -32,11 +39,14 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .create = studiofs_linux_fuse_create,
     .mkdir = studiofs_linux_fuse_mkdir,
     .mknod = studiofs_linux_fuse_mknod,
+    .symlink = studiofs_linux_fuse_symlink,
     .unlink = studiofs_linux_fuse_unlink,
     .rmdir = studiofs_linux_fuse_rmdir,
     .rename = studiofs_linux_fuse_rename,
+    .link = studiofs_linux_fuse_link,
     .open = studiofs_linux_fuse_open,
     .read = studiofs_linux_fuse_read,
+    .readlink = studiofs_linux_fuse_readlink,
     .write = studiofs_linux_fuse_write,
     .flush = studiofs_linux_fuse_flush,
     .fsync = studiofs_linux_fuse_fsync,
@@ -46,6 +56,10 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .releasedir = studiofs_linux_fuse_releasedir,
     .statfs = studiofs_linux_fuse_statfs,
     .access = studiofs_linux_fuse_access,
+    .setxattr = studiofs_linux_fuse_setxattr,
+    .getxattr = studiofs_linux_fuse_getxattr,
+    .listxattr = studiofs_linux_fuse_listxattr,
+    .removexattr = studiofs_linux_fuse_removexattr,
 };
 
 const struct fuse_lowlevel_ops *studiofs_linux_fuse_empty_low_level_ops(void) {
@@ -98,6 +112,11 @@ int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fu
 
 int studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->mkdir && ops->mknod && ops->unlink && ops->rmdir && ops->rename;
+}
+
+int studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(const struct fuse_lowlevel_ops *ops) {
+    return ops->symlink && ops->readlink && ops->link &&
+           ops->setxattr && ops->getxattr && ops->listxattr && ops->removexattr;
 }
 
 int studiofs_linux_fuse_file_info_direct_io_after_init(void) {

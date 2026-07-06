@@ -70,6 +70,7 @@ pub(crate) mod raw {
             fi: *const FuseFileInfo,
         ) -> c_int;
         pub(crate) fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
+        pub(crate) fn fuse_reply_xattr(req: *mut FuseReq, count: size_t) -> c_int;
         pub(crate) fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         pub(crate) fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
         pub(crate) fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
@@ -119,6 +120,10 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
@@ -468,6 +473,25 @@ pub extern "C" fn studiofs_linux_fuse_mknod(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_symlink(
+    req: *mut raw::FuseReq,
+    link: *const c_char,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result = with_name_bytes(link, |target| {
+        with_name_bytes(name, |name| state.symlink(parent, name, target))
+    })
+    .flatten()
+    .unwrap_or(Err(libc::EINVAL));
+    reply_entry_result(req, state, result);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn studiofs_linux_fuse_unlink(
     req: *mut raw::FuseReq,
     parent: raw::FuseIno,
@@ -530,6 +554,22 @@ pub extern "C" fn studiofs_linux_fuse_rename(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_link(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result = with_name_bytes(newname, |newname| state.link(ino, newparent, newname))
+        .unwrap_or(Err(libc::EINVAL));
+    reply_entry_result(req, state, result);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn studiofs_linux_fuse_open(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
@@ -565,6 +605,21 @@ pub extern "C" fn studiofs_linux_fuse_read(
         Ok(buffer) => {
             // SAFETY: `buffer` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.readlink(ino) {
+        Ok(target) => {
+            // SAFETY: `target` is valid for this synchronous reply.
+            unsafe { raw::fuse_reply_buf(req, target.as_ptr().cast::<c_char>(), target.len()) };
         }
         Err(errno) => reply_error(req, errno),
     }
@@ -738,6 +793,93 @@ pub extern "C" fn studiofs_linux_fuse_access(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_setxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    value: *const c_char,
+    size: size_t,
+    flags: c_int,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let flags = match u32::try_from(flags) {
+        Ok(flags) => flags,
+        Err(_) => {
+            reply_error(req, libc::EINVAL);
+            return;
+        }
+    };
+    let result = with_name_bytes(name, |name| {
+        with_xattr_value(value, size, |value| {
+            state.set_xattr(ino, name, value, flags)
+        })
+    })
+    .flatten()
+    .unwrap_or(Err(libc::EINVAL));
+    match result {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_getxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    size: size_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result =
+        with_name_bytes(name, |name| state.get_xattr(ino, name)).unwrap_or(Err(libc::EINVAL));
+    match result {
+        Ok(Some(value)) => reply_xattr_value(req, size, &value),
+        Ok(None) => reply_error(req, libc::ENODATA),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_listxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.list_xattrs(ino) {
+        Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_removexattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let result =
+        with_name_bytes(name, |name| state.remove_xattr(ino, name)).unwrap_or(Err(libc::EINVAL));
+    match result {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
 fn callback_state(req: *mut raw::FuseReq) -> Option<&'static SessionState> {
     if req.is_null() {
         return None;
@@ -759,6 +901,20 @@ fn with_name_bytes<T>(name: *const c_char, f: impl FnOnce(&[u8]) -> T) -> Option
     // SAFETY: libfuse passes callback names as NUL-terminated strings valid
     // for the duration of the callback.
     Some(f(unsafe { CStr::from_ptr(name) }.to_bytes()))
+}
+
+fn with_xattr_value<T>(value: *const c_char, size: usize, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+    if size == 0 {
+        return Some(f(&[]));
+    }
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: libfuse passes `value` as a request-owned byte slice valid for
+    // the duration of the callback.
+    Some(f(unsafe {
+        std::slice::from_raw_parts(value.cast::<u8>(), size)
+    }))
 }
 
 impl SessionState {
@@ -855,6 +1011,15 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -879,6 +1044,15 @@ impl SessionState {
         }
         self.vfs
             .rename(parent, name, newparent, newname)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .link(ino, newparent, newname)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -919,6 +1093,12 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))?;
         buffer.truncate(read as usize);
         Ok(buffer)
+    }
+
+    fn readlink(&self, ino: u64) -> Result<Vec<u8>, i32> {
+        self.vfs
+            .readlink(ino)
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn write(
@@ -1086,6 +1266,36 @@ impl SessionState {
             self.mount_gid,
             LINUX_FUSE_BLOCK_SIZE,
         ))
+    }
+
+    fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        self.vfs
+            .get_xattr(ino, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn set_xattr(&self, ino: u64, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .set_xattr(ino, name, value, flags)
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
+    }
+
+    fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .remove_xattr(ino, name)
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
+    }
+
+    fn list_xattrs(&self, ino: u64) -> Result<Vec<Vec<u8>>, i32> {
+        self.vfs
+            .list_xattrs(ino)
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 }
 
@@ -1334,6 +1544,38 @@ fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
     unsafe { raw::fuse_reply_err(req, errno) };
 }
 
+fn reply_xattr_value(req: *mut raw::FuseReq, size: usize, value: &[u8]) {
+    if size == 0 {
+        // SAFETY: `req` is live and this consumes the callback reply.
+        unsafe { raw::fuse_reply_xattr(req, value.len()) };
+    } else if size < value.len() {
+        reply_error(req, libc::ERANGE);
+    } else {
+        // SAFETY: `value` is valid for this synchronous reply.
+        unsafe { raw::fuse_reply_buf(req, value.as_ptr().cast::<c_char>(), value.len()) };
+    }
+}
+
+fn format_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(names.iter().map(|name| name.len() + 1).sum());
+    for name in names {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    out
+}
+
+fn xattr_mutation_err_to_errno(err: &studiofs_vfs::VfsError) -> i32 {
+    if matches!(
+        err,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    ) {
+        libc::ENODATA
+    } else {
+        vfs_err_to_errno(err)
+    }
+}
+
 struct DirectoryEntryBuffer {
     words: Vec<MaybeUninit<u64>>,
     len: usize,
@@ -1428,6 +1670,7 @@ impl Drop for Session {
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use std::time::Duration;
 
@@ -1460,6 +1703,95 @@ mod tests {
         })?;
         // SAFETY: `path` is NUL-terminated and valid for this syscall.
         let result = unsafe { libc::mknod(path.as_ptr(), libc::S_IFREG | 0o644, 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn path_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test path contains an interior NUL byte",
+            )
+        })
+    }
+
+    fn set_xattr(path: &std::path::Path, name: &[u8], value: &[u8]) -> std::io::Result<()> {
+        let path = path_cstring(path)?;
+        let name = std::ffi::CString::new(name).expect("test xattr name has no NUL");
+        // SAFETY: path and name are NUL-terminated; value points to `value.len()` bytes.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn get_xattr(path: &std::path::Path, name: &[u8]) -> std::io::Result<Vec<u8>> {
+        let path = path_cstring(path)?;
+        let name = std::ffi::CString::new(name).expect("test xattr name has no NUL");
+        // SAFETY: path and name are NUL-terminated; null value asks for size.
+        let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut value = vec![0; size as usize];
+        // SAFETY: value has `size` bytes of writable capacity.
+        let read = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            value.truncate(read as usize);
+            Ok(value)
+        }
+    }
+
+    fn list_xattrs(path: &std::path::Path) -> std::io::Result<Vec<Vec<u8>>> {
+        let path = path_cstring(path)?;
+        // SAFETY: path is NUL-terminated; null list asks for size.
+        let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut names = vec![0; size as usize];
+        // SAFETY: names has `size` bytes of writable capacity.
+        let read =
+            unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        names.truncate(read as usize);
+        Ok(names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_vec())
+            .collect())
+    }
+
+    fn remove_xattr(path: &std::path::Path, name: &[u8]) -> std::io::Result<()> {
+        let path = path_cstring(path)?;
+        let name = std::ffi::CString::new(name).expect("test xattr name has no NUL");
+        // SAFETY: path and name are NUL-terminated.
+        let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
         if result == 0 {
             Ok(())
         } else {
@@ -1514,6 +1846,18 @@ mod tests {
         // SAFETY: the C shim only inspects callback pointers in a static table.
         let has_callbacks = unsafe {
             super::studiofs_linux_fuse_low_level_ops_has_namespace_mutation_callbacks(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn low_level_ops_include_posix_compat_callbacks() {
+        // SAFETY: the C shim only inspects callback pointers in a static table.
+        let has_callbacks = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(
                 super::studiofs_linux_fuse_low_level_ops(),
             )
         };
@@ -1599,6 +1943,16 @@ mod tests {
         assert_eq!(state.unlink(1, b"file"), Err(libc::EROFS));
         assert_eq!(state.rmdir(1, b"dir"), Err(libc::EROFS));
         assert_eq!(state.rename(1, b"old", 1, b"new"), Err(libc::EROFS));
+        assert_eq!(
+            state.symlink(1, b"link", b"target").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(state.link(2, 1, b"hard").unwrap_err(), libc::EROFS);
+        assert_eq!(
+            state.set_xattr(1, b"user.key", b"value", 0),
+            Err(libc::EROFS)
+        );
+        assert_eq!(state.remove_xattr(1, b"user.key"), Err(libc::EROFS));
     }
 
     #[test]
@@ -1642,6 +1996,14 @@ mod tests {
         assert_eq!(args.uid, Some(1000));
         assert_eq!(args.gid, Some(1001));
         assert_eq!(args.mtime.resolve(), Some(7_000_000_009));
+    }
+
+    #[test]
+    fn xattr_name_list_is_nul_separated() {
+        assert_eq!(
+            super::format_xattr_name_list(&[b"user.one".to_vec(), b"user.two".to_vec()]),
+            b"user.one\0user.two\0"
+        );
     }
 
     #[test]
@@ -1755,18 +2117,49 @@ mod tests {
             let guard = UnmountGuard::new(mount_point_for_worker.clone());
             let dir = mount_point_for_worker.join("dir");
             let file = dir.join("file.txt");
+            let hardlink = dir.join("hardlink.txt");
+            let symlink = dir.join("symlink.txt");
             let mknod_file = dir.join("mknod.txt");
             let renamed = dir.join("renamed.txt");
+            let xattr_name = b"user.studiofs.test";
             std::fs::create_dir(&dir)?;
             mknod_regular_file(&mknod_file)?;
             assert!(mknod_file.is_file());
             std::fs::remove_file(&mknod_file)?;
             std::fs::write(&file, b"namespace")?;
             std::fs::rename(&file, &renamed)?;
-            let names = std::fs::read_dir(&dir)?
+            std::fs::hard_link(&renamed, &hardlink)?;
+            assert_eq!(std::fs::read_to_string(&hardlink)?, "namespace");
+            assert!(std::fs::metadata(&renamed)?.nlink() >= 2);
+            std::os::unix::fs::symlink("renamed.txt", &symlink)?;
+            assert_eq!(
+                std::fs::read_link(&symlink)?,
+                std::path::PathBuf::from("renamed.txt")
+            );
+            set_xattr(&renamed, xattr_name, b"value")?;
+            assert_eq!(get_xattr(&renamed, xattr_name)?, b"value");
+            assert!(list_xattrs(&renamed)?.iter().any(|name| name == xattr_name));
+            remove_xattr(&renamed, xattr_name)?;
+            assert_eq!(
+                get_xattr(&renamed, xattr_name)
+                    .expect_err("removed xattr should be missing")
+                    .raw_os_error(),
+                Some(libc::ENODATA)
+            );
+            let mut names = std::fs::read_dir(&dir)?
                 .map(|entry| entry.map(|entry| entry.file_name()))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            assert_eq!(names, vec![std::ffi::OsString::from("renamed.txt")]);
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    std::ffi::OsString::from("hardlink.txt"),
+                    std::ffi::OsString::from("renamed.txt"),
+                    std::ffi::OsString::from("symlink.txt")
+                ]
+            );
+            std::fs::remove_file(&symlink)?;
+            std::fs::remove_file(&hardlink)?;
             std::fs::remove_file(&renamed)?;
             std::fs::remove_dir(&dir)?;
 
