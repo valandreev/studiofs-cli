@@ -970,23 +970,23 @@ fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
     ];
     let bridge_terms = ["First validated target: Ubuntu 24.04+"];
 
-    let mut missing: Vec<String> = matrix_terms
+    let missing: Vec<String> = matrix_terms
         .into_iter()
         .filter(|term| !contains_doc_term(&matrix, &normalized_matrix, term))
         .map(|term| format!("docs/local-first-validation-matrix.md: {term}"))
+        .chain(
+            tests_terms
+                .into_iter()
+                .filter(|term| !contains_doc_term(&tests, &normalized_tests, term))
+                .map(|term| format!("docs/tests.md: {term}")),
+        )
+        .chain(
+            bridge_terms
+                .into_iter()
+                .filter(|term| !contains_doc_term(&bridge, &normalized_bridge, term))
+                .map(|term| format!("docs/platform-bridges.md: {term}")),
+        )
         .collect();
-    missing.extend(
-        tests_terms
-            .into_iter()
-            .filter(|term| !contains_doc_term(&tests, &normalized_tests, term))
-            .map(|term| format!("docs/tests.md: {term}")),
-    );
-    missing.extend(
-        bridge_terms
-            .into_iter()
-            .filter(|term| !contains_doc_term(&bridge, &normalized_bridge, term))
-            .map(|term| format!("docs/platform-bridges.md: {term}")),
-    );
 
     assert!(
         missing.is_empty(),
