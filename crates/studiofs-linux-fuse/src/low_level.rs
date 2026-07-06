@@ -618,6 +618,7 @@ pub extern "C" fn studiofs_linux_fuse_readlink(req: *mut raw::FuseReq, ino: raw:
     };
     match state.readlink(ino) {
         Ok(target) => {
+            // Linux readlink replies are byte buffers without a trailing NUL.
             // SAFETY: `target` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, target.as_ptr().cast::<c_char>(), target.len()) };
         }
@@ -1567,10 +1568,8 @@ fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
 }
 
 fn reply_xattr_value(req: *mut raw::FuseReq, size: usize, value: &[u8]) {
-    if size == 0 {
-        // SAFETY: `req` is live and this consumes the callback reply.
-        unsafe { raw::fuse_reply_xattr(req, value.len()) };
-    } else if size < value.len() {
+    debug_assert!(size > 0);
+    if size < value.len() {
         reply_error(req, libc::ERANGE);
     } else {
         // SAFETY: `value` is valid for this synchronous reply.
@@ -2025,6 +2024,25 @@ mod tests {
         assert_eq!(
             super::format_xattr_name_list(&[b"user.one".to_vec(), b"user.two".to_vec()]),
             b"user.one\0user.two\0"
+        );
+    }
+
+    #[test]
+    fn xattr_mutation_errno_preserves_missing_inode() {
+        assert_eq!(
+            super::xattr_mutation_err_to_errno(&studiofs_vfs::VfsError::Meta(
+                studiofs_meta::MetaError::EntryNotFound {
+                    parent: 7,
+                    name: "user.missing".to_owned(),
+                },
+            )),
+            libc::ENODATA
+        );
+        assert_eq!(
+            super::xattr_mutation_err_to_errno(&studiofs_vfs::VfsError::Meta(
+                studiofs_meta::MetaError::InodeNotFound(7),
+            )),
+            libc::ENOENT
         );
     }
 
