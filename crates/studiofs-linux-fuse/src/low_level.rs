@@ -148,7 +148,7 @@ unsafe extern "C" {
         congestion_threshold: u32,
     ) -> c_int;
     #[cfg(test)]
-    fn studiofs_linux_fuse_loop_config_uses_modern_api() -> c_int;
+    fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
 }
@@ -194,6 +194,8 @@ fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
 fn linux_fuse_loop_thread_count_for_parallelism(parallelism: usize, max_background: u32) -> c_uint {
     u32::try_from(parallelism)
         .unwrap_or(u32::MAX)
+        // FUSE callbacks can block on local disk and remote object I/O, so keep
+        // a small surplus over CPU count without exceeding kernel queue bounds.
         .saturating_mul(2)
         .clamp(1, max_background.max(1))
 }
@@ -410,6 +412,8 @@ impl Session {
             .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background);
         let loop_threads = linux_fuse_loop_thread_count(max_background);
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
+        // Keep idle workers equal to the cap so bursty filesystem I/O does not
+        // pay thread create/destroy overhead between request spikes.
         let result = unsafe {
             studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), loop_threads, loop_threads)
         };
@@ -2088,9 +2092,10 @@ mod tests {
     #[test]
     fn multithread_loop_uses_fuse_loop_config_api() {
         // SAFETY: the C shim returns its compile-time libfuse API selection.
-        let uses_modern_api = unsafe { super::studiofs_linux_fuse_loop_config_uses_modern_api() };
+        let uses_loop_config_api =
+            unsafe { super::studiofs_linux_fuse_loop_config_uses_loop_config_api() };
 
-        assert_eq!(uses_modern_api, 1);
+        assert_eq!(uses_loop_config_api, 1);
     }
 
     #[test]

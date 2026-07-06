@@ -17,15 +17,17 @@ fn main() {
         .version
         .split('.')
         .map(|part| part.parse::<u32>().unwrap_or(0));
-    let fuse_api_version = if (
+    let fuse_version = (
         version_parts.next().unwrap_or(0),
         version_parts.next().unwrap_or(0),
-    ) >= (3, 12)
-    {
-        "312"
-    } else {
-        "32"
-    };
+    );
+    if fuse_version < (3, 2) {
+        panic!(
+            "libfuse3 >= 3.2 is required for StudioFS Linux mounts; found {}",
+            fuse3.version
+        );
+    }
+    let fuse_api_version = if fuse_version >= (3, 12) { "312" } else { "32" };
 
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");

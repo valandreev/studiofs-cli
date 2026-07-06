@@ -109,6 +109,7 @@ int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
     fuse_loop_cfg_destroy(config);
     return result;
 #else
+    /* Pre-3.12 public config has max_idle_threads but no max_threads field. */
     (void)max_threads;
     struct fuse_loop_config config = {
         .clone_fd = 0,
@@ -158,7 +159,7 @@ int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
            conn.congestion_threshold == congestion_threshold;
 }
 
-int studiofs_linux_fuse_loop_config_uses_modern_api(void) {
+int studiofs_linux_fuse_loop_config_uses_loop_config_api(void) {
     return FUSE_USE_VERSION >= 32;
 }
 
