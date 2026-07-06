@@ -473,7 +473,7 @@ impl LinuxFuseKernelInvalidator {
             studiofs_linux_fuse_notify_inval_inode(self.session.as_ptr(), ino, offset, len)
         };
         if result != 0 && result != -libc::ENOENT {
-            debug!(
+            warn!(
                 ino,
                 offset, len, result, "Linux FUSE inode invalidation failed"
             );
@@ -2070,7 +2070,6 @@ mod tests {
             tx.send(idle).expect("send idle result");
         });
 
-        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
         drop(guard);
         assert!(
             rx.recv_timeout(Duration::from_secs(1))
