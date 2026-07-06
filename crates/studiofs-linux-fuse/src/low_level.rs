@@ -157,6 +157,8 @@ pub(crate) struct SessionState {
     connection_config: LinuxFuseConnectionConfig,
 }
 
+const _: fn() = assert_send_sync_static::<SessionState>;
+
 impl SessionState {
     pub(crate) fn new(
         vfs: Arc<StudioVfs>,
@@ -164,7 +166,6 @@ impl SessionState {
         read_only: bool,
         connection_config: LinuxFuseConnectionConfig,
     ) -> Self {
-        assert_send_sync_static::<Self>();
         Self {
             vfs,
             runtime_handle,
