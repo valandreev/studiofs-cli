@@ -371,6 +371,7 @@ impl Session {
     }
 }
 
+#[derive(Debug)]
 struct LinuxFuseKernelInvalidator {
     session: NonNull<raw::FuseSession>,
     state: Arc<SessionInvalidationState>,
@@ -434,9 +435,12 @@ impl SessionInvalidationState {
 
 impl Drop for SessionInvalidationGuard<'_> {
     fn drop(&mut self) {
-        let mut status = self.state.lock_status();
-        status.active -= 1;
-        if status.active == 0 {
+        let should_notify = {
+            let mut status = self.state.lock_status();
+            status.active -= 1;
+            status.active == 0
+        };
+        if should_notify {
             self.state.idle.notify_all();
         }
     }
@@ -450,7 +454,7 @@ unsafe impl Sync for LinuxFuseKernelInvalidator {}
 
 impl KernelInvalidator for LinuxFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.inval_inode_range(ino, 0, -1);
+        self.inval_inode_range(ino, 0, 0);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
@@ -2064,15 +2068,31 @@ mod tests {
         let state = Arc::new(super::SessionInvalidationState::new());
         let guard = state.begin_invalidation().expect("begin invalidation");
         let waiter_state = Arc::clone(&state);
-        let (tx, rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
         let waiter = thread::spawn(move || {
-            let idle = waiter_state.wait_for_idle(Duration::from_secs(1));
-            tx.send(idle).expect("send idle result");
+            let status = waiter_state.lock_status();
+            let result = waiter_state
+                .idle
+                .wait_timeout_while(status, Duration::from_secs(1), |status| {
+                    if status.active > 0 {
+                        let _ = observed_tx.send(());
+                    }
+                    status.active > 0
+                })
+                .unwrap_or_else(|err| err.into_inner());
+            result_tx
+                .send(result.0.active == 0)
+                .expect("send idle result");
         });
 
+        observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should observe active invalidation");
         drop(guard);
         assert!(
-            rx.recv_timeout(Duration::from_secs(1))
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
                 .expect("idle result")
         );
         waiter.join().expect("join idle waiter");
