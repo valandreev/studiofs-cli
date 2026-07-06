@@ -1431,11 +1431,23 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    struct UnmountGuard(std::path::PathBuf);
+    struct UnmountGuard(Option<std::path::PathBuf>);
+
+    impl UnmountGuard {
+        fn new(path: std::path::PathBuf) -> Self {
+            Self(Some(path))
+        }
+
+        fn disarm(mut self) {
+            self.0 = None;
+        }
+    }
 
     impl Drop for UnmountGuard {
         fn drop(&mut self) {
-            let _ = Command::new("fusermount3").arg("-u").arg(&self.0).status();
+            if let Some(path) = &self.0 {
+                let _ = Command::new("fusermount3").arg("-u").arg(path).status();
+            }
         }
     }
 
@@ -1679,7 +1691,7 @@ mod tests {
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            let guard = UnmountGuard(mount_point_for_worker.clone());
+            let guard = UnmountGuard::new(mount_point_for_worker.clone());
             let path = mount_point_for_worker.join("regular.txt");
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
@@ -1706,7 +1718,7 @@ mod tests {
                 .arg("-u")
                 .arg(&mount_point_for_worker)
                 .status();
-            std::mem::forget(guard);
+            guard.disarm();
             status
         });
 
@@ -1740,7 +1752,7 @@ mod tests {
             super::Session::mount(state, &mount_point, "studiofs-namespace-mutate").expect("mount");
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            let guard = UnmountGuard(mount_point_for_worker.clone());
+            let guard = UnmountGuard::new(mount_point_for_worker.clone());
             let dir = mount_point_for_worker.join("dir");
             let file = dir.join("file.txt");
             let mknod_file = dir.join("mknod.txt");
@@ -1762,7 +1774,7 @@ mod tests {
                 .arg("-u")
                 .arg(&mount_point_for_worker)
                 .status();
-            std::mem::forget(guard);
+            guard.disarm();
             status
         });
 
