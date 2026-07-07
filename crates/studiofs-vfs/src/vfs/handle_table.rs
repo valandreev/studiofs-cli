@@ -111,6 +111,17 @@ impl HandleTable {
             .any(|open_file| open_file.ino == ino && open_file.active_open_overlay)
     }
 
+    pub(super) fn clear_read_windows_for_inode(&self, ino: Ino) {
+        for open_file in self
+            .handles
+            .read()
+            .values()
+            .filter(|open_file| open_file.ino == ino)
+        {
+            open_file.clear_read_window();
+        }
+    }
+
     /// Mark an inode as orphan (unlinked while open).
     pub(super) fn mark_orphan(&self, ino: Ino) {
         self.orphans.lock().insert(ino);

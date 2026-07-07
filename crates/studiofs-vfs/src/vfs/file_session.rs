@@ -1,4 +1,5 @@
 use crate::access::{AccessClass, AccessDecision, AccessTrackerConfig, HandleAccessState};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +44,19 @@ pub(super) struct FileSessionDebugSnapshot {
     pub(super) active_writer: Option<&'static str>,
     pub(super) last_transition_unix_ms: u64,
     pub(super) last_transition_label: (&'static str, &'static str),
+}
+
+#[derive(Clone, Debug)]
+struct ReadWindow {
+    ino: Ino,
+    start: u64,
+    data: Bytes,
+}
+
+#[derive(Debug, Default)]
+struct ReadWindowState {
+    last_end: Option<u64>,
+    window: Option<ReadWindow>,
 }
 
 /// Flags associated with an open file descriptor.
@@ -109,6 +123,7 @@ pub struct OpenFile {
     pub(super) open_attr: Option<InodeAttr>,
     pub(super) active_open_overlay: bool,
     access_state: Arc<Mutex<HandleAccessState>>,
+    read_window: Arc<Mutex<ReadWindowState>>,
 }
 
 impl OpenFile {
@@ -126,6 +141,7 @@ impl OpenFile {
             open_attr,
             active_open_overlay,
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
+            read_window: Arc::new(Mutex::new(ReadWindowState::default())),
         }
     }
 
@@ -158,6 +174,47 @@ impl OpenFile {
         cfg: AccessTrackerConfig,
     ) -> AccessDecision {
         self.access_state.lock().observe_write(offset, len, cfg)
+    }
+
+    pub(super) fn read_window_hit(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> Option<u32> {
+        let mut state = self.read_window.lock();
+        let window = state.window.as_ref()?;
+        if window.ino != ino || offset < window.start {
+            return None;
+        }
+        let rel = usize::try_from(offset - window.start).ok()?;
+        let end = rel.checked_add(buffer.len())?;
+        if end > window.data.len() {
+            return None;
+        }
+        buffer.copy_from_slice(&window.data[rel..end]);
+        state.last_end = Some(offset.saturating_add(buffer.len() as u64));
+        Some(buffer.len() as u32)
+    }
+
+    pub(super) fn should_fill_read_window(
+        &self,
+        offset: u64,
+        requested_len: usize,
+        window_len: usize,
+    ) -> bool {
+        requested_len < window_len && self.read_window.lock().last_end == Some(offset)
+    }
+
+    pub(super) fn record_read_progress(&self, offset: u64, read_len: usize) {
+        self.read_window.lock().last_end = Some(offset.saturating_add(read_len as u64));
+    }
+
+    pub(super) fn replace_read_window(&self, ino: Ino, start: u64, data: Bytes) {
+        let mut state = self.read_window.lock();
+        state.last_end = Some(start.saturating_add(data.len() as u64));
+        state.window = Some(ReadWindow { ino, start, data });
+    }
+
+    pub(super) fn clear_read_window(&self) {
+        let mut state = self.read_window.lock();
+        state.last_end = None;
+        state.window = None;
     }
 }
 
@@ -594,6 +651,30 @@ mod tests {
         f3 |= OpenFlags::APPEND;
         assert!(f3.contains(OpenFlags::RDONLY));
         assert!(f3.contains(OpenFlags::APPEND));
+    }
+
+    #[test]
+    fn read_window_hit_requires_full_range_coverage() {
+        let open_file = OpenFile::new(7, 42, OpenFlags::RDONLY, None, false);
+        open_file.replace_read_window(42, 1024, Bytes::from_static(b"abcdef"));
+
+        let mut hit = [0u8; 3];
+        assert_eq!(open_file.read_window_hit(42, 1026, &mut hit), Some(3));
+        assert_eq!(&hit, b"cde");
+
+        let mut miss = [0u8; 4];
+        assert_eq!(open_file.read_window_hit(42, 1027, &mut miss), None);
+    }
+
+    #[test]
+    fn read_window_fill_requires_sequential_read() {
+        let open_file = OpenFile::new(7, 42, OpenFlags::RDONLY, None, false);
+
+        assert!(!open_file.should_fill_read_window(128, 128, 4096));
+        open_file.record_read_progress(0, 128);
+        assert!(open_file.should_fill_read_window(128, 128, 4096));
+        assert!(!open_file.should_fill_read_window(512, 128, 4096));
+        assert!(!open_file.should_fill_read_window(128, 4096, 4096));
     }
 
     #[test]
