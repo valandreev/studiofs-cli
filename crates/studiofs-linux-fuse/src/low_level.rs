@@ -3,7 +3,7 @@ use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
@@ -993,12 +993,21 @@ pub extern "C" fn studiofs_linux_fuse_read(
         reply_error(req, libc::EIO);
         return;
     };
+    let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
+            state
+                .vfs
+                .record_fuse_read_callback(buffer.len(), started.elapsed(), false);
             // SAFETY: `buffer` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            state
+                .vfs
+                .record_fuse_read_callback(size, started.elapsed(), true);
+            reply_error(req, errno);
+        }
     }
 }
 
