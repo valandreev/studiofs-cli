@@ -392,6 +392,21 @@ fn linux_fuse_env_flag(name: &str) -> bool {
     })
 }
 
+fn linux_fuse_metadata_admission_enabled() -> bool {
+    linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_METADATA_ADMISSION")
+}
+
+fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
+    args.size.is_none()
+        && (args.mode.is_some()
+            || args.uid.is_some()
+            || args.gid.is_some()
+            || !matches!(args.atime, TimeSpec::Omit)
+            || !matches!(args.mtime, TimeSpec::Omit)
+            || !matches!(args.crtime, TimeSpec::Omit)
+            || args.win_attrs.is_some())
+}
+
 fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
@@ -1370,6 +1385,12 @@ impl SessionState {
         ino: u64,
         args: SetattrArgs,
     ) -> Result<InodeAttr, i32> {
+        if linux_fuse_metadata_admission_enabled() && linux_fuse_setattr_args_are_attr_only(&args) {
+            return self
+                .vfs
+                .setattr_attr_only_deferred_metadata(ino, args, &self.runtime_handle)
+                .map_err(|error| vfs_err_to_errno(&error));
+        }
         self.vfs
             .setattr_with_handle(file_handle, ino, args)
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1389,16 +1410,21 @@ impl SessionState {
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
         }
-        let attr = self
-            .vfs
-            .create(
+        let mode = (mode & 0o7777) as u16;
+        let attr = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.create_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        } else {
+            self.vfs
+                .create(parent, name, self.mount_uid, self.mount_gid, mode)
+        }
+        .map_err(|error| vfs_err_to_errno(&error))?;
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
         let fh = self
             .vfs
@@ -1411,15 +1437,21 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .mkdir(
+        let mode = (mode & 0o7777) as u16;
+        let result = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.mkdir_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            self.vfs
+                .mkdir(parent, name, self.mount_uid, self.mount_gid, mode)
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
@@ -1430,15 +1462,21 @@ impl SessionState {
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
         }
-        self.vfs
-            .create(
+        let mode = (mode & 0o7777) as u16;
+        let result = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.create_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            self.vfs
+                .create(parent, name, self.mount_uid, self.mount_gid, mode)
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<InodeAttr, i32> {

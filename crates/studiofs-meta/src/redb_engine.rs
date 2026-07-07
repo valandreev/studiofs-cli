@@ -5,7 +5,8 @@
 use crate::engine::*;
 use crate::types::*;
 use redb::{
-    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
+    Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
+    WriteTransaction,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -29,6 +30,35 @@ pub(crate) struct CounterWriteTransaction<'a> {
     txn: &'a WriteTransaction,
 }
 
+fn redb_relaxed_durability_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
+    let mut txn = db
+        .begin_write()
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    if redb_relaxed_durability_enabled() {
+        txn.set_durability(Durability::None)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+    }
+    Ok(txn)
+}
+
 impl CounterWriteTransaction<'_> {
     pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
         let mut table = self
@@ -43,6 +73,10 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn begin_write_txn(&self) -> MetaResult<WriteTransaction> {
+        begin_redb_write_txn(&self.db)
+    }
+
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -55,9 +89,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
         {
-            let txn = db
-                .begin_write()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let txn = begin_redb_write_txn(&db)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
@@ -141,10 +173,7 @@ impl RedbMetaEngine {
     where
         F: FnOnce(&CounterWriteTransaction<'_>) -> MetaResult<T>,
     {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let counters = CounterWriteTransaction { txn: &txn };
         let out = f(&counters)?;
         txn.commit()

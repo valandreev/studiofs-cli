@@ -2590,6 +2590,7 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
+        self.wait_for_deferred_namespace_metadata(ino).await?;
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, true)
             .await?;
@@ -2602,6 +2603,7 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
+        self.wait_for_deferred_namespace_metadata(ino).await?;
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, false)
             .await?;

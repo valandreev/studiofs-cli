@@ -2875,6 +2875,17 @@ fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
 }
 
+fn write_admission_soft_pacing_disabled() -> bool {
+    std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes
         .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
@@ -6211,6 +6222,9 @@ impl StudioVfs {
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
             self.state.write_admission_governor.lock().reset_stats();
+            return;
+        }
+        if write_admission_soft_pacing_disabled() {
             return;
         }
 

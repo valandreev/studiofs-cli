@@ -34,6 +34,80 @@ impl DentryCacheKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct DeferredNamespaceKey {
+    pub(super) parent: Ino,
+    pub(super) name: Arc<[u8]>,
+}
+
+impl DeferredNamespaceKey {
+    pub(super) fn new(parent: Ino, name: &[u8]) -> Self {
+        Self {
+            parent,
+            name: Arc::from(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum DeferredNamespaceOp {
+    CreateFile {
+        attr: InodeAttr,
+        parent: Ino,
+        name: Vec<u8>,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    },
+    CreateDir {
+        attr: InodeAttr,
+        parent: Ino,
+        name: Vec<u8>,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    },
+    SetAttr {
+        attr: InodeAttr,
+    },
+}
+
+impl DeferredNamespaceOp {
+    pub(super) fn ino(&self) -> Ino {
+        match self {
+            Self::CreateFile { attr, .. }
+            | Self::CreateDir { attr, .. }
+            | Self::SetAttr { attr } => attr.ino,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DeferredNamespaceInner {
+    pub(super) entries: HashMap<DeferredNamespaceKey, Ino>,
+    pub(super) attrs: HashMap<Ino, InodeAttr>,
+    pub(super) pending_inodes: HashSet<Ino>,
+    pub(super) errors: HashMap<Ino, String>,
+    pub(super) queue: VecDeque<DeferredNamespaceOp>,
+    pub(super) reserved_inos: VecDeque<Ino>,
+}
+
+pub(super) struct DeferredNamespaceState {
+    pub(super) inner: OrderedMutex<DeferredNamespaceInner>,
+    pub(super) notify: tokio::sync::Notify,
+    pub(super) draining: AtomicBool,
+}
+
+impl DeferredNamespaceState {
+    fn new() -> Self {
+        Self {
+            inner: OrderedMutex::new(DeferredNamespaceInner::default(), LockTier::Namespace),
+            notify: tokio::sync::Notify::new(),
+            draining: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Cached result for one `(parent, name)` namespace lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DentryCacheValue {
@@ -894,6 +968,8 @@ pub(super) struct NamespaceState {
     pub(super) namespace_epoch: AtomicU64,
     /// Per-directory generation map used to detect stale parent chains.
     pub(super) directory_generations: OrderedMutex<std::collections::HashMap<Ino, u64>>,
+    /// Linux opt-in namespace metadata admission queue and in-memory visibility overlay.
+    pub(super) deferred: DeferredNamespaceState,
 }
 
 impl NamespaceState {
@@ -925,6 +1001,7 @@ impl NamespaceState {
                 std::collections::HashMap::new(),
                 LockTier::Namespace,
             ),
+            deferred: DeferredNamespaceState::new(),
         }
     }
 }

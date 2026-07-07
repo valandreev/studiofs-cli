@@ -1642,6 +1642,13 @@ impl StudioVfs {
         let mut base_attr;
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
             base_attr = attr;
+        } else if let Some(attr) = self
+            .handle_table
+            .get(fh)
+            .filter(|open_file| open_file.ino == ino)
+            .and_then(|open_file| open_file.open_attr.clone())
+        {
+            base_attr = attr;
         } else {
             base_attr = match self.getattr_async(ino).await {
                 Ok(attr) => attr,

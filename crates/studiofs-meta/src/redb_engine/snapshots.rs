@@ -311,10 +311,7 @@ impl RedbMetaEngine {
         } else {
             (Vec::new(), Vec::new())
         };
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         if !preserve_local_state {
             Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
@@ -670,10 +667,7 @@ impl MetaSnapshots for RedbMetaEngine {
         };
 
         let bytes = encode(&snapshot)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         {
             let mut table = txn
                 .open_table(SNAPSHOTS_TABLE)

@@ -3074,6 +3074,56 @@ fn open_file_with_known_attr_uses_supplied_create_attr() {
 }
 
 #[test]
+fn handle_write_uses_open_attr_before_meta_lookup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "handle-write-open-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"handle-write-open-attr.txt", 0, 0, 0o644)
+            .expect("create test file");
+        let fh = vfs
+            .open_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open file with create attr");
+
+        let mut stale_attr = attr.clone();
+        stale_attr.size = 99;
+        vfs.state.namespace.attr_read_cache.lock().put(
+            attr.ino,
+            stale_attr,
+            ATTR_CACHE_TTL,
+            std::time::Instant::now(),
+        );
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            attr.ino,
+            0,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write through open handle");
+
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&attr.ino)
+            .cloned()
+            .expect("dirty attr after write");
+        assert_eq!(
+            dirty_attr.size, 1,
+            "first handle write should use the fresh open attr, not a stale meta lookup"
+        );
+
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
 fn open_created_file_with_known_attr_does_not_recheck_mutation_authority() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "open-created-known-attr");
@@ -10104,6 +10154,86 @@ fn test_flush_fh_retries_inline_dirty_attr_persist_after_transient_failure() {
         );
 
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_namespace_create_is_visible_before_background_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-create");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-namespace-create.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = attr.ino;
+
+        let visible = vfs
+            .lookup(1, b"deferred-namespace-create.txt")
+            .expect("admitted create should be visible immediately");
+        assert_eq!(visible.ino, ino);
+
+        vfs.wait_for_deferred_namespace_metadata(ino)
+            .await
+            .expect("background create commit should finish");
+
+        let persisted = meta
+            .lookup(1, b"deferred-namespace-create.txt")
+            .expect("load persisted dentry");
+        assert_eq!(persisted.ino, ino);
+    });
+}
+
+#[test]
+fn deferred_namespace_create_under_deferred_dir_is_visible() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-nested-create");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(
+                1,
+                b"deferred-namespace-dir",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .unwrap();
+        let file = vfs
+            .create_with_deferred_metadata_admission(
+                dir.ino,
+                b"child.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+
+        let visible = vfs
+            .lookup(dir.ino, b"child.txt")
+            .expect("admitted nested create should be visible immediately");
+        assert_eq!(visible.ino, file.ino);
+
+        vfs.wait_for_deferred_namespace_metadata(dir.ino)
+            .await
+            .expect("background mkdir commit should finish");
+        vfs.wait_for_deferred_namespace_metadata(file.ino)
+            .await
+            .expect("background child create commit should finish");
+
+        let persisted = meta
+            .lookup(dir.ino, b"child.txt")
+            .expect("load persisted child dentry");
+        assert_eq!(persisted.ino, file.ino);
     });
 }
 

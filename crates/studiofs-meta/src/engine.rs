@@ -426,9 +426,31 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
         mode: u16,
     ) -> MetaResult<InodeAttr>;
 
+    /// Create a new file using a caller-reserved inode.
+    fn create_file_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
+
     /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
     fn create_dir(
         &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
+
+    /// Create a new directory using a caller-reserved inode.
+    fn create_dir_with_ino(
+        &self,
+        ino: Ino,
         parent: Ino,
         name: &[u8],
         uid: u32,
