@@ -1642,7 +1642,16 @@ impl SessionState {
         if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH")
             && self.local_sync_policy_for_handle(fh).is_opportunistic()
         {
-            return Ok(());
+            let ino = self
+                .vfs
+                .get_open_file(fh)
+                .map(|open_file| open_file.ino)
+                .ok_or(libc::EBADF)?;
+            return self
+                .runtime_handle
+                .block_on(self.vfs.flush_fuse_writeback_with_outcome(ino, fh))
+                .map(|_| ())
+                .map_err(|error| vfs_err_to_errno(&error));
         }
         self.runtime_handle
             .block_on(self.vfs.flush_fh(fh))
@@ -1664,7 +1673,9 @@ impl SessionState {
 
     fn release(&self, fh: u64) -> Result<(), i32> {
         self.async_writes.wait_idle();
-        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH") {
+        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH")
+            && self.local_sync_policy_for_handle(fh).is_opportunistic()
+        {
             self.vfs
                 .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
             return Ok(());
