@@ -1639,6 +1639,11 @@ impl SessionState {
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
         self.async_writes.wait_idle();
+        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH")
+            && self.local_sync_policy_for_handle(fh).is_opportunistic()
+        {
+            return Ok(());
+        }
         self.runtime_handle
             .block_on(self.vfs.flush_fh(fh))
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1659,6 +1664,11 @@ impl SessionState {
 
     fn release(&self, fh: u64) -> Result<(), i32> {
         self.async_writes.wait_idle();
+        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH") {
+            self.vfs
+                .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+            return Ok(());
+        }
         self.runtime_handle
             .block_on(self.vfs.release_fh(fh))
             .map_err(|error| vfs_err_to_errno(&error))
