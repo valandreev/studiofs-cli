@@ -268,6 +268,36 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.payload_store_sync_data.calls_per_gib
     ));
     out.push_str(&format!(
+        "linux_fuse_write: calls={} avg_ms={:.2} max_ms={:.2} errors={}\n",
+        snapshot.fuse_callbacks.write.calls,
+        snapshot.fuse_callbacks.write.avg_ms,
+        snapshot.fuse_callbacks.write.max_ms,
+        snapshot.fuse_callbacks.write.errors
+    ));
+    out.push_str(&format!(
+        "vfs_write_foreground_ms: pre_drain_avg={:.2} throttle_avg={:.2} file_session_avg={:.2} record_stack_avg={:.2} getattr_avg={:.2} spawn_deferred_avg={:.2}\n",
+        snapshot.vfs_write_path.pre_drain.avg_ms,
+        snapshot.vfs_write_path.admission_throttle.avg_ms,
+        snapshot.vfs_write_path.file_session_wait.avg_ms,
+        snapshot.vfs_write_path.record_writer_stack_state.avg_ms,
+        snapshot.vfs_write_path.getattr_async.avg_ms,
+        snapshot.vfs_write_path.spawn_deferred_materialization.avg_ms
+    ));
+    out.push_str(&format!(
+        "vfs_write_ops_ms: create_avg={:.2} mkdir_avg={:.2} open_avg={:.2} setattr_avg={:.2}\n",
+        snapshot.vfs_write_path.create.avg_ms,
+        snapshot.vfs_write_path.mkdir.avg_ms,
+        snapshot.vfs_write_path.open_file.avg_ms,
+        snapshot.vfs_write_path.setattr.avg_ms
+    ));
+    out.push_str(&format!(
+        "vfs_write_attr_source: dirty={} open_attr={} getattr_async={} active_open_overlay={}\n",
+        snapshot.vfs_write_path.dirty_attr_hits,
+        snapshot.vfs_write_path.open_attr_hits,
+        snapshot.vfs_write_path.getattr_async.calls,
+        snapshot.vfs_write_path.active_open_overlay_fallbacks
+    ));
+    out.push_str(&format!(
         "winfsp_callbacks: write={} overwrite={} cleanup={} cleanup_flush_fh={} flush={} close={}\n",
         snapshot.winfsp_callbacks.write,
         snapshot.winfsp_callbacks.overwrite,

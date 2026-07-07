@@ -860,9 +860,42 @@ pub struct VfsWritePathVfsWriteStats {
     pub write_bytes: u64,
     /// Average write size in bytes.
     pub avg_write_bytes: f64,
+    /// Foreground create operation latency.
+    #[serde(default)]
+    pub create: VfsWritePathStageLatencyStats,
+    /// Foreground mkdir operation latency.
+    #[serde(default)]
+    pub mkdir: VfsWritePathStageLatencyStats,
+    /// Foreground open operation latency.
+    #[serde(default)]
+    pub open_file: VfsWritePathStageLatencyStats,
+    /// Foreground setattr operation latency.
+    #[serde(default)]
+    pub setattr: VfsWritePathStageLatencyStats,
+    /// Pre-drain/admission pressure stage metrics.
+    #[serde(default)]
+    pub pre_drain: VfsWritePathStageLatencyStats,
+    /// Soft admission throttle stage metrics.
+    #[serde(default)]
+    pub admission_throttle: VfsWritePathStageLatencyStats,
+    /// Per-inode file-session gate wait metrics.
+    #[serde(default)]
+    pub file_session_wait: VfsWritePathStageLatencyStats,
     /// Writer stack state recording stage metrics.
     #[serde(default)]
     pub record_writer_stack_state: VfsWritePathStageLatencyStats,
+    /// Attribute lookup fallback metrics inside writer-stack admission.
+    #[serde(default)]
+    pub getattr_async: VfsWritePathStageLatencyStats,
+    /// Dirty-attr fast-path hits.
+    #[serde(default)]
+    pub dirty_attr_hits: u64,
+    /// Open-handle attr fast-path hits.
+    #[serde(default)]
+    pub open_attr_hits: u64,
+    /// Active-open overlay fallback hits after attr lookup miss.
+    #[serde(default)]
+    pub active_open_overlay_fallbacks: u64,
     /// Materialization completion stage metrics.
     #[serde(default)]
     pub materialize_completed: VfsWritePathStageLatencyStats,
@@ -872,6 +905,9 @@ pub struct VfsWritePathVfsWriteStats {
     /// Materialization-for-limits stage metrics.
     #[serde(default)]
     pub materialize_for_limits: VfsWritePathStageLatencyStats,
+    /// Deferred materialization task scheduling stage metrics.
+    #[serde(default)]
+    pub spawn_deferred_materialization: VfsWritePathStageLatencyStats,
 }
 
 /// FUSE callback latency and byte counters.

@@ -10192,6 +10192,325 @@ fn deferred_namespace_create_is_visible_before_background_commit() {
 }
 
 #[test]
+fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-keeps-written-dirty-attr");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let committed_create_attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-keeps-written-dirty-attr.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = committed_create_attr.ino;
+
+        let mut written_attr = committed_create_attr.clone();
+        written_attr.size = 37;
+        written_attr.touch_mtime();
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, written_attr);
+
+        vfs.clear_matching_dirty_attr_if_committed(ino, &committed_create_attr);
+
+        let retained = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("written dirty attr must survive zero-size create commit");
+        assert_eq!(retained.size, 37);
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &committed_create_attr);
+
+        let retained = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("written dirty attr must survive zero-size authoritative refresh");
+        assert_eq!(retained.size, 37);
+    });
+}
+
+#[test]
+fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-first-write-uploading");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-first-write-uploading.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open deferred-created file");
+
+        vfs.write_fh(fh, ino, 0, b"payload after deferred create")
+            .await
+            .expect("write deferred-created file");
+
+        let dirty = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("first write should leave a dirty attr");
+        assert_eq!(dirty.upload_state, MetaUploadState::Uploading);
+        assert!(dirty.content_epoch > attr.content_epoch);
+        assert!(dirty.size > 0);
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn deferred_namespace_written_file_reads_back_after_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-written-readback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let payload = b"payload after deferred create";
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-written-readback.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open deferred-created file");
+
+        vfs.write_fh(fh, ino, 0, payload)
+            .await
+            .expect("write deferred-created file");
+        vfs.flush_fh(fh).await.expect("flush deferred-created file");
+        vfs.wait_for_deferred_namespace_metadata(ino)
+            .await
+            .expect("background create commit should finish");
+
+        let read = vfs
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("read deferred-created file");
+        assert_eq!(read.as_ref(), payload);
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn deferred_namespace_written_file_commits_locally_without_explicit_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-written-background-local");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let payload = b"background local payload after deferred create";
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-written-background-local.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open deferred-created file");
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("write deferred-created file");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persisted_size = meta.get_attr(ino).map(|attr| attr.size).unwrap_or(0);
+                if persisted_size == payload.len() as u64
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background materialization should commit local metadata before close");
+
+        let read = vfs
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("read background-committed deferred-created file");
+        assert_eq!(read.as_ref(), payload);
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn deferred_attr_only_commit_does_not_revert_written_size() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-attr-only-keeps-written-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let payload = b"linux write then utimens";
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-attr-only-keeps-written-size.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open deferred-created file");
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("write deferred-created file");
+        vfs.setattr_attr_only_deferred_metadata(
+            ino,
+            SetattrArgs {
+                mtime: TimeSpec::Set(attr.mtime.saturating_add(1)),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer attr-only setattr");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persisted_size = meta.get_attr(ino).map(|attr| attr.size).unwrap_or(0);
+                if persisted_size == payload.len() as u64 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("attr-only commit must not revert background-written size");
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn deferred_namespace_wait_keeps_blocking_until_all_inode_ops_complete() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-wait-refcount");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"deferred-namespace-wait-refcount.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.pending_inodes.insert(ino, 2);
+        }
+
+        let waiter_vfs = vfs.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_vfs.wait_for_deferred_namespace_metadata(ino).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait should block while multiple deferred ops remain for the inode"
+        );
+
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.pending_inodes.insert(ino, 1);
+        }
+        vfs.state.namespace.deferred.notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait must not unblock after only one deferred op completes"
+        );
+
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .pending_inodes
+            .remove(&ino);
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        waiter
+            .await
+            .expect("wait task should join")
+            .expect("wait should finish after all deferred ops complete");
+    });
+}
+
+#[test]
+fn deferred_namespace_dir_commit_clears_admitted_dirty_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-dir-clears-dirty-attr");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(
+                1,
+                b"deferred-dir-clears-dirty-attr",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .unwrap();
+
+        vfs.wait_for_deferred_namespace_metadata(dir.ino)
+            .await
+            .expect("background mkdir commit should finish");
+
+        assert!(
+            !vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&dir.ino),
+            "committed deferred mkdir should not leave directory attrs dirty until shutdown"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_create_under_deferred_dir_is_visible() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-nested-create");
@@ -12520,6 +12839,52 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 }
 
 #[test]
+fn deferred_release_drains_many_tiny_closed_files_promptly() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-release-many-tiny");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let payload = b"tiny close payload";
+        let mut inos = Vec::new();
+        for index in 0..32 {
+            let name = format!("tiny-{index}.txt");
+            let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0,
+                payload,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+            let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+            assert!(outcome.closed_last_handle);
+            inos.push(ino);
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let all_drained = inos.iter().all(|ino| {
+                    !vfs.state.writer_stack.has_dirty_writers(*ino)
+                        && meta
+                            .get_attr(*ino)
+                            .is_ok_and(|attr| attr.size == payload.len() as u64)
+                });
+                if all_drained {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred close should drain many tiny files promptly");
+    });
+}
+
+#[test]
 fn deferred_release_barrier_replaces_older_inflight_marker() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");
@@ -13380,17 +13745,44 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-vfs-breakdown");
 
     vfs.note_vfs_write_call(4 * 1024 * 1024);
+    vfs.record_vfs_write_create(Duration::from_millis(8));
+    vfs.record_vfs_write_mkdir(Duration::from_millis(9));
+    vfs.record_vfs_write_open_file(Duration::from_millis(10));
+    vfs.record_vfs_write_setattr(Duration::from_millis(11));
+    vfs.record_vfs_write_pre_drain(Duration::from_millis(1));
+    vfs.record_vfs_write_admission_throttle(Duration::from_millis(2));
+    vfs.record_vfs_write_file_session_wait(Duration::from_millis(4));
     vfs.record_vfs_write_record_writer_stack_state(Duration::from_millis(3));
+    vfs.record_vfs_write_getattr_async(Duration::from_millis(5));
+    vfs.note_vfs_write_dirty_attr_hit();
+    vfs.note_vfs_write_open_attr_hit();
+    vfs.note_vfs_write_active_open_overlay_fallback();
     vfs.record_vfs_write_materialize_completed(Duration::from_millis(7));
     vfs.record_vfs_write_materialize_for_limits(Duration::from_millis(2));
+    vfs.record_vfs_write_spawn_deferred_materialization(Duration::from_millis(6));
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert_eq!(snapshot.vfs_write_path.calls, 1);
     assert_eq!(snapshot.vfs_write_path.write_bytes, 4 * 1024 * 1024);
+    assert_eq!(snapshot.vfs_write_path.create.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.mkdir.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.open_file.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.setattr.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.pre_drain.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.admission_throttle.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.file_session_wait.calls, 1);
     assert_eq!(snapshot.vfs_write_path.record_writer_stack_state.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.getattr_async.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.dirty_attr_hits, 1);
+    assert_eq!(snapshot.vfs_write_path.open_attr_hits, 1);
+    assert_eq!(snapshot.vfs_write_path.active_open_overlay_fallbacks, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_completed.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_strict.calls, 0);
     assert_eq!(snapshot.vfs_write_path.materialize_for_limits.calls, 1);
+    assert_eq!(
+        snapshot.vfs_write_path.spawn_deferred_materialization.calls,
+        1
+    );
     assert!(snapshot.vfs_write_path.avg_write_bytes >= 4.0 * 1024.0 * 1024.0);
 }
 

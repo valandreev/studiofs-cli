@@ -393,7 +393,7 @@ fn linux_fuse_env_flag(name: &str) -> bool {
 }
 
 fn linux_fuse_metadata_admission_enabled() -> bool {
-    linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_METADATA_ADMISSION")
+    true
 }
 
 fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
@@ -1677,9 +1677,7 @@ impl SessionState {
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
         self.async_writes.wait_idle();
-        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH")
-            && self.local_sync_policy_for_handle(fh).is_opportunistic()
-        {
+        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
             let ino = self
                 .vfs
                 .get_open_file(fh)
@@ -1711,9 +1709,7 @@ impl SessionState {
 
     fn release(&self, fh: u64) -> Result<(), i32> {
         self.async_writes.wait_idle();
-        if linux_fuse_env_flag("STUDIOFS_LINUX_FUSE_DEFER_FLUSH")
-            && self.local_sync_policy_for_handle(fh).is_opportunistic()
-        {
+        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
             self.vfs
                 .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
             return Ok(());
@@ -2880,6 +2876,52 @@ mod tests {
         assert_eq!(args.uid, Some(1000));
         assert_eq!(args.gid, Some(1001));
         assert_eq!(args.mtime.resolve(), Some(7_000_000_009));
+    }
+
+    #[test]
+    fn setattr_args_attr_only_classifier_accepts_metadata_updates_without_size() {
+        for args in [
+            studiofs_meta::SetattrArgs {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                uid: Some(1000),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                gid: Some(1001),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                mtime: studiofs_meta::TimeSpec::Now,
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                win_attrs: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(super::linux_fuse_setattr_args_are_attr_only(&args));
+        }
+    }
+
+    #[test]
+    fn setattr_args_attr_only_classifier_rejects_empty_and_size_updates() {
+        for args in [
+            studiofs_meta::SetattrArgs::default(),
+            studiofs_meta::SetattrArgs {
+                size: Some(42),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                size: Some(42),
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        ] {
+            assert!(!super::linux_fuse_setattr_args_are_attr_only(&args));
+        }
     }
 
     #[test]

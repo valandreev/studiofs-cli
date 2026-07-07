@@ -69,6 +69,7 @@ pub(super) enum DeferredNamespaceOp {
     },
     SetAttr {
         attr: InodeAttr,
+        args: SetattrArgs,
     },
 }
 
@@ -77,7 +78,7 @@ impl DeferredNamespaceOp {
         match self {
             Self::CreateFile { attr, .. }
             | Self::CreateDir { attr, .. }
-            | Self::SetAttr { attr } => attr.ino,
+            | Self::SetAttr { attr, .. } => attr.ino,
         }
     }
 }
@@ -86,7 +87,7 @@ impl DeferredNamespaceOp {
 pub(super) struct DeferredNamespaceInner {
     pub(super) entries: HashMap<DeferredNamespaceKey, Ino>,
     pub(super) attrs: HashMap<Ino, InodeAttr>,
-    pub(super) pending_inodes: HashSet<Ino>,
+    pub(super) pending_inodes: HashMap<Ino, usize>,
     pub(super) errors: HashMap<Ino, String>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
     pub(super) reserved_inos: VecDeque<Ino>,
