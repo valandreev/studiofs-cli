@@ -1572,6 +1572,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Fetch metrics.
     #[serde(default)]
     pub fetch: VfsFetchStats,
+    /// Foreground-read protection and upload reread pressure metrics.
+    #[serde(default)]
+    pub foreground_reads: VfsForegroundReadProtectionStats,
     /// Local cache pipeline metrics.
     #[serde(default)]
     pub cache_pipeline: VfsCachePipelineStats,

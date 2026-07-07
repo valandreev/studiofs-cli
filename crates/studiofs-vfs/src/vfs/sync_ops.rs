@@ -217,8 +217,18 @@ impl StudioVfs {
         }
         let admission = self.observe_sustained_write_admission(ino, offset, len);
         if !admission.pre_drain {
-            return Ok(admission.delay_ms);
+            return Ok(0);
         }
+        let pressure_after_write = self.total_pending_write_buffer_bytes().saturating_add(len);
+        let pacing_threshold = self
+            .max_dirty_bytes()
+            .saturating_div(2)
+            .max(self.write_eager_flush_drain_chunk_bytes);
+        let delay_ms = if pressure_after_write > pacing_threshold {
+            admission.delay_ms
+        } else {
+            0
+        };
 
         // #region debug log
         self.debug_write_probe(
@@ -230,7 +240,10 @@ impl StudioVfs {
                 "offset": offset,
                 "len": len,
                 "duration_ms": admission.duration_ms,
-                "delay_ms": admission.delay_ms,
+                "delay_ms": delay_ms,
+                "raw_delay_ms": admission.delay_ms,
+                "pacing_threshold_bytes": pacing_threshold,
+                "pressure_after_write": pressure_after_write,
                 "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
             }),
@@ -238,7 +251,7 @@ impl StudioVfs {
         // #endregion debug log
 
         self.spawn_deferred_materialization_if_needed(ino).await;
-        Ok(admission.delay_ms)
+        Ok(delay_ms)
     }
 
     fn record_deferred_write_hard_backpressure(&self, ino: Ino, hard_threshold_bytes: usize) {

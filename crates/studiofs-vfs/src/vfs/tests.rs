@@ -6409,6 +6409,80 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
 }
 
 #[test]
+fn sustained_pre_drain_schedules_without_pacing_when_dirty_runway_is_long() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sustained-pre-drain-long-runway");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sustained-pre-drain-long-runway.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.set_max_dirty_bytes(512 * 1024 * 1024);
+
+        let seeded_len = 33 * 1024 * 1024;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; seeded_len]),
+            )
+            .unwrap();
+        let now = now_unix_millis();
+        vfs.state.sustained_write_streams.lock().insert(
+            ino,
+            SustainedWriteState {
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DELAY_START_MS),
+                last_write_ms: now.saturating_sub(1),
+                last_end_offset: seeded_len as u64,
+            },
+        );
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should reserve deferred materialization gate");
+
+        let delay_ms = vfs
+            .maybe_pre_drain_sustained_write_buffer(
+                ino,
+                seeded_len as u64,
+                1,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delay_ms, 0,
+            "sustained pre-drain should schedule materialization without sleeping while dirty runway is long"
+        );
+
+        assert!(
+            vfs.state
+                .deferred_materialize_reschedule_needed
+                .lock()
+                .contains(&ino),
+            "sustained pre-drain should still request background materialization"
+        );
+        let _ = vfs
+            .state
+            .deferred_materialize_inflight
+            .replace_if_current_or_remove(&entry, || false);
+        drop(guard);
+        vfs.state.writer_stack.clear_inode(ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn sustained_write_delay_ramps_to_stable_plateau_for_long_streams() {
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
@@ -12601,6 +12675,63 @@ fn write_path_observability_reports_active_tuning_knobs() {
     assert_eq!(
         snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
         "observability should report the active sync-data group minimum"
+    );
+}
+
+#[test]
+fn write_path_observability_reports_upload_reread_pressure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-upload-reread");
+
+    vfs.state
+        .upload
+        .upload_hot_payload_reads
+        .store(3, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_hot_payload_read_bytes
+        .store(12 * 1024 * 1024, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_staged_payload_reads
+        .store(5, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_staged_payload_read_bytes
+        .store(20 * 1024 * 1024, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_fallback_rereads
+        .store(2, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_fallback_reread_bytes
+        .store(8 * 1024 * 1024, Ordering::Relaxed);
+    vfs.state
+        .upload
+        .upload_cache_io_foreground_cost
+        .store(7, Ordering::Relaxed);
+    vfs.state
+        .read
+        .foreground_local_payload_reads
+        .store(11, Ordering::Relaxed);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.foreground_reads.upload_hot_payload_reads, 3);
+    assert_eq!(
+        snapshot.foreground_reads.upload_staged_payload_read_bytes,
+        20 * 1024 * 1024
+    );
+    assert_eq!(snapshot.foreground_reads.upload_fallback_rereads, 2);
+    assert_eq!(snapshot.foreground_reads.upload_cache_io_foreground_cost, 7);
+    assert_eq!(snapshot.foreground_reads.foreground_local_payload_reads, 11);
+
+    let json = serde_json::to_value(&snapshot).expect("serialize write-path snapshot");
+    assert_eq!(json["foreground_reads"]["upload_hot_payload_reads"], 3);
+    assert_eq!(
+        json["foreground_reads"]["upload_fallback_reread_bytes"],
+        8 * 1024 * 1024
     );
 }
 

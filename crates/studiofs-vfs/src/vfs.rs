@@ -7449,6 +7449,7 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let foreground_reads = self.foreground_read_protection_stats();
         let cache_pipeline_metrics = self.cached_store.cache_pipeline_metrics();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
@@ -8103,6 +8104,7 @@ impl StudioVfs {
                 },
                 fetch_total_max_ms: fetch_total_max_ns as f64 / 1_000_000.0,
             },
+            foreground_reads,
             cache_pipeline: VfsCachePipelineStats {
                 materialize: VfsCachePipelineMaterializeStats {
                     batches: cache_pipeline_metrics.materialize_batches.batches,
