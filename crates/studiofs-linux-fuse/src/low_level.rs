@@ -1468,6 +1468,7 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        require_file_info(fi)?;
         let file_type = mode & libc::S_IFMT as mode_t;
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
@@ -2878,6 +2879,25 @@ mod tests {
             state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
             Err(libc::EROFS)
         );
+    }
+
+    #[test]
+    fn create_rejects_null_file_info_before_touching_vfs() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-create-null-fi")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+
+        assert!(matches!(
+            state.create(1, b"null-fi.txt", libc::S_IFREG | 0o644, std::ptr::null()),
+            Err(errno) if errno == libc::EINVAL
+        ));
+        assert!(fixture.vfs().lookup(1, b"null-fi.txt").is_err());
     }
 
     #[test]

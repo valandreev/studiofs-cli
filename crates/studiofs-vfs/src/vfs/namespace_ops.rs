@@ -1394,16 +1394,16 @@ impl StudioVfs {
             });
         }
 
+        let existing_names = entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<HashSet<_>>();
         let mut confirmed_entry_inos = HashSet::new();
         let mut attrs_by_ino = HashMap::new();
         {
             let inner = self.state.namespace.deferred.inner.lock();
             for (key, child_ino) in &inner.entries {
-                if key.parent != ino
-                    || entries
-                        .iter()
-                        .any(|entry| entry.name.as_slice() == key.name.as_ref())
-                {
+                if key.parent != ino || existing_names.contains(key.name.as_ref()) {
                     continue;
                 }
                 if let Some(attr) = inner.attrs.get(child_ino) {
