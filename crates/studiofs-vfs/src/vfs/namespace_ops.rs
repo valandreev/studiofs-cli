@@ -6,7 +6,7 @@ use super::{
     PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange,
     SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsForegroundWriteOp, VfsForegroundWriteTimer,
     VfsMeta, VfsResult, VfsUploadState, block_index_from_offset, chunk_id_from_offset,
-    chunk_start_offset, debug, info, offset_within_block, validate_name, warn,
+    chunk_start_offset, debug, error, info, offset_within_block, validate_name, warn,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -375,7 +375,7 @@ impl StudioVfs {
                         .or_insert(1);
                     if *attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
                         self.abandon_failed_deferred_namespace_op(&op, &error);
-                        warn!(
+                        error!(
                             ino,
                             attempts = *attempts,
                             error = %error,

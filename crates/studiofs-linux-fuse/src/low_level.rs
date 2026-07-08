@@ -225,6 +225,7 @@ fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 struct LinuxFuseAsyncWrites {
     limits: LinuxFuseAsyncWriteLimits,
     state: Mutex<LinuxFuseAsyncWriteState>,
+    // Block libfuse worker threads here so write backpressure reaches the kernel.
     idle: Condvar,
 }
 
