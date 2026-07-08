@@ -11,9 +11,10 @@ use redb::{
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::{
-    Arc, Once, OnceLock, RwLock,
+    Arc, Once, OnceLock, RwLock, RwLockReadGuard,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
@@ -38,6 +39,11 @@ pub struct RedbMetaEngine {
 
 pub(crate) struct CounterWriteTransaction<'a> {
     txn: &'a WriteTransaction,
+}
+
+pub(crate) struct RedbWriteTransaction<'a> {
+    txn: WriteTransaction,
+    _db: RwLockReadGuard<'a, Database>,
 }
 
 fn redb_relaxed_durability_enabled() -> bool {
@@ -105,6 +111,11 @@ fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
     Ok(txn)
 }
 
+fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
+    db.begin_read()
+        .map_err(|e| MetaError::Storage(e.to_string()))
+}
+
 impl CounterWriteTransaction<'_> {
     pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
         let mut table = self
@@ -118,21 +129,37 @@ impl CounterWriteTransaction<'_> {
     }
 }
 
-impl RedbMetaEngine {
-    pub(crate) fn begin_read_txn(&self) -> MetaResult<ReadTransaction> {
-        self.db
-            .read()
-            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))
+impl Deref for RedbWriteTransaction<'_> {
+    type Target = WriteTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+impl RedbWriteTransaction<'_> {
+    pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
+        let Self { txn, _db } = self;
+        txn.commit()
     }
 
-    pub(crate) fn begin_write_txn(&self) -> MetaResult<WriteTransaction> {
-        let db = self
-            .db
+    pub(crate) fn abort(self) -> Result<(), redb::StorageError> {
+        let Self { txn, _db } = self;
+        txn.abort()
+    }
+}
+
+impl RedbMetaEngine {
+    pub(crate) fn read_db(&self) -> MetaResult<RwLockReadGuard<'_, Database>> {
+        self.db
             .read()
-            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
-        begin_redb_write_txn(&db)
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))
+    }
+
+    pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
+        let db = self.read_db()?;
+        let txn = begin_redb_write_txn(&db)?;
+        Ok(RedbWriteTransaction { txn, _db: db })
     }
 
     /// Open or create a metadata database at the given path.

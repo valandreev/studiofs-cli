@@ -4100,13 +4100,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redb_test"
-version = "0.1.1"
-dependencies = [
- "redb",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

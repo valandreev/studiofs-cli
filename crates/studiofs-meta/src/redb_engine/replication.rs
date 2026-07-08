@@ -141,7 +141,8 @@ impl RedbMetaEngine {
 
     /// Return symlink inode ids whose local state differs from the imported base view.
     pub fn local_overlay_symlink_inodes(&self) -> MetaResult<HashSet<Ino>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let current = txn
             .open_table(SYMLINKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -181,7 +182,8 @@ impl RedbMetaEngine {
 
     /// Return encoded xattr keys whose local state differs from the imported base view.
     pub fn local_overlay_xattr_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let current = txn
             .open_table(XATTRS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -230,7 +232,8 @@ impl RedbMetaEngine {
 
     /// Return encoded ACL keys whose local state differs from the imported base view.
     pub fn local_overlay_acl_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let current = txn
             .open_table(ACL_RULES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -275,7 +278,8 @@ impl RedbMetaEngine {
             return Ok(true);
         }
 
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let has_base_metadata = txn
             .open_table(BASE_INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -339,7 +343,8 @@ impl RedbMetaEngine {
         if end_seq <= start_seq {
             return Ok(Vec::new());
         }
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

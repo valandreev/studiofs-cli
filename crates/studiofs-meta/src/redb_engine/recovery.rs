@@ -45,7 +45,8 @@ impl RedbMetaEngine {
     }
 
     fn list_pending_create_intents(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(PENDING_CREATES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -208,7 +209,8 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(DEFERRED_DELETES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -323,7 +325,8 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(UNDO_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

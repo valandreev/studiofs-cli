@@ -54,7 +54,8 @@ fn test_resource_fork_xattr_compresses_when_beneficial() {
         .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
         .unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let table = txn.open_table(XATTRS_TABLE).unwrap();
     let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
     let stored = table
@@ -88,7 +89,8 @@ fn test_resource_fork_xattr_size_reports_decoded_length() {
         .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
         .unwrap();
     let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let table = txn.open_table(XATTRS_TABLE).unwrap();
     let stored_len = table
         .get(key.as_slice())
@@ -122,7 +124,8 @@ fn test_resource_fork_xattr_keeps_plain_when_not_compressible() {
         .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
         .unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let table = txn.open_table(XATTRS_TABLE).unwrap();
     let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
     let stored = table

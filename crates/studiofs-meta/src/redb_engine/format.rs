@@ -84,7 +84,8 @@ impl MetaFormat for RedbMetaEngine {
     }
 
     fn get_format_info(&self) -> MetaResult<FormatInfo> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

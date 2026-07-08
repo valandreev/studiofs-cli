@@ -70,7 +70,8 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let table = txn
             .open_table(PENDING_DELETIONS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -86,7 +87,8 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        let txn = self.begin_read_txn()?;
+        let db = self.read_db()?;
+        let txn = begin_redb_read_txn(&db)?;
         let snapshots = txn
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

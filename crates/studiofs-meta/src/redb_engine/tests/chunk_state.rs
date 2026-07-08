@@ -178,7 +178,8 @@ fn test_clear_regular_file_graph_clears_pending_compaction_rows() {
     RedbMetaEngine::clear_regular_file_graph_in_txn(&txn, ino).unwrap();
     txn.commit().unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let pending = txn
         .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
         .unwrap();
@@ -219,7 +220,8 @@ fn test_block_replace_clears_pending_compaction_rows() {
     .unwrap();
     txn.commit().unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let pending = txn
         .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
         .unwrap();
@@ -401,7 +403,8 @@ fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
         .flush_regular_file_overlay_slices(ino, &[(chunk_id, incoming)])
         .unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     let row = overlay_table
         .get(chunk_key.as_slice())
@@ -490,7 +493,8 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
         .flush_regular_file_overlay_slices(ino, &[(chunk_id, incoming)])
         .unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let counters = txn.open_table(COUNTERS_TABLE).unwrap();
     let next_event_seq = counters
         .get("nextEventSeq")
@@ -593,7 +597,8 @@ fn test_regular_file_overlay_slice_events_replace_rows_and_delete_empty_payload(
         .unwrap();
 
     {
-        let txn = engine.begin_read_txn().unwrap();
+        let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
         let base_row = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .unwrap()
@@ -659,7 +664,8 @@ fn test_regular_file_overlay_slice_events_replace_rows_and_delete_empty_payload(
         .apply_replica_serving_state(std::slice::from_ref(&delete_event))
         .unwrap();
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     assert!(
         txn.open_table(REGULAR_FILE_BASE_TABLE)
             .unwrap()
@@ -725,7 +731,8 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
     assert_eq!(persisted_attr.content_epoch, committed_attr.content_epoch);
     assert_eq!(persisted_attr.upload_state, committed_attr.upload_state);
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     assert!(
         RedbMetaEngine::has_regular_file_chunk_rows_in_read_txn(
             &txn,
@@ -1188,7 +1195,8 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         assert_eq!(actual.payload, expected.payload);
     }
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     let key = encode_regular_file_chunk_key(ino, ChunkId(0));
     let row = overlay_table
@@ -1439,7 +1447,8 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
             .unwrap()
     );
 
-    let txn = engine.begin_read_txn().unwrap();
+    let db = engine.read_db().unwrap();
+    let txn = begin_redb_read_txn(&db).unwrap();
     let base = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
     let chunk_key = encode_regular_file_chunk_key(file.ino, ChunkId(2));
     let row = base
