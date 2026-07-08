@@ -309,6 +309,13 @@ impl StudioVfs {
         }
     }
 
+    async fn wait_for_deferred_namespace_entry(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if let Some(attr) = self.deferred_namespace_lookup(parent, name) {
+            self.wait_for_deferred_namespace_metadata(attr.ino).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn has_deferred_namespace_metadata(&self, ino: Ino) -> bool {
         self.state
             .namespace
@@ -1948,6 +1955,7 @@ impl StudioVfs {
         }
 
         let meta = self.sync_meta();
+        self.wait_for_deferred_namespace_entry(parent, name).await?;
         let initial_target = self.resolve_unlink_target(&meta, parent, name)?;
         let delete_session = self
             .state
@@ -1987,6 +1995,10 @@ impl StudioVfs {
 
     /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        Self::run_sync_future(self.rmdir_inner(parent, name))
+    }
+
+    async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
@@ -1994,6 +2006,7 @@ impl StudioVfs {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(());
         }
+        self.wait_for_deferred_namespace_entry(parent, name).await?;
         let removed = self
             .sync_meta()
             .lookup(parent, name)
@@ -2046,7 +2059,7 @@ impl StudioVfs {
             }
 
             if visited {
-                self.rmdir(current_parent, &current_name)?;
+                self.rmdir_inner(current_parent, &current_name).await?;
                 continue;
             }
 
@@ -2199,6 +2212,9 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename looking up source"
         );
+        self.wait_for_deferred_namespace_entry(parent, name).await?;
+        self.wait_for_deferred_namespace_entry(new_parent, new_name)
+            .await?;
         let source_entry = meta.lookup(parent, name)?;
         debug!(
             parent,

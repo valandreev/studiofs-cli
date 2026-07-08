@@ -10683,6 +10683,64 @@ fn deferred_namespace_create_under_deferred_dir_is_visible() {
 }
 
 #[test]
+fn deferred_namespace_durable_mutations_wait_for_admitted_entries() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-mutation-wait");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let unlinked = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"unlink-before-commit.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect("admit file for unlink");
+        assert!(vfs.has_deferred_namespace_metadata(unlinked.ino));
+        vfs.unlink(1, b"unlink-before-commit.txt")
+            .expect("unlink should wait for deferred create commit");
+        assert!(vfs.lookup(1, b"unlink-before-commit.txt").is_err());
+
+        let renamed = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"rename-before-commit.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect("admit file for rename");
+        assert!(vfs.has_deferred_namespace_metadata(renamed.ino));
+        vfs.rename(1, b"rename-before-commit.txt", 1, b"renamed-after-wait.txt")
+            .expect("rename should wait for deferred create commit");
+        assert_eq!(
+            vfs.lookup(1, b"renamed-after-wait.txt")
+                .expect("renamed file should be visible")
+                .ino,
+            renamed.ino
+        );
+
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(
+                1,
+                b"rmdir-before-commit",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .expect("admit dir for rmdir");
+        assert!(vfs.has_deferred_namespace_metadata(dir.ino));
+        vfs.rmdir(1, b"rmdir-before-commit")
+            .expect("rmdir should wait for deferred mkdir commit");
+        assert!(vfs.lookup(1, b"rmdir-before-commit").is_err());
+    });
+}
+
+#[test]
 fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "datasync-outcome-persisted-metadata");
