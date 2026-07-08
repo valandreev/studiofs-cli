@@ -552,12 +552,12 @@ pub(in crate::scenario) fn seed_open_handle_initial_tree(
     let unlink_payload = isolation.payload(
         "initial_unlink_target",
         &unlink_target,
-        &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+        String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD).as_ref(),
     );
     let rename_payload = isolation.payload(
         "initial_rename_source",
         &rename_source,
-        &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+        String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD).as_ref(),
     );
     let active_workers = Arc::new(AtomicUsize::new(0));
     run_hotspot_mount_operation_with_timeout(
@@ -628,7 +628,7 @@ pub(in crate::scenario) fn open_handle_initial_payloads(
             isolation.payload(
                 "initial_unlink_target",
                 &unlink_target,
-                &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+                String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD).as_ref(),
             ),
         ),
         (
@@ -636,7 +636,7 @@ pub(in crate::scenario) fn open_handle_initial_payloads(
             isolation.payload(
                 "initial_rename_source",
                 &rename_source,
-                &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+                String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD).as_ref(),
             ),
         ),
     ]

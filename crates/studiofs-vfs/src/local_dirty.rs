@@ -500,11 +500,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
             Err(error) => return Err(VfsError::Meta(error)),
         }
 
-        let chunk_slices = self.drain.build_overlay_slice_records(
-            self.ino,
-            &Vec::new(),
-            pending_slices.clone(),
-        )?;
+        let chunk_slices =
+            self.drain
+                .build_overlay_slice_records(self.ino, &[], pending_slices.clone())?;
         let attr_to_persist =
             self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
         let attr_to_clear = attr_to_persist.clone();

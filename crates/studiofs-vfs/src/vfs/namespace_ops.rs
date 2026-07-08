@@ -948,13 +948,15 @@ impl StudioVfs {
                 )
             })
             .collect();
-        let mut retained_pending = self
-            .pending_uploads_snapshot()
-            .into_iter()
-            .filter(|op| op.ino == ino)
-            .filter(|op| retained.contains_key(&op.object_id))
-            .map(|op| (op.object_id, op))
-            .collect::<std::collections::HashMap<_, _>>();
+        let mut retained_pending = std::collections::HashMap::new();
+        let mut cancel_pending = Vec::new();
+        for op in self.pending_uploads_snapshot_for_inode(ino) {
+            if retained.contains_key(&op.object_id) {
+                retained_pending.insert(op.object_id, op);
+            } else {
+                cancel_pending.push(op);
+            }
+        }
         if !retained_pending.is_empty() {
             self.cancel_upload_token_for_inode(ino);
         }
@@ -980,11 +982,7 @@ impl StudioVfs {
                 payload_len,
             ));
         }
-        for op in self
-            .pending_uploads_snapshot()
-            .into_iter()
-            .filter(|op| op.ino == ino && !retained.contains_key(&op.object_id))
-        {
+        for op in cancel_pending {
             self.cached_store.cancel_upload(&op);
         }
         let live_extents: Vec<_> = retained

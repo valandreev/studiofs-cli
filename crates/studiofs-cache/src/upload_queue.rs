@@ -387,8 +387,7 @@ impl UploadQueue {
         {
             return None;
         }
-        let previous = current.clone();
-        *current = replacement.clone();
+        let previous = std::mem::replace(current, replacement.clone());
         Some(previous)
     }
 
