@@ -1758,6 +1758,25 @@ mod tests {
     }
 
     #[test]
+    fn rmdir_heals_dangling_children_before_empty_check() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "rmdir-dangling-child");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("mkdir parent");
+        let child = vfs
+            .create(dir.ino, b"dangling.txt", 1000, 1000, 0o644)
+            .expect("create child");
+        meta.remove_attr(child.ino)
+            .expect("remove child attr while leaving dentry");
+
+        vfs.rmdir(ROOT_INO, b"parent")
+            .expect("rmdir should heal dangling children");
+
+        assert!(meta.lookup(ROOT_INO, b"parent").is_err());
+    }
+
+    #[test]
     fn readdir_invalidates_stale_negative_path_shortcut_for_observed_child() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-negative-path-shortcut");

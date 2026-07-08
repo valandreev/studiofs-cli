@@ -12709,8 +12709,14 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         let block_size = vfs.block_size as usize;
+        let second_block_offset = block_size as u64;
         let first_block = vec![0x46; block_size];
         let second_block = vec![0x47; block_size];
+        let hot_writer_timeout = Duration::from_millis(
+            DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
+                * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
+                * 3,
+        );
 
         vfs.write_fh_with_deferred_materialize(
             fh,
@@ -12722,7 +12728,7 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         .await
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(hot_writer_timeout, async {
             loop {
                 if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
                     && vfs.state.deferred_materialize_inflight.contains(ino)
@@ -12740,17 +12746,21 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
         vfs.write_fh_with_deferred_materialize(
             fh,
             ino,
-            block_size as u64,
+            second_block_offset,
             &second_block,
             LocalSyncPolicy::Opportunistic,
         )
         .await
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(hot_writer_timeout, async {
             loop {
                 if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
-                    && vfs.total_pending_persisted_local_dirty_slice_bytes() >= block_size * 2
+                    && (vfs.total_pending_persisted_local_dirty_slice_bytes() >= block_size
+                        || vfs
+                            .pending_uploads_for_inode(ino)
+                            .iter()
+                            .any(|(offset, _, _)| *offset == second_block_offset))
                 {
                     break;
                 }

@@ -1521,6 +1521,38 @@ impl StudioVfs {
             .collect())
     }
 
+    fn heal_dangling_directory_children(&self, dir_ino: Ino) -> VfsResult<usize> {
+        let meta = self.sync_meta();
+        let entries = meta.readdir(dir_ino)?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
+        let mut live_inos = HashSet::new();
+        let attr_batch_len = self
+            .readdir_attr_batch_chunk
+            .min(self.readdir_attr_batch_max_inodes)
+            .max(1);
+        for chunk in child_inos.chunks(attr_batch_len) {
+            live_inos.extend(
+                meta.get_attrs_batch(chunk)?
+                    .into_iter()
+                    .map(|attr| attr.ino),
+            );
+        }
+
+        let mut healed = 0;
+        for entry in entries {
+            if live_inos.contains(&entry.ino) {
+                continue;
+            }
+            self.heal_orphaned_dentry(dir_ino, &entry.name, Some(entry.ino));
+            healed += 1;
+        }
+        Ok(healed)
+    }
+
     fn resolve_unlink_target(
         &self,
         meta: &Arc<dyn VfsMeta>,
@@ -2007,12 +2039,23 @@ impl StudioVfs {
             return Ok(());
         }
         self.wait_for_deferred_namespace_entry(parent, name).await?;
-        let removed = self
-            .sync_meta()
-            .lookup(parent, name)
-            .ok()
-            .map(|entry| entry.ino);
-        self.sync_meta().rmdir(parent, name)?;
+        let meta = self.sync_meta();
+        let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
+        match meta.rmdir(parent, name) {
+            Ok(()) => {}
+            Err(err @ MetaError::DirNotEmpty(_)) => {
+                let Some(removed_ino) = removed else {
+                    return Err(VfsError::Meta(err));
+                };
+                let healed = self.heal_dangling_directory_children(removed_ino)?;
+                if healed == 0 {
+                    return Err(VfsError::Meta(err));
+                }
+                debug!(ino = removed_ino, healed, "rmdir healed dangling children");
+                meta.rmdir(parent, name)?;
+            }
+            Err(err) => return Err(VfsError::Meta(err)),
+        }
         namespace_mutations.record_removal(parent, name, std::iter::empty());
         if let Some(removed_ino) = removed {
             self.bump_directory_generation(removed_ino);

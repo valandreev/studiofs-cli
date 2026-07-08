@@ -847,6 +847,7 @@ impl StudioVfs {
             None
         }
         .unwrap_or(ino);
+        let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         self.wait_for_deferred_release_inflight(target_ino).await;
         let session = self
             .state
@@ -865,7 +866,8 @@ impl StudioVfs {
             {
                 Ok(outcome) => outcome,
                 Err(VfsError::Meta(MetaError::InodeNotFound(_)))
-                    if self.inode_has_local_dirty_state(target_ino)
+                    if had_local_dirty_state
+                        || self.inode_has_local_dirty_state(target_ino)
                         || self.state.writer_stack.has_dirty_writers(target_ino) =>
                 {
                     warn!(
@@ -878,8 +880,14 @@ impl StudioVfs {
                 }
                 Err(error) => return Err(error),
             };
+            if had_local_dirty_state && !outcome.had_local_dirty_state {
+                self.state
+                    .metrics
+                    .flush_barrier_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(ExplicitFlushOutcome {
-                flushed_local_dirty_state: outcome.had_local_dirty_state,
+                flushed_local_dirty_state: had_local_dirty_state || outcome.had_local_dirty_state,
             })
         }
         .await;
