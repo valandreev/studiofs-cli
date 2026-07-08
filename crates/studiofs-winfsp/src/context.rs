@@ -1282,6 +1282,88 @@ impl StudioFsContext {
     }
 }
 
+impl StudioFsContext {
+    fn populate_directory_buffer(
+        &self,
+        context: &StudioFileHandle,
+        lock: &DirBufferLock<'_>,
+    ) -> winfsp::Result<()> {
+        const DOT: &[u16] = &[b'.' as u16];
+        const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
+
+        {
+            let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+            dot.set_name_raw(DOT)?;
+            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            *dot.file_info_mut() = attr_to_file_info(&attr);
+            let _ = lock.write(&mut dot);
+        }
+
+        {
+            let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+            dotdot.set_name_raw(DOTDOT)?;
+            if let Ok(attr) = self.vfs.getattr(context.ino) {
+                *dotdot.file_info_mut() = attr_to_file_info(&attr);
+                let _ = lock.write(&mut dotdot);
+            }
+        }
+
+        let entries = self
+            .vfs
+            .readdir_with_attrs(context.ino)
+            .map_err(vfs_to_winfsp_err)?;
+        debug!(ino = context.ino, count = entries.len(), "read_directory");
+        let mut name_u16 = Vec::<u16>::new();
+
+        for entry_with_attr in &entries {
+            let entry = &entry_with_attr.entry;
+            if maybe_hide_platform_root_entry(&self.vfs, context.ino, &entry.name)? {
+                continue;
+            }
+            encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
+            if name_u16.len() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
+                warn!(
+                    ino = context.ino,
+                    entry_ino = entry.ino,
+                    utf16_len = name_u16.len(),
+                    max_utf16_len = MAX_WINDOWS_COMPONENT_UTF16_UNITS,
+                    "read_directory skipping overlong entry name"
+                );
+                continue;
+            }
+
+            let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+            if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
+                let display_name = String::from_utf8_lossy(&entry.name);
+                warn!(
+                    "failed to set name for entry '{}': bytes={} utf16_len={}",
+                    display_name,
+                    entry.name.len(),
+                    name_u16.len()
+                );
+                continue;
+            }
+
+            let Some(child_attr) = entry_with_attr
+                .attr
+                .clone()
+                .or_else(|| self.vfs.getattr(entry.ino).ok())
+            else {
+                continue;
+            };
+            *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
+
+            if let Err(e) = lock.write(&mut dir_info) {
+                let display_name = String::from_utf8_lossy(&entry.name);
+                warn!("DirBuffer write failed for '{}': {:?}", display_name, e);
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl FileSystemContext for StudioFsContext {
     type FileContext = StudioFileHandle;
 
@@ -1637,90 +1719,14 @@ impl FileSystemContext for StudioFsContext {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        // Constant UTF-16 names for "." and ".." — avoids heap allocation.
-        const DOT: &[u16] = &[b'.' as u16];
-        const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
-
         // On first call (no marker), populate the DirBuffer with all entries.
         if marker.is_none() {
             let lock = context.dir_buffer.acquire(true, None)?;
-
-            // Add "." entry
-            {
-                let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
-                dot.set_name_raw(DOT)?;
-                let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
-                *dot.file_info_mut() = attr_to_file_info(&attr);
-                let _ = lock.write(&mut dot);
-            }
-
-            // Add ".." entry
-            {
-                let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
-                dotdot.set_name_raw(DOTDOT)?;
-                if let Ok(attr) = self.vfs.getattr(context.ino) {
-                    *dotdot.file_info_mut() = attr_to_file_info(&attr);
-                    let _ = lock.write(&mut dotdot);
-                }
-            }
-
-            // Add all directory entries
-            let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
-            debug!(ino = context.ino, count = entries.len(), "read_directory");
-            let mut name_u16 = Vec::<u16>::new();
-
-            for entry in &entries {
-                if maybe_hide_platform_root_entry(&self.vfs, context.ino, &entry.name)? {
-                    continue;
-                }
-                let had_invalid_utf8 = encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
-                if name_u16.len() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
-                    warn!(
-                        ino = context.ino,
-                        entry_ino = entry.ino,
-                        utf16_len = name_u16.len(),
-                        max_utf16_len = MAX_WINDOWS_COMPONENT_UTF16_UNITS,
-                        "read_directory skipping overlong entry name"
-                    );
-                    continue;
-                }
-
-                let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
-                if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
-                    let display_name = String::from_utf8_lossy(&entry.name);
-                    warn!(
-                        "failed to set name for entry '{}': bytes={} utf16_len={}",
-                        display_name,
-                        entry.name.len(),
-                        name_u16.len()
-                    );
-                    continue;
-                }
-
-                let child_attr = match self.vfs.getattr(entry.ino) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        let display_name = String::from_utf8_lossy(&entry.name);
-                        warn!(
-                            "failed to get attr for '{}': {:?} (had_invalid_utf8={})",
-                            display_name, e, had_invalid_utf8
-                        );
-                        continue;
-                    }
-                };
-                *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
-
-                if let Err(e) = lock.write(&mut dir_info) {
-                    let display_name = String::from_utf8_lossy(&entry.name);
-                    warn!("DirBuffer write failed for '{}': {:?}", display_name, e);
-                    break;
-                }
-            }
+            self.populate_directory_buffer(context, &lock)?;
         }
 
         Ok(context.dir_buffer.read(marker, buffer))
     }
-
     fn set_delete(
         &self,
         context: &Self::FileContext,
@@ -2318,6 +2324,26 @@ mod tests {
         handle.record_read_callback(256);
 
         assert_eq!(handle.read_callback_snapshot(), (2, 384));
+    }
+
+    #[test]
+    fn read_directory_skips_dangling_probe_entry_without_error() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("read-directory-dangling-probe");
+        let probe = vfs
+            .meta()
+            .create_file(ROOT_INO, b"dangling-probe", 0, 0, 0o644)
+            .expect("seed probe file");
+        vfs.meta()
+            .remove_attr(probe.ino)
+            .expect("remove attr while leaving probe dentry");
+        let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
+        let lock = handle
+            .dir_buffer
+            .acquire(true, None)
+            .expect("acquire directory buffer");
+
+        ctx.populate_directory_buffer(&handle, &lock)
+            .expect("populate directory buffer");
     }
 
     #[test]
