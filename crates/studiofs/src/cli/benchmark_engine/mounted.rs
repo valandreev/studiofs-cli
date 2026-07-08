@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::fs;
@@ -38,6 +38,8 @@ use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
     stream_reports_from_telemetry,
 };
+
+const WRITE_PATH_SNAPSHOT_FRESH_TIMEOUT: Duration = Duration::from_secs(2);
 use super::workload::{
     SizeClass, SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
     build_work_sizes, classify_size, fill_deterministic_bytes, public_bench_workload,
@@ -780,6 +782,35 @@ async fn read_write_path_observability_snapshot(
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("read {}", metrics_path.display())),
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+async fn read_fresh_write_path_observability_snapshot(
+    metrics_path: &Path,
+    expected_publisher_pid: u32,
+    min_generated_unix_ms: u64,
+) -> Result<Option<VfsWritePathObservabilitySnapshot>> {
+    let deadline = Instant::now() + WRITE_PATH_SNAPSHOT_FRESH_TIMEOUT;
+    loop {
+        if let Some(snapshot) =
+            read_write_path_observability_snapshot(metrics_path, expected_publisher_pid).await?
+            && snapshot.generated_unix_ms >= min_generated_unix_ms
+        {
+            return Ok(Some(snapshot));
+        }
+        if Instant::now() >= deadline {
+            return read_write_path_observability_snapshot(metrics_path, expected_publisher_pid)
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -2978,6 +3009,7 @@ pub(crate) async fn run_mounted_end_to_end(
                         phase = "e2e-write",
                         "cache benchmark phase start"
                     );
+                    let write_phase_started_unix_ms = unix_ms_now();
                     portable_profile.set_phase(PHASE_WRITE);
                     let writes_wall_start = Instant::now();
                     let writes_cpu_start = process_cpu_time();
@@ -3003,7 +3035,12 @@ pub(crate) async fn run_mounted_end_to_end(
                     let write_path_after_write = match write_path_observability_path_ref.as_deref()
                     {
                         Some(path) => {
-                            read_write_path_observability_snapshot(path, mount_pid).await?
+                            read_fresh_write_path_observability_snapshot(
+                                path,
+                                mount_pid,
+                                write_phase_started_unix_ms,
+                            )
+                            .await?
                         }
                         None => None,
                     };
@@ -3122,9 +3159,17 @@ pub(crate) async fn run_mounted_end_to_end(
             )
             .await?;
         let mut measured = measured;
+        let report_snapshot_started_unix_ms = unix_ms_now();
         let mut measured_write_path_after_for_report =
             match write_path_observability_path.as_deref() {
-                Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
+                Some(path) => {
+                    read_fresh_write_path_observability_snapshot(
+                        path,
+                        mount_pid,
+                        report_snapshot_started_unix_ms,
+                    )
+                    .await?
+                }
                 None => None,
             };
         let measured_write_path_after_write_for_report = measured

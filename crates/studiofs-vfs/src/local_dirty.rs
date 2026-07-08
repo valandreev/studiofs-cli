@@ -1849,13 +1849,26 @@ impl StudioVfs {
         if self.has_pending_local_dirty_payloads_for_inode(ino) {
             return;
         }
+        if self.has_deferred_namespace_metadata(ino) {
+            return;
+        }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
         let should_clear = dirty_attrs.get(&ino).is_some_and(|current| {
-            current.content_epoch == attr.content_epoch
-                && (Self::is_fully_published_regular_file(attr)
-                    || (current.size == attr.size
-                        && current.mtime == attr.mtime
-                        && current.ctime == attr.ctime))
+            let exact_match = current.content_epoch == attr.content_epoch
+                && current.size == attr.size
+                && current.mtime == attr.mtime
+                && current.ctime == attr.ctime;
+            let committed_directory_attr_covers_current = current.kind != FileType::RegularFile
+                && current.kind == attr.kind
+                && current.content_epoch == attr.content_epoch;
+            let published_attr_covers_current = current.content_epoch == attr.content_epoch
+                && Self::is_fully_published_regular_file(attr)
+                && current.size <= attr.size
+                && current.mtime <= attr.mtime
+                && current.ctime <= attr.ctime;
+            exact_match
+                || committed_directory_attr_covers_current
+                || published_attr_covers_current
                 || Self::is_stale_zero_size_dirty_attr_after_publish(current, attr)
         });
         if should_clear {
@@ -2590,6 +2603,7 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
+        self.wait_for_deferred_namespace_metadata(ino).await?;
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, true)
             .await?;
@@ -2602,6 +2616,7 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
+        self.wait_for_deferred_namespace_metadata(ino).await?;
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, false)
             .await?;

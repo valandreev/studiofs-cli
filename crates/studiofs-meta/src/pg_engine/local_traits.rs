@@ -101,6 +101,18 @@ impl MetaFsOps for PgMetaEngine {
         self.mutate(|local| local.create_file_with_ino(ino, parent, name, uid, gid, mode))
     }
 
+    fn create_file_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_file_with_ino(ino, parent, name, uid, gid, mode))
+    }
+
     fn create_dir(
         &self,
         parent: Ino,
@@ -110,6 +122,18 @@ impl MetaFsOps for PgMetaEngine {
         mode: u16,
     ) -> MetaResult<InodeAttr> {
         let ino = self.next_inode()?;
+        self.mutate(|local| local.create_dir_with_ino(ino, parent, name, uid, gid, mode))
+    }
+
+    fn create_dir_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
         self.mutate(|local| local.create_dir_with_ino(ino, parent, name, uid, gid, mode))
     }
 

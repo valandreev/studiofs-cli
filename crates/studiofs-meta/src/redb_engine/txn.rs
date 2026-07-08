@@ -3,10 +3,7 @@ use super::*;
 impl RedbMetaEngine {
     /// Enable or disable filtering that hides remote-only namespace rows locally.
     pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         Self::set_remote_namespace_visibility_filter_in_txn(&txn, enabled)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -65,10 +62,7 @@ impl RedbMetaEngine {
     }
 
     pub(super) fn ensure_dentry_by_inode_indexes(&self) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         let current_version = {
             let settings = txn
@@ -1537,10 +1531,7 @@ impl RedbMetaEngine {
         ino: Ino,
         phase: UndoLogPhase,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         {
             Self::set_undo_log_phase_for_in_txn(&txn, kind, ino, phase)?;
         }

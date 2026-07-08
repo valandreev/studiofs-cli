@@ -1,7 +1,7 @@
 use super::{
-    AccessLevel, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
-    PayloadRef, StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug,
-    error, format_object_fragment_keys, offset_within_block, warn,
+    AccessLevel, Bytes, ExplicitFlushOutcome, FOREGROUND_READ_WINDOW_BYTES, FileSessionOperation,
+    Ino, LocalSyncPolicy, PayloadRef, StickyErrorPolicy, StudioVfs, VfsError, VfsResult,
+    block_index_from_offset, debug, error, format_object_fragment_keys, offset_within_block, warn,
 };
 
 impl StudioVfs {
@@ -141,8 +141,21 @@ impl StudioVfs {
             }
             return Ok(len as u32);
         }
+        let open_file = fh.and_then(|handle| self.handle_table.get(handle));
+        if let Some(open_file) = &open_file
+            && let Some(read) = open_file.read_window_hit(ino, offset, buffer)
+        {
+            return Ok(read);
+        }
+        let requested_len = if open_file.as_ref().is_some_and(|open_file| {
+            open_file.should_fill_read_window(offset, buffer.len(), FOREGROUND_READ_WINDOW_BYTES)
+        }) {
+            FOREGROUND_READ_WINDOW_BYTES
+        } else {
+            buffer.len()
+        };
         let prepared = self
-            .prepare_foreground_read(ino, offset, buffer.len())
+            .prepare_foreground_read(ino, offset, requested_len)
             .await?;
         if let Some(path) = &debug_path {
             tracing::info!(
@@ -150,7 +163,7 @@ impl StudioVfs {
                 fh = fh.unwrap_or_default(),
                 path = %path,
                 offset,
-                requested_len = buffer.len(),
+                requested_len,
                 read_len = prepared.read_len,
                 "debug target read_into_impl prepared foreground read"
             );
@@ -180,16 +193,31 @@ impl StudioVfs {
             }
             return Ok(0);
         }
-        debug_assert!(prepared.read_len <= buffer.len());
-        let written = self
-            .execute_prepared_foreground_read(
+        let written = if prepared.read_len <= buffer.len() {
+            self.execute_prepared_foreground_read(
                 fh,
                 ino,
                 offset,
                 &mut buffer[..prepared.read_len],
                 &prepared,
             )
-            .await?;
+            .await?
+        } else {
+            let mut window = vec![0u8; prepared.read_len];
+            let written = self
+                .execute_prepared_foreground_read(fh, ino, offset, &mut window, &prepared)
+                .await?;
+            window.truncate(written);
+            let read = buffer.len().min(window.len());
+            buffer[..read].copy_from_slice(&window[..read]);
+            if let Some(open_file) = &open_file {
+                open_file.replace_read_window(ino, offset, Bytes::from(window));
+            }
+            read
+        };
+        if let Some(open_file) = &open_file {
+            open_file.record_read_progress(offset, written);
+        }
         if let Some(path) = &debug_path {
             tracing::info!(
                 ino,

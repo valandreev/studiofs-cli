@@ -5,20 +5,31 @@
 use crate::engine::*;
 use crate::types::*;
 use redb::{
-    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
+    Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
+    WriteTransaction,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
-use tracing::debug;
+use std::sync::{
+    Arc, Once, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
+use tracing::{debug, warn};
 
 pub(crate) mod layout;
 pub use self::layout::RedbSnapshot;
 use self::layout::*;
 
 mod fs_ops;
+
+static RELAXED_DURABILITY_WARN: Once = Once::new();
+static RELAXED_DURABILITY_CLOCK_START: OnceLock<Instant> = OnceLock::new();
+static RELAXED_DURABILITY_NEXT_BARRIER_MS: AtomicU64 =
+    AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
@@ -27,6 +38,71 @@ pub struct RedbMetaEngine {
 
 pub(crate) struct CounterWriteTransaction<'a> {
     txn: &'a WriteTransaction,
+}
+
+fn redb_relaxed_durability_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn redb_relaxed_durability() -> Durability {
+    let start = RELAXED_DURABILITY_CLOCK_START.get_or_init(Instant::now);
+    let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    redb_relaxed_durability_for_elapsed_ms(&RELAXED_DURABILITY_NEXT_BARRIER_MS, elapsed_ms)
+}
+
+// Durability::Immediate makes earlier Durability::None commits persistent in redb.
+// This keeps relaxed mode fast while bounding local metadata loss to the last interval.
+fn redb_relaxed_durability_for_elapsed_ms(
+    next_barrier_ms: &AtomicU64,
+    elapsed_ms: u64,
+) -> Durability {
+    loop {
+        let next = next_barrier_ms.load(Ordering::Relaxed);
+        if elapsed_ms < next {
+            return Durability::None;
+        }
+        let new_next = elapsed_ms.saturating_add(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+        if next_barrier_ms
+            .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Durability::Immediate;
+        }
+    }
+}
+
+fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
+    let mut txn = db
+        .begin_write()
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    if redb_relaxed_durability_enabled() {
+        RELAXED_DURABILITY_WARN.call_once(|| {
+            warn!(
+                interval_ms = REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS,
+                "STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE is enabled; most local redb commits skip durable flushes, with periodic durable barriers"
+            );
+        });
+        txn.set_durability(redb_relaxed_durability())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+    }
+    Ok(txn)
 }
 
 impl CounterWriteTransaction<'_> {
@@ -43,6 +119,10 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn begin_write_txn(&self) -> MetaResult<WriteTransaction> {
+        begin_redb_write_txn(&self.db)
+    }
+
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -55,9 +135,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
         {
-            let txn = db
-                .begin_write()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let txn = begin_redb_write_txn(&db)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
@@ -141,10 +219,7 @@ impl RedbMetaEngine {
     where
         F: FnOnce(&CounterWriteTransaction<'_>) -> MetaResult<T>,
     {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let counters = CounterWriteTransaction { txn: &txn };
         let out = f(&counters)?;
         txn.commit()

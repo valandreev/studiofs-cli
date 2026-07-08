@@ -378,10 +378,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         for event in events {
             match event {
@@ -565,10 +562,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         for event in events {
             match event {
@@ -805,10 +799,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         for event in events {
             match event {
@@ -1004,10 +995,7 @@ impl RedbMetaEngine {
         REGULAR_FILE_SERVING_RECONCILE_CALLS
             .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let mut changed = false;
 
         for ino in inodes {
@@ -1074,10 +1062,7 @@ impl RedbMetaEngine {
             return Ok(false);
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let mut changed = false;
 
         for key in dentry_keys {
@@ -1168,10 +1153,7 @@ impl RedbMetaEngine {
         new_name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
 
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn, parent, name, new_parent, new_name, entry,

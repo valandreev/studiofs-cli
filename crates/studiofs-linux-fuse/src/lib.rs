@@ -26,8 +26,8 @@ pub struct LinuxFuseConnectionConfig {
 impl Default for LinuxFuseConnectionConfig {
     fn default() -> Self {
         Self {
-            max_background: 16,
-            congestion_threshold: 12,
+            max_background: 128,
+            congestion_threshold: 96,
         }
     }
 }

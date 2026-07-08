@@ -244,8 +244,30 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
         ) -> MetaResult<InodeAttr>
     );
     forward_method!(
+        fn create_file_with_ino(
+            &self,
+            ino: Ino,
+            parent: Ino,
+            name: &[u8],
+            uid: u32,
+            gid: u32,
+            mode: u16,
+        ) -> MetaResult<InodeAttr>
+    );
+    forward_method!(
         fn create_dir(
             &self,
+            parent: Ino,
+            name: &[u8],
+            uid: u32,
+            gid: u32,
+            mode: u16,
+        ) -> MetaResult<InodeAttr>
+    );
+    forward_method!(
+        fn create_dir_with_ino(
+            &self,
+            ino: Ino,
             parent: Ino,
             name: &[u8],
             uid: u32,

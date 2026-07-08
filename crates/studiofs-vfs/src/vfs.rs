@@ -218,6 +218,7 @@ const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
 const SUSTAINED_WRITE_DELAY_STEP_MS: u64 = 1_500;
 const SUSTAINED_WRITE_MAX_DELAY_MS: u64 = 8;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
+const FOREGROUND_READ_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2178,10 +2179,45 @@ struct MetricsState {
     vfs_read_requested_bytes: AtomicU64,
     vfs_write_calls: AtomicU64,
     vfs_write_bytes: AtomicU64,
+    vfs_write_create_calls: AtomicU64,
+    vfs_write_create_total_ns: AtomicU64,
+    vfs_write_create_max_ns: AtomicU64,
+    vfs_write_create_histogram: LatencyHistogram,
+    vfs_write_mkdir_calls: AtomicU64,
+    vfs_write_mkdir_total_ns: AtomicU64,
+    vfs_write_mkdir_max_ns: AtomicU64,
+    vfs_write_mkdir_histogram: LatencyHistogram,
+    vfs_write_open_file_calls: AtomicU64,
+    vfs_write_open_file_total_ns: AtomicU64,
+    vfs_write_open_file_max_ns: AtomicU64,
+    vfs_write_open_file_histogram: LatencyHistogram,
+    vfs_write_setattr_calls: AtomicU64,
+    vfs_write_setattr_total_ns: AtomicU64,
+    vfs_write_setattr_max_ns: AtomicU64,
+    vfs_write_setattr_histogram: LatencyHistogram,
+    vfs_write_pre_drain_calls: AtomicU64,
+    vfs_write_pre_drain_total_ns: AtomicU64,
+    vfs_write_pre_drain_max_ns: AtomicU64,
+    vfs_write_pre_drain_histogram: LatencyHistogram,
+    vfs_write_admission_throttle_calls: AtomicU64,
+    vfs_write_admission_throttle_total_ns: AtomicU64,
+    vfs_write_admission_throttle_max_ns: AtomicU64,
+    vfs_write_admission_throttle_histogram: LatencyHistogram,
+    vfs_write_file_session_wait_calls: AtomicU64,
+    vfs_write_file_session_wait_total_ns: AtomicU64,
+    vfs_write_file_session_wait_max_ns: AtomicU64,
+    vfs_write_file_session_wait_histogram: LatencyHistogram,
     vfs_write_record_writer_stack_state_calls: AtomicU64,
     vfs_write_record_writer_stack_state_total_ns: AtomicU64,
     vfs_write_record_writer_stack_state_max_ns: AtomicU64,
     vfs_write_record_writer_stack_state_histogram: LatencyHistogram,
+    vfs_write_getattr_async_calls: AtomicU64,
+    vfs_write_getattr_async_total_ns: AtomicU64,
+    vfs_write_getattr_async_max_ns: AtomicU64,
+    vfs_write_getattr_async_histogram: LatencyHistogram,
+    vfs_write_dirty_attr_hits: AtomicU64,
+    vfs_write_open_attr_hits: AtomicU64,
+    vfs_write_active_open_overlay_fallbacks: AtomicU64,
     vfs_write_materialize_completed_calls: AtomicU64,
     vfs_write_materialize_completed_total_ns: AtomicU64,
     vfs_write_materialize_completed_max_ns: AtomicU64,
@@ -2194,6 +2230,10 @@ struct MetricsState {
     vfs_write_materialize_for_limits_total_ns: AtomicU64,
     vfs_write_materialize_for_limits_max_ns: AtomicU64,
     vfs_write_materialize_for_limits_histogram: LatencyHistogram,
+    vfs_write_spawn_deferred_materialization_calls: AtomicU64,
+    vfs_write_spawn_deferred_materialization_total_ns: AtomicU64,
+    vfs_write_spawn_deferred_materialization_max_ns: AtomicU64,
+    vfs_write_spawn_deferred_materialization_histogram: LatencyHistogram,
     winfsp_write_callbacks: AtomicU64,
     winfsp_write_callback_bytes: AtomicU64,
     winfsp_write_callback_total_ns: AtomicU64,
@@ -2329,10 +2369,45 @@ impl MetricsState {
             vfs_read_requested_bytes: AtomicU64::new(0),
             vfs_write_calls: AtomicU64::new(0),
             vfs_write_bytes: AtomicU64::new(0),
+            vfs_write_create_calls: AtomicU64::new(0),
+            vfs_write_create_total_ns: AtomicU64::new(0),
+            vfs_write_create_max_ns: AtomicU64::new(0),
+            vfs_write_create_histogram: LatencyHistogram::default(),
+            vfs_write_mkdir_calls: AtomicU64::new(0),
+            vfs_write_mkdir_total_ns: AtomicU64::new(0),
+            vfs_write_mkdir_max_ns: AtomicU64::new(0),
+            vfs_write_mkdir_histogram: LatencyHistogram::default(),
+            vfs_write_open_file_calls: AtomicU64::new(0),
+            vfs_write_open_file_total_ns: AtomicU64::new(0),
+            vfs_write_open_file_max_ns: AtomicU64::new(0),
+            vfs_write_open_file_histogram: LatencyHistogram::default(),
+            vfs_write_setattr_calls: AtomicU64::new(0),
+            vfs_write_setattr_total_ns: AtomicU64::new(0),
+            vfs_write_setattr_max_ns: AtomicU64::new(0),
+            vfs_write_setattr_histogram: LatencyHistogram::default(),
+            vfs_write_pre_drain_calls: AtomicU64::new(0),
+            vfs_write_pre_drain_total_ns: AtomicU64::new(0),
+            vfs_write_pre_drain_max_ns: AtomicU64::new(0),
+            vfs_write_pre_drain_histogram: LatencyHistogram::default(),
+            vfs_write_admission_throttle_calls: AtomicU64::new(0),
+            vfs_write_admission_throttle_total_ns: AtomicU64::new(0),
+            vfs_write_admission_throttle_max_ns: AtomicU64::new(0),
+            vfs_write_admission_throttle_histogram: LatencyHistogram::default(),
+            vfs_write_file_session_wait_calls: AtomicU64::new(0),
+            vfs_write_file_session_wait_total_ns: AtomicU64::new(0),
+            vfs_write_file_session_wait_max_ns: AtomicU64::new(0),
+            vfs_write_file_session_wait_histogram: LatencyHistogram::default(),
             vfs_write_record_writer_stack_state_calls: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_total_ns: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_max_ns: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_histogram: LatencyHistogram::default(),
+            vfs_write_getattr_async_calls: AtomicU64::new(0),
+            vfs_write_getattr_async_total_ns: AtomicU64::new(0),
+            vfs_write_getattr_async_max_ns: AtomicU64::new(0),
+            vfs_write_getattr_async_histogram: LatencyHistogram::default(),
+            vfs_write_dirty_attr_hits: AtomicU64::new(0),
+            vfs_write_open_attr_hits: AtomicU64::new(0),
+            vfs_write_active_open_overlay_fallbacks: AtomicU64::new(0),
             vfs_write_materialize_completed_calls: AtomicU64::new(0),
             vfs_write_materialize_completed_total_ns: AtomicU64::new(0),
             vfs_write_materialize_completed_max_ns: AtomicU64::new(0),
@@ -2345,6 +2420,10 @@ impl MetricsState {
             vfs_write_materialize_for_limits_total_ns: AtomicU64::new(0),
             vfs_write_materialize_for_limits_max_ns: AtomicU64::new(0),
             vfs_write_materialize_for_limits_histogram: LatencyHistogram::default(),
+            vfs_write_spawn_deferred_materialization_calls: AtomicU64::new(0),
+            vfs_write_spawn_deferred_materialization_total_ns: AtomicU64::new(0),
+            vfs_write_spawn_deferred_materialization_max_ns: AtomicU64::new(0),
+            vfs_write_spawn_deferred_materialization_histogram: LatencyHistogram::default(),
             winfsp_write_callbacks: AtomicU64::new(0),
             winfsp_write_callback_bytes: AtomicU64::new(0),
             winfsp_write_callback_total_ns: AtomicU64::new(0),
@@ -2474,9 +2553,36 @@ impl MetricsState {
             vfs_read_requested_bytes,
             vfs_write_calls,
             vfs_write_bytes,
+            vfs_write_create_calls,
+            vfs_write_create_total_ns,
+            vfs_write_create_max_ns,
+            vfs_write_mkdir_calls,
+            vfs_write_mkdir_total_ns,
+            vfs_write_mkdir_max_ns,
+            vfs_write_open_file_calls,
+            vfs_write_open_file_total_ns,
+            vfs_write_open_file_max_ns,
+            vfs_write_setattr_calls,
+            vfs_write_setattr_total_ns,
+            vfs_write_setattr_max_ns,
+            vfs_write_pre_drain_calls,
+            vfs_write_pre_drain_total_ns,
+            vfs_write_pre_drain_max_ns,
+            vfs_write_admission_throttle_calls,
+            vfs_write_admission_throttle_total_ns,
+            vfs_write_admission_throttle_max_ns,
+            vfs_write_file_session_wait_calls,
+            vfs_write_file_session_wait_total_ns,
+            vfs_write_file_session_wait_max_ns,
             vfs_write_record_writer_stack_state_calls,
             vfs_write_record_writer_stack_state_total_ns,
             vfs_write_record_writer_stack_state_max_ns,
+            vfs_write_getattr_async_calls,
+            vfs_write_getattr_async_total_ns,
+            vfs_write_getattr_async_max_ns,
+            vfs_write_dirty_attr_hits,
+            vfs_write_open_attr_hits,
+            vfs_write_active_open_overlay_fallbacks,
             vfs_write_materialize_completed_calls,
             vfs_write_materialize_completed_total_ns,
             vfs_write_materialize_completed_max_ns,
@@ -2486,6 +2592,9 @@ impl MetricsState {
             vfs_write_materialize_for_limits_calls,
             vfs_write_materialize_for_limits_total_ns,
             vfs_write_materialize_for_limits_max_ns,
+            vfs_write_spawn_deferred_materialization_calls,
+            vfs_write_spawn_deferred_materialization_total_ns,
+            vfs_write_spawn_deferred_materialization_max_ns,
             winfsp_write_callbacks,
             winfsp_write_callback_bytes,
             winfsp_write_callback_strict_calls,
@@ -2553,14 +2662,60 @@ impl MetricsState {
         self.payload_burst_interval_histogram.reset();
         self.metadata_commit_histogram.reset();
         self.metadata_commit_interval_histogram.reset();
+        self.vfs_write_create_histogram.reset();
+        self.vfs_write_mkdir_histogram.reset();
+        self.vfs_write_open_file_histogram.reset();
+        self.vfs_write_setattr_histogram.reset();
+        self.vfs_write_pre_drain_histogram.reset();
+        self.vfs_write_admission_throttle_histogram.reset();
+        self.vfs_write_file_session_wait_histogram.reset();
         self.vfs_write_record_writer_stack_state_histogram.reset();
+        self.vfs_write_getattr_async_histogram.reset();
         self.vfs_write_materialize_completed_histogram.reset();
         self.vfs_write_materialize_strict_histogram.reset();
         self.vfs_write_materialize_for_limits_histogram.reset();
+        self.vfs_write_spawn_deferred_materialization_histogram
+            .reset();
         self.winfsp_write_callback_histogram.reset();
         self.winfsp_write_callback_vfs_histogram.reset();
         self.winfsp_write_callback_getattr_histogram.reset();
         self.runtime_events.lock().clear();
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum VfsForegroundWriteOp {
+    Create,
+    Mkdir,
+    OpenFile,
+    Setattr,
+}
+
+pub(super) struct VfsForegroundWriteTimer<'a> {
+    vfs: &'a StudioVfs,
+    op: VfsForegroundWriteOp,
+    started: Instant,
+}
+
+impl<'a> VfsForegroundWriteTimer<'a> {
+    pub(super) fn new(vfs: &'a StudioVfs, op: VfsForegroundWriteOp) -> Self {
+        Self {
+            vfs,
+            op,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for VfsForegroundWriteTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        match self.op {
+            VfsForegroundWriteOp::Create => self.vfs.record_vfs_write_create(elapsed),
+            VfsForegroundWriteOp::Mkdir => self.vfs.record_vfs_write_mkdir(elapsed),
+            VfsForegroundWriteOp::OpenFile => self.vfs.record_vfs_write_open_file(elapsed),
+            VfsForegroundWriteOp::Setattr => self.vfs.record_vfs_write_setattr(elapsed),
+        }
     }
 }
 
@@ -2872,6 +3027,20 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
 
 fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
+}
+
+fn write_admission_soft_pacing_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
 }
 
 fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
@@ -4696,7 +4865,12 @@ impl StudioVfs {
             return false;
         }
         let committed_epoch = attr.committed_content_epoch;
-        let (dirty_attr_present, dirty_attr_epoch, dirty_attr_covers_ready_attr) = {
+        let (
+            dirty_attr_present,
+            dirty_attr_epoch,
+            dirty_attr_covers_ready_attr,
+            dirty_attr_outpaces_ready_attr,
+        ) = {
             let dirty_attrs = self.state.namespace.dirty_attrs.lock();
             let dirty_attr = dirty_attrs.get(&ino);
             (
@@ -4704,6 +4878,12 @@ impl StudioVfs {
                 dirty_attr.map(|dirty_attr| dirty_attr.content_epoch),
                 dirty_attr.is_some_and(|dirty_attr| {
                     dirty_attr.content_epoch > committed_epoch && dirty_attr.size >= attr.size
+                }),
+                dirty_attr.is_some_and(|dirty_attr| {
+                    dirty_attr.content_epoch == committed_epoch
+                        && (dirty_attr.size > attr.size
+                            || dirty_attr.mtime > attr.mtime
+                            || dirty_attr.ctime > attr.ctime)
                 }),
             )
         };
@@ -4758,6 +4938,9 @@ impl StudioVfs {
             return false;
         }
         if dirty_attr_covers_ready_attr {
+            return false;
+        }
+        if dirty_attr_outpaces_ready_attr {
             return false;
         }
         if !dirty_attr_present
@@ -6212,6 +6395,9 @@ impl StudioVfs {
             self.state.write_admission_governor.lock().reset_stats();
             return;
         }
+        if write_admission_soft_pacing_disabled() {
+            return;
+        }
 
         let decision = {
             let mut governor = self.state.write_admission_governor.lock();
@@ -7079,7 +7265,83 @@ impl StudioVfs {
         }
     }
 
-    /// Record write-path stage latency for recording writer stack state.
+    pub(super) fn record_vfs_write_create(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_create_calls,
+            &metrics.vfs_write_create_total_ns,
+            &metrics.vfs_write_create_max_ns,
+            &metrics.vfs_write_create_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_mkdir(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_mkdir_calls,
+            &metrics.vfs_write_mkdir_total_ns,
+            &metrics.vfs_write_mkdir_max_ns,
+            &metrics.vfs_write_mkdir_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_open_file(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_open_file_calls,
+            &metrics.vfs_write_open_file_total_ns,
+            &metrics.vfs_write_open_file_max_ns,
+            &metrics.vfs_write_open_file_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_setattr(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_setattr_calls,
+            &metrics.vfs_write_setattr_total_ns,
+            &metrics.vfs_write_setattr_max_ns,
+            &metrics.vfs_write_setattr_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_pre_drain(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_pre_drain_calls,
+            &metrics.vfs_write_pre_drain_total_ns,
+            &metrics.vfs_write_pre_drain_max_ns,
+            &metrics.vfs_write_pre_drain_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_admission_throttle(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_admission_throttle_calls,
+            &metrics.vfs_write_admission_throttle_total_ns,
+            &metrics.vfs_write_admission_throttle_max_ns,
+            &metrics.vfs_write_admission_throttle_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_file_session_wait(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_file_session_wait_calls,
+            &metrics.vfs_write_file_session_wait_total_ns,
+            &metrics.vfs_write_file_session_wait_max_ns,
+            &metrics.vfs_write_file_session_wait_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
     pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -7091,6 +7353,38 @@ impl StudioVfs {
         );
     }
 
+    pub(super) fn record_vfs_write_getattr_async(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_getattr_async_calls,
+            &metrics.vfs_write_getattr_async_total_ns,
+            &metrics.vfs_write_getattr_async_max_ns,
+            &metrics.vfs_write_getattr_async_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn note_vfs_write_dirty_attr_hit(&self) {
+        self.state
+            .metrics
+            .vfs_write_dirty_attr_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_vfs_write_open_attr_hit(&self) {
+        self.state
+            .metrics
+            .vfs_write_open_attr_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_vfs_write_active_open_overlay_fallback(&self) {
+        self.state
+            .metrics
+            .vfs_write_active_open_overlay_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record write-path stage latency for completed materialization.
     pub(super) fn record_vfs_write_materialize_completed(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
@@ -7099,6 +7393,17 @@ impl StudioVfs {
             &metrics.vfs_write_materialize_completed_total_ns,
             &metrics.vfs_write_materialize_completed_max_ns,
             &metrics.vfs_write_materialize_completed_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_spawn_deferred_materialization(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_spawn_deferred_materialization_calls,
+            &metrics.vfs_write_spawn_deferred_materialization_total_ns,
+            &metrics.vfs_write_spawn_deferred_materialization_max_ns,
+            &metrics.vfs_write_spawn_deferred_materialization_histogram,
             Self::duration_ns_u64(elapsed),
         );
     }
@@ -7260,9 +7565,36 @@ impl StudioVfs {
             vfs_read_requested_bytes: vfs_read_requested_bytes,
             vfs_write_calls: vfs_write_calls,
             vfs_write_bytes: vfs_write_bytes,
+            vfs_write_create_calls: vfs_write_create_calls,
+            vfs_write_create_total_ns: vfs_write_create_total_ns,
+            vfs_write_create_max_ns: vfs_write_create_max_ns,
+            vfs_write_mkdir_calls: vfs_write_mkdir_calls,
+            vfs_write_mkdir_total_ns: vfs_write_mkdir_total_ns,
+            vfs_write_mkdir_max_ns: vfs_write_mkdir_max_ns,
+            vfs_write_open_file_calls: vfs_write_open_file_calls,
+            vfs_write_open_file_total_ns: vfs_write_open_file_total_ns,
+            vfs_write_open_file_max_ns: vfs_write_open_file_max_ns,
+            vfs_write_setattr_calls: vfs_write_setattr_calls,
+            vfs_write_setattr_total_ns: vfs_write_setattr_total_ns,
+            vfs_write_setattr_max_ns: vfs_write_setattr_max_ns,
+            vfs_write_pre_drain_calls: vfs_write_pre_drain_calls,
+            vfs_write_pre_drain_total_ns: vfs_write_pre_drain_total_ns,
+            vfs_write_pre_drain_max_ns: vfs_write_pre_drain_max_ns,
+            vfs_write_admission_throttle_calls: vfs_write_admission_throttle_calls,
+            vfs_write_admission_throttle_total_ns: vfs_write_admission_throttle_total_ns,
+            vfs_write_admission_throttle_max_ns: vfs_write_admission_throttle_max_ns,
+            vfs_write_file_session_wait_calls: vfs_write_file_session_wait_calls,
+            vfs_write_file_session_wait_total_ns: vfs_write_file_session_wait_total_ns,
+            vfs_write_file_session_wait_max_ns: vfs_write_file_session_wait_max_ns,
             vfs_write_record_writer_stack_state_calls: vfs_write_record_writer_stack_state_calls,
             vfs_write_record_writer_stack_state_total_ns: vfs_write_record_writer_stack_state_total_ns,
             vfs_write_record_writer_stack_state_max_ns: vfs_write_record_writer_stack_state_max_ns,
+            vfs_write_getattr_async_calls: vfs_write_getattr_async_calls,
+            vfs_write_getattr_async_total_ns: vfs_write_getattr_async_total_ns,
+            vfs_write_getattr_async_max_ns: vfs_write_getattr_async_max_ns,
+            vfs_write_dirty_attr_hits: vfs_write_dirty_attr_hits,
+            vfs_write_open_attr_hits: vfs_write_open_attr_hits,
+            vfs_write_active_open_overlay_fallbacks: vfs_write_active_open_overlay_fallbacks,
             vfs_write_materialize_completed_calls: vfs_write_materialize_completed_calls,
             vfs_write_materialize_completed_total_ns: vfs_write_materialize_completed_total_ns,
             vfs_write_materialize_completed_max_ns: vfs_write_materialize_completed_max_ns,
@@ -7272,6 +7604,11 @@ impl StudioVfs {
             vfs_write_materialize_for_limits_calls: vfs_write_materialize_for_limits_calls,
             vfs_write_materialize_for_limits_total_ns: vfs_write_materialize_for_limits_total_ns,
             vfs_write_materialize_for_limits_max_ns: vfs_write_materialize_for_limits_max_ns,
+            vfs_write_spawn_deferred_materialization_calls: vfs_write_spawn_deferred_materialization_calls,
+            vfs_write_spawn_deferred_materialization_total_ns:
+                vfs_write_spawn_deferred_materialization_total_ns,
+            vfs_write_spawn_deferred_materialization_max_ns:
+                vfs_write_spawn_deferred_materialization_max_ns,
             winfsp_write_callback_bytes: winfsp_write_callback_bytes,
             winfsp_write_callback_total_ns: winfsp_write_callback_total_ns,
             winfsp_write_callback_max_ns: winfsp_write_callback_max_ns,
@@ -7364,10 +7701,32 @@ impl StudioVfs {
             .metrics
             .payload_store_sync_data_interval_histogram
             .snapshot();
+        let vfs_write_create_histogram = self.state.metrics.vfs_write_create_histogram.snapshot();
+        let vfs_write_mkdir_histogram = self.state.metrics.vfs_write_mkdir_histogram.snapshot();
+        let vfs_write_open_file_histogram =
+            self.state.metrics.vfs_write_open_file_histogram.snapshot();
+        let vfs_write_setattr_histogram = self.state.metrics.vfs_write_setattr_histogram.snapshot();
+        let vfs_write_pre_drain_histogram =
+            self.state.metrics.vfs_write_pre_drain_histogram.snapshot();
+        let vfs_write_admission_throttle_histogram = self
+            .state
+            .metrics
+            .vfs_write_admission_throttle_histogram
+            .snapshot();
+        let vfs_write_file_session_wait_histogram = self
+            .state
+            .metrics
+            .vfs_write_file_session_wait_histogram
+            .snapshot();
         let vfs_write_record_writer_stack_state_histogram = self
             .state
             .metrics
             .vfs_write_record_writer_stack_state_histogram
+            .snapshot();
+        let vfs_write_getattr_async_histogram = self
+            .state
+            .metrics
+            .vfs_write_getattr_async_histogram
             .snapshot();
         let vfs_write_materialize_completed_histogram = self
             .state
@@ -7383,6 +7742,11 @@ impl StudioVfs {
             .state
             .metrics
             .vfs_write_materialize_for_limits_histogram
+            .snapshot();
+        let vfs_write_spawn_deferred_materialization_histogram = self
+            .state
+            .metrics
+            .vfs_write_spawn_deferred_materialization_histogram
             .snapshot();
         let payload_persist_histogram = self.state.metrics.payload_persist_histogram.snapshot();
         let payload_burst_interval_histogram = self
@@ -7449,6 +7813,7 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let foreground_reads = self.foreground_read_protection_stats();
         let cache_pipeline_metrics = self.cached_store.cache_pipeline_metrics();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
@@ -7801,6 +8166,55 @@ impl StudioVfs {
                 } else {
                     vfs_write_bytes as f64 / vfs_write_calls as f64
                 },
+                create: Self::build_stage_latency_stats(
+                    vfs_write_create_calls,
+                    vfs_write_create_total_ns,
+                    vfs_write_create_max_ns,
+                    vfs_write_create_histogram,
+                    elapsed,
+                ),
+                mkdir: Self::build_stage_latency_stats(
+                    vfs_write_mkdir_calls,
+                    vfs_write_mkdir_total_ns,
+                    vfs_write_mkdir_max_ns,
+                    vfs_write_mkdir_histogram,
+                    elapsed,
+                ),
+                open_file: Self::build_stage_latency_stats(
+                    vfs_write_open_file_calls,
+                    vfs_write_open_file_total_ns,
+                    vfs_write_open_file_max_ns,
+                    vfs_write_open_file_histogram,
+                    elapsed,
+                ),
+                setattr: Self::build_stage_latency_stats(
+                    vfs_write_setattr_calls,
+                    vfs_write_setattr_total_ns,
+                    vfs_write_setattr_max_ns,
+                    vfs_write_setattr_histogram,
+                    elapsed,
+                ),
+                pre_drain: Self::build_stage_latency_stats(
+                    vfs_write_pre_drain_calls,
+                    vfs_write_pre_drain_total_ns,
+                    vfs_write_pre_drain_max_ns,
+                    vfs_write_pre_drain_histogram,
+                    elapsed,
+                ),
+                admission_throttle: Self::build_stage_latency_stats(
+                    vfs_write_admission_throttle_calls,
+                    vfs_write_admission_throttle_total_ns,
+                    vfs_write_admission_throttle_max_ns,
+                    vfs_write_admission_throttle_histogram,
+                    elapsed,
+                ),
+                file_session_wait: Self::build_stage_latency_stats(
+                    vfs_write_file_session_wait_calls,
+                    vfs_write_file_session_wait_total_ns,
+                    vfs_write_file_session_wait_max_ns,
+                    vfs_write_file_session_wait_histogram,
+                    elapsed,
+                ),
                 record_writer_stack_state: Self::build_stage_latency_stats(
                     vfs_write_record_writer_stack_state_calls,
                     vfs_write_record_writer_stack_state_total_ns,
@@ -7808,6 +8222,16 @@ impl StudioVfs {
                     vfs_write_record_writer_stack_state_histogram,
                     elapsed,
                 ),
+                getattr_async: Self::build_stage_latency_stats(
+                    vfs_write_getattr_async_calls,
+                    vfs_write_getattr_async_total_ns,
+                    vfs_write_getattr_async_max_ns,
+                    vfs_write_getattr_async_histogram,
+                    elapsed,
+                ),
+                dirty_attr_hits: vfs_write_dirty_attr_hits,
+                open_attr_hits: vfs_write_open_attr_hits,
+                active_open_overlay_fallbacks: vfs_write_active_open_overlay_fallbacks,
                 materialize_completed: Self::build_stage_latency_stats(
                     vfs_write_materialize_completed_calls,
                     vfs_write_materialize_completed_total_ns,
@@ -7827,6 +8251,13 @@ impl StudioVfs {
                     vfs_write_materialize_for_limits_total_ns,
                     vfs_write_materialize_for_limits_max_ns,
                     vfs_write_materialize_for_limits_histogram,
+                    elapsed,
+                ),
+                spawn_deferred_materialization: Self::build_stage_latency_stats(
+                    vfs_write_spawn_deferred_materialization_calls,
+                    vfs_write_spawn_deferred_materialization_total_ns,
+                    vfs_write_spawn_deferred_materialization_max_ns,
+                    vfs_write_spawn_deferred_materialization_histogram,
                     elapsed,
                 ),
             },
@@ -8103,6 +8534,7 @@ impl StudioVfs {
                 },
                 fetch_total_max_ms: fetch_total_max_ns as f64 / 1_000_000.0,
             },
+            foreground_reads,
             cache_pipeline: VfsCachePipelineStats {
                 materialize: VfsCachePipelineMaterializeStats {
                     batches: cache_pipeline_metrics.materialize_batches.batches,
@@ -8250,6 +8682,7 @@ impl StudioVfs {
         known_attr: Option<InodeAttr>,
         check_authority: bool,
     ) -> VfsResult<u64> {
+        let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::OpenFile);
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {

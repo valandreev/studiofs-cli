@@ -19,7 +19,6 @@ pub(super) struct NamespaceCreateSpec<'a> {
     name: &'a [u8],
     uid: u32,
     gid: u32,
-    created_at: i64,
     kind: NamespaceCreateKind<'a>,
 }
 
@@ -38,7 +37,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::File { mode },
         }
     }
@@ -57,7 +55,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::Directory { mode },
         }
     }
@@ -76,7 +73,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::Symlink { target },
         }
     }
@@ -118,16 +114,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             NamespaceCreateKind::Symlink { target } => {
                 InodeAttr::new_symlink(self.ino, self.parent, self.uid, self.gid, target.len())
             }
-        }
-    }
-
-    pub(super) fn pending_create_record(&self) -> PendingCreateRecord {
-        PendingCreateRecord {
-            ino: self.ino,
-            parent: self.parent,
-            name: self.name.to_vec(),
-            kind: self.kind(),
-            created_at: self.created_at,
         }
     }
 
@@ -720,30 +706,11 @@ impl RedbMetaEngine {
         &self,
         spec: NamespaceCreateSpec<'_>,
     ) -> MetaResult<InodeAttr> {
-        let intent = spec.pending_create_record();
-        self.add_pending_create(&intent)?;
-
-        let create_result = (|| -> MetaResult<InodeAttr> {
-            let txn = self
-                .db
-                .begin_write()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
-            txn.commit()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Ok(result_attr)
-        })();
-
-        match create_result {
-            Ok(attr) => {
-                self.remove_pending_create(spec.ino)?;
-                Ok(attr)
-            }
-            Err(err) => {
-                let _ = self.remove_pending_create(spec.ino);
-                Err(err)
-            }
-        }
+        let txn = self.begin_write_txn()?;
+        let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
     }
 
     pub(crate) fn create_file_with_ino(
@@ -792,10 +759,7 @@ impl RedbMetaEngine {
         &self,
         spec: NamespaceDeleteSpec<'_>,
     ) -> MetaResult<NamespaceDeleteResult> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let result = NamespaceDeleteTxn::new(&txn).execute(&spec)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -813,10 +777,7 @@ impl MetaFsOps for RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
     ) -> MetaResult<RenameAtomicResult> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
             MetaError::EntryNotFound {
                 parent,
@@ -958,10 +919,7 @@ impl MetaFsOps for RedbMetaEngine {
             });
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_write_txn()?;
         let result;
         let parent_attr_event: Option<InodeAttr>;
         {
@@ -1027,6 +985,20 @@ impl MetaFsOps for RedbMetaEngine {
         ))
     }
 
+    fn create_file_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.execute_namespace_create(NamespaceCreateSpec::new_file(
+            ino, parent, name, uid, gid, mode,
+        ))
+    }
+
     fn create_dir(
         &self,
         parent: Ino,
@@ -1036,6 +1008,20 @@ impl MetaFsOps for RedbMetaEngine {
         mode: u16,
     ) -> MetaResult<InodeAttr> {
         let ino = self.next_inode()?;
+        self.execute_namespace_create(NamespaceCreateSpec::new_dir(
+            ino, parent, name, uid, gid, mode,
+        ))
+    }
+
+    fn create_dir_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
         self.execute_namespace_create(NamespaceCreateSpec::new_dir(
             ino, parent, name, uid, gid, mode,
         ))

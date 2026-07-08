@@ -124,6 +124,7 @@ const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
 const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
 const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
 const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
+const FOREGROUND_UPLOAD_ADMISSION_DELAY: Duration = Duration::from_secs(2);
 
 fn post_put_visibility_delay(attempt: usize) -> Duration {
     let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
@@ -157,6 +158,14 @@ fn upload_reread_idle_wait_window(
         Duration::ZERO
     } else {
         adaptive_penalty.max(idle_grace)
+    }
+}
+
+fn upload_admission_delay(foreground_active: bool, adaptive_penalty: Duration) -> Duration {
+    if foreground_active {
+        adaptive_penalty.max(FOREGROUND_UPLOAD_ADMISSION_DELAY)
+    } else {
+        adaptive_penalty
     }
 }
 
@@ -353,6 +362,7 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
 
 trait RemoteUploadPort: Clone + Send + Sync + 'static {
     fn adaptive_penalty_ms(&self) -> u64;
+    fn upload_admission_delay(&self, adaptive_penalty: Duration) -> Duration;
     fn fragment_keys(&self, object_id: u64) -> Vec<String>;
     async fn all_fragments_visible(
         &self,
@@ -571,10 +581,12 @@ where
             return Ok(SingleUploadOutcome::CancelledDeleted);
         }
 
-        let adaptive_penalty_ms = self.remote.adaptive_penalty_ms();
-        let effective_adaptive_penalty_ms =
-            adaptive_penalty_ms.saturating_sub(waited_upload_delay_ms);
-        if effective_adaptive_penalty_ms > 0 {
+        let adaptive_penalty = Duration::from_millis(self.remote.adaptive_penalty_ms());
+        let admission_delay = self
+            .remote
+            .upload_admission_delay(adaptive_penalty)
+            .saturating_sub(Duration::from_millis(waited_upload_delay_ms));
+        if !admission_delay.is_zero() {
             let shutdown_token = self.shutdown.shutdown_token();
             tokio::select! {
                 _ = shutdown_token.cancelled() => return Ok(SingleUploadOutcome::Shutdown),
@@ -585,7 +597,7 @@ where
                         Ok(SingleUploadOutcome::Shutdown)
                     };
                 }
-                _ = tokio::time::sleep(Duration::from_millis(effective_adaptive_penalty_ms)) => {}
+                _ = tokio::time::sleep(admission_delay) => {}
             }
         }
 
@@ -613,7 +625,7 @@ where
         }
 
         self.local_payloads
-            .prepare_local_priority_read(op.object_id, Duration::from_millis(adaptive_penalty_ms))
+            .prepare_local_priority_read(op.object_id, adaptive_penalty)
             .await?;
 
         let t0 = Instant::now();
@@ -1616,6 +1628,15 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         self.vfs.upload_scheduler.adaptive_penalty_ms()
     }
 
+    fn upload_admission_delay(&self, adaptive_penalty: Duration) -> Duration {
+        let foreground_active = self
+            .vfs
+            .state
+            .read
+            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        upload_admission_delay(foreground_active, adaptive_penalty)
+    }
+
     fn fragment_keys(&self, object_id: u64) -> Vec<String> {
         format_object_fragment_keys(&self.vfs.data_prefix, object_id).into()
     }
@@ -2526,6 +2547,10 @@ mod tests {
     impl RemoteUploadPort for FakeRemote {
         fn adaptive_penalty_ms(&self) -> u64 {
             self.adaptive_penalty_ms
+        }
+
+        fn upload_admission_delay(&self, adaptive_penalty: Duration) -> Duration {
+            adaptive_penalty
         }
 
         fn fragment_keys(&self, object_id: u64) -> Vec<String> {
@@ -3894,6 +3919,22 @@ mod tests {
                 Duration::from_millis(50),
             ),
             Duration::from_millis(240)
+        );
+    }
+
+    #[test]
+    fn upload_admission_delay_throttles_foreground_io() {
+        assert_eq!(
+            upload_admission_delay(false, Duration::from_millis(240)),
+            Duration::from_millis(240)
+        );
+        assert_eq!(
+            upload_admission_delay(true, Duration::from_millis(240)),
+            FOREGROUND_UPLOAD_ADMISSION_DELAY
+        );
+        assert_eq!(
+            upload_admission_delay(true, Duration::from_secs(3)),
+            Duration::from_secs(3)
         );
     }
 

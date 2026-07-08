@@ -2,9 +2,10 @@ use super::*;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
@@ -19,6 +20,8 @@ use tracing::{debug, warn};
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
+const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
@@ -122,7 +125,13 @@ unsafe extern "C" {
         len: off_t,
     ) -> c_int;
     fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
-    fn studiofs_linux_fuse_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
+    fn studiofs_linux_fuse_file_info_init(
+        info: *mut raw::FuseFileInfo,
+        fh: u64,
+        direct_io: c_int,
+        keep_cache: c_int,
+        parallel_direct_writes: c_int,
+    );
     fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
     fn studiofs_linux_fuse_file_info_flags(info: *const raw::FuseFileInfo) -> c_int;
     #[cfg(test)]
@@ -150,12 +159,23 @@ unsafe extern "C" {
     #[cfg(test)]
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_conn_wants_async_dio_after_set(capable_ext: u64) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_conn_wants_writeback_cache_after_set(capable_ext: u64) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_flags_after_init(
+        direct_io: c_int,
+        keep_cache: c_int,
+        parallel_direct_writes: c_int,
+    ) -> c_int;
 }
 
 pub(crate) struct SessionState {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
+    async_writes: Arc<LinuxFuseAsyncWrites>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
@@ -163,6 +183,19 @@ pub(crate) struct SessionState {
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxFuseCachePolicy {
+    Direct,
+    Kernel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxFuseOpenCachePolicy {
+    direct_io: bool,
+    keep_cache: bool,
+    parallel_direct_writes: bool,
+}
 
 impl SessionState {
     pub(crate) fn new(
@@ -174,6 +207,10 @@ impl SessionState {
         Self {
             vfs,
             runtime_handle,
+            async_writes: Arc::new(LinuxFuseAsyncWrites::new(
+                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
+                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES,
+            )),
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
@@ -183,6 +220,113 @@ impl SessionState {
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+#[derive(Clone, Copy, Debug)]
+struct FuseReqPtr(*mut raw::FuseReq);
+
+// SAFETY: libfuse low-level requests may be replied asynchronously exactly once.
+// Async write transfers that reply obligation to the spawned task.
+unsafe impl Send for FuseReqPtr {}
+
+impl FuseReqPtr {
+    fn reply_write(self, written: size_t) {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
+        unsafe { raw::fuse_reply_write(self.0, written) };
+    }
+
+    fn reply_error(self, errno: c_int) {
+        reply_error(self.0, errno);
+    }
+}
+
+#[derive(Debug)]
+struct LinuxFuseAsyncWrites {
+    limits: LinuxFuseAsyncWriteLimits,
+    state: Mutex<LinuxFuseAsyncWriteState>,
+    // Block libfuse worker threads here so write backpressure reaches the kernel.
+    idle: Condvar,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxFuseAsyncWriteLimits {
+    max_pending_bytes: usize,
+    max_pending_writes: usize,
+}
+
+#[derive(Default, Debug)]
+struct LinuxFuseAsyncWriteState {
+    pending_bytes: usize,
+    pending_writes: usize,
+}
+
+struct LinuxFuseAsyncWriteReservation {
+    writes: Arc<LinuxFuseAsyncWrites>,
+    bytes: usize,
+}
+
+impl LinuxFuseAsyncWrites {
+    fn new(max_pending_bytes: usize, max_pending_writes: usize) -> Self {
+        Self {
+            limits: LinuxFuseAsyncWriteLimits {
+                max_pending_bytes,
+                max_pending_writes,
+            },
+            state: Mutex::new(LinuxFuseAsyncWriteState::default()),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: usize) -> LinuxFuseAsyncWriteReservation {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        while self.should_wait(&state, bytes) {
+            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
+        }
+        state.pending_writes += 1;
+        state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+        LinuxFuseAsyncWriteReservation {
+            writes: self.clone(),
+            bytes,
+        }
+    }
+
+    fn should_wait(&self, state: &LinuxFuseAsyncWriteState, bytes: usize) -> bool {
+        state.pending_writes >= self.limits.max_pending_writes
+            || (state.pending_bytes > 0
+                && state.pending_bytes.saturating_add(bytes) > self.limits.max_pending_bytes)
+    }
+
+    fn wait_idle(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        while state.pending_writes > 0 {
+            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        (state.pending_writes, state.pending_bytes)
+    }
+
+    fn finish(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.pending_writes = state.pending_writes.saturating_sub(1);
+        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        self.idle.notify_all();
+    }
+}
+
+impl Drop for LinuxFuseAsyncWriteReservation {
+    fn drop(&mut self) {
+        self.writes.finish(self.bytes);
+    }
+}
+
+struct LinuxFuseWriteRequest {
+    fh: u64,
+    offset: u64,
+    local_sync_policy: LocalSyncPolicy,
+}
 
 fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
     let parallelism = std::thread::available_parallelism()
@@ -218,6 +362,28 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
         .unwrap_or_else(|| LinuxFuseConnectionConfig::default().congestion_threshold)
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
+    _userdata: *mut c_void,
+) -> c_int {
+    if linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO") {
+        1
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
+    _userdata: *mut c_void,
+) -> c_int {
+    if linux_fuse_cache_policy_from_env() == LinuxFuseCachePolicy::Kernel {
+        1
+    } else {
+        0
+    }
+}
+
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions.
     unsafe { libc::geteuid() }
@@ -228,7 +394,84 @@ fn current_gid() -> u32 {
     unsafe { libc::getegid() }
 }
 
+fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
+    // ponytail: internal benchmark knob; promote only after studiofs-bench proves it.
+    std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY")
+        .ok()
+        .and_then(|value| linux_fuse_cache_policy_from_str(&value))
+        .unwrap_or(LinuxFuseCachePolicy::Direct)
+}
+
+fn linux_fuse_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| linux_fuse_env_flag_value(&value))
+}
+
+fn linux_fuse_env_flag_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn linux_fuse_async_write_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        linux_fuse_async_write_enabled_from_env(
+            std::env::var("STUDIOFS_FUSE_ASYNC_WRITE").ok().as_deref(),
+            std::env::var("STUDIOFS_FUSE_ASYNC_WRITE_DISABLED")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn linux_fuse_async_write_enabled_from_env(
+    async_write: Option<&str>,
+    disabled: Option<&str>,
+) -> bool {
+    if disabled.is_some_and(linux_fuse_env_flag_value) {
+        return false;
+    }
+    async_write.is_none_or(linux_fuse_env_flag_value)
+}
+
+fn linux_fuse_metadata_admission_enabled() -> bool {
+    true
+}
+
+fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
+    args.size.is_none()
+        && (args.mode.is_some()
+            || args.uid.is_some()
+            || args.gid.is_some()
+            || !matches!(args.atime, TimeSpec::Omit)
+            || !matches!(args.mtime, TimeSpec::Omit)
+            || !matches!(args.crtime, TimeSpec::Omit)
+            || args.win_attrs.is_some())
+}
+
+fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
+            Some(LinuxFuseCachePolicy::Direct)
+        }
+        "kernel" | "cached" | "page_cache" | "1" | "true" | "yes" | "on" => {
+            Some(LinuxFuseCachePolicy::Kernel)
+        }
+        _ => None,
+    }
+}
+
 fn argv_strings(volume_name: &str) -> Vec<String> {
+    argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env())
+}
+
+fn argv_strings_for_cache_policy(
+    volume_name: &str,
+    _cache_policy: LinuxFuseCachePolicy,
+) -> Vec<String> {
     vec![
         "studiofs-linux-fuse".to_owned(),
         "-o".to_owned(),
@@ -810,12 +1053,21 @@ pub extern "C" fn studiofs_linux_fuse_read(
         reply_error(req, libc::EIO);
         return;
     };
+    let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
+            state
+                .vfs
+                .record_fuse_read_callback(buffer.len(), started.elapsed(), false);
             // SAFETY: `buffer` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            state
+                .vfs
+                .record_fuse_read_callback(size, started.elapsed(), true);
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -848,12 +1100,37 @@ pub extern "C" fn studiofs_linux_fuse_write(
         reply_error(req, libc::EIO);
         return;
     };
+    let started = Instant::now();
+    match state.queue_async_write(req, ino, buf, size, off, fi) {
+        Ok(true) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), false);
+            return;
+        }
+        Ok(false) => {}
+        Err(errno) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), true);
+            reply_error(req, errno);
+            return;
+        }
+    }
     match state.write(ino, buf, size, off, fi) {
         Ok(written) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), false);
             // SAFETY: `req` is live and this consumes the callback reply.
             unsafe { raw::fuse_reply_write(req, written as size_t) };
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), true);
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -1170,6 +1447,12 @@ impl SessionState {
         ino: u64,
         args: SetattrArgs,
     ) -> Result<InodeAttr, i32> {
+        if linux_fuse_metadata_admission_enabled() && linux_fuse_setattr_args_are_attr_only(&args) {
+            return self
+                .vfs
+                .setattr_attr_only_deferred_metadata(ino, args, &self.runtime_handle)
+                .map_err(|error| vfs_err_to_errno(&error));
+        }
         self.vfs
             .setattr_with_handle(file_handle, ino, args)
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1185,20 +1468,26 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        require_file_info(fi)?;
         let file_type = mode & libc::S_IFMT as mode_t;
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
         }
-        let attr = self
-            .vfs
-            .create(
+        let mode = (mode & 0o7777) as u16;
+        let attr = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.create_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        } else {
+            self.vfs
+                .create(parent, name, self.mount_uid, self.mount_gid, mode)
+        }
+        .map_err(|error| vfs_err_to_errno(&error))?;
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
         let fh = self
             .vfs
@@ -1211,15 +1500,21 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .mkdir(
+        let mode = (mode & 0o7777) as u16;
+        let result = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.mkdir_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            self.vfs
+                .mkdir(parent, name, self.mount_uid, self.mount_gid, mode)
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
@@ -1230,15 +1525,21 @@ impl SessionState {
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
         }
-        self.vfs
-            .create(
+        let mode = (mode & 0o7777) as u16;
+        let result = if linux_fuse_metadata_admission_enabled() {
+            self.vfs.create_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                (mode & 0o7777) as u16,
+                mode,
+                &self.runtime_handle,
             )
-            .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            self.vfs
+                .create(parent, name, self.mount_uid, self.mount_gid, mode)
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<InodeAttr, i32> {
@@ -1339,6 +1640,76 @@ impl SessionState {
         offset: off_t,
         fi: *const raw::FuseFileInfo,
     ) -> Result<u32, i32> {
+        let request = self.prepare_write_metadata(buf, size, offset, fi)?;
+        with_write_data_slice(buf, size, |data| {
+            self.runtime_handle
+                .block_on(self.vfs.write_fh_with_deferred_materialize(
+                    request.fh,
+                    ino,
+                    request.offset,
+                    data,
+                    request.local_sync_policy,
+                ))
+        })?
+        .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn queue_async_write(
+        &self,
+        req: *mut raw::FuseReq,
+        ino: u64,
+        buf: *const c_char,
+        size: usize,
+        offset: off_t,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<bool, i32> {
+        if !linux_fuse_async_write_enabled() {
+            return Ok(false);
+        }
+        let request = self.prepare_write_metadata(buf, size, offset, fi)?;
+        if !request.local_sync_policy.is_opportunistic() {
+            return Ok(false);
+        }
+
+        let data = with_write_data_slice(buf, size, |data| {
+            let reservation = self.async_writes.reserve(data.len());
+            (reservation, Bytes::copy_from_slice(data))
+        })?;
+        let (reservation, data) = data;
+        let fh = request.fh;
+        let write_offset = request.offset;
+        let vfs = self.vfs.clone();
+        let req = FuseReqPtr(req);
+        self.runtime_handle.spawn(async move {
+            let result = vfs
+                .write_fh_owned_with_deferred_materialize(
+                    fh,
+                    ino,
+                    write_offset,
+                    data,
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await;
+            drop(reservation);
+            match result {
+                Ok(written) => {
+                    req.reply_write(written as size_t);
+                }
+                Err(error) => {
+                    req.reply_error(vfs_err_to_errno(&error));
+                }
+            }
+        });
+        Ok(true)
+    }
+
+    fn prepare_write_metadata(
+        &self,
+        buf: *const c_char,
+        size: usize,
+        offset: off_t,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<LinuxFuseWriteRequest, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1347,23 +1718,12 @@ impl SessionState {
         if buf.is_null() && size > 0 {
             return Err(libc::EINVAL);
         }
-        let data = if size == 0 {
-            &[]
-        } else {
-            // SAFETY: libfuse passes `buf` as a request-owned byte slice valid for
-            // the duration of the callback.
-            unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
-        };
         let local_sync_policy = self.local_sync_policy_for_handle(fh);
-        self.runtime_handle
-            .block_on(self.vfs.write_fh_with_deferred_materialize(
-                fh,
-                ino,
-                offset,
-                data,
-                local_sync_policy,
-            ))
-            .map_err(|error| vfs_err_to_errno(&error))
+        Ok(LinuxFuseWriteRequest {
+            fh,
+            offset,
+            local_sync_policy,
+        })
     }
 
     fn local_sync_policy_for_handle(&self, fh: u64) -> LocalSyncPolicy {
@@ -1375,12 +1735,26 @@ impl SessionState {
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
+        self.async_writes.wait_idle();
+        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
+            let ino = self
+                .vfs
+                .get_open_file(fh)
+                .map(|open_file| open_file.ino)
+                .ok_or(libc::EBADF)?;
+            return self
+                .runtime_handle
+                .block_on(self.vfs.flush_fuse_writeback_with_outcome(ino, fh))
+                .map(|_| ())
+                .map_err(|error| vfs_err_to_errno(&error));
+        }
         self.runtime_handle
             .block_on(self.vfs.flush_fh(fh))
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
+        self.async_writes.wait_idle();
         let result = if let Some(fh) = file_handle {
             // Handle-backed sync must preserve pending handle-local write state;
             // StudioVfs does not currently distinguish fdatasync from fsync on
@@ -1393,6 +1767,12 @@ impl SessionState {
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
+        self.async_writes.wait_idle();
+        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
+            self.vfs
+                .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+            return Ok(());
+        }
         self.runtime_handle
             .block_on(self.vfs.release_fh(fh))
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1694,6 +2074,57 @@ fn clamp_read_size(size: usize) -> usize {
     size.min(LINUX_FUSE_MAX_READ_SIZE)
 }
 
+fn with_write_data_slice<T>(
+    buf: *const c_char,
+    size: usize,
+    f: impl FnOnce(&[u8]) -> T,
+) -> Result<T, i32> {
+    if size == 0 {
+        return Ok(f(&[]));
+    }
+    if buf.is_null() {
+        return Err(libc::EINVAL);
+    }
+    // SAFETY: libfuse passes `buf` as a request-owned byte slice valid for the
+    // duration of this write callback; the closure cannot return a borrowed
+    // reference to it because the slice has no named lifetime.
+    Ok(f(unsafe {
+        std::slice::from_raw_parts(buf.cast::<u8>(), size)
+    }))
+}
+
+fn linux_fuse_open_cache_policy(flags: c_int) -> LinuxFuseOpenCachePolicy {
+    linux_fuse_open_cache_policy_for(flags, linux_fuse_cache_policy_from_env())
+}
+
+fn linux_fuse_open_cache_policy_for(
+    flags: c_int,
+    cache_policy: LinuxFuseCachePolicy,
+) -> LinuxFuseOpenCachePolicy {
+    if cache_policy == LinuxFuseCachePolicy::Direct {
+        return LinuxFuseOpenCachePolicy {
+            direct_io: true,
+            keep_cache: false,
+            parallel_direct_writes: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+        };
+    }
+
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    let write_capable = trunc
+        || open_flags.contains(OpenFlags::WRONLY)
+        || open_flags.contains(OpenFlags::RDWR)
+        || flags & libc::O_APPEND != 0;
+    LinuxFuseOpenCachePolicy {
+        direct_io: false,
+        keep_cache: !write_capable,
+        parallel_direct_writes: false,
+    }
+}
+
+fn fuse_flag(value: bool) -> c_int {
+    if value { 1 } else { 0 }
+}
+
 fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
@@ -1743,7 +2174,14 @@ fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) 
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, fh);
+        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
+        studiofs_linux_fuse_file_info_init(
+            fi,
+            fh,
+            fuse_flag(policy.direct_io),
+            fuse_flag(policy.keep_cache),
+            fuse_flag(policy.parallel_direct_writes),
+        );
         raw::fuse_reply_open(req, fi);
     }
 }
@@ -1769,7 +2207,14 @@ fn reply_create(
     };
     // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
     unsafe {
-        studiofs_linux_fuse_file_info_init(fi, fh);
+        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
+        studiofs_linux_fuse_file_info_init(
+            fi,
+            fh,
+            fuse_flag(policy.direct_io),
+            fuse_flag(policy.keep_cache),
+            fuse_flag(policy.parallel_direct_writes),
+        );
         raw::fuse_reply_create(req, &entry, fi);
     }
 }
@@ -2065,8 +2510,72 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
+    }
+
+    #[test]
+    fn argv_kernel_cache_policy_keeps_mount_options_portable() {
+        let args =
+            super::argv_strings_for_cache_policy("demo", super::LinuxFuseCachePolicy::Kernel);
+
+        assert!(!args.iter().any(|arg| arg == "writeback_cache"));
+    }
+
+    #[test]
+    fn conn_feature_helper_requests_writeback_cache_when_supported() {
+        let writeback_cache_cap = 1_u64 << 16;
+        // SAFETY: the C shim mutates and inspects a stack-local fuse_conn_info.
+        let enabled = unsafe {
+            super::studiofs_linux_fuse_conn_wants_writeback_cache_after_set(writeback_cache_cap)
+        };
+
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn conn_feature_helper_requests_async_dio_when_supported() {
+        let async_dio_cap = 1_u64 << 15;
+        // SAFETY: the C shim mutates and inspects a stack-local fuse_conn_info.
+        let enabled =
+            unsafe { super::studiofs_linux_fuse_conn_wants_async_dio_after_set(async_dio_cap) };
+
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn async_write_reservation_releases_pending_bytes_on_drop() {
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+
+        let reservation = writes.reserve(8);
+        assert_eq!(writes.snapshot(), (1, 8));
+
+        drop(reservation);
+        assert_eq!(writes.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn async_write_defaults_to_enabled_with_explicit_disable() {
+        assert!(super::linux_fuse_env_flag_value("1"));
+        assert!(super::linux_fuse_env_flag_value("true"));
+        assert!(super::linux_fuse_env_flag_value("yes"));
+        assert!(super::linux_fuse_env_flag_value("on"));
+        assert!(!super::linux_fuse_env_flag_value("0"));
+        assert!(!super::linux_fuse_env_flag_value("false"));
+        assert!(super::linux_fuse_async_write_enabled_from_env(None, None));
+        assert!(super::linux_fuse_async_write_enabled_from_env(
+            Some("1"),
+            None
+        ));
+        assert!(!super::linux_fuse_async_write_enabled_from_env(
+            Some("0"),
+            None
+        ));
+        assert!(!super::linux_fuse_async_write_enabled_from_env(
+            Some("1"),
+            Some("1")
+        ));
     }
 
     #[test]
@@ -2210,6 +2719,48 @@ mod tests {
     }
 
     #[test]
+    fn file_info_init_sets_requested_cache_flags() {
+        // SAFETY: the C shim initializes and inspects a stack-local fuse_file_info.
+        let flags = unsafe { super::studiofs_linux_fuse_file_info_flags_after_init(0, 1, 1) };
+
+        assert_eq!(flags, 6);
+    }
+
+    #[test]
+    fn kernel_cache_policy_keeps_read_only_open_cache() {
+        let policy = super::linux_fuse_open_cache_policy_for(
+            libc::O_RDONLY,
+            super::LinuxFuseCachePolicy::Kernel,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: true,
+                parallel_direct_writes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn kernel_cache_policy_drops_write_capable_open_cache() {
+        let policy = super::linux_fuse_open_cache_policy_for(
+            libc::O_RDWR,
+            super::LinuxFuseCachePolicy::Kernel,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: false,
+                parallel_direct_writes: false,
+            }
+        );
+    }
+
+    #[test]
     fn invalidation_state_wait_for_idle_returns_true_when_idle() {
         let state = super::SessionInvalidationState::new();
 
@@ -2331,6 +2882,25 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_null_file_info_before_touching_vfs() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-create-null-fi")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+
+        assert!(matches!(
+            state.create(1, b"null-fi.txt", libc::S_IFREG | 0o644, std::ptr::null()),
+            Err(errno) if errno == libc::EINVAL
+        ));
+        assert!(fixture.vfs().lookup(1, b"null-fi.txt").is_err());
+    }
+
+    #[test]
     fn read_only_namespace_mutations_reject_before_touching_vfs() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-mutate")
@@ -2407,6 +2977,52 @@ mod tests {
         assert_eq!(args.uid, Some(1000));
         assert_eq!(args.gid, Some(1001));
         assert_eq!(args.mtime.resolve(), Some(7_000_000_009));
+    }
+
+    #[test]
+    fn setattr_args_attr_only_classifier_accepts_metadata_updates_without_size() {
+        for args in [
+            studiofs_meta::SetattrArgs {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                uid: Some(1000),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                gid: Some(1001),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                mtime: studiofs_meta::TimeSpec::Now,
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                win_attrs: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(super::linux_fuse_setattr_args_are_attr_only(&args));
+        }
+    }
+
+    #[test]
+    fn setattr_args_attr_only_classifier_rejects_empty_and_size_updates() {
+        for args in [
+            studiofs_meta::SetattrArgs::default(),
+            studiofs_meta::SetattrArgs {
+                size: Some(42),
+                ..Default::default()
+            },
+            studiofs_meta::SetattrArgs {
+                size: Some(42),
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        ] {
+            assert!(!super::linux_fuse_setattr_args_are_attr_only(&args));
+        }
     }
 
     #[test]

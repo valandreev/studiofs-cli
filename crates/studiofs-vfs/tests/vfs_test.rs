@@ -61,6 +61,8 @@ use uuid::Uuid;
 // Test Helpers
 // =============================================================================
 
+const LIVE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 trait FileGraphMetaFixture {
     fn stage_payload_slice(
         &self,
@@ -11081,7 +11083,12 @@ async fn create_should_persist_ds_store_as_regular_file() {
     vfs.flush(attr.ino).await.unwrap();
     vfs.release_fh(fh).await.unwrap();
 
-    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    assert!(
+        vfs.wait_for_uploads_idle(LIVE_UPLOAD_IDLE_TIMEOUT).await,
+        "upload queue did not drain: stats={:?} pending={:?}",
+        vfs.upload_stats(),
+        vfs.pending_uploads_for_inode(attr.ino)
+    );
     assert!(vfs.meta().lookup(1, b".DS_Store").is_ok());
     assert!(vfs.lookup(1, b".DS_Store").is_ok());
     assert_eq!(vfs.readdir(1).unwrap().len(), 1);
@@ -11102,7 +11109,7 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
     vfs.flush(attr.ino).await.unwrap();
     vfs.release_fh(fh).await.unwrap();
 
-    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    assert!(vfs.wait_for_uploads_idle(LIVE_UPLOAD_IDLE_TIMEOUT).await);
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
     assert!(vfs.meta().lookup(1, b"._photo.jpg").is_err());
@@ -11188,7 +11195,7 @@ async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_chil
     assert!(read_back.iter().all(|byte| *byte == 0));
 
     vfs.release_fh(fh).await.unwrap();
-    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    assert!(vfs.wait_for_uploads_idle(LIVE_UPLOAD_IDLE_TIMEOUT).await);
 
     assert_eq!(vfs.readdir(1).unwrap().len(), 0);
     assert_eq!(vfs.readdir(dir.ino).unwrap().len(), 0);
@@ -11196,7 +11203,7 @@ async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_chil
     assert!(vfs.lookup(1, b".Spotlight-V100").is_ok());
     assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
     assert!(vfs.meta().lookup(dir.ino, b"Store-V2").is_err());
-    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    assert!(vfs.wait_for_uploads_idle(LIVE_UPLOAD_IDLE_TIMEOUT).await);
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
 

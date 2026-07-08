@@ -1,9 +1,9 @@
 use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino,
-    LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, OpenFile,
-    OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
-    VfsResult,
+    LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, MetaUploadState,
+    OpenFile, OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy,
+    StudioVfs, VfsResult,
 };
 use bytes::Bytes;
 use std::collections::BTreeSet;
@@ -217,8 +217,18 @@ impl StudioVfs {
         }
         let admission = self.observe_sustained_write_admission(ino, offset, len);
         if !admission.pre_drain {
-            return Ok(admission.delay_ms);
+            return Ok(0);
         }
+        let pressure_after_write = self.total_pending_write_buffer_bytes().saturating_add(len);
+        let pacing_threshold = self
+            .max_dirty_bytes()
+            .saturating_div(2)
+            .max(self.write_eager_flush_drain_chunk_bytes);
+        let delay_ms = if pressure_after_write > pacing_threshold {
+            admission.delay_ms
+        } else {
+            0
+        };
 
         // #region debug log
         self.debug_write_probe(
@@ -230,7 +240,10 @@ impl StudioVfs {
                 "offset": offset,
                 "len": len,
                 "duration_ms": admission.duration_ms,
-                "delay_ms": admission.delay_ms,
+                "delay_ms": delay_ms,
+                "raw_delay_ms": admission.delay_ms,
+                "pacing_threshold_bytes": pacing_threshold,
+                "pressure_after_write": pressure_after_write,
                 "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
             }),
@@ -238,7 +251,7 @@ impl StudioVfs {
         // #endregion debug log
 
         self.spawn_deferred_materialization_if_needed(ino).await;
-        Ok(admission.delay_ms)
+        Ok(delay_ms)
     }
 
     fn record_deferred_write_hard_backpressure(&self, ino: Ino, hard_threshold_bytes: usize) {
@@ -491,6 +504,21 @@ impl StudioVfs {
                 tokio::task::yield_now().await;
             }
 
+            if vfs.inode_has_local_dirty_state(ino)
+                && let Err(error) = vfs
+                    .flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
+                    .await
+            {
+                allow_reschedule_on_exit = false;
+                if !vfs.suppress_deleted_inode_materialization_error(ino, &error) {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "deferred local metadata drain failed; will retry at next strict barrier"
+                    );
+                }
+            }
+
             vfs.finish_deferred_materialization_task(entry, allow_reschedule_on_exit);
             drop(guard);
         }));
@@ -566,6 +594,9 @@ impl StudioVfs {
         self.debug_pending_inode_state(ino, "release_handle_closed");
         if remaining > 0 {
             return None;
+        }
+        if self.inode_has_local_dirty_state(ino) {
+            self.invalidate_kernel_inode_attrs([ino]);
         }
         self.debug_pending_inode_state(ino, "release_last_handle");
         Some(HandleReleaseContext { open_file, ino })
@@ -679,6 +710,32 @@ impl StudioVfs {
         }
     }
 
+    async fn execute_deferred_last_handle_release_action(
+        &self,
+        ino: Ino,
+        action: LastHandleReleaseAction,
+    ) -> VfsResult<ReleaseFhOutcome> {
+        match action {
+            LastHandleReleaseAction::LocalSync {
+                sticky_error_policy,
+            } => {
+                let outcome = self
+                    .local_sync_barrier_with_outcome(
+                        ino,
+                        LocalSyncPolicy::Opportunistic,
+                        sticky_error_policy,
+                        DirtyAttrPersistPolicy::PersistIfPresent,
+                    )
+                    .await?;
+                Ok(ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: outcome.had_local_dirty_state,
+                })
+            }
+            action => self.execute_last_handle_release_action(ino, action).await,
+        }
+    }
+
     async fn release_last_handle_with_outcome(
         &self,
         context: HandleReleaseContext,
@@ -750,7 +807,9 @@ impl StudioVfs {
                 .file_session
                 .enter_op(ino, FileSessionOperation::Release)
                 .await;
-            let result = vfs.execute_last_handle_release_action(ino, action).await;
+            let result = vfs
+                .execute_deferred_last_handle_release_action(ino, action)
+                .await;
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
             if let Err(error) = result {
@@ -1465,19 +1524,25 @@ impl StudioVfs {
             }
         }
         if local_sync_policy.is_opportunistic() {
+            let pre_drain_started = Instant::now();
             let sustained_delay_ms = self
                 .maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
+            self.record_vfs_write_pre_drain(pre_drain_started.elapsed());
+            let admission_throttle_started = Instant::now();
             self.maybe_throttle_write_admission(data.len(), sustained_delay_ms)
                 .await;
+            self.record_vfs_write_admission_throttle(admission_throttle_started.elapsed());
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
+        let file_session_wait_started = Instant::now();
         let mut session = Some(
             self.state
                 .file_session
                 .enter_op(ino, FileSessionOperation::Write)
                 .await,
         );
+        self.record_vfs_write_file_session_wait(file_session_wait_started.elapsed());
         let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -1550,7 +1615,9 @@ impl StudioVfs {
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
             (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
+                let spawn_started = Instant::now();
                 self.spawn_deferred_materialization_if_needed(ino).await;
+                self.record_vfs_write_spawn_deferred_materialization(spawn_started.elapsed());
             }
             (Ok(_), policy) if policy.requires_write_path_durability() => {
                 // Durability-required: await writer-stack materialization inline.
@@ -1628,9 +1695,21 @@ impl StudioVfs {
     ) -> VfsResult<u32> {
         let mut base_attr;
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
+            self.note_vfs_write_dirty_attr_hit();
+            base_attr = attr;
+        } else if let Some(attr) = self
+            .handle_table
+            .get(fh)
+            .filter(|open_file| open_file.ino == ino)
+            .and_then(|open_file| open_file.open_attr.clone())
+        {
+            self.note_vfs_write_open_attr_hit();
             base_attr = attr;
         } else {
-            base_attr = match self.getattr_async(ino).await {
+            let getattr_started = Instant::now();
+            let getattr_result = self.getattr_async(ino).await;
+            self.record_vfs_write_getattr_async(getattr_started.elapsed());
+            base_attr = match getattr_result {
                 Ok(attr) => attr,
                 Err(error)
                     if Self::is_inode_not_found_error(&error, ino)
@@ -1639,6 +1718,7 @@ impl StudioVfs {
                             .get(fh)
                             .is_some_and(|open_file| open_file.active_open_overlay) =>
                 {
+                    self.note_vfs_write_active_open_overlay_fallback();
                     let open_file = self
                         .handle_table
                         .get(fh)
@@ -1653,6 +1733,16 @@ impl StudioVfs {
             };
             self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
             self.begin_pending_incarnation(ino, &mut base_attr);
+            base_attr.upload_state =
+                if base_attr.committed_size > 0 || base_attr.committed_content_epoch > 0 {
+                    MetaUploadState::Updating
+                } else {
+                    MetaUploadState::Uploading
+                };
+        }
+        if base_attr.is_unpublished_empty_draft() && !data.is_empty() {
+            self.begin_size_change_incarnation(ino, &mut base_attr);
+            base_attr.upload_state = MetaUploadState::Uploading;
         }
 
         let spec = super::writer_stack::WriterWriteSpec {
@@ -1672,8 +1762,20 @@ impl StudioVfs {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
             attr.content_epoch = attr.content_epoch.max(base_attr.content_epoch);
+            if base_attr.upload_state != MetaUploadState::Ready {
+                attr.upload_state = base_attr.upload_state;
+            }
             attr.kind = FileType::RegularFile;
             if accepted.visible_len > attr.size {
+                if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
+                    self.begin_size_change_incarnation(ino, attr);
+                    attr.upload_state =
+                        if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
+                            MetaUploadState::Updating
+                        } else {
+                            MetaUploadState::Uploading
+                        };
+                }
                 attr.size = accepted.visible_len;
             }
             attr.touch_mtime();
