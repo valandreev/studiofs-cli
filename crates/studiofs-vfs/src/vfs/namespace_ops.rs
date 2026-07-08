@@ -954,7 +954,7 @@ impl StudioVfs {
             .filter(|op| op.ino == ino)
             .filter(|op| retained.contains_key(&op.object_id))
             .map(|op| (op.object_id, op))
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .collect::<std::collections::HashMap<_, _>>();
         if !retained_pending.is_empty() {
             self.cancel_upload_token_for_inode(ino);
         }

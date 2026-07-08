@@ -381,9 +381,8 @@ impl StudioVfs {
 
     pub(super) async fn evict_payload_objects_from_caches(&self, ino: Ino, object_ids: &[u64]) {
         let pending_upload_object_ids = self
-            .pending_uploads_snapshot()
+            .pending_uploads_snapshot_for_inode(ino)
             .into_iter()
-            .filter(|op| op.ino == ino)
             .map(|op| op.object_id)
             .collect::<std::collections::HashSet<_>>();
         let object_ids = object_ids

@@ -177,14 +177,15 @@ impl UploadQueue {
     /// The `current` op must still match the live pending entry. `rebased` is
     /// then sent to workers and becomes the new pending state.
     pub fn requeue_rebased(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
-        let Some(previous) = self.update_pending_if_matches_to(current, rebased.clone()) else {
+        let Some(previous) = self.update_pending_if_matches_to(current, &rebased) else {
             return false;
         };
-        if self.sender.send(rebased.clone()).is_ok() {
-            true
-        } else {
-            self.restore_pending_if_current_matches(&rebased, previous);
+        if let Err(tokio::sync::mpsc::error::SendError(failed_rebased)) = self.sender.send(rebased)
+        {
+            self.restore_pending_if_current_matches(&failed_rebased, previous);
             false
+        } else {
+            true
         }
     }
 
@@ -369,7 +370,7 @@ impl UploadQueue {
     fn update_pending_if_matches_to(
         &self,
         expected: &PendingUpload,
-        replacement: PendingUpload,
+        replacement: &PendingUpload,
     ) -> Option<PendingUpload> {
         if replacement.object_id != expected.object_id
             || replacement.ino != expected.ino
@@ -387,7 +388,7 @@ impl UploadQueue {
             return None;
         }
         let previous = current.clone();
-        *current = replacement;
+        *current = replacement.clone();
         Some(previous)
     }
 
