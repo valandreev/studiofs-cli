@@ -1529,12 +1529,20 @@ impl StudioVfs {
         }
 
         let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
-        let live_inos = meta
-            .get_attrs_batch(&child_inos)?
-            .into_iter()
-            .map(|attr| attr.ino)
-            .collect::<HashSet<_>>();
-        let mut healed = 0usize;
+        let mut live_inos = HashSet::new();
+        let attr_batch_len = self
+            .readdir_attr_batch_chunk
+            .min(self.readdir_attr_batch_max_inodes)
+            .max(1);
+        for chunk in child_inos.chunks(attr_batch_len) {
+            live_inos.extend(
+                meta.get_attrs_batch(chunk)?
+                    .into_iter()
+                    .map(|attr| attr.ino),
+            );
+        }
+
+        let mut healed = 0;
         for entry in entries {
             if live_inos.contains(&entry.ino) {
                 continue;
