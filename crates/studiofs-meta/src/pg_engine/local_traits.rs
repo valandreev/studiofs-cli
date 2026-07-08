@@ -1,8 +1,9 @@
 use super::PgMetaEngine;
 use crate::engine::{
-    DeferredDeleteRecord, MetaAcl, MetaEngine, MetaError, MetaFormat, MetaFsOps, MetaGc,
-    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
-    MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaError, MetaFormat,
+    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -302,7 +303,7 @@ impl MetaPayloadObjects for PgMetaEngine {
 }
 
 impl MetaGc for PgMetaEngine {
-    fn compact_local_storage(&self) -> MetaResult<bool> {
+    fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         self.local.compact_local_storage()
     }
 

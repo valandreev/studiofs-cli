@@ -167,6 +167,17 @@ pub struct MetadataInvalidationDiagnostics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of a best-effort local metadata storage compaction attempt.
+pub enum LocalStorageCompactionResult {
+    /// Compaction reclaimed space or otherwise made progress.
+    Compacted,
+    /// Compaction was skipped because metadata transactions were active.
+    SkippedBusy,
+    /// Compaction was not applicable or had no reclaimable work.
+    NoWork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Whether this engine instance is still allowed to accept new mutations.
 pub struct MetadataAuthorityStatus {
     /// `true` when inode id allocation still has local headroom.
@@ -697,11 +708,10 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
 pub trait MetaGc: Send + Sync {
     /// Best-effort compaction of local metadata storage.
     ///
-    /// Returns `Ok(true)` when space reclamation made progress. Implementations
-    /// may return `Ok(false)` when compaction is not applicable or local
-    /// transactions are currently active.
-    fn compact_local_storage(&self) -> MetaResult<bool> {
-        Ok(false)
+    /// Returns whether compaction made progress, skipped because the store was
+    /// busy, or had no work to do.
+    fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
+        Ok(LocalStorageCompactionResult::NoWork)
     }
 
     /// Add a block to pending deletions (mark for GC).

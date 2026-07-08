@@ -78,7 +78,10 @@ fn local_storage_compaction_skips_when_read_transaction_is_active() {
     let engine = temp_engine();
     let _read_txn = engine.begin_read_txn().unwrap();
 
-    assert!(!engine.compact_local_storage().unwrap());
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::SkippedBusy
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ use tokio::time::MissedTickBehavior;
 use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
+use studiofs_meta::LocalStorageCompactionResult;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -1112,7 +1113,7 @@ impl StudioVfs {
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
 
-        self.compact_local_metadata_storage().await;
+        self.compact_local_metadata_storage_with_retries().await;
 
         loop {
             tokio::select! {
@@ -1123,7 +1124,7 @@ impl StudioVfs {
                 break;
             }
 
-            self.compact_local_metadata_storage().await;
+            self.compact_local_metadata_storage_with_retries().await;
 
             let meta = self.meta.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1259,7 +1260,31 @@ impl StudioVfs {
         }
     }
 
-    async fn compact_local_metadata_storage(&self) {
+    async fn compact_local_metadata_storage_with_retries(&self) {
+        for retry_delay in [
+            Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(60)),
+            None,
+        ] {
+            match self.compact_local_metadata_storage().await {
+                Ok(LocalStorageCompactionResult::SkippedBusy) => {
+                    let Some(delay) = retry_delay else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = self.state.shutdown.shutdown_notify.notified() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                _ => return,
+            }
+            if self.shutdown_requested() {
+                return;
+            }
+        }
+    }
+
+    async fn compact_local_metadata_storage(&self) -> VfsResult<LocalStorageCompactionResult> {
         let meta = self.meta.clone();
         let started = std::time::Instant::now();
         let result = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1268,8 +1293,8 @@ impl StudioVfs {
         .await;
         let elapsed = started.elapsed();
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match result {
-            Ok(true) => {
+        match &result {
+            Ok(LocalStorageCompactionResult::Compacted) => {
                 if elapsed > std::time::Duration::from_secs(2) {
                     warn!(
                         elapsed_ms,
@@ -1279,10 +1304,16 @@ impl StudioVfs {
                     info!(elapsed_ms, "background GC compacted local metadata storage");
                 }
             }
-            Ok(false) => {
+            Ok(LocalStorageCompactionResult::SkippedBusy) => {
                 debug!(
                     elapsed_ms,
-                    "background GC local metadata compaction skipped or had no work"
+                    "background GC local metadata compaction skipped because metadata was busy"
+                );
+            }
+            Ok(LocalStorageCompactionResult::NoWork) => {
+                debug!(
+                    elapsed_ms,
+                    "background GC local metadata compaction had no work"
                 );
             }
             Err(e) => {
@@ -1293,6 +1324,7 @@ impl StudioVfs {
                 );
             }
         }
+        result
     }
 
     pub(super) async fn background_janitor(self: Arc<Self>) {

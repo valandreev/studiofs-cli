@@ -2,17 +2,22 @@ use super::*;
 use redb::CompactionError;
 
 impl MetaGc for RedbMetaEngine {
-    fn compact_local_storage(&self) -> MetaResult<bool> {
+    fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         let mut db = match self.db.try_write() {
             Ok(db) => db,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(LocalStorageCompactionResult::SkippedBusy);
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(MetaError::Storage("redb lock poisoned".to_string()));
             }
         };
         match db.compact() {
-            Ok(compacted) => Ok(compacted),
-            Err(CompactionError::TransactionInProgress) => Ok(false),
+            Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
+            Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
+            Err(CompactionError::TransactionInProgress) => {
+                Ok(LocalStorageCompactionResult::SkippedBusy)
+            }
             Err(error) => Err(MetaError::Storage(format!(
                 "failed to compact local redb: {error}"
             ))),
