@@ -384,12 +384,35 @@ fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
 }
 
 fn linux_fuse_env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| linux_fuse_env_flag_value(&value))
+}
+
+fn linux_fuse_env_flag_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn linux_fuse_async_write_enabled() -> bool {
+    linux_fuse_async_write_enabled_from_env(
+        std::env::var("STUDIOFS_FUSE_ASYNC_WRITE").ok().as_deref(),
+        std::env::var("STUDIOFS_FUSE_ASYNC_WRITE_DISABLED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn linux_fuse_async_write_enabled_from_env(
+    async_write: Option<&str>,
+    disabled: Option<&str>,
+) -> bool {
+    if disabled.is_some_and(linux_fuse_env_flag_value) {
+        return false;
+    }
+    async_write.is_none_or(linux_fuse_env_flag_value)
 }
 
 fn linux_fuse_metadata_admission_enabled() -> bool {
@@ -1055,20 +1078,37 @@ pub extern "C" fn studiofs_linux_fuse_write(
         reply_error(req, libc::EIO);
         return;
     };
+    let started = Instant::now();
     match state.queue_async_write(req, ino, buf, size, off, fi) {
-        Ok(true) => return,
+        Ok(true) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), false);
+            return;
+        }
         Ok(false) => {}
         Err(errno) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), true);
             reply_error(req, errno);
             return;
         }
     }
     match state.write(ino, buf, size, off, fi) {
         Ok(written) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), false);
             // SAFETY: `req` is live and this consumes the callback reply.
             unsafe { raw::fuse_reply_write(req, written as size_t) };
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            state
+                .vfs
+                .record_fuse_write_callback(size, started.elapsed(), true);
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -1600,7 +1640,7 @@ impl SessionState {
         offset: off_t,
         fi: *const raw::FuseFileInfo,
     ) -> Result<bool, i32> {
-        if !linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_WRITE") {
+        if !linux_fuse_async_write_enabled() {
             return Ok(false);
         }
         let request = self.prepare_write_metadata(buf, size, offset, fi)?;
@@ -2494,6 +2534,29 @@ mod tests {
 
         drop(reservation);
         assert_eq!(writes.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn async_write_defaults_to_enabled_with_explicit_disable() {
+        assert!(super::linux_fuse_env_flag_value("1"));
+        assert!(super::linux_fuse_env_flag_value("true"));
+        assert!(super::linux_fuse_env_flag_value("yes"));
+        assert!(super::linux_fuse_env_flag_value("on"));
+        assert!(!super::linux_fuse_env_flag_value("0"));
+        assert!(!super::linux_fuse_env_flag_value("false"));
+        assert!(super::linux_fuse_async_write_enabled_from_env(None, None));
+        assert!(super::linux_fuse_async_write_enabled_from_env(
+            Some("1"),
+            None
+        ));
+        assert!(!super::linux_fuse_async_write_enabled_from_env(
+            Some("0"),
+            None
+        ));
+        assert!(!super::linux_fuse_async_write_enabled_from_env(
+            Some("1"),
+            Some("1")
+        ));
     }
 
     #[test]

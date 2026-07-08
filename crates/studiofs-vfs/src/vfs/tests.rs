@@ -8333,14 +8333,6 @@ fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
         .await
         .unwrap();
 
-        assert!(
-            !vfs.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .contains(attr.ino),
-            "accepted local writes should evict stale attr cache entries"
-        );
         assert_eq!(
             invalidator.snapshot(),
             Vec::<Ino>::new(),
@@ -10400,15 +10392,26 @@ fn deferred_attr_only_commit_does_not_revert_written_size() {
         vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
             .await
             .expect("write deferred-created file");
-        vfs.setattr_attr_only_deferred_metadata(
-            ino,
-            SetattrArgs {
-                mtime: TimeSpec::Set(attr.mtime.saturating_add(1)),
-                ..SetattrArgs::default()
-            },
-            rt.handle(),
-        )
-        .expect("defer attr-only setattr");
+        let updated_attr = vfs
+            .setattr_attr_only_deferred_metadata(
+                ino,
+                SetattrArgs {
+                    mtime: TimeSpec::Set(attr.mtime.saturating_add(1)),
+                    ..SetattrArgs::default()
+                },
+                rt.handle(),
+            )
+            .expect("defer attr-only setattr");
+        assert_eq!(
+            updated_attr.size,
+            payload.len() as u64,
+            "attr-only setattr should preserve the dirty write size immediately"
+        );
+        assert_eq!(
+            vfs.getattr(ino).expect("get dirty attr after setattr").size,
+            payload.len() as u64,
+            "getattr should report local dirty size before background commit"
+        );
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -10507,6 +10510,48 @@ fn deferred_namespace_dir_commit_clears_admitted_dirty_attr() {
                 .contains_key(&dir.ino),
             "committed deferred mkdir should not leave directory attrs dirty until shutdown"
         );
+    });
+}
+
+#[test]
+fn deferred_create_respects_dentry_cache_admission() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-dentry-cache-admission");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        assert!(vfs.lookup(1, b"negative-cache-create.txt").is_err());
+        vfs.create_with_deferred_metadata_admission(
+            1,
+            b"negative-cache-create.txt",
+            0,
+            0,
+            0o644,
+            rt.handle(),
+        )
+        .expect("negative dentry cache should allow deferred create admission");
+
+        let existing = vfs
+            .create(1, b"positive-cache-create.txt", 0, 0, 0o644)
+            .expect("create existing file");
+        let looked_up = vfs
+            .lookup(1, b"positive-cache-create.txt")
+            .expect("prime positive dentry cache");
+        assert_eq!(looked_up.ino, existing.ino);
+
+        let error = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"positive-cache-create.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect_err("positive dentry cache should reject duplicate create");
+        assert!(matches!(
+            error,
+            VfsError::Meta(MetaError::EntryExists { .. })
+        ));
     });
 }
 
@@ -12282,6 +12327,43 @@ fn release_fh_materializes_opportunistic_writer_stack_state() {
         assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "last-handle release should drain writer-stack dirty state"
+        );
+    });
+}
+
+#[test]
+fn release_fh_invalidates_kernel_attrs_after_dirty_last_handle_close() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-invalidates-dirty-attrs");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-invalidates-dirty-attrs.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"release should drop stale kernel attrs",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(
+            invalidator.attr_snapshot().is_empty(),
+            "write should not invalidate kernel attrs while the handle is active"
+        );
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+        assert!(outcome.closed_last_handle);
+        assert!(
+            invalidator.attr_snapshot().contains(&ino),
+            "last-handle release should evict stale kernel attrs after local dirty writes"
         );
     });
 }

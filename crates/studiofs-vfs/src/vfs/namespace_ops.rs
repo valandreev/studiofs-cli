@@ -419,7 +419,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let mut attr = self.getattr(ino)?;
+        let mut attr = self.attr_only_setattr_base_attr(ino)?;
         if apply_attr_only_setattr_args(&mut attr, &args) {
             attr.touch_ctime();
             self.state
@@ -431,6 +431,13 @@ impl StudioVfs {
         }
 
         Ok(attr)
+    }
+
+    fn attr_only_setattr_base_attr(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
+            return Ok(attr);
+        }
+        self.getattr(ino)
     }
 
     /// Apply attr-only metadata updates locally and commit them from the deferred metadata worker.
@@ -501,7 +508,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let mut attr = self.getattr(ino)?;
+        let mut attr = self.attr_only_setattr_base_attr(ino)?;
         if let Some(new_size) = args.size
             && new_size != attr.size
         {
@@ -1654,6 +1661,15 @@ impl StudioVfs {
                 parent,
                 name: String::from_utf8_lossy(name).into_owned(),
             }));
+        }
+        if let Some(cached) = self.dentry_cache_lookup(parent, name) {
+            return match cached {
+                DentryCacheValue::Negative => Ok(()),
+                DentryCacheValue::Positive(_) => Err(VfsError::Meta(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                })),
+            };
         }
         match self.sync_meta().lookup(parent, name) {
             Ok(_) => Err(VfsError::Meta(MetaError::EntryExists {
