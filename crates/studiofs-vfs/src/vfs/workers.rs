@@ -1261,14 +1261,37 @@ impl StudioVfs {
 
     async fn compact_local_metadata_storage(&self) {
         let meta = self.meta.clone();
-        match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+        let started = std::time::Instant::now();
+        let result = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.compact_local_storage()
         })
-        .await
-        {
-            Ok(true) => info!("background GC compacted local metadata storage"),
-            Ok(false) => {}
-            Err(e) => warn!(error = %e, "background GC local metadata compaction failed"),
+        .await;
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        match result {
+            Ok(true) => {
+                if elapsed > std::time::Duration::from_secs(2) {
+                    warn!(
+                        elapsed_ms,
+                        "background GC local metadata compaction took longer than expected"
+                    );
+                } else {
+                    info!(elapsed_ms, "background GC compacted local metadata storage");
+                }
+            }
+            Ok(false) => {
+                debug!(
+                    elapsed_ms,
+                    "background GC local metadata compaction skipped or had no work"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    elapsed_ms,
+                    error = %e,
+                    "background GC local metadata compaction failed"
+                );
+            }
         }
     }
 
