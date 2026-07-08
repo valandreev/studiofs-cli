@@ -1344,14 +1344,27 @@ impl StudioFsContext {
                 continue;
             }
 
-            let Some(child_attr) = entry_with_attr
-                .attr
-                .clone()
-                .or_else(|| self.vfs.getattr(entry.ino).ok())
-            else {
-                continue;
+            let fetched_attr;
+            let child_attr = match &entry_with_attr.attr {
+                Some(attr) => attr,
+                None => match self.vfs.getattr(entry.ino) {
+                    Ok(attr) => {
+                        fetched_attr = attr;
+                        &fetched_attr
+                    }
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => continue,
+                    Err(error) => {
+                        warn!(
+                            entry = %String::from_utf8_lossy(&entry.name),
+                            entry_ino = entry.ino,
+                            error = %error,
+                            "read_directory failed to load entry attr"
+                        );
+                        continue;
+                    }
+                },
             };
-            *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
+            *dir_info.file_info_mut() = attr_to_file_info(child_attr);
 
             if let Err(e) = lock.write(&mut dir_info) {
                 let display_name = String::from_utf8_lossy(&entry.name);
