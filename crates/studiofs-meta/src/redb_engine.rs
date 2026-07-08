@@ -12,14 +12,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
-use tracing::debug;
+use std::sync::{Arc, Once};
+use tracing::{debug, warn};
 
 pub(crate) mod layout;
 pub use self::layout::RedbSnapshot;
 use self::layout::*;
 
 mod fs_ops;
+
+static RELAXED_DURABILITY_WARN: Once = Once::new();
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
@@ -53,6 +55,11 @@ fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
         .begin_write()
         .map_err(|e| MetaError::Storage(e.to_string()))?;
     if redb_relaxed_durability_enabled() {
+        RELAXED_DURABILITY_WARN.call_once(|| {
+            warn!(
+                "STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE is enabled; local redb commits will not request durable flushes"
+            );
+        });
         txn.set_durability(Durability::None)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
     }

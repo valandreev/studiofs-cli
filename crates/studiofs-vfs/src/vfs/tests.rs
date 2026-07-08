@@ -10482,6 +10482,64 @@ fn deferred_namespace_wait_keeps_blocking_until_all_inode_ops_complete() {
 }
 
 #[test]
+fn deferred_namespace_drain_abandons_permanent_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-abandons-failure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let parent = 9_000_001;
+        let attr = InodeAttr::new_file(9_000_002, parent, 0, 0, 0o644);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(
+                parent,
+                b"never.txt",
+            )),
+            attr.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr: attr.clone(),
+                parent,
+                name: b"never.txt".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        );
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        vfs.wait_for_deferred_namespace_metadata(attr.ino)
+            .await
+            .expect_err("failed deferred op should be reported");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !vfs
+                    .state
+                    .namespace
+                    .deferred
+                    .inner
+                    .lock()
+                    .pending_inodes
+                    .contains_key(&attr.ino)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("permanent failure should eventually clear pending accounting");
+
+        let inner = vfs.state.namespace.deferred.inner.lock();
+        assert!(!inner.pending_inodes.contains_key(&attr.ino));
+        assert!(!inner.attrs.contains_key(&attr.ino));
+        assert!(
+            inner.queue.is_empty(),
+            "permanent failure should not block later namespace ops"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_dir_commit_clears_admitted_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-dir-clears-dirty-attr");
@@ -10560,14 +10618,7 @@ fn deferred_lookup_under_locally_created_dir_uses_negative_cache() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-local-dir-negative-lookup");
     let dir = vfs
-        .mkdir_with_deferred_metadata_admission(
-            1,
-            b"locally-created-dir",
-            0,
-            0,
-            0o755,
-            rt.handle(),
-        )
+        .mkdir_with_deferred_metadata_admission(1, b"locally-created-dir", 0, 0, 0o755, rt.handle())
         .expect("admit deferred dir");
 
     assert!(vfs.lookup(dir.ino, b"child.txt").is_err());
@@ -10576,15 +10627,8 @@ fn deferred_lookup_under_locally_created_dir_uses_negative_cache() {
         Some(DentryCacheValue::Negative)
     );
 
-    vfs.create_with_deferred_metadata_admission(
-        dir.ino,
-        b"child.txt",
-        0,
-        0,
-        0o644,
-        rt.handle(),
-    )
-    .expect("negative cache under local dir should allow create");
+    vfs.create_with_deferred_metadata_admission(dir.ino, b"child.txt", 0, 0, 0o644, rt.handle())
+        .expect("negative cache under local dir should allow create");
 }
 
 #[test]

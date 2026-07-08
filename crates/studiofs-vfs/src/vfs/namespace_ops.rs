@@ -21,6 +21,7 @@ struct TruncateMutation {
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 const DEFERRED_NAMESPACE_INODE_BATCH: u32 = 4096;
+const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
 
 #[cfg(not(target_os = "macos"))]
 fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
@@ -198,7 +199,7 @@ impl StudioVfs {
             .cloned()
     }
 
-    fn enqueue_deferred_namespace_op(
+    pub(super) fn enqueue_deferred_namespace_op(
         &self,
         key: Option<DeferredNamespaceKey>,
         attr: InodeAttr,
@@ -263,6 +264,33 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
+    fn abandon_failed_deferred_namespace_op(&self, op: &DeferredNamespaceOp, error: &VfsError) {
+        let ino = op.ino();
+        {
+            let mut inner = self.state.namespace.deferred.inner.lock();
+            inner.errors.insert(ino, error.to_string());
+            match op {
+                DeferredNamespaceOp::CreateFile { parent, name, .. }
+                | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
+                    inner
+                        .entries
+                        .remove(&DeferredNamespaceKey::new(*parent, name));
+                }
+                DeferredNamespaceOp::SetAttr { .. } => {}
+            }
+            let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
+            if pending_count <= 1 {
+                inner.pending_inodes.remove(&ino);
+                inner.attrs.remove(&ino);
+            } else {
+                inner.pending_inodes.insert(ino, pending_count - 1);
+            }
+        }
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.invalidate_attr_read_cache([ino]);
+        self.state.namespace.deferred.notify.notify_waiters();
+    }
+
     pub(super) async fn wait_for_deferred_namespace_metadata(&self, ino: Ino) -> VfsResult<()> {
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
@@ -311,6 +339,7 @@ impl StudioVfs {
     }
 
     async fn drain_deferred_namespace_metadata(self: Arc<Self>) {
+        let mut failures: HashMap<Ino, u8> = HashMap::new();
         loop {
             let Some(op) = self.pop_deferred_namespace_op() else {
                 self.state
@@ -334,11 +363,32 @@ impl StudioVfs {
 
             let result = self.commit_deferred_namespace_op(op.clone()).await;
             match result {
-                Ok(committed_attr) => self.complete_deferred_namespace_op(&op, &committed_attr),
+                Ok(committed_attr) => {
+                    failures.remove(&op.ino());
+                    self.complete_deferred_namespace_op(&op, &committed_attr);
+                }
                 Err(error) => {
+                    let ino = op.ino();
+                    let attempts = failures
+                        .entry(ino)
+                        .and_modify(|attempts| *attempts = attempts.saturating_add(1))
+                        .or_insert(1);
+                    if *attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
+                        self.abandon_failed_deferred_namespace_op(&op, &error);
+                        warn!(
+                            ino,
+                            attempts = *attempts,
+                            error = %error,
+                            "deferred namespace metadata commit failed permanently; abandoning op"
+                        );
+                        failures.remove(&ino);
+                        continue;
+                    }
                     self.fail_deferred_namespace_op(&op, &error);
                     warn!(
-                        ino = op.ino(),
+                        ino,
+                        attempts = *attempts,
+                        max_attempts = DEFERRED_NAMESPACE_MAX_RETRIES,
                         error = %error,
                         "deferred namespace metadata commit failed; retrying"
                     );
