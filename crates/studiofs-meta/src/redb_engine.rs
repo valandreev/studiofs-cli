@@ -67,6 +67,8 @@ fn redb_relaxed_durability() -> Durability {
     redb_relaxed_durability_for_elapsed_ms(&RELAXED_DURABILITY_NEXT_BARRIER_MS, elapsed_ms)
 }
 
+// Durability::Immediate makes earlier Durability::None commits persistent in redb.
+// This keeps relaxed mode fast while bounding local metadata loss to the last interval.
 fn redb_relaxed_durability_for_elapsed_ms(
     next_barrier_ms: &AtomicU64,
     elapsed_ms: u64,

@@ -319,6 +319,7 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
+    /// Schedules the background drain for namespace metadata admitted in memory.
     pub fn schedule_deferred_namespace_metadata_drain(
         self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
@@ -1317,15 +1318,11 @@ impl StudioVfs {
                 }
             }
         }
-        if self
-            .state
-            .namespace
-            .deferred
-            .inner
-            .lock()
-            .locally_created_dirs
-            .contains(&parent)
-        {
+        let parent_is_uncommitted_local_dir = {
+            let inner = self.state.namespace.deferred.inner.lock();
+            inner.locally_created_dirs.contains(&parent) && inner.attrs.contains_key(&parent)
+        };
+        if parent_is_uncommitted_local_dir {
             self.dentry_cache_insert_negative(parent, name);
             return Err(Self::ignored_entry_not_found(parent, name));
         }
@@ -1754,6 +1751,7 @@ impl StudioVfs {
         }
     }
 
+    /// Creates a file in the in-memory namespace and defers the metadata commit.
     pub fn create_with_deferred_metadata_admission(
         self: &Arc<Self>,
         parent: Ino,
@@ -1845,6 +1843,7 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Creates a directory in the in-memory namespace and defers the metadata commit.
     pub fn mkdir_with_deferred_metadata_admission(
         self: &Arc<Self>,
         parent: Ino,

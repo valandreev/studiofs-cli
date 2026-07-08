@@ -1042,6 +1042,7 @@ mod tests {
             landing_zone: Default::default(),
             drain_lag: Default::default(),
             winfsp_foreground_flushes: Default::default(),
+            foreground_reads: Default::default(),
             write_backpressure: Default::default(),
             dirty_pressure: Default::default(),
             upload: Default::default(),

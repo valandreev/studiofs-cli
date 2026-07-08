@@ -221,6 +221,24 @@ impl SessionState {
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
+#[derive(Clone, Copy, Debug)]
+struct FuseReqPtr(*mut raw::FuseReq);
+
+// SAFETY: libfuse low-level requests may be replied asynchronously exactly once.
+// Async write transfers that reply obligation to the spawned task.
+unsafe impl Send for FuseReqPtr {}
+
+impl FuseReqPtr {
+    fn reply_write(self, written: size_t) {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
+        unsafe { raw::fuse_reply_write(self.0, written) };
+    }
+
+    fn reply_error(self, errno: c_int) {
+        reply_error(self.0, errno);
+    }
+}
+
 #[derive(Debug)]
 struct LinuxFuseAsyncWrites {
     limits: LinuxFuseAsyncWriteLimits,
@@ -1660,7 +1678,7 @@ impl SessionState {
         let fh = request.fh;
         let write_offset = request.offset;
         let vfs = self.vfs.clone();
-        let req_addr = req as usize;
+        let req = FuseReqPtr(req);
         self.runtime_handle.spawn(async move {
             let result = vfs
                 .write_fh_owned_with_deferred_materialize(
@@ -1674,14 +1692,10 @@ impl SessionState {
             drop(reservation);
             match result {
                 Ok(written) => {
-                    let req = req_addr as *mut raw::FuseReq;
-                    // SAFETY: low-level FUSE requests may be replied asynchronously
-                    // once; this task owns the reply path after queue_async_write returns.
-                    unsafe { raw::fuse_reply_write(req, written as size_t) };
+                    req.reply_write(written as size_t);
                 }
                 Err(error) => {
-                    let req = req_addr as *mut raw::FuseReq;
-                    reply_error(req, vfs_err_to_errno(&error));
+                    req.reply_error(vfs_err_to_errno(&error));
                 }
             }
         });

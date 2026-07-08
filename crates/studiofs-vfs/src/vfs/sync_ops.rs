@@ -1767,6 +1767,15 @@ impl StudioVfs {
             }
             attr.kind = FileType::RegularFile;
             if accepted.visible_len > attr.size {
+                if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
+                    self.begin_size_change_incarnation(ino, attr);
+                    attr.upload_state =
+                        if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
+                            MetaUploadState::Updating
+                        } else {
+                            MetaUploadState::Uploading
+                        };
+                }
                 attr.size = accepted.visible_len;
             }
             attr.touch_mtime();

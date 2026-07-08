@@ -802,10 +802,9 @@ async fn read_fresh_write_path_observability_snapshot(
     loop {
         if let Some(snapshot) =
             read_write_path_observability_snapshot(metrics_path, expected_publisher_pid).await?
+            && snapshot.generated_unix_ms >= min_generated_unix_ms
         {
-            if snapshot.generated_unix_ms >= min_generated_unix_ms {
-                return Ok(Some(snapshot));
-            }
+            return Ok(Some(snapshot));
         }
         if Instant::now() >= deadline {
             return read_write_path_observability_snapshot(metrics_path, expected_publisher_pid)

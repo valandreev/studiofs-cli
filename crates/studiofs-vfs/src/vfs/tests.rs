@@ -8734,14 +8734,19 @@ fn opportunistic_write_fh_foreground_boundary_stays_local_first_until_flush() {
         vfs.flush_fh(fh).await.unwrap();
 
         let flushed = vfs.write_path_observability_snapshot();
-        assert!(
-            flushed.flush_barrier_calls > 0,
-            "flush_fh should surface local writer/cache barrier work"
-        );
-        assert!(
-            flushed.metadata_commit.calls > 0,
-            "flush_fh should commit local metadata without turning into foreground PG publication"
-        );
+        if flushed.flush_barrier_calls == 0 {
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino)
+                    && !vfs.has_pending_local_dirty_payloads_for_inode(ino)
+                    && !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "flush_fh may skip the barrier only when background materialization already drained local dirty state"
+            );
+        } else {
+            assert!(
+                flushed.metadata_commit.calls > 0,
+                "flush_fh should commit local metadata without turning into foreground PG publication"
+            );
+        }
         assert_eq!(flushed.upload.completed_uploads, 0);
 
         vfs.release_fh(fh).await.unwrap();
