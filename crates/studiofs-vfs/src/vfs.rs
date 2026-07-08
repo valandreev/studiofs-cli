@@ -3030,14 +3030,17 @@ fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
 }
 
 fn write_admission_soft_pacing_disabled() -> bool {
-    std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
 }
 
 fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {

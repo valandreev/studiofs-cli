@@ -2,7 +2,7 @@ use super::*;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -398,12 +398,15 @@ fn linux_fuse_env_flag_value(value: &str) -> bool {
 }
 
 fn linux_fuse_async_write_enabled() -> bool {
-    linux_fuse_async_write_enabled_from_env(
-        std::env::var("STUDIOFS_FUSE_ASYNC_WRITE").ok().as_deref(),
-        std::env::var("STUDIOFS_FUSE_ASYNC_WRITE_DISABLED")
-            .ok()
-            .as_deref(),
-    )
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        linux_fuse_async_write_enabled_from_env(
+            std::env::var("STUDIOFS_FUSE_ASYNC_WRITE").ok().as_deref(),
+            std::env::var("STUDIOFS_FUSE_ASYNC_WRITE_DISABLED")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 fn linux_fuse_async_write_enabled_from_env(

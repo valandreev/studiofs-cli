@@ -12,7 +12,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::{
+    Arc, Once, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 pub(crate) mod layout;
@@ -22,6 +26,10 @@ use self::layout::*;
 mod fs_ops;
 
 static RELAXED_DURABILITY_WARN: Once = Once::new();
+static RELAXED_DURABILITY_CLOCK_START: OnceLock<Instant> = OnceLock::new();
+static RELAXED_DURABILITY_NEXT_BARRIER_MS: AtomicU64 =
+    AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
@@ -35,18 +43,46 @@ pub(crate) struct CounterWriteTransaction<'a> {
 fn redb_relaxed_durability_enabled() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
         false
+    }
+}
+
+fn redb_relaxed_durability() -> Durability {
+    let start = RELAXED_DURABILITY_CLOCK_START.get_or_init(Instant::now);
+    let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    redb_relaxed_durability_for_elapsed_ms(&RELAXED_DURABILITY_NEXT_BARRIER_MS, elapsed_ms)
+}
+
+fn redb_relaxed_durability_for_elapsed_ms(
+    next_barrier_ms: &AtomicU64,
+    elapsed_ms: u64,
+) -> Durability {
+    loop {
+        let next = next_barrier_ms.load(Ordering::Relaxed);
+        if elapsed_ms < next {
+            return Durability::None;
+        }
+        let new_next = elapsed_ms.saturating_add(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+        if next_barrier_ms
+            .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Durability::Immediate;
+        }
     }
 }
 
@@ -57,10 +93,11 @@ fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
     if redb_relaxed_durability_enabled() {
         RELAXED_DURABILITY_WARN.call_once(|| {
             warn!(
-                "STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE is enabled; local redb commits will not request durable flushes"
+                interval_ms = REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS,
+                "STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE is enabled; most local redb commits skip durable flushes, with periodic durable barriers"
             );
         });
-        txn.set_durability(Durability::None)
+        txn.set_durability(redb_relaxed_durability())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
     }
     Ok(txn)

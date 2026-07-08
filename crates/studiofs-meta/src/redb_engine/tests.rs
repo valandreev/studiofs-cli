@@ -43,6 +43,37 @@ include!("tests/fs_ops.rs");
 include!("tests/chunk_state.rs");
 
 #[test]
+fn relaxed_durability_uses_immediate_barrier_every_five_seconds() {
+    let next_barrier_ms =
+        std::sync::atomic::AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 0),
+        Durability::None
+    ));
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 4_999),
+        Durability::None
+    ));
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
+        Durability::Immediate
+    ));
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
+        Durability::None
+    ));
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 9_999),
+        Durability::None
+    ));
+    assert!(matches!(
+        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 10_000),
+        Durability::Immediate
+    ));
+}
+
+#[test]
 fn contract_core_harness_runs_ops_and_reopens_with_invariants() {
     let mut fixture =
         ContractCoreFixture::new("redb-contract-harness").expect("create contract fixture");

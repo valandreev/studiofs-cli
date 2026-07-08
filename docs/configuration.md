@@ -158,6 +158,7 @@ Notes:
 - Public runtime IO tuning starts from persisted `studiofs settings` values, then applies transitional `STUDIOFS_*` env overrides, and finally applies explicit mount flags before validation.
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
+- Linux performance investigation only: `STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE=1` makes most local `redb` commits non-durable, with a durable barrier on the next metadata write after each 5-second interval; power loss or kernel panic can still lose recent local metadata inside that window.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
 - On Windows, `<mount-point>` must be a drive letter (for example `Z:`). Directory mount points are not supported.
