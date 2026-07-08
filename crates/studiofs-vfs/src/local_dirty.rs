@@ -500,11 +500,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
             Err(error) => return Err(VfsError::Meta(error)),
         }
 
-        let chunk_slices = self.drain.build_overlay_slice_records(
-            self.ino,
-            &Vec::new(),
-            pending_slices.clone(),
-        )?;
+        let chunk_slices =
+            self.drain
+                .build_overlay_slice_records(self.ino, &[], pending_slices.clone())?;
         let attr_to_persist =
             self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
         let attr_to_clear = attr_to_persist.clone();
@@ -1626,7 +1624,7 @@ impl StudioVfs {
         }
 
         let persisted_bytes: u64 = entries.iter().map(|(_, data)| data.len() as u64).sum();
-        let persisted_object_ids: Vec<u64> =
+        let mut persisted_object_ids: Vec<u64> =
             entries.iter().map(|(object_id, _)| *object_id).collect();
         let started = Instant::now();
         let result: VfsResult<()> = async {
@@ -1657,6 +1655,17 @@ impl StudioVfs {
             Ok(())
         }
         .await;
+        if result.is_ok() {
+            let persisted_payload_count = persisted_object_ids.len();
+            let object_ids = std::mem::take(&mut persisted_object_ids);
+            if let Err(error) = self.upload_stage_link_batch_async(object_ids).await {
+                warn!(
+                    persisted_payload_count,
+                    error = %error,
+                    "failed to create zero-copy upload links for persisted local dirty payloads"
+                );
+            }
+        }
         self.record_payload_persist_observability(
             logical_block_count,
             persisted_bytes,

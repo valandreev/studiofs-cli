@@ -289,19 +289,16 @@ fn should_disable_winfsp_file_cache(
     is_dir: bool,
     open_flags: OpenFlags,
     truncates_on_open: bool,
+    create_options: u32,
 ) -> bool {
     if is_dir {
         return false;
     }
 
-    open_flags.contains(OpenFlags::WRONLY) || truncates_on_open
-}
-
-fn should_disable_winfsp_file_cache_for_handle(
-    handle: &StudioFileHandle,
-    truncates_on_open: bool,
-) -> bool {
-    should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, truncates_on_open)
+    let requested_uncached = (create_options & FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION) != 0
+        || (open_flags_allow_write(open_flags)
+            && (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0);
+    open_flags.contains(OpenFlags::WRONLY) || truncates_on_open || requested_uncached
 }
 
 fn winfsp_read_cache_diagnostics_enabled() -> bool {
@@ -919,8 +916,14 @@ impl StudioFsContext {
         &self,
         handle: &StudioFileHandle,
         truncates_on_open: bool,
+        create_options: u32,
     ) -> bool {
-        should_disable_winfsp_file_cache_for_handle(handle, truncates_on_open)
+        should_disable_winfsp_file_cache(
+            handle.is_dir,
+            handle.open_flags,
+            truncates_on_open,
+            create_options,
+        )
     }
 
     fn record_handle_zero_fill_range(&self, fh: u64, old_size: u64, new_size: u64) {
@@ -1431,7 +1434,7 @@ impl FileSystemContext for StudioFsContext {
         let mut handle =
             self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || self.should_disable_os_cache_for_handle(&handle, trunc);
+            || self.should_disable_os_cache_for_handle(&handle, trunc, raw_create_options);
         handle.set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -1526,7 +1529,8 @@ impl FileSystemContext for StudioFsContext {
         let truncates_on_open =
             should_truncate_existing_file_on_open(raw_create_options, plan.open_flags);
         let mut handle = self.execute_create_callback_plan(plan, file_info)?;
-        let disable_os_cache = self.should_disable_os_cache_for_handle(&handle, truncates_on_open);
+        let disable_os_cache =
+            self.should_disable_os_cache_for_handle(&handle, truncates_on_open, raw_create_options);
         handle.set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -2118,9 +2122,10 @@ mod tests {
     use super::{
         CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
         FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
-        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
-        FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
+        FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS, FILE_READ_DATA_ACCESS,
+        FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS, FILE_WRITE_THROUGH_CREATE_OPTION,
         FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
@@ -2150,9 +2155,6 @@ mod tests {
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
-
-    const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
-    const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
     #[test]
     fn callback_buffer_helpers_live_in_focused_module_and_remain_send() {
@@ -2308,7 +2310,7 @@ mod tests {
 
         let unbuffered = open_flags_from_access(
             FILE_READ_DATA_ACCESS,
-            FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
+            FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION | FILE_WRITE_THROUGH_CREATE_OPTION,
         );
         assert_eq!(unbuffered.bits(), OpenFlags::RDONLY.bits());
     }
@@ -2324,7 +2326,7 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(!should_disable_winfsp_file_cache(false, flags, false));
+        assert!(!should_disable_winfsp_file_cache(false, flags, false, 0));
     }
 
     #[test]
@@ -2386,7 +2388,7 @@ mod tests {
             .expect("create file");
         let mut handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
 
-        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle, false);
+        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle, false, 0);
         handle.set_disable_os_cache(disable_os_cache);
         vfs.note_winfsp_os_cache_open(disable_os_cache);
         vfs.record_winfsp_read_callback_observability(4096, Duration::from_millis(2));
@@ -2407,36 +2409,43 @@ mod tests {
 
     #[test]
     fn winfsp_file_cache_policy_tracks_write_intent() {
-        assert!(!should_disable_winfsp_file_cache(
-            false,
-            OpenFlags::RDONLY,
-            false
-        ));
-        assert!(should_disable_winfsp_file_cache(
-            false,
-            OpenFlags::WRONLY,
-            false
-        ));
-        assert!(!should_disable_winfsp_file_cache(
-            false,
-            OpenFlags::RDWR,
-            false
-        ));
-        assert!(should_disable_winfsp_file_cache(
-            false,
-            OpenFlags::RDWR,
-            true
-        ));
-        assert!(!should_disable_winfsp_file_cache(
-            true,
-            OpenFlags::WRONLY,
-            true
-        ));
-        assert!(!should_disable_winfsp_file_cache(
-            true,
-            OpenFlags::RDWR,
-            true
-        ));
+        for (is_dir, open_flags, truncates_on_open, create_options, expected) in [
+            (false, OpenFlags::RDONLY, false, 0, false),
+            (false, OpenFlags::WRONLY, false, 0, true),
+            (false, OpenFlags::RDWR, false, 0, false),
+            (false, OpenFlags::RDWR, true, 0, true),
+            (
+                false,
+                OpenFlags::RDWR,
+                false,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
+                true,
+            ),
+            (
+                true,
+                OpenFlags::WRONLY,
+                true,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
+                false,
+            ),
+            (
+                true,
+                OpenFlags::RDWR,
+                true,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_disable_winfsp_file_cache(
+                    is_dir,
+                    open_flags,
+                    truncates_on_open,
+                    create_options,
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2496,8 +2505,8 @@ mod tests {
         let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
         let dir_handle = StudioFileHandle::new(ROOT_INO, true, 2, OpenFlags::RDONLY);
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0));
         queue.lock().push(attr.ino);
 
         let notifications = ctx.should_notify().expect("pending WinFSP notification");
@@ -2507,8 +2516,8 @@ mod tests {
                 .any(|notification| notification.ino == attr.ino)
         );
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0));
     }
 
     #[test]
@@ -3782,16 +3791,18 @@ mod tests {
             LocalSyncPolicy::Opportunistic
         );
         assert_eq!(
-            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
-            LocalSyncPolicy::WriteThrough
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_CREATE_OPTION),
             LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
+                FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION
+            ),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_options(
+                FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION
             ),
             LocalSyncPolicy::WriteThrough
         );
@@ -3812,7 +3823,7 @@ mod tests {
             fh,
             OpenFlags::RDWR,
             write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
+                FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION,
             ),
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
@@ -3897,7 +3908,7 @@ mod tests {
             false,
             fh,
             OpenFlags::RDWR,
-            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_CREATE_OPTION),
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let flush_calls_before = flush_barrier_calls(&vfs);
