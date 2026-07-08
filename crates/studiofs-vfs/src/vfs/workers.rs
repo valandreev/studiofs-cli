@@ -5,7 +5,6 @@ use tokio::time::MissedTickBehavior;
 use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
-use studiofs_meta::LocalStorageCompactionResult;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -1113,8 +1112,6 @@ impl StudioVfs {
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
 
-        self.compact_local_metadata_storage_with_retries().await;
-
         loop {
             tokio::select! {
                 _ = self.state.shutdown.shutdown_notify.notified() => break,
@@ -1123,8 +1120,6 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-
-            self.compact_local_metadata_storage_with_retries().await;
 
             let meta = self.meta.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1193,8 +1188,12 @@ impl StudioVfs {
             .await
             {
                 Ok(pending) => {
+                    const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
                     let mut deleted_count = 0;
-                    for (object_id, timestamp) in pending {
+                    let pending_total = pending.len();
+                    for (object_id, timestamp) in
+                        pending.into_iter().take(PENDING_DELETION_GC_BATCH_LIMIT)
+                    {
                         if referenced_object_ids.contains(&object_id) {
                             debug!(object_id, "skipping object - still reachable in metadata");
                             continue;
@@ -1238,6 +1237,13 @@ impl StudioVfs {
                     if deleted_count > 0 {
                         info!("GC deleted {} objects", deleted_count);
                     }
+                    if pending_total > PENDING_DELETION_GC_BATCH_LIMIT {
+                        debug!(
+                            pending_total,
+                            batch_limit = PENDING_DELETION_GC_BATCH_LIMIT,
+                            "GC limited pending deletion cleanup batch"
+                        );
+                    }
                 }
                 Err(e) => {
                     let meta = self.meta.clone();
@@ -1258,73 +1264,6 @@ impl StudioVfs {
                 warn!(error = %e, "background GC failed to release janitor PG lock");
             }
         }
-    }
-
-    async fn compact_local_metadata_storage_with_retries(&self) {
-        for retry_delay in [
-            Some(std::time::Duration::from_secs(30)),
-            Some(std::time::Duration::from_secs(60)),
-            None,
-        ] {
-            match self.compact_local_metadata_storage().await {
-                Ok(LocalStorageCompactionResult::SkippedBusy) => {
-                    let Some(delay) = retry_delay else {
-                        return;
-                    };
-                    tokio::select! {
-                        _ = self.state.shutdown.shutdown_notify.notified() => return,
-                        _ = tokio::time::sleep(delay) => {}
-                    }
-                }
-                _ => return,
-            }
-            if self.shutdown_requested() {
-                return;
-            }
-        }
-    }
-
-    async fn compact_local_metadata_storage(&self) -> VfsResult<LocalStorageCompactionResult> {
-        let meta = self.meta.clone();
-        let started = std::time::Instant::now();
-        let result = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.compact_local_storage()
-        })
-        .await;
-        let elapsed = started.elapsed();
-        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match &result {
-            Ok(LocalStorageCompactionResult::Compacted) => {
-                if elapsed > std::time::Duration::from_secs(2) {
-                    warn!(
-                        elapsed_ms,
-                        "background GC local metadata compaction took longer than expected"
-                    );
-                } else {
-                    info!(elapsed_ms, "background GC compacted local metadata storage");
-                }
-            }
-            Ok(LocalStorageCompactionResult::SkippedBusy) => {
-                debug!(
-                    elapsed_ms,
-                    "background GC local metadata compaction skipped because metadata was busy"
-                );
-            }
-            Ok(LocalStorageCompactionResult::NoWork) => {
-                debug!(
-                    elapsed_ms,
-                    "background GC local metadata compaction had no work"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    elapsed_ms,
-                    error = %e,
-                    "background GC local metadata compaction failed"
-                );
-            }
-        }
-        result
     }
 
     pub(super) async fn background_janitor(self: Arc<Self>) {

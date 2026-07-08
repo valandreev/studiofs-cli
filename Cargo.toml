@@ -11,7 +11,7 @@ members = [
     "crates/studiofs-winfsp",
     "crates/studiofs-e2e",
     "crates/studiofs-scenario",
-    "crates/studiofs-test-support",
+    "crates/studiofs-test-support", "target/redb_test",
 ]
 resolver = "3"
 

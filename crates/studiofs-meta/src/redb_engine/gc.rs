@@ -15,6 +15,8 @@ impl MetaGc for RedbMetaEngine {
         match db.compact() {
             Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
             Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
+            // ReadTransaction outlives our short RwLock read guard; redb
+            // reports active transactions here.
             Err(CompactionError::TransactionInProgress) => {
                 Ok(LocalStorageCompactionResult::SkippedBusy)
             }
