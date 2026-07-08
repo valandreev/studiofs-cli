@@ -1267,6 +1267,18 @@ impl StudioVfs {
                 }
             }
         }
+        if self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .contains(&parent)
+        {
+            self.dentry_cache_insert_negative(parent, name);
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
 
         let entry = match self.sync_meta().lookup(parent, name) {
             Ok(entry) => entry,
@@ -1671,6 +1683,17 @@ impl StudioVfs {
                 })),
             };
         }
+        if self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .contains(&parent)
+        {
+            return Ok(());
+        }
         match self.sync_meta().lookup(parent, name) {
             Ok(_) => Err(VfsError::Meta(MetaError::EntryExists {
                 parent,
@@ -1760,6 +1783,13 @@ impl StudioVfs {
         let attr = self
             .sync_meta()
             .create_dir(parent, name, uid, gid, mode & 0o7777)?;
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .insert(attr.ino);
         namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
         self.sync_meta().request_eager_flush();
         Ok(attr)
@@ -1789,6 +1819,13 @@ impl StudioVfs {
 
         let ino = self.reserve_deferred_namespace_ino()?;
         let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777);
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .insert(attr.ino);
         self.enqueue_deferred_namespace_op(
             Some(DeferredNamespaceKey::new(parent, name)),
             attr.clone(),

@@ -10556,6 +10556,38 @@ fn deferred_create_respects_dentry_cache_admission() {
 }
 
 #[test]
+fn deferred_lookup_under_locally_created_dir_uses_negative_cache() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-local-dir-negative-lookup");
+    let dir = vfs
+        .mkdir_with_deferred_metadata_admission(
+            1,
+            b"locally-created-dir",
+            0,
+            0,
+            0o755,
+            rt.handle(),
+        )
+        .expect("admit deferred dir");
+
+    assert!(vfs.lookup(dir.ino, b"child.txt").is_err());
+    assert_eq!(
+        vfs.dentry_cache_lookup(dir.ino, b"child.txt"),
+        Some(DentryCacheValue::Negative)
+    );
+
+    vfs.create_with_deferred_metadata_admission(
+        dir.ino,
+        b"child.txt",
+        0,
+        0,
+        0o644,
+        rt.handle(),
+    )
+    .expect("negative cache under local dir should allow create");
+}
+
+#[test]
 fn deferred_namespace_create_under_deferred_dir_is_visible() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-nested-create");

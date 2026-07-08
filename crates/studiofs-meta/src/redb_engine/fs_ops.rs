@@ -19,7 +19,6 @@ pub(super) struct NamespaceCreateSpec<'a> {
     name: &'a [u8],
     uid: u32,
     gid: u32,
-    created_at: i64,
     kind: NamespaceCreateKind<'a>,
 }
 
@@ -38,7 +37,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::File { mode },
         }
     }
@@ -57,7 +55,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::Directory { mode },
         }
     }
@@ -76,7 +73,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             name,
             uid,
             gid,
-            created_at: current_unix_seconds(),
             kind: NamespaceCreateKind::Symlink { target },
         }
     }
@@ -118,16 +114,6 @@ impl<'a> NamespaceCreateSpec<'a> {
             NamespaceCreateKind::Symlink { target } => {
                 InodeAttr::new_symlink(self.ino, self.parent, self.uid, self.gid, target.len())
             }
-        }
-    }
-
-    pub(super) fn pending_create_record(&self) -> PendingCreateRecord {
-        PendingCreateRecord {
-            ino: self.ino,
-            parent: self.parent,
-            name: self.name.to_vec(),
-            kind: self.kind(),
-            created_at: self.created_at,
         }
     }
 
@@ -720,27 +706,11 @@ impl RedbMetaEngine {
         &self,
         spec: NamespaceCreateSpec<'_>,
     ) -> MetaResult<InodeAttr> {
-        let intent = spec.pending_create_record();
-        self.add_pending_create(&intent)?;
-
-        let create_result = (|| -> MetaResult<InodeAttr> {
-            let txn = self.begin_write_txn()?;
-            let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
-            txn.commit()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Ok(result_attr)
-        })();
-
-        match create_result {
-            Ok(attr) => {
-                self.remove_pending_create(spec.ino)?;
-                Ok(attr)
-            }
-            Err(err) => {
-                let _ = self.remove_pending_create(spec.ino);
-                Err(err)
-            }
-        }
+        let txn = self.begin_write_txn()?;
+        let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
     }
 
     pub(crate) fn create_file_with_ino(

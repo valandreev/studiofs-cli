@@ -91,6 +91,7 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) errors: HashMap<Ino, String>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
     pub(super) reserved_inos: VecDeque<Ino>,
+    pub(super) locally_created_dirs: HashSet<Ino>,
 }
 
 pub(super) struct DeferredNamespaceState {
@@ -1117,6 +1118,13 @@ impl StudioVfs {
             .dentry_cache
             .lock()
             .invalidate_parent(parent);
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .remove(&parent);
     }
 
     /// Returns current dentry cache counters and capacity snapshot.
