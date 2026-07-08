@@ -2344,6 +2344,25 @@ mod tests {
 
         ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate directory buffer");
+
+        let raw_entries = vfs.meta().readdir(ROOT_INO).expect("raw root readdir");
+        assert!(
+            raw_entries
+                .iter()
+                .any(|entry| entry.name == b"dangling-probe"),
+            "setup should leave the dangling probe dentry in raw metadata"
+        );
+        let entries_with_attrs = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .expect("visible root readdir");
+        let dangling_entry = entries_with_attrs
+            .iter()
+            .find(|entry| entry.entry.name == b"dangling-probe")
+            .expect("batched readdir should keep the dangling dentry");
+        assert!(
+            dangling_entry.attr.is_none(),
+            "directory buffer population should skip dangling entries without attrs"
+        );
     }
 
     #[test]
