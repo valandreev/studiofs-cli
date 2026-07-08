@@ -25,10 +25,7 @@ impl RedbMetaEngine {
 
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let mut snapshot = RedbSnapshot::default();
 
         {
@@ -262,10 +259,7 @@ impl RedbMetaEngine {
         let enable_remote_namespace_filter = mode != SnapshotImportMode::Local;
         let preserve_local_state = mode == SnapshotImportMode::RemotePreserveLocalState;
         let (preserved_inodes, preserved_dentries) = if preserve_local_state {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let txn = self.begin_read_txn()?;
             let mut overlay_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
             overlay_inodes.extend(Self::local_overlay_attr_inodes_from_txn(&txn)?);
 
@@ -689,10 +683,7 @@ impl MetaSnapshots for RedbMetaEngine {
     }
 
     fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -714,10 +705,7 @@ impl MetaSnapshots for RedbMetaEngine {
     }
 
     fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

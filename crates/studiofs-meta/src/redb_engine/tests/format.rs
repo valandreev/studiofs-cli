@@ -221,7 +221,7 @@ fn test_read_format_info_readonly_reports_serialization_error() {
     let path = dir.path().join("probe-invalid-format.db");
 
     let engine = RedbMetaEngine::open(&path).unwrap();
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     {
         let mut table = txn.open_table(SETTINGS_TABLE).unwrap();
         table.insert("format", b"{not-json".as_slice()).unwrap();

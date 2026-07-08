@@ -256,7 +256,7 @@ fn test_get_attr_merged_in_write_txn_matches_read_get_attr() {
     local_attr.mode = 0o600;
     engine.set_attr(&local_attr).unwrap();
 
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     let base_from_write = RedbMetaEngine::get_attr_merged_in_write_txn(&txn, base_file.ino).unwrap();
     let local_from_write =
         RedbMetaEngine::get_attr_merged_in_write_txn(&txn, local_file.ino).unwrap();

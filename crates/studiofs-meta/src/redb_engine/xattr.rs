@@ -2,18 +2,12 @@ use super::*;
 
 impl MetaXattr for RedbMetaEngine {
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         self.merged_xattr_value(&txn, ino, name)
     }
 
     fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<usize>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         self.merged_xattr_value_size(&txn, ino, name)
     }
 
@@ -76,10 +70,7 @@ impl MetaXattr for RedbMetaEngine {
     }
 
     fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let mut names = std::collections::BTreeSet::<Vec<u8>>::new();
 
         for key in Self::keys_for_inode_in_table(&txn, BASE_XATTRS_TABLE, ino)? {

@@ -169,7 +169,7 @@ fn test_replica_base_remove_attr_clears_dangling_dentries_for_inode() {
     let dentry_key = encode_dentry_key(ROOT_INO, b"base-only.txt");
     let index_key = encode_dentry_by_inode_key(ino, ROOT_INO, b"base-only.txt");
     {
-        let txn = engine.db.begin_read().unwrap();
+        let txn = engine.begin_read_txn().unwrap();
         let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
         let by_inode = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE).unwrap();
         assert!(dentries.get(dentry_key.as_slice()).unwrap().is_some());
@@ -180,7 +180,7 @@ fn test_replica_base_remove_attr_clears_dangling_dentries_for_inode() {
         .apply_replica_events_to_base(&[MetaEvent::RemoveAttr { ino }])
         .unwrap();
 
-    let txn = engine.db.begin_read().unwrap();
+    let txn = engine.begin_read_txn().unwrap();
     let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
     let by_inode = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE).unwrap();
     assert!(dentries.get(dentry_key.as_slice()).unwrap().is_none());

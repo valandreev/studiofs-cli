@@ -5,15 +5,15 @@
 use crate::engine::*;
 use crate::types::*;
 use redb::{
-    Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
-    WriteTransaction,
+    Database, Durability, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition, WriteTransaction,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{
-    Arc, Once, OnceLock,
+    Arc, Once, OnceLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
@@ -33,7 +33,7 @@ const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
-    db: Arc<Database>,
+    db: Arc<RwLock<Database>>,
 }
 
 pub(crate) struct CounterWriteTransaction<'a> {
@@ -119,8 +119,20 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn begin_read_txn(&self) -> MetaResult<ReadTransaction> {
+        self.db
+            .read()
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))
+    }
+
     pub(crate) fn begin_write_txn(&self) -> MetaResult<WriteTransaction> {
-        begin_redb_write_txn(&self.db)
+        let db = self
+            .db
+            .read()
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
+        begin_redb_write_txn(&db)
     }
 
     /// Open or create a metadata database at the given path.
@@ -170,7 +182,9 @@ impl RedbMetaEngine {
         }
 
         debug!("opened metadata database at {:?}", path.as_ref());
-        let engine = Self { db: Arc::new(db) };
+        let engine = Self {
+            db: Arc::new(RwLock::new(db)),
+        };
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
 

@@ -302,6 +302,10 @@ impl MetaPayloadObjects for PgMetaEngine {
 }
 
 impl MetaGc for PgMetaEngine {
+    fn compact_local_storage(&self) -> MetaResult<bool> {
+        self.local.compact_local_storage()
+    }
+
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
     }

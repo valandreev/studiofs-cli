@@ -74,6 +74,14 @@ fn relaxed_durability_uses_immediate_barrier_every_five_seconds() {
 }
 
 #[test]
+fn local_storage_compaction_skips_when_read_transaction_is_active() {
+    let engine = temp_engine();
+    let _read_txn = engine.begin_read_txn().unwrap();
+
+    assert!(!engine.compact_local_storage().unwrap());
+}
+
+#[test]
 fn contract_core_harness_runs_ops_and_reopens_with_invariants() {
     let mut fixture =
         ContractCoreFixture::new("redb-contract-harness").expect("create contract fixture");

@@ -1112,6 +1112,8 @@ impl StudioVfs {
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
 
+        self.compact_local_metadata_storage().await;
+
         loop {
             tokio::select! {
                 _ = self.state.shutdown.shutdown_notify.notified() => break,
@@ -1120,6 +1122,8 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+
+            self.compact_local_metadata_storage().await;
 
             let meta = self.meta.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1252,6 +1256,19 @@ impl StudioVfs {
             {
                 warn!(error = %e, "background GC failed to release janitor PG lock");
             }
+        }
+    }
+
+    async fn compact_local_metadata_storage(&self) {
+        let meta = self.meta.clone();
+        match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.compact_local_storage()
+        })
+        .await
+        {
+            Ok(true) => info!("background GC compacted local metadata storage"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "background GC local metadata compaction failed"),
         }
     }
 

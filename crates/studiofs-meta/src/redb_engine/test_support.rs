@@ -48,7 +48,7 @@ pub(super) fn set_regular_file_chunk_rows(
     overlay_rows: &[(ChunkId, RegularFileChunkState)],
     base_rows: &[(ChunkId, RegularFileChunkState)],
 ) {
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     {
         RedbMetaEngine::clear_regular_file_chunk_rows_in_txn(&txn, REGULAR_FILE_OVERLAY_TABLE, ino)
             .unwrap();
@@ -78,7 +78,7 @@ pub(super) fn set_regular_file_pending_compaction_rows(
     ino: Ino,
     chunks: &[ChunkId],
 ) {
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     {
         let mut pending = txn
             .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)

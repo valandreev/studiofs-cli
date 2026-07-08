@@ -695,6 +695,15 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
 
 /// Capability trait for garbage-collection bookkeeping and reachability scans.
 pub trait MetaGc: Send + Sync {
+    /// Best-effort compaction of local metadata storage.
+    ///
+    /// Returns `Ok(true)` when space reclamation made progress. Implementations
+    /// may return `Ok(false)` when compaction is not applicable or local
+    /// transactions are currently active.
+    fn compact_local_storage(&self) -> MetaResult<bool> {
+        Ok(false)
+    }
+
     /// Add a block to pending deletions (mark for GC).
     /// The timestamp is used for grace period.
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
