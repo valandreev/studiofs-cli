@@ -230,7 +230,7 @@ fn test_lookup_merged_in_write_txn_matches_read_lookup() {
         .rename(ROOT_INO, b"shared.txt", ROOT_INO, b"local-name.txt")
         .unwrap();
 
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     let base_only = RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"base-only.txt")
         .unwrap()
         .expect("base entry visible in write txn");
@@ -286,7 +286,7 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
         .collect::<Vec<_>>();
     expected.sort();
 
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     let mut merged = RedbMetaEngine::readdir_merged_in_write_txn(&txn, ROOT_INO)
         .unwrap()
         .into_iter()

@@ -74,6 +74,30 @@ fn relaxed_durability_uses_immediate_barrier_every_five_seconds() {
 }
 
 #[test]
+fn local_storage_compaction_skips_when_read_transaction_is_active() {
+    let engine = temp_engine();
+    let _read_txn = engine.begin_read_txn().unwrap();
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::SkippedBusy
+    );
+}
+
+#[test]
+fn pending_deletions_limited_stops_at_limit() {
+    let engine = temp_engine();
+    engine.add_pending_deletion(10, 100).unwrap();
+    engine.add_pending_deletion(20, 200).unwrap();
+    engine.add_pending_deletion(30, 300).unwrap();
+
+    assert_eq!(
+        engine.get_pending_deletions_limited(2).unwrap(),
+        vec![(10, 100), (20, 200)]
+    );
+}
+
+#[test]
 fn contract_core_harness_runs_ops_and_reopens_with_invariants() {
     let mut fixture =
         ContractCoreFixture::new("redb-contract-harness").expect("create contract fixture");

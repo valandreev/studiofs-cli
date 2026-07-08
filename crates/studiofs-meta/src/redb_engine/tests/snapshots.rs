@@ -493,7 +493,7 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
     let base_bytes = encode(&base_chunk).expect("encode base chunk");
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(11));
 
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     {
         let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
         overlay_table
@@ -524,7 +524,7 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();
 
-    let txn = imported.db.begin_read().unwrap();
+    let txn = imported.begin_read_txn().unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     let overlay_row = overlay_table
         .get(chunk_key.as_slice())
@@ -604,7 +604,7 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
         },
     );
 
-    let txn = source.db.begin_write().unwrap();
+    let txn = source.begin_write_txn().unwrap();
     {
         let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
         let key = encode_regular_file_chunk_key(ino, ChunkId(4));
@@ -620,7 +620,7 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
 
     target.import_snapshot(&snapshot).unwrap();
 
-    let txn = target.db.begin_read().unwrap();
+    let txn = target.begin_read_txn().unwrap();
     let pending = txn
         .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
         .unwrap();
@@ -715,7 +715,7 @@ fn test_regular_file_graph_rows_removed_on_unlink() {
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(0));
     let chunk_bytes = encode(&chunk).expect("encode chunk state");
 
-    let txn = engine.db.begin_write().unwrap();
+    let txn = engine.begin_write_txn().unwrap();
     {
         let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
         overlay_table
@@ -731,7 +731,7 @@ fn test_regular_file_graph_rows_removed_on_unlink() {
 
     engine.unlink(ROOT_INO, b"unlink-graph.bin").unwrap();
 
-    let txn = engine.db.begin_read().unwrap();
+    let txn = engine.begin_read_txn().unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     assert!(overlay_table.get(chunk_key.as_slice()).unwrap().is_none());
     let base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();

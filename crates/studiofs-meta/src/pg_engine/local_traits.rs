@@ -1,8 +1,9 @@
 use super::PgMetaEngine;
 use crate::engine::{
-    DeferredDeleteRecord, MetaAcl, MetaEngine, MetaError, MetaFormat, MetaFsOps, MetaGc,
-    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
-    MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaError, MetaFormat,
+    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -302,6 +303,10 @@ impl MetaPayloadObjects for PgMetaEngine {
 }
 
 impl MetaGc for PgMetaEngine {
+    fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
+        self.local.compact_local_storage()
+    }
+
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
     }
@@ -312,6 +317,10 @@ impl MetaGc for PgMetaEngine {
 
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
         self.local.get_pending_deletions()
+    }
+
+    fn get_pending_deletions_limited(&self, limit: usize) -> MetaResult<Vec<(u64, i64)>> {
+        self.local.get_pending_deletions_limited(limit)
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {

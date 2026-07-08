@@ -1,6 +1,31 @@
 use super::*;
+use redb::CompactionError;
 
 impl MetaGc for RedbMetaEngine {
+    fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
+        let mut db = match self.db.try_write() {
+            Ok(db) => db,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(LocalStorageCompactionResult::SkippedBusy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MetaError::Storage("redb lock poisoned".to_string()));
+            }
+        };
+        match db.compact() {
+            Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
+            Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
+            // ReadTransaction outlives our short RwLock read guard; redb
+            // reports active transactions here.
+            Err(CompactionError::TransactionInProgress) => {
+                Ok(LocalStorageCompactionResult::SkippedBusy)
+            }
+            Err(error) => Err(MetaError::Storage(format!(
+                "failed to compact local redb: {error}"
+            ))),
+        }
+    }
+
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
         {
@@ -45,10 +70,11 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.get_pending_deletions_limited(usize::MAX)
+    }
+
+    fn get_pending_deletions_limited(&self, limit: usize) -> MetaResult<Vec<(u64, i64)>> {
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(PENDING_DELETIONS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -56,6 +82,7 @@ impl MetaGc for RedbMetaEngine {
         let deletions: Vec<(u64, i64)> = table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
+            .take(limit)
             .filter_map(|r| r.ok())
             .map(|(k, v)| (k.value(), v.value()))
             .collect();
@@ -64,10 +91,7 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let snapshots = txn
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

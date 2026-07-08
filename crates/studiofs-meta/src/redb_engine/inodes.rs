@@ -5,10 +5,7 @@ const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 
 impl RedbMetaEngine {
     pub(crate) fn get_base_attr(&self, ino: Ino) -> MetaResult<Option<InodeAttr>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(BASE_INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -56,10 +53,7 @@ impl RedbMetaEngine {
 
     /// Return the lifecycle record for one inode, if the table contains it.
     pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(INODE_LIFECYCLE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -72,10 +66,7 @@ impl RedbMetaEngine {
 
     /// Return all persisted inode lifecycle rows.
     pub fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(INODE_LIFECYCLE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -515,29 +506,20 @@ impl RedbMetaEngine {
 
     /// Returns inode ids whose local state differs from the last imported base view.
     pub fn local_overlay_inodes(&self) -> MetaResult<HashSet<Ino>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         Self::local_overlay_inodes_from_txn(&txn)
     }
 
     /// Returns inode attrs that diverged from the last imported/applied base view.
     pub fn local_overlay_attr_inodes(&self) -> MetaResult<HashSet<Ino>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         Self::local_overlay_attr_inodes_from_txn(&txn)
     }
 }
 
 impl MetaInodes for RedbMetaEngine {
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -606,10 +588,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
         Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
@@ -627,10 +606,7 @@ impl MetaInodes for RedbMetaEngine {
         if inos.is_empty() {
             return Ok(Vec::new());
         }
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
         let mut attrs = Vec::with_capacity(inos.len());
@@ -695,10 +671,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
 

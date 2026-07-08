@@ -18,10 +18,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         chunk_id: ChunkId,
         chunk_range: SliceRange,
     ) -> MetaResult<Vec<ResolvedSliceSpan>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_table = txn
             .open_table(REGULAR_FILE_OVERLAY_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -59,10 +56,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         let end = offset
             .checked_add(length)
             .ok_or_else(|| MetaError::Storage("regular-file lookup range overflow".to_string()))?;
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_table = txn
             .open_table(REGULAR_FILE_OVERLAY_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -187,18 +181,12 @@ impl MetaPayloadObjects for RedbMetaEngine {
     }
 
     fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         Self::has_regular_file_chunk_rows_in_read_txn(&txn, REGULAR_FILE_OVERLAY_TABLE, ino)
     }
 
     fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let table = txn
             .open_table(REGULAR_FILE_OVERLAY_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -223,10 +211,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
     }
 
     fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
             &txn,
             REGULAR_FILE_OVERLAY_TABLE,
@@ -254,10 +239,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         expected_epoch: u64,
         object_id: u64,
     ) -> MetaResult<bool> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -519,10 +501,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         const COMPACTION_TXN_BATCH_SIZE: usize = 64;
 
         let mut compacted = 0usize;
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_read_txn()?;
         let pending_table = txn
             .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

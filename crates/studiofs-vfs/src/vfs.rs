@@ -184,7 +184,9 @@ use studiofs_meta::schema::{
 use studiofs_meta::types::{
     AccessLevel, FileType, Ino, InodeAttr, PayloadRef, block_index_from_offset, offset_within_block,
 };
-use studiofs_meta::{FileLockLease, HardLockKind, MetaError, MetaResult};
+use studiofs_meta::{
+    FileLockLease, HardLockKind, LocalStorageCompactionResult, MetaError, MetaResult,
+};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -4270,6 +4272,7 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
+        self.run_startup_local_metadata_compaction();
         self.spawn_landing_zone_recovery_worker();
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();
@@ -4282,6 +4285,41 @@ impl StudioVfs {
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
         Ok(())
+    }
+
+    fn run_startup_local_metadata_compaction(&self) {
+        let started = Instant::now();
+        let result = self.meta.run_sync(|engine| engine.compact_local_storage());
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        match result {
+            Ok(LocalStorageCompactionResult::Compacted) => {
+                if elapsed > Duration::from_secs(2) {
+                    warn!(
+                        elapsed_ms,
+                        "startup local metadata compaction took longer than expected"
+                    );
+                } else {
+                    info!(elapsed_ms, "startup compacted local metadata storage");
+                }
+            }
+            Ok(LocalStorageCompactionResult::SkippedBusy) => {
+                debug!(
+                    elapsed_ms,
+                    "startup local metadata compaction skipped because metadata was busy"
+                );
+            }
+            Ok(LocalStorageCompactionResult::NoWork) => {
+                debug!(elapsed_ms, "startup local metadata compaction had no work");
+            }
+            Err(error) => {
+                warn!(
+                    elapsed_ms,
+                    error = %error,
+                    "startup local metadata compaction failed"
+                );
+            }
+        }
     }
 
     fn spawn_prefetch_worker(

@@ -1181,15 +1181,19 @@ impl StudioVfs {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
+            const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
             let meta = self.meta.clone();
             match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_pending_deletions()
+                engine.get_pending_deletions_limited(PENDING_DELETION_GC_BATCH_LIMIT + 1)
             })
             .await
             {
                 Ok(pending) => {
                     let mut deleted_count = 0;
-                    for (object_id, timestamp) in pending {
+                    let pending_total = pending.len();
+                    for (object_id, timestamp) in
+                        pending.into_iter().take(PENDING_DELETION_GC_BATCH_LIMIT)
+                    {
                         if referenced_object_ids.contains(&object_id) {
                             debug!(object_id, "skipping object - still reachable in metadata");
                             continue;
@@ -1232,6 +1236,13 @@ impl StudioVfs {
                     }
                     if deleted_count > 0 {
                         info!("GC deleted {} objects", deleted_count);
+                    }
+                    if pending_total > PENDING_DELETION_GC_BATCH_LIMIT {
+                        debug!(
+                            pending_total,
+                            batch_limit = PENDING_DELETION_GC_BATCH_LIMIT,
+                            "GC limited pending deletion cleanup batch"
+                        );
                     }
                 }
                 Err(e) => {
