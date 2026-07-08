@@ -920,8 +920,8 @@ impl StudioVfs {
             }
         }
 
-        self.cancel_pending_uploads_for_inode(ino);
         if retained.is_empty() {
+            self.cancel_pending_uploads_for_inode(ino);
             return;
         }
 
@@ -948,12 +948,51 @@ impl StudioVfs {
                 )
             })
             .collect();
+        let mut retained_pending = self
+            .pending_uploads_snapshot()
+            .into_iter()
+            .filter(|op| op.ino == ino)
+            .filter(|op| retained.contains_key(&op.object_id))
+            .map(|op| (op.object_id, op))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if !retained_pending.is_empty() {
+            self.cancel_upload_token_for_inode(ino);
+        }
+        let mut submit_upload_ops = Vec::new();
+        for op in upload_ops {
+            let (op_ino, offset, object_file_offset, object_id, op_epoch, payload_len) = op;
+            if let Some(current) = retained_pending.remove(&object_id) {
+                let mut rebased = current.clone();
+                rebased.offset = offset;
+                rebased.object_file_offset = object_file_offset;
+                rebased.content_epoch = op_epoch;
+                rebased.payload_len = payload_len;
+                if self.cached_store.requeue_rebased_upload(&current, rebased) {
+                    continue;
+                }
+            }
+            submit_upload_ops.push((
+                op_ino,
+                offset,
+                object_file_offset,
+                object_id,
+                op_epoch,
+                payload_len,
+            ));
+        }
+        for op in self
+            .pending_uploads_snapshot()
+            .into_iter()
+            .filter(|op| op.ino == ino && !retained.contains_key(&op.object_id))
+        {
+            self.cached_store.cancel_upload(&op);
+        }
         let live_extents: Vec<_> = retained
             .into_iter()
             .map(|(object_id, (_, _, _, block_index))| (ino, block_index, object_id, content_epoch))
             .collect();
         self.record_live_extents(&live_extents);
-        self.cached_store.submit_uploads_batch(&upload_ops);
+        self.cached_store.submit_uploads_batch(&submit_upload_ops);
         self.state.file_session.note_background_transition(
             ino,
             FileSessionOperation::Upload,

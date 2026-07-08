@@ -9599,8 +9599,8 @@ fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
             "setup should leave the flushed payload in the local backend"
         );
         assert!(
-            !vfs.cached_store().has_staged_upload(object_id),
-            "flush should defer upload-stage hardlink creation to the uploader"
+            vfs.cached_store().has_staged_upload(object_id),
+            "flush should keep an upload-stage hardlink for retryable pending uploads"
         );
         assert!(
             vfs.cached_store().is_pinned(object_id),
@@ -9673,7 +9673,7 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
             .object_id;
 
         assert!(vfs.local_payload_backend().contains(object_id));
-        assert!(!vfs.cached_store().has_staged_upload(object_id));
+        assert!(vfs.cached_store().has_staged_upload(object_id));
         assert!(vfs.cached_store().is_pinned(object_id));
 
         vfs.lazy_evict_removed_metadata_payloads(
@@ -9734,8 +9734,8 @@ fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
             "removed payloads for a retained inode must not poison future uploads with a delete marker"
         );
         assert!(
-            !vfs.local_payload_backend().contains(object_id),
-            "retained-inode payload eviction should still reclaim removed local payload bytes"
+            vfs.local_payload_backend().contains(object_id),
+            "retained-inode payload eviction must not remove bytes while upload is still pending"
         );
     });
 }

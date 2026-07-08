@@ -172,6 +172,22 @@ impl UploadQueue {
         }
     }
 
+    /// Requeue an upload after metadata rebased it onto a different content epoch.
+    ///
+    /// The `current` op must still match the live pending entry. `rebased` is
+    /// then sent to workers and becomes the new pending state.
+    pub fn requeue_rebased(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
+        let Some(previous) = self.update_pending_if_matches_to(current, rebased.clone()) else {
+            return false;
+        };
+        if self.sender.send(rebased.clone()).is_ok() {
+            true
+        } else {
+            self.restore_pending_if_current_matches(&rebased, previous);
+            false
+        }
+    }
+
     /// Cancel a pending upload and decrement pending count.
     ///
     /// Returns `true` when the pending entry matched and was removed; `false`
@@ -347,6 +363,31 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
+        Some(previous)
+    }
+
+    fn update_pending_if_matches_to(
+        &self,
+        expected: &PendingUpload,
+        replacement: PendingUpload,
+    ) -> Option<PendingUpload> {
+        if replacement.object_id != expected.object_id
+            || replacement.ino != expected.ino
+            || replacement.offset != expected.offset
+        {
+            return None;
+        }
+
+        let mut state = self.pending_state.lock();
+        let current = state.by_object.get_mut(&expected.object_id)?;
+        if current.ino != expected.ino
+            || current.offset != expected.offset
+            || current.content_epoch != expected.content_epoch
+        {
+            return None;
+        }
+        let previous = current.clone();
+        *current = replacement;
         Some(previous)
     }
 

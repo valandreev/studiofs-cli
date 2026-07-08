@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::local::{
     LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadObjectStats, LocalPayloadPut,
@@ -842,6 +843,17 @@ impl CachedStore {
             pinned.insert_many(ops.iter().map(|(_, _, _, object_id, _, _)| *object_id))
         };
         self.local_payload_backend.pin_batch(&first_pins);
+        let object_ids = ops
+            .iter()
+            .map(|(_, _, _, object_id, _, _)| *object_id)
+            .collect::<Vec<_>>();
+        if let Err(error) = self.upload_stage_store.link_payload_batch(&object_ids) {
+            warn!(
+                object_count = object_ids.len(),
+                error = %error,
+                "failed to link upload-stage payloads before batch upload submit"
+            );
+        }
         for (ino, offset, object_file_offset, object_id, content_epoch, payload_len) in ops {
             self.upload_queue.submit_with_payload(
                 *ino,
@@ -876,6 +888,15 @@ impl CachedStore {
     /// Requeues an upload op back into the upload queue.
     pub fn requeue_upload(&self, op: PendingUpload) -> bool {
         let queued = self.upload_queue.requeue(op);
+        if queued {
+            self.metrics.upload_queue.record_requeue();
+        }
+        queued
+    }
+
+    /// Requeues an upload op after rebasing it onto newer metadata.
+    pub fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
+        let queued = self.upload_queue.requeue_rebased(current, rebased);
         if queued {
             self.metrics.upload_queue.record_requeue();
         }
@@ -2376,6 +2397,36 @@ mod tests {
         assert_eq!(requeued.object_id, 303);
         assert_eq!(cached_store.pending_upload_count(), 1);
         assert!(cached_store.is_pinned(303));
+    }
+
+    #[tokio::test]
+    async fn submit_uploads_batch_links_payloads_into_upload_stage() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let put = LocalPayloadPut {
+            object_id: 404,
+            data: bytes::Bytes::from_static(b"batch-staged-payload"),
+            evictable: false,
+        };
+        cached_store
+            .put_batch(std::slice::from_ref(&put))
+            .expect("persist payload batch");
+
+        cached_store.submit_uploads_batch(&[(
+            7,
+            1024,
+            1024,
+            put.object_id,
+            3,
+            put.data.len() as u64,
+        )]);
+        let op = rx.recv().await.expect("queued upload");
+
+        assert_eq!(op.object_id, put.object_id);
+        assert_eq!(
+            cached_store.get_staged_for_upload(put.object_id).as_deref(),
+            Some(&b"batch-staged-payload"[..])
+        );
     }
 
     #[test]

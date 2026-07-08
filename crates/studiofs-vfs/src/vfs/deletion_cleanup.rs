@@ -380,12 +380,23 @@ impl StudioVfs {
     }
 
     pub(super) async fn evict_payload_objects_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+        let pending_upload_object_ids = self
+            .pending_uploads_snapshot()
+            .into_iter()
+            .filter(|op| op.ino == ino)
+            .map(|op| op.object_id)
+            .collect::<std::collections::HashSet<_>>();
+        let object_ids = object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| !pending_upload_object_ids.contains(object_id))
+            .collect::<Vec<_>>();
         if object_ids.is_empty() {
             return;
         }
 
         let mut forced_pinned = 0;
-        for &object_id in object_ids {
+        for &object_id in &object_ids {
             if self.cached_store.is_pinned(object_id) {
                 forced_pinned += 1;
                 self.cached_store.unpin(object_id);
@@ -394,13 +405,13 @@ impl StudioVfs {
 
         {
             let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in object_ids {
+            for object_id in &object_ids {
                 pending_evictions.remove(object_id);
             }
         }
 
-        self.upload_hot_remove_batch(object_ids);
-        if let Err(error) = self.upload_stage_remove_batch_async(object_ids).await {
+        self.upload_hot_remove_batch(&object_ids);
+        if let Err(error) = self.upload_stage_remove_batch_async(&object_ids).await {
             warn!(
                 ino,
                 error = %error,
@@ -408,7 +419,7 @@ impl StudioVfs {
                 "evict_payload_objects: upload stage batch removal failed"
             );
         }
-        if let Err(error) = self.payload_store_remove_batch_async(object_ids).await {
+        if let Err(error) = self.payload_store_remove_batch_async(&object_ids).await {
             warn!(
                 ino,
                 error = %error,

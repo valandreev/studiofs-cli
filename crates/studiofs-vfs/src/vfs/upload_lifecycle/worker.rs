@@ -110,6 +110,7 @@ enum SingleUploadOutcome {
     Completed,
     CancelledDeleted,
     CancelledStale,
+    Requeued,
     Shutdown,
 }
 
@@ -292,6 +293,7 @@ fn append_uploaded_object_reattach_slices(
 trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
+    fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool;
     fn cancel_upload(&self, op: &PendingUpload);
 }
 
@@ -453,6 +455,7 @@ where
             Ok(SingleUploadOutcome::Completed) => UploadOutcome::Completed,
             Ok(SingleUploadOutcome::CancelledDeleted) => UploadOutcome::CancelledDeleted,
             Ok(SingleUploadOutcome::CancelledStale) => UploadOutcome::CancelledStale,
+            Ok(SingleUploadOutcome::Requeued) => UploadOutcome::Requeued,
             Ok(SingleUploadOutcome::Shutdown) => {
                 if self.shutdown.uploader_shutdown_requested() {
                     return UploadOutcome::Shutdown;
@@ -610,6 +613,9 @@ where
         };
 
         if attr.content_epoch != op.content_epoch {
+            if self.requeue_stale_upload_if_uncovered(op).await? {
+                return Ok(SingleUploadOutcome::Requeued);
+            }
             self.cancel_stale_upload(op).await?;
             return Ok(SingleUploadOutcome::CancelledStale);
         }
@@ -620,6 +626,9 @@ where
             .await?;
 
         if !overlay_object_current {
+            if self.requeue_stale_upload_if_uncovered(op).await? {
+                return Ok(SingleUploadOutcome::Requeued);
+            }
             self.cancel_stale_upload(op).await?;
             return Ok(SingleUploadOutcome::CancelledStale);
         }
@@ -1023,6 +1032,34 @@ where
         Ok(())
     }
 
+    async fn requeue_stale_upload_if_uncovered(&self, op: &PendingUpload) -> VfsResult<bool> {
+        let Some(rebased_epoch) = self
+            .meta
+            .reattach_uploaded_object_if_uncovered(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.object_file_offset,
+                op.payload_len,
+                self.block_size,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let mut rebased = op.clone();
+        rebased.content_epoch = rebased_epoch;
+        if self.coordinator.requeue_rebased_upload(op, rebased) {
+            self.shutdown.record_requeue();
+            self.policy
+                .debug_pending_inode_state(op.ino, "stale_upload_reattached_requeued");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn upload_requeue_delay(&self, op: &PendingUpload) -> Duration {
         let exp = op.retry_count.min(8);
         let base = self
@@ -1048,6 +1085,12 @@ impl CachedStorePort for VfsCachedStorePort {
 
     fn requeue_upload(&self, op: PendingUpload) -> bool {
         self.vfs.cached_store.requeue_upload(op)
+    }
+
+    fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
+        self.vfs
+            .cached_store
+            .requeue_rebased_upload(current, rebased)
     }
 
     fn cancel_upload(&self, op: &PendingUpload) {
@@ -2320,6 +2363,11 @@ mod tests {
             true
         }
 
+        fn requeue_rebased_upload(&self, _current: &PendingUpload, rebased: PendingUpload) -> bool {
+            self.requeued.lock().push(rebased);
+            true
+        }
+
         fn cancel_upload(&self, op: &PendingUpload) {
             self.cancelled.lock().push(op.object_id);
             self.pending_inodes.lock().remove(&op.ino);
@@ -3366,6 +3414,42 @@ mod tests {
         assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_pre_put_stale_content_epoch_when_payload_can_reattach() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let rebased_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, rebased_epoch)));
+        *meta.reattach_epoch.lock() = Some(rebased_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            meta.reattached_uploads.lock().as_slice(),
+            &[(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.object_file_offset,
+                op.payload_len,
+                4096
+            )]
+        );
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
+        assert_eq!(requeued[0].content_epoch, rebased_epoch);
     }
 
     #[tokio::test]
