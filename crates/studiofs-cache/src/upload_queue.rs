@@ -372,10 +372,7 @@ impl UploadQueue {
         expected: &PendingUpload,
         replacement: &PendingUpload,
     ) -> Option<PendingUpload> {
-        if replacement.object_id != expected.object_id
-            || replacement.ino != expected.ino
-            || replacement.offset != expected.offset
-        {
+        if replacement.object_id != expected.object_id || replacement.ino != expected.ino {
             return None;
         }
 
@@ -595,6 +592,32 @@ mod tests {
         assert_eq!(pending[0].object_id, 100);
         assert_eq!(pending[0].retry_count, 2);
         assert_eq!(pending[0].not_before_unix_ms, retry.not_before_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn requeue_rebased_allows_offset_change_for_same_object() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit_with_payload(10, 0, 0, 100, 1, 4096);
+        let current = rx.recv().await.unwrap();
+        let mut rebased = current.clone();
+        rebased.offset = 4096;
+        rebased.object_file_offset = 4096;
+        rebased.content_epoch = 2;
+
+        assert!(queue.requeue_rebased(&current, rebased.clone()));
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.offset, 4096);
+        assert_eq!(queued.object_file_offset, 4096);
+        assert_eq!(queued.content_epoch, 2);
+
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].offset, 4096);
+        assert_eq!(pending[0].content_epoch, 2);
+        assert!(!queue.complete(&current));
+        assert!(queue.complete(&rebased));
     }
 
     #[tokio::test]

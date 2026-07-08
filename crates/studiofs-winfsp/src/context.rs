@@ -2122,9 +2122,10 @@ mod tests {
     use super::{
         CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
         FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
-        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
-        FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
+        FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS, FILE_READ_DATA_ACCESS,
+        FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS, FILE_WRITE_THROUGH_CREATE_OPTION,
         FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
@@ -2154,9 +2155,6 @@ mod tests {
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
-
-    const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
-    const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
     #[test]
     fn callback_buffer_helpers_live_in_focused_module_and_remain_send() {
@@ -2312,7 +2310,7 @@ mod tests {
 
         let unbuffered = open_flags_from_access(
             FILE_READ_DATA_ACCESS,
-            FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
+            FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION | FILE_WRITE_THROUGH_CREATE_OPTION,
         );
         assert_eq!(unbuffered.bits(), OpenFlags::RDONLY.bits());
     }
@@ -2420,21 +2418,21 @@ mod tests {
                 false,
                 OpenFlags::RDWR,
                 false,
-                FILE_WRITE_THROUGH_OPTION,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
                 true,
             ),
             (
                 true,
                 OpenFlags::WRONLY,
                 true,
-                FILE_WRITE_THROUGH_OPTION,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
                 false,
             ),
             (
                 true,
                 OpenFlags::RDWR,
                 true,
-                FILE_WRITE_THROUGH_OPTION,
+                FILE_WRITE_THROUGH_CREATE_OPTION,
                 false,
             ),
         ] {
@@ -3793,16 +3791,18 @@ mod tests {
             LocalSyncPolicy::Opportunistic
         );
         assert_eq!(
-            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
-            LocalSyncPolicy::WriteThrough
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_CREATE_OPTION),
             LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
+                FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION
+            ),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_options(
+                FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION
             ),
             LocalSyncPolicy::WriteThrough
         );
@@ -3823,7 +3823,7 @@ mod tests {
             fh,
             OpenFlags::RDWR,
             write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
+                FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION,
             ),
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
@@ -3908,7 +3908,7 @@ mod tests {
             false,
             fh,
             OpenFlags::RDWR,
-            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_CREATE_OPTION),
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let flush_calls_before = flush_barrier_calls(&vfs);

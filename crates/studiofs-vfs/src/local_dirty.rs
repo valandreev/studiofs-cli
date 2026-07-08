@@ -1624,7 +1624,7 @@ impl StudioVfs {
         }
 
         let persisted_bytes: u64 = entries.iter().map(|(_, data)| data.len() as u64).sum();
-        let persisted_object_ids: Vec<u64> =
+        let mut persisted_object_ids: Vec<u64> =
             entries.iter().map(|(object_id, _)| *object_id).collect();
         let started = Instant::now();
         let result: VfsResult<()> = async {
@@ -1652,19 +1652,20 @@ impl StudioVfs {
             }
             self.maybe_payload_store_sync_data_async(persisted_bytes, local_sync_policy)
                 .await?;
-            if let Err(error) = self
-                .upload_stage_link_batch_async(persisted_object_ids.clone())
-                .await
-            {
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            let persisted_payload_count = persisted_object_ids.len();
+            let object_ids = std::mem::take(&mut persisted_object_ids);
+            if let Err(error) = self.upload_stage_link_batch_async(object_ids).await {
                 warn!(
-                    persisted_payload_count = persisted_object_ids.len(),
+                    persisted_payload_count,
                     error = %error,
                     "failed to create zero-copy upload links for persisted local dirty payloads"
                 );
             }
-            Ok(())
         }
-        .await;
         self.record_payload_persist_observability(
             logical_block_count,
             persisted_bytes,
