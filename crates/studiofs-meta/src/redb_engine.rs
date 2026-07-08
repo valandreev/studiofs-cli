@@ -156,6 +156,11 @@ impl RedbMetaEngine {
             .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))
     }
 
+    pub(crate) fn begin_read_txn(&self) -> MetaResult<ReadTransaction> {
+        let db = self.read_db()?;
+        begin_redb_read_txn(&db)
+    }
+
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         let db = self.read_db()?;
         let txn = begin_redb_write_txn(&db)?;

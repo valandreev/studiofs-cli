@@ -724,6 +724,15 @@ pub trait MetaGc: Send + Sync {
     /// Get all pending deletions (object_id, timestamp).
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
 
+    /// Get up to `limit` pending deletions (object_id, timestamp).
+    fn get_pending_deletions_limited(&self, limit: usize) -> MetaResult<Vec<(u64, i64)>> {
+        Ok(self
+            .get_pending_deletions()?
+            .into_iter()
+            .take(limit)
+            .collect())
+    }
+
     /// Get currently referenced object IDs from the full reachability graph.
     ///
     /// Backends should include regular-file graph overlay/base rows and snapshot pins so cleanup can reason about publication races

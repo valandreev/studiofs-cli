@@ -1181,14 +1181,14 @@ impl StudioVfs {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
+            const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
             let meta = self.meta.clone();
             match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_pending_deletions()
+                engine.get_pending_deletions_limited(PENDING_DELETION_GC_BATCH_LIMIT + 1)
             })
             .await
             {
                 Ok(pending) => {
-                    const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
                     let mut deleted_count = 0;
                     let pending_total = pending.len();
                     for (object_id, timestamp) in

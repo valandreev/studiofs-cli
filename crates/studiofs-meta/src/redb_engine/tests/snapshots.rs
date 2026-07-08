@@ -524,8 +524,7 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();
 
-    let db = imported.read_db().unwrap();
-    let txn = begin_redb_read_txn(&db).unwrap();
+    let txn = imported.begin_read_txn().unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     let overlay_row = overlay_table
         .get(chunk_key.as_slice())
@@ -621,8 +620,7 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
 
     target.import_snapshot(&snapshot).unwrap();
 
-    let db = target.read_db().unwrap();
-    let txn = begin_redb_read_txn(&db).unwrap();
+    let txn = target.begin_read_txn().unwrap();
     let pending = txn
         .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
         .unwrap();
@@ -733,8 +731,7 @@ fn test_regular_file_graph_rows_removed_on_unlink() {
 
     engine.unlink(ROOT_INO, b"unlink-graph.bin").unwrap();
 
-    let db = engine.read_db().unwrap();
-    let txn = begin_redb_read_txn(&db).unwrap();
+    let txn = engine.begin_read_txn().unwrap();
     let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     assert!(overlay_table.get(chunk_key.as_slice()).unwrap().is_none());
     let base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();

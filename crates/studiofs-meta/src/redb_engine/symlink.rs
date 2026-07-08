@@ -20,8 +20,7 @@ impl MetaSymlink for RedbMetaEngine {
     }
 
     fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
-        let db = self.read_db()?;
-        let txn = begin_redb_read_txn(&db)?;
+        let txn = self.begin_read_txn()?;
         self.merged_symlink_target(&txn, ino)?
             .ok_or(MetaError::InodeNotFound(ino))
     }

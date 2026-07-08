@@ -319,6 +319,10 @@ impl MetaGc for PgMetaEngine {
         self.local.get_pending_deletions()
     }
 
+    fn get_pending_deletions_limited(&self, limit: usize) -> MetaResult<Vec<(u64, i64)>> {
+        self.local.get_pending_deletions_limited(limit)
+    }
+
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         self.local.get_referenced_object_ids()
     }

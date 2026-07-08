@@ -3,8 +3,7 @@ use super::*;
 impl RedbMetaEngine {
     /// Returns dentry keys whose local state differs from the last imported base view.
     pub fn local_overlay_dentries(&self) -> MetaResult<HashSet<Vec<u8>>> {
-        let db = self.read_db()?;
-        let txn = begin_redb_read_txn(&db)?;
+        let txn = self.begin_read_txn()?;
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -21,8 +20,7 @@ impl RedbMetaEngine {
 
 impl MetaNamespace for RedbMetaEngine {
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let db = self.read_db()?;
-        let txn = begin_redb_read_txn(&db)?;
+        let txn = self.begin_read_txn()?;
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -85,8 +83,7 @@ impl MetaNamespace for RedbMetaEngine {
     }
 
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        let db = self.read_db()?;
-        let txn = begin_redb_read_txn(&db)?;
+        let txn = self.begin_read_txn()?;
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;

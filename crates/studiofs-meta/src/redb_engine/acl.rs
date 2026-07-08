@@ -59,8 +59,7 @@ impl MetaAcl for RedbMetaEngine {
 
     fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
         let key = encode_acl_rule_key(ino, principal);
-        let db = self.read_db()?;
-        let txn = begin_redb_read_txn(&db)?;
+        let txn = self.begin_read_txn()?;
         if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
             return Ok(None);
         }
