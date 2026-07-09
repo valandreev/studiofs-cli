@@ -10,10 +10,21 @@ use std::process::Command;
 fn main() {
     emit_git_metadata();
 
-    // Required for WinFSP delayed loading — must be in the final binary's build.rs
-    // so the linker flag /DELAYLOAD:winfsp-x64.dll applies to the exe, not just the lib.
     #[cfg(windows)]
-    winfsp::build::winfsp_link_delayload();
+    emit_winfsp_delayload_for_studiofs_bin();
+}
+
+#[cfg(windows)]
+fn emit_winfsp_delayload_for_studiofs_bin() {
+    let dll = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => "winfsp-x64.dll",
+        Ok("x86") => "winfsp-x86.dll",
+        Ok("aarch64") => "winfsp-a64.dll",
+        _ => panic!("unsupported WinFSP target architecture"),
+    };
+
+    println!("cargo:rustc-link-lib=dylib=delayimp");
+    println!("cargo:rustc-link-arg-bin=studiofs=/DELAYLOAD:{dll}");
 }
 
 fn emit_git_metadata() {

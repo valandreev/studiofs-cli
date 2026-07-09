@@ -4820,7 +4820,6 @@ dependencies = [
  "url",
  "uuid",
  "windows 0.62.2",
- "winfsp",
  "winit",
  "winreg",
 ]
