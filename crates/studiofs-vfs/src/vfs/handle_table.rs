@@ -64,6 +64,7 @@ impl HandleTable {
         self.handles.read().get(&fh).cloned()
     }
 
+    /// Refresh the attribute snapshot carried by an already-open handle.
     pub(super) fn update_open_attr(&self, fh: u64, attr: InodeAttr) {
         if let Some(open_file) = self.handles.write().get_mut(&fh) {
             open_file.open_attr = Some(attr);

@@ -171,6 +171,49 @@ impl StudioFileHandle {
     }
 }
 
+struct PendingStudioFileHandle<'a> {
+    context: &'a StudioFsContext,
+    handle: Option<StudioFileHandle>,
+}
+
+impl<'a> PendingStudioFileHandle<'a> {
+    fn new(context: &'a StudioFsContext, handle: StudioFileHandle) -> Self {
+        Self {
+            context,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> &StudioFileHandle {
+        let Some(handle) = self.handle.as_ref() else {
+            unreachable!("pending WinFSP handle already returned");
+        };
+        handle
+    }
+
+    fn handle_mut(&mut self) -> &mut StudioFileHandle {
+        let Some(handle) = self.handle.as_mut() else {
+            unreachable!("pending WinFSP handle already returned");
+        };
+        handle
+    }
+
+    fn into_inner(mut self) -> StudioFileHandle {
+        let Some(handle) = self.handle.take() else {
+            unreachable!("pending WinFSP handle already returned");
+        };
+        handle
+    }
+}
+
+impl Drop for PendingStudioFileHandle<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            self.context.release_unreturned_handle(handle);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HandleZeroFillRange {
     start: u64,
@@ -1119,6 +1162,8 @@ impl StudioFsContext {
         let _ = self.spawn_wait(async move { vfs.release_fh(fh).await });
     }
 
+    // WinFSP overwrite opens need an allocated VFS handle first: the truncate
+    // must update the same open-file view used by the following writes.
     fn truncate_open_handle_after_open(
         &self,
         handle: &StudioFileHandle,
@@ -1212,19 +1257,21 @@ impl StudioFsContext {
         } else {
             let truncates_on_open =
                 should_truncate_existing_file_on_open(plan.create_options, plan.open_flags);
-            let handle = self.open_file_handle_for_attr(
-                &attr,
-                plan.open_flags,
-                false,
-                plan.write_local_sync_policy,
-            )?;
+            let handle = PendingStudioFileHandle::new(
+                self,
+                self.open_file_handle_for_attr(
+                    &attr,
+                    plan.open_flags,
+                    false,
+                    plan.write_local_sync_policy,
+                )?,
+            );
             if truncates_on_open
-                && let Err(error) = self.truncate_open_handle_after_open(&handle, file_info)
+                && let Err(error) = self.truncate_open_handle_after_open(handle.handle(), file_info)
             {
-                self.release_unreturned_handle(&handle);
                 return Err(error);
             }
-            Ok(handle)
+            Ok(handle.into_inner())
         }
     }
 
@@ -1490,22 +1537,30 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
         Self::write_open_file_info(file_info, &attr);
-        let mut handle =
-            self.open_file_handle_for_attr(&attr, open_flags, false, write_local_sync_policy)?;
-        if trunc && let Err(error) = self.truncate_open_handle_after_open(&handle, file_info) {
-            self.release_unreturned_handle(&handle);
+        let mut handle = PendingStudioFileHandle::new(
+            self,
+            self.open_file_handle_for_attr(&attr, open_flags, false, write_local_sync_policy)?,
+        );
+        if trunc
+            && let Err(error) = self.truncate_open_handle_after_open(handle.handle(), file_info)
+        {
             return Err(error);
         }
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || self.should_disable_os_cache_for_handle(&handle, trunc, raw_create_options, 0);
-        handle.set_disable_os_cache(disable_os_cache);
+            || self.should_disable_os_cache_for_handle(
+                handle.handle(),
+                trunc,
+                raw_create_options,
+                0,
+            );
+        handle.handle_mut().set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
             ino = attr.ino,
-            fh = handle.fh,
-            is_dir = handle.is_dir,
+            fh = handle.handle().fh,
+            is_dir = handle.handle().is_dir,
             open_flags = open_flags.bits(),
             create_options,
             raw_create_options,
@@ -1513,7 +1568,7 @@ impl FileSystemContext for StudioFsContext {
             disable_os_cache,
             "open"
         );
-        Ok(handle)
+        Ok(handle.into_inner())
     }
 
     fn close(&self, context: Self::FileContext) {
