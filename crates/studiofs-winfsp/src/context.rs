@@ -185,24 +185,21 @@ impl<'a> PendingStudioFileHandle<'a> {
     }
 
     fn handle(&self) -> &StudioFileHandle {
-        let Some(handle) = self.handle.as_ref() else {
-            unreachable!("pending WinFSP handle already returned");
-        };
-        handle
+        self.handle
+            .as_ref()
+            .expect("pending WinFSP handle already returned")
     }
 
     fn handle_mut(&mut self) -> &mut StudioFileHandle {
-        let Some(handle) = self.handle.as_mut() else {
-            unreachable!("pending WinFSP handle already returned");
-        };
-        handle
+        self.handle
+            .as_mut()
+            .expect("pending WinFSP handle already returned")
     }
 
     fn into_inner(mut self) -> StudioFileHandle {
-        let Some(handle) = self.handle.take() else {
-            unreachable!("pending WinFSP handle already returned");
-        };
-        handle
+        self.handle
+            .take()
+            .expect("pending WinFSP handle already returned")
     }
 }
 
