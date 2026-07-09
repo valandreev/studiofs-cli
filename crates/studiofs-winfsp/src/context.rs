@@ -1156,7 +1156,9 @@ impl StudioFsContext {
         }
         let vfs = self.vfs.clone();
         let fh = handle.fh;
-        let _ = self.spawn_wait(async move { vfs.release_fh(fh).await });
+        self.rt.spawn(async move {
+            let _ = vfs.release_fh(fh).await;
+        });
     }
 
     // WinFSP overwrite opens need an allocated VFS handle first: the truncate
