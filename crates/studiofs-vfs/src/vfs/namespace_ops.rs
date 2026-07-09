@@ -579,7 +579,7 @@ impl StudioVfs {
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
             let updated = Self::run_sync_future(self.setattr_with_size_change(
                 ino,
-                args.clone(),
+                args,
                 defer_handle_growth_flush,
             ))?;
             if let Some(handle) = fh {
