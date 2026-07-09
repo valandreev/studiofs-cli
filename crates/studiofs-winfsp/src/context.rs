@@ -171,6 +171,46 @@ impl StudioFileHandle {
     }
 }
 
+struct PendingStudioFileHandle<'a> {
+    context: &'a StudioFsContext,
+    handle: Option<StudioFileHandle>,
+}
+
+impl<'a> PendingStudioFileHandle<'a> {
+    fn new(context: &'a StudioFsContext, handle: StudioFileHandle) -> Self {
+        Self {
+            context,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> &StudioFileHandle {
+        self.handle
+            .as_ref()
+            .expect("pending WinFSP handle already returned")
+    }
+
+    fn handle_mut(&mut self) -> &mut StudioFileHandle {
+        self.handle
+            .as_mut()
+            .expect("pending WinFSP handle already returned")
+    }
+
+    fn into_inner(mut self) -> StudioFileHandle {
+        self.handle
+            .take()
+            .expect("pending WinFSP handle already returned")
+    }
+}
+
+impl Drop for PendingStudioFileHandle<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            self.context.release_unreturned_handle(handle);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HandleZeroFillRange {
     start: u64,
@@ -225,6 +265,8 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
 
 const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
+const FILE_FLAG_NO_BUFFERING_ATTRIBUTE: u32 = 0x2000_0000;
+const FILE_FLAG_WRITE_THROUGH_ATTRIBUTE: u32 = 0x8000_0000;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
 const FILE_SUPERSEDE_DISPOSITION: u32 = 0;
 const FILE_CREATE_DISPOSITION: u32 = 2;
@@ -285,19 +327,36 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
     LocalSyncPolicy::Opportunistic
 }
 
+fn write_local_sync_policy_from_create_parameters(
+    create_options: u32,
+    file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+) -> LocalSyncPolicy {
+    if (file_attributes & (FILE_FLAG_WRITE_THROUGH_ATTRIBUTE | FILE_FLAG_NO_BUFFERING_ATTRIBUTE))
+        != 0
+    {
+        return LocalSyncPolicy::WriteThrough;
+    }
+    write_local_sync_policy_from_create_options(create_options)
+}
+
 fn should_disable_winfsp_file_cache(
     is_dir: bool,
     open_flags: OpenFlags,
     truncates_on_open: bool,
     create_options: u32,
+    file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> bool {
     if is_dir {
         return false;
     }
 
-    let requested_uncached = (create_options & FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION) != 0
-        || (open_flags_allow_write(open_flags)
-            && (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0);
+    let write_through_requested = (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0
+        || (file_attributes & FILE_FLAG_WRITE_THROUGH_ATTRIBUTE) != 0;
+    let no_buffering_requested = (create_options & FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION)
+        != 0
+        || (file_attributes & FILE_FLAG_NO_BUFFERING_ATTRIBUTE) != 0;
+    let requested_uncached =
+        no_buffering_requested || (open_flags_allow_write(open_flags) && write_through_requested);
     open_flags.contains(OpenFlags::WRONLY) || truncates_on_open || requested_uncached
 }
 
@@ -917,12 +976,14 @@ impl StudioFsContext {
         handle: &StudioFileHandle,
         truncates_on_open: bool,
         create_options: u32,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> bool {
         should_disable_winfsp_file_cache(
             handle.is_dir,
             handle.open_flags,
             truncates_on_open,
             create_options,
+            file_attributes,
         )
     }
 
@@ -1089,6 +1150,32 @@ impl StudioFsContext {
         }
     }
 
+    fn release_unreturned_handle(&self, handle: &StudioFileHandle) {
+        if handle.is_dir || handle.fh == 0 {
+            return;
+        }
+        let vfs = self.vfs.clone();
+        let fh = handle.fh;
+        self.rt.spawn(async move {
+            let _ = vfs.release_fh(fh).await;
+        });
+    }
+
+    // WinFSP overwrite opens need an allocated VFS handle first: the truncate
+    // must update the same open-file view used by the following writes.
+    fn truncate_open_handle_after_open(
+        &self,
+        handle: &StudioFileHandle,
+        file_info: &mut OpenFileInfo,
+    ) -> winfsp::Result<()> {
+        let attr = self
+            .vfs
+            .setattr_with_handle(Some(handle.fh), handle.ino, SetattrArgs::size_only(0))
+            .map_err(vfs_to_winfsp_err)?;
+        Self::write_open_file_info(file_info, &attr);
+        Ok(())
+    }
+
     fn write_open_file_info(out: &mut OpenFileInfo, attr: &InodeAttr) {
         *out.as_mut() = attr_to_file_info(attr);
     }
@@ -1102,16 +1189,22 @@ impl StudioFsContext {
         file_name: &U16CStr,
         create_options: u32,
         granted_access: FILE_ACCESS_RIGHTS,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         extra_buffer: Option<&[u8]>,
         extra_buffer_is_reparse_point: bool,
     ) -> winfsp::Result<CreateCallbackPlan> {
+        let create_options = current_winfsp_create_options(create_options);
         let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
         Ok(CreateCallbackPlan {
             parent_ino,
             name,
             create_options,
+            file_attributes,
             open_flags: open_flags_from_access(granted_access, create_options),
-            write_local_sync_policy: write_local_sync_policy_from_create_options(create_options),
+            write_local_sync_policy: write_local_sync_policy_from_create_parameters(
+                create_options,
+                file_attributes,
+            ),
             kind: resolve_create_callback_kind(
                 create_options,
                 extra_buffer,
@@ -1161,12 +1254,23 @@ impl StudioFsContext {
                 plan.write_local_sync_policy,
             ))
         } else {
-            self.open_file_handle_for_attr(
-                &attr,
-                plan.open_flags,
-                should_truncate_existing_file_on_open(plan.create_options, plan.open_flags),
-                plan.write_local_sync_policy,
-            )
+            let truncates_on_open =
+                should_truncate_existing_file_on_open(plan.create_options, plan.open_flags);
+            let handle = PendingStudioFileHandle::new(
+                self,
+                self.open_file_handle_for_attr(
+                    &attr,
+                    plan.open_flags,
+                    false,
+                    plan.write_local_sync_policy,
+                )?,
+            );
+            if truncates_on_open
+                && let Err(error) = self.truncate_open_handle_after_open(handle.handle(), file_info)
+            {
+                return Err(error);
+            }
+            Ok(handle.into_inner())
         }
     }
 
@@ -1429,20 +1533,33 @@ impl FileSystemContext for StudioFsContext {
         let open_flags = open_flags_from_access(granted_access, create_options);
         let raw_create_options = current_winfsp_create_options(create_options);
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
-        let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
+        let write_local_sync_policy =
+            write_local_sync_policy_from_create_options(raw_create_options);
         Self::write_open_file_info(file_info, &attr);
-        let mut handle =
-            self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
+        let mut handle = PendingStudioFileHandle::new(
+            self,
+            self.open_file_handle_for_attr(&attr, open_flags, false, write_local_sync_policy)?,
+        );
+        if trunc
+            && let Err(error) = self.truncate_open_handle_after_open(handle.handle(), file_info)
+        {
+            return Err(error);
+        }
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || self.should_disable_os_cache_for_handle(&handle, trunc, raw_create_options);
-        handle.set_disable_os_cache(disable_os_cache);
+            || self.should_disable_os_cache_for_handle(
+                handle.handle(),
+                trunc,
+                raw_create_options,
+                0,
+            );
+        handle.handle_mut().set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
             ino = attr.ino,
-            fh = handle.fh,
-            is_dir = handle.is_dir,
+            fh = handle.handle().fh,
+            is_dir = handle.handle().is_dir,
             open_flags = open_flags.bits(),
             create_options,
             raw_create_options,
@@ -1450,7 +1567,7 @@ impl FileSystemContext for StudioFsContext {
             disable_os_cache,
             "open"
         );
-        Ok(handle)
+        Ok(handle.into_inner())
     }
 
     fn close(&self, context: Self::FileContext) {
@@ -1478,7 +1595,7 @@ impl FileSystemContext for StudioFsContext {
         file_name: &U16CStr,
         create_options: u32,
         granted_access: FILE_ACCESS_RIGHTS,
-        _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
         extra_buffer: Option<&[u8]>,
@@ -1508,7 +1625,7 @@ impl FileSystemContext for StudioFsContext {
                 &attr,
                 open_flags,
                 false,
-                write_local_sync_policy_from_create_options(create_options),
+                write_local_sync_policy_from_create_parameters(create_options, file_attributes),
             )?;
             handle.set_disable_os_cache(true);
             self.vfs.note_winfsp_os_cache_open(true);
@@ -1522,15 +1639,21 @@ impl FileSystemContext for StudioFsContext {
             file_name,
             create_options,
             granted_access,
+            file_attributes,
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
-        let raw_create_options = current_winfsp_create_options(plan.create_options);
+        let raw_create_options = plan.create_options;
+        let file_attributes = plan.file_attributes;
         let truncates_on_open =
             should_truncate_existing_file_on_open(raw_create_options, plan.open_flags);
         let mut handle = self.execute_create_callback_plan(plan, file_info)?;
-        let disable_os_cache =
-            self.should_disable_os_cache_for_handle(&handle, truncates_on_open, raw_create_options);
+        let disable_os_cache = self.should_disable_os_cache_for_handle(
+            &handle,
+            truncates_on_open,
+            raw_create_options,
+            file_attributes,
+        );
         handle.set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -2120,22 +2243,25 @@ impl AsyncFileSystemContext for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
-        FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
+        CREATE_DISPOSITION_SHIFT, CreateCallbackKind, FILE_ACTION_MODIFIED,
+        FILE_APPEND_DATA_ACCESS, FILE_DIRECTORY_FILE_OPTION, FILE_FLAG_NO_BUFFERING_ATTRIBUTE,
+        FILE_FLAG_WRITE_THROUGH_ATTRIBUTE, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
         FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
         FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-        FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS, FILE_READ_DATA_ACCESS,
-        FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS, FILE_WRITE_THROUGH_CREATE_OPTION,
-        FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
-        STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
-        StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
-        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
-        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
-        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
-        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_OVERWRITE_IF_DISPOSITION, FILE_READ_ATTRIBUTES_ACCESS,
+        FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
+        FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PreparedWinfspNotifications,
+        READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE,
+        STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
+        is_runtime_stats_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
+        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
+        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        write_local_sync_policy_from_create_options,
+        write_local_sync_policy_from_create_parameters,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -2326,7 +2452,7 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(!should_disable_winfsp_file_cache(false, flags, false, 0));
+        assert!(!should_disable_winfsp_file_cache(false, flags, false, 0, 0));
     }
 
     #[test]
@@ -2388,7 +2514,7 @@ mod tests {
             .expect("create file");
         let mut handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
 
-        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle, false, 0);
+        let disable_os_cache = ctx.should_disable_os_cache_for_handle(&handle, false, 0, 0);
         handle.set_disable_os_cache(disable_os_cache);
         vfs.note_winfsp_os_cache_open(disable_os_cache);
         vfs.record_winfsp_read_callback_observability(4096, Duration::from_millis(2));
@@ -2409,16 +2535,41 @@ mod tests {
 
     #[test]
     fn winfsp_file_cache_policy_tracks_write_intent() {
-        for (is_dir, open_flags, truncates_on_open, create_options, expected) in [
-            (false, OpenFlags::RDONLY, false, 0, false),
-            (false, OpenFlags::WRONLY, false, 0, true),
-            (false, OpenFlags::RDWR, false, 0, false),
-            (false, OpenFlags::RDWR, true, 0, true),
+        for (is_dir, open_flags, truncates_on_open, create_options, file_attributes, expected) in [
+            (false, OpenFlags::RDONLY, false, 0, 0, false),
+            (false, OpenFlags::WRONLY, false, 0, 0, true),
+            (false, OpenFlags::RDWR, false, 0, 0, false),
+            (false, OpenFlags::RDWR, true, 0, 0, true),
             (
                 false,
                 OpenFlags::RDWR,
                 false,
                 FILE_WRITE_THROUGH_CREATE_OPTION,
+                0,
+                true,
+            ),
+            (
+                false,
+                OpenFlags::RDONLY,
+                false,
+                0,
+                FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
+                false,
+            ),
+            (
+                false,
+                OpenFlags::RDWR,
+                false,
+                0,
+                FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
+                true,
+            ),
+            (
+                false,
+                OpenFlags::RDONLY,
+                false,
+                0,
+                FILE_FLAG_NO_BUFFERING_ATTRIBUTE,
                 true,
             ),
             (
@@ -2426,6 +2577,7 @@ mod tests {
                 OpenFlags::WRONLY,
                 true,
                 FILE_WRITE_THROUGH_CREATE_OPTION,
+                FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
                 false,
             ),
             (
@@ -2433,6 +2585,7 @@ mod tests {
                 OpenFlags::RDWR,
                 true,
                 FILE_WRITE_THROUGH_CREATE_OPTION,
+                FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
                 false,
             ),
         ] {
@@ -2442,6 +2595,7 @@ mod tests {
                     open_flags,
                     truncates_on_open,
                     create_options,
+                    file_attributes,
                 ),
                 expected
             );
@@ -2505,8 +2659,8 @@ mod tests {
         let read_handle = StudioFileHandle::new(attr.ino, false, 1, OpenFlags::RDONLY);
         let dir_handle = StudioFileHandle::new(ROOT_INO, true, 2, OpenFlags::RDONLY);
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0, 0));
         queue.lock().push(attr.ino);
 
         let notifications = ctx.should_notify().expect("pending WinFSP notification");
@@ -2516,8 +2670,8 @@ mod tests {
                 .any(|notification| notification.ino == attr.ino)
         );
 
-        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0));
-        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0, 0));
+        assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0, 0));
     }
 
     #[test]
@@ -2731,6 +2885,81 @@ mod tests {
                 .size,
             0,
             "FILE_OVERWRITE_IF create fallback should synchronously truncate the logical EOF"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(handle.fh).await }
+        })
+        .expect("release handle");
+    }
+
+    #[test]
+    fn winfsp_create_overwrite_if_write_through_publishes_replacement_payload() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("overwrite-if-write-through-replacement");
+        let attr = vfs
+            .create(ROOT_INO, b"overwrite-replacement.txt", 0, 0, 0o644)
+            .expect("create existing file");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"old-payload-tail").await }
+        })
+        .expect("seed existing contents");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("flush existing contents");
+
+        let file_name = U16CString::from_str(r"\overwrite-replacement.txt").expect("u16 path");
+        let mut open_file_info = empty_open_file_info();
+        let overwrite_if_create_options = FILE_OVERWRITE_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT;
+        let handle = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            overwrite_if_create_options,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
+            None,
+            0,
+            None,
+            false,
+            &mut open_file_info,
+        )
+        .expect("CREATE_ALWAYS should open and truncate an existing regular file");
+        assert_eq!(handle.ino, attr.ino);
+        assert_eq!(
+            handle.write_local_sync_policy,
+            LocalSyncPolicy::WriteThrough
+        );
+
+        let replacement = b"replacement-payload";
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let written = <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            replacement,
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write replacement through WinFSP callback");
+        assert_eq!(written, replacement.len() as u32);
+
+        let readback = ctx
+            .spawn_wait({
+                let vfs = vfs.clone();
+                async move { vfs.read(handle.ino, 0, replacement.len() as u32).await }
+            })
+            .expect("read replacement");
+        assert_eq!(readback.as_ref(), replacement);
+
+        let attr_after_write = vfs.getattr(attr.ino).expect("attr after replacement write");
+        assert_eq!(attr_after_write.size, replacement.len() as u64);
+        assert!(
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "write-through overwrite replacement must queue upload work before publication"
         );
 
         ctx.spawn_wait({
@@ -3804,6 +4033,10 @@ mod tests {
             write_local_sync_policy_from_create_options(
                 FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION
             ),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_parameters(0, FILE_FLAG_WRITE_THROUGH_ATTRIBUTE),
             LocalSyncPolicy::WriteThrough
         );
     }

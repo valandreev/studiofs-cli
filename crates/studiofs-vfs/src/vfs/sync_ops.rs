@@ -1751,6 +1751,14 @@ impl StudioVfs {
         if base_attr.is_unpublished_empty_draft() && !data.is_empty() {
             self.begin_size_change_incarnation(ino, &mut base_attr);
             base_attr.upload_state = MetaUploadState::Uploading;
+        } else if base_attr.upload_state == MetaUploadState::Ready && !data.is_empty() {
+            self.begin_pending_incarnation(ino, &mut base_attr);
+            base_attr.upload_state =
+                if base_attr.committed_size > 0 || base_attr.committed_content_epoch > 0 {
+                    MetaUploadState::Updating
+                } else {
+                    MetaUploadState::Uploading
+                };
         }
 
         let spec = super::writer_stack::WriterWriteSpec {

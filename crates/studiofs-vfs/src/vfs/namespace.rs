@@ -672,18 +672,13 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     fn path_components(&self, path: &str) -> Vec<String> {
-        let stripped = match self.style {
-            NamespacePathStyle::Posix => path.trim_start_matches('/'),
-            NamespacePathStyle::Windows => path.trim_start_matches('\\'),
+        let (stripped, separator) = match self.style {
+            NamespacePathStyle::Posix => (path.trim_start_matches('/'), '/'),
+            NamespacePathStyle::Windows => (path.trim_start_matches('\\'), '\\'),
         };
 
         let mut components: Vec<String> = Vec::new();
-        let parts: Box<dyn Iterator<Item = &str>> = match self.style {
-            NamespacePathStyle::Posix => Box::new(stripped.split('/')),
-            NamespacePathStyle::Windows => Box::new(stripped.split('\\')),
-        };
-
-        for raw in parts {
+        for raw in stripped.split(separator) {
             if raw.is_empty() || raw == "." {
                 continue;
             }
