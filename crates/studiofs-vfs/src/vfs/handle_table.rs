@@ -64,6 +64,12 @@ impl HandleTable {
         self.handles.read().get(&fh).cloned()
     }
 
+    pub(super) fn update_open_attr(&self, fh: u64, attr: InodeAttr) {
+        if let Some(open_file) = self.handles.write().get_mut(&fh) {
+            open_file.open_attr = Some(attr);
+        }
+    }
+
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
         let open_file = self.handles.write().remove(&fh)?;

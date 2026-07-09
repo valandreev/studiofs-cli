@@ -7,6 +7,7 @@ pub(super) struct CreateCallbackPlan {
     pub(super) parent_ino: Ino,
     pub(super) name: Vec<u8>,
     pub(super) create_options: u32,
+    pub(super) file_attributes: u32,
     pub(super) open_flags: OpenFlags,
     pub(super) write_local_sync_policy: LocalSyncPolicy,
     pub(super) kind: CreateCallbackKind,

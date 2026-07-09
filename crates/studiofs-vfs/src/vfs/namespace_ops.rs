@@ -577,11 +577,15 @@ impl StudioVfs {
             }
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
-            return Self::run_sync_future(self.setattr_with_size_change(
+            let updated = Self::run_sync_future(self.setattr_with_size_change(
                 ino,
                 args.clone(),
                 defer_handle_growth_flush,
-            ));
+            ))?;
+            if let Some(handle) = fh {
+                self.handle_table.update_open_attr(handle, updated.clone());
+            }
+            return Ok(updated);
         }
 
         if apply_attr_only_setattr_args(&mut attr, &args) {

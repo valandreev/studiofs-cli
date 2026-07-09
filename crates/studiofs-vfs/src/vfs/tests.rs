@@ -3991,6 +3991,73 @@ fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch()
 }
 
 #[test]
+fn write_through_same_size_overwrite_queues_new_upload() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "same-size-overwrite-upload");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"same-size-overwrite-upload.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let initial = b"published-data!!";
+        let replacement = b"replacement-data";
+        assert_eq!(initial.len(), replacement.len());
+
+        let initial_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open initial writer");
+        vfs.write_fh_with_deferred_materialize(
+            initial_fh,
+            ino,
+            0,
+            initial,
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .expect("write initial payload");
+        vfs.release_fh(initial_fh)
+            .await
+            .expect("release initial writer");
+
+        let (published_epoch, published_objects) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_objects);
+        let ready_attr = meta.get_attr(ino).expect("load ready attr");
+        assert_eq!(ready_attr.upload_state, MetaUploadState::Ready);
+        assert_eq!(ready_attr.committed_size, replacement.len() as u64);
+
+        let overwrite_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite writer");
+        vfs.write_fh_with_deferred_materialize(
+            overwrite_fh,
+            ino,
+            0,
+            replacement,
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .expect("write same-size replacement");
+
+        let dirty_attr = meta.get_attr(ino).expect("load replacement attr");
+        assert!(
+            dirty_attr.content_epoch > ready_attr.content_epoch,
+            "same-size replacement must advance content epoch"
+        );
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "same-size replacement must queue replacement payload upload"
+        );
+
+        vfs.release_fh(overwrite_fh)
+            .await
+            .expect("release overwrite writer");
+    });
+}
+
+#[test]
 fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "write-through-sparse-extend-retains");
