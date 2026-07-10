@@ -570,6 +570,163 @@ mod tests {
     }
 
     #[test]
+    fn opportunistic_pending_slice_commit_never_splits_persisted_payload_objects() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-whole-objects");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-whole-objects.bin", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        let block_size = vfs.block_size as usize;
+        let first_len = block_size / 4;
+        let created_at = Instant::now()
+            .checked_sub(Duration::from_millis(250))
+            .expect("old instant");
+        let mut persisted = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        persisted.entry(1).or_default().push(PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(
+                0,
+                u32::try_from(first_len).expect("first slice len"),
+            )
+            .expect("first slice range"),
+            block_index: 16,
+            block_offset: 0,
+            seq: 1,
+            object_id: Some(40_000),
+            object_offset: 0,
+            created_at,
+        });
+        for index in 0..16usize {
+            let start = u32::try_from(index * block_size).expect("slice start");
+            persisted.entry(0).or_default().push(PendingDirtySlice {
+                range: studiofs_meta::schema::SliceRange::new(start, start + vfs.block_size)
+                    .expect("slice range"),
+                block_index: u32::try_from(index).expect("block index"),
+                block_offset: 0,
+                seq: index as u64 + 2,
+                object_id: Some(40_001 + index as u64),
+                object_offset: 0,
+                created_at,
+            });
+        }
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+        let selected_lengths = selected
+            .values()
+            .flat_map(|slices| slices.iter())
+            .map(|slice| slice.len())
+            .collect::<Vec<_>>();
+
+        assert!(selected_lengths.contains(&first_len));
+        assert!(
+            selected_lengths
+                .iter()
+                .all(|len| *len == first_len || *len == block_size),
+            "commit waves must retain or commit an immutable payload object as a whole: {selected_lengths:?}"
+        );
+    }
+
+    #[test]
+    fn opportunistic_pending_slice_commit_keeps_cross_chunk_object_atomic() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-cross-chunk-object");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-cross-chunk-object.bin", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        let block_size = vfs.block_size;
+        let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
+        let mut persisted = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        for index in 0..15u32 {
+            let start = index * block_size;
+            persisted.entry(0).or_default().push(PendingDirtySlice {
+                range: studiofs_meta::schema::SliceRange::new(start, start + block_size)
+                    .expect("full block range"),
+                block_index: index,
+                block_offset: 0,
+                seq: u64::from(index) + 1,
+                object_id: Some(50_000 + u64::from(index)),
+                object_offset: 0,
+                created_at: Instant::now(),
+            });
+        }
+        let three_mib = 3 * 1024 * 1024;
+        let sixty_mib = 60 * 1024 * 1024;
+        persisted.entry(0).or_default().push(PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(sixty_mib, sixty_mib + three_mib)
+                .expect("63 MiB prefix tail"),
+            block_index: 15,
+            block_offset: 0,
+            seq: 16,
+            object_id: Some(50_015),
+            object_offset: 0,
+            created_at: Instant::now(),
+        });
+
+        let cross_chunk_object = 60_000;
+        persisted.entry(0).or_default().push(PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(chunk_size - 1024 * 1024, chunk_size)
+                .expect("cross-chunk first slice"),
+            block_index: 16,
+            block_offset: 0,
+            seq: cross_chunk_object,
+            object_id: Some(cross_chunk_object),
+            object_offset: 0,
+            created_at: Instant::now(),
+        });
+        persisted.entry(1).or_default().push(PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(0, 2 * 1024 * 1024)
+                .expect("cross-chunk second slice"),
+            block_index: 16,
+            block_offset: 1024 * 1024,
+            seq: cross_chunk_object,
+            object_id: Some(cross_chunk_object),
+            object_offset: 1024 * 1024,
+            created_at: Instant::now(),
+        });
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+        let selected_cross_chunk_slice_count = selected
+            .values()
+            .flat_map(|slices| slices.iter())
+            .filter(|slice| slice.object_id == Some(cross_chunk_object))
+            .count();
+
+        assert!(
+            selected_cross_chunk_slice_count == 0 || selected_cross_chunk_slice_count == 2,
+            "commit waves must keep every slice of one immutable object together"
+        );
+    }
+
+    #[test]
     fn opportunistic_pending_slice_commit_drains_aged_tail_when_upload_pipeline_is_idle() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-idle-tail");

@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_builds_low_level_mount_arguments_without_kernel_read_only_option() {
+    fn session_config_uses_buffered_data_cache_with_uncached_names() {
         let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native")
             .with_read_only(true)
             .with_run_in_foreground(true);
@@ -363,9 +363,9 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-olocal"));
         assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
-        assert!(mount_args.iter().any(|arg| arg == "-odirect_io"));
-        assert!(mount_args.iter().any(|arg| arg == "-onolocalcaches"));
-        assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
+        assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
+        assert!(!mount_args.iter().any(|arg| arg == "-oauto_cache"));
         let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
         assert!(
             mount_args
@@ -377,7 +377,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
         );
-        assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
+        assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));

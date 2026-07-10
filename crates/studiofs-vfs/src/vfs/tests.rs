@@ -6952,33 +6952,6 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
     );
 }
 
-#[test]
-fn foreground_user_io_active_respects_idle_grace_after_last_write() {
-    let state = ReadState::new(1);
-    let grace = Duration::from_millis(50);
-
-    let _ = state.observe_write_access(
-        None,
-        1,
-        0,
-        4096,
-        AccessTrackerConfig {
-            block_size: 4096,
-            readahead_base_width: 8,
-            readahead_max_width: 32,
-            readahead_min_prefetch: 2,
-        },
-    );
-
-    let last_write = state.last_foreground_write_ms.load(AtomicOrdering::Relaxed);
-    assert!(state.foreground_user_io_active(last_write + 49, grace));
-    assert!(!state.foreground_user_io_active(last_write + 51, grace));
-    assert!(
-        !state.foreground_read_active(last_write + 49, grace),
-        "upload disk rereads should not throttle purely because foreground writes are active"
-    );
-}
-
 #[tokio::test]
 async fn foreground_idle_notify_fires_when_last_read_finishes() {
     let state = ReadState::new(1);
@@ -12695,13 +12668,209 @@ fn release_fh_materializes_sparse_cross_chunk_tail_before_size_extend() {
 }
 
 #[test]
-fn deferred_materialization_linger_matches_juicefs_scale() {
-    assert!(
-        Duration::from_millis(
-            DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
-                * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
-        ) >= Duration::from_secs(1)
+fn deferred_materialization_linger_preserves_stream_coalescing() {
+    assert_eq!(
+        DEFERRED_MATERIALIZATION_LINGER_WAIT_MS, 200,
+        "synchronous bridge callbacks need enough time to coalesce one payload object"
     );
+}
+
+#[test]
+fn strict_flush_interrupts_deferred_materialization_linger() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "interrupt-deferred-materialization-linger");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"interrupt-deferred-materialization-linger.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+
+        let payload = [0xA5; 8 * 1024];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write small callback");
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !vfs.state.deferred_materialize_inflight.contains(ino) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred materializer should enter its coalescing window");
+
+        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+            .await
+            .expect("strict flush must wake a lingering materializer")
+            .expect("strict flush should persist the accepted write");
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), 0);
+        let mut readback = vec![0; payload.len()];
+        let read_len = vfs
+            .read_into_fh(fh, ino, 0, &mut readback)
+            .await
+            .expect("read flushed payload");
+        assert_eq!(read_len as usize, payload.len());
+        assert_eq!(readback, payload);
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
+fn last_handle_release_interrupts_deferred_materialization_linger() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-interrupts-linger");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-interrupts-linger.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let payload = [0x6B; 8 * 1024];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write small callback");
+
+        tokio::time::timeout(Duration::from_millis(500), vfs.release_fh(fh))
+            .await
+            .expect("last-handle release must wake a lingering materializer")
+            .expect("release accepted write");
+        assert_eq!(vfs.open_count(ino), 0);
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), 0);
+
+        let read_fh = vfs
+            .open_file(ino, OpenFlags::RDONLY, false)
+            .expect("reopen file");
+        let mut readback = vec![0; payload.len()];
+        let read_len = vfs
+            .read_into_fh(read_fh, ino, 0, &mut readback)
+            .await
+            .expect("read released payload");
+        assert_eq!(read_len as usize, payload.len());
+        assert_eq!(readback, payload);
+        vfs.release_fh(read_fh).await.expect("release read handle");
+    });
+}
+
+#[test]
+fn strict_flush_interrupts_clean_deferred_materialization_linger() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "interrupt-clean-linger");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"interrupt-clean-linger.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let payload = vec![0x73; vfs.block_size as usize];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write full block");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.state.deferred_materialize_inflight.contains(ino)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("materializer should enter the clean coalescing window");
+        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+            .await
+            .expect("strict flush must wake the clean-linger branch")
+            .expect("flush full block");
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
+fn deferred_materialization_coalesces_synchronous_small_callbacks() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coalesce-small-sync-callbacks");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"coalesce-small-sync-callbacks.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let callback = [0x5A; 8 * 1024];
+        let callback_count = 32usize;
+
+        for index in 0..callback_count {
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                (index * callback.len()) as u64,
+                &callback,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write synchronous-sized callback");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let expected_bytes = callback.len() * callback_count;
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            expected_bytes,
+            "active small callbacks should remain in one coalescing writer buffer"
+        );
+        assert_eq!(
+            vfs.total_pending_persisted_local_dirty_slice_bytes(),
+            0,
+            "the coalescing window must not emit one persisted object per callback"
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+            .await
+            .expect("strict flush must interrupt the coalescing window")
+            .expect("flush coalesced callbacks");
+        assert_eq!(
+            vfs.pending_uploads_for_inode(ino).len(),
+            1,
+            "one partial block should produce one upload object after flush"
+        );
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
 }
 
 #[test]
@@ -12734,7 +12903,8 @@ fn deferred_materialization_drains_idle_tail_before_close() {
             DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
                 * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
                 * 3,
-        );
+        )
+        .max(Duration::from_secs(2));
         tokio::time::timeout(idle_tail_timeout, async {
             loop {
                 if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
@@ -12783,7 +12953,8 @@ fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
             DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
                 * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
                 * 3,
-        );
+        )
+        .max(Duration::from_secs(2));
 
         vfs.write_fh_with_deferred_materialize(
             fh,
@@ -13296,6 +13467,11 @@ fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
             !wait.is_finished(),
             "foreground sync must not be able to acquire a newly registered deferred release marker before the background release task owns it"
         );
+        assert_eq!(
+            barrier.interrupt_waiter_count(),
+            0,
+            "deferred-release waits must stay passive"
+        );
 
         drop(guard);
         drop(barrier);
@@ -13349,6 +13525,118 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
         drop(newer_entry);
         drop(newer_guard);
         wait.await.expect("wait task should not panic");
+    });
+}
+
+#[test]
+fn deferred_materialization_interrupt_waiters_are_cancellation_safe_and_inode_scoped() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, _vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-interrupt-waiters");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let gate = DeferredInodeGate::default();
+        let (entry_a, guard_a) = gate
+            .try_register(101)
+            .expect("register inode A materializer");
+        let (entry_b, guard_b) = gate
+            .try_register(202)
+            .expect("register inode B materializer");
+
+        let first_gate = gate.clone();
+        let first_waiter = tokio::spawn(async move {
+            first_gate.wait_interrupting(101).await;
+        });
+        let second_gate = gate.clone();
+        let second_waiter = tokio::spawn(async move {
+            second_gate.wait_interrupting(101).await;
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while entry_a.interrupt_waiter_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both strict waiters should register on the exact task generation");
+
+        first_waiter.abort();
+        let _ = first_waiter.await;
+        assert_eq!(
+            entry_a.interrupt_waiter_count(),
+            1,
+            "canceling one strict waiter must release only its own registration"
+        );
+        assert!(
+            !entry_b
+                .wait_linger_or_interrupt(Duration::from_millis(20))
+                .await,
+            "an inode A waiter must not interrupt inode B"
+        );
+
+        drop(entry_a);
+        drop(guard_a);
+        tokio::time::timeout(Duration::from_millis(250), second_waiter)
+            .await
+            .expect("remaining waiter should acquire the released gate")
+            .expect("remaining waiter should not panic");
+        drop(entry_b);
+        drop(guard_b);
+    });
+}
+
+#[test]
+fn interrupted_materializer_does_not_orphan_dirty_tail_if_last_waiter_is_cancelled() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "cancelled-last-materialize-waiter");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"cancelled-last-materialize-waiter.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let payload = [0x4C; 8 * 1024];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write dirty tail");
+
+        let waiting_vfs = Arc::clone(&vfs);
+        let waiter = tokio::spawn(async move {
+            waiting_vfs
+                .wait_for_deferred_materialization_inflight(ino)
+                .await;
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while vfs.state.deferred_materialize_inflight.contains(ino) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interrupted materializer should hand off its gate");
+        waiter.abort();
+        let _ = waiter.await;
+
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            0,
+            "a cancelled last waiter must not leave the interrupted tail without a materializer"
+        );
+        let mut readback = vec![0; payload.len()];
+        let read_len = vfs
+            .read_into_fh(fh, ino, 0, &mut readback)
+            .await
+            .expect("read materialized tail");
+        assert_eq!(read_len as usize, payload.len());
+        assert_eq!(readback, payload);
+        vfs.release_fh(fh).await.expect("release file handle");
     });
 }
 
@@ -13525,6 +13813,33 @@ fn write_path_observability_reports_upload_reread_pressure() {
     assert_eq!(
         json["foreground_reads"]["upload_fallback_reread_bytes"],
         8 * 1024 * 1024
+    );
+}
+
+#[test]
+fn foreground_metrics_apply_bounded_upload_scheduler_penalty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-independent-foreground-metrics");
+
+    vfs.upload_scheduler.set_adaptive_penalty(Duration::ZERO);
+    vfs.adjust_upload_backpressure_from_metrics(
+        Some(vfs.upload_fg_read_latency_target_ns.saturating_mul(8)),
+        3,
+    );
+
+    let penalty_ms = vfs.upload_scheduler.adaptive_penalty_ms();
+    assert!(
+        penalty_ms > 0 && penalty_ms <= UPLOAD_SCHEDULER_PENALTY_MAX_MS,
+        "foreground-read congestion should apply only the bounded adaptive penalty: {penalty_ms}"
+    );
+    let io_cost = vfs
+        .state
+        .upload
+        .upload_cache_io_foreground_cost
+        .load(Ordering::Relaxed);
+    assert!(
+        io_cost > vfs.upload_cache_io_foreground_cost_base,
+        "foreground-read congestion should increase upload reread slot cost"
     );
 }
 

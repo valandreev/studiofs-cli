@@ -1041,6 +1041,11 @@ impl<'a> DataReader<'a> {
             }
         }
 
+        if !span_resolved && let Some(data) = vfs.upload_stage_get_async(payload.object_id).await? {
+            vfs.copy_committed_payload_into_range(data.as_ref(), payload, file_offset, dst)?;
+            span_resolved = true;
+        }
+
         if !span_resolved {
             match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                 Ok(data) => {
@@ -2288,6 +2293,49 @@ mod tests {
         let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn committed_read_uses_upload_stage_when_local_payload_is_unavailable() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-upload-stage-fallback");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_001;
+            let data = Bytes::from_static(b"read from upload stage");
+            vfs.local_payload_backend()
+                .put(object_id, data.as_ref(), false)
+                .expect("persist local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+
+            assert!(
+                !vfs.local_payload_backend().contains(object_id),
+                "setup must force the committed-read local miss"
+            );
+            assert!(
+                vfs.cached_store().has_staged_upload(object_id),
+                "setup must retain the upload-stage copy"
+            );
+
+            let payload = PayloadRef {
+                object_id,
+                offset: 0,
+                length: u32::try_from(data.len()).expect("payload length fits u32"),
+                flags: MetaBlockFlags::empty(),
+            };
+            let mut out = vec![0; data.len()];
+
+            DataReader::assemble_committed_payload_into(&vfs, &payload, 0, &mut out)
+                .await
+                .expect("committed read should resolve the staged payload");
+
+            assert_eq!(out, data);
+        });
     }
 
     fn mark_all_overlay_objects_uploaded(

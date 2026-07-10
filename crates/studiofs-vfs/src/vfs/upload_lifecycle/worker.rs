@@ -114,6 +114,19 @@ enum SingleUploadOutcome {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleUploadDisposition {
+    Uncovered,
+    Requeued,
+    CoveredButNotRequeued,
+}
+
+impl StaleUploadDisposition {
+    fn protects_payload(self) -> bool {
+        !matches!(self, Self::Uncovered)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct UploadedObjectReconcile {
     keep_local_object: bool,
@@ -125,8 +138,6 @@ const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
 const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
 const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
 const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
-const FOREGROUND_UPLOAD_ADMISSION_DELAY: Duration = Duration::from_secs(2);
-
 fn post_put_visibility_delay(attempt: usize) -> Duration {
     let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
     Duration::from_millis(
@@ -162,12 +173,8 @@ fn upload_reread_idle_wait_window(
     }
 }
 
-fn upload_admission_delay(foreground_active: bool, adaptive_penalty: Duration) -> Duration {
-    if foreground_active {
-        adaptive_penalty.max(FOREGROUND_UPLOAD_ADMISSION_DELAY)
-    } else {
-        adaptive_penalty
-    }
+fn upload_admission_delay(adaptive_penalty: Duration) -> Duration {
+    adaptive_penalty
 }
 
 fn upload_disk_reread_defer_delay(
@@ -402,6 +409,7 @@ trait UploadPolicyPort: Clone + Send + Sync + 'static {
     fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError);
     fn clear_upload_sticky_error(&self, ino: Ino);
     fn debug_pending_inode_state(&self, ino: Ino, event: &'static str);
+    fn live_extent_epoch_for_object(&self, ino: Ino, object_id: u64) -> Option<u64>;
     async fn refresh_incarnation_state(&self, ino: Ino);
     async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64);
 }
@@ -613,7 +621,11 @@ where
         };
 
         if attr.content_epoch != op.content_epoch {
-            if self.requeue_stale_upload_if_uncovered(op).await? {
+            if self
+                .protect_stale_upload_if_covered(op)
+                .await?
+                .protects_payload()
+            {
                 return Ok(SingleUploadOutcome::Requeued);
             }
             self.cancel_stale_upload(op).await?;
@@ -626,7 +638,11 @@ where
             .await?;
 
         if !overlay_object_current {
-            if self.requeue_stale_upload_if_uncovered(op).await? {
+            if self
+                .protect_stale_upload_if_covered(op)
+                .await?
+                .protects_payload()
+            {
                 return Ok(SingleUploadOutcome::Requeued);
             }
             self.cancel_stale_upload(op).await?;
@@ -834,6 +850,13 @@ where
                 reconcile.finalize_content_epoch,
             )
         } else {
+            if self
+                .protect_stale_upload_if_covered(op)
+                .await?
+                .protects_payload()
+            {
+                return Ok(SingleUploadOutcome::Requeued);
+            }
             self.shutdown.record_canceled_stale_after_put(payload_len);
             self.meta
                 .add_pending_deletion(op.object_id, timestamp)
@@ -1032,7 +1055,31 @@ where
         Ok(())
     }
 
-    async fn requeue_stale_upload_if_uncovered(&self, op: &PendingUpload) -> VfsResult<bool> {
+    async fn protect_stale_upload_if_covered(
+        &self,
+        op: &PendingUpload,
+    ) -> VfsResult<StaleUploadDisposition> {
+        if let Some(attr) = self.meta.get_attr(op.ino).await?
+            && self
+                .meta
+                .has_regular_file_overlay_object_if_matches(
+                    op.ino,
+                    attr.content_epoch,
+                    op.object_id,
+                )
+                .await?
+        {
+            return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
+        }
+
+        if let Some(live_epoch) = self
+            .policy
+            .live_extent_epoch_for_object(op.ino, op.object_id)
+            && live_epoch >= op.content_epoch
+        {
+            return Ok(self.requeue_stale_upload_at_epoch(op, live_epoch));
+        }
+
         let Some(rebased_epoch) = self
             .meta
             .reattach_uploaded_object_if_uncovered(
@@ -1045,18 +1092,32 @@ where
             )
             .await?
         else {
-            return Ok(false);
+            return Ok(StaleUploadDisposition::Uncovered);
         };
 
+        Ok(self.requeue_stale_upload_at_epoch(op, rebased_epoch))
+    }
+
+    fn requeue_stale_upload_at_epoch(
+        &self,
+        op: &PendingUpload,
+        content_epoch: u64,
+    ) -> StaleUploadDisposition {
         let mut rebased = op.clone();
-        rebased.content_epoch = rebased_epoch;
+        rebased.content_epoch = content_epoch;
+        rebased.retry_count = op.retry_count.saturating_add(1);
+        let delay = self.upload_requeue_delay(op);
+        rebased.not_before_unix_ms =
+            now_unix_millis().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
         if self.coordinator.requeue_rebased_upload(op, rebased) {
             self.shutdown.record_requeue();
             self.policy
                 .debug_pending_inode_state(op.ino, "stale_upload_reattached_requeued");
-            Ok(true)
+            StaleUploadDisposition::Requeued
         } else {
-            Ok(false)
+            self.policy
+                .debug_pending_inode_state(op.ino, "stale_upload_covered_requeue_not_applied");
+            StaleUploadDisposition::CoveredButNotRequeued
         }
     }
 
@@ -1672,12 +1733,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
     }
 
     fn upload_admission_delay(&self, adaptive_penalty: Duration) -> Duration {
-        let foreground_active = self
-            .vfs
-            .state
-            .read
-            .foreground_user_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-        upload_admission_delay(foreground_active, adaptive_penalty)
+        upload_admission_delay(adaptive_penalty)
     }
 
     fn fragment_keys(&self, object_id: u64) -> Vec<String> {
@@ -1929,6 +1985,10 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 
     fn debug_pending_inode_state(&self, ino: Ino, event: &'static str) {
         self.vfs.debug_pending_inode_state(ino, event);
+    }
+
+    fn live_extent_epoch_for_object(&self, ino: Ino, object_id: u64) -> Option<u64> {
+        self.vfs.live_extent_epoch_for_object(ino, object_id)
     }
 
     async fn refresh_incarnation_state(&self, ino: Ino) {
@@ -2350,6 +2410,7 @@ mod tests {
         cancelled: Arc<Mutex<Vec<u64>>>,
         requeued: Arc<Mutex<Vec<PendingUpload>>>,
         pending_inodes: FakePendingInodes,
+        reject_rebased_requeue: Arc<AtomicBool>,
     }
 
     impl CachedStorePort for FakeCoordinator {
@@ -2364,6 +2425,9 @@ mod tests {
         }
 
         fn requeue_rebased_upload(&self, _current: &PendingUpload, rebased: PendingUpload) -> bool {
+            if self.reject_rebased_requeue.load(Ordering::Relaxed) {
+                return false;
+            }
             self.requeued.lock().push(rebased);
             true
         }
@@ -2762,6 +2826,7 @@ mod tests {
         quarantines: Arc<Mutex<Vec<(Ino, u64, String)>>>,
         refreshed: Arc<Mutex<Vec<Ino>>>,
         finalized_upload_epochs: Arc<Mutex<Vec<(Ino, u64)>>>,
+        live_extent_epochs: Arc<Mutex<HashMap<(Ino, u64), u64>>>,
         invalid_graph: Arc<AtomicBool>,
     }
 
@@ -2785,6 +2850,13 @@ mod tests {
         fn clear_upload_sticky_error(&self, _ino: Ino) {}
 
         fn debug_pending_inode_state(&self, _ino: Ino, _event: &'static str) {}
+
+        fn live_extent_epoch_for_object(&self, ino: Ino, object_id: u64) -> Option<u64> {
+            self.live_extent_epochs
+                .lock()
+                .get(&(ino, object_id))
+                .copied()
+        }
 
         async fn refresh_incarnation_state(&self, ino: Ino) {
             self.refreshed.lock().push(ino);
@@ -3453,6 +3525,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_upload_requeues_pre_put_stale_epoch_when_payload_is_still_current() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let current_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, current_epoch)));
+        meta.overlay_objects
+            .lock()
+            .entry(op.ino)
+            .or_default()
+            .insert(op.object_id);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
+        assert_eq!(requeued[0].content_epoch, current_epoch);
+        assert!(
+            meta.reattached_uploads.lock().is_empty(),
+            "an object already present in the current overlay must be requeued without reattaching"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_keeps_live_extent_during_pre_commit_metadata_gap() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let current_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, current_epoch)));
+        policy
+            .live_extent_epochs
+            .lock()
+            .insert((op.ino, op.object_id), current_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert!(local_payloads.upload_stage_removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
+        assert_eq!(requeued[0].content_epoch, current_epoch);
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_post_put_live_extent_during_metadata_gap() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        *remote.remove_overlay_after_upload.lock() = Some((meta.clone(), op.ino, op.object_id));
+        *meta.reattach_epoch.lock() = None;
+        policy
+            .live_extent_epochs
+            .lock()
+            .insert((op.ino, op.object_id), op.content_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.completed.lock().is_empty());
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(local_payloads.upload_stage_removed.lock().is_empty());
+        assert!(meta.pending_deletions.lock().is_empty());
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
+        assert_eq!(requeued[0].content_epoch, op.content_epoch);
+        assert_eq!(requeued[0].retry_count, op.retry_count + 1);
+    }
+
+    #[tokio::test]
+    async fn process_upload_preserves_post_put_live_extent_when_requeue_was_superseded() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        coordinator
+            .reject_rebased_requeue
+            .store(true, Ordering::Relaxed);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        *remote.remove_overlay_after_upload.lock() = Some((meta.clone(), op.ino, op.object_id));
+        *meta.reattach_epoch.lock() = None;
+        policy
+            .live_extent_epochs
+            .lock()
+            .insert((op.ino, op.object_id), op.content_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.completed.lock().is_empty());
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(coordinator.requeued.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(local_payloads.upload_stage_removed.lock().is_empty());
+        assert!(meta.pending_deletions.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn process_upload_records_durable_uploaded_progress_before_local_cleanup() {
         let (processor, coordinator, local_payloads, meta, _remote, _shutdown, policy) =
             processor_fixture();
@@ -4007,19 +4212,12 @@ mod tests {
     }
 
     #[test]
-    fn upload_admission_delay_throttles_foreground_io() {
+    fn upload_admission_delay_does_not_add_a_foreground_floor() {
         assert_eq!(
-            upload_admission_delay(false, Duration::from_millis(240)),
+            upload_admission_delay(Duration::from_millis(240)),
             Duration::from_millis(240)
         );
-        assert_eq!(
-            upload_admission_delay(true, Duration::from_millis(240)),
-            FOREGROUND_UPLOAD_ADMISSION_DELAY
-        );
-        assert_eq!(
-            upload_admission_delay(true, Duration::from_secs(3)),
-            Duration::from_secs(3)
-        );
+        assert_eq!(upload_admission_delay(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

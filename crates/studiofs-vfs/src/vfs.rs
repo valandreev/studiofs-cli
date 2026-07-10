@@ -1677,7 +1677,6 @@ struct PublishedReadPlanCacheEntry {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
-    last_foreground_write_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
@@ -1703,7 +1702,6 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
-            last_foreground_write_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
@@ -1858,8 +1856,6 @@ impl ReadState {
         len: usize,
         tracker: AccessTrackerConfig,
     ) -> AccessDecision {
-        self.last_foreground_write_ms
-            .store(now_unix_millis(), Ordering::Relaxed);
         if let Some(open_file) = open_file {
             let decision = open_file.observe_write(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
@@ -1963,17 +1959,6 @@ impl ReadState {
             return true;
         }
         let last = self.last_foreground_read_ms.load(Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
-    }
-
-    fn foreground_user_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
-        if self.foreground_read_active(now_ms, idle_grace) {
-            return true;
-        }
-        let last = self.last_foreground_write_ms.load(Ordering::Relaxed);
         if last == 0 {
             return false;
         }
@@ -2842,20 +2827,87 @@ struct VfsState {
 
 #[derive(Clone, Default)]
 struct DeferredInodeGate {
-    entries: Arc<Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>>,
+    entries: Arc<Mutex<HashMap<Ino, Arc<DeferredInodeTaskState>>>>,
+}
+
+struct DeferredInodeTaskState {
+    task_lock: Arc<tokio::sync::Mutex<()>>,
+    interrupt_waiters: AtomicUsize,
+    linger_wake: tokio::sync::Notify,
+}
+
+impl DeferredInodeTaskState {
+    fn new() -> Self {
+        Self {
+            task_lock: Arc::new(tokio::sync::Mutex::new(())),
+            interrupt_waiters: AtomicUsize::new(0),
+            linger_wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn interrupt_requested(&self) -> bool {
+        self.interrupt_waiters.load(Ordering::Acquire) > 0
+    }
+
+    async fn wait_linger_or_interrupt(&self, duration: Duration) -> bool {
+        if self.interrupt_requested() {
+            return true;
+        }
+
+        let sleep = tokio::time::sleep(duration);
+        tokio::pin!(sleep);
+        loop {
+            let notified = self.linger_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.interrupt_requested() {
+                return true;
+            }
+
+            tokio::select! {
+                _ = &mut sleep => return false,
+                _ = &mut notified => {
+                    if self.interrupt_requested() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct DeferredInodeInterruptGuard {
+    task_state: Arc<DeferredInodeTaskState>,
+}
+
+impl DeferredInodeInterruptGuard {
+    fn new(task_state: Arc<DeferredInodeTaskState>) -> Self {
+        task_state.interrupt_waiters.fetch_add(1, Ordering::AcqRel);
+        task_state.linger_wake.notify_one();
+        Self { task_state }
+    }
+}
+
+impl Drop for DeferredInodeInterruptGuard {
+    fn drop(&mut self) {
+        self.task_state
+            .interrupt_waiters
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl DeferredInodeGate {
     fn create_task_lock() -> (
-        Arc<tokio::sync::Mutex<()>>,
+        Arc<DeferredInodeTaskState>,
         tokio::sync::OwnedMutexGuard<()>,
     ) {
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock
+        let task_state = Arc::new(DeferredInodeTaskState::new());
+        let guard = task_state
+            .task_lock
             .clone()
             .try_lock_owned()
             .expect("new deferred inode gate lock should be uncontended");
-        (task_lock, guard)
+        (task_state, guard)
     }
 
     #[cfg(test)]
@@ -2883,10 +2935,10 @@ impl DeferredInodeGate {
                 None
             }
             Entry::Vacant(entry) => {
-                let (task_lock, guard) = Self::create_task_lock();
-                entry.insert(Arc::clone(&task_lock));
+                let (task_state, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_state));
                 Some((
-                    DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
+                    DeferredInodeGateEntry::new(self.clone(), ino, task_state),
                     guard,
                 ))
             }
@@ -2894,25 +2946,43 @@ impl DeferredInodeGate {
     }
 
     fn replace(&self, ino: Ino) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
-        let (task_lock, guard) = Self::create_task_lock();
-        self.entries.lock().insert(ino, Arc::clone(&task_lock));
+        let (task_state, guard) = Self::create_task_lock();
+        self.entries.lock().insert(ino, Arc::clone(&task_state));
         (
-            DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
+            DeferredInodeGateEntry::new(self.clone(), ino, task_state),
             guard,
         )
     }
 
     async fn wait(&self, ino: Ino) {
         loop {
-            let task_lock = self.entries.lock().get(&ino).cloned();
-            let Some(task_lock) = task_lock else {
+            let task_state = self.entries.lock().get(&ino).cloned();
+            let Some(task_state) = task_state else {
                 return;
             };
-            let _guard = task_lock.lock().await;
+            let _guard = task_state.task_lock.lock().await;
             let current = self.entries.lock().get(&ino).cloned();
             if current
                 .as_ref()
-                .is_none_or(|current| Arc::ptr_eq(current, &task_lock))
+                .is_none_or(|current| Arc::ptr_eq(current, &task_state))
+            {
+                return;
+            }
+        }
+    }
+
+    async fn wait_interrupting(&self, ino: Ino) {
+        loop {
+            let task_state = self.entries.lock().get(&ino).cloned();
+            let Some(task_state) = task_state else {
+                return;
+            };
+            let _interrupt = DeferredInodeInterruptGuard::new(Arc::clone(&task_state));
+            let _guard = task_state.task_lock.lock().await;
+            let current = self.entries.lock().get(&ino).cloned();
+            if current
+                .as_ref()
+                .is_none_or(|current| Arc::ptr_eq(current, &task_state))
             {
                 return;
             }
@@ -2943,15 +3013,15 @@ impl DeferredInodeGate {
 
         let mut entries = self.entries.lock();
         match entries.entry(current_entry.ino) {
-            Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &current_entry.task_lock) => {
+            Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &current_entry.task_state) => {
                 if !should_replace() {
                     entry.remove();
                     return None;
                 }
-                let (task_lock, guard) = Self::create_task_lock();
-                entry.insert(Arc::clone(&task_lock));
+                let (task_state, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_state));
                 Some((
-                    DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_lock),
+                    DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_state),
                     guard,
                 ))
             }
@@ -2959,12 +3029,12 @@ impl DeferredInodeGate {
         }
     }
 
-    fn finish(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
+    fn finish(&self, ino: Ino, task_state: &Arc<DeferredInodeTaskState>) {
         use std::collections::hash_map::Entry;
 
         let mut entries = self.entries.lock();
         match entries.entry(ino) {
-            Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), task_lock) => {
+            Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), task_state) => {
                 entry.remove();
             }
             _ => {}
@@ -2975,22 +3045,31 @@ impl DeferredInodeGate {
 struct DeferredInodeGateEntry {
     gate: DeferredInodeGate,
     ino: Ino,
-    task_lock: Arc<tokio::sync::Mutex<()>>,
+    task_state: Arc<DeferredInodeTaskState>,
 }
 
 impl DeferredInodeGateEntry {
-    fn new(gate: DeferredInodeGate, ino: Ino, task_lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+    fn new(gate: DeferredInodeGate, ino: Ino, task_state: Arc<DeferredInodeTaskState>) -> Self {
         Self {
             gate,
             ino,
-            task_lock,
+            task_state,
         }
+    }
+
+    #[cfg(test)]
+    fn interrupt_waiter_count(&self) -> usize {
+        self.task_state.interrupt_waiters.load(Ordering::Acquire)
+    }
+
+    async fn wait_linger_or_interrupt(&self, duration: Duration) -> bool {
+        self.task_state.wait_linger_or_interrupt(duration).await
     }
 }
 
 impl Drop for DeferredInodeGateEntry {
     fn drop(&mut self) {
-        self.gate.finish(self.ino, &self.task_lock);
+        self.gate.finish(self.ino, &self.task_state);
     }
 }
 
@@ -4526,7 +4605,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_user_io_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -5436,6 +5515,19 @@ impl StudioVfs {
             .collect();
         out.sort_by_key(|(block_index, _, _)| *block_index);
         out
+    }
+
+    fn live_extent_epoch_for_object(&self, ino: Ino, object_id: u64) -> Option<u64> {
+        self.state
+            .incarnation
+            .live_extent_records
+            .lock()
+            .iter()
+            .filter_map(|((candidate_ino, _), extent)| {
+                (*candidate_ino == ino && extent.object_id == object_id)
+                    .then_some(extent.content_epoch)
+            })
+            .max()
     }
 
     /// Return pending uploads for an inode as `(offset, object_id, content_epoch)`.
