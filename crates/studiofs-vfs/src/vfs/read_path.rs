@@ -4567,7 +4567,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_batch_resolves_one_snapshot_for_contiguous_pending_blocks() {
+    fn prefetch_batch_resolves_one_snapshot_for_contiguous_pending_extents() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) =
             make_unstarted_test_vfs(&tmp, "prefetch-contiguous-pending-snapshot");
@@ -4594,7 +4594,7 @@ mod tests {
             assert_eq!(
                 vfs.live_extent_records_for_inode(ino).len(),
                 3,
-                "setup should materialize three pending blocks"
+                "setup should materialize three pending extents"
             );
             let attr = vfs.getattr(ino).expect("load pending attr");
             let mut read_context = vfs.prefetch_read_context_from_attr(ino, &attr);
