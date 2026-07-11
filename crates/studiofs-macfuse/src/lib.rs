@@ -1227,7 +1227,7 @@ mod tests {
         invalidator.inval_inode(attr.ino);
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "this setup has no cacheable generation while the file is locally dirty"
+            "data invalidation must force the next open to drop cached pages"
         );
 
         fixture

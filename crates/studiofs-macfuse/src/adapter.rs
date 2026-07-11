@@ -432,6 +432,7 @@ impl ReadWindowStore {
 
 struct ReadWindowKernelInvalidator {
     read_windows: Arc<ReadWindowStore>,
+    open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
 }
@@ -439,6 +440,7 @@ struct ReadWindowKernelInvalidator {
 impl KernelInvalidator for ReadWindowKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         self.read_windows.invalidate_inode(ino);
+        self.open_cache_snapshots.lock().pop(&ino);
         if self.kernel_invalidations.defer_data_if_reads_active(ino) {
             debug!(
                 ino,
@@ -1159,6 +1161,7 @@ impl StudioVfsAdapter {
             .set_inner(Arc::clone(&inner));
         Arc::new(ReadWindowKernelInvalidator {
             read_windows: Arc::clone(&self.shared.read_windows),
+            open_cache_snapshots: Arc::clone(&self.shared.open_cache_snapshots),
             kernel_invalidations: Arc::clone(&self.shared.kernel_invalidations),
             inner,
         })
@@ -2653,33 +2656,6 @@ mod open_cache_snapshot_tests {
             local_stable, remote_ready,
             "publication transitions with unchanged graph must still drop kernel pages once"
         );
-    }
-
-    #[test]
-    fn data_invalidation_keeps_snapshot_for_next_generation_comparison() {
-        struct NoopInvalidator;
-        impl super::KernelInvalidator for NoopInvalidator {
-            fn inval_inode(&self, _ino: u64) {}
-        }
-
-        let fixture = ContractVfsFixture::new("macfuse-open-cache-invalidation-identity")
-            .expect("create VFS fixture");
-        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
-        let ino = 42;
-        adapter.shared.open_cache_snapshots.lock().put(
-            ino,
-            MacFuseOpenCacheSnapshot {
-                content_epoch: 1,
-                size: 4096,
-                kind: MacFuseOpenCacheSnapshotKind::RemoteReady,
-                graph: Vec::new(),
-            },
-        );
-
-        let invalidator = adapter.kernel_invalidator_for_test(Arc::new(NoopInvalidator));
-        invalidator.inval_inode(ino);
-
-        assert!(adapter.has_open_cache_snapshot_for_test(ino));
     }
 
     #[test]
