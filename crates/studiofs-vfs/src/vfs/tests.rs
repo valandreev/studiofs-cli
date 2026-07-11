@@ -2698,7 +2698,7 @@ fn epoch_finalizer_keeps_captured_larger_attr_when_same_epoch_current_attr_is_sm
 
         let open_attr = vfs
             .get_open_file(fh)
-            .and_then(|open_file| open_file.open_attr)
+            .and_then(|open_file| open_file.open_attr())
             .expect("open handle attr after finalizer refresh");
         assert_eq!(
             (open_attr.content_epoch, open_attr.size),
@@ -2761,7 +2761,7 @@ fn epoch_finalizer_preserves_larger_current_attr_at_same_epoch() {
 
         let open_attr = vfs
             .get_open_file(fh)
-            .and_then(|open_file| open_file.open_attr)
+            .and_then(|open_file| open_file.open_attr())
             .expect("open handle attr after finalizer refresh");
         let canonical_dirty_attr = vfs
             .state
@@ -3282,7 +3282,7 @@ fn open_file_with_known_attr_uses_supplied_create_attr() {
         .expect("open file with create attr");
     let open_file = vfs.get_open_file(fh).expect("open handle");
 
-    assert_eq!(open_file.open_attr.expect("open attr").size, attr.size);
+    assert_eq!(open_file.open_attr().expect("open attr").size, attr.size);
 }
 
 #[test]
@@ -3356,7 +3356,7 @@ fn open_created_file_with_known_attr_does_not_recheck_mutation_authority() {
         .expect("open freshly created file with create attr");
     let open_file = vfs.get_open_file(fh).expect("open handle");
 
-    assert_eq!(open_file.open_attr.expect("open attr").ino, attr.ino);
+    assert_eq!(open_file.open_attr().expect("open attr").ino, attr.ino);
 }
 
 #[test]

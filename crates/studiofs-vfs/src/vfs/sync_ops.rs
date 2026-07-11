@@ -1754,7 +1754,7 @@ impl StudioVfs {
             .handle_table
             .get(fh)
             .filter(|open_file| open_file.ino == ino)
-            .and_then(|open_file| open_file.open_attr.clone())
+            .and_then(|open_file| open_file.open_attr())
         {
             self.note_vfs_write_open_attr_hit();
             base_attr = attr;
@@ -1778,8 +1778,7 @@ impl StudioVfs {
                         .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?;
                     self.handle_table.mark_orphan(ino);
                     open_file
-                        .open_attr
-                        .clone()
+                        .open_attr()
                         .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?
                 }
                 Err(error) => return Err(error),

@@ -77,19 +77,19 @@ impl HandleTable {
 
     /// Refresh the attribute snapshot carried by an already-open handle.
     pub(super) fn update_open_attr(&self, fh: u64, attr: InodeAttr) {
-        if let Some(open_file) = self.handles.write().get_mut(&fh) {
-            open_file.open_attr = Some(attr);
+        if let Some(open_file) = self.handles.read().get(&fh) {
+            open_file.set_open_attr(attr);
         }
     }
 
     /// Refresh the attribute snapshot carried by every handle for an inode.
     pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
-        let mut handles = self.handles.write();
+        let handles = self.handles.read();
         let handles_by_inode = self.handles_by_inode.lock();
         if let Some(handle_ids) = handles_by_inode.get(&ino) {
             for fh in handle_ids {
-                if let Some(open_file) = handles.get_mut(fh) {
-                    open_file.open_attr = Some(attr.clone());
+                if let Some(open_file) = handles.get(fh) {
+                    open_file.set_open_attr(attr.clone());
                 }
             }
         }

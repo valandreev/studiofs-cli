@@ -2857,16 +2857,13 @@ impl DeferredInodeTaskState {
         let sleep = tokio::time::sleep(duration);
         tokio::pin!(sleep);
         loop {
-            let notified = self.linger_wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             if self.interrupt_requested() {
                 return true;
             }
 
             tokio::select! {
                 _ = &mut sleep => return false,
-                _ = &mut notified => {
+                _ = self.linger_wake.notified() => {
                     if self.interrupt_requested() {
                         return true;
                     }
