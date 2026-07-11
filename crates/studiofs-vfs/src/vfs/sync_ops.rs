@@ -344,6 +344,7 @@ impl StudioVfs {
     ) {
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let _guard = guard;
             let ino = entry.ino;
             let mut allow_reschedule_on_exit = true;
             let mut linger_interrupted = false;
@@ -562,7 +563,6 @@ impl StudioVfs {
             }
 
             vfs.finish_deferred_materialization_task(entry, allow_reschedule_on_exit);
-            drop(guard);
         }));
     }
 
