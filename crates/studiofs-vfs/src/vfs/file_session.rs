@@ -120,7 +120,7 @@ pub struct OpenFile {
     pub ino: Ino,
     /// Open flags applied to this handle.
     pub flags: OpenFlags,
-    pub(super) open_attr: Arc<RwLock<Option<InodeAttr>>>,
+    pub(super) open_attr: Arc<RwLock<Option<Arc<InodeAttr>>>>,
     pub(super) active_open_overlay: bool,
     access_state: Arc<Mutex<HandleAccessState>>,
     read_window: Arc<Mutex<ReadWindowState>>,
@@ -138,7 +138,7 @@ impl OpenFile {
             fh,
             ino,
             flags,
-            open_attr: Arc::new(RwLock::new(open_attr)),
+            open_attr: Arc::new(RwLock::new(open_attr.map(Arc::new))),
             active_open_overlay,
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
             read_window: Arc::new(Mutex::new(ReadWindowState::default())),
@@ -146,10 +146,14 @@ impl OpenFile {
     }
 
     pub(super) fn open_attr(&self) -> Option<InodeAttr> {
-        self.open_attr.read().clone()
+        self.open_attr.read().as_deref().cloned()
     }
 
     pub(super) fn set_open_attr(&self, attr: InodeAttr) {
+        self.set_shared_open_attr(Arc::new(attr));
+    }
+
+    pub(super) fn set_shared_open_attr(&self, attr: Arc<InodeAttr>) {
         *self.open_attr.write() = Some(attr);
     }
 

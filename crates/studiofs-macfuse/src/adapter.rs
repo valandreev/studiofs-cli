@@ -1302,10 +1302,8 @@ impl StudioVfsAdapter {
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
                     false
-                } else if flag_policy.keep_cache {
-                    self.keep_cache_for_current_generation(ino)
                 } else {
-                    false
+                    self.keep_cache_for_current_generation(ino)
                 };
                 debug!(
                     ino,

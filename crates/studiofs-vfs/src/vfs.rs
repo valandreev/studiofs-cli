@@ -2949,7 +2949,11 @@ impl DeferredInodeGate {
             let Some(task_state) = task_state else {
                 return;
             };
-            let _guard = task_state.task_lock.acquire().await;
+            let _guard = task_state
+                .task_lock
+                .acquire()
+                .await
+                .expect("deferred inode task semaphore should not be closed");
             let current = self.entries.lock().get(&ino).cloned();
             if current
                 .as_ref()
@@ -2967,7 +2971,11 @@ impl DeferredInodeGate {
                 return;
             };
             let _interrupt = DeferredInodeInterruptGuard::new(Arc::clone(&task_state));
-            let _guard = task_state.task_lock.acquire().await;
+            let _guard = task_state
+                .task_lock
+                .acquire()
+                .await
+                .expect("deferred inode task semaphore should not be closed");
             let current = self.entries.lock().get(&ino).cloned();
             if current
                 .as_ref()

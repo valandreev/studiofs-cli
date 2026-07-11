@@ -1,7 +1,10 @@
 use crate::access::AccessClass;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use studiofs_meta::types::{Ino, InodeAttr};
 
 use super::{OpenFile, OpenFlags};
@@ -84,9 +87,10 @@ impl HandleTable {
     pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
         let handles = self.handles.read();
         if let Some(handle_ids) = handles.handles_by_inode.get(&ino) {
+            let attr = Arc::new(attr.clone());
             for fh in handle_ids {
                 if let Some(open_file) = handles.handles.get(fh) {
-                    open_file.set_open_attr(attr.clone());
+                    open_file.set_shared_open_attr(Arc::clone(&attr));
                 }
             }
         }
