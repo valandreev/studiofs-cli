@@ -176,7 +176,7 @@ impl StudioVfs {
     pub(super) fn register_deferred_release_barrier(
         &self,
         ino: Ino,
-    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
+    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit) {
         let replaced = self.state.deferred_release_inflight.contains(ino);
         let (entry, guard) = self.state.deferred_release_inflight.replace(ino);
         if replaced {
@@ -340,7 +340,7 @@ impl StudioVfs {
     fn start_deferred_materialization_task(
         self: &Arc<Self>,
         entry: DeferredInodeGateEntry,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: tokio::sync::OwnedSemaphorePermit,
     ) {
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {

@@ -97,7 +97,7 @@ struct AdapterSharedState {
     read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
-    read_handle_cancellations: ParkingMutex<HashMap<u64, CancellationToken>>,
+    read_handle_cancellations: DashMap<u64, CancellationToken>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
 }
@@ -1060,7 +1060,7 @@ impl StudioVfsAdapter {
                 read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
-                read_handle_cancellations: ParkingMutex::new(HashMap::new()),
+                read_handle_cancellations: DashMap::new(),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
@@ -1295,7 +1295,6 @@ impl StudioVfsAdapter {
             .map(|fh| {
                 self.shared
                     .read_handle_cancellations
-                    .lock()
                     .insert(fh, CancellationToken::new());
                 let keep_cache = if flag_policy.write_capable {
                     self.record_write_capable_open(ino, fh);
@@ -1724,9 +1723,8 @@ impl StudioVfsAdapter {
         let cancellation = ReadCancellationToken::for_handle(
             self.shared
                 .read_handle_cancellations
-                .lock()
                 .get(&file_handle)
-                .cloned(),
+                .map(|token| token.value().clone()),
         );
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
@@ -1841,9 +1839,8 @@ impl StudioVfsAdapter {
         let cancellation = ReadCancellationToken::for_handle(
             self.shared
                 .read_handle_cancellations
-                .lock()
                 .get(&file_handle)
-                .cloned(),
+                .map(|token| token.value().clone()),
         );
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
@@ -1923,9 +1920,8 @@ impl StudioVfsAdapter {
         let cancellation = ReadCancellationToken::for_handle(
             self.shared
                 .read_handle_cancellations
-                .lock()
                 .get(&file_handle)
-                .cloned(),
+                .map(|token| token.value().clone()),
         );
         let worker_cancellation = cancellation.clone();
         Ok(CancelableQueuedReadForTest {
@@ -2075,11 +2071,7 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
-        if let Some(cancellation) = self
-            .shared
-            .read_handle_cancellations
-            .lock()
-            .remove(&file_handle)
+        if let Some((_, cancellation)) = self.shared.read_handle_cancellations.remove(&file_handle)
         {
             cancellation.cancel();
         }

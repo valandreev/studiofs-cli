@@ -173,10 +173,6 @@ fn upload_reread_idle_wait_window(
     }
 }
 
-fn upload_admission_delay(adaptive_penalty: Duration) -> Duration {
-    adaptive_penalty
-}
-
 fn upload_disk_reread_defer_delay(
     foreground_active: bool,
     hot_payload_available: bool,
@@ -1106,7 +1102,7 @@ where
         let mut rebased = op.clone();
         rebased.content_epoch = content_epoch;
         rebased.retry_count = op.retry_count.saturating_add(1);
-        let delay = self.upload_requeue_delay(op);
+        let delay = self.upload_requeue_delay(&rebased);
         rebased.not_before_unix_ms =
             now_unix_millis().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
         if self.coordinator.requeue_rebased_upload(op, rebased) {
@@ -1733,7 +1729,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
     }
 
     fn upload_admission_delay(&self, adaptive_penalty: Duration) -> Duration {
-        upload_admission_delay(adaptive_penalty)
+        adaptive_penalty
     }
 
     fn fragment_keys(&self, object_id: u64) -> Vec<String> {
@@ -4209,15 +4205,6 @@ mod tests {
             ),
             Duration::from_millis(240)
         );
-    }
-
-    #[test]
-    fn upload_admission_delay_does_not_add_a_foreground_floor() {
-        assert_eq!(
-            upload_admission_delay(Duration::from_millis(240)),
-            Duration::from_millis(240)
-        );
-        assert_eq!(upload_admission_delay(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

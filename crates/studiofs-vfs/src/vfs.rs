@@ -2831,7 +2831,7 @@ struct DeferredInodeGate {
 }
 
 struct DeferredInodeTaskState {
-    task_lock: Arc<tokio::sync::Mutex<()>>,
+    task_lock: Arc<tokio::sync::Semaphore>,
     interrupt_waiters: AtomicUsize,
     linger_wake: tokio::sync::Notify,
 }
@@ -2839,7 +2839,7 @@ struct DeferredInodeTaskState {
 impl DeferredInodeTaskState {
     fn new() -> Self {
         Self {
-            task_lock: Arc::new(tokio::sync::Mutex::new(())),
+            task_lock: Arc::new(tokio::sync::Semaphore::new(1)),
             interrupt_waiters: AtomicUsize::new(0),
             linger_wake: tokio::sync::Notify::new(),
         }
@@ -2850,10 +2850,6 @@ impl DeferredInodeTaskState {
     }
 
     async fn wait_linger_or_interrupt(&self, duration: Duration) -> bool {
-        if self.interrupt_requested() {
-            return true;
-        }
-
         let sleep = tokio::time::sleep(duration);
         tokio::pin!(sleep);
         loop {
@@ -2863,11 +2859,7 @@ impl DeferredInodeTaskState {
 
             tokio::select! {
                 _ = &mut sleep => return false,
-                _ = self.linger_wake.notified() => {
-                    if self.interrupt_requested() {
-                        return true;
-                    }
-                }
+                _ = self.linger_wake.notified() => {}
             }
         }
     }
@@ -2896,14 +2888,14 @@ impl Drop for DeferredInodeInterruptGuard {
 impl DeferredInodeGate {
     fn create_task_lock() -> (
         Arc<DeferredInodeTaskState>,
-        tokio::sync::OwnedMutexGuard<()>,
+        tokio::sync::OwnedSemaphorePermit,
     ) {
         let task_state = Arc::new(DeferredInodeTaskState::new());
         let guard = task_state
             .task_lock
             .clone()
-            .try_lock_owned()
-            .expect("new deferred inode gate lock should be uncontended");
+            .try_acquire_owned()
+            .expect("new deferred inode gate semaphore should have its permit");
         (task_state, guard)
     }
 
@@ -2911,7 +2903,7 @@ impl DeferredInodeGate {
     fn try_register(
         &self,
         ino: Ino,
-    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit)> {
         self.try_register_or_update_occupied(ino, || {})
     }
 
@@ -2919,7 +2911,7 @@ impl DeferredInodeGate {
         &self,
         ino: Ino,
         on_occupied: F,
-    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)>
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit)>
     where
         F: FnOnce(),
     {
@@ -2942,7 +2934,7 @@ impl DeferredInodeGate {
         }
     }
 
-    fn replace(&self, ino: Ino) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
+    fn replace(&self, ino: Ino) -> (DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit) {
         let (task_state, guard) = Self::create_task_lock();
         self.entries.lock().insert(ino, Arc::clone(&task_state));
         (
@@ -2957,7 +2949,7 @@ impl DeferredInodeGate {
             let Some(task_state) = task_state else {
                 return;
             };
-            let _guard = task_state.task_lock.lock().await;
+            let _guard = task_state.task_lock.acquire().await;
             let current = self.entries.lock().get(&ino).cloned();
             if current
                 .as_ref()
@@ -2975,7 +2967,7 @@ impl DeferredInodeGate {
                 return;
             };
             let _interrupt = DeferredInodeInterruptGuard::new(Arc::clone(&task_state));
-            let _guard = task_state.task_lock.lock().await;
+            let _guard = task_state.task_lock.acquire().await;
             let current = self.entries.lock().get(&ino).cloned();
             if current
                 .as_ref()
@@ -2994,7 +2986,7 @@ impl DeferredInodeGate {
     fn replace_if_current(
         &self,
         current_entry: &DeferredInodeGateEntry,
-    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit)> {
         self.replace_if_current_or_remove(current_entry, || true)
     }
 
@@ -3002,7 +2994,7 @@ impl DeferredInodeGate {
         &self,
         current_entry: &DeferredInodeGateEntry,
         should_replace: F,
-    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)>
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit)>
     where
         F: FnOnce() -> bool,
     {
