@@ -2665,6 +2665,132 @@ fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
 }
 
 #[test]
+fn epoch_finalizer_keeps_captured_larger_attr_when_same_epoch_current_attr_is_smaller() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "finalizer-same-epoch-smaller-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"finalizer-same-epoch-smaller-attr.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        let mut captured_newer_attr = attr.clone();
+        captured_newer_attr.content_epoch = captured_newer_attr.content_epoch.saturating_add(1);
+        captured_newer_attr.size = 16 * 1024 * 1024 * 1024_u64;
+        captured_newer_attr.upload_state = MetaUploadState::Updating;
+        let mut stale_current_attr = captured_newer_attr.clone();
+        stale_current_attr.size = 4 * 1024 * 1024 * 1024_u64;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_current_attr);
+
+        super::commit::CommitCoordinator::restore_newer_dirty_attr_and_refresh_open_handles(
+            &vfs,
+            ino,
+            captured_newer_attr.clone(),
+        );
+
+        let open_attr = vfs
+            .get_open_file(fh)
+            .and_then(|open_file| open_file.open_attr)
+            .expect("open handle attr after finalizer refresh");
+        assert_eq!(
+            (open_attr.content_epoch, open_attr.size),
+            (captured_newer_attr.content_epoch, captured_newer_attr.size),
+            "a same-epoch smaller dirty snapshot must not roll back the open handle EOF"
+        );
+        let canonical_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("canonical dirty attr after finalizer refresh");
+        assert_eq!(
+            (
+                canonical_dirty_attr.content_epoch,
+                canonical_dirty_attr.size
+            ),
+            (captured_newer_attr.content_epoch, captured_newer_attr.size),
+            "a same-epoch smaller dirty snapshot must not remain the canonical inode EOF"
+        );
+
+        vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
+fn epoch_finalizer_preserves_larger_current_attr_at_same_epoch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "finalizer-same-epoch-larger-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"finalizer-same-epoch-larger-attr.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        let mut captured_newer_attr = attr.clone();
+        captured_newer_attr.content_epoch = captured_newer_attr.content_epoch.saturating_add(1);
+        captured_newer_attr.size = 4 * 1024 * 1024 * 1024_u64;
+        captured_newer_attr.upload_state = MetaUploadState::Updating;
+        let mut current_larger_attr = captured_newer_attr.clone();
+        current_larger_attr.size = 16 * 1024 * 1024 * 1024_u64;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, current_larger_attr.clone());
+
+        super::commit::CommitCoordinator::restore_newer_dirty_attr_and_refresh_open_handles(
+            &vfs,
+            ino,
+            captured_newer_attr,
+        );
+
+        let open_attr = vfs
+            .get_open_file(fh)
+            .and_then(|open_file| open_file.open_attr)
+            .expect("open handle attr after finalizer refresh");
+        let canonical_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("canonical dirty attr after finalizer refresh");
+        assert_eq!(
+            (
+                canonical_dirty_attr.content_epoch,
+                canonical_dirty_attr.size
+            ),
+            (current_larger_attr.content_epoch, current_larger_attr.size),
+            "the finalizer must preserve a larger concurrent tail at the same epoch"
+        );
+        assert_eq!(
+            (open_attr.content_epoch, open_attr.size),
+            (current_larger_attr.content_epoch, current_larger_attr.size),
+            "the open handle must observe the larger concurrent tail"
+        );
+
+        vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
 fn epoch_finalizer_refreshes_open_writer_before_followup_tail_write() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "finalizer-refreshes-open-writer");

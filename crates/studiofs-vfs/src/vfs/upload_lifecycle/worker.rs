@@ -5,6 +5,7 @@ use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -26,6 +27,49 @@ use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
 const FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug)]
+struct StagedReadPacer {
+    bytes_per_second: u64,
+    next_slot: Mutex<Option<Instant>>,
+}
+
+impl StagedReadPacer {
+    fn new(bytes_per_second: u64) -> Self {
+        Self {
+            bytes_per_second: bytes_per_second.max(1),
+            next_slot: Mutex::new(None),
+        }
+    }
+
+    fn reserve_delay_at(&self, now: Instant, bytes: u64) -> Duration {
+        if bytes == 0 {
+            return Duration::ZERO;
+        }
+        let interval = upload_reread_interval(self.bytes_per_second, bytes);
+        let mut next_slot = self.next_slot.lock();
+        let slot = next_slot.map_or(now, |next| next.max(now));
+        *next_slot = slot.checked_add(interval).or(Some(slot));
+        slot.saturating_duration_since(now)
+    }
+
+    fn reserve_delay_for_target_at(
+        &self,
+        foreground_active: bool,
+        target_os: &str,
+        now: Instant,
+        bytes: u64,
+    ) -> Duration {
+        if !foreground_active || !staged_read_pacing_enabled_for_target(target_os) {
+            return Duration::ZERO;
+        }
+        self.reserve_delay_at(now, bytes)
+    }
+}
+
+fn staged_read_pacing_enabled_for_target(target_os: &str) -> bool {
+    target_os == "macos"
+}
 
 #[derive(Debug, Default)]
 struct ReadyUploads {
@@ -202,11 +246,11 @@ fn foreground_upload_reread_slot_cost(
     }
 }
 
-fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: usize) -> Duration {
-    if !foreground_active || reread_bytes == 0 {
+fn upload_reread_interval(bytes_per_second: u64, reread_bytes: u64) -> Duration {
+    if reread_bytes == 0 {
         return Duration::ZERO;
     }
-    let limit = FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC.max(1) as u128;
+    let limit = bytes_per_second.max(1) as u128;
     let nanos = (reread_bytes as u128)
         .saturating_mul(1_000_000_000u128)
         .div_ceil(limit)
@@ -1162,6 +1206,7 @@ impl CachedStorePort for VfsCachedStorePort {
 #[derive(Clone)]
 struct VfsUploadLocalPayloadPort {
     vfs: Arc<StudioVfs>,
+    staged_read_pacer: Arc<StagedReadPacer>,
 }
 
 impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
@@ -1291,8 +1336,12 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             foreground_cost,
             self.vfs.upload_cache_io_slots_max,
         );
-        let pacing_delay =
-            foreground_upload_reread_pacing_delay(foreground_active, payload_len as usize);
+        let pacing_delay = self.staged_read_pacer.reserve_delay_for_target_at(
+            foreground_active,
+            std::env::consts::OS,
+            Instant::now(),
+            payload_len,
+        );
         if !pacing_delay.is_zero() {
             self.vfs.debug_write_probe(
                 "H5",
@@ -2027,7 +2076,12 @@ impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
         let processor = UploadProcessor {
             coordinator: VfsCachedStorePort { vfs: vfs.clone() },
-            local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
+            local_payloads: VfsUploadLocalPayloadPort {
+                vfs: vfs.clone(),
+                staged_read_pacer: Arc::new(StagedReadPacer::new(
+                    FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC,
+                )),
+            },
             meta: VfsUploadMetaPort { vfs: vfs.clone() },
             remote: VfsRemoteUploadPort { vfs: vfs.clone() },
             shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
@@ -4259,21 +4313,20 @@ mod tests {
     }
 
     #[test]
-    fn foreground_upload_reread_pacing_delay_tracks_payload_size() {
+    fn upload_reread_interval_tracks_payload_size() {
+        assert_eq!(upload_reread_interval(1024, 0), Duration::ZERO);
         assert_eq!(
-            foreground_upload_reread_pacing_delay(false, 4096),
-            Duration::ZERO
-        );
-        assert_eq!(
-            foreground_upload_reread_pacing_delay(true, 0),
-            Duration::ZERO
-        );
-        assert_eq!(
-            foreground_upload_reread_pacing_delay(true, 1024usize * 1024 * 1024),
+            upload_reread_interval(
+                FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC,
+                1024 * 1024 * 1024,
+            ),
             Duration::from_secs(1)
         );
         assert_eq!(
-            foreground_upload_reread_pacing_delay(true, 4usize * 1024 * 1024),
+            upload_reread_interval(
+                FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC,
+                4 * 1024 * 1024,
+            ),
             Duration::from_nanos(3_906_250)
         );
     }
@@ -4305,5 +4358,37 @@ mod tests {
             vec![101, 201, 301, 102, 202],
             "ready queue should rotate across inodes instead of letting one inode monopolize dispatch"
         );
+    }
+
+    #[test]
+    fn staged_read_pacer_assigns_sequential_slots_across_workers() {
+        let started = Instant::now();
+        let pacer = StagedReadPacer::new(1024);
+
+        let first = pacer.reserve_delay_at(started, 512);
+        let second = pacer.reserve_delay_at(started, 512);
+
+        assert_eq!(
+            (first, second),
+            (Duration::ZERO, Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn staged_read_pacing_is_enabled_only_for_macos() {
+        assert!(staged_read_pacing_enabled_for_target("macos"));
+        assert!(!staged_read_pacing_enabled_for_target("linux"));
+        assert!(!staged_read_pacing_enabled_for_target("windows"));
+    }
+
+    #[test]
+    fn staged_read_pacer_does_not_reserve_slots_off_macos() {
+        let started = Instant::now();
+        let pacer = StagedReadPacer::new(1024);
+
+        let disabled = pacer.reserve_delay_for_target_at(false, "linux", started, 512);
+        let first_macos = pacer.reserve_delay_for_target_at(true, "macos", started, 512);
+
+        assert_eq!((disabled, first_macos), (Duration::ZERO, Duration::ZERO));
     }
 }

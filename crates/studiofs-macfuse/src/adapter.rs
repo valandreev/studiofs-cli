@@ -74,6 +74,8 @@ pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
     read_only: bool,
+    #[cfg(test)]
+    kernel_data_cache_enabled: bool,
     mount_uid: u32,
     mount_gid: u32,
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
@@ -593,6 +595,22 @@ struct ReadExecutionState {
     vfs: Arc<StudioVfs>,
     shared: Arc<AdapterSharedState>,
     runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
+    #[cfg(test)]
+    kernel_data_cache_enabled: bool,
+}
+
+impl ReadExecutionState {
+    #[inline]
+    fn kernel_data_cache_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.kernel_data_cache_enabled
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -672,8 +690,17 @@ fn readahead_window_len(size: usize) -> usize {
         .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
-fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    readahead_window_len(size as usize).min(read_queue_byte_limit as usize) as u32
+#[inline]
+fn queued_read_admission_bytes(
+    size: u32,
+    read_queue_byte_limit: u32,
+    kernel_data_cache_enabled: bool,
+) -> u32 {
+    if kernel_data_cache_enabled {
+        size.min(read_queue_byte_limit)
+    } else {
+        readahead_window_len(size as usize).min(read_queue_byte_limit as usize) as u32
+    }
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -997,6 +1024,8 @@ impl StudioVfsAdapter {
             vfs,
             runtime_handle,
             read_only,
+            #[cfg(test)]
+            kernel_data_cache_enabled: true,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             readdir_cache: Mutex::new(HashMap::new()),
@@ -1027,6 +1056,21 @@ impl StudioVfsAdapter {
         read_queue_byte_limit: usize,
     ) -> Self {
         Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_kernel_data_cache_for_test(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+    ) -> Self {
+        let mut adapter = Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            false,
+            MACFUSE_READ_MAX_PENDING_BYTES,
+        );
+        adapter.kernel_data_cache_enabled = false;
+        adapter
     }
 
     #[cfg(test)]
@@ -1521,7 +1565,11 @@ impl StudioVfsAdapter {
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = (size as usize).min(request.max_read_len as usize);
-        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
+        let read_len = if state.kernel_data_cache_enabled() {
+            size_usize
+        } else {
+            readahead_window_len(size_usize).min(request.max_read_len as usize)
+        };
 
         let mut out = state
             .shared
@@ -1531,12 +1579,14 @@ impl StudioVfsAdapter {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        if let Some(copied) = state.shared.read_windows.try_read(
-            request.file_handle,
-            request.ino,
-            request.offset,
-            &mut out,
-        ) {
+        if !state.kernel_data_cache_enabled()
+            && let Some(copied) = state.shared.read_windows.try_read(
+                request.file_handle,
+                request.ino,
+                request.offset,
+                &mut out,
+            )
+        {
             out.truncate(copied);
             state
                 .vfs
@@ -1550,10 +1600,12 @@ impl StudioVfsAdapter {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        let generation = state
-            .shared
-            .read_windows
-            .invalidation_generation(request.ino);
+        let read_window_generation = (!state.kernel_data_cache_enabled()).then(|| {
+            state
+                .shared
+                .read_windows
+                .invalidation_generation(request.ino)
+        });
         let result = tokio::select! {
             result = state.vfs.read_into_fh(request.file_handle, request.ino, request.offset, &mut out) => result,
             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
@@ -1565,25 +1617,26 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
-                if written > size_usize {
-                    let remainder_len = written - reply_len;
-                    let mut remainder = state
-                        .shared
-                        .read_buffers
-                        .clone()
-                        .acquire_with_capacity(0, remainder_len);
-                    remainder.buffer.extend_from_slice(&out[reply_len..written]);
-                    state.shared.read_windows.remember_if_current(
-                        request.file_handle,
-                        request.ino,
-                        request.offset.saturating_add(reply_len as u64),
-                        request.offset.saturating_add(reply_len as u64),
-                        remainder,
-                        generation,
-                    );
-                    out.truncate(reply_len);
-                    return Ok(out);
-                } else {
+                if let Some(generation) = read_window_generation {
+                    if written > size_usize {
+                        let remainder_len = written - reply_len;
+                        let mut remainder = state
+                            .shared
+                            .read_buffers
+                            .clone()
+                            .acquire_with_capacity(0, remainder_len);
+                        remainder.buffer.extend_from_slice(&out[reply_len..written]);
+                        state.shared.read_windows.remember_if_current(
+                            request.file_handle,
+                            request.ino,
+                            request.offset.saturating_add(reply_len as u64),
+                            request.offset.saturating_add(reply_len as u64),
+                            remainder,
+                            generation,
+                        );
+                        out.truncate(reply_len);
+                        return Ok(out);
+                    }
                     state
                         .shared
                         .read_windows
@@ -1596,10 +1649,12 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(size_usize, started.elapsed(), true);
-                state
-                    .shared
-                    .read_windows
-                    .invalidate_handle(request.file_handle);
+                if read_window_generation.is_some() {
+                    state
+                        .shared
+                        .read_windows
+                        .invalidate_handle(request.file_handle);
+                }
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -1621,6 +1676,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
+            #[cfg(test)]
+            kernel_data_cache_enabled: self.kernel_data_cache_enabled,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1631,7 +1688,11 @@ impl StudioVfsAdapter {
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
-            let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
+            let admission_bytes = queued_read_admission_bytes(
+                size,
+                read_queue_byte_limit,
+                state.kernel_data_cache_enabled(),
+            );
             let mut read_guard =
                 AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
@@ -1726,6 +1787,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
+            #[cfg(test)]
+            kernel_data_cache_enabled: self.kernel_data_cache_enabled,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1736,7 +1799,11 @@ impl StudioVfsAdapter {
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
-                let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
+                let admission_bytes = queued_read_admission_bytes(
+                    size,
+                    read_queue_byte_limit,
+                    state.kernel_data_cache_enabled(),
+                );
                 let mut read_guard =
                     AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                 if cancellation.is_cancelled() {
@@ -1796,6 +1863,8 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
+            #[cfg(test)]
+            kernel_data_cache_enabled: self.kernel_data_cache_enabled,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
@@ -1809,7 +1878,11 @@ impl StudioVfsAdapter {
             queued: QueuedReadForTest {
                 runtime_handle: self.runtime_handle.clone(),
                 handle: self.runtime_handle.spawn(async move {
-                    let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
+                    let admission_bytes = queued_read_admission_bytes(
+                        size,
+                        read_queue_byte_limit,
+                        state.kernel_data_cache_enabled(),
+                    );
                     let mut read_guard =
                         AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                     if worker_cancellation.is_cancelled() {
