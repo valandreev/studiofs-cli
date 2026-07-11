@@ -71,6 +71,18 @@ impl HandleTable {
         }
     }
 
+    /// Refresh the attribute snapshot carried by every handle for an inode.
+    pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
+        for open_file in self
+            .handles
+            .write()
+            .values_mut()
+            .filter(|open_file| open_file.ino == ino)
+        {
+            open_file.open_attr = Some(attr.clone());
+        }
+    }
+
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
         let open_file = self.handles.write().remove(&fh)?;

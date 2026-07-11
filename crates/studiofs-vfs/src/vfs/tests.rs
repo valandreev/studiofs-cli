@@ -2665,6 +2665,92 @@ fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
 }
 
 #[test]
+fn epoch_finalizer_refreshes_open_writer_before_followup_tail_write() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "finalizer-refreshes-open-writer");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"finalizer-refreshes-open-writer.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        let published_prefix_len = 4096_u64;
+        let mut staged_attr = meta.get_attr(ino).expect("load created attr");
+        staged_attr.size = published_prefix_len;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&staged_attr)
+            .expect("stage sparse prefix publication");
+        meta.remove_regular_file_graph(ino)
+            .expect("stage sparse prefix graph");
+        vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(ino);
+        let (published_epoch, uploaded_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(uploaded_blocks.is_empty());
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            ino,
+            published_epoch,
+        )
+        .await
+        .expect("finalize prefix while writer stays open");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ), "prefix finalization did not publish; attr={:?}; lifecycle={:?}; pending={:?}; writer_dirty={}; local_dirty={}; inflight={}",
+            meta.get_attr(ino),
+            meta.get_inode_lifecycle(ino),
+            vfs.pending_uploads_for_inode(ino),
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
+            vfs.state.deferred_materialize_inflight.contains(ino),
+        );
+        let published_attr = meta.get_attr(ino).expect("load published prefix attr");
+        assert_eq!(published_attr.size, published_prefix_len);
+        assert_eq!(published_attr.committed_size, published_attr.size);
+
+        let tail = b" accepted tail";
+        vfs.write_fh(fh, ino, published_attr.size, tail)
+            .await
+            .expect("write tail through the still-open handle");
+
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("follow-up tail should leave a dirty attr");
+        assert!(
+            dirty_attr.content_epoch > published_attr.content_epoch,
+            "a write after prefix publication must start a new epoch instead of reusing the stale open-time attr: published={published_attr:?}, dirty={dirty_attr:?}"
+        );
+        assert_eq!(
+            dirty_attr.size,
+            published_prefix_len + tail.len() as u64,
+            "the visible size must retain the already-published prefix and the new tail"
+        );
+
+        vfs.flush_fh(fh).await.expect("flush follow-up tail");
+        let actual = vfs
+            .read(ino, 0, (published_prefix_len + tail.len() as u64) as u32)
+            .await
+            .expect("read complete payload");
+        let mut expected = vec![0; published_prefix_len as usize];
+        expected.extend_from_slice(tail);
+        assert_eq!(actual.as_ref(), expected.as_slice());
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
 fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-same-size-graph");
