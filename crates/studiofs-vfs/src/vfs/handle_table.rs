@@ -108,7 +108,9 @@ impl HandleTable {
         }
         drop(handles);
         let mut counts = self.counts.lock();
-        let counts_for_inode = counts.get_mut(&open_file.ino)?;
+        let counts_for_inode = counts
+            .get_mut(&open_file.ino)
+            .expect("inode must exist in counts if handle existed");
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
         if Self::flags_allow_write(open_file.flags) {
             assert!(
