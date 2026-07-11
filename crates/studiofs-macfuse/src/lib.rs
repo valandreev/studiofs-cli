@@ -814,6 +814,56 @@ mod tests {
     }
 
     #[test]
+    fn releasing_handle_cancels_reads_waiting_for_admission() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-release-cancels-queued-read",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"release-cancel.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"release cancels queued read"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            7,
+        );
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        vfs.reset_diagnostics_observability();
+        let held_capacity = adapter.hold_read_capacity_for_test(7);
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
+            .expect("queue read behind admission capacity");
+
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release reader");
+        let errno = queued
+            .wait_timeout(std::time::Duration::from_secs(1))
+            .expect("released handle must cancel its queued reads")
+            .expect_err("released read must not reach VFS");
+        drop(held_capacity);
+
+        assert_eq!(errno, libc::EINTR);
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.vfs_read_path.calls, 0);
+        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
+        assert_eq!(metrics.fuse_async_read.canceled_reads, 1);
+    }
+
+    #[test]
     fn read_only_adapter_rejects_negative_read_offset_before_queueing() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-async-read-negative-offset",
@@ -1083,7 +1133,7 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_without_kernel_data_cache_for_test(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
         );
@@ -1154,7 +1204,7 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, b"0123456789abcdef"))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_without_kernel_data_cache_for_test(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
         );
@@ -1177,7 +1227,7 @@ mod tests {
         invalidator.inval_inode(attr.ino);
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "data invalidation must force the next open to drop cached pages"
+            "this setup has no cacheable generation while the file is locally dirty"
         );
 
         fixture
@@ -1302,7 +1352,7 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_without_kernel_data_cache_for_test(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
         );
@@ -1355,7 +1405,7 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_without_kernel_data_cache_for_test(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
         );
@@ -1881,26 +1931,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_keeps_kernel_cache_only_for_read_only_handles() {
+    fn cache_policy_uses_ubc_for_readers_and_direct_io_for_writers() {
         let read_only = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, false);
         assert!(!read_only.direct_io);
         assert!(read_only.keep_cache);
 
         let write_only = super::adapter::macfuse_open_cache_policy(libc::O_WRONLY, false);
-        assert!(!write_only.direct_io);
+        assert!(write_only.direct_io);
         assert!(!write_only.keep_cache);
 
         let read_write = super::adapter::macfuse_open_cache_policy(libc::O_RDWR, false);
-        assert!(!read_write.direct_io);
+        assert!(read_write.direct_io);
         assert!(!read_write.keep_cache);
 
         let append =
             super::adapter::macfuse_open_cache_policy(libc::O_RDONLY | libc::O_APPEND, false);
-        assert!(!append.direct_io);
+        assert!(append.direct_io);
         assert!(!append.keep_cache);
 
         let truncate = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, true);
-        assert!(!truncate.direct_io);
+        assert!(truncate.direct_io);
         assert!(!truncate.keep_cache);
     }
 
