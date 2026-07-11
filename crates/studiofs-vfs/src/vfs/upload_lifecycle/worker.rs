@@ -618,7 +618,7 @@ where
 
         if attr.content_epoch != op.content_epoch {
             if self
-                .protect_stale_upload_if_covered(op)
+                .protect_stale_upload_if_covered(op, Some(attr), None)
                 .await?
                 .protects_payload()
             {
@@ -635,7 +635,7 @@ where
 
         if !overlay_object_current {
             if self
-                .protect_stale_upload_if_covered(op)
+                .protect_stale_upload_if_covered(op, Some(attr), Some(overlay_object_current))
                 .await?
                 .protects_payload()
             {
@@ -847,7 +847,7 @@ where
             )
         } else {
             if self
-                .protect_stale_upload_if_covered(op)
+                .protect_stale_upload_if_covered(op, None, None)
                 .await?
                 .protects_payload()
             {
@@ -1054,18 +1054,28 @@ where
     async fn protect_stale_upload_if_covered(
         &self,
         op: &PendingUpload,
+        prefetched_attr: Option<InodeAttr>,
+        prefetched_overlay: Option<bool>,
     ) -> VfsResult<StaleUploadDisposition> {
-        if let Some(attr) = self.meta.get_attr(op.ino).await?
-            && self
-                .meta
-                .has_regular_file_overlay_object_if_matches(
-                    op.ino,
-                    attr.content_epoch,
-                    op.object_id,
-                )
-                .await?
-        {
-            return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
+        if let Some(attr) = match prefetched_attr {
+            Some(attr) => Some(attr),
+            None => self.meta.get_attr(op.ino).await?,
+        } {
+            let covered = match prefetched_overlay {
+                Some(covered) => covered,
+                None => {
+                    self.meta
+                        .has_regular_file_overlay_object_if_matches(
+                            op.ino,
+                            attr.content_epoch,
+                            op.object_id,
+                        )
+                        .await?
+                }
+            };
+            if covered {
+                return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
+            }
         }
 
         if let Some(live_epoch) = self

@@ -563,6 +563,10 @@ pub const fn cache_io_execution_model() -> LocalCacheIoExecutionModel {
     LocalCacheIoExecutionModel::InlineRuntimeWorkerWithBlockingIsolation
 }
 
+/// The closure must not be called from Tokio's `spawn_blocking` pool. Such
+/// callers must use [`run_local_cache_io_blocking`] instead; Tokio does not
+/// expose a reliable runtime API for distinguishing a blocking-pool thread
+/// from a worker thread before calling `block_in_place`.
 pub fn run_local_cache_io<T>(operation: impl FnOnce() -> T) -> (T, LocalCacheIoTiming) {
     let io_started = std::time::Instant::now();
     let result = if tokio::runtime::Handle::try_current()

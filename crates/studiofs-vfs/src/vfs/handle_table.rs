@@ -12,16 +12,19 @@ struct HandleCounts {
     write: u32,
 }
 
+#[derive(Debug, Default)]
+struct HandleTableData {
+    handles: HashMap<u64, OpenFile>,
+    handles_by_inode: HashMap<Ino, HashSet<u64>>,
+}
+
 /// Per-VFS handle table tracking all open file descriptors.
 pub(super) struct HandleTable {
     /// Monotonically increasing file handle counter. Zero is reserved for
     /// bridge callbacks that use `fh == 0` as "no VFS handle".
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
-    handles: RwLock<HashMap<u64, OpenFile>>,
-    /// Open handle ids grouped by inode, avoiding a full handle-table scan
-    /// when an inode attribute snapshot changes.
-    handles_by_inode: Mutex<HashMap<Ino, HashSet<u64>>>,
+    handles: RwLock<HandleTableData>,
     /// Inode -> currently open file descriptor counters.
     counts: Mutex<HashMap<Ino, HandleCounts>>,
     /// Inodes that were unlinked while still open (deferred deletion).
@@ -32,8 +35,7 @@ impl HandleTable {
     pub(super) fn new() -> Self {
         Self {
             next_fh: AtomicU64::new(1),
-            handles: RwLock::new(HashMap::new()),
-            handles_by_inode: Mutex::new(HashMap::new()),
+            handles: RwLock::new(HandleTableData::default()),
             counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
@@ -54,12 +56,8 @@ impl HandleTable {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         let mut handles = self.handles.write();
-        handles.insert(fh, open_file.clone());
-        self.handles_by_inode
-            .lock()
-            .entry(ino)
-            .or_default()
-            .insert(fh);
+        handles.handles.insert(fh, open_file.clone());
+        handles.handles_by_inode.entry(ino).or_default().insert(fh);
         drop(handles);
         let mut counts = self.counts.lock();
         let counts_for_inode = counts.entry(ino).or_default();
@@ -72,12 +70,12 @@ impl HandleTable {
 
     /// Look up an open file handle.
     pub(super) fn get(&self, fh: u64) -> Option<OpenFile> {
-        self.handles.read().get(&fh).cloned()
+        self.handles.read().handles.get(&fh).cloned()
     }
 
     /// Refresh the attribute snapshot carried by an already-open handle.
     pub(super) fn update_open_attr(&self, fh: u64, attr: InodeAttr) {
-        if let Some(open_file) = self.handles.read().get(&fh) {
+        if let Some(open_file) = self.handles.read().handles.get(&fh) {
             open_file.set_open_attr(attr);
         }
     }
@@ -85,10 +83,9 @@ impl HandleTable {
     /// Refresh the attribute snapshot carried by every handle for an inode.
     pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
         let handles = self.handles.read();
-        let handles_by_inode = self.handles_by_inode.lock();
-        if let Some(handle_ids) = handles_by_inode.get(&ino) {
+        if let Some(handle_ids) = handles.handles_by_inode.get(&ino) {
             for fh in handle_ids {
-                if let Some(open_file) = handles.get(fh) {
+                if let Some(open_file) = handles.handles.get(fh) {
                     open_file.set_open_attr(attr.clone());
                 }
             }
@@ -98,15 +95,13 @@ impl HandleTable {
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
         let mut handles = self.handles.write();
-        let open_file = handles.remove(&fh)?;
-        let mut handles_by_inode = self.handles_by_inode.lock();
-        if let Some(handle_ids) = handles_by_inode.get_mut(&open_file.ino) {
+        let open_file = handles.handles.remove(&fh)?;
+        if let Some(handle_ids) = handles.handles_by_inode.get_mut(&open_file.ino) {
             handle_ids.remove(&fh);
             if handle_ids.is_empty() {
-                handles_by_inode.remove(&open_file.ino);
+                handles.handles_by_inode.remove(&open_file.ino);
             }
         }
-        drop(handles_by_inode);
         drop(handles);
         let mut counts = self.counts.lock();
         let counts_for_inode = counts.get_mut(&open_file.ino)?;
@@ -148,6 +143,7 @@ impl HandleTable {
     pub(super) fn has_active_open_overlay(&self, ino: Ino) -> bool {
         self.handles
             .read()
+            .handles
             .values()
             .any(|open_file| open_file.ino == ino && open_file.active_open_overlay)
     }
@@ -156,6 +152,7 @@ impl HandleTable {
         for open_file in self
             .handles
             .read()
+            .handles
             .values()
             .filter(|open_file| open_file.ino == ino)
         {
@@ -181,6 +178,7 @@ impl HandleTable {
     pub(super) fn collect_open_access_classes(&self) -> Vec<AccessClass> {
         self.handles
             .read()
+            .handles
             .values()
             .map(|f| f.current_access_class())
             .collect()
@@ -205,7 +203,10 @@ mod tests {
         assert_eq!(ht.write_open_count(10), 1);
         assert_eq!(ht.open_count(20), 1);
         assert_eq!(ht.write_open_count(20), 1);
-        assert_eq!(ht.handles_by_inode.lock().get(&10).unwrap().len(), 2);
+        assert_eq!(
+            ht.handles.read().handles_by_inode.get(&10).unwrap().len(),
+            2
+        );
         assert_eq!(ht.open_count(99), 0);
         assert_eq!(ht.write_open_count(99), 0);
         assert!(ht.has_active_open_overlay(10));
@@ -232,7 +233,7 @@ mod tests {
         assert_eq!(remaining, 0);
         assert_eq!(ht.open_count(10), 0);
         assert_eq!(ht.write_open_count(10), 0);
-        assert!(!ht.handles_by_inode.lock().contains_key(&10));
+        assert!(!ht.handles.read().handles_by_inode.contains_key(&10));
         assert!(!ht.has_active_open_overlay(10));
 
         let (closed3, remaining) = ht.close(fh3.fh).unwrap();
