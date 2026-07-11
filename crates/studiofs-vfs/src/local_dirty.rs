@@ -1526,7 +1526,7 @@ impl StudioVfs {
         let mut retain_tail_bytes = self
             .pending_slice_commit_hot_tail_bytes()
             .min(total_bytes.saturating_sub(commit_wave_bytes));
-        let mut commit_candidate_groups = Vec::<Vec<(u64, PendingDirtySlice)>>::new();
+        let mut commit_candidate_groups = Vec::<&Vec<(u64, PendingDirtySlice)>>::new();
         for group in ordered_object_groups.iter().rev() {
             let group_len = group.iter().map(|(_, slice)| slice.len()).sum::<usize>();
             let protect_fresh_tail = retain_tail_bytes > 0
@@ -1534,7 +1534,7 @@ impl StudioVfs {
                     .iter()
                     .any(|(_, slice)| slice.age(now) < PENDING_SLICE_COMMIT_MAX_AGE);
             if !protect_fresh_tail {
-                commit_candidate_groups.push(group.clone());
+                commit_candidate_groups.push(group);
                 continue;
             }
             retain_tail_bytes = retain_tail_bytes.saturating_sub(group_len);
@@ -1543,7 +1543,7 @@ impl StudioVfs {
 
         let mut selected = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
         let mut selected_bytes = 0usize;
-        for group in &commit_candidate_groups {
+        for group in commit_candidate_groups {
             if selected_bytes >= commit_wave_bytes {
                 break;
             }

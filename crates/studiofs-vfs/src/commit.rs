@@ -320,10 +320,12 @@ impl CommitCoordinator {
                 || (current.content_epoch == newer_dirty_attr.content_epoch
                     && current.size < newer_dirty_attr.size)
         });
-        if should_restore {
+        let open_attr = if should_restore {
             dirty_attrs.insert(ino, newer_dirty_attr.clone());
-        }
-        let open_attr = dirty_attrs.get(&ino).cloned().unwrap_or(newer_dirty_attr);
+            newer_dirty_attr
+        } else {
+            dirty_attrs.get(&ino).cloned().unwrap_or(newer_dirty_attr)
+        };
         drop(dirty_attrs);
         vfs.handle_table
             .update_open_attrs_for_inode(ino, &open_attr);

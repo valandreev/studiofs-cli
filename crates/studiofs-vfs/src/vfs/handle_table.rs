@@ -19,6 +19,9 @@ pub(super) struct HandleTable {
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
     handles: RwLock<HashMap<u64, OpenFile>>,
+    /// Open handle ids grouped by inode, avoiding a full handle-table scan
+    /// when an inode attribute snapshot changes.
+    handles_by_inode: Mutex<HashMap<Ino, HashSet<u64>>>,
     /// Inode -> currently open file descriptor counters.
     counts: Mutex<HashMap<Ino, HandleCounts>>,
     /// Inodes that were unlinked while still open (deferred deletion).
@@ -30,6 +33,7 @@ impl HandleTable {
         Self {
             next_fh: AtomicU64::new(1),
             handles: RwLock::new(HashMap::new()),
+            handles_by_inode: Mutex::new(HashMap::new()),
             counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
@@ -49,7 +53,14 @@ impl HandleTable {
     ) -> OpenFile {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
-        self.handles.write().insert(fh, open_file.clone());
+        let mut handles = self.handles.write();
+        handles.insert(fh, open_file.clone());
+        self.handles_by_inode
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(fh);
+        drop(handles);
         let mut counts = self.counts.lock();
         let counts_for_inode = counts.entry(ino).or_default();
         counts_for_inode.open = counts_for_inode.open.saturating_add(1);
@@ -73,19 +84,30 @@ impl HandleTable {
 
     /// Refresh the attribute snapshot carried by every handle for an inode.
     pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
-        for open_file in self
-            .handles
-            .write()
-            .values_mut()
-            .filter(|open_file| open_file.ino == ino)
-        {
-            open_file.open_attr = Some(attr.clone());
+        let mut handles = self.handles.write();
+        let handles_by_inode = self.handles_by_inode.lock();
+        if let Some(handle_ids) = handles_by_inode.get(&ino) {
+            for fh in handle_ids {
+                if let Some(open_file) = handles.get_mut(fh) {
+                    open_file.open_attr = Some(attr.clone());
+                }
+            }
         }
     }
 
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
-        let open_file = self.handles.write().remove(&fh)?;
+        let mut handles = self.handles.write();
+        let open_file = handles.remove(&fh)?;
+        let mut handles_by_inode = self.handles_by_inode.lock();
+        if let Some(handle_ids) = handles_by_inode.get_mut(&open_file.ino) {
+            handle_ids.remove(&fh);
+            if handle_ids.is_empty() {
+                handles_by_inode.remove(&open_file.ino);
+            }
+        }
+        drop(handles_by_inode);
+        drop(handles);
         let mut counts = self.counts.lock();
         let counts_for_inode = counts.get_mut(&open_file.ino)?;
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
@@ -183,6 +205,7 @@ mod tests {
         assert_eq!(ht.write_open_count(10), 1);
         assert_eq!(ht.open_count(20), 1);
         assert_eq!(ht.write_open_count(20), 1);
+        assert_eq!(ht.handles_by_inode.lock().get(&10).unwrap().len(), 2);
         assert_eq!(ht.open_count(99), 0);
         assert_eq!(ht.write_open_count(99), 0);
         assert!(ht.has_active_open_overlay(10));
@@ -209,6 +232,7 @@ mod tests {
         assert_eq!(remaining, 0);
         assert_eq!(ht.open_count(10), 0);
         assert_eq!(ht.write_open_count(10), 0);
+        assert!(!ht.handles_by_inode.lock().contains_key(&10));
         assert!(!ht.has_active_open_overlay(10));
 
         let (closed3, remaining) = ht.close(fh3.fh).unwrap();
