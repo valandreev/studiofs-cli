@@ -1947,6 +1947,40 @@ mod tests {
     }
 
     #[test]
+    fn adapter_read_only_handle_keeps_foreground_read_active_until_release() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-read-handle-foreground-lease",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cached-media-read.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only handle");
+        assert_eq!(
+            vfs.foreground_reads_inflight(),
+            1,
+            "read-only handle must keep background disk rereads paused while UBC serves pages"
+        );
+
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read-only handle");
+        assert_eq!(vfs.foreground_reads_inflight(), 0);
+    }
+
+    #[test]
     fn adapter_clean_write_release_drops_cache_while_read_only_handle_remains_open() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-read-open-during-write-release",

@@ -1281,6 +1281,15 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             );
             return Ok(Some(hot_payload));
         }
+        while !self
+            .vfs
+            .wait_for_foreground_reads_idle(Duration::from_secs(1))
+            .await
+        {
+            if self.vfs.shutdown_requested() {
+                return Ok(None);
+            }
+        }
         let foreground_active = self
             .vfs
             .state
@@ -2928,6 +2937,45 @@ mod tests {
         )
         .expect("create vfs");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn upload_disk_reread_waits_for_foreground_reads_to_be_idle() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-yields-to-read");
+        let object_id = 0xA1A0_0001;
+        let payload = Bytes::from_static(b"disk-backed upload payload");
+
+        rt.block_on(async {
+            vfs.payload_store_put_async(object_id, payload.clone(), false)
+                .await
+                .expect("persist upload payload");
+            vfs.state.read.mark_foreground_read(now_unix_millis());
+
+            let port = VfsUploadLocalPayloadPort { vfs: vfs.clone() };
+            let reread =
+                tokio::spawn(
+                    async move { port.read_for_upload(object_id, payload.len() as u64).await },
+                );
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                !reread.is_finished(),
+                "background disk reread must not compete with an active foreground read"
+            );
+
+            vfs.state.read.unmark_foreground_read(now_unix_millis());
+            let reread_payload = tokio::time::timeout(Duration::from_secs(2), reread)
+                .await
+                .expect("upload reread should resume after foreground idle grace")
+                .expect("upload reread task")
+                .expect("upload reread result")
+                .expect("persisted payload should exist");
+            assert_eq!(
+                reread_payload,
+                Bytes::from_static(b"disk-backed upload payload")
+            );
+        });
     }
 
     #[test]

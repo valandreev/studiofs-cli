@@ -81,6 +81,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     shared: Arc<AdapterSharedState>,
     write_capable_state: WriteCapableState,
+    foreground_read_handles: ParkingMutex<HashSet<u64>>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
@@ -673,7 +674,7 @@ fn readahead_window_len(size: usize) -> usize {
 }
 
 fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    readahead_window_len(size as usize).min(read_queue_byte_limit as usize) as u32
+    size.min(read_queue_byte_limit)
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -1013,6 +1014,7 @@ impl StudioVfsAdapter {
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
             write_capable_state: WriteCapableState::default(),
+            foreground_read_handles: ParkingMutex::new(HashSet::new()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
             next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
@@ -1227,6 +1229,7 @@ impl StudioVfsAdapter {
         open_result
             .map(|fh| {
                 let keep_cache = if flag_policy.keep_cache {
+                    self.record_foreground_read_handle(fh);
                     self.keep_cache_for_current_generation(ino)
                 } else {
                     self.record_write_capable_open(ino, fh);
@@ -1257,6 +1260,18 @@ impl StudioVfsAdapter {
             reason = "write_capable",
             "macFUSE open invalidates kernel cache"
         );
+    }
+
+    fn record_foreground_read_handle(&self, file_handle: u64) {
+        if self.foreground_read_handles.lock().insert(file_handle) {
+            self.vfs.begin_foreground_read_handle();
+        }
+    }
+
+    fn release_foreground_read_handle(&self, file_handle: u64) {
+        if self.foreground_read_handles.lock().remove(&file_handle) {
+            self.vfs.end_foreground_read_handle();
+        }
     }
 
     fn has_active_write_capable_handles(&self, ino: u64) -> bool {
@@ -1974,6 +1989,7 @@ impl StudioVfsAdapter {
         released_write_handle: Option<ReleasedWriteCapableHandle>,
         outcome_result: Result<ReleaseFhOutcome, i32>,
     ) -> Result<(), i32> {
+        self.release_foreground_read_handle(file_handle);
         self.shared.read_windows.invalidate_handle(file_handle);
         if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
             self.clear_open_cache_snapshot(released.ino, "clean_write_release");
@@ -4095,6 +4111,17 @@ mod tests {
         assert_eq!(
             read_execution_size(u32::MAX, oversized_queue_limit),
             MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32
+        );
+    }
+
+    #[test]
+    fn queued_read_admission_charges_only_callback_bytes() {
+        let callback_bytes = 128 * 1024;
+        let queue_limit = MACFUSE_READ_WINDOW_MAX_BYTES as u32;
+
+        assert_eq!(
+            queued_read_admission_bytes(callback_bytes, queue_limit),
+            callback_bytes
         );
     }
 

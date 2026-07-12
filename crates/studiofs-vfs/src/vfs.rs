@@ -6279,8 +6279,17 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    /// Test helper: wait until foreground reads complete or timeout elapses.
+    /// Mark a platform read-only handle as active foreground I/O.
+    pub fn begin_foreground_read_handle(&self) {
+        self.state.read.mark_foreground_read(now_unix_millis());
+    }
+
+    /// Mark a platform read-only handle as no longer active foreground I/O.
+    pub fn end_foreground_read_handle(&self) {
+        self.state.read.unmark_foreground_read(now_unix_millis());
+    }
+
+    /// Wait until foreground reads complete or timeout elapses.
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
