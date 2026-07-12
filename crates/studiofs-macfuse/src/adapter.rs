@@ -215,12 +215,11 @@ impl KernelInodeLiveness {
         let Some(state) = self.current(ino) else {
             return;
         };
-        // RATIONALE: keep the per-inode state lock across notify so close/forget
-        // cannot remove this inode generation until the invalidation boundary
-        // has completed. `current` already dropped the DashMap shard guard, so
-        // unrelated inodes remain independent while this external call runs.
-        let count = state.lock();
-        if self.is_current(ino, &state) && *count > 0 {
+        let should_notify = {
+            let count = state.lock();
+            self.is_current(ino, &state) && *count > 0
+        };
+        if should_notify {
             notify();
         }
     }
@@ -4463,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_inode_liveness_close_waits_for_same_inode_notification_boundary() {
+    fn kernel_inode_liveness_close_does_not_wait_for_external_notification() {
         let liveness = Arc::new(KernelInodeLiveness::default());
         let ino = 42;
         liveness.observe(ino);
@@ -4486,17 +4485,34 @@ mod tests {
             closer_liveness.close(ino);
             closed_tx.send(()).expect("signal closed gate");
         });
-        assert!(
-            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "final unlink must serialize with an in-flight notification for the same inode"
-        );
-
-        release_notification.wait();
         closed_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("close should finish after the in-flight notification exits");
+            .expect("final unlink must not wait for an external notification callback");
+
+        release_notification.wait();
         notifier.join().expect("notification thread exits");
         closer.join().expect("close thread exits");
+        assert!(!liveness.contains(ino));
+    }
+
+    #[test]
+    fn kernel_inode_liveness_notification_can_reenter_close() {
+        let liveness = Arc::new(KernelInodeLiveness::default());
+        let ino = 42;
+        liveness.observe(ino);
+        let callback_liveness = Arc::clone(&liveness);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let notifier = std::thread::spawn(move || {
+            callback_liveness.notify_if_observed(ino, || {
+                callback_liveness.close(ino);
+                closed_tx.send(()).expect("signal re-entrant close");
+            });
+        });
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("notification callback must not deadlock when close re-enters liveness");
+        notifier.join().expect("notification thread exits");
         assert!(!liveness.contains(ino));
     }
 

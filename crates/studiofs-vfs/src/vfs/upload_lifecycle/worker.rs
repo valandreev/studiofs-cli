@@ -1224,7 +1224,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .vfs
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let defer_delay = upload_disk_reread_defer_delay(
             foreground_active,
             false,
@@ -1293,7 +1293,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .vfs
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
         let foreground_cost = self
             .vfs
             .state

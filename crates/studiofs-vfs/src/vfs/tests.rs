@@ -3406,6 +3406,43 @@ fn handle_write_uses_open_attr_before_meta_lookup() {
 }
 
 #[test]
+fn newer_dirty_epoch_keeps_its_upload_state_during_write_merge() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "newer-dirty-epoch-upload-state");
+    let attr = vfs
+        .create(1, b"newer-dirty-epoch-upload-state.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    let mut newer = attr.clone();
+    newer.content_epoch = attr.content_epoch.saturating_add(1);
+    newer.upload_state = MetaUploadState::Ready;
+    let mut older = attr;
+    older.upload_state = MetaUploadState::Uploading;
+
+    super::sync_ops::merge_write_dirty_attr(&mut newer, &older);
+
+    assert_eq!(newer.upload_state, MetaUploadState::Ready);
+}
+
+#[test]
+fn equal_dirty_epoch_updates_upload_state_from_non_ready_write_base() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "equal-dirty-epoch-upload-state");
+    let attr = vfs
+        .create(1, b"equal-dirty-epoch-upload-state.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    let mut current = attr.clone();
+    current.upload_state = MetaUploadState::Ready;
+    let mut write_base = attr;
+    write_base.upload_state = MetaUploadState::Uploading;
+
+    super::sync_ops::merge_write_dirty_attr(&mut current, &write_base);
+
+    assert_eq!(current.upload_state, MetaUploadState::Uploading);
+}
+
+#[test]
 fn open_created_file_with_known_attr_does_not_recheck_mutation_authority() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "open-created-known-attr");
@@ -7360,6 +7397,18 @@ fn wait_for_foreground_reads_idle_honors_idle_grace() {
 
         assert!(waiter.await.expect("join foreground idle waiter"));
     });
+}
+
+#[test]
+fn foreground_io_active_includes_active_writers() {
+    let state = ReadState::new(1);
+
+    state.increment_active_access_class(AccessClass::SequentialWriter);
+
+    assert!(
+        state.foreground_io_active(100, Duration::from_millis(50)),
+        "active sequential writers must protect local materialization from upload rereads"
+    );
 }
 
 #[test]

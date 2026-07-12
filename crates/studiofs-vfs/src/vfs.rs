@@ -1979,6 +1979,12 @@ impl ReadState {
         now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
     }
 
+    fn foreground_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        self.foreground_read_active(now_ms, idle_grace)
+            || self.active_access_class_count(AccessClass::SequentialWriter) > 0
+            || self.active_access_class_count(AccessClass::RandomWriter) > 0
+    }
+
     fn record_foreground_read_latency(
         &self,
         shard_idx: usize,
@@ -4602,7 +4608,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);

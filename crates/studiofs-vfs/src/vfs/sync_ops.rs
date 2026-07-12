@@ -1,6 +1,6 @@
 use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
-    FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino,
+    FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, MetaUploadState,
     OpenFile, OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy,
     StudioVfs, VfsResult,
@@ -41,6 +41,16 @@ impl VfsWritePayload<'_> {
             Self::Borrowed(data) => data,
             Self::Owned(data) => data,
         }
+    }
+}
+
+pub(super) fn merge_write_dirty_attr(attr: &mut InodeAttr, base_attr: &InodeAttr) {
+    if attr.content_epoch < base_attr.content_epoch {
+        *attr = base_attr.clone();
+    } else if attr.content_epoch == base_attr.content_epoch
+        && base_attr.upload_state != MetaUploadState::Ready
+    {
+        attr.upload_state = base_attr.upload_state;
     }
 }
 
@@ -1833,12 +1843,7 @@ impl StudioVfs {
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            if attr.content_epoch < base_attr.content_epoch {
-                *attr = base_attr.clone();
-            }
-            if base_attr.upload_state != MetaUploadState::Ready {
-                attr.upload_state = base_attr.upload_state;
-            }
+            merge_write_dirty_attr(attr, &base_attr);
             attr.kind = FileType::RegularFile;
             if accepted.visible_len > attr.size {
                 if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
