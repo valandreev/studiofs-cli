@@ -231,11 +231,10 @@ impl StudioVfs {
             .max_dirty_bytes()
             .saturating_div(2)
             .max(self.write_eager_flush_drain_chunk_bytes);
-        let delay_ms = if pressure_after_write > pacing_threshold {
-            admission.delay_ms
-        } else {
-            0
-        };
+        // Sustained-stream detection is a pre-drain signal only. Adaptive
+        // admission already owns pacing from measured pressure and drain rate;
+        // adding a second time-based sleep here produces periodic callback stalls.
+        let delay_ms = 0;
 
         // #region debug log
         self.debug_write_probe(
@@ -1747,15 +1746,23 @@ impl StudioVfs {
         data: VfsWritePayload<'_>,
     ) -> VfsResult<u32> {
         let mut base_attr;
-        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
-            self.note_vfs_write_dirty_attr_hit();
-            base_attr = attr;
-        } else if let Some(attr) = self
+        let dirty_attr = self.state.namespace.dirty_attrs.lock().get(&ino).cloned();
+        let open_attr = self
             .handle_table
             .get(fh)
             .filter(|open_file| open_file.ino == ino)
-            .and_then(|open_file| open_file.open_attr())
-        {
+            .and_then(|open_file| open_file.open_attr());
+        let open_attr_is_newer = dirty_attr
+            .as_ref()
+            .zip(open_attr.as_ref())
+            .is_some_and(|(dirty, open)| open.content_epoch > dirty.content_epoch);
+        if open_attr_is_newer {
+            self.note_vfs_write_open_attr_hit();
+            base_attr = open_attr.expect("newer open attr is present");
+        } else if let Some(attr) = dirty_attr {
+            self.note_vfs_write_dirty_attr_hit();
+            base_attr = attr;
+        } else if let Some(attr) = open_attr {
             self.note_vfs_write_open_attr_hit();
             base_attr = attr;
         } else {
@@ -1792,7 +1799,12 @@ impl StudioVfs {
                     MetaUploadState::Uploading
                 };
         }
-        if base_attr.is_unpublished_empty_draft() && !data.is_empty() {
+        let starts_payload_after_empty_local_incarnation = base_attr.is_unpublished_empty_draft()
+            || (base_attr.size == 0
+                && base_attr.committed_size == 0
+                && base_attr.content_epoch > base_attr.committed_content_epoch
+                && base_attr.upload_state != MetaUploadState::Ready);
+        if starts_payload_after_empty_local_incarnation && !data.is_empty() {
             self.begin_size_change_incarnation(ino, &mut base_attr);
             base_attr.upload_state = MetaUploadState::Uploading;
         } else if base_attr.upload_state == MetaUploadState::Ready && !data.is_empty() {
@@ -1821,6 +1833,9 @@ impl StudioVfs {
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+            if attr.content_epoch < base_attr.content_epoch {
+                *attr = base_attr.clone();
+            }
             attr.content_epoch = attr.content_epoch.max(base_attr.content_epoch);
             if base_attr.upload_state != MetaUploadState::Ready {
                 attr.upload_state = base_attr.upload_state;

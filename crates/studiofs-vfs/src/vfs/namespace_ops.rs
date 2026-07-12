@@ -663,6 +663,7 @@ impl StudioVfs {
                 && new_size != attr.size
             {
                 if new_size < attr.size {
+                    self.state.writer_stack.clear_inode(ino);
                     self.begin_size_change_incarnation(ino, &mut attr);
                     truncate_mutation = Some(self.truncate_blocks(
                         ino,

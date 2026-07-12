@@ -208,6 +208,76 @@ fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
 }
 
 #[test]
+fn opportunistic_write_does_not_wait_for_background_materialize_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"write-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+
+        let written = tokio::time::timeout(Duration::from_millis(100), async {
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"foreground",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+        })
+        .await
+        .expect("foreground write must not queue behind background materialization")
+        .expect("foreground write should be accepted");
+
+        assert_eq!(written, b"foreground".len() as u32);
+        drop(materialize);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn durability_barrier_still_waits_for_background_materialize_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"flush-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let mut barrier = Box::pin(tokio::spawn(async move {
+            let _barrier = vfs_clone
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Flush)
+                .await;
+        }));
+
+        tokio::time::timeout(Duration::from_millis(50), &mut barrier)
+            .await
+            .expect_err("durability barrier must wait for background materialization");
+        drop(materialize);
+        tokio::time::timeout(Duration::from_millis(150), barrier)
+            .await
+            .expect("durability barrier should pass after materialization finishes")
+            .unwrap();
+    });
+}
+
+#[test]
 fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-surface");
@@ -6718,7 +6788,10 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             )
             .await
             .unwrap();
-        assert_eq!(delay_ms, 1);
+        assert_eq!(
+            delay_ms, 0,
+            "sustained pre-drain should not add a second foreground pacing delay"
+        );
 
         assert!(
             vfs.state
@@ -6891,6 +6964,32 @@ fn write_admission_governor_throttles_on_short_runway_before_limit() {
     let stats = governor.stats();
     assert_eq!(stats.pressure_bytes, 700);
     assert_eq!(stats.budget_bytes, 1_000);
+}
+
+#[test]
+fn write_admission_governor_uses_remaining_runway_instead_of_full_budget() {
+    let mut governor = WriteAdmissionGovernor::default();
+
+    governor.plan(WriteAdmissionSample {
+        now_ms: 1_000,
+        pressure_bytes: 200,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+    governor.record_accepted_bytes(600);
+    let decision = governor.plan(WriteAdmissionSample {
+        now_ms: 2_000,
+        pressure_bytes: 500,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+
+    assert!(decision.runway_ms < WRITE_ADMISSION_RUNWAY_TARGET_MS);
+    assert!(decision.ingress_bytes_per_sec > decision.drain_bytes_per_sec);
+    assert!(
+        decision.delay_ms > 0,
+        "pacing allowance must use the remaining buffer runway, not reuse the full budget"
+    );
 }
 
 #[test]
@@ -13281,6 +13380,49 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         .await
         .expect("finishing materializer should reschedule dirty writer-stack state");
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn first_write_after_truncate_ignores_stale_pretruncate_dirty_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recovered-truncate-write-epoch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"recovered-truncate-write-epoch.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, b"locally unpublished").await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let unpublished_attr = vfs.getattr(ino).unwrap();
+        assert_eq!(unpublished_attr.committed_size, 0);
+        assert_ne!(unpublished_attr.upload_state, MetaUploadState::Ready);
+
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, true).unwrap();
+        let truncate_attr = vfs
+            .handle_table
+            .get(fh)
+            .and_then(|open_file| open_file.open_attr())
+            .expect("truncate open should retain its generation snapshot");
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, unpublished_attr);
+
+        let rewritten = b"rewritten";
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, rewritten, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        let rewritten_attr = vfs.getattr(ino).unwrap();
+        assert_eq!(
+            (rewritten_attr.size, rewritten_attr.content_epoch),
+            (rewritten.len() as u64, truncate_attr.content_epoch + 1),
+            "the truncate handle generation must win over a late pre-truncate dirty attr"
+        );
         vfs.release_fh(fh).await.unwrap();
     });
 }

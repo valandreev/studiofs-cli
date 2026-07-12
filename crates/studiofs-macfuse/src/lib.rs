@@ -1511,6 +1511,7 @@ mod tests {
             .expect("create file");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        vfs.reset_diagnostics_observability();
 
         let writer = adapter
             .open(attr.ino, libc::O_WRONLY)
@@ -1527,6 +1528,10 @@ mod tests {
 
         assert_eq!(accepted, 18);
         assert_eq!(&bytes[..], b"hello from macFUSE");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.write.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.write.bytes, 18);
+        assert_eq!(metrics.fuse_callbacks.write.errors, 0);
     }
 
     #[test]

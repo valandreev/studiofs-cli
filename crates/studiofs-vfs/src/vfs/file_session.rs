@@ -273,6 +273,13 @@ impl FileSessionOperation {
         matches!(self, Self::Read | Self::Materialize | Self::Finalize)
     }
 
+    fn blocks_materialize(self) -> bool {
+        matches!(
+            self,
+            Self::Flush | Self::Fsync | Self::Release | Self::Upload | Self::Delete
+        )
+    }
+
     fn index(self) -> usize {
         match self {
             Self::Read => 0,
@@ -307,6 +314,8 @@ impl FileSessionOperation {
 pub(super) struct FileSessionEntry {
     /// Gate that serializes conflicting operations for this inode.
     gate: Arc<tokio::sync::RwLock<()>>,
+    /// Gate that keeps background materialization ordered with durability and lifecycle barriers.
+    materialize_gate: Arc<tokio::sync::RwLock<()>>,
     /// Gate that serializes background finalization while allowing readers.
     finalize_gate: Arc<tokio::sync::Mutex<()>>,
     open_handles: AtomicU32,
@@ -326,6 +335,7 @@ impl FileSessionEntry {
     fn new() -> Self {
         Self {
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            materialize_gate: Arc::new(tokio::sync::RwLock::new(())),
             finalize_gate: Arc::new(tokio::sync::Mutex::new(())),
             open_handles: AtomicU32::new(0),
             queued_ops: AtomicU64::new(0),
@@ -384,6 +394,10 @@ pub(super) struct FileSessionPermit {
     _read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     /// Write side lock guard held while the operation is active.
     _write_gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    /// Background-materialization guard held while an opportunistic drain is active.
+    _materialize_read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    /// Barrier guard that waits for active background materialization.
+    _materialize_write_gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
     /// Shared counters used by the permit.
     counters: Arc<FileSessionCounters>,
     /// Session that owns the active permit.
@@ -399,6 +413,8 @@ impl Drop for FileSessionPermit {
         // observe lower tail latency on contended inodes.
         drop(self._read_gate.take());
         drop(self._write_gate.take());
+        drop(self._materialize_read_gate.take());
+        drop(self._materialize_write_gate.take());
         drop(self._finalize_gate.take());
         self.session.note_active_finish(self.op);
         self.counters.transitions.fetch_add(1, Ordering::Relaxed);
@@ -526,7 +542,19 @@ impl FileSessionState {
         } else {
             None
         };
-        let (read_guard, write_guard) = if op.shared_lock() {
+        let materialize_write_guard = if op.blocks_materialize() {
+            Some(session.materialize_gate.clone().write_owned().await)
+        } else {
+            None
+        };
+        let materialize_read_guard = if op == FileSessionOperation::Materialize {
+            Some(session.materialize_gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        let (read_guard, write_guard) = if op == FileSessionOperation::Materialize {
+            (None, None)
+        } else if op.shared_lock() {
             (Some(session.gate.clone().read_owned().await), None)
         } else {
             (None, Some(session.gate.clone().write_owned().await))
@@ -555,6 +583,8 @@ impl FileSessionState {
             _finalize_gate: finalize_guard,
             _read_gate: read_guard,
             _write_gate: write_guard,
+            _materialize_read_gate: materialize_read_guard,
+            _materialize_write_gate: materialize_write_guard,
             counters,
             session,
             op,

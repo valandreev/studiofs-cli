@@ -367,7 +367,12 @@ impl WriteAdmissionGovernor {
             self.ingress_bytes_per_sec,
             self.drain_bytes_per_sec,
         );
-        let delay_ms = self.delay_ms(sample.next_bytes, budget_bytes, runway_ms);
+        let delay_ms = self.delay_ms(
+            sample.next_bytes,
+            pressure_after_bytes,
+            budget_bytes,
+            runway_ms,
+        );
         self.last_runway_ms = runway_ms;
         self.last_delay_ms = delay_ms;
         self.decision(delay_ms)
@@ -409,7 +414,13 @@ impl WriteAdmissionGovernor {
         }
     }
 
-    fn delay_ms(&self, next_bytes: usize, budget_bytes: usize, runway_ms: u64) -> u64 {
+    fn delay_ms(
+        &self,
+        next_bytes: usize,
+        pressure_bytes: usize,
+        budget_bytes: usize,
+        runway_ms: u64,
+    ) -> u64 {
         if next_bytes == 0
             || runway_ms >= WRITE_ADMISSION_RUNWAY_TARGET_MS
             || self.ingress_bytes_per_sec <= self.drain_bytes_per_sec
@@ -417,8 +428,11 @@ impl WriteAdmissionGovernor {
             return 0;
         }
 
-        let runway_allowance_bps =
-            Self::bytes_per_sec(budget_bytes as u64, WRITE_ADMISSION_RUNWAY_TARGET_MS).max(1);
+        let remaining_runway_bytes = budget_bytes.saturating_sub(pressure_bytes);
+        let runway_allowance_bps = Self::bytes_per_sec(
+            remaining_runway_bytes as u64,
+            WRITE_ADMISSION_RUNWAY_TARGET_MS,
+        );
         let allowed_bytes_per_sec = self
             .drain_bytes_per_sec
             .saturating_add(runway_allowance_bps)

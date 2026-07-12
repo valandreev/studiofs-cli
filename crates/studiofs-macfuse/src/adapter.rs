@@ -187,13 +187,23 @@ fn write_capable_shard_index(key: u64) -> usize {
     key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize % WRITE_CAPABLE_STATE_SHARDS
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
     size: u64,
     kind: MacFuseOpenCacheSnapshotKind,
     graph: Vec<MacFuseOpenCacheGraphSpan>,
 }
+
+impl PartialEq for MacFuseOpenCacheSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.content_epoch == other.content_epoch
+            && self.size == other.size
+            && self.graph == other.graph
+    }
+}
+
+impl Eq for MacFuseOpenCacheSnapshot {}
 
 impl MacFuseOpenCacheSnapshot {
     fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
@@ -1884,7 +1894,8 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let written = self
+        let started = Instant::now();
+        let result = self
             .runtime_handle
             .block_on(self.vfs.write_fh_with_deferred_materialize(
                 file_handle,
@@ -1893,7 +1904,10 @@ impl StudioVfsAdapter {
                 data,
                 LocalSyncPolicy::Opportunistic,
             ))
-            .map_err(|error| vfs_err_to_errno(&error))?;
+            .map_err(|error| vfs_err_to_errno(&error));
+        self.vfs
+            .record_fuse_write_callback(data.len(), started.elapsed(), result.is_err());
+        let written = result?;
         self.shared.read_windows.invalidate_inode(ino);
         Ok(written)
     }
@@ -2503,7 +2517,7 @@ mod open_cache_snapshot_tests {
     use studiofs_vfs::vfs::ReleaseFhOutcome;
 
     #[test]
-    fn open_cache_snapshot_identity_includes_publication_state() {
+    fn open_cache_snapshot_identity_ignores_publication_only_transition() {
         let mut attr = InodeAttr::new_file(42, 1, 501, 20, 0o644);
         attr.size = 4096;
         attr.content_epoch = 7;
@@ -2531,9 +2545,9 @@ mod open_cache_snapshot_tests {
         let remote_ready = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
         assert_eq!(remote_ready.kind, MacFuseOpenCacheSnapshotKind::RemoteReady);
 
-        assert_ne!(
+        assert_eq!(
             local_stable, remote_ready,
-            "publication transitions with unchanged graph must still drop kernel pages once"
+            "publication-only transitions must preserve UBC pages for unchanged content"
         );
     }
 
@@ -3471,7 +3485,7 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     ino: raw::FuseIno,
     attr: *mut raw::FuseSetattrX,
     to_set: libc::c_int,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
@@ -3498,10 +3512,13 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     };
     debug!(
         ino,
-        to_set, flags, "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+        file_handle = ?setattr_x_file_handle(fi),
+        to_set,
+        flags,
+        "macFUSE setattr_x callback accepted Darwin metadata as overlay"
     );
     if !setattr_args_are_empty(&args) {
-        match state.adapter.setattr(None, ino, args) {
+        match state.adapter.setattr(setattr_x_file_handle(fi), ino, args) {
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
                 if let Some(request) = owned_request(req) {
@@ -3532,6 +3549,16 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
             reply_error(req, errno);
         }
     }
+}
+
+fn setattr_x_file_handle(fi: *mut raw::FuseFileInfo) -> Option<u64> {
+    if fi.is_null() {
+        return None;
+    }
+    // SAFETY: macFUSE owns `fi` for the duration of the callback. Unlike the
+    // portable setattr callback, Darwin's setattr_x supplies the open handle
+    // without adding FUSE_SET_ATTR_FH to `to_set`.
+    Some(unsafe { (*fi).fh })
 }
 
 fn setattr_x_args_from_callback(
@@ -4238,6 +4265,14 @@ mod tests {
         assert!(!setattr_mask_has_size(0));
         assert!(!setattr_mask_has_fh(size_mask));
         assert_eq!(setattr_mask_has_fh(size_mask | fh_mask), fh_mask != 0);
+    }
+
+    #[test]
+    fn setattr_x_uses_open_handle_for_size_change_without_fh_mask() {
+        let mut fi = raw::FuseFileInfo::for_test(libc::O_WRONLY, 67, false, false);
+
+        assert_eq!(setattr_x_file_handle(&mut fi), Some(67));
+        assert_eq!(setattr_x_file_handle(std::ptr::null_mut()), None);
     }
 
     #[test]
