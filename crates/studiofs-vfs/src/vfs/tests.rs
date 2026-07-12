@@ -83,6 +83,45 @@ fn rmdir_waits_for_inflight_child_unlink_before_reporting_not_empty() {
     });
 }
 
+#[test]
+fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-queued-parent-unlink");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let parent_delete_gate = vfs
+            .state
+            .file_session
+            .enter_op(parent.ino, FileSessionOperation::Delete)
+            .await;
+        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
+        let rmdir_vfs = vfs.clone();
+        let rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let unlink_vfs = vfs.clone();
+        let unlink =
+            tokio::task::spawn_blocking(move || unlink_vfs.unlink(parent.ino, b"child.txt"));
+        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        drop(parent_delete_gate);
+
+        unlink
+            .await
+            .expect("child unlink task should complete")
+            .expect("child unlink should succeed");
+        rmdir
+            .await
+            .expect("rmdir task should complete")
+            .expect("rmdir should wait for the queued parent unlink");
+    });
+}
+
 #[tokio::test]
 async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
     let shutdown = CancellationToken::new();

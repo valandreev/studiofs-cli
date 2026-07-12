@@ -22,7 +22,8 @@ type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 const DEFERRED_NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
-const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u8 = 8;
+const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u16 = 200;
+const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[cfg(not(target_os = "macos"))]
@@ -2034,6 +2035,15 @@ impl StudioVfs {
         }
 
         let meta = self.sync_meta();
+        // Serialize namespace mutations targeting one directory. macFUSE can
+        // dispatch the child unlink callbacks concurrently with rmdir; keeping
+        // the parent session visible lets rmdir wait for callbacks already
+        // queued behind the metadata transaction.
+        let parent_delete_session = self
+            .state
+            .file_session
+            .enter_op(parent, FileSessionOperation::Delete)
+            .await;
         self.wait_for_deferred_namespace_entry(parent, name).await?;
         let initial_target = self.resolve_unlink_target(&meta, parent, name)?;
         let delete_session = self
@@ -2069,6 +2079,8 @@ impl StudioVfs {
         .await;
         drop(delete_session);
         self.state.file_session.gc_if_idle(initial_target.ino);
+        drop(parent_delete_session);
+        self.state.file_session.gc_if_idle(parent);
         result
     }
 
@@ -2089,6 +2101,7 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
         let mut retry_attempts = 0;
+        let mut settle_attempts = 0;
         loop {
             match meta.rmdir(parent, name) {
                 Ok(()) => break,
@@ -2096,19 +2109,34 @@ impl StudioVfs {
                     let Some(removed_ino) = removed else {
                         return Err(VfsError::Meta(err));
                     };
-                    let (healed, has_inflight_delete) =
+                    let (healed, child_delete_inflight) =
                         self.heal_dangling_directory_children(removed_ino)?;
                     if healed > 0 {
                         debug!(ino = removed_ino, healed, "rmdir healed dangling children");
                         continue;
                     }
-                    if !has_inflight_delete || retry_attempts >= RMDIR_INFLIGHT_RETRY_ATTEMPTS {
-                        return Err(VfsError::Meta(err));
+                    let has_inflight_delete = child_delete_inflight
+                        || self.state.file_session.has_delete_inflight(removed_ino);
+                    if has_inflight_delete {
+                        if retry_attempts >= RMDIR_INFLIGHT_RETRY_ATTEMPTS {
+                            return Err(VfsError::Meta(err));
+                        }
+                        retry_attempts += 1;
+                    } else {
+                        // A child delete can finish between the failed
+                        // rmdir transaction and this check. Give the local
+                        // metadata view a short settling window before
+                        // returning ENOTEMPTY; a first, ordinary rmdir with
+                        // no observed child mutation remains immediate.
+                        if retry_attempts == 0 || settle_attempts >= RMDIR_SETTLE_RETRY_ATTEMPTS {
+                            return Err(VfsError::Meta(err));
+                        }
+                        settle_attempts += 1;
                     }
-                    retry_attempts += 1;
                     debug!(
                         ino = removed_ino,
                         retry_attempt = retry_attempts,
+                        settle_attempt = settle_attempts,
                         "rmdir waiting for in-flight child delete"
                     );
                     tokio::time::sleep(RMDIR_INFLIGHT_RETRY_DELAY).await;

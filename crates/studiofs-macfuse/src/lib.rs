@@ -1877,6 +1877,74 @@ mod tests {
     }
 
     #[test]
+    fn adapter_rmdir_retries_when_child_unlink_arrives_after_first_not_empty() {
+        use std::thread;
+        use std::time::Duration;
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rmdir-child-unlink-arrives-late",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let parent = vfs
+            .mkdir(root, b"late-delete-parent", 501, 20, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 501, 20, 0o644)
+            .expect("create child file");
+        let adapter = Arc::new(super::adapter::StudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        ));
+
+        let rmdir_adapter = adapter.clone();
+        let rmdir = thread::spawn(move || rmdir_adapter.rmdir(root, b"late-delete-parent"));
+        thread::sleep(Duration::from_millis(10));
+        adapter
+            .unlink(parent.ino, b"child.txt")
+            .expect("late child unlink should succeed");
+
+        rmdir
+            .join()
+            .expect("rmdir callback thread should finish")
+            .expect("rmdir should retry after the late child unlink arrives");
+    }
+
+    #[test]
+    fn adapter_rmdir_waits_for_child_unlink_beyond_short_retry_window() {
+        use std::thread;
+        use std::time::Duration;
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rmdir-child-unlink-arrives-after-short-retry-window",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let parent = vfs
+            .mkdir(root, b"delayed-delete-parent", 501, 20, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 501, 20, 0o644)
+            .expect("create child file");
+        let adapter = Arc::new(super::adapter::StudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        ));
+
+        let rmdir_adapter = adapter.clone();
+        let rmdir = thread::spawn(move || rmdir_adapter.rmdir(root, b"delayed-delete-parent"));
+        thread::sleep(Duration::from_millis(300));
+        adapter
+            .unlink(parent.ino, b"child.txt")
+            .expect("delayed child unlink should succeed");
+
+        rmdir
+            .join()
+            .expect("rmdir callback thread should finish")
+            .expect("rmdir should wait beyond the short retry window");
+    }
+
+    #[test]
     fn read_only_adapter_still_rejects_write_or_truncate_open_flags() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-read-only-adapter-open-flags",

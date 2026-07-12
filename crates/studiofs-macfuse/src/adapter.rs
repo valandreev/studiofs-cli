@@ -55,6 +55,8 @@ const MACFUSE_READ_WINDOW_MAX_BYTES: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACI
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
+const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 32;
+const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
 const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
@@ -1603,8 +1605,29 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let existing = self.vfs.lookup(parent, name).ok();
-        self.vfs
-            .rmdir(parent, name)
+        let mut retry_attempts = 0;
+        let result = loop {
+            match self.vfs.rmdir(parent, name) {
+                Ok(()) => break Ok(()),
+                Err(error)
+                    if matches!(
+                        &error,
+                        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::DirNotEmpty(_))
+                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS =>
+                {
+                    retry_attempts += 1;
+                    debug!(
+                        parent,
+                        name = %String::from_utf8_lossy(name),
+                        retry_attempt = retry_attempts,
+                        "macFUSE rmdir waiting for concurrent child deletion"
+                    );
+                    std::thread::sleep(MACFUSE_RMDIR_RETRY_DELAY);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        result
             .inspect(|_| {
                 if let Some(attr) = &existing {
                     self.clear_file_flags(attr.ino);
@@ -1613,6 +1636,38 @@ impl StudioVfsAdapter {
                 self.invalidate_readdir_cache(parent);
             })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Run the potentially waiting rmdir path away from the single macFUSE
+    /// session-loop thread. macFUSE delivers callbacks serially through that
+    /// loop; sleeping there would prevent the queued child unlink callbacks
+    /// from running and make the directory stay non-empty indefinitely.
+    pub(crate) fn queue_rmdir_reply(
+        self: &Arc<Self>,
+        parent: u64,
+        name: Vec<u8>,
+        request: Request,
+    ) {
+        let adapter = Arc::clone(self);
+        self.runtime_handle.spawn_blocking(move || {
+            let result = adapter.rmdir(parent, &name);
+            match result {
+                Ok(()) => {
+                    let _ = Reply::new(request).error(0);
+                }
+                Err(errno) => {
+                    if callback_error_log_level("rmdir", errno).is_some() {
+                        warn!(
+                            parent,
+                            name = %String::from_utf8_lossy(&name),
+                            errno,
+                            "macFUSE rmdir callback returned error"
+                        );
+                    }
+                    let _ = Reply::new(request).error(errno);
+                }
+            }
+        });
     }
 
     /// Rename a namespace entry.
@@ -2535,13 +2590,17 @@ enum ReaddirCacheEntry {
 }
 
 pub(crate) struct CallbackState {
-    adapter: StudioVfsAdapter,
+    adapter: Arc<StudioVfsAdapter>,
 }
 
 impl CallbackState {
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
         Self {
-            adapter: StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
+            adapter: Arc::new(StudioVfsAdapter::new_with_read_only(
+                vfs,
+                runtime_handle,
+                read_only,
+            )),
         }
     }
 
@@ -3384,18 +3443,12 @@ pub extern "C" fn studiofs_macfuse_rmdir(
     }
     // SAFETY: macFUSE passes a NUL-terminated entry name for rmdir callbacks.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.rmdir(parent, name) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                errno,
-                "macFUSE rmdir callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    state
+        .adapter
+        .queue_rmdir_reply(parent, name.to_vec(), request);
 }
 
 /// macFUSE rename callback for the StudioVfs bridge.
