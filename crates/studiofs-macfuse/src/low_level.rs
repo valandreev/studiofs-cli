@@ -265,6 +265,10 @@ unsafe extern "C" {
     #[cfg(test)]
     fn studiofs_macfuse_low_level_ops_has_init_callback(ops: *const raw::FuseLowLevelOps) -> c_int;
     #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_forget_callback(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_macfuse_low_level_ops_has_rmdir_callback(ops: *const raw::FuseLowLevelOps)
     -> c_int;
     #[cfg(test)]
@@ -389,6 +393,12 @@ impl LowLevelOperations {
     pub(crate) fn has_init_callback(self) -> bool {
         // SAFETY: The C shim only inspects callback pointers in a static table.
         unsafe { studiofs_macfuse_low_level_ops_has_init_callback(self.raw) != 0 }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_forget_callback(self) -> bool {
+        // SAFETY: The C shim only inspects a callback pointer in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_forget_callback(self.raw) != 0 }
     }
 
     #[cfg(test)]

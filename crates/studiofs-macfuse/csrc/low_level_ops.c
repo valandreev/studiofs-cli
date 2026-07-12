@@ -5,6 +5,7 @@
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 
 extern void studiofs_macfuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_macfuse_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup);
 extern void studiofs_macfuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
 extern void studiofs_macfuse_symlink(fuse_req_t req,
@@ -82,6 +83,7 @@ extern void studiofs_macfuse_init(void *userdata, struct fuse_conn_info *conn);
 static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
+    .forget = studiofs_macfuse_forget,
     .getattr = studiofs_macfuse_getattr,
     .open = studiofs_macfuse_open,
     .read = studiofs_macfuse_read,
@@ -96,6 +98,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
+    .forget = studiofs_macfuse_forget,
     .getattr = studiofs_macfuse_getattr,
     .mkdir = studiofs_macfuse_mkdir,
     .symlink = studiofs_macfuse_symlink,
@@ -149,6 +152,10 @@ int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fu
 
 int studiofs_macfuse_low_level_ops_has_init_callback(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->init != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_forget_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->forget != NULL;
 }
 
 int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel_ops *ops) {

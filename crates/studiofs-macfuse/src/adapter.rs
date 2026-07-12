@@ -4,7 +4,7 @@ use std::fmt;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry as DashMapEntry};
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
@@ -20,7 +20,7 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::engine::XATTR_CREATE_FLAG;
-use studiofs_meta::schema::ResolvedSliceSource;
+use studiofs_meta::schema::{ROOT_INO, ResolvedSliceSource};
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::vfs::ReleaseFhOutcome;
 use studiofs_vfs::{
@@ -91,11 +91,74 @@ pub(crate) struct StudioVfsAdapter {
 #[derive(Debug)]
 struct AdapterSharedState {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    kernel_inode_liveness: Arc<KernelInodeLiveness>,
     read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
+}
+
+#[derive(Debug)]
+struct KernelInodeLiveness {
+    observed: DashMap<u64, u64>,
+}
+
+impl Default for KernelInodeLiveness {
+    fn default() -> Self {
+        let observed = DashMap::new();
+        observed.insert(ROOT_INO, u64::MAX);
+        Self { observed }
+    }
+}
+
+impl KernelInodeLiveness {
+    fn observe(&self, ino: u64) {
+        match self.observed.entry(ino) {
+            DashMapEntry::Occupied(mut entry) => {
+                *entry.get_mut() = entry.get().saturating_add(1);
+            }
+            DashMapEntry::Vacant(entry) => {
+                entry.insert(1);
+            }
+        }
+    }
+
+    fn ensure_observed(&self, ino: u64) {
+        self.observed.entry(ino).or_insert(1);
+    }
+
+    #[cfg(test)]
+    fn contains(&self, ino: u64) -> bool {
+        self.observed.contains_key(&ino)
+    }
+
+    fn close(&self, ino: u64) {
+        if ino != ROOT_INO {
+            self.observed.remove(&ino);
+        }
+    }
+
+    fn forget(&self, ino: u64, nlookup: u64) {
+        if ino == ROOT_INO || nlookup == 0 {
+            return;
+        }
+        let DashMapEntry::Occupied(mut entry) = self.observed.entry(ino) else {
+            return;
+        };
+        if *entry.get() <= nlookup {
+            entry.remove();
+        } else {
+            *entry.get_mut() -= nlookup;
+        }
+    }
+
+    fn notify_if_observed(&self, ino: u64, notify: impl FnOnce()) {
+        let Some(_liveness_guard) = self.observed.get(&ino) else {
+            return;
+        };
+        notify();
+    }
 }
 
 #[derive(Debug)]
@@ -441,6 +504,23 @@ struct ReadWindowKernelInvalidator {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
+}
+
+struct LiveKernelInvalidator {
+    kernel_inode_liveness: Arc<KernelInodeLiveness>,
+    inner: Arc<dyn KernelInvalidator>,
+}
+
+impl KernelInvalidator for LiveKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.kernel_inode_liveness
+            .notify_if_observed(ino, || self.inner.inval_inode(ino));
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.kernel_inode_liveness
+            .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
+    }
 }
 
 impl KernelInvalidator for ReadWindowKernelInvalidator {
@@ -1017,6 +1097,7 @@ impl StudioVfsAdapter {
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
                 ))),
+                kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
                 read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
@@ -1101,6 +1182,10 @@ impl StudioVfsAdapter {
         &self,
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
+        let inner: Arc<dyn KernelInvalidator> = Arc::new(LiveKernelInvalidator {
+            kernel_inode_liveness: Arc::clone(&self.shared.kernel_inode_liveness),
+            inner,
+        });
         self.shared
             .kernel_invalidations
             .set_inner(Arc::clone(&inner));
@@ -1121,7 +1206,12 @@ impl StudioVfsAdapter {
     pub(crate) fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
         self.vfs
             .lookup(parent, name)
+            .inspect(|attr| self.shared.kernel_inode_liveness.observe(attr.ino))
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
+        self.shared.kernel_inode_liveness.forget(ino, nlookup);
     }
 
     /// Get inode attributes.
@@ -1142,7 +1232,10 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .mkdir(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1158,7 +1251,10 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .symlink(parent, name, target, self.mount_uid, self.mount_gid)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1187,6 +1283,7 @@ impl StudioVfsAdapter {
             self.vfs
                 .open_created_file_with_known_attr(&attr, open_flags, trunc),
         )?;
+        self.shared.kernel_inode_liveness.observe(attr.ino);
         Ok((attr, open))
     }
 
@@ -1202,6 +1299,7 @@ impl StudioVfsAdapter {
         self.vfs
             .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
             .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
                 self.remember_named_file_flags(attr.ino, name);
                 self.invalidate_readdir_cache(parent);
             })
@@ -1228,6 +1326,7 @@ impl StudioVfsAdapter {
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
+            .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
 
     fn open_with_result(
@@ -1421,6 +1520,7 @@ impl StudioVfsAdapter {
                 {
                     self.clear_open_cache_snapshot(attr.ino, "unlink");
                     self.clear_file_flags(attr.ino);
+                    self.shared.kernel_inode_liveness.close(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
@@ -1439,6 +1539,7 @@ impl StudioVfsAdapter {
             .inspect(|_| {
                 if let Some(attr) = &existing {
                     self.clear_file_flags(attr.ino);
+                    self.shared.kernel_inode_liveness.close(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
@@ -2891,6 +2992,19 @@ pub extern "C" fn studiofs_macfuse_lookup(
     }
 }
 
+/// macFUSE forget callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_forget(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    nlookup: c_ulong,
+) {
+    let Some(state) = callback_state(req) else {
+        return;
+    };
+    state.adapter.forget(ino, nlookup);
+}
+
 /// macFUSE getattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_getattr(
@@ -4221,6 +4335,64 @@ mod tests {
                 .is_some_and(|capacity| capacity >= 5),
             "rejected stale cache buffer should be returned to the reusable pool"
         );
+    }
+
+    #[test]
+    fn kernel_inode_liveness_closes_only_after_all_lookup_references_are_forgotten() {
+        let liveness = KernelInodeLiveness::default();
+        let ino = 42;
+        liveness.observe(ino);
+        liveness.observe(ino);
+
+        liveness.forget(ino, 1);
+        assert!(
+            liveness.contains(ino),
+            "one remaining lookup reference must keep notification live"
+        );
+
+        liveness.forget(ino, 1);
+        assert!(
+            !liveness.contains(ino),
+            "the final forget must close the notification gate"
+        );
+    }
+
+    #[test]
+    fn kernel_inode_liveness_close_waits_for_same_inode_notification_boundary() {
+        let liveness = Arc::new(KernelInodeLiveness::default());
+        let ino = 42;
+        liveness.observe(ino);
+        let entered_notification = Arc::new(std::sync::Barrier::new(2));
+        let release_notification = Arc::new(std::sync::Barrier::new(2));
+        let notifier_liveness = Arc::clone(&liveness);
+        let notifier_entered = Arc::clone(&entered_notification);
+        let notifier_release = Arc::clone(&release_notification);
+        let notifier = std::thread::spawn(move || {
+            notifier_liveness.notify_if_observed(ino, || {
+                notifier_entered.wait();
+                notifier_release.wait();
+            });
+        });
+        entered_notification.wait();
+
+        let closer_liveness = Arc::clone(&liveness);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closer_liveness.close(ino);
+            closed_tx.send(()).expect("signal closed gate");
+        });
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "final unlink must serialize with an in-flight notification for the same inode"
+        );
+
+        release_notification.wait();
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close should finish after the in-flight notification exits");
+        notifier.join().expect("notification thread exits");
+        closer.join().expect("close thread exits");
+        assert!(!liveness.contains(ino));
     }
 
     #[test]

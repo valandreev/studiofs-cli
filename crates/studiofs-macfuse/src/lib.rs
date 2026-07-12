@@ -422,6 +422,12 @@ mod tests {
     }
 
     #[test]
+    fn studio_vfs_low_level_ops_install_forget_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_forget_callback());
+        assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_forget_callback());
+    }
+
+    #[test]
     fn writable_studio_vfs_low_level_ops_install_rmdir_callback() {
         assert!(super::low_level::LowLevelOperations::studio_vfs().has_rmdir_callback());
         assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_rmdir_callback());
@@ -1121,6 +1127,50 @@ mod tests {
         );
         assert!(inner.data.load(Ordering::Acquire));
         assert!(inner.attrs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn kernel_invalidator_skips_inode_not_observed_by_macfuse_session() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+            attr_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+
+            fn inval_inode_attrs(&self, _ino: u64) {
+                self.attr_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-unobserved-inode-invalidation",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"never-observed.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file outside the macFUSE adapter");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        invalidator.inval_inode(attr.ino);
+        invalidator.inval_inode_attrs(attr.ino);
+
+        assert_eq!(inner.data_calls.load(Ordering::Acquire), 0);
+        assert_eq!(inner.attr_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2259,6 +2309,17 @@ mod tests {
 
     #[test]
     fn adapter_unlink_clears_kernel_cache_observation_for_removed_inode() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-cache-unlink")
                 .expect("create VFS fixture");
@@ -2269,6 +2330,8 @@ mod tests {
             .expect("create file");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
             .open(attr.ino, libc::O_RDONLY)
@@ -2290,6 +2353,13 @@ mod tests {
             .expect("unlink through macFUSE adapter");
 
         assert!(!adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let calls_before_late_completion = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_late_completion,
+            "late background completion must not notify a vnode closed by final unlink"
+        );
     }
 
     #[test]
@@ -2319,7 +2389,64 @@ mod tests {
     }
 
     #[test]
+    fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-late-write-completion-after-unlink",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+        let (attr, writer) = adapter
+            .create(root, b"late-completion.bin", 0o644, libc::O_WRONLY)
+            .expect("create file through macFUSE adapter");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b"pending upload")
+            .expect("accept local write");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer while background work may remain");
+        adapter
+            .unlink(root, b"late-completion.bin")
+            .expect("unlink final hardlink");
+
+        let calls_before_late_completion = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_late_completion,
+            "late upload or GC completion must not notify the removed vnode"
+        );
+    }
+
+    #[test]
     fn adapter_unlink_keeps_kernel_cache_observation_for_remaining_hardlink() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-hardlink",
         )
@@ -2333,6 +2460,8 @@ mod tests {
             .expect("create hardlink");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
             .open(attr.ino, libc::O_RDONLY)
@@ -2359,6 +2488,13 @@ mod tests {
                 .expect("remaining hardlink should still resolve")
                 .ino,
             attr.ino
+        );
+        let calls_before_invalidation = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_invalidation + 1,
+            "unlinking one hardlink must keep kernel notification live for the remaining name"
         );
     }
 
