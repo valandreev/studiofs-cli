@@ -6654,14 +6654,14 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
         )
         .await
         .expect("soft pressure below the hard window must not delay a local-first write");
-        assert_eq!(
+        assert!(
             vfs.state
                 .write_admission_governor
                 .lock()
                 .stats()
-                .last_delay_ms,
-            0,
-            "only the hard local-memory window may pace a foreground write"
+                .last_delay_ms
+                > 0,
+            "soft pacing estimate should remain visible without pacing a foreground write"
         );
 
         vfs.release_fh(fh).await.unwrap();

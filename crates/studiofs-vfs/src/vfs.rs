@@ -6549,7 +6549,6 @@ impl StudioVfs {
                 decision.drain_bytes_per_sec,
                 decision.runway_ms,
             );
-            governor.last_delay_ms = 0;
         }
         let _ = sustained_delay_ms;
     }

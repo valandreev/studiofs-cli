@@ -319,6 +319,8 @@ struct MacFuseOpenCacheSnapshot {
 
 impl PartialEq for MacFuseOpenCacheSnapshot {
     fn eq(&self, other: &Self) -> bool {
+        // `kind` is intentionally omitted: publication-only transitions must
+        // retain the kernel page cache when file contents are unchanged.
         self.content_epoch == other.content_epoch
             && self.size == other.size
             && self.graph == other.graph
