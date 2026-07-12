@@ -71,6 +71,8 @@ pub(crate) struct MacFuseOpenCachePolicy {
     pub(crate) direct_io: bool,
     /// Whether macFUSE should keep existing cached pages for this handle.
     pub(crate) keep_cache: bool,
+    /// Whether this handle can mutate the inode and must participate in writer accounting.
+    pub(crate) write_capable: bool,
 }
 
 /// Operation adapter shared by macFUSE callbacks and fast tests.
@@ -213,6 +215,10 @@ impl KernelInodeLiveness {
         let Some(state) = self.current(ino) else {
             return;
         };
+        // RATIONALE: keep the per-inode state lock across notify so close/forget
+        // cannot remove this inode generation until the invalidation boundary
+        // has completed. `current` already dropped the DashMap shard guard, so
+        // unrelated inodes remain independent while this external call runs.
         let count = state.lock();
         if self.is_current(ino, &state) && *count > 0 {
             notify();
@@ -1399,14 +1405,16 @@ impl StudioVfsAdapter {
     ) -> Result<OpenReply, i32> {
         open_result
             .map(|fh| {
-                let keep_cache = if flag_policy.keep_cache {
-                    self.record_foreground_read_handle(fh);
-                    self.keep_cache_for_current_generation(ino)
-                } else {
+                let keep_cache = if flag_policy.write_capable {
                     self.record_write_capable_open(ino, fh);
                     self.vfs.record_macfuse_open_cache_decision(
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
+                    false
+                } else if flag_policy.keep_cache {
+                    self.record_foreground_read_handle(fh);
+                    self.keep_cache_for_current_generation(ino)
+                } else {
                     false
                 };
                 OpenReply::new(fh)
@@ -2655,6 +2663,7 @@ pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenC
     MacFuseOpenCachePolicy {
         direct_io: false,
         keep_cache: !write_capable,
+        write_capable,
     }
 }
 
@@ -2673,13 +2682,45 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        ReleasedWriteCapableHandle, StudioVfsAdapter,
+        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
+        MacFuseOpenCacheSnapshotKind, ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
     use std::sync::Arc;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
-    use studiofs_vfs::vfs::ReleaseFhOutcome;
+    use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
+
+    #[test]
+    fn open_without_cache_must_not_imply_write_capable_handle() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-independent-policy")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"independent-policy.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open read-only file");
+        let policy = MacFuseOpenCachePolicy {
+            direct_io: false,
+            keep_cache: false,
+            write_capable: false,
+        };
+
+        let opened = adapter
+            .open_with_result(attr.ino, policy, Ok(fh))
+            .expect("open with explicit cache policy");
+
+        assert!(!opened.keep_cache());
+        assert!(
+            !adapter.has_active_write_capable_handles(attr.ino),
+            "a cache-disabled read-only handle must not enter the writer accounting"
+        );
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read-only handle");
+    }
 
     #[test]
     fn open_cache_snapshot_identity_ignores_publication_only_transition() {
