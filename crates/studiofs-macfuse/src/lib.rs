@@ -1047,6 +1047,64 @@ mod tests {
     }
 
     #[test]
+    fn queued_max_size_callbacks_reuse_ahead_window_without_second_vfs_read() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-window-max-callback",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"max-callback-window.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let callback_size = super::adapter::max_reusable_read_buffer_capacity_for_test();
+        let payload = vec![0x5A; callback_size * 2];
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, &payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, callback_size as u32)
+            .expect("queue first max-size callback");
+        assert_eq!(
+            first.wait().expect("first callback should complete"),
+            payload[..callback_size]
+        );
+
+        let second = adapter
+            .queue_read_for_test(
+                attr.ino,
+                reader.file_handle(),
+                callback_size as i64,
+                callback_size as u32,
+            )
+            .expect("queue adjacent max-size callback");
+        assert_eq!(
+            second.wait().expect("second callback should complete"),
+            payload[callback_size..]
+        );
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
+        assert_eq!(
+            metrics.vfs_read_path.calls, 1,
+            "the second max-size callback must be served from the macFUSE ahead window"
+        );
+    }
+
+    #[test]
     fn kernel_data_invalidation_clears_adapter_read_window() {
         #[derive(Default)]
         struct RecordingInvalidator {

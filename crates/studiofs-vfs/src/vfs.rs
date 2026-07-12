@@ -3121,20 +3121,6 @@ fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
 }
 
-fn write_admission_soft_pacing_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    })
-}
-
 fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes
         .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
@@ -6545,51 +6531,27 @@ impl StudioVfs {
             self.state.write_admission_governor.lock().reset_stats();
             return;
         }
-        if write_admission_soft_pacing_disabled() {
-            return;
-        }
-
-        let decision = {
+        // Keep the governor's pressure/rate snapshot for runtime diagnostics,
+        // but never turn a soft estimate into foreground callback latency.
+        // Local-first writes may wait only for the explicit hard writer-stack
+        // memory bound above; upload and drain progress remain background work.
+        {
             let mut governor = self.state.write_admission_governor.lock();
-            governor.plan(WriteAdmissionSample {
+            let decision = governor.plan(WriteAdmissionSample {
                 now_ms: now_unix_millis(),
                 pressure_bytes,
                 budget_bytes: buffer_budget_bytes,
                 next_bytes,
-            })
-        };
-        let delay_ms = decision.delay_ms.max(sustained_delay_ms);
-        if delay_ms == 0 {
-            return;
-        }
-        // #region debug log
-        if self.write_debug_enabled() {
-            self.debug_write_probe(
-                "H2",
-                concat!(file!(), ":", line!()),
-                "write admission governor pacing",
-                serde_json::json!({
-                    "delay_ms": delay_ms,
-                    "governor_delay_ms": decision.delay_ms,
-                    "sustained_delay_ms": sustained_delay_ms,
-                    "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
-                    "drain_bytes_per_sec": decision.drain_bytes_per_sec,
-                    "runway_ms": decision.runway_ms,
-                    "pressure_bytes": pressure_bytes,
-                    "pending_upload_bytes": pressure.pending_upload_bytes,
-                    "budget_bytes": buffer_budget_bytes,
-                    "next_bytes": next_bytes,
-                }),
+            });
+            let _ = (
+                decision.delay_ms,
+                decision.ingress_bytes_per_sec,
+                decision.drain_bytes_per_sec,
+                decision.runway_ms,
             );
+            governor.last_delay_ms = 0;
         }
-        // #endregion debug log
-
-        if self.shutdown_requested() {
-            return;
-        }
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        self.record_write_admission_wait(started.elapsed());
+        let _ = sustained_delay_ms;
     }
 
     fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {

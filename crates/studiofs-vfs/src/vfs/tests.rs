@@ -6613,6 +6613,58 @@ fn write_admission_first_sample_below_budget_without_pacing() {
 }
 
 #[test]
+fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-no-soft-pacing");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-no-soft-pacing.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        let pressure_bytes = buffer_budget_bytes * 7 / 10;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; pressure_bytes]),
+            )
+            .unwrap();
+
+        {
+            let mut governor = vfs.state.write_admission_governor.lock();
+            governor.last_sample_ms = now_unix_millis()
+                .saturating_sub(WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS);
+            governor.last_pressure_bytes = buffer_budget_bytes / 5;
+            governor.accepted_since_sample = (buffer_budget_bytes * 3 / 5) as u64;
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10, 0),
+        )
+        .await
+        .expect("soft pressure below the hard window must not delay a local-first write");
+        assert_eq!(
+            vfs.state.write_admission_governor.lock().stats().last_delay_ms,
+            0,
+            "only the hard local-memory window may pace a foreground write"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_admission_admits_oversized_write_when_pressure_is_empty() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-oversized-write");

@@ -47,7 +47,11 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
-const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
+// Keep the next eight maximum-size macFUSE callbacks ready for one sequential
+// handle. The callback and admission limits remain 8 MiB; this is only the
+// per-handle read-ahead window that prevents UBC from synchronously refilling
+// after every callback-sized cache run.
+const MACFUSE_READ_WINDOW_MAX_BYTES: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 8;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
@@ -1647,7 +1651,7 @@ impl StudioVfsAdapter {
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = (size as usize).min(request.max_read_len as usize);
-        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
+        let read_len = readahead_window_len(size_usize);
 
         let mut out = state
             .shared
@@ -1708,6 +1712,8 @@ impl StudioVfsAdapter {
                         generation,
                     );
                     out.truncate(reply_len);
+                    out.buffer
+                        .shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                     return Ok(out);
                 } else {
                     state
@@ -1716,6 +1722,8 @@ impl StudioVfsAdapter {
                         .invalidate_handle(request.file_handle);
                 }
                 out.truncate(reply_len);
+                out.buffer
+                    .shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                 Ok(out)
             }
             Err(error) => {
