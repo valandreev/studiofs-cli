@@ -6642,8 +6642,8 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
 
         {
             let mut governor = vfs.state.write_admission_governor.lock();
-            governor.last_sample_ms = now_unix_millis()
-                .saturating_sub(WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS);
+            governor.last_sample_ms =
+                now_unix_millis().saturating_sub(WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS);
             governor.last_pressure_bytes = buffer_budget_bytes / 5;
             governor.accepted_since_sample = (buffer_budget_bytes * 3 / 5) as u64;
         }
@@ -6655,7 +6655,11 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
         .await
         .expect("soft pressure below the hard window must not delay a local-first write");
         assert_eq!(
-            vfs.state.write_admission_governor.lock().stats().last_delay_ms,
+            vfs.state
+                .write_admission_governor
+                .lock()
+                .stats()
+                .last_delay_ms,
             0,
             "only the hard local-memory window may pace a foreground write"
         );

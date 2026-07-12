@@ -1712,8 +1712,7 @@ impl StudioVfsAdapter {
                         generation,
                     );
                     out.truncate(reply_len);
-                    out.buffer
-                        .shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
+                    out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                     return Ok(out);
                 } else {
                     state
@@ -1722,8 +1721,7 @@ impl StudioVfsAdapter {
                         .invalidate_handle(request.file_handle);
                 }
                 out.truncate(reply_len);
-                out.buffer
-                    .shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
+                out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                 Ok(out)
             }
             Err(error) => {
