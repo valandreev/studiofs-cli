@@ -422,6 +422,12 @@ mod tests {
     }
 
     #[test]
+    fn studio_vfs_low_level_ops_install_forget_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_forget_callback());
+        assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_forget_callback());
+    }
+
+    #[test]
     fn writable_studio_vfs_low_level_ops_install_rmdir_callback() {
         assert!(super::low_level::LowLevelOperations::studio_vfs().has_rmdir_callback());
         assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_rmdir_callback());
@@ -814,56 +820,6 @@ mod tests {
     }
 
     #[test]
-    fn releasing_handle_cancels_reads_waiting_for_admission() {
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-release-cancels-queued-read",
-        )
-        .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"release-cancel.txt",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, b"release cancels queued read"))
-            .expect("seed payload");
-        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-            7,
-        );
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
-        vfs.reset_diagnostics_observability();
-        let held_capacity = adapter.hold_read_capacity_for_test(7);
-        let queued = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
-            .expect("queue read behind admission capacity");
-
-        adapter
-            .release(attr.ino, reader.file_handle())
-            .expect("release reader");
-        let errno = queued
-            .wait_timeout(std::time::Duration::from_secs(1))
-            .expect("released handle must cancel its queued reads")
-            .expect_err("released read must not reach VFS");
-        drop(held_capacity);
-
-        assert_eq!(errno, libc::EINTR);
-        let metrics = vfs.write_path_observability_snapshot();
-        assert_eq!(metrics.vfs_read_path.calls, 0);
-        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
-        assert_eq!(metrics.fuse_async_read.canceled_reads, 1);
-    }
-
-    #[test]
     fn read_only_adapter_rejects_negative_read_offset_before_queueing() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-async-read-negative-offset",
@@ -1038,82 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_adapter_read_executes_exact_kernel_requested_range() {
-        const REQUEST_BYTES: usize = 4 * 1024;
-        const PAYLOAD_BYTES: usize = 256 * 1024;
-
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-buffered-read-exact-range",
-        )
-        .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"buffered-exact-range.bin",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        let payload = vec![0xA5; PAYLOAD_BYTES];
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, &payload))
-            .expect("seed payload");
-        vfs.reset_diagnostics_observability();
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open buffered reader through macFUSE adapter");
-        assert!(
-            !reader.direct_io(),
-            "ordinary macFUSE data handles must use the kernel data cache"
-        );
-
-        let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, REQUEST_BYTES as u32)
-            .expect("queue buffered read")
-            .wait()
-            .expect("buffered read should complete");
-        assert_eq!(first, payload[..REQUEST_BYTES]);
-
-        let second = adapter
-            .queue_read_for_test(
-                attr.ino,
-                reader.file_handle(),
-                REQUEST_BYTES as i64,
-                REQUEST_BYTES as u32,
-            )
-            .expect("queue adjacent buffered read")
-            .wait()
-            .expect("adjacent buffered read should complete");
-        assert_eq!(second, payload[REQUEST_BYTES..REQUEST_BYTES * 2]);
-
-        let metrics = vfs.write_path_observability_snapshot();
-        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
-        assert_eq!(
-            metrics.fuse_callbacks.read.bytes,
-            (REQUEST_BYTES * 2) as u64
-        );
-        assert_eq!(
-            metrics.vfs_read_path.calls, 2,
-            "buffered adjacent callbacks must not reuse a daemon read window"
-        );
-        assert_eq!(
-            metrics.vfs_read_path.requested_bytes,
-            (REQUEST_BYTES * 2) as u64,
-            "buffered reads must leave speculative readahead to the kernel/UBC"
-        );
-        assert_eq!(
-            metrics.fuse_async_read.peak_pending_bytes, REQUEST_BYTES,
-            "buffered read admission must account only the kernel-requested range"
-        );
-    }
-
-    #[test]
-    fn non_buffered_adjacent_reads_reuse_per_handle_window_without_second_vfs_read() {
+    fn queued_adjacent_reads_reuse_per_handle_window_without_second_vfs_read() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-hit")
                 .expect("create VFS fixture");
@@ -1133,10 +1014,8 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
@@ -1164,6 +1043,64 @@ mod tests {
         assert_eq!(
             after_second.vfs_read_path.calls, 1,
             "adjacent read should be served from the macFUSE per-handle window"
+        );
+    }
+
+    #[test]
+    fn queued_max_size_callbacks_reuse_ahead_window_without_second_vfs_read() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-window-max-callback",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"max-callback-window.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let callback_size = super::adapter::max_reusable_read_buffer_capacity_for_test();
+        let payload = vec![0x5A; callback_size * 2];
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, &payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, callback_size as u32)
+            .expect("queue first max-size callback");
+        assert_eq!(
+            first.wait().expect("first callback should complete"),
+            payload[..callback_size]
+        );
+
+        let second = adapter
+            .queue_read_for_test(
+                attr.ino,
+                reader.file_handle(),
+                callback_size as i64,
+                callback_size as u32,
+            )
+            .expect("queue adjacent max-size callback");
+        assert_eq!(
+            second.wait().expect("second callback should complete"),
+            payload[callback_size..]
+        );
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
+        assert_eq!(
+            metrics.vfs_read_path.calls, 1,
+            "the second max-size callback must be served from the macFUSE ahead window"
         );
     }
 
@@ -1204,10 +1141,8 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, b"0123456789abcdef"))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
@@ -1250,6 +1185,50 @@ mod tests {
         );
         assert!(inner.data.load(Ordering::Acquire));
         assert!(inner.attrs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn kernel_invalidator_skips_inode_not_observed_by_macfuse_session() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+            attr_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+
+            fn inval_inode_attrs(&self, _ino: u64) {
+                self.attr_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-unobserved-inode-invalidation",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"never-observed.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file outside the macFUSE adapter");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        invalidator.inval_inode(attr.ino);
+        invalidator.inval_inode_attrs(attr.ino);
+
+        assert_eq!(inner.data_calls.load(Ordering::Acquire), 0);
+        assert_eq!(inner.attr_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1332,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn non_buffered_non_adjacent_read_falls_back_to_vfs_instead_of_reusing_window() {
+    fn queued_non_adjacent_read_falls_back_to_vfs_instead_of_reusing_window() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-random")
                 .expect("create VFS fixture");
@@ -1352,10 +1331,8 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
@@ -1385,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn non_buffered_adjacent_eof_read_returns_partial_window_bytes_without_vfs_fallback() {
+    fn queued_adjacent_eof_read_returns_partial_window_bytes_without_vfs_fallback() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-eof")
                 .expect("create VFS fixture");
@@ -1405,10 +1382,8 @@ mod tests {
             .block_on(vfs.write(attr.ino, 0, payload))
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
-        let adapter = super::adapter::StudioVfsAdapter::new_with_daemon_read_window_for_test(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
@@ -1644,6 +1619,7 @@ mod tests {
             .expect("create file");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        vfs.reset_diagnostics_observability();
 
         let writer = adapter
             .open(attr.ino, libc::O_WRONLY)
@@ -1660,6 +1636,10 @@ mod tests {
 
         assert_eq!(accepted, 18);
         assert_eq!(&bytes[..], b"hello from macFUSE");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.write.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.write.bytes, 18);
+        assert_eq!(metrics.fuse_callbacks.write.errors, 0);
     }
 
     #[test]
@@ -1897,6 +1877,74 @@ mod tests {
     }
 
     #[test]
+    fn adapter_rmdir_retries_when_child_unlink_arrives_after_first_not_empty() {
+        use std::thread;
+        use std::time::Duration;
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rmdir-child-unlink-arrives-late",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let parent = vfs
+            .mkdir(root, b"late-delete-parent", 501, 20, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 501, 20, 0o644)
+            .expect("create child file");
+        let adapter = Arc::new(super::adapter::StudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        ));
+
+        let rmdir_adapter = adapter.clone();
+        let rmdir = thread::spawn(move || rmdir_adapter.rmdir(root, b"late-delete-parent"));
+        thread::sleep(Duration::from_millis(10));
+        adapter
+            .unlink(parent.ino, b"child.txt")
+            .expect("late child unlink should succeed");
+
+        rmdir
+            .join()
+            .expect("rmdir callback thread should finish")
+            .expect("rmdir should retry after the late child unlink arrives");
+    }
+
+    #[test]
+    fn adapter_rmdir_waits_for_child_unlink_beyond_short_retry_window() {
+        use std::thread;
+        use std::time::Duration;
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rmdir-child-unlink-arrives-after-short-retry-window",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let parent = vfs
+            .mkdir(root, b"delayed-delete-parent", 501, 20, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 501, 20, 0o644)
+            .expect("create child file");
+        let adapter = Arc::new(super::adapter::StudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        ));
+
+        let rmdir_adapter = adapter.clone();
+        let rmdir = thread::spawn(move || rmdir_adapter.rmdir(root, b"delayed-delete-parent"));
+        thread::sleep(Duration::from_millis(300));
+        adapter
+            .unlink(parent.ino, b"child.txt")
+            .expect("delayed child unlink should succeed");
+
+        rmdir
+            .join()
+            .expect("rmdir callback thread should finish")
+            .expect("rmdir should wait beyond the short retry window");
+    }
+
+    #[test]
     fn read_only_adapter_still_rejects_write_or_truncate_open_flags() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-read-only-adapter-open-flags",
@@ -1931,26 +1979,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_uses_ubc_for_readers_and_direct_io_for_writers() {
+    fn cache_policy_keeps_kernel_cache_only_for_read_only_handles() {
         let read_only = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, false);
         assert!(!read_only.direct_io);
         assert!(read_only.keep_cache);
 
         let write_only = super::adapter::macfuse_open_cache_policy(libc::O_WRONLY, false);
-        assert!(write_only.direct_io);
+        assert!(!write_only.direct_io);
         assert!(!write_only.keep_cache);
 
         let read_write = super::adapter::macfuse_open_cache_policy(libc::O_RDWR, false);
-        assert!(read_write.direct_io);
+        assert!(!read_write.direct_io);
         assert!(!read_write.keep_cache);
 
         let append =
             super::adapter::macfuse_open_cache_policy(libc::O_RDONLY | libc::O_APPEND, false);
-        assert!(append.direct_io);
+        assert!(!append.direct_io);
         assert!(!append.keep_cache);
 
         let truncate = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, true);
-        assert!(truncate.direct_io);
+        assert!(!truncate.direct_io);
         assert!(!truncate.keep_cache);
     }
 
@@ -2077,6 +2125,40 @@ mod tests {
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);
         assert_eq!(cache_decisions.read_only_generation_changed, 2);
         assert_eq!(cache_decisions.read_only_keep, 1);
+    }
+
+    #[test]
+    fn adapter_read_only_handle_keeps_foreground_read_active_until_release() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-read-handle-foreground-lease",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cached-media-read.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only handle");
+        assert_eq!(
+            vfs.foreground_reads_inflight(),
+            1,
+            "read-only handle must keep background disk rereads paused while UBC serves pages"
+        );
+
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read-only handle");
+        assert_eq!(vfs.foreground_reads_inflight(), 0);
     }
 
     #[test]
@@ -2353,6 +2435,17 @@ mod tests {
 
     #[test]
     fn adapter_unlink_clears_kernel_cache_observation_for_removed_inode() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-cache-unlink")
                 .expect("create VFS fixture");
@@ -2363,6 +2456,8 @@ mod tests {
             .expect("create file");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
             .open(attr.ino, libc::O_RDONLY)
@@ -2384,6 +2479,13 @@ mod tests {
             .expect("unlink through macFUSE adapter");
 
         assert!(!adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let calls_before_late_completion = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_late_completion,
+            "late background completion must not notify a vnode closed by final unlink"
+        );
     }
 
     #[test]
@@ -2413,7 +2515,64 @@ mod tests {
     }
 
     #[test]
+    fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-late-write-completion-after-unlink",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+        let (attr, writer) = adapter
+            .create(root, b"late-completion.bin", 0o644, libc::O_WRONLY)
+            .expect("create file through macFUSE adapter");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b"pending upload")
+            .expect("accept local write");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer while background work may remain");
+        adapter
+            .unlink(root, b"late-completion.bin")
+            .expect("unlink final hardlink");
+
+        let calls_before_late_completion = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_late_completion,
+            "late upload or GC completion must not notify the removed vnode"
+        );
+    }
+
+    #[test]
     fn adapter_unlink_keeps_kernel_cache_observation_for_remaining_hardlink() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-hardlink",
         )
@@ -2427,6 +2586,8 @@ mod tests {
             .expect("create hardlink");
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
             .open(attr.ino, libc::O_RDONLY)
@@ -2453,6 +2614,164 @@ mod tests {
                 .expect("remaining hardlink should still resolve")
                 .ino,
             attr.ino
+        );
+        let calls_before_invalidation = inner.data_calls.load(Ordering::Acquire);
+        invalidator.inval_inode(attr.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            calls_before_invalidation + 1,
+            "unlinking one hardlink must keep kernel notification live for the remaining name"
+        );
+    }
+
+    #[test]
+    fn adapter_rename_closes_liveness_for_overwritten_final_link() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-final-link-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let source = vfs
+            .create(root, b"rename-source.txt", 501, 20, 0o644)
+            .expect("create source file");
+        let overwritten = vfs
+            .create(root, b"rename-destination.txt", 501, 20, 0o644)
+            .expect("create destination file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-destination.txt")
+            .expect("observe overwritten destination inode");
+        adapter
+            .rename(root, b"rename-source.txt", root, b"rename-destination.txt")
+            .expect("rename over final destination link");
+
+        assert_eq!(
+            vfs.lookup(root, b"rename-destination.txt")
+                .expect("renamed source should occupy destination")
+                .ino,
+            source.ino
+        );
+        invalidator.inval_inode(overwritten.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            0,
+            "overwritten final inode must stop receiving late kernel invalidations"
+        );
+    }
+
+    #[test]
+    fn adapter_rename_same_path_keeps_liveness_observed() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-same-path-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let file = vfs
+            .create(root, b"rename-same-path.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-same-path.txt")
+            .expect("observe file");
+        adapter
+            .rename(root, b"rename-same-path.txt", root, b"rename-same-path.txt")
+            .expect("same-path rename is a no-op");
+
+        invalidator.inval_inode(file.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            1,
+            "same-path rename must not close the inode liveness gate"
+        );
+    }
+
+    #[test]
+    fn adapter_rename_keeps_liveness_for_overwritten_hardlink() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-hardlink-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let _source = vfs
+            .create(root, b"rename-hardlink-source.txt", 501, 20, 0o644)
+            .expect("create source file");
+        let overwritten = vfs
+            .create(root, b"rename-hardlink-destination.txt", 501, 20, 0o644)
+            .expect("create destination file");
+        vfs.link(overwritten.ino, root, b"rename-hardlink-remaining.txt")
+            .expect("create destination hardlink");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-hardlink-destination.txt")
+            .expect("observe overwritten hardlink inode");
+        adapter
+            .rename(
+                root,
+                b"rename-hardlink-source.txt",
+                root,
+                b"rename-hardlink-destination.txt",
+            )
+            .expect("rename over one hardlink name");
+
+        assert_eq!(
+            vfs.lookup(root, b"rename-hardlink-remaining.txt")
+                .expect("remaining hardlink should resolve")
+                .ino,
+            overwritten.ino
+        );
+        invalidator.inval_inode(overwritten.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            1,
+            "remaining hardlink must keep kernel invalidations live"
         );
     }
 

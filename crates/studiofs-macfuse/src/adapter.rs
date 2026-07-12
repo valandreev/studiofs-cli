@@ -4,7 +4,7 @@ use std::fmt;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry as DashMapEntry};
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
@@ -20,7 +20,7 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::engine::XATTR_CREATE_FLAG;
-use studiofs_meta::schema::ResolvedSliceSource;
+use studiofs_meta::schema::{ROOT_INO, ResolvedSliceSource};
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::vfs::ReleaseFhOutcome;
 use studiofs_vfs::{
@@ -47,10 +47,16 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
-const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
+// Keep the next eight maximum-size macFUSE callbacks ready for one sequential
+// handle. The callback and admission limits remain 8 MiB; this is only the
+// per-handle read-ahead window that prevents UBC from synchronously refilling
+// after every callback-sized cache run.
+const MACFUSE_READ_WINDOW_MAX_BYTES: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 8;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
+const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 32;
+const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
 const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
@@ -63,12 +69,12 @@ const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8;
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MacFuseOpenCachePolicy {
-    /// Whether this handle can mutate file contents.
-    pub(crate) write_capable: bool,
     /// Whether this handle should bypass kernel page cache.
     pub(crate) direct_io: bool,
     /// Whether macFUSE should keep existing cached pages for this handle.
     pub(crate) keep_cache: bool,
+    /// Whether this handle can mutate the inode and must participate in writer accounting.
+    pub(crate) write_capable: bool,
 }
 
 /// Operation adapter shared by macFUSE callbacks and fast tests.
@@ -76,8 +82,6 @@ pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
     read_only: bool,
-    #[cfg(test)]
-    exact_callback_reads: bool,
     mount_uid: u32,
     mount_gid: u32,
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
@@ -85,6 +89,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     shared: Arc<AdapterSharedState>,
     write_capable_state: WriteCapableState,
+    foreground_read_handles: ParkingMutex<HashSet<u64>>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
@@ -94,12 +99,132 @@ pub(crate) struct StudioVfsAdapter {
 #[derive(Debug)]
 struct AdapterSharedState {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    kernel_inode_liveness: Arc<KernelInodeLiveness>,
     read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
-    read_handle_cancellations: DashMap<u64, CancellationToken>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
+}
+
+#[derive(Debug)]
+struct KernelInodeLiveness {
+    observed: DashMap<u64, Arc<ParkingMutex<u64>>>,
+}
+
+impl Default for KernelInodeLiveness {
+    fn default() -> Self {
+        let observed = DashMap::new();
+        observed.insert(ROOT_INO, Arc::new(ParkingMutex::new(u64::MAX)));
+        Self { observed }
+    }
+}
+
+impl KernelInodeLiveness {
+    fn current(&self, ino: u64) -> Option<Arc<ParkingMutex<u64>>> {
+        self.observed
+            .get(&ino)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    fn is_current(&self, ino: u64, state: &Arc<ParkingMutex<u64>>) -> bool {
+        self.observed
+            .get(&ino)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), state))
+    }
+
+    fn current_or_insert(&self, ino: u64) -> Arc<ParkingMutex<u64>> {
+        match self.observed.entry(ino) {
+            DashMapEntry::Occupied(entry) => Arc::clone(entry.get()),
+            DashMapEntry::Vacant(entry) => {
+                let state = Arc::new(ParkingMutex::new(0));
+                entry.insert(Arc::clone(&state));
+                state
+            }
+        }
+    }
+
+    fn observe(&self, ino: u64) {
+        loop {
+            let state = self.current_or_insert(ino);
+            let mut count = state.lock();
+            if self.is_current(ino, &state) {
+                *count = count.saturating_add(1);
+                return;
+            }
+        }
+    }
+
+    fn ensure_observed(&self, ino: u64) {
+        loop {
+            let state = self.current_or_insert(ino);
+            let mut count = state.lock();
+            if self.is_current(ino, &state) {
+                *count = (*count).max(1);
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, ino: u64) -> bool {
+        self.current(ino).is_some_and(|state| *state.lock() > 0)
+    }
+
+    fn close(&self, ino: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        loop {
+            let Some(state) = self.current(ino) else {
+                return;
+            };
+            let mut count = state.lock();
+            if !self.is_current(ino, &state) {
+                continue;
+            }
+            *count = 0;
+            self.observed
+                .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
+            return;
+        }
+    }
+
+    fn forget(&self, ino: u64, nlookup: u64) {
+        if ino == ROOT_INO || nlookup == 0 {
+            return;
+        }
+        loop {
+            let Some(state) = self.current(ino) else {
+                return;
+            };
+            let mut count = state.lock();
+            if !self.is_current(ino, &state) {
+                continue;
+            }
+            if *count <= nlookup {
+                *count = 0;
+                self.observed
+                    .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
+            } else {
+                *count -= nlookup;
+            }
+            return;
+        }
+    }
+
+    fn notify_if_observed(&self, ino: u64, notify: impl FnOnce()) {
+        let Some(state) = self.current(ino) else {
+            return;
+        };
+        let should_notify = {
+            let count = state.lock();
+            self.is_current(ino, &state) && *count > 0
+        };
+        if should_notify {
+            notify();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -191,13 +316,25 @@ fn write_capable_shard_index(key: u64) -> usize {
     key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize % WRITE_CAPABLE_STATE_SHARDS
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
     size: u64,
     kind: MacFuseOpenCacheSnapshotKind,
     graph: Vec<MacFuseOpenCacheGraphSpan>,
 }
+
+impl PartialEq for MacFuseOpenCacheSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // `kind` is intentionally omitted: publication-only transitions must
+        // retain the kernel page cache when file contents are unchanged.
+        self.content_epoch == other.content_epoch
+            && self.size == other.size
+            && self.graph == other.graph
+    }
+}
+
+impl Eq for MacFuseOpenCacheSnapshot {}
 
 impl MacFuseOpenCacheSnapshot {
     fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
@@ -437,6 +574,23 @@ struct ReadWindowKernelInvalidator {
     inner: Arc<dyn KernelInvalidator>,
 }
 
+struct LiveKernelInvalidator {
+    kernel_inode_liveness: Arc<KernelInodeLiveness>,
+    inner: Arc<dyn KernelInvalidator>,
+}
+
+impl KernelInvalidator for LiveKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.kernel_inode_liveness
+            .notify_if_observed(ino, || self.inner.inval_inode(ino));
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.kernel_inode_liveness
+            .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
+    }
+}
+
 impl KernelInvalidator for ReadWindowKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         self.read_windows.invalidate_inode(ino);
@@ -598,22 +752,6 @@ struct ReadExecutionState {
     vfs: Arc<StudioVfs>,
     shared: Arc<AdapterSharedState>,
     runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
-    #[cfg(test)]
-    exact_callback_reads: bool,
-}
-
-impl ReadExecutionState {
-    #[inline]
-    fn exact_callback_reads(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.exact_callback_reads
-        }
-        #[cfg(not(test))]
-        {
-            true
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -693,17 +831,9 @@ fn readahead_window_len(size: usize) -> usize {
         .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
-#[inline]
-fn queued_read_admission_bytes(
-    size: u32,
-    read_queue_byte_limit: u32,
-    exact_callback_reads: bool,
-) -> u32 {
-    if exact_callback_reads {
-        size.min(read_queue_byte_limit)
-    } else {
-        readahead_window_len(size as usize).min(read_queue_byte_limit as usize) as u32
-    }
+fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
+    let callback_bytes = size.min(read_queue_byte_limit);
+    readahead_window_len(callback_bytes as usize).min(read_queue_byte_limit as usize) as u32
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -721,17 +851,9 @@ pub(crate) struct QueuedReadForTest {
 #[derive(Debug, Clone, Default)]
 struct ReadCancellationToken {
     token: CancellationToken,
-    handle_token: Option<CancellationToken>,
 }
 
 impl ReadCancellationToken {
-    fn for_handle(handle_token: Option<CancellationToken>) -> Self {
-        Self {
-            token: CancellationToken::new(),
-            handle_token,
-        }
-    }
-
     #[cfg(test)]
     fn cancel(&self) {
         self.token.cancel();
@@ -739,21 +861,10 @@ impl ReadCancellationToken {
 
     fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
-            || self
-                .handle_token
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
     }
 
     async fn cancelled(&self) {
-        if let Some(handle_token) = &self.handle_token {
-            tokio::select! {
-                () = self.token.cancelled() => {}
-                () = handle_token.cancelled() => {}
-            }
-        } else {
-            self.token.cancelled().await;
-        }
+        self.token.cancelled().await;
     }
 
     fn fuse_token(&self) -> CancellationToken {
@@ -1046,8 +1157,6 @@ impl StudioVfsAdapter {
             vfs,
             runtime_handle,
             read_only,
-            #[cfg(test)]
-            exact_callback_reads: true,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             readdir_cache: Mutex::new(HashMap::new()),
@@ -1057,14 +1166,15 @@ impl StudioVfsAdapter {
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
                 ))),
+                kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
                 read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
-                read_handle_cancellations: DashMap::new(),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
             write_capable_state: WriteCapableState::default(),
+            foreground_read_handles: ParkingMutex::new(HashSet::new()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
             next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
@@ -1079,21 +1189,6 @@ impl StudioVfsAdapter {
         read_queue_byte_limit: usize,
     ) -> Self {
         Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_daemon_read_window_for_test(
-        vfs: Arc<StudioVfs>,
-        runtime_handle: Handle,
-    ) -> Self {
-        let mut adapter = Self::new_with_read_queue_byte_limit(
-            vfs,
-            runtime_handle,
-            false,
-            MACFUSE_READ_MAX_PENDING_BYTES,
-        );
-        adapter.exact_callback_reads = false;
-        adapter
     }
 
     #[cfg(test)]
@@ -1156,6 +1251,10 @@ impl StudioVfsAdapter {
         &self,
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
+        let inner: Arc<dyn KernelInvalidator> = Arc::new(LiveKernelInvalidator {
+            kernel_inode_liveness: Arc::clone(&self.shared.kernel_inode_liveness),
+            inner,
+        });
         self.shared
             .kernel_invalidations
             .set_inner(Arc::clone(&inner));
@@ -1176,7 +1275,12 @@ impl StudioVfsAdapter {
     pub(crate) fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
         self.vfs
             .lookup(parent, name)
+            .inspect(|attr| self.shared.kernel_inode_liveness.observe(attr.ino))
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
+        self.shared.kernel_inode_liveness.forget(ino, nlookup);
     }
 
     /// Get inode attributes.
@@ -1197,7 +1301,10 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .mkdir(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1213,7 +1320,10 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .symlink(parent, name, target, self.mount_uid, self.mount_gid)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1242,6 +1352,7 @@ impl StudioVfsAdapter {
             self.vfs
                 .open_created_file_with_known_attr(&attr, open_flags, trunc),
         )?;
+        self.shared.kernel_inode_liveness.observe(attr.ino);
         Ok((attr, open))
     }
 
@@ -1257,6 +1368,7 @@ impl StudioVfsAdapter {
         self.vfs
             .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
             .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
                 self.remember_named_file_flags(attr.ino, name);
                 self.invalidate_readdir_cache(parent);
             })
@@ -1283,6 +1395,7 @@ impl StudioVfsAdapter {
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
+            .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
 
     fn open_with_result(
@@ -1293,26 +1406,18 @@ impl StudioVfsAdapter {
     ) -> Result<OpenReply, i32> {
         open_result
             .map(|fh| {
-                self.shared
-                    .read_handle_cancellations
-                    .insert(fh, CancellationToken::new());
                 let keep_cache = if flag_policy.write_capable {
                     self.record_write_capable_open(ino, fh);
                     self.vfs.record_macfuse_open_cache_decision(
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
                     false
-                } else {
+                } else if flag_policy.keep_cache {
+                    self.record_foreground_read_handle(fh);
                     self.keep_cache_for_current_generation(ino)
+                } else {
+                    false
                 };
-                debug!(
-                    ino,
-                    fh,
-                    direct_io = flag_policy.direct_io,
-                    keep_cache,
-                    write_capable = flag_policy.write_capable,
-                    "macFUSE regular-file open cache policy"
-                );
                 OpenReply::new(fh)
                     .with_direct_io(flag_policy.direct_io)
                     .with_keep_cache(keep_cache)
@@ -1335,6 +1440,18 @@ impl StudioVfsAdapter {
             reason = "write_capable",
             "macFUSE open invalidates kernel cache"
         );
+    }
+
+    fn record_foreground_read_handle(&self, file_handle: u64) {
+        if self.foreground_read_handles.lock().insert(file_handle) {
+            self.vfs.begin_foreground_read_handle();
+        }
+    }
+
+    fn release_foreground_read_handle(&self, file_handle: u64) {
+        if self.foreground_read_handles.lock().remove(&file_handle) {
+            self.vfs.end_foreground_read_handle();
+        }
     }
 
     fn has_active_write_capable_handles(&self, ino: u64) -> bool {
@@ -1474,6 +1591,7 @@ impl StudioVfsAdapter {
                 {
                     self.clear_open_cache_snapshot(attr.ino, "unlink");
                     self.clear_file_flags(attr.ino);
+                    self.shared.kernel_inode_liveness.close(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
@@ -1487,15 +1605,69 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let existing = self.vfs.lookup(parent, name).ok();
-        self.vfs
-            .rmdir(parent, name)
+        let mut retry_attempts = 0;
+        let result = loop {
+            match self.vfs.rmdir(parent, name) {
+                Ok(()) => break Ok(()),
+                Err(error)
+                    if matches!(
+                        &error,
+                        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::DirNotEmpty(_))
+                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS =>
+                {
+                    retry_attempts += 1;
+                    debug!(
+                        parent,
+                        name = %String::from_utf8_lossy(name),
+                        retry_attempt = retry_attempts,
+                        "macFUSE rmdir waiting for concurrent child deletion"
+                    );
+                    std::thread::sleep(MACFUSE_RMDIR_RETRY_DELAY);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        result
             .inspect(|_| {
                 if let Some(attr) = &existing {
                     self.clear_file_flags(attr.ino);
+                    self.shared.kernel_inode_liveness.close(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Run the potentially waiting rmdir path away from the single macFUSE
+    /// session-loop thread. macFUSE delivers callbacks serially through that
+    /// loop; sleeping there would prevent the queued child unlink callbacks
+    /// from running and make the directory stay non-empty indefinitely.
+    pub(crate) fn queue_rmdir_reply(
+        self: &Arc<Self>,
+        parent: u64,
+        name: Vec<u8>,
+        request: Request,
+    ) {
+        let adapter = Arc::clone(self);
+        self.runtime_handle.spawn_blocking(move || {
+            let result = adapter.rmdir(parent, &name);
+            match result {
+                Ok(()) => {
+                    let _ = Reply::new(request).error(0);
+                }
+                Err(errno) => {
+                    if callback_error_log_level("rmdir", errno).is_some() {
+                        warn!(
+                            parent,
+                            name = %String::from_utf8_lossy(&name),
+                            errno,
+                            "macFUSE rmdir callback returned error"
+                        );
+                    }
+                    let _ = Reply::new(request).error(errno);
+                }
+            }
+        });
     }
 
     /// Rename a namespace entry.
@@ -1509,12 +1681,21 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let overwritten = self.vfs.lookup(newparent, newname).ok();
+        let overwritten = (parent != newparent || name != newname)
+            .then(|| self.vfs.lookup(newparent, newname).ok())
+            .flatten();
         self.vfs
             .rename(parent, name, newparent, newname)
             .inspect(|_| {
                 if let Some(attr) = &overwritten {
                     self.clear_file_flags(attr.ino);
+                    // A regular file with more than one link remains reachable
+                    // after the destination dentry is replaced. Directory link
+                    // counts include `.`/`..`, and directory hard links are not
+                    // allowed, so an overwritten directory is final here too.
+                    if attr.kind == FileType::Directory || attr.nlink <= 1 {
+                        self.shared.kernel_inode_liveness.close(attr.ino);
+                    }
                 }
                 self.invalidate_readdir_cache(parent);
                 if newparent != parent {
@@ -1599,11 +1780,7 @@ impl StudioVfsAdapter {
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = (size as usize).min(request.max_read_len as usize);
-        let read_len = if state.exact_callback_reads() {
-            size_usize
-        } else {
-            readahead_window_len(size_usize).min(request.max_read_len as usize)
-        };
+        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
 
         let mut out = state
             .shared
@@ -1613,14 +1790,12 @@ impl StudioVfsAdapter {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        if !state.exact_callback_reads()
-            && let Some(copied) = state.shared.read_windows.try_read(
-                request.file_handle,
-                request.ino,
-                request.offset,
-                &mut out,
-            )
-        {
+        if let Some(copied) = state.shared.read_windows.try_read(
+            request.file_handle,
+            request.ino,
+            request.offset,
+            &mut out,
+        ) {
             out.truncate(copied);
             state
                 .vfs
@@ -1634,12 +1809,10 @@ impl StudioVfsAdapter {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        let read_window_generation = (!state.exact_callback_reads()).then(|| {
-            state
-                .shared
-                .read_windows
-                .invalidation_generation(request.ino)
-        });
+        let generation = state
+            .shared
+            .read_windows
+            .invalidation_generation(request.ino);
         let result = tokio::select! {
             result = state.vfs.read_into_fh(request.file_handle, request.ino, request.offset, &mut out) => result,
             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
@@ -1651,44 +1824,43 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
-                if let Some(generation) = read_window_generation {
-                    if written > size_usize {
-                        let remainder_len = written - reply_len;
-                        let mut remainder = state
-                            .shared
-                            .read_buffers
-                            .clone()
-                            .acquire_with_capacity(0, remainder_len);
-                        remainder.buffer.extend_from_slice(&out[reply_len..written]);
-                        state.shared.read_windows.remember_if_current(
-                            request.file_handle,
-                            request.ino,
-                            request.offset.saturating_add(reply_len as u64),
-                            request.offset.saturating_add(reply_len as u64),
-                            remainder,
-                            generation,
-                        );
-                        out.truncate(reply_len);
-                        return Ok(out);
-                    }
+                if written > size_usize {
+                    let remainder_len = written - reply_len;
+                    let mut remainder = state
+                        .shared
+                        .read_buffers
+                        .clone()
+                        .acquire_with_capacity(0, remainder_len);
+                    remainder.buffer.extend_from_slice(&out[reply_len..written]);
+                    state.shared.read_windows.remember_if_current(
+                        request.file_handle,
+                        request.ino,
+                        request.offset.saturating_add(reply_len as u64),
+                        request.offset.saturating_add(reply_len as u64),
+                        remainder,
+                        generation,
+                    );
+                    out.truncate(reply_len);
+                    out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
+                    return Ok(out);
+                } else {
                     state
                         .shared
                         .read_windows
                         .invalidate_handle(request.file_handle);
                 }
                 out.truncate(reply_len);
+                out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                 Ok(out)
             }
             Err(error) => {
                 state
                     .vfs
                     .record_fuse_read_callback(size_usize, started.elapsed(), true);
-                if read_window_generation.is_some() {
-                    state
-                        .shared
-                        .read_windows
-                        .invalidate_handle(request.file_handle);
-                }
+                state
+                    .shared
+                    .read_windows
+                    .invalidate_handle(request.file_handle);
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -1710,28 +1882,17 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
-            #[cfg(test)]
-            exact_callback_reads: self.exact_callback_reads,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
-        let cancellation = ReadCancellationToken::for_handle(
-            self.shared
-                .read_handle_cancellations
-                .get(&file_handle)
-                .map(|token| token.value().clone()),
-        );
+        let cancellation = ReadCancellationToken::default();
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
-            let admission_bytes = queued_read_admission_bytes(
-                size,
-                read_queue_byte_limit,
-                state.exact_callback_reads(),
-            );
+            let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
             let mut read_guard =
                 AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
@@ -1826,28 +1987,17 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
-            #[cfg(test)]
-            exact_callback_reads: self.exact_callback_reads,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
-        let cancellation = ReadCancellationToken::for_handle(
-            self.shared
-                .read_handle_cancellations
-                .get(&file_handle)
-                .map(|token| token.value().clone()),
-        );
+        let cancellation = ReadCancellationToken::default();
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
-                let admission_bytes = queued_read_admission_bytes(
-                    size,
-                    read_queue_byte_limit,
-                    state.exact_callback_reads(),
-                );
+                let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
                 let mut read_guard =
                     AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                 if cancellation.is_cancelled() {
@@ -1907,31 +2057,20 @@ impl StudioVfsAdapter {
             vfs: Arc::clone(&self.vfs),
             shared: Arc::clone(&self.shared),
             runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
-            #[cfg(test)]
-            exact_callback_reads: self.exact_callback_reads,
         };
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
-        let cancellation = ReadCancellationToken::for_handle(
-            self.shared
-                .read_handle_cancellations
-                .get(&file_handle)
-                .map(|token| token.value().clone()),
-        );
+        let cancellation = ReadCancellationToken::default();
         let worker_cancellation = cancellation.clone();
         Ok(CancelableQueuedReadForTest {
             cancellation,
             queued: QueuedReadForTest {
                 runtime_handle: self.runtime_handle.clone(),
                 handle: self.runtime_handle.spawn(async move {
-                    let admission_bytes = queued_read_admission_bytes(
-                        size,
-                        read_queue_byte_limit,
-                        state.exact_callback_reads(),
-                    );
+                    let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
                     let mut read_guard =
                         AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
                     if worker_cancellation.is_cancelled() {
@@ -1991,7 +2130,8 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let written = self
+        let started = Instant::now();
+        let result = self
             .runtime_handle
             .block_on(self.vfs.write_fh_with_deferred_materialize(
                 file_handle,
@@ -2000,7 +2140,10 @@ impl StudioVfsAdapter {
                 data,
                 LocalSyncPolicy::Opportunistic,
             ))
-            .map_err(|error| vfs_err_to_errno(&error))?;
+            .map_err(|error| vfs_err_to_errno(&error));
+        self.vfs
+            .record_fuse_write_callback(data.len(), started.elapsed(), result.is_err());
+        let written = result?;
         self.shared.read_windows.invalidate_inode(ino);
         Ok(written)
     }
@@ -2069,10 +2212,6 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
-        if let Some((_, cancellation)) = self.shared.read_handle_cancellations.remove(&file_handle)
-        {
-            cancellation.cancel();
-        }
         if self
             .runtime_stats_handles
             .lock()
@@ -2100,6 +2239,7 @@ impl StudioVfsAdapter {
         released_write_handle: Option<ReleasedWriteCapableHandle>,
         outcome_result: Result<ReleaseFhOutcome, i32>,
     ) -> Result<(), i32> {
+        self.release_foreground_read_handle(file_handle);
         self.shared.read_windows.invalidate_handle(file_handle);
         if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
             self.clear_open_cache_snapshot(released.ino, "clean_write_release");
@@ -2450,13 +2590,17 @@ enum ReaddirCacheEntry {
 }
 
 pub(crate) struct CallbackState {
-    adapter: StudioVfsAdapter,
+    adapter: Arc<StudioVfsAdapter>,
 }
 
 impl CallbackState {
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
         Self {
-            adapter: StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
+            adapter: Arc::new(StudioVfsAdapter::new_with_read_only(
+                vfs,
+                runtime_handle,
+                read_only,
+            )),
         }
     }
 
@@ -2584,9 +2728,9 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
 pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
     let write_capable = posix_open_requests_write(flags, trunc);
     MacFuseOpenCachePolicy {
-        write_capable,
-        direct_io: write_capable,
+        direct_io: false,
         keep_cache: !write_capable,
+        write_capable,
     }
 }
 
@@ -2605,16 +2749,48 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        ReleasedWriteCapableHandle, StudioVfsAdapter,
+        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
+        MacFuseOpenCacheSnapshotKind, ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
     use std::sync::Arc;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
-    use studiofs_vfs::vfs::ReleaseFhOutcome;
+    use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
 
     #[test]
-    fn open_cache_snapshot_identity_includes_publication_state() {
+    fn open_without_cache_must_not_imply_write_capable_handle() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-independent-policy")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"independent-policy.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open read-only file");
+        let policy = MacFuseOpenCachePolicy {
+            direct_io: false,
+            keep_cache: false,
+            write_capable: false,
+        };
+
+        let opened = adapter
+            .open_with_result(attr.ino, policy, Ok(fh))
+            .expect("open with explicit cache policy");
+
+        assert!(!opened.keep_cache());
+        assert!(
+            !adapter.has_active_write_capable_handles(attr.ino),
+            "a cache-disabled read-only handle must not enter the writer accounting"
+        );
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read-only handle");
+    }
+
+    #[test]
+    fn open_cache_snapshot_identity_ignores_publication_only_transition() {
         let mut attr = InodeAttr::new_file(42, 1, 501, 20, 0o644);
         attr.size = 4096;
         attr.content_epoch = 7;
@@ -2642,9 +2818,9 @@ mod open_cache_snapshot_tests {
         let remote_ready = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
         assert_eq!(remote_ready.kind, MacFuseOpenCacheSnapshotKind::RemoteReady);
 
-        assert_ne!(
+        assert_eq!(
             local_stable, remote_ready,
-            "publication transitions with unchanged graph must still drop kernel pages once"
+            "publication-only transitions must preserve UBC pages for unchanged content"
         );
     }
 
@@ -2988,6 +3164,19 @@ pub extern "C" fn studiofs_macfuse_lookup(
     }
 }
 
+/// macFUSE forget callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_forget(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    nlookup: c_ulong,
+) {
+    let Some(state) = callback_state(req) else {
+        return;
+    };
+    state.adapter.forget(ino, nlookup);
+}
+
 /// macFUSE getattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_getattr(
@@ -3254,18 +3443,12 @@ pub extern "C" fn studiofs_macfuse_rmdir(
     }
     // SAFETY: macFUSE passes a NUL-terminated entry name for rmdir callbacks.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.rmdir(parent, name) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                errno,
-                "macFUSE rmdir callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    state
+        .adapter
+        .queue_rmdir_reply(parent, name.to_vec(), request);
 }
 
 /// macFUSE rename callback for the StudioVfs bridge.
@@ -3582,7 +3765,7 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     ino: raw::FuseIno,
     attr: *mut raw::FuseSetattrX,
     to_set: libc::c_int,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
@@ -3609,10 +3792,13 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     };
     debug!(
         ino,
-        to_set, flags, "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+        file_handle = ?setattr_x_file_handle(fi),
+        to_set,
+        flags,
+        "macFUSE setattr_x callback accepted Darwin metadata as overlay"
     );
     if !setattr_args_are_empty(&args) {
-        match state.adapter.setattr(None, ino, args) {
+        match state.adapter.setattr(setattr_x_file_handle(fi), ino, args) {
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
                 if let Some(request) = owned_request(req) {
@@ -3643,6 +3829,16 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
             reply_error(req, errno);
         }
     }
+}
+
+fn setattr_x_file_handle(fi: *mut raw::FuseFileInfo) -> Option<u64> {
+    if fi.is_null() {
+        return None;
+    }
+    // SAFETY: macFUSE owns `fi` for the duration of the callback. Unlike the
+    // portable setattr callback, Darwin's setattr_x supplies the open handle
+    // without adding FUSE_SET_ATTR_FH to `to_set`.
+    Some(unsafe { (*fi).fh })
 }
 
 fn setattr_x_args_from_callback(
@@ -4226,6 +4422,17 @@ mod tests {
     }
 
     #[test]
+    fn queued_read_admission_charges_readahead_allocation_bytes() {
+        let callback_bytes = 128 * 1024;
+        let queue_limit = MACFUSE_READ_WINDOW_MAX_BYTES as u32;
+
+        assert_eq!(
+            queued_read_admission_bytes(callback_bytes, queue_limit),
+            readahead_window_len(callback_bytes as usize) as u32
+        );
+    }
+
+    #[test]
     fn async_read_diagnostic_counters_are_cache_line_aligned() {
         assert!(std::mem::align_of::<AsyncReadDiagnostics>() >= 128);
         assert_eq!(std::mem::align_of::<CachePaddedAtomicUsize>(), 128);
@@ -4297,6 +4504,118 @@ mod tests {
     }
 
     #[test]
+    fn kernel_inode_liveness_closes_only_after_all_lookup_references_are_forgotten() {
+        let liveness = KernelInodeLiveness::default();
+        let ino = 42;
+        liveness.observe(ino);
+        liveness.observe(ino);
+
+        liveness.forget(ino, 1);
+        assert!(
+            liveness.contains(ino),
+            "one remaining lookup reference must keep notification live"
+        );
+
+        liveness.forget(ino, 1);
+        assert!(
+            !liveness.contains(ino),
+            "the final forget must close the notification gate"
+        );
+    }
+
+    #[test]
+    fn kernel_inode_liveness_close_does_not_wait_for_external_notification() {
+        let liveness = Arc::new(KernelInodeLiveness::default());
+        let ino = 42;
+        liveness.observe(ino);
+        let entered_notification = Arc::new(std::sync::Barrier::new(2));
+        let release_notification = Arc::new(std::sync::Barrier::new(2));
+        let notifier_liveness = Arc::clone(&liveness);
+        let notifier_entered = Arc::clone(&entered_notification);
+        let notifier_release = Arc::clone(&release_notification);
+        let notifier = std::thread::spawn(move || {
+            notifier_liveness.notify_if_observed(ino, || {
+                notifier_entered.wait();
+                notifier_release.wait();
+            });
+        });
+        entered_notification.wait();
+
+        let closer_liveness = Arc::clone(&liveness);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closer_liveness.close(ino);
+            closed_tx.send(()).expect("signal closed gate");
+        });
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("final unlink must not wait for an external notification callback");
+
+        release_notification.wait();
+        notifier.join().expect("notification thread exits");
+        closer.join().expect("close thread exits");
+        assert!(!liveness.contains(ino));
+    }
+
+    #[test]
+    fn kernel_inode_liveness_notification_can_reenter_close() {
+        let liveness = Arc::new(KernelInodeLiveness::default());
+        let ino = 42;
+        liveness.observe(ino);
+        let callback_liveness = Arc::clone(&liveness);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let notifier = std::thread::spawn(move || {
+            callback_liveness.notify_if_observed(ino, || {
+                callback_liveness.close(ino);
+                closed_tx.send(()).expect("signal re-entrant close");
+            });
+        });
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("notification callback must not deadlock when close re-enters liveness");
+        notifier.join().expect("notification thread exits");
+        assert!(!liveness.contains(ino));
+    }
+
+    #[test]
+    fn kernel_inode_liveness_notification_does_not_block_unrelated_inode_updates() {
+        let liveness = Arc::new(KernelInodeLiveness::default());
+        let notifying_ino = 42;
+        liveness.observe(notifying_ino);
+        let entered_notification = Arc::new(std::sync::Barrier::new(2));
+        let release_notification = Arc::new(std::sync::Barrier::new(2));
+        let notifier_liveness = Arc::clone(&liveness);
+        let notifier_entered = Arc::clone(&entered_notification);
+        let notifier_release = Arc::clone(&release_notification);
+        let notifier = std::thread::spawn(move || {
+            notifier_liveness.notify_if_observed(notifying_ino, || {
+                notifier_entered.wait();
+                notifier_release.wait();
+            });
+        });
+        entered_notification.wait();
+
+        let updater_liveness = Arc::clone(&liveness);
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            for ino in 1_000..5_096 {
+                updater_liveness.ensure_observed(ino);
+            }
+            updated_tx.send(()).expect("signal unrelated updates");
+        });
+        let unrelated_updates_completed = updated_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        release_notification.wait();
+        notifier.join().expect("notification thread exits");
+        updater.join().expect("unrelated inode updater exits");
+        assert!(
+            unrelated_updates_completed,
+            "kernel IPC for one inode must not retain a DashMap shard guard and block unrelated inode updates"
+        );
+    }
+
+    #[test]
     fn write_capable_state_allows_concurrent_per_inode_access_without_external_lock() {
         let state = Arc::new(WriteCapableState::default());
 
@@ -4338,6 +4657,14 @@ mod tests {
         assert!(!setattr_mask_has_size(0));
         assert!(!setattr_mask_has_fh(size_mask));
         assert_eq!(setattr_mask_has_fh(size_mask | fh_mask), fh_mask != 0);
+    }
+
+    #[test]
+    fn setattr_x_uses_open_handle_for_size_change_without_fh_mask() {
+        let mut fi = raw::FuseFileInfo::for_test(libc::O_WRONLY, 67, false, false);
+
+        assert_eq!(setattr_x_file_handle(&mut fi), Some(67));
+        assert_eq!(setattr_x_file_handle(std::ptr::null_mut()), None);
     }
 
     #[test]

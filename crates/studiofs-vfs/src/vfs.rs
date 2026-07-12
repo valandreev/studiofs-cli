@@ -367,7 +367,12 @@ impl WriteAdmissionGovernor {
             self.ingress_bytes_per_sec,
             self.drain_bytes_per_sec,
         );
-        let delay_ms = self.delay_ms(sample.next_bytes, budget_bytes, runway_ms);
+        let delay_ms = self.delay_ms(
+            sample.next_bytes,
+            pressure_after_bytes,
+            budget_bytes,
+            runway_ms,
+        );
         self.last_runway_ms = runway_ms;
         self.last_delay_ms = delay_ms;
         self.decision(delay_ms)
@@ -409,7 +414,13 @@ impl WriteAdmissionGovernor {
         }
     }
 
-    fn delay_ms(&self, next_bytes: usize, budget_bytes: usize, runway_ms: u64) -> u64 {
+    fn delay_ms(
+        &self,
+        next_bytes: usize,
+        pressure_bytes: usize,
+        budget_bytes: usize,
+        runway_ms: u64,
+    ) -> u64 {
         if next_bytes == 0
             || runway_ms >= WRITE_ADMISSION_RUNWAY_TARGET_MS
             || self.ingress_bytes_per_sec <= self.drain_bytes_per_sec
@@ -417,8 +428,11 @@ impl WriteAdmissionGovernor {
             return 0;
         }
 
-        let runway_allowance_bps =
-            Self::bytes_per_sec(budget_bytes as u64, WRITE_ADMISSION_RUNWAY_TARGET_MS).max(1);
+        let remaining_runway_bytes = budget_bytes.saturating_sub(pressure_bytes);
+        let runway_allowance_bps = Self::bytes_per_sec(
+            remaining_runway_bytes as u64,
+            WRITE_ADMISSION_RUNWAY_TARGET_MS,
+        );
         let allowed_bytes_per_sec = self
             .drain_bytes_per_sec
             .saturating_add(runway_allowance_bps)
@@ -1965,6 +1979,12 @@ impl ReadState {
         now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
     }
 
+    fn foreground_io_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        self.foreground_read_active(now_ms, idle_grace)
+            || self.active_access_class_count(AccessClass::SequentialWriter) > 0
+            || self.active_access_class_count(AccessClass::RandomWriter) > 0
+    }
+
     fn record_foreground_read_latency(
         &self,
         shard_idx: usize,
@@ -2076,6 +2096,7 @@ struct ShutdownState {
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_completed: std::sync::atomic::AtomicBool,
     shutdown_notify: tokio::sync::Notify,
+    background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
@@ -2089,11 +2110,32 @@ impl ShutdownState {
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
+            background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
+    }
+}
+
+async fn run_fetch_warmup_until_shutdown(
+    shutdown: CancellationToken,
+    warmup: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = warmup => {}
+    }
+}
+
+async fn run_epoch_finalization_until_shutdown<T>(
+    shutdown: CancellationToken,
+    finalization: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = shutdown.cancelled() => None,
+        result = finalization => Some(result),
     }
 }
 
@@ -3105,20 +3147,6 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
 
 fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
-}
-
-fn write_admission_soft_pacing_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("STUDIOFS_WRITE_ADMISSION_NO_PACING")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    })
 }
 
 fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
@@ -4458,9 +4486,13 @@ impl StudioVfs {
 
     fn spawn_fetch_warmup_task(self: &Arc<Self>) {
         let fetch_scheduler = self.fetch_scheduler.clone();
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
         let timeout = Duration::from_secs(3);
         self.track_background_task(tokio::spawn(async move {
-            let _ = fetch_scheduler.warmup(timeout).await;
+            run_fetch_warmup_until_shutdown(shutdown, async move {
+                let _ = fetch_scheduler.warmup(timeout).await;
+            })
+            .await;
         }));
     }
 
@@ -4602,7 +4634,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6279,8 +6311,17 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    /// Test helper: wait until foreground reads complete or timeout elapses.
+    /// Mark a platform read-only handle as active foreground I/O.
+    pub fn begin_foreground_read_handle(&self) {
+        self.state.read.mark_foreground_read(now_unix_millis());
+    }
+
+    /// Mark a platform read-only handle as no longer active foreground I/O.
+    pub fn end_foreground_read_handle(&self) {
+        self.state.read.unmark_foreground_read(now_unix_millis());
+    }
+
+    /// Wait until foreground reads complete or timeout elapses.
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
@@ -6522,51 +6563,26 @@ impl StudioVfs {
             self.state.write_admission_governor.lock().reset_stats();
             return;
         }
-        if write_admission_soft_pacing_disabled() {
-            return;
-        }
-
-        let decision = {
+        // Keep the governor's pressure/rate snapshot for runtime diagnostics,
+        // but never turn a soft estimate into foreground callback latency.
+        // Local-first writes may wait only for the explicit hard writer-stack
+        // memory bound above; upload and drain progress remain background work.
+        {
             let mut governor = self.state.write_admission_governor.lock();
-            governor.plan(WriteAdmissionSample {
+            let decision = governor.plan(WriteAdmissionSample {
                 now_ms: now_unix_millis(),
                 pressure_bytes,
                 budget_bytes: buffer_budget_bytes,
                 next_bytes,
-            })
-        };
-        let delay_ms = decision.delay_ms.max(sustained_delay_ms);
-        if delay_ms == 0 {
-            return;
-        }
-        // #region debug log
-        if self.write_debug_enabled() {
-            self.debug_write_probe(
-                "H2",
-                concat!(file!(), ":", line!()),
-                "write admission governor pacing",
-                serde_json::json!({
-                    "delay_ms": delay_ms,
-                    "governor_delay_ms": decision.delay_ms,
-                    "sustained_delay_ms": sustained_delay_ms,
-                    "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
-                    "drain_bytes_per_sec": decision.drain_bytes_per_sec,
-                    "runway_ms": decision.runway_ms,
-                    "pressure_bytes": pressure_bytes,
-                    "pending_upload_bytes": pressure.pending_upload_bytes,
-                    "budget_bytes": buffer_budget_bytes,
-                    "next_bytes": next_bytes,
-                }),
+            });
+            let _ = (
+                decision.delay_ms,
+                decision.ingress_bytes_per_sec,
+                decision.drain_bytes_per_sec,
+                decision.runway_ms,
             );
         }
-        // #endregion debug log
-
-        if self.shutdown_requested() {
-            return;
-        }
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        self.record_write_admission_wait(started.elapsed());
+        let _ = sustained_delay_ms;
     }
 
     fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {

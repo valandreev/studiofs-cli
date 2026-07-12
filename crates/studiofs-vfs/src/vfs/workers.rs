@@ -267,7 +267,16 @@ impl StudioVfs {
                 continue;
             };
 
-            match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
+            let Some(finalize_result) = run_epoch_finalization_until_shutdown(
+                self.state.shutdown.background_shutdown_token.clone(),
+                commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch),
+            )
+            .await
+            else {
+                break;
+            };
+
+            match finalize_result {
                 Ok(commit::EpochFinalizeStatus::Published) => {
                     self.state.file_session.note_background_transition(
                         ino,

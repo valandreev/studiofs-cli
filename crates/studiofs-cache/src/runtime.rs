@@ -204,17 +204,21 @@ pub enum LocalPayloadReadMode {
     /// Use the platform's normal buffered file reads.
     #[default]
     Buffered,
-    /// Prefer Windows unbuffered reads for aligned object ranges, with buffered
-    /// fallback for ranges that do not satisfy direct-I/O rules.
+    /// Avoid the platform cache for internal payload reads when supported.
+    /// Windows requires aligned direct-I/O ranges; macOS uses `F_NOCACHE`.
     Unbuffered,
 }
 
 impl LocalPayloadReadMode {
     /// Default read mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
-        // Keep ordinary cache reads buffered so Windows can apply the system
-        // file cache, sequential readahead, and explicit warmup hints.
-        Self::Buffered
+        // The mounted vnode already has a kernel page cache. On macOS, caching
+        // backing payload files too duplicates pages and competes with UBC.
+        if cfg!(target_os = "macos") {
+            Self::Unbuffered
+        } else {
+            Self::Buffered
+        }
     }
 }
 

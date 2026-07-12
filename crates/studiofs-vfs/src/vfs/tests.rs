@@ -17,6 +17,134 @@ use studiofs_meta::{
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn fetch_warmup_shutdown_cancels_in_flight_probe() {
+    let shutdown = CancellationToken::new();
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_by_warmup = completed.clone();
+    let task = tokio::spawn(run_fetch_warmup_until_shutdown(
+        shutdown.clone(),
+        async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            completed_by_warmup.store(true, AtomicOrdering::Release);
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("shutdown must cancel an in-flight warmup probe")
+        .expect("warmup task must not panic");
+    assert!(
+        !completed.load(AtomicOrdering::Acquire),
+        "cancellation must drop the in-flight warmup operation"
+    );
+}
+
+#[test]
+fn rmdir_waits_for_inflight_child_unlink_before_reporting_not_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-inflight-child-unlink");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        let child = vfs
+            .create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let child_delete_gate = vfs
+            .state
+            .file_session
+            .enter_op(child.ino, FileSessionOperation::Delete)
+            .await;
+        let unlink_vfs = vfs.clone();
+        let unlink =
+            tokio::task::spawn_blocking(move || unlink_vfs.unlink(parent.ino, b"child.txt"));
+        tokio::task::yield_now().await;
+
+        let rmdir_vfs = vfs.clone();
+        let rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        drop(child_delete_gate);
+
+        unlink
+            .await
+            .expect("child unlink task should complete")
+            .expect("child unlink should succeed");
+        rmdir
+            .await
+            .expect("rmdir task should complete")
+            .expect("rmdir should wait for the in-flight child unlink");
+    });
+}
+
+#[test]
+fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-queued-parent-unlink");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let parent_delete_gate = vfs
+            .state
+            .file_session
+            .enter_op(parent.ino, FileSessionOperation::Delete)
+            .await;
+        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
+        let rmdir_vfs = vfs.clone();
+        let rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let unlink_vfs = vfs.clone();
+        let unlink =
+            tokio::task::spawn_blocking(move || unlink_vfs.unlink(parent.ino, b"child.txt"));
+        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        drop(parent_delete_gate);
+
+        unlink
+            .await
+            .expect("child unlink task should complete")
+            .expect("child unlink should succeed");
+        rmdir
+            .await
+            .expect("rmdir task should complete")
+            .expect("rmdir should wait for the queued parent unlink");
+    });
+}
+
+#[tokio::test]
+async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(run_epoch_finalization_until_shutdown(
+        shutdown.clone(),
+        async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            7_u8
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("shutdown must cancel in-flight epoch finalization")
+        .expect("epoch finalizer task must not panic");
+    assert!(
+        result.is_none(),
+        "cancelled finalization must not report a completed epoch"
+    );
+}
 
 #[derive(Default)]
 struct RecordingKernelInvalidator {
@@ -204,6 +332,76 @@ fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
         assert_eq!(&out, b"dirty-overlay");
         drop(_materialize);
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_write_does_not_wait_for_background_materialize_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"write-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+
+        let written = tokio::time::timeout(Duration::from_millis(100), async {
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"foreground",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+        })
+        .await
+        .expect("foreground write must not queue behind background materialization")
+        .expect("foreground write should be accepted");
+
+        assert_eq!(written, b"foreground".len() as u32);
+        drop(materialize);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn durability_barrier_still_waits_for_background_materialize_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-during-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"flush-during-materialize.txt", 0, 0, 0o644)
+            .unwrap();
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let mut barrier = Box::pin(tokio::spawn(async move {
+            let _barrier = vfs_clone
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Flush)
+                .await;
+        }));
+
+        tokio::time::timeout(Duration::from_millis(50), &mut barrier)
+            .await
+            .expect_err("durability barrier must wait for background materialization");
+        drop(materialize);
+        tokio::time::timeout(Duration::from_millis(150), barrier)
+            .await
+            .expect("durability barrier should pass after materialization finishes")
+            .unwrap();
     });
 }
 
@@ -3333,6 +3531,43 @@ fn handle_write_uses_open_attr_before_meta_lookup() {
 
         vfs.release_fh(fh).await.expect("release file handle");
     });
+}
+
+#[test]
+fn newer_dirty_epoch_keeps_its_upload_state_during_write_merge() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "newer-dirty-epoch-upload-state");
+    let attr = vfs
+        .create(1, b"newer-dirty-epoch-upload-state.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    let mut newer = attr.clone();
+    newer.content_epoch = attr.content_epoch.saturating_add(1);
+    newer.upload_state = MetaUploadState::Ready;
+    let mut older = attr;
+    older.upload_state = MetaUploadState::Uploading;
+
+    super::sync_ops::merge_write_dirty_attr(&mut newer, &older);
+
+    assert_eq!(newer.upload_state, MetaUploadState::Ready);
+}
+
+#[test]
+fn equal_dirty_epoch_updates_upload_state_from_non_ready_write_base() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "equal-dirty-epoch-upload-state");
+    let attr = vfs
+        .create(1, b"equal-dirty-epoch-upload-state.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    let mut current = attr.clone();
+    current.upload_state = MetaUploadState::Ready;
+    let mut write_base = attr;
+    write_base.upload_state = MetaUploadState::Uploading;
+
+    super::sync_ops::merge_write_dirty_attr(&mut current, &write_base);
+
+    assert_eq!(current.upload_state, MetaUploadState::Uploading);
 }
 
 #[test]
@@ -6543,6 +6778,62 @@ fn write_admission_first_sample_below_budget_without_pacing() {
 }
 
 #[test]
+fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-no-soft-pacing");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-no-soft-pacing.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        let pressure_bytes = buffer_budget_bytes * 7 / 10;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; pressure_bytes]),
+            )
+            .unwrap();
+
+        {
+            let mut governor = vfs.state.write_admission_governor.lock();
+            governor.last_sample_ms =
+                now_unix_millis().saturating_sub(WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS);
+            governor.last_pressure_bytes = buffer_budget_bytes / 5;
+            governor.accepted_since_sample = (buffer_budget_bytes * 3 / 5) as u64;
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10, 0),
+        )
+        .await
+        .expect("soft pressure below the hard window must not delay a local-first write");
+        assert!(
+            vfs.state
+                .write_admission_governor
+                .lock()
+                .stats()
+                .last_delay_ms
+                > 0,
+            "soft pacing estimate should remain visible without pacing a foreground write"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_admission_admits_oversized_write_when_pressure_is_empty() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-oversized-write");
@@ -6718,7 +7009,10 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             )
             .await
             .unwrap();
-        assert_eq!(delay_ms, 1);
+        assert_eq!(
+            delay_ms, 0,
+            "sustained pre-drain should not add a second foreground pacing delay"
+        );
 
         assert!(
             vfs.state
@@ -6894,6 +7188,32 @@ fn write_admission_governor_throttles_on_short_runway_before_limit() {
 }
 
 #[test]
+fn write_admission_governor_uses_remaining_runway_instead_of_full_budget() {
+    let mut governor = WriteAdmissionGovernor::default();
+
+    governor.plan(WriteAdmissionSample {
+        now_ms: 1_000,
+        pressure_bytes: 200,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+    governor.record_accepted_bytes(600);
+    let decision = governor.plan(WriteAdmissionSample {
+        now_ms: 2_000,
+        pressure_bytes: 500,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+
+    assert!(decision.runway_ms < WRITE_ADMISSION_RUNWAY_TARGET_MS);
+    assert!(decision.ingress_bytes_per_sec > decision.drain_bytes_per_sec);
+    assert!(
+        decision.delay_ms > 0,
+        "pacing allowance must use the remaining buffer runway, not reuse the full budget"
+    );
+}
+
+#[test]
 fn write_admission_governor_does_not_throttle_when_drain_keeps_up() {
     let mut governor = WriteAdmissionGovernor::default();
 
@@ -6915,6 +7235,22 @@ fn write_admission_governor_does_not_throttle_when_drain_keeps_up() {
 
     assert_eq!(decision.delay_ms, 0);
     assert!(decision.drain_bytes_per_sec >= decision.ingress_bytes_per_sec);
+}
+
+#[test]
+fn write_admission_governor_handles_empty_drain_and_runway() {
+    let governor = WriteAdmissionGovernor {
+        ingress_bytes_per_sec: 1_000,
+        drain_bytes_per_sec: 0,
+        ..WriteAdmissionGovernor::default()
+    };
+
+    let delay_ms = governor.delay_ms(4 * 1024 * 1024, 1_024, 1_024, 0);
+
+    assert_eq!(
+        delay_ms, WRITE_ADMISSION_MAX_DELAY_MS,
+        "zero drain and zero runway allowance must use a non-zero divisor and saturate at the configured delay cap"
+    );
 }
 
 #[test]
@@ -7205,6 +7541,18 @@ fn wait_for_foreground_reads_idle_honors_idle_grace() {
 
         assert!(waiter.await.expect("join foreground idle waiter"));
     });
+}
+
+#[test]
+fn foreground_io_active_includes_active_writers() {
+    let state = ReadState::new(1);
+
+    state.increment_active_access_class(AccessClass::SequentialWriter);
+
+    assert!(
+        state.foreground_io_active(100, Duration::from_millis(50)),
+        "active sequential writers must protect local materialization from upload rereads"
+    );
 }
 
 #[test]
@@ -13281,6 +13629,49 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         .await
         .expect("finishing materializer should reschedule dirty writer-stack state");
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn first_write_after_truncate_ignores_stale_pretruncate_dirty_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recovered-truncate-write-epoch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"recovered-truncate-write-epoch.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, b"locally unpublished").await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let unpublished_attr = vfs.getattr(ino).unwrap();
+        assert_eq!(unpublished_attr.committed_size, 0);
+        assert_ne!(unpublished_attr.upload_state, MetaUploadState::Ready);
+
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, true).unwrap();
+        let truncate_attr = vfs
+            .handle_table
+            .get(fh)
+            .and_then(|open_file| open_file.open_attr())
+            .expect("truncate open should retain its generation snapshot");
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, unpublished_attr);
+
+        let rewritten = b"rewritten";
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, rewritten, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        let rewritten_attr = vfs.getattr(ino).unwrap();
+        assert_eq!(
+            (rewritten_attr.size, rewritten_attr.content_epoch),
+            (rewritten.len() as u64, truncate_attr.content_epoch + 1),
+            "the truncate handle generation must win over a late pre-truncate dirty attr"
+        );
         vfs.release_fh(fh).await.unwrap();
     });
 }

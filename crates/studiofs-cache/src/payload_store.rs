@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mount_read_mode_keeps_buffered_reads_cacheable() {
+    fn default_mount_read_mode_avoids_duplicate_macos_page_cache() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_sync_and_write_mode(
@@ -1803,9 +1803,15 @@ mod tests {
         assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
         assert_eq!(out, payload);
         let reads = store.read_mode_snapshot();
-        assert_eq!(reads.unbuffered_read_attempts, 0);
-        assert_eq!(reads.unbuffered_read_successes, 0);
-        assert_eq!(reads.unbuffered_read_fallbacks, 0);
+        if cfg!(target_os = "macos") {
+            assert_eq!(reads.unbuffered_read_attempts, 1);
+            assert_eq!(reads.unbuffered_read_successes, 1);
+            assert_eq!(reads.unbuffered_read_fallbacks, 0);
+        } else {
+            assert_eq!(reads.unbuffered_read_attempts, 0);
+            assert_eq!(reads.unbuffered_read_successes, 0);
+            assert_eq!(reads.unbuffered_read_fallbacks, 0);
+        }
     }
 
     #[test]
@@ -1827,7 +1833,7 @@ mod tests {
         assert_eq!(store.read_into(4300, 0, &mut out), Some(4096));
         assert_eq!(out, payload);
         let reads = store.read_mode_snapshot();
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "macos")) {
             assert_eq!(reads.unbuffered_read_attempts, 1);
             assert_eq!(
                 reads.unbuffered_read_successes + reads.unbuffered_read_fallbacks,
@@ -1840,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn unbuffered_read_mode_falls_back_for_unaligned_range() {
+    fn unbuffered_read_mode_handles_platform_alignment_rules() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_modes(
@@ -1857,14 +1863,20 @@ mod tests {
         assert_eq!(store.read_into(4301, 1, &mut out), Some(3));
         assert_eq!(&out, b"bcd");
         let reads = store.read_mode_snapshot();
-        assert_eq!(reads.unbuffered_read_attempts, 0);
-        assert_eq!(reads.unbuffered_read_successes, 0);
-        assert_eq!(reads.unbuffered_read_fallbacks, 1);
-        assert_eq!(
-            store.read_handle_stats().cached,
-            1,
-            "unaligned fallback should cache a separate buffered read handle"
-        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(reads.unbuffered_read_attempts, 1);
+            assert_eq!(reads.unbuffered_read_successes, 1);
+            assert_eq!(reads.unbuffered_read_fallbacks, 0);
+        } else {
+            assert_eq!(reads.unbuffered_read_attempts, 0);
+            assert_eq!(reads.unbuffered_read_successes, 0);
+            assert_eq!(reads.unbuffered_read_fallbacks, 1);
+            assert_eq!(
+                store.read_handle_stats().cached,
+                1,
+                "unaligned fallback should cache a separate buffered read handle"
+            );
+        }
     }
 
     #[test]

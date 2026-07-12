@@ -313,7 +313,20 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new().read(true).open(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_read_only(path)?;
+    // SAFETY: `file` owns a live descriptor for the duration of this call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
     open_read_only(path)
 }
@@ -382,7 +395,12 @@ fn unbuffered_read_alignment_for_path_impl(path: &Path) -> usize {
     windows_unbuffered_write_alignment_for_path(path).unwrap_or(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn can_read_unbuffered_range_impl(_offset: u64, len: usize, _alignment: usize) -> bool {
+    len != 0
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn can_read_unbuffered_range_impl(_offset: u64, _len: usize, _alignment: usize) -> bool {
     false
 }
