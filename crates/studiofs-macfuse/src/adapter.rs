@@ -1626,12 +1626,21 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let overwritten = self.vfs.lookup(newparent, newname).ok();
+        let overwritten = (parent != newparent || name != newname)
+            .then(|| self.vfs.lookup(newparent, newname).ok())
+            .flatten();
         self.vfs
             .rename(parent, name, newparent, newname)
             .inspect(|_| {
                 if let Some(attr) = &overwritten {
                     self.clear_file_flags(attr.ino);
+                    // A regular file with more than one link remains reachable
+                    // after the destination dentry is replaced. Directory link
+                    // counts include `.`/`..`, and directory hard links are not
+                    // allowed, so an overwritten directory is final here too.
+                    if attr.kind == FileType::Directory || attr.nlink <= 1 {
+                        self.shared.kernel_inode_liveness.close(attr.ino);
+                    }
                 }
                 self.invalidate_readdir_cache(parent);
                 if newparent != parent {

@@ -2557,6 +2557,157 @@ mod tests {
     }
 
     #[test]
+    fn adapter_rename_closes_liveness_for_overwritten_final_link() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-final-link-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let source = vfs
+            .create(root, b"rename-source.txt", 501, 20, 0o644)
+            .expect("create source file");
+        let overwritten = vfs
+            .create(root, b"rename-destination.txt", 501, 20, 0o644)
+            .expect("create destination file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-destination.txt")
+            .expect("observe overwritten destination inode");
+        adapter
+            .rename(root, b"rename-source.txt", root, b"rename-destination.txt")
+            .expect("rename over final destination link");
+
+        assert_eq!(
+            vfs.lookup(root, b"rename-destination.txt")
+                .expect("renamed source should occupy destination")
+                .ino,
+            source.ino
+        );
+        invalidator.inval_inode(overwritten.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            0,
+            "overwritten final inode must stop receiving late kernel invalidations"
+        );
+    }
+
+    #[test]
+    fn adapter_rename_same_path_keeps_liveness_observed() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-same-path-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let file = vfs
+            .create(root, b"rename-same-path.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-same-path.txt")
+            .expect("observe file");
+        adapter
+            .rename(root, b"rename-same-path.txt", root, b"rename-same-path.txt")
+            .expect("same-path rename is a no-op");
+
+        invalidator.inval_inode(file.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            1,
+            "same-path rename must not close the inode liveness gate"
+        );
+    }
+
+    #[test]
+    fn adapter_rename_keeps_liveness_for_overwritten_hardlink() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data_calls: AtomicUsize,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data_calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-rename-hardlink-liveness",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let _source = vfs
+            .create(root, b"rename-hardlink-source.txt", 501, 20, 0o644)
+            .expect("create source file");
+        let overwritten = vfs
+            .create(root, b"rename-hardlink-destination.txt", 501, 20, 0o644)
+            .expect("create destination file");
+        vfs.link(overwritten.ino, root, b"rename-hardlink-remaining.txt")
+            .expect("create destination hardlink");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+
+        adapter
+            .lookup(root, b"rename-hardlink-destination.txt")
+            .expect("observe overwritten hardlink inode");
+        adapter
+            .rename(
+                root,
+                b"rename-hardlink-source.txt",
+                root,
+                b"rename-hardlink-destination.txt",
+            )
+            .expect("rename over one hardlink name");
+
+        assert_eq!(
+            vfs.lookup(root, b"rename-hardlink-remaining.txt")
+                .expect("remaining hardlink should resolve")
+                .ino,
+            overwritten.ino
+        );
+        invalidator.inval_inode(overwritten.ino);
+        assert_eq!(
+            inner.data_calls.load(Ordering::Acquire),
+            1,
+            "remaining hardlink must keep kernel invalidations live"
+        );
+    }
+
+    #[test]
     fn adapter_open_cache_observations_are_bounded() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-bounded",
