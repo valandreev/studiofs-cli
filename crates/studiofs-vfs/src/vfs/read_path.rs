@@ -691,6 +691,12 @@ impl<'a> DataReader<'a> {
         Self::fetch_remote_blocks(vfs, segments, RemoteFetchMode::ForegroundColdRead).await
     }
 
+    fn has_local_payload_for_read(vfs: &StudioVfs, object_id: u64) -> bool {
+        vfs.local_payload_backend.contains(object_id)
+            || vfs.cached_store.has_staged_upload(object_id)
+            || vfs.cached_store.get_hot_upload(object_id).is_some()
+    }
+
     async fn fetch_remote_blocks(
         vfs: &StudioVfs,
         segments: &[ReadSegment],
@@ -726,7 +732,7 @@ impl<'a> DataReader<'a> {
                 }
             }
         }
-        remote_blocks.retain(|object_id, _| !vfs.local_payload_backend.contains(*object_id));
+        remote_blocks.retain(|object_id, _| !Self::has_local_payload_for_read(vfs, *object_id));
         if remote_blocks.is_empty() {
             return Ok(());
         }
@@ -1994,6 +2000,7 @@ mod tests {
     use super::{
         DataReader, MetadataRefreshDecision, ReadClaimBuffers, ReadDataPlanner,
         ReadMetadataResolver, ReadRange, ReadRangeList, ReadSegment, ReadSegmentSource,
+        RemoteFetchMode,
     };
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
@@ -2350,6 +2357,58 @@ mod tests {
                 .expect("committed read should resolve the staged payload");
 
             assert_eq!(out, data);
+        });
+    }
+
+    #[test]
+    fn prefetch_treats_staged_payload_as_local_after_primary_eviction() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-upload-stage-local");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_002;
+            let data = Bytes::from_static(b"prefetch should stay local");
+            vfs.local_payload_backend()
+                .put(object_id, data.as_ref(), false)
+                .expect("persist local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+
+            assert!(
+                DataReader::has_local_payload_for_read(&vfs, object_id),
+                "prefetch must recognize the durable upload-stage copy after cache eviction"
+            );
+
+            let payload = PayloadRef {
+                object_id,
+                offset: 0,
+                length: u32::try_from(data.len()).expect("payload length fits u32"),
+                flags: MetaBlockFlags::empty(),
+            };
+            let segment = ReadSegment {
+                range: read_range(0, data.len() as u64),
+                source: ReadSegmentSource::Base { payload },
+            };
+            let s3_gets_before = vfs
+                .fetch_scheduler
+                .metrics
+                .s3_get_calls
+                .load(AtomicOrdering::Relaxed);
+            DataReader::fetch_remote_blocks(&vfs, &[segment], RemoteFetchMode::BestEffortPrefetch)
+                .await
+                .expect("staged prefetch should not fail");
+            assert_eq!(
+                vfs.fetch_scheduler
+                    .metrics
+                    .s3_get_calls
+                    .load(AtomicOrdering::Relaxed),
+                s3_gets_before,
+                "prefetch must not query S3 for a payload that remains in the upload stage"
+            );
         });
     }
 
