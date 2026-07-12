@@ -412,7 +412,7 @@ The `--infra disabled` path remains limited to runner self-tests and writes only
 the skeleton validation artifact.
 
 `postgres-outage-multi-client-recovery` uses the same three-client mounted
-bootstrap, writes an initial file while PostgreSQL is healthy, stops only the
+bootstrap, writes and converges an initial file while PostgreSQL is healthy, stops only the
 PostgreSQL compose service, accepts a writer-local outage write through
 `client-a`, force-kills that writer, starts PostgreSQL again with compose health
 waiting, and remounts `client-a`. After writer recovery, the scenario always

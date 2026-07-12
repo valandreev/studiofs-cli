@@ -58,6 +58,7 @@ fn postgres_outage_records_local_operations_and_recovery_metrics() {
         [
             "bootstrap",
             "mount_all",
+            "after_initial_write",
             "stop_postgres",
             "force_kill_writer",
             "start_postgres",
