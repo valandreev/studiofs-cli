@@ -324,6 +324,8 @@ pub(super) struct FileSessionEntry {
     wait_events: AtomicU64,
     wait_ms: AtomicU64,
     transitions: AtomicU64,
+    queued_delete_ops: AtomicU64,
+    active_delete_ops: AtomicU64,
     active_shared_locks: AtomicU32,
     active_writer: Mutex<Option<&'static str>>,
     last_transition_unix_ms: AtomicU64,
@@ -343,6 +345,8 @@ impl FileSessionEntry {
             wait_events: AtomicU64::new(0),
             wait_ms: AtomicU64::new(0),
             transitions: AtomicU64::new(0),
+            queued_delete_ops: AtomicU64::new(0),
+            active_delete_ops: AtomicU64::new(0),
             active_shared_locks: AtomicU32::new(0),
             active_writer: Mutex::new(None),
             last_transition_unix_ms: AtomicU64::new(0),
@@ -366,6 +370,9 @@ impl FileSessionEntry {
     }
 
     fn note_active_start(&self, op: FileSessionOperation) {
+        if op == FileSessionOperation::Delete {
+            self.active_delete_ops.fetch_add(1, Ordering::Relaxed);
+        }
         if op.shared_lock() {
             self.active_shared_locks.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -374,6 +381,13 @@ impl FileSessionEntry {
     }
 
     fn note_active_finish(&self, op: FileSessionOperation) {
+        if op == FileSessionOperation::Delete {
+            self.active_delete_ops
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
         if op.shared_lock() {
             self.active_shared_locks
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -492,6 +506,14 @@ impl FileSessionState {
         self.sessions.lock().get(&ino).cloned()
     }
 
+    /// Returns whether a delete operation is queued or active for an inode.
+    pub(super) fn has_delete_inflight(&self, ino: Ino) -> bool {
+        self.live_session(ino).is_some_and(|session| {
+            session.queued_delete_ops.load(Ordering::Relaxed) > 0
+                || session.active_delete_ops.load(Ordering::Relaxed) > 0
+        })
+    }
+
     fn session_is_idle(session: &Arc<FileSessionEntry>) -> bool {
         session.open_handles.load(Ordering::Relaxed) == 0
             && session.queued_ops.load(Ordering::Relaxed) == 0
@@ -526,6 +548,9 @@ impl FileSessionState {
     /// Enters the operation gate for `ino` and returns a session permit.
     pub(super) async fn enter_op(&self, ino: Ino, op: FileSessionOperation) -> FileSessionPermit {
         let session = self.session(ino);
+        if op == FileSessionOperation::Delete {
+            session.queued_delete_ops.fetch_add(1, Ordering::Relaxed);
+        }
         let counters = self.counters.clone();
         let queue_depth = session.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
         session.update_max_queue_depth(queue_depth);
@@ -579,6 +604,14 @@ impl FileSessionState {
         counters.note_transition();
         session.note_active_start(op);
         session.record_transition(op, "start");
+        if op == FileSessionOperation::Delete {
+            session
+                .queued_delete_ops
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
         FileSessionPermit {
             _finalize_gate: finalize_guard,
             _read_gate: read_guard,
