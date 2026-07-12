@@ -1041,6 +1041,11 @@ impl<'a> DataReader<'a> {
             }
         }
 
+        if !span_resolved && let Some(data) = vfs.upload_stage_get_async(payload.object_id).await? {
+            vfs.copy_committed_payload_into_range(data.as_ref(), payload, file_offset, dst)?;
+            span_resolved = true;
+        }
+
         if !span_resolved {
             match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                 Ok(data) => {
@@ -1879,16 +1884,16 @@ impl StudioVfs {
                 return Ok(());
             }
 
-            let Some(context) = self
+            let Some(queued_context) = self
                 .resolve_prefetch_batch_context(ino, read_context)
                 .await?
             else {
                 return Ok(());
             };
-            if context.size == 0 {
+            if queued_context.size == 0 {
                 return Ok(());
             }
-            let Some(eof_block) = context.eof_block(self.block_size) else {
+            let Some(eof_block) = queued_context.eof_block(self.block_size) else {
                 return Ok(());
             };
             block_indices.retain(|object_idx| *object_idx <= eof_block);
@@ -1900,9 +1905,24 @@ impl StudioVfs {
                 Self::contiguous_prefetch_block_ranges(&mut block_indices)
             {
                 let block_start = (first_block as u64).saturating_mul(self.block_size as u64);
-                let block_end = ((last_block as u64).saturating_add(1))
+                let queued_block_end = ((last_block as u64).saturating_add(1))
                     .saturating_mul(self.block_size as u64)
-                    .min(context.size);
+                    .min(queued_context.size);
+                let queued_block_len = queued_block_end.saturating_sub(block_start);
+                if queued_block_len == 0 {
+                    continue;
+                }
+                let (attr, resolved_slices) = self
+                    .resolve_read_metadata_async(ino, block_start, queued_block_len)
+                    .await?;
+                let context = ReadRequestContext::from_attr(self, ino, attr);
+                if context.placeholder_visible(self, ino) {
+                    return Ok(());
+                }
+                if context.pending_content_epoch != queued_context.pending_content_epoch {
+                    return Ok(());
+                }
+                let block_end = queued_block_end.min(context.attr.size);
                 let block_len = block_end.saturating_sub(block_start);
                 if block_len == 0 {
                     continue;
@@ -1913,7 +1933,7 @@ impl StudioVfs {
                     block_start,
                     block_len,
                     context.pending_content_epoch,
-                    None,
+                    Some(resolved_slices.as_ref()),
                 );
                 data_reader.prefetch_only().await?;
             }
@@ -2288,6 +2308,49 @@ mod tests {
         let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn committed_read_uses_upload_stage_when_local_payload_is_unavailable() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-upload-stage-fallback");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_001;
+            let data = Bytes::from_static(b"read from upload stage");
+            vfs.local_payload_backend()
+                .put(object_id, data.as_ref(), false)
+                .expect("persist local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+
+            assert!(
+                !vfs.local_payload_backend().contains(object_id),
+                "setup must force the committed-read local miss"
+            );
+            assert!(
+                vfs.cached_store().has_staged_upload(object_id),
+                "setup must retain the upload-stage copy"
+            );
+
+            let payload = PayloadRef {
+                object_id,
+                offset: 0,
+                length: u32::try_from(data.len()).expect("payload length fits u32"),
+                flags: MetaBlockFlags::empty(),
+            };
+            let mut out = vec![0; data.len()];
+
+            DataReader::assemble_committed_payload_into(&vfs, &payload, 0, &mut out)
+                .await
+                .expect("committed read should resolve the staged payload");
+
+            assert_eq!(out, data);
+        });
     }
 
     fn mark_all_overlay_objects_uploaded(
@@ -4500,6 +4563,69 @@ mod tests {
                 .expect("read task should join cleanly")
                 .expect("foreground read should complete");
             assert_eq!(read.as_ref(), b"BBBB");
+        });
+    }
+
+    #[test]
+    fn prefetch_batch_resolves_one_snapshot_for_contiguous_pending_extents() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "prefetch-contiguous-pending-snapshot");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"prefetch-contiguous-pending-snapshot.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create test file");
+            let ino = created.ino;
+            let block_size = vfs.block_size as usize;
+            let payload = vec![0x6B; block_size.saturating_mul(2).saturating_add(4)];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino)
+                .await
+                .expect("materialize pending local extents");
+
+            assert_eq!(
+                vfs.live_extent_records_for_inode(ino).len(),
+                3,
+                "setup should materialize three pending extents"
+            );
+            let attr = vfs.getattr(ino).expect("load pending attr");
+            let mut read_context = vfs.prefetch_read_context_from_attr(ino, &attr);
+            read_context.size = read_context.size.saturating_add(vfs.block_size as u64);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, attr.clone());
+            vfs.state
+                .read
+                .published_read_plan_cache
+                .lock()
+                .pop(&ino);
+
+            vfs.read_prefetch_batch(PrefetchBatch::new(
+                ino,
+                vec![0, 1, 2, 3],
+                Some(read_context),
+            ))
+            .await;
+
+            let key = PublishedReadPlanCacheKey::from_locally_stable_attr(&attr)
+                .expect("regular pending attr should be cacheable");
+            assert!(
+                vfs.state
+                    .read
+                    .published_read_plan_cache_get(ino, key, 0, attr.size)
+                    .is_some(),
+                "one contiguous prefetch range should resolve and reuse one canonical slice snapshot"
+            );
         });
     }
 

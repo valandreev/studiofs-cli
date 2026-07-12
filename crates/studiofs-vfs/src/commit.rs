@@ -257,24 +257,24 @@ impl CommitCoordinator {
             (present, removed_matching, newer)
         };
 
-        if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.get_attr(ino)
-        })
-        .await
+        let published_attr = if let Ok(attr) =
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_attr(ino)
+            })
+            .await
         {
             vfs.refresh_inode_incarnation_state_from_attr_inner(ino, &attr, false);
+            Some(attr)
         } else {
             vfs.clear_inode_incarnation(ino);
-        }
+            None
+        };
         let restored_newer_dirty_attr = newer_dirty_attr.is_some();
         if let Some(newer_dirty_attr) = newer_dirty_attr {
-            let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
-            let should_restore = dirty_attrs
-                .get(&ino)
-                .is_none_or(|current| current.content_epoch < newer_dirty_attr.content_epoch);
-            if should_restore {
-                dirty_attrs.insert(ino, newer_dirty_attr);
-            }
+            Self::restore_newer_dirty_attr_and_refresh_open_handles(vfs, ino, newer_dirty_attr);
+        } else if let Some(published_attr) = published_attr.as_ref() {
+            vfs.handle_table
+                .update_open_attrs_for_inode(ino, published_attr);
         }
         let removed_cached_attr = !vfs.invalidate_attr_read_cache([ino]).is_empty();
         // `getattr` can expose pending attrs from dirty_attrs without populating
@@ -305,6 +305,30 @@ impl CommitCoordinator {
         }
 
         Ok(EpochFinalizeStatus::Published)
+    }
+
+    pub(super) fn restore_newer_dirty_attr_and_refresh_open_handles(
+        vfs: &StudioVfs,
+        ino: Ino,
+        newer_dirty_attr: InodeAttr,
+    ) {
+        let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
+        // EOF is monotonic within one unpublished content epoch; a smaller
+        // same-epoch snapshot is stale and must not become canonical again.
+        let should_restore = dirty_attrs.get(&ino).is_none_or(|current| {
+            current.content_epoch < newer_dirty_attr.content_epoch
+                || (current.content_epoch == newer_dirty_attr.content_epoch
+                    && current.size < newer_dirty_attr.size)
+        });
+        let open_attr = if should_restore {
+            dirty_attrs.insert(ino, newer_dirty_attr.clone());
+            newer_dirty_attr
+        } else {
+            dirty_attrs.get(&ino).cloned().unwrap_or(newer_dirty_attr)
+        };
+        drop(dirty_attrs);
+        vfs.handle_table
+            .update_open_attrs_for_inode(ino, &open_attr);
     }
 
     async fn wait_until_remote_objects_visible(

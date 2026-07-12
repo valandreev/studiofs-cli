@@ -563,9 +563,22 @@ pub const fn cache_io_execution_model() -> LocalCacheIoExecutionModel {
     LocalCacheIoExecutionModel::InlineRuntimeWorkerWithBlockingIsolation
 }
 
+/// The closure must not be called from Tokio's `spawn_blocking` pool. Such
+/// callers must use [`run_local_cache_io_blocking`] instead; Tokio does not
+/// expose a reliable runtime API for distinguishing a blocking-pool thread
+/// from a worker thread before calling `block_in_place`.
 pub fn run_local_cache_io<T>(operation: impl FnOnce() -> T) -> (T, LocalCacheIoTiming) {
     let io_started = std::time::Instant::now();
-    let result = operation();
+    let result = if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        // Foreground payload reads borrow the caller's output buffer and cannot
+        // move to spawn_blocking. Mark the synchronous pread as blocking so
+        // Tokio can replace this worker instead of stalling unrelated FUSE reads.
+        task::block_in_place(operation)
+    } else {
+        operation()
+    };
     let backend_io_ns = duration_to_nanos_u64(io_started.elapsed());
     (
         result,
@@ -665,6 +678,7 @@ pub async fn sleep_or_cancel(cancel_token: &CancellationToken, delay: Duration) 
 mod tests {
     use super::{MetaExecutor, cache_io_execution_model, into_vfs_meta, run_local_cache_io};
     use std::sync::Arc;
+    use std::time::Duration;
     use studiofs_meta::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine};
 
     #[test]
@@ -680,6 +694,31 @@ mod tests {
         let (value, timing) = run_local_cache_io(|| 42usize);
         assert_eq!(value, 42);
         assert_eq!(timing.handoff_ns, 0);
+    }
+
+    #[test]
+    fn run_local_cache_io_does_not_starve_single_runtime_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("build single-worker runtime");
+
+        runtime.block_on(async {
+            let slow_read = tokio::spawn(async {
+                run_local_cache_io(|| std::thread::sleep(Duration::from_millis(150)));
+            });
+            let (timer_tx, timer_rx) = std::sync::mpsc::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                timer_tx.send(()).expect("test receiver remains live");
+            });
+
+            timer_rx
+                .recv_timeout(Duration::from_millis(75))
+                .expect("local cache I/O must not starve unrelated runtime work");
+            slow_read.await.expect("slow local-cache task should join");
+        });
     }
 
     #[test]

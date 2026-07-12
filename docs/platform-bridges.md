@@ -248,22 +248,29 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | `direct` by default |
+| macOS: cache policy | buffered data cache with uncached vnode names |
 | macOS: validated macFUSE | 5.2.0 |
 
 ### macOS cache and I/O policy
 
-macOS FUSE defaults to the direct cache policy. The mount keeps `local`,
-`sparse`, and `volname`, and adds `direct_io`, `nolocalcaches`, and `auto_cache`
-so AJA-style media workloads do not fight macOS UBC while StudioFS is already
-buffering and materializing writes locally. The mount also passes
+macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for file
+data, while `novncache` keeps namespace lookups coherent. The mount does not
+pass `direct_io`, `nolocalcaches`, or `auto_cache`; data and attribute coherence
+instead use per-handle `keep_cache` decisions plus scoped low-level inode
+invalidations. The mount also passes
 `iosize=4194304`, `max_read=4194304`, and `defer_permissions`; the 4 MiB
 geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide
 `.DS_Store`, which Finder/copyfile requires for folder copies.
-The default macOS asyncFUSE profile also enables async write replies, applies
-the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
+The native macOS bridge queues read replies asynchronously. Write callbacks are
+currently acknowledged after the shared VFS accepts the write, while the VFS
+materializes and uploads accepted data in the background. The shared writer
+keeps a 200 ms coalescing window for synchronous small callbacks; a strict
+flush, fsync, or last-handle release wakes that materializer and drains the
+accepted tail immediately instead of waiting through the full idle window. The
+bridge applies the `50/40` background queue policy, keeps macFUSE-safe
+`max_write=131072`, and
 reports the preferred I/O size through regular file attributes.
 The mounted performance probe records SFS-491 read-geometry evidence in
 `performance-probe-summary.json`: `read_observations.fuse_read_calls`,

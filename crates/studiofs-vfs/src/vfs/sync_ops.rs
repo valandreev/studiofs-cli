@@ -159,7 +159,14 @@ impl StudioVfs {
     }
 
     pub(super) async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
-        self.state.deferred_materialize_inflight.wait(ino).await;
+        self.state
+            .deferred_materialize_inflight
+            .wait_interrupting(ino)
+            .await;
+        self.state
+            .deferred_materialize_reschedule_needed
+            .lock()
+            .remove(&ino);
     }
 
     pub(super) async fn wait_for_deferred_release_inflight(&self, ino: Ino) {
@@ -169,7 +176,7 @@ impl StudioVfs {
     pub(super) fn register_deferred_release_barrier(
         &self,
         ino: Ino,
-    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
+    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit) {
         let replaced = self.state.deferred_release_inflight.contains(ino);
         let (entry, guard) = self.state.deferred_release_inflight.replace(ino);
         if replaced {
@@ -333,12 +340,14 @@ impl StudioVfs {
     fn start_deferred_materialization_task(
         self: &Arc<Self>,
         entry: DeferredInodeGateEntry,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: tokio::sync::OwnedSemaphorePermit,
     ) {
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let _guard = guard;
             let ino = entry.ino;
             let mut allow_reschedule_on_exit = true;
+            let mut linger_interrupted = false;
             let mut no_progress_retries = 0usize;
             loop {
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
@@ -349,10 +358,15 @@ impl StudioVfs {
                         && vfs.should_linger_clean_deferred_materialization(ino)
                     {
                         no_progress_retries += 1;
-                        tokio::time::sleep(Duration::from_millis(
-                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                        ))
-                        .await;
+                        if entry
+                            .wait_linger_or_interrupt(Duration::from_millis(
+                                super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                            ))
+                            .await
+                        {
+                            linger_interrupted = true;
+                            break;
+                        }
                         continue;
                     }
                     break;
@@ -479,10 +493,15 @@ impl StudioVfs {
                     no_progress_retries = no_progress_retries
                         .saturating_add(1)
                         .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
-                    tokio::time::sleep(Duration::from_millis(
-                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                    ))
-                    .await;
+                    if entry
+                        .wait_linger_or_interrupt(Duration::from_millis(
+                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                        ))
+                        .await
+                    {
+                        linger_interrupted = true;
+                        break;
+                    }
                     continue;
                 }
 
@@ -492,16 +511,40 @@ impl StudioVfs {
                     && vfs.should_linger_deferred_materialization(ino)
                 {
                     no_progress_retries += 1;
-                    tokio::time::sleep(Duration::from_millis(
-                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                    ))
-                    .await;
+                    if entry
+                        .wait_linger_or_interrupt(Duration::from_millis(
+                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                        ))
+                        .await
+                    {
+                        linger_interrupted = true;
+                        break;
+                    }
                     continue;
                 }
                 if !made_progress || !completed_blocks_remain {
                     break;
                 }
                 tokio::task::yield_now().await;
+            }
+
+            if linger_interrupted && vfs.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+                let interrupted_materialize_started = Instant::now();
+                match vfs.materialize_writer_stack_for_inode(ino).await {
+                    Ok(_) => vfs.record_vfs_write_materialize_completed(
+                        interrupted_materialize_started.elapsed(),
+                    ),
+                    Err(error) => {
+                        allow_reschedule_on_exit = false;
+                        if !vfs.suppress_deleted_inode_materialization_error(ino, &error) {
+                            warn!(
+                                ino,
+                                error = %error,
+                                "interrupted deferred writer-stack materialization failed; strict barrier will retry"
+                            );
+                        }
+                    }
+                }
             }
 
             if vfs.inode_has_local_dirty_state(ino)
@@ -520,7 +563,6 @@ impl StudioVfs {
             }
 
             vfs.finish_deferred_materialization_task(entry, allow_reschedule_on_exit);
-            drop(guard);
         }));
     }
 
@@ -927,9 +969,12 @@ impl StudioVfs {
         dirty_attr_persist_policy: DirtyAttrPersistPolicy,
     ) -> VfsResult<LocalSyncBarrierOutcome> {
         // Wait for any in-flight deferred materialization task to finish
-        // before we run our own strict materialization pass.  Without this
-        // the flush/close path and the background task would race on
-        // writer-stack snapshots, producing fragmented blocks.
+        // before we run our own strict materialization pass. A strict waiter
+        // interrupts only the task's coalescing sleep; the task still drains
+        // its accepted tail and normal local-dirty epilogue under the existing
+        // gate. Without this ordering the flush/close path and the background
+        // task would race on writer-stack snapshots, producing fragmented
+        // blocks.
         //
         // The parking_lot lock is scoped so the MutexGuard (which is !Send)
         // is dropped before the .await point.  We then acquire the
@@ -1709,7 +1754,7 @@ impl StudioVfs {
             .handle_table
             .get(fh)
             .filter(|open_file| open_file.ino == ino)
-            .and_then(|open_file| open_file.open_attr.clone())
+            .and_then(|open_file| open_file.open_attr())
         {
             self.note_vfs_write_open_attr_hit();
             base_attr = attr;
@@ -1733,8 +1778,7 @@ impl StudioVfs {
                         .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?;
                     self.handle_table.mark_orphan(ino);
                     open_file
-                        .open_attr
-                        .clone()
+                        .open_attr()
                         .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?
                 }
                 Err(error) => return Err(error),

@@ -131,6 +131,7 @@ impl PendingDirtySlice {
         now.saturating_duration_since(self.created_at)
     }
 
+    #[cfg(test)]
     fn prefix(self, len: usize) -> Option<Self> {
         let len = len.min(self.len());
         let range_end = self.range.start.checked_add(u32::try_from(len).ok()?)?;
@@ -1508,56 +1509,55 @@ impl StudioVfs {
         }
         ordered_slices.sort_by_key(|(chunk_id, slice)| slice.order_key(*chunk_id));
 
+        let mut object_group_indices = std::collections::HashMap::<u64, usize>::new();
+        let mut ordered_object_groups = Vec::<Vec<(u64, PendingDirtySlice)>>::new();
+        for (chunk_id, slice) in ordered_slices.iter().copied() {
+            let object_id = slice
+                .object_id
+                .expect("persisted pending slices must retain their object id");
+            let group_index = *object_group_indices.entry(object_id).or_insert_with(|| {
+                ordered_object_groups.push(Vec::new());
+                ordered_object_groups.len() - 1
+            });
+            ordered_object_groups[group_index].push((chunk_id, slice));
+        }
+
         let now = Instant::now();
         let mut retain_tail_bytes = self
             .pending_slice_commit_hot_tail_bytes()
             .min(total_bytes.saturating_sub(commit_wave_bytes));
-        let mut commit_candidates = Vec::<(u64, PendingDirtySlice)>::new();
-        for (chunk_id, slice) in ordered_slices.iter().rev().copied() {
-            let slice_len = slice.len();
-            let protect_fresh_tail =
-                retain_tail_bytes > 0 && slice.age(now) < PENDING_SLICE_COMMIT_MAX_AGE;
+        let mut commit_candidate_groups = Vec::<&Vec<(u64, PendingDirtySlice)>>::new();
+        for group in ordered_object_groups.iter().rev() {
+            let group_len = group.iter().map(|(_, slice)| slice.len()).sum::<usize>();
+            let protect_fresh_tail = retain_tail_bytes > 0
+                && group
+                    .iter()
+                    .any(|(_, slice)| slice.age(now) < PENDING_SLICE_COMMIT_MAX_AGE);
             if !protect_fresh_tail {
-                commit_candidates.push((chunk_id, slice));
+                commit_candidate_groups.push(group);
                 continue;
             }
-            if slice_len <= retain_tail_bytes {
-                retain_tail_bytes = retain_tail_bytes.saturating_sub(slice_len);
-                continue;
-            }
-
-            let commit_len = slice_len.saturating_sub(retain_tail_bytes);
-            retain_tail_bytes = 0;
-            if let Some(prefix) = slice.prefix(commit_len) {
-                commit_candidates.push((chunk_id, prefix));
-            }
+            retain_tail_bytes = retain_tail_bytes.saturating_sub(group_len);
         }
-        commit_candidates.reverse();
+        commit_candidate_groups.reverse();
 
         let mut selected = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
         let mut selected_bytes = 0usize;
-        for (chunk_id, slice) in commit_candidates.iter().copied() {
-            let remaining = commit_wave_bytes.saturating_sub(selected_bytes);
-            if remaining == 0 {
+        for group in commit_candidate_groups {
+            if selected_bytes >= commit_wave_bytes {
                 break;
             }
-            let commit_len = remaining.min(slice.len());
-            let Some(prefix) = slice.prefix(commit_len) else {
-                continue;
-            };
-            selected.entry(chunk_id).or_default().push(prefix);
-            selected_bytes = selected_bytes.saturating_add(prefix.len());
-            if commit_len < slice.len() {
-                break;
+            for (chunk_id, slice) in group.iter().copied() {
+                selected.entry(chunk_id).or_default().push(slice);
+                selected_bytes = selected_bytes.saturating_add(slice.len());
             }
         }
         if selected.is_empty()
             && oldest_age.is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)
-            && let Some((chunk_id, slice)) = ordered_slices.first().copied()
+            && let Some(group) = ordered_object_groups.first()
         {
-            let commit_len = commit_wave_bytes.min(slice.len());
-            if let Some(prefix) = slice.prefix(commit_len) {
-                selected.entry(chunk_id).or_default().push(prefix);
+            for (chunk_id, slice) in group.iter().copied() {
+                selected.entry(chunk_id).or_default().push(slice);
             }
         }
 
