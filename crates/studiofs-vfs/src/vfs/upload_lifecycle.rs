@@ -292,6 +292,7 @@ impl StudioVfs {
             .shutdown
             .slab_flusher_stopped
             .store(true, Ordering::Release);
+        self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.join_background_tasks(background_join_timeout).await;
 

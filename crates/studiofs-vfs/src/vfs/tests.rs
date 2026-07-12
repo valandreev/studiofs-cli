@@ -17,6 +17,57 @@ use studiofs_meta::{
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn fetch_warmup_shutdown_cancels_in_flight_probe() {
+    let shutdown = CancellationToken::new();
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_by_warmup = completed.clone();
+    let task = tokio::spawn(run_fetch_warmup_until_shutdown(
+        shutdown.clone(),
+        async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            completed_by_warmup.store(true, AtomicOrdering::Release);
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("shutdown must cancel an in-flight warmup probe")
+        .expect("warmup task must not panic");
+    assert!(
+        !completed.load(AtomicOrdering::Acquire),
+        "cancellation must drop the in-flight warmup operation"
+    );
+}
+
+#[tokio::test]
+async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(run_epoch_finalization_until_shutdown(
+        shutdown.clone(),
+        async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            7_u8
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("shutdown must cancel in-flight epoch finalization")
+        .expect("epoch finalizer task must not panic");
+    assert!(
+        result.is_none(),
+        "cancelled finalization must not report a completed epoch"
+    );
+}
 
 #[derive(Default)]
 struct RecordingKernelInvalidator {
@@ -7107,6 +7158,22 @@ fn write_admission_governor_does_not_throttle_when_drain_keeps_up() {
 
     assert_eq!(decision.delay_ms, 0);
     assert!(decision.drain_bytes_per_sec >= decision.ingress_bytes_per_sec);
+}
+
+#[test]
+fn write_admission_governor_handles_empty_drain_and_runway() {
+    let governor = WriteAdmissionGovernor {
+        ingress_bytes_per_sec: 1_000,
+        drain_bytes_per_sec: 0,
+        ..WriteAdmissionGovernor::default()
+    };
+
+    let delay_ms = governor.delay_ms(4 * 1024 * 1024, 1_024, 1_024, 0);
+
+    assert_eq!(
+        delay_ms, WRITE_ADMISSION_MAX_DELAY_MS,
+        "zero drain and zero runway allowance must use a non-zero divisor and saturate at the configured delay cap"
+    );
 }
 
 #[test]

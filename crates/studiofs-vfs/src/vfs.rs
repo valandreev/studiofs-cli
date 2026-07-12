@@ -2096,6 +2096,7 @@ struct ShutdownState {
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_completed: std::sync::atomic::AtomicBool,
     shutdown_notify: tokio::sync::Notify,
+    background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
@@ -2109,11 +2110,32 @@ impl ShutdownState {
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
+            background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
+    }
+}
+
+async fn run_fetch_warmup_until_shutdown(
+    shutdown: CancellationToken,
+    warmup: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = warmup => {}
+    }
+}
+
+async fn run_epoch_finalization_until_shutdown<T>(
+    shutdown: CancellationToken,
+    finalization: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = shutdown.cancelled() => None,
+        result = finalization => Some(result),
     }
 }
 
@@ -4464,9 +4486,13 @@ impl StudioVfs {
 
     fn spawn_fetch_warmup_task(self: &Arc<Self>) {
         let fetch_scheduler = self.fetch_scheduler.clone();
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
         let timeout = Duration::from_secs(3);
         self.track_background_task(tokio::spawn(async move {
-            let _ = fetch_scheduler.warmup(timeout).await;
+            run_fetch_warmup_until_shutdown(shutdown, async move {
+                let _ = fetch_scheduler.warmup(timeout).await;
+            })
+            .await;
         }));
     }
 
