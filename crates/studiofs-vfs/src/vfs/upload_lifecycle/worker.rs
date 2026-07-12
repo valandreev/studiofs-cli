@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
 const FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC: u64 = 1024 * 1024 * 1024;
+const FOREGROUND_UPLOAD_REREAD_YIELD: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 struct ReadyUploads {
@@ -1280,6 +1281,13 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 }),
             );
             return Ok(Some(hot_payload));
+        }
+        let _ = self
+            .vfs
+            .wait_for_foreground_reads_idle(FOREGROUND_UPLOAD_REREAD_YIELD)
+            .await;
+        if self.vfs.shutdown_requested() {
+            return Ok(None);
         }
         let foreground_active = self
             .vfs
