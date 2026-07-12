@@ -1281,15 +1281,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             );
             return Ok(Some(hot_payload));
         }
-        while !self
-            .vfs
-            .wait_for_foreground_reads_idle(Duration::from_secs(1))
-            .await
-        {
-            if self.vfs.shutdown_requested() {
-                return Ok(None);
-            }
-        }
         let foreground_active = self
             .vfs
             .state

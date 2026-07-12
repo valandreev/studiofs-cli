@@ -6290,6 +6290,7 @@ impl StudioVfs {
     }
 
     /// Wait until foreground reads complete or timeout elapses.
+    #[cfg(test)]
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
