@@ -641,6 +641,12 @@ pub(in crate::scenario) trait PostgresOutageDriver {
     ) -> Result<VolumeBootstrapSummary, ScenarioError>;
     fn mount_all(&mut self) -> Result<(), ScenarioError>;
     fn clients(&self) -> Vec<ClientSpec>;
+    // Test drivers use this hook to model the healthy pre-outage publication.
+    fn after_initial_write(
+        &mut self,
+        clients: &[ClientSpec],
+        relative_path: &str,
+    ) -> Result<(), ScenarioError>;
     fn stop_postgres(&mut self) -> Result<(), ScenarioError>;
     fn start_postgres(&mut self) -> Result<(), ScenarioError>;
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
@@ -668,6 +674,14 @@ impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
 
     fn clients(&self) -> Vec<ClientSpec> {
         self.controller.clients().into_iter().cloned().collect()
+    }
+
+    fn after_initial_write(
+        &mut self,
+        _clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        Ok(())
     }
 
     fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
@@ -781,6 +795,21 @@ pub(in crate::scenario) fn run_postgres_outage_body(
         ),
         MOUNTED_WRITE_READBACK_TIMEOUT,
     )?;
+    let initial_clients = &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()];
+    driver.after_initial_write(initial_clients, OUTAGE_INITIAL_FILE_NAME)?;
+    let initial_mounts = initial_clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &initial_mounts,
+        context.scenario_dir.join("healthy-validation"),
+        convergence_timeout,
+        poll_interval,
+    )
+    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+        detail: format!("healthy initial file did not converge: {error}"),
+    })?;
 
     let writer = &clients[0];
     let outage_started = Instant::now();

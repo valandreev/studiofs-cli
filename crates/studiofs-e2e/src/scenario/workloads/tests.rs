@@ -303,6 +303,19 @@ impl PostgresOutageDriver for RecordingOutageDriver {
         self.clients.clone()
     }
 
+    fn after_initial_write(
+        &mut self,
+        clients: &[ClientSpec],
+        relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        self.actions.borrow_mut().push("after_initial_write");
+        let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
+        for client in clients.iter().skip(1) {
+            std::fs::write(client.mount_point.join(relative_path), &payload)?;
+        }
+        Ok(())
+    }
+
     fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
         self.actions.borrow_mut().push("stop_postgres");
         Ok(())
