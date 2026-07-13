@@ -158,12 +158,15 @@ impl<'a> StartupReplayCoordinator<'a> {
             .iter()
             .map(|graph_object| (graph_object.absolute_offset, graph_object.object_id))
             .collect();
+        let covered_block_indices: HashSet<_> = graph_objects
+            .iter()
+            .map(|graph_object| graph_object.block_index)
+            .collect();
 
         for op in self.pending_catalog.ops_for_inode(attr.ino) {
             let key = pending_upload_key(op);
-            let metadata_covers_pending_block = graph_objects.iter().any(|graph_object| {
-                graph_object.block_index == block_index_from_offset(op.offset, self.vfs.block_size)
-            });
+            let block_index = block_index_from_offset(op.offset, self.vfs.block_size);
+            let metadata_covers_pending_block = covered_block_indices.contains(&block_index);
             let recovers_interrupted_metadata_commit = !metadata_covers_pending_block
                 && self.vfs.local_payload_backend.contains(op.object_id);
             let is_live = attr.upload_state != MetaUploadState::Ready

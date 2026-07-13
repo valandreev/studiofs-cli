@@ -1374,6 +1374,56 @@ fn startup_replay_recovers_current_epoch_pending_upload_when_metadata_graph_is_m
 }
 
 #[test]
+fn startup_replay_recovers_uploaded_pending_payload_when_metadata_graph_is_missing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-uploaded-missing-graph");
+
+    let created = vfs
+        .create(1, b"startup-uploaded-missing-graph.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 9_102;
+    let payload = b"uploaded payload whose metadata commit was interrupted";
+
+    vfs.local_payload_backend()
+        .put(object_id, payload, true)
+        .expect("persist uploaded local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+    assert!(
+        vfs.local_payload_backend().dirty_object_ids().is_empty(),
+        "uploaded payload must not be present in the dirty-only startup snapshot"
+    );
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+
+    vfs.cached_store()
+        .submit_upload(ino, 0, object_id, attr.content_epoch);
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr.clone()]);
+
+    assert_eq!(
+        (
+            vfs.live_extent_records_for_inode(ino),
+            vfs.pending_uploads_for_inode(ino),
+        ),
+        (
+            vec![(0, object_id, attr.content_epoch)],
+            vec![(0, object_id, attr.content_epoch)],
+        ),
+        "startup replay must recover an uploaded current-epoch payload when metadata commit was interrupted"
+    );
+}
+
+#[test]
 fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");

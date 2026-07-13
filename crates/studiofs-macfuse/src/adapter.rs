@@ -1129,7 +1129,7 @@ fn normalize_close_flush_result(result: Result<(), i32>) -> Result<(), i32> {
         // ENOENT here prevents the kernel from advancing to `release`, even
         // though the open handle and its locally accepted payload remain valid.
         Err(libc::ENOENT) => Ok(()),
-        result => result,
+        other => other,
     }
 }
 
