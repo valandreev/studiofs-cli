@@ -803,7 +803,7 @@ pub(in crate::scenario) fn perform_namespace_collision_operations(
                         order: 2,
                         client: clients[1].clone(),
                         operation: "create",
-                        helper_operation: "create",
+                        helper_operation: "create-barrier-sync",
                         path: "race/child.txt",
                         target: None,
                         payload: Some(b"child\n"),

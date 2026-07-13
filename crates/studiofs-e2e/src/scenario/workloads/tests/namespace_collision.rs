@@ -63,6 +63,51 @@ fn namespace_collision_records_operations_and_validates_three_client_convergence
 }
 
 #[test]
+fn mkdir_rmdir_vs_create_uses_sync_only_create_helper() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let sandbox = temp.path().join("run-mkdir-rmdir-vs-create-helper");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(COLLISION_MKDIR_RMDIR_VS_CREATE);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let clients = COLLISION_CLIENT_NAMES
+        .iter()
+        .copied()
+        .map(|name| {
+            let mount = temp.path().join("mounts").join(name);
+            std::fs::create_dir_all(mount.join("race")).unwrap();
+            client_spec_for(&sandbox, "projectfs", name, mount)
+        })
+        .collect::<Vec<_>>();
+    let context = ScenarioContext {
+        run_id: "run-mkdir-rmdir-vs-create-helper".to_string(),
+        seed: 328,
+        sandbox,
+        scenario_dir: scenario_dir.clone(),
+        client_controller_config: None,
+    };
+
+    perform_namespace_collision_operations(
+        &context,
+        NamespaceCollisionKind::MkdirRmdirVsCreate,
+        &clients,
+    )
+    .unwrap();
+
+    let progress_files = std::fs::read_dir(scenario_dir.join("hotspot-helper-progress"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        progress_files
+            .iter()
+            .any(|name| name.contains("client-b-create-barrier-sync-race_child_txt")),
+        "create operation must avoid an inline readback during the namespace race: {progress_files:?}"
+    );
+}
+
+#[test]
 fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
