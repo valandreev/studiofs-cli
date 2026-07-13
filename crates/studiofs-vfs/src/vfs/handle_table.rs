@@ -172,6 +172,9 @@ impl HandleTable {
     }
 
     /// Check if inode is an orphan and remove the mark. Returns true if it was.
+    ///
+    /// This is transient last-handle release routing, not durable cleanup-retry
+    /// state; object reachability GC does not consult the handle table.
     pub(super) fn take_orphan(&self, ino: Ino) -> bool {
         self.orphans.lock().remove(&ino)
     }

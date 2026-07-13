@@ -1,6 +1,8 @@
 //! Mounted action and helper-process operations shared by advanced scenarios.
 
 use super::*;
+#[cfg(all(target_os = "macos", not(test)))]
+use std::os::fd::IntoRawFd;
 
 static BOUNDED_MOUNTED_IO_POOL: OnceLock<BoundedMountedIoPool> = OnceLock::new();
 pub(in crate::scenario) static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize =
@@ -1629,7 +1631,7 @@ fn close_synced_mounted_file(file: fs::File) -> io::Result<()> {
     // sync already succeeded. Keep the descriptor owned by the short-lived
     // helper until its parent has validated the operation and unmounted the
     // client, then let process teardown release it safely.
-    std::mem::forget(file);
+    let _ = file.into_raw_fd();
     Ok(())
 }
 

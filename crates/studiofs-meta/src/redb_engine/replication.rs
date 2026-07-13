@@ -1345,6 +1345,18 @@ impl RedbMetaEngine {
         }
         Ok(matching)
     }
+
+    /// Return the lowest sequence number still present in the local event log.
+    pub(crate) fn first_event_seq(&self) -> MetaResult<Option<u64>> {
+        let txn = self.begin_read_txn()?;
+        let table = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let first = table
+            .first()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(first.map(|(seq, _)| seq.value()))
+    }
 }
 
 impl MetaReplication for RedbMetaEngine {

@@ -114,7 +114,7 @@ impl PgMetaEngine {
         let event_end = self.local.get_counter("nextEventSeq")?;
         let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
 
-        let mut event_start = 0;
+        let mut event_start = self.local.first_event_seq()?.unwrap_or(event_end);
         while event_start < event_end {
             let event_batch_end = event_start
                 .saturating_add(REDB_REPAIR_EVENT_BATCH_SIZE)
