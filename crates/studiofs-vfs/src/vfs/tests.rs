@@ -1424,6 +1424,52 @@ fn startup_replay_recovers_uploaded_pending_payload_when_metadata_graph_is_missi
 }
 
 #[test]
+fn startup_replay_does_not_recover_pending_upload_beyond_truncated_size() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-truncated-pending-upload");
+
+    let created = vfs
+        .create(1, b"startup-truncated-pending-upload.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 9_103;
+
+    vfs.local_payload_backend()
+        .put(object_id, b"payload truncated before startup replay", false)
+        .expect("persist truncated local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync truncated local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 1;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist truncated attr");
+
+    vfs.cached_store().submit_upload(
+        ino,
+        u64::from(vfs.block_size),
+        object_id,
+        attr.content_epoch,
+    );
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    assert_eq!(
+        (
+            vfs.live_extent_records_for_inode(ino),
+            vfs.pending_uploads_for_inode(ino),
+        ),
+        (Vec::new(), Vec::new()),
+        "startup replay must cancel a pending upload whose offset is beyond the truncated file size"
+    );
+}
+
+#[test]
 fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");

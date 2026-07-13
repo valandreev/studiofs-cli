@@ -168,6 +168,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             let block_index = block_index_from_offset(op.offset, self.vfs.block_size);
             let metadata_covers_pending_block = covered_block_indices.contains(&block_index);
             let recovers_interrupted_metadata_commit = !metadata_covers_pending_block
+                && op.offset < attr.size
                 && self.vfs.local_payload_backend.contains(op.object_id);
             let is_live = attr.upload_state != MetaUploadState::Ready
                 && op.content_epoch == attr.content_epoch
