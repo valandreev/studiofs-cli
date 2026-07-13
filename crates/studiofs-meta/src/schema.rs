@@ -301,6 +301,15 @@ impl InodeLifecycleRecord {
 }
 
 impl InodeAttr {
+    /// Return `true` when a regular file has locally visible content that is
+    /// not yet settled in the committed remote view.
+    pub fn is_upload_pending(&self) -> bool {
+        self.kind == FileType::RegularFile
+            && self.upload_state != UploadState::Ready
+            && (self.content_epoch != self.committed_content_epoch
+                || self.size != self.committed_size)
+    }
+
     /// Return `true` for a brand-new empty regular file that has not published
     /// its dentry to remote peers yet.
     pub fn is_unpublished_empty_draft(&self) -> bool {
@@ -2150,5 +2159,23 @@ mod tests {
         assert!(attr.mtime > 0);
         assert!(attr.ctime > 0);
         assert!(attr.atime > 0);
+    }
+
+    #[test]
+    fn test_inode_attr_upload_pending_requires_unpublished_regular_file() {
+        let mut attr = InodeAttr::new_file(2, 1, 1000, 1000, 0o644);
+        assert!(!attr.is_upload_pending());
+
+        attr.upload_state = UploadState::Uploading;
+        attr.size = 1;
+        attr.content_epoch = 1;
+        assert!(attr.is_upload_pending());
+
+        attr.committed_size = attr.size;
+        attr.committed_content_epoch = attr.content_epoch;
+        assert!(!attr.is_upload_pending());
+
+        attr.kind = FileType::Directory;
+        assert!(!attr.is_upload_pending());
     }
 }

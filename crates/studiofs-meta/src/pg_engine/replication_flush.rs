@@ -6,10 +6,12 @@ use super::{
 use crate::engine::{MetaError, MetaInodes, MetaPayloadObjects, MetaResult};
 use crate::events::MetaEvent;
 use crate::schema::{ChunkId, PayloadRefState, SliceRecord};
-use crate::types::{FileType, Ino, InodeAttr, UploadState};
+use crate::types::{FileType, Ino, InodeAttr};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 
 #[derive(Default)]
 struct RepairedRegularFileOverlay {
@@ -110,38 +112,41 @@ impl PgMetaEngine {
         &self,
     ) -> MetaResult<()> {
         let event_end = self.local.get_counter("nextEventSeq")?;
-        let events = self.local.read_events_range(0, event_end)?;
         let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
 
-        for event in events {
-            match event {
-                MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
-                    let overlay = overlays.entry(ino).or_default();
-                    for (chunk_id, slices) in chunk_slices {
-                        overlay.chunks.insert(chunk_id, slices);
+        let mut event_start = 0;
+        while event_start < event_end {
+            let event_batch_end = event_start
+                .saturating_add(REDB_REPAIR_EVENT_BATCH_SIZE)
+                .min(event_end);
+            for event in self.local.read_events_range(event_start, event_batch_end)? {
+                match event {
+                    MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                        let overlay = overlays.entry(ino).or_default();
+                        for (chunk_id, slices) in chunk_slices {
+                            overlay.chunks.insert(chunk_id, slices);
+                        }
                     }
-                }
-                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                    let is_unfinished = attr.upload_state != UploadState::Ready
-                        && (attr.content_epoch != attr.committed_content_epoch
-                            || attr.size != attr.committed_size);
-                    let overlay = overlays.entry(attr.ino).or_default();
-                    if !is_unfinished {
-                        overlay.reset();
-                        continue;
+                    MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                        let overlay = overlays.entry(attr.ino).or_default();
+                        if !attr.is_upload_pending() {
+                            overlay.reset();
+                            continue;
+                        }
+                        overlay.attr = Some(attr);
                     }
-                    overlay.attr = Some(attr);
+                    MetaEvent::SetAttr { attr } => {
+                        overlays.remove(&attr.ino);
+                    }
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                    | MetaEvent::RemoveRegularFileGraph { ino }
+                    | MetaEvent::RemoveAttr { ino } => {
+                        overlays.remove(&ino);
+                    }
+                    _ => {}
                 }
-                MetaEvent::SetAttr { attr } => {
-                    overlays.remove(&attr.ino);
-                }
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveRegularFileGraph { ino }
-                | MetaEvent::RemoveAttr { ino } => {
-                    overlays.remove(&ino);
-                }
-                _ => {}
             }
+            event_start = event_batch_end;
         }
 
         let mut restored_inodes = 0usize;

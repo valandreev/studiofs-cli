@@ -654,7 +654,7 @@ fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-const HELD_HELPER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const HELD_HELPER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const HELD_HELPER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn wait_for_held_helper_release(marker: Option<&std::path::Path>, parent_pid: Option<u32>) {
