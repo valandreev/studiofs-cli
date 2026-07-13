@@ -218,7 +218,7 @@ pub struct AclRule {
 ///
 /// Key design: timestamps stored as nanoseconds since Unix epoch,
 /// simplifying comparisons and range queries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeAttr {
     /// Inode number.
     pub ino: Ino,

@@ -1631,6 +1631,7 @@ fn close_synced_mounted_file(file: fs::File) -> io::Result<()> {
     // sync already succeeded. Keep the descriptor owned by the short-lived
     // helper until its parent has validated the operation and unmounted the
     // client, then let process teardown release it safely.
+    // INTENTIONAL LEAK: process teardown closes the fd after unmount.
     let _ = file.into_raw_fd();
     Ok(())
 }

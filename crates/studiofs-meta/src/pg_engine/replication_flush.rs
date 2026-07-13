@@ -33,22 +33,24 @@ impl RepairedRegularFileOverlay {
 }
 
 fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
-    left.ino == right.ino
-        && left.kind == right.kind
-        && left.mode == right.mode
-        && left.uid == right.uid
-        && left.gid == right.gid
-        && left.committed_size == right.committed_size
-        && left.nlink == right.nlink
-        && left.mtime == right.mtime
-        && left.ctime == right.ctime
-        && left.atime == right.atime
-        && left.parent == right.parent
-        && left.crtime == right.crtime
-        && left.win_attrs == right.win_attrs
-        && left.content_epoch == right.content_epoch
-        && left.committed_content_epoch == right.committed_content_epoch
-        && left.upload_state == right.upload_state
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.size = 0;
+    right.size = 0;
+    left == right
+}
+
+fn push_repaired_overlay_events(
+    events: &mut Vec<MetaEvent>,
+    attr: InodeAttr,
+    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+) {
+    let ino = attr.ino;
+    events.push(MetaEvent::SetAttr { attr });
+    events.push(MetaEvent::SetRegularFileOverlaySlices {
+        ino,
+        chunk_slices: chunks.into_iter().collect(),
+    });
 }
 
 impl PgMetaEngine {
@@ -150,6 +152,7 @@ impl PgMetaEngine {
         }
 
         let mut restored_inodes = 0usize;
+        let mut restored_events = Vec::new();
         for (ino, overlay) in overlays {
             if overlay.chunks.is_empty() || !overlay.has_uploaded_payload() {
                 continue;
@@ -173,17 +176,12 @@ impl PgMetaEngine {
                 continue;
             }
 
-            self.local.apply_replica_serving_state(&[
-                MetaEvent::SetAttr { attr },
-                MetaEvent::SetRegularFileOverlaySlices {
-                    ino,
-                    chunk_slices: overlay.chunks.into_iter().collect(),
-                },
-            ])?;
+            push_repaired_overlay_events(&mut restored_events, attr, overlay.chunks);
             restored_inodes = restored_inodes.saturating_add(1);
         }
 
         if restored_inodes > 0 {
+            self.local.apply_replica_serving_state(&restored_events)?;
             self.local.rebuild_inode_lifecycle_table()?;
             tracing::warn!(
                 restored_inodes,
@@ -393,5 +391,41 @@ impl PgMetaEngine {
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
         let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[test]
+    fn repair_identity_ignores_only_local_visible_size() {
+        let left = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        let mut right = left.clone();
+        right.size = 128;
+
+        assert!(attrs_match_repair_identity(&left, &right));
+
+        right.committed_size = 64;
+        assert!(!attrs_match_repair_identity(&left, &right));
+    }
+
+    #[test]
+    fn repaired_overlay_events_preserve_attr_before_slices() {
+        let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        let mut events = Vec::new();
+
+        push_repaired_overlay_events(&mut events, attr.clone(), BTreeMap::new());
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            MetaEvent::SetAttr { attr: actual } if actual == &attr
+        ));
+        assert!(matches!(
+            &events[1],
+            MetaEvent::SetRegularFileOverlaySlices { ino: 42, chunk_slices }
+                if chunk_slices.is_empty()
+        ));
     }
 }
