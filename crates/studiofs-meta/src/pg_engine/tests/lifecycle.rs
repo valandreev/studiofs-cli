@@ -44,6 +44,71 @@ fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
 }
 
 #[test]
+fn repair_startup_keeps_recovery_marker_when_remote_sync_fails() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "repair-startup-remote-failure",
+            "repair-startup-remote-failure-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set unavailable postgres config");
+    local
+        .set_counter(LOCAL_PG_CLIENT_SLOT_COUNTER, 1)
+        .expect("persist client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 73)
+        .expect("persist stale replay cursor");
+    local
+        .set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, 71)
+        .expect("persist stale namespace replay cursor");
+    local
+        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+        .expect("set repair recovery marker");
+    drop(local);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    );
+    assert!(
+        reopened.is_err(),
+        "repair startup must fail rather than starting cleanup from stale local state"
+    );
+
+    let local = RedbMetaEngine::open(&db).expect("reopen local metadata");
+    assert_eq!(
+        local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .expect("read repair recovery marker"),
+        1,
+        "failed repair startup must leave the recovery marker durable for a later retry"
+    );
+    assert_eq!(
+        local
+            .get_counter(LOCAL_PG_VERSION_COUNTER)
+            .expect("read replay cursor"),
+        0,
+        "repair startup must reset stale replay cursor before attempting remote recovery"
+    );
+    assert_eq!(
+        local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .expect("read namespace replay cursor"),
+        0,
+        "repair startup must reset stale namespace replay cursor before attempting remote recovery"
+    );
+}
+
+#[test]
 fn startup_snapshot_preserves_local_overlay_when_only_acl_changed() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg

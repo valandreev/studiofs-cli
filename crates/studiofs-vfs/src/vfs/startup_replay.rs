@@ -766,6 +766,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .iter()
             .copied()
             .chain(self.dirty_set.iter().copied())
+            .chain(live_extents.iter().map(|(_, _, object_id, _)| *object_id))
             .collect();
         self.cleanup_unreferenced_local_payloads(
             local_object_ids,
@@ -801,6 +802,10 @@ impl<'a> StartupReplayCoordinator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::tests::{FileGraphMetaFixture, make_unstarted_test_vfs};
+    use studiofs_meta::MetaGc;
+    use studiofs_meta::engine::MetaInodes;
+    use studiofs_meta::schema::PayloadRef;
 
     fn zero_size_unpublished_attr(nlink: u32) -> InodeAttr {
         let mut attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
@@ -877,6 +882,75 @@ mod tests {
         assert!(
             StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
             "startup replay should still clean up unlinked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn finish_keeps_uploaded_live_extent_until_epoch_finalization() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-live-extent-cleanup");
+        let created = vfs
+            .create(1, b"pending-finalization.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let object_id = 991_339;
+        let payload = b"uploaded payload awaiting epoch finalization";
+
+        vfs.local_payload_backend()
+            .put(object_id, payload, true)
+            .expect("persist uploaded local payload");
+        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .sync_data()
+            .expect("sync uploaded local payload");
+
+        let mut attr = meta.get_attr(created.ino).expect("load test attr");
+        attr.size = payload.len() as u64;
+        attr.committed_size = 0;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 0;
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist nonfinalized attr");
+        meta.stage_payload_slice(
+            created.ino,
+            0,
+            &PayloadRef::new_partial(object_id, payload.len() as u32),
+        )
+        .expect("persist uploaded payload slice");
+
+        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[]);
+        coordinator.process_attr(&attr);
+        assert_eq!(
+            coordinator
+                .live_extents
+                .get(&(created.ino, 0))
+                .map(|extent| extent.object_id),
+            Some(object_id),
+            "startup replay should retain the nonfinalized extent before cleanup"
+        );
+
+        meta.remove_attr(created.ino)
+            .expect("model transient metadata reachability gap");
+        assert!(
+            !meta
+                .get_referenced_object_ids()
+                .expect("read transient reachability")
+                .contains(&object_id),
+            "test setup should leave the recovered live extent temporarily unreachable from metadata"
+        );
+
+        coordinator.finish();
+
+        assert!(
+            vfs.local_payload_backend().contains(object_id),
+            "startup cleanup must keep an uploaded extent already retained for epoch finalization"
+        );
+        assert_eq!(
+            vfs.state
+                .upload
+                .upload_canceled_stale
+                .load(Ordering::Relaxed),
+            0,
+            "startup cleanup must not classify a recovered live extent as stale"
         );
     }
 }

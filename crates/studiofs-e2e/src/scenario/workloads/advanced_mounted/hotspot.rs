@@ -385,6 +385,16 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
         if let Some(payload_path) = &payload_path {
             command.arg("--payload").arg(payload_path);
         }
+        let hold_after_complete = should_hold_completed_hotspot_helper(context, operation);
+        if hold_after_complete {
+            let marker = create_completed_hotspot_helper_hold_marker(context, &progress_path)?;
+            command
+                .arg("--hold-after-complete")
+                .arg("--hold-release-marker")
+                .arg(marker)
+                .arg("--hold-parent-pid")
+                .arg(std::process::id().to_string());
+        }
         command
             .arg("--timeout-ms")
             .arg(duration_millis_u64(hotspot_helper_internal_timeout(timeout)).to_string());
@@ -414,6 +424,8 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
                 format!("failed to isolate hotspot helper process: {error}"),
             ))
         })?;
+        #[cfg(target_os = "macos")]
+        let mut job = job;
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -439,6 +451,15 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
                     stderr.trim(),
                     progress.as_deref().unwrap_or("<none>")
                 ))));
+            }
+            // Only the macOS held-helper path needs completion polling. Keep
+            // ordinary helpers on the original try_wait-only fast path.
+            if held_helper_completion_detected(hold_after_complete, || {
+                read_hotspot_helper_progress_tail(&progress_path)
+            }) {
+                #[cfg(target_os = "macos")]
+                job.detach();
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 let progress = read_hotspot_helper_progress_tail(&progress_path);
@@ -682,6 +703,67 @@ pub(in crate::scenario) fn read_hotspot_helper_progress_tail(progress: &Path) ->
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(str::to_string)
+}
+
+pub(in crate::scenario) fn hotspot_helper_progress_completed(progress: Option<&str>) -> bool {
+    progress
+        .and_then(|progress| serde_json::from_str::<serde_json::Value>(progress).ok())
+        .is_some_and(|progress| {
+            progress.get("phase").and_then(serde_json::Value::as_str) == Some("completed")
+        })
+}
+
+pub(in crate::scenario) fn held_helper_completion_detected(
+    hold_after_complete: bool,
+    read_progress: impl FnOnce() -> Option<String>,
+) -> bool {
+    hold_after_complete && hotspot_helper_progress_completed(read_progress().as_deref())
+}
+
+pub(in crate::scenario) fn should_hold_completed_hotspot_helper(
+    context: &ScenarioContext,
+    operation: &str,
+) -> bool {
+    cfg!(target_os = "macos")
+        && operation == "append"
+        && context
+            .scenario_dir
+            .file_name()
+            .is_some_and(|name| name == COLLISION_UNLINK_VS_APPEND)
+}
+
+fn completed_hotspot_helper_hold_dir(context: &ScenarioContext) -> PathBuf {
+    context.scenario_dir.join("hotspot-helper-holds")
+}
+
+pub(in crate::scenario) fn create_completed_hotspot_helper_hold_marker(
+    context: &ScenarioContext,
+    progress_path: &Path,
+) -> io::Result<PathBuf> {
+    let hold_dir = completed_hotspot_helper_hold_dir(context);
+    fs::create_dir_all(&hold_dir)?;
+    let marker = hold_dir.join(
+        progress_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("held-helper")),
+    );
+    fs::write(&marker, b"hold")?;
+    Ok(marker)
+}
+
+pub(in crate::scenario) fn release_completed_hotspot_helpers(
+    context: &ScenarioContext,
+) -> io::Result<()> {
+    let hold_dir = completed_hotspot_helper_hold_dir(context);
+    let entries = match fs::read_dir(&hold_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        fs::remove_file(entry?.path())?;
+    }
+    Ok(())
 }
 
 pub(in crate::scenario) fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(

@@ -403,7 +403,18 @@ mod imp {
         }
 
         pub(crate) fn force_kill(&self) -> io::Result<bool> {
+            if self.pgid <= 0 {
+                return Ok(false);
+            }
             signal_process_group(self.pgid, libc::SIGKILL)
+        }
+
+        #[cfg(not(test))]
+        pub(crate) fn detach(&mut self) {
+            if self.pgid > 0 {
+                unregister_group(self.pgid);
+                self.pgid = 0;
+            }
         }
     }
 

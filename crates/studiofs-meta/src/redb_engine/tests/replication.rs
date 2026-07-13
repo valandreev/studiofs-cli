@@ -1,3 +1,32 @@
+fn clear_event_log_for_test(engine: &RedbMetaEngine) {
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        events.retain(|_, _| false).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn first_event_seq_returns_none_for_empty_log() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+
+    assert_eq!(engine.first_event_seq().unwrap(), None);
+}
+
+#[test]
+fn first_event_seq_returns_lowest_durable_sequence() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    engine.set_counter("nextEventSeq", 1_000_000).unwrap();
+    engine
+        .create_file(ROOT_INO, b"sparse-event-log.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    assert_eq!(engine.first_event_seq().unwrap(), Some(1_000_000));
+}
+
 #[test]
 fn test_replica_apply_keeps_namespace_in_base_only() {
     let engine = temp_engine();

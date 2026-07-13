@@ -131,6 +131,7 @@ pub fn open_meta_engine_with_options(
                 let info = redb.get_format_info()?;
                 ensure_supported_format_version(&info)?;
                 if info.metadata.backend == MetadataBackend::Postgres {
+                    redb.set_counter(pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)?;
                     redb.set_counter("pgLastAppliedBatchVersion", 0)?;
                     redb.set_counter("pgLastAppliedNamespaceBatchVersion", 0)?;
                 }

@@ -4,6 +4,7 @@ use super::*;
 enum SnapshotImportMode {
     Local,
     RemoteReplace,
+    RemoteReplacePreservingEventLog,
     RemotePreserveLocalState,
 }
 
@@ -243,6 +244,18 @@ impl RedbMetaEngine {
         self.import_snapshot_with_mode(snapshot, SnapshotImportMode::RemoteReplace)
     }
 
+    /// Import a remote snapshot while retaining the local event journal needed
+    /// to reconstruct a redb-repaired pending regular-file graph.
+    pub fn import_remote_snapshot_preserving_local_event_log(
+        &self,
+        snapshot: &RedbSnapshot,
+    ) -> MetaResult<()> {
+        self.import_snapshot_with_mode(
+            snapshot,
+            SnapshotImportMode::RemoteReplacePreservingEventLog,
+        )
+    }
+
     /// Import a remote snapshot while preserving this client's local overlay and replay log.
     pub fn import_remote_snapshot_preserving_local_state(
         &self,
@@ -258,6 +271,8 @@ impl RedbMetaEngine {
     ) -> MetaResult<()> {
         let enable_remote_namespace_filter = mode != SnapshotImportMode::Local;
         let preserve_local_state = mode == SnapshotImportMode::RemotePreserveLocalState;
+        let preserve_event_log =
+            preserve_local_state || mode == SnapshotImportMode::RemoteReplacePreservingEventLog;
         let (preserved_inodes, preserved_dentries) = if preserve_local_state {
             let txn = self.begin_read_txn()?;
             let mut overlay_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
@@ -331,7 +346,12 @@ impl RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
-                .retain(|_, _| preserve_local_state)
+                .retain(|name, _| {
+                    preserve_local_state
+                        || (preserve_event_log
+                            && (name == "nextEventSeq"
+                                || crate::pg_engine::is_local_pg_snapshot_state_counter(name)))
+                })
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {
                 if enable_remote_namespace_filter
@@ -572,7 +592,7 @@ impl RedbMetaEngine {
             }
         }
         {
-            if !preserve_local_state {
+            if !preserve_event_log {
                 let mut table = txn
                     .open_table(EVENT_LOG_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;

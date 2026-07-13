@@ -169,6 +169,18 @@ pub struct HotspotOpArgs {
     /// Internal operation timeout so the helper can cancel mounted I/O before parent kill.
     #[arg(long, hide = true)]
     pub timeout_ms: Option<u64>,
+
+    /// Keep the helper process alive after a successful operation.
+    #[arg(long, hide = true)]
+    pub hold_after_complete: bool,
+
+    /// Marker file whose removal releases a held helper process.
+    #[arg(long, hide = true)]
+    pub hold_release_marker: Option<PathBuf>,
+
+    /// Parent runner PID whose exit releases a held helper process.
+    #[arg(long, hide = true)]
+    pub hold_parent_pid: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -245,6 +257,14 @@ pub struct OpenHandleOpArgs {
     /// Per-sequence progress JSONL path used to diagnose bounded helper timeouts.
     #[arg(long, hide = true)]
     pub progress: Option<PathBuf>,
+
+    /// Marker file whose removal releases the helper after client unmount.
+    #[arg(long, hide = true)]
+    pub hold_release_marker: Option<PathBuf>,
+
+    /// Parent runner PID whose exit releases a held helper process.
+    #[arg(long, hide = true)]
+    pub hold_parent_pid: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -513,6 +533,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code)
         }
         Commands::HotspotOp(args) => {
+            arm_held_helper_parent_watchdog(args.hold_parent_pid)?;
             let result = scenario::run_hotspot_op_helper_with_timeout(
                 &args.operation,
                 args.mount_point,
@@ -527,6 +548,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             // without running any remaining process teardown that can wedge while
             // WinFSP is under churn.
             match result {
+                Ok(()) if args.hold_after_complete => {
+                    wait_for_held_helper_release(
+                        args.hold_release_marker.as_deref(),
+                        args.hold_parent_pid,
+                    );
+                    std::process::exit(0);
+                }
                 Ok(()) => std::process::exit(0),
                 Err(error) => {
                     eprintln!("{error:#}");
@@ -555,6 +583,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Commands::OpenHandleOp(args) => {
+            arm_held_helper_parent_watchdog(args.hold_parent_pid)?;
             scenario::run_open_handle_op_helper(
                 args.client_a_mount,
                 args.client_b_mount,
@@ -564,9 +593,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 &args.append_payload,
                 args.progress.as_deref(),
             )?;
-            // This helper isolates the whole open-handle mutation sequence.  Exit
-            // immediately after the bounded filesystem work returns so parent
-            // cleanup does not inherit any helper-local teardown risk.
+            wait_for_held_helper_release(args.hold_release_marker.as_deref(), args.hold_parent_pid);
+            // The parent removes the marker only after unmount, so process
+            // teardown cannot wedge on a live macFUSE channel here.
             std::process::exit(0);
         }
         Commands::ProcessDump(args) => {
@@ -625,6 +654,96 @@ fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+const HELD_HELPER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const HELD_HELPER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn wait_for_held_helper_release(marker: Option<&std::path::Path>, parent_pid: Option<u32>) {
+    let Some(marker) = marker else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let marker_exists = marker.exists();
+        let parent_alive = parent_pid.map(held_helper_parent_is_alive).unwrap_or(true);
+        let watchdog_expired = started.elapsed() >= HELD_HELPER_WATCHDOG;
+        if !held_helper_should_wait(marker_exists, parent_alive, watchdog_expired) {
+            return;
+        }
+        std::thread::sleep(HELD_HELPER_POLL_INTERVAL);
+    }
+}
+
+fn held_helper_should_wait(
+    marker_exists: bool,
+    parent_alive: bool,
+    watchdog_expired: bool,
+) -> bool {
+    marker_exists && parent_alive && !watchdog_expired
+}
+
+#[cfg(unix)]
+fn held_helper_parent_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only probes whether the supplied process exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn held_helper_parent_is_valid(
+    observed_parent_pid: u32,
+    expected_parent_pid: u32,
+    parent_alive: bool,
+) -> bool {
+    observed_parent_pid == expected_parent_pid && parent_alive
+}
+
+#[cfg(target_os = "macos")]
+fn arm_held_helper_parent_watchdog(parent_pid: Option<u32>) -> std::io::Result<()> {
+    let Some(expected_parent_pid) = parent_pid else {
+        return Ok(());
+    };
+    std::thread::Builder::new()
+        .name("studiofs-e2e-held-helper-parent-watchdog".to_string())
+        .spawn(move || {
+            loop {
+                // SAFETY: getppid only reads the calling process's parent PID.
+                let observed_parent_pid = unsafe { libc::getppid() };
+                let parent_is_valid =
+                    u32::try_from(observed_parent_pid)
+                        .ok()
+                        .is_some_and(|observed_parent_pid| {
+                            held_helper_parent_is_valid(
+                                observed_parent_pid,
+                                expected_parent_pid,
+                                held_helper_parent_is_alive(expected_parent_pid),
+                            )
+                        });
+                if !parent_is_valid {
+                    // A macOS helper may be detached after its mounted operation
+                    // completes. Exiting here avoids retaining a live FUSE file
+                    // descriptor when its scenario parent disappears mid-operation.
+                    std::process::exit(0);
+                }
+                std::thread::sleep(HELD_HELPER_POLL_INTERVAL);
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm_held_helper_parent_watchdog(_parent_pid: Option<u32>) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn held_helper_parent_is_alive(_pid: u32) -> bool {
+    // Windows helpers are never detached, so the watchdog is sufficient for
+    // this defensive fallback.
+    true
+}
+
 fn should_print_run_one_summary(exit_code: i32) -> bool {
     exit_code != 0
 }
@@ -679,6 +798,8 @@ mod tests {
             "hotspot/slot-1-renamed.txt",
             "--timeout-ms",
             "13000",
+            "--hold-parent-pid",
+            "4242",
         ])
         .expect("hidden hotspot-op command should parse");
 
@@ -691,6 +812,7 @@ mod tests {
         assert_eq!(args.path, "hotspot/slot-1.txt");
         assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));
         assert_eq!(args.timeout_ms, Some(13_000));
+        assert_eq!(args.hold_parent_pid, Some(4242));
         assert_eq!(args.progress, None);
     }
 
@@ -713,6 +835,8 @@ mod tests {
             "open-handles/renamed-destination.txt",
             "--append-payload",
             "target/e2e-runs/run-1/open-handle.payload",
+            "--hold-parent-pid",
+            "4242",
         ])
         .expect("hidden open-handle-op command should parse");
 
@@ -730,6 +854,22 @@ mod tests {
             PathBuf::from("target/e2e-runs/run-1/open-handle.payload")
         );
         assert_eq!(args.progress, None);
+        assert_eq!(args.hold_parent_pid, Some(4242));
+    }
+
+    #[test]
+    fn held_helper_stops_waiting_after_parent_exit_or_watchdog() {
+        assert!(held_helper_should_wait(true, true, false));
+        assert!(!held_helper_should_wait(false, true, false));
+        assert!(!held_helper_should_wait(true, false, false));
+        assert!(!held_helper_should_wait(true, true, true));
+    }
+
+    #[test]
+    fn held_helper_parent_watchdog_rejects_dead_or_reparented_parent() {
+        assert!(held_helper_parent_is_valid(4242, 4242, true));
+        assert!(!held_helper_parent_is_valid(4242, 4242, false));
+        assert!(!held_helper_parent_is_valid(1, 4242, true));
     }
 
     #[test]

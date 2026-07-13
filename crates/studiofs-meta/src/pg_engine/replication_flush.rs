@@ -3,9 +3,61 @@
 use super::{
     ClaimedPendingBatch, PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaPayloadObjects, MetaResult};
+use crate::events::MetaEvent;
+use crate::schema::{ChunkId, PayloadRefState, SliceRecord};
+use crate::types::{FileType, Ino, InodeAttr};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
+
+#[derive(Default)]
+struct RepairedRegularFileOverlay {
+    attr: Option<InodeAttr>,
+    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+}
+
+impl RepairedRegularFileOverlay {
+    fn reset(&mut self) {
+        self.attr = None;
+        self.chunks.clear();
+    }
+
+    fn has_uploaded_payload(&self) -> bool {
+        self.chunks.values().flatten().any(|slice| {
+            slice.payload.is_some() && slice.payload_state == PayloadRefState::Uploaded
+        })
+    }
+}
+
+fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.size = 0;
+    right.size = 0;
+    left == right
+}
+
+fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> bool {
+    current == candidate
+        || (attrs_match_repair_identity(current, candidate)
+            && current.size == candidate.committed_size)
+}
+
+fn push_repaired_overlay_events(
+    events: &mut Vec<MetaEvent>,
+    attr: InodeAttr,
+    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+) {
+    let ino = attr.ino;
+    events.push(MetaEvent::SetAttr { attr });
+    events.push(MetaEvent::SetRegularFileOverlaySlices {
+        ino,
+        chunk_slices: chunks.into_iter().collect(),
+    });
+}
 
 impl PgMetaEngine {
     pub(super) fn clear_pending_state(state: &mut PendingReplicationState) {
@@ -52,6 +104,92 @@ impl PgMetaEngine {
         state.event_end = event_end;
         state.started_at = Some(now);
         state.last_mutation_at = Some(now);
+        Ok(())
+    }
+
+    /// Restore the local regular-file serving graph that redb recovery can lose
+    /// after an upload has reached object storage but before its epoch publishes.
+    ///
+    /// Uploaded overlay transitions are deliberately acknowledged locally: they
+    /// do not create a PostgreSQL metadata backlog.  A redb repair resets the
+    /// remote replay position but must not turn that acknowledgement into a
+    /// reason to discard the only durable local graph for the pending epoch.
+    /// This method replays only those journal records into serving state; it
+    /// never appends an event, moves the flushed cursor, or re-submits history.
+    pub(super) fn restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair(
+        &self,
+    ) -> MetaResult<()> {
+        let event_end = self.local.get_counter("nextEventSeq")?;
+        let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
+
+        let mut event_start = self.local.first_event_seq()?.unwrap_or(event_end);
+        while event_start < event_end {
+            let event_batch_end = event_start
+                .saturating_add(REDB_REPAIR_EVENT_BATCH_SIZE)
+                .min(event_end);
+            for event in self.local.read_events_range(event_start, event_batch_end)? {
+                match event {
+                    MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                        let overlay = overlays.entry(ino).or_default();
+                        for (chunk_id, slices) in chunk_slices {
+                            overlay.chunks.insert(chunk_id, slices);
+                        }
+                    }
+                    MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                        let overlay = overlays.entry(attr.ino).or_default();
+                        if !attr.is_upload_pending() {
+                            overlay.reset();
+                            continue;
+                        }
+                        overlay.attr = Some(attr);
+                    }
+                    MetaEvent::SetAttr { attr } => {
+                        overlays.remove(&attr.ino);
+                    }
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                    | MetaEvent::RemoveRegularFileGraph { ino }
+                    | MetaEvent::RemoveAttr { ino } => {
+                        overlays.remove(&ino);
+                    }
+                    _ => {}
+                }
+            }
+            event_start = event_batch_end;
+        }
+
+        let mut restored_inodes = 0usize;
+        let mut restored_events = Vec::new();
+        for (ino, overlay) in overlays {
+            if overlay.chunks.is_empty() || !overlay.has_uploaded_payload() {
+                continue;
+            }
+            let Some(attr) = overlay.attr else {
+                continue;
+            };
+
+            let current = match self.local.get_attr(ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if !attrs_match_repair_candidate(&current, &attr)
+                || self.local.has_local_regular_file_overlay(ino)?
+            {
+                continue;
+            }
+
+            push_repaired_overlay_events(&mut restored_events, attr, overlay.chunks);
+            restored_inodes = restored_inodes.saturating_add(1);
+        }
+
+        if restored_inodes > 0 {
+            self.local.apply_replica_serving_state(&restored_events)?;
+            self.local.rebuild_inode_lifecycle_table()?;
+            tracing::warn!(
+                restored_inodes,
+                "redb repair restored acknowledged uploaded regular-file serving overlays"
+            );
+        }
         Ok(())
     }
 
@@ -255,5 +393,59 @@ impl PgMetaEngine {
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
         let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[test]
+    fn repair_candidate_matches_exact_attr() {
+        let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+
+        assert!(attrs_match_repair_candidate(&attr, &attr));
+    }
+
+    #[test]
+    fn repair_candidate_matches_remote_projection_size() {
+        let mut candidate = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        candidate.size = 128;
+        candidate.committed_size = 64;
+        let mut remote_projection = candidate.clone();
+        remote_projection.size = candidate.committed_size;
+
+        assert!(attrs_match_repair_candidate(&remote_projection, &candidate));
+    }
+
+    #[test]
+    fn repair_identity_ignores_only_local_visible_size() {
+        let left = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        let mut right = left.clone();
+        right.size = 128;
+
+        assert!(attrs_match_repair_identity(&left, &right));
+
+        right.committed_size = 64;
+        assert!(!attrs_match_repair_identity(&left, &right));
+    }
+
+    #[test]
+    fn repaired_overlay_events_preserve_attr_before_slices() {
+        let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        let mut events = Vec::new();
+
+        push_repaired_overlay_events(&mut events, attr.clone(), BTreeMap::new());
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            MetaEvent::SetAttr { attr: actual } if actual == &attr
+        ));
+        assert!(matches!(
+            &events[1],
+            MetaEvent::SetRegularFileOverlaySlices { ino: 42, chunk_slices }
+                if chunk_slices.is_empty()
+        ));
     }
 }

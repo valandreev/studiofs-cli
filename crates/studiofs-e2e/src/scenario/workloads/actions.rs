@@ -1,6 +1,8 @@
 //! Mounted action and helper-process operations shared by advanced scenarios.
 
 use super::*;
+#[cfg(all(target_os = "macos", not(test)))]
+use std::os::fd::IntoRawFd;
 
 static BOUNDED_MOUNTED_IO_POOL: OnceLock<BoundedMountedIoPool> = OnceLock::new();
 pub(in crate::scenario) static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize =
@@ -1328,7 +1330,23 @@ pub fn run_open_handle_op_helper(
         Some(rename_dest),
         None,
     )?;
-    drop(handle);
+    record_hotspot_helper_progress(
+        progress,
+        "before_close",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    close_synced_mounted_file(handle)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_close",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
     record_hotspot_helper_progress(
         progress,
         "completed",
@@ -1601,7 +1619,27 @@ pub(in crate::scenario) fn append_payload_with_progress(
     )?;
     record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
     file.sync_all()?;
-    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)?;
+    record_hotspot_helper_progress(progress, "before_close", operation, path, target, None)?;
+    close_synced_mounted_file(file)?;
+    record_hotspot_helper_progress(progress, "after_close", operation, path, target, None)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn close_synced_mounted_file(file: fs::File) -> io::Result<()> {
+    // A synchronous close can wedge in macFUSE release after the requested
+    // sync already succeeded. Keep the descriptor owned by the short-lived
+    // helper until its parent has validated the operation and unmounted the
+    // client, then let process teardown release it safely.
+    // INTENTIONAL LEAK: process teardown closes the fd after unmount.
+    let _ = file.into_raw_fd();
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn close_synced_mounted_file(file: fs::File) -> io::Result<()> {
+    drop(file);
+    Ok(())
 }
 
 pub(in crate::scenario) fn write_sparse_range_with_progress(

@@ -142,6 +142,188 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
 }
 
 #[test]
+fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"repair-uploaded-overlay.bin", 0, 0, 0o644)
+        .expect("create file");
+    let create_end = pg.local.get_counter("nextEventSeq").expect("create end");
+    pg.persist_flushed_event_seq(create_end)
+        .expect("acknowledge remote-visible create");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+
+    let payload = PayloadRef::new_partial(77_010, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage local-only payload");
+    set_file_state(&pg, file.ino, 152, 1);
+    let accepted = pg.get_attr(file.ino).expect("accepted attr");
+    assert_eq!(accepted.size, 152);
+    assert_eq!(accepted.committed_size, 0);
+    assert_eq!(accepted.content_epoch, 1);
+    assert_eq!(accepted.committed_content_epoch, 0);
+    assert_eq!(accepted.upload_state, UploadState::Uploading);
+
+    let accepted_end = pg.local.get_counter("nextEventSeq").expect("accepted end");
+    pg.persist_flushed_event_seq(accepted_end)
+        .expect("acknowledge accepted metadata");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            accepted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark payload uploaded"),
+        "the accepted object should remain in the local overlay"
+    );
+    let acknowledged_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("uploaded-marker end");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        acknowledged_end,
+        "the local-only uploaded marker is deliberately acknowledged without a PG backlog"
+    );
+
+    let mut remote_projection = accepted.clone();
+    remote_projection.size = 0;
+    remote_projection.committed_size = 0;
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::RemoveAttr { ino: file.ino },
+            MetaEvent::SetAttr {
+                attr: remote_projection.clone(),
+            },
+        ])
+        .expect("simulate repair plus remote startup projection");
+    assert_eq!(
+        pg.get_attr(file.ino).expect("projected startup attr").size,
+        0,
+        "the repair projection has the unfinished inode but no local extent"
+    );
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("references after repair projection")
+            .is_empty(),
+        "without repair replay startup cleanup would classify the uploaded object as stale"
+    );
+
+    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+        .expect("restore acknowledged uploaded overlay");
+
+    let restored = pg.get_attr(file.ino).expect("restored attr");
+    assert_eq!(restored.size, accepted.size);
+    assert_eq!(restored.content_epoch, accepted.content_epoch);
+    assert_eq!(
+        restored.committed_content_epoch,
+        accepted.committed_content_epoch
+    );
+    assert_eq!(restored.upload_state, accepted.upload_state);
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, restored.size).expect("restored object ids"),
+        vec![payload.object_id],
+        "repair must restore the uploaded extent before VFS startup cleanup"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        acknowledged_end,
+        "repair replay must not reopen already-flushed metadata for PG publication"
+    );
+    assert_eq!(
+        pg.replication_backlog().total_ops(),
+        0,
+        "repair replay is local-only and must not create a PG backlog"
+    );
+}
+
+#[test]
+fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"repair-newer-ready-state.bin", 0, 0, 0o644)
+        .expect("create file");
+    let create_end = pg.local.get_counter("nextEventSeq").expect("create end");
+    pg.persist_flushed_event_seq(create_end)
+        .expect("acknowledge remote-visible create");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+
+    let payload = PayloadRef::new_partial(77_011, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage local-only payload");
+    set_file_state(&pg, file.ino, 152, 1);
+    let accepted = pg.get_attr(file.ino).expect("accepted attr");
+    let accepted_end = pg.local.get_counter("nextEventSeq").expect("accepted end");
+    pg.persist_flushed_event_seq(accepted_end)
+        .expect("acknowledge accepted metadata");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            accepted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark payload uploaded")
+    );
+    let acknowledged_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("uploaded-marker end");
+
+    let mut newer_remote = accepted.clone();
+    newer_remote.size = 0;
+    newer_remote.committed_size = 0;
+    newer_remote.content_epoch = accepted.content_epoch;
+    newer_remote.committed_content_epoch = accepted.content_epoch;
+    newer_remote.upload_state = UploadState::Ready;
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::RemoveAttr { ino: file.ino },
+            MetaEvent::SetAttr {
+                attr: newer_remote.clone(),
+            },
+        ])
+        .expect("simulate newer remote state after repair");
+
+    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+        .expect("attempt repair replay");
+
+    let current = pg.get_attr(file.ino).expect("current attr");
+    assert_eq!(
+        current.content_epoch, newer_remote.content_epoch,
+        "repair replay must not overwrite a conflicting same-epoch remote state"
+    );
+    assert_eq!(current.size, newer_remote.size);
+    assert_eq!(current.committed_size, newer_remote.committed_size);
+    assert_eq!(current.upload_state, newer_remote.upload_state);
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("current references")
+            .is_empty(),
+        "the stale uploaded extent must stay unreachable under the newer remote state"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        acknowledged_end,
+        "guarded replay must leave the flushed cursor untouched"
+    );
+}
+
+#[test]
 fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
