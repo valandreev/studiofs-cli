@@ -40,6 +40,12 @@ fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
     left == right
 }
 
+fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> bool {
+    current == candidate
+        || (attrs_match_repair_identity(current, candidate)
+            && current.size == candidate.committed_size)
+}
+
 fn push_repaired_overlay_events(
     events: &mut Vec<MetaEvent>,
     attr: InodeAttr,
@@ -166,11 +172,7 @@ impl PgMetaEngine {
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let current_matches_candidate =
-                attrs_match_repair_identity(&current, &attr) && current.size == attr.size;
-            let current_matches_remote_projection =
-                attrs_match_repair_identity(&current, &attr) && current.size == attr.committed_size;
-            if !(current_matches_candidate || current_matches_remote_projection)
+            if !attrs_match_repair_candidate(&current, &attr)
                 || self.local.has_local_regular_file_overlay(ino)?
             {
                 continue;
@@ -397,6 +399,24 @@ impl PgMetaEngine {
 #[cfg(test)]
 mod repair_tests {
     use super::*;
+
+    #[test]
+    fn repair_candidate_matches_exact_attr() {
+        let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+
+        assert!(attrs_match_repair_candidate(&attr, &attr));
+    }
+
+    #[test]
+    fn repair_candidate_matches_remote_projection_size() {
+        let mut candidate = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        candidate.size = 128;
+        candidate.committed_size = 64;
+        let mut remote_projection = candidate.clone();
+        remote_projection.size = candidate.committed_size;
+
+        assert!(attrs_match_repair_candidate(&remote_projection, &candidate));
+    }
 
     #[test]
     fn repair_identity_ignores_only_local_visible_size() {
