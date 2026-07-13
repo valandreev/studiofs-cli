@@ -161,10 +161,19 @@ impl<'a> StartupReplayCoordinator<'a> {
 
         for op in self.pending_catalog.ops_for_inode(attr.ino) {
             let key = pending_upload_key(op);
+            let metadata_covers_pending_block = graph_objects.iter().any(|graph_object| {
+                graph_object.block_index == block_index_from_offset(op.offset, self.vfs.block_size)
+            });
+            let recovers_interrupted_metadata_commit = !metadata_covers_pending_block
+                && self.vfs.local_payload_backend.contains(op.object_id);
             let is_live = attr.upload_state != MetaUploadState::Ready
                 && op.content_epoch == attr.content_epoch
-                && current_graph_objects.contains(&(op.offset, op.object_id));
+                && (current_graph_objects.contains(&(op.offset, op.object_id))
+                    || recovers_interrupted_metadata_commit);
             if is_live {
+                if recovers_interrupted_metadata_commit && self.dirty_set.remove(&op.object_id) {
+                    self.recovered_dirty_object_ids.insert(op.object_id);
+                }
                 self.valid_pending_uploads.insert(key);
                 self.stale_pending_uploads.remove(&key);
             } else if !self.valid_pending_uploads.contains(&key) {
