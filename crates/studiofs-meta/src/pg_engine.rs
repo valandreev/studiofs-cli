@@ -70,6 +70,8 @@ const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
+pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
+    "pgRedbRepairLocalGraphRecoveryPending";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
 const LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER: &str = "pgInodeReservedRangeEnd";
@@ -96,6 +98,7 @@ const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
     ReplaceLocalState,
+    ReplaceLocalStatePreservingEventLog,
     PreserveLocalState,
 }
 
@@ -104,6 +107,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
         name,
         LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER
             | LOCAL_PG_CLIENT_SLOT_COUNTER
+            | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER
             | LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER
@@ -459,11 +463,20 @@ impl PgMetaEngine {
         options: PgOpenOptions,
     ) -> MetaResult<Arc<Self>> {
         let local = Arc::new(RedbMetaEngine::open(path)?);
+        let repair_local_graph_recovery_pending =
+            local.get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)? != 0;
         let info = local.get_format_info()?;
         if info.metadata.backend != MetadataBackend::Postgres {
             return Err(MetaError::Storage(
                 "PgMetaEngine open requested for non-Postgres volume".to_string(),
             ));
+        }
+        if repair_local_graph_recovery_pending {
+            // A crash can persist the durable repair marker before the caller
+            // resets these cursors. Reset them here as well, before any remote
+            // snapshot/catch-up decision can trust the stale positions.
+            local.set_counter(LOCAL_PG_VERSION_COUNTER, 0)?;
+            local.set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)?;
         }
         local.set_remote_namespace_visibility_filter(true)?;
 
@@ -577,16 +590,29 @@ impl PgMetaEngine {
 
         // Bootstrap from the last checkpoint if present, then catch up from
         // append-only event deltas.
-        let import_mode =
-            Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?;
-        let _ = engine.pull_snapshot_locked(import_mode);
-        if let Err(error) = engine.sync_metadata_to_current_head() {
-            warn!(
-                error = %error,
-                "postgres metadata startup catch-up did not reach the current remote head"
-            );
+        let import_mode = if repair_local_graph_recovery_pending {
+            StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog
+        } else {
+            Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
+        };
+        if repair_local_graph_recovery_pending {
+            engine.pull_snapshot_locked(import_mode)?;
+            engine.sync_metadata_to_current_head()?;
+            engine.restore_pending_state_from_local_log()?;
+            engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
+            engine
+                .local
+                .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+        } else {
+            let _ = engine.pull_snapshot_locked(import_mode);
+            if let Err(error) = engine.sync_metadata_to_current_head() {
+                warn!(
+                    error = %error,
+                    "postgres metadata startup catch-up did not reach the current remote head"
+                );
+            }
+            let _ = engine.restore_pending_state_from_local_log();
         }
-        let _ = engine.restore_pending_state_from_local_log();
         engine.prime_local_id_ranges(client_slot)?;
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;

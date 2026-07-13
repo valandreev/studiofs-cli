@@ -745,14 +745,28 @@ impl StudioVfs {
             LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
             } => {
-                let outcome = self
+                let outcome = match self
                     .local_sync_barrier_with_outcome(
                         ino,
                         self.local_sync_policy_for_barrier(ino),
                         sticky_error_policy,
                         DirtyAttrPersistPolicy::PersistIfPresent,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) if Self::is_inode_not_found_error(&error, ino) => {
+                        // A metadata miss alone is not a deletion tombstone: cleanup
+                        // would evict locally durable payloads before their upload.
+                        // Only an explicit open-unlink marker permits the destructive
+                        // last-handle orphan path.
+                        if self.handle_table.take_orphan(ino) {
+                            return self.cleanup_orphan_on_last_handle_close(ino).await;
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(ReleaseFhOutcome {
                     closed_last_handle: true,
                     flushed_local_dirty_state: outcome.had_local_dirty_state,
@@ -770,14 +784,27 @@ impl StudioVfs {
             LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
             } => {
-                let outcome = self
+                let outcome = match self
                     .local_sync_barrier_with_outcome(
                         ino,
                         LocalSyncPolicy::Opportunistic,
                         sticky_error_policy,
                         DirtyAttrPersistPolicy::PersistIfPresent,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) if Self::is_inode_not_found_error(&error, ino) => {
+                        // The action was selected before a concurrent unlink marked
+                        // the open inode orphaned. Match the synchronous last-handle
+                        // path: only that explicit marker permits destructive cleanup.
+                        if self.handle_table.take_orphan(ino) {
+                            return self.cleanup_orphan_on_last_handle_close(ino).await;
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(ReleaseFhOutcome {
                     closed_last_handle: true,
                     flushed_local_dirty_state: outcome.had_local_dirty_state,

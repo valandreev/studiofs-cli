@@ -349,20 +349,51 @@ pub(in crate::scenario) fn run_namespace_collision_with_driver(
     let result =
         run_namespace_collision_body(context, kind, driver, convergence_timeout, poll_interval);
     match result {
-        Ok(summary) => match driver.unmount_all() {
-            Ok(()) => Ok(summary),
-            Err(error) => Err(error),
-        },
+        Ok(summary) => cleanup_namespace_collision_driver(context, kind, driver).map(|()| summary),
         Err(error) if namespace_collision_error_requires_emergency_cleanup(&error) => {
-            handle_namespace_collision_timeout_error(error, driver)
+            match driver.emergency_kill_all_no_wait("namespace collision timeout") {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                    primary: error.to_string(),
+                    cleanup: cleanup.to_string(),
+                }),
+            }
         }
-        Err(error) => match driver.unmount_all() {
+        Err(error) => match cleanup_namespace_collision_driver(context, kind, driver) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
                 primary: error.to_string(),
                 cleanup: cleanup.to_string(),
             }),
         },
+    }
+}
+
+fn cleanup_namespace_collision_driver(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    driver: &mut dyn NamespaceCollisionDriver,
+) -> Result<(), ScenarioError> {
+    match driver.unmount_all() {
+        Ok(()) => release_completed_hotspot_helpers_for_kind(context, kind),
+        Err(unmount) => match driver.emergency_kill_all_no_wait("namespace collision unmount") {
+            Ok(()) => Err(unmount),
+            Err(emergency) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                primary: unmount.to_string(),
+                cleanup: format!("emergency teardown failed: {emergency}"),
+            }),
+        },
+    }
+}
+
+fn release_completed_hotspot_helpers_for_kind(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+) -> Result<(), ScenarioError> {
+    if kind == NamespaceCollisionKind::UnlinkVsAppend {
+        release_completed_hotspot_helpers(context).map_err(ScenarioError::Io)
+    } else {
+        Ok(())
     }
 }
 

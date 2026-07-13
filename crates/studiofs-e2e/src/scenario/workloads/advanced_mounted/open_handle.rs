@@ -252,6 +252,15 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
 
     #[cfg(not(test))]
     {
+        let hold_after_complete = cfg!(target_os = "macos");
+        let hold_marker = if hold_after_complete {
+            Some(create_completed_hotspot_helper_hold_marker(
+                context,
+                &progress_path,
+            )?)
+        } else {
+            None
+        };
         let exe = prepare_hotspot_helper_exe(context)?;
         let mut command = Command::new(exe);
         command
@@ -275,6 +284,13 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        if let Some(marker) = &hold_marker {
+            command
+                .arg("--hold-release-marker")
+                .arg(marker)
+                .arg("--hold-parent-pid")
+                .arg(std::process::id().to_string());
+        }
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
@@ -301,6 +317,8 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
                 format!("failed to isolate open handle helper process: {error}"),
             ))
         })?;
+        #[cfg(target_os = "macos")]
+        let mut job = job;
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -316,6 +334,18 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
                     stderr.trim(),
                     progress.as_deref().unwrap_or("<none>")
                 ))));
+            }
+            // Only the macOS held-helper path needs completion polling. Keep
+            // ordinary helpers on the original try_wait-only fast path.
+            if held_helper_completion_detected(hold_after_complete, || {
+                read_hotspot_helper_progress_tail(&progress_path)
+            }) {
+                // The macOS helper deliberately holds its synchronized handle
+                // until the normal client unmount. Completion is therefore the
+                // operation boundary; child exit is not required here.
+                #[cfg(target_os = "macos")]
+                job.detach();
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 let progress = read_hotspot_helper_progress_tail(&progress_path);

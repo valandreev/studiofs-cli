@@ -684,6 +684,7 @@ struct RecordingNamespaceCollisionDriver {
     clients: Vec<ClientSpec>,
     actions: RefCell<Vec<&'static str>>,
     unmount_error: Option<&'static str>,
+    emergency_error: Option<&'static str>,
 }
 
 impl RecordingNamespaceCollisionDriver {
@@ -692,11 +693,17 @@ impl RecordingNamespaceCollisionDriver {
             clients,
             actions: RefCell::new(Vec::new()),
             unmount_error: None,
+            emergency_error: None,
         }
     }
 
     fn with_unmount_error(mut self, error: &'static str) -> Self {
         self.unmount_error = Some(error);
+        self
+    }
+
+    fn with_emergency_error(mut self, error: &'static str) -> Self {
+        self.emergency_error = Some(error);
         self
     }
 
@@ -777,6 +784,9 @@ impl NamespaceCollisionDriver for RecordingNamespaceCollisionDriver {
 
     fn emergency_kill_all_no_wait(&mut self, _context: &str) -> Result<(), ScenarioError> {
         self.actions.borrow_mut().push("emergency_kill_all_no_wait");
+        if let Some(error) = self.emergency_error {
+            return Err(ScenarioError::Io(std::io::Error::other(error)));
+        }
         Ok(())
     }
 }

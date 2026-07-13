@@ -12,26 +12,55 @@ pub(in crate::scenario) fn run_advanced_mounted_with_controller(
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
     let result = run_advanced_mounted_body(context, kind, controller);
     if let Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) = result {
-        if let Err(cleanup) = controller.emergency_kill_all_no_wait("advanced mounted timeout") {
-            return Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
+        return match controller.emergency_kill_all_no_wait("advanced mounted timeout") {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
                 scenario: kind.name().to_string(),
                 primary: error.to_string(),
                 cleanup: cleanup.to_string(),
-            });
-        }
-        return Err(error);
+            }),
+        };
     }
 
-    let unmount_result = controller.unmount_all();
-    match (result, unmount_result) {
+    let cleanup_result = cleanup_advanced_mounted_after_run(context, kind, controller);
+    match (result, cleanup_result) {
         (Ok(summary), Ok(())) => Ok(summary),
         (Err(primary), Err(cleanup)) => Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
             scenario: kind.name().to_string(),
             primary: primary.to_string(),
             cleanup: cleanup.to_string(),
         }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn cleanup_advanced_mounted_after_run(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+) -> Result<(), ScenarioError> {
+    match controller.unmount_all() {
+        Ok(()) => release_completed_hotspot_helpers_for_advanced_kind(context, kind),
+        Err(unmount) => match controller.emergency_kill_all_no_wait("advanced mounted unmount") {
+            Ok(()) => Err(unmount.into()),
+            Err(emergency) => Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
+                scenario: kind.name().to_string(),
+                primary: unmount.to_string(),
+                cleanup: format!("emergency teardown failed: {emergency}"),
+            }),
+        },
+    }
+}
+
+pub(in crate::scenario) fn release_completed_hotspot_helpers_for_advanced_kind(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+) -> Result<(), ScenarioError> {
+    if kind == AdvancedMountedKind::OpenHandle {
+        release_completed_hotspot_helpers(context).map_err(ScenarioError::Io)
+    } else {
+        Ok(())
     }
 }
 

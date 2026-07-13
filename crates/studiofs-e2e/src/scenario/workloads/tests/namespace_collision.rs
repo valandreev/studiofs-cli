@@ -99,6 +99,129 @@ fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
 }
 
 #[test]
+fn namespace_collision_releases_completed_hotspot_helper_after_nonemergency_failure() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-release-completed-helper-on-error".to_string(),
+        seed: 328,
+        sandbox: temp.path().join("run-1"),
+        scenario_dir: temp.path().join(COLLISION_UNLINK_VS_APPEND),
+        client_controller_config: None,
+    };
+    let progress = context.scenario_dir.join("progress.jsonl");
+    let marker = create_completed_hotspot_helper_hold_marker(&context, &progress).unwrap();
+    let mut driver = RecordingNamespaceCollisionDriver::new(Vec::new());
+
+    let err = run_namespace_collision_with_driver(
+        &context,
+        NamespaceCollisionKind::UnlinkVsAppend,
+        &mut driver,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ScenarioError::InsufficientCollisionClients { .. }
+    ));
+    assert!(
+        !marker.exists(),
+        "nonemergency cleanup must release a detached completed helper"
+    );
+}
+
+#[test]
+fn namespace_collision_keeps_completed_helper_held_after_unmount_failure() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-release-completed-helper-on-unmount-error".to_string(),
+        seed: 328,
+        sandbox: temp.path().join("run-1"),
+        scenario_dir: temp.path().join(COLLISION_UNLINK_VS_APPEND),
+        client_controller_config: None,
+    };
+    let progress = context.scenario_dir.join("progress.jsonl");
+    let marker = create_completed_hotspot_helper_hold_marker(&context, &progress).unwrap();
+    let mut driver =
+        RecordingNamespaceCollisionDriver::new(Vec::new()).with_unmount_error("umount failed");
+
+    let err = run_namespace_collision_with_driver(
+        &context,
+        NamespaceCollisionKind::UnlinkVsAppend,
+        &mut driver,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ScenarioError::NamespaceCollisionUnmountAfterFailure { .. }
+    ));
+    assert!(
+        marker.exists(),
+        "a detached helper must remain held until its parent-death watchdog observes scenario exit"
+    );
+    assert_eq!(
+        driver.actions.borrow().as_slice(),
+        [
+            "bootstrap",
+            "mount_all",
+            "unmount_all",
+            "emergency_kill_all_no_wait",
+        ],
+        "unmount failure must trigger emergency teardown before scenario exit"
+    );
+    release_completed_hotspot_helpers(&context).unwrap();
+}
+
+#[test]
+fn namespace_collision_keeps_completed_helper_held_when_emergency_teardown_fails() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-keep-completed-helper-on-emergency-error".to_string(),
+        seed: 328,
+        sandbox: temp.path().join("run-1"),
+        scenario_dir: temp.path().join(COLLISION_UNLINK_VS_APPEND),
+        client_controller_config: None,
+    };
+    let progress = context.scenario_dir.join("progress.jsonl");
+    let marker = create_completed_hotspot_helper_hold_marker(&context, &progress).unwrap();
+    let mut driver = RecordingNamespaceCollisionDriver::new(Vec::new())
+        .with_unmount_error("umount failed")
+        .with_emergency_error("emergency kill failed");
+
+    let err = run_namespace_collision_with_driver(
+        &context,
+        NamespaceCollisionKind::UnlinkVsAppend,
+        &mut driver,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ScenarioError::NamespaceCollisionUnmountAfterFailure { .. }
+    ));
+    assert!(
+        marker.exists(),
+        "the helper must remain held until parent-death cleanup when emergency teardown is unconfirmed"
+    );
+    assert_eq!(
+        driver.actions.borrow().as_slice(),
+        [
+            "bootstrap",
+            "mount_all",
+            "unmount_all",
+            "emergency_kill_all_no_wait",
+        ]
+    );
+    release_completed_hotspot_helpers(&context).unwrap();
+}
+
+#[test]
 fn namespace_collision_recording_replication_collects_errors_after_all_clients() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
@@ -413,6 +536,8 @@ fn open_handle_helper_records_progress_for_old_handle_sequence() {
     assert!(progress_log.contains("\"phase\":\"after_remove_file\""));
     assert!(progress_log.contains("\"phase\":\"after_rename\""));
     assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+    assert!(progress_log.contains("\"phase\":\"before_close\""));
+    assert!(progress_log.contains("\"phase\":\"after_close\""));
     assert!(progress_log.contains("\"phase\":\"completed\""));
 }
 
@@ -600,6 +725,87 @@ fn hotspot_helper_internal_timeout_leaves_parent_kill_reserve() {
         Duration::from_secs(1),
         "short operation timeouts should not underflow"
     );
+}
+
+#[test]
+fn completed_hotspot_helper_progress_does_not_require_child_exit() {
+    assert!(hotspot_helper_progress_completed(Some(
+        r#"{"operation":"append","phase":"completed"}"#,
+    )));
+    assert!(!hotspot_helper_progress_completed(Some(
+        r#"{"operation":"append","phase":"after_sync_all"}"#,
+    )));
+    assert!(!hotspot_helper_progress_completed(Some("not json")));
+}
+
+#[test]
+fn ordinary_helpers_skip_completed_progress_polling() {
+    let reads = std::cell::Cell::new(0);
+    assert!(!held_helper_completion_detected(false, || {
+        reads.set(reads.get() + 1);
+        Some(r#"{"operation":"append","phase":"completed"}"#.to_string())
+    }));
+    assert_eq!(reads.get(), 0);
+
+    assert!(held_helper_completion_detected(true, || {
+        reads.set(reads.get() + 1);
+        Some(r#"{"operation":"append","phase":"completed"}"#.to_string())
+    }));
+    assert_eq!(reads.get(), 1);
+}
+
+#[test]
+fn unlink_append_collision_holds_only_its_macos_append_helper() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-hold-completed-helper".to_string(),
+        seed: 0,
+        sandbox: temp.path().join("run"),
+        scenario_dir: temp.path().join(COLLISION_UNLINK_VS_APPEND),
+        client_controller_config: None,
+    };
+
+    assert_eq!(
+        should_hold_completed_hotspot_helper(&context, "append"),
+        cfg!(target_os = "macos")
+    );
+    assert!(!should_hold_completed_hotspot_helper(&context, "overwrite"));
+}
+
+#[test]
+fn completed_hotspot_helper_hold_markers_are_released_after_validation() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-release-completed-helper".to_string(),
+        seed: 0,
+        sandbox: temp.path().join("run"),
+        scenario_dir: temp.path().join(COLLISION_UNLINK_VS_APPEND),
+        client_controller_config: None,
+    };
+    let progress = context.scenario_dir.join("progress.jsonl");
+    let marker = create_completed_hotspot_helper_hold_marker(&context, &progress).unwrap();
+
+    assert!(marker.exists());
+    release_completed_hotspot_helpers(&context).unwrap();
+    assert!(!marker.exists());
+}
+
+#[test]
+fn completed_open_handle_helper_hold_markers_are_released_after_unmount() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "run-release-open-handle-helper".to_string(),
+        seed: 0,
+        sandbox: temp.path().join("run"),
+        scenario_dir: temp.path().join(MOUNTED_OPEN_HANDLE_CONVERGENCE),
+        client_controller_config: None,
+    };
+    let progress = context.scenario_dir.join("progress.jsonl");
+    let marker = create_completed_hotspot_helper_hold_marker(&context, &progress).unwrap();
+
+    assert!(marker.exists());
+    release_completed_hotspot_helpers(&context).unwrap();
+    assert!(!marker.exists());
 }
 
 #[test]

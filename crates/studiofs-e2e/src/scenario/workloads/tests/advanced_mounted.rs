@@ -32,6 +32,31 @@ fn advanced_mounted_isolation_uses_volume_specific_roots_and_payloads() {
 }
 
 #[test]
+fn open_handle_timeout_cleanup_releases_completed_helper_hold() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let context = ScenarioContext {
+        run_id: "open-handle-timeout-cleanup".to_string(),
+        seed: 0,
+        sandbox: temp.path().join("sandbox"),
+        scenario_dir: temp.path().join("scenario"),
+        client_controller_config: None,
+    };
+    let marker = create_completed_hotspot_helper_hold_marker(
+        &context,
+        &context.scenario_dir.join("open-handle.jsonl"),
+    )
+    .expect("create held helper marker");
+
+    release_completed_hotspot_helpers_for_advanced_kind(&context, AdvancedMountedKind::OpenHandle)
+        .expect("release held open-handle helper");
+
+    assert!(
+        !marker.exists(),
+        "timeout cleanup must release a detached completed open-handle helper"
+    );
+}
+
+#[test]
 fn mounted_chaos_read_target_payload_is_direct_io_aligned() {
     let context = ScenarioContext {
         run_id: "run-1".to_string(),

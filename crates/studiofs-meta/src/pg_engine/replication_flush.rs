@@ -3,9 +3,51 @@
 use super::{
     ClaimedPendingBatch, PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaPayloadObjects, MetaResult};
+use crate::events::MetaEvent;
+use crate::schema::{ChunkId, PayloadRefState, SliceRecord};
+use crate::types::{FileType, Ino, InodeAttr, UploadState};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct RepairedRegularFileOverlay {
+    attr: Option<InodeAttr>,
+    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+}
+
+impl RepairedRegularFileOverlay {
+    fn reset(&mut self) {
+        self.attr = None;
+        self.chunks.clear();
+    }
+
+    fn has_uploaded_payload(&self) -> bool {
+        self.chunks.values().flatten().any(|slice| {
+            slice.payload.is_some() && slice.payload_state == PayloadRefState::Uploaded
+        })
+    }
+}
+
+fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
+    left.ino == right.ino
+        && left.kind == right.kind
+        && left.mode == right.mode
+        && left.uid == right.uid
+        && left.gid == right.gid
+        && left.committed_size == right.committed_size
+        && left.nlink == right.nlink
+        && left.mtime == right.mtime
+        && left.ctime == right.ctime
+        && left.atime == right.atime
+        && left.parent == right.parent
+        && left.crtime == right.crtime
+        && left.win_attrs == right.win_attrs
+        && left.content_epoch == right.content_epoch
+        && left.committed_content_epoch == right.committed_content_epoch
+        && left.upload_state == right.upload_state
+}
 
 impl PgMetaEngine {
     pub(super) fn clear_pending_state(state: &mut PendingReplicationState) {
@@ -52,6 +94,97 @@ impl PgMetaEngine {
         state.event_end = event_end;
         state.started_at = Some(now);
         state.last_mutation_at = Some(now);
+        Ok(())
+    }
+
+    /// Restore the local regular-file serving graph that redb recovery can lose
+    /// after an upload has reached object storage but before its epoch publishes.
+    ///
+    /// Uploaded overlay transitions are deliberately acknowledged locally: they
+    /// do not create a PostgreSQL metadata backlog.  A redb repair resets the
+    /// remote replay position but must not turn that acknowledgement into a
+    /// reason to discard the only durable local graph for the pending epoch.
+    /// This method replays only those journal records into serving state; it
+    /// never appends an event, moves the flushed cursor, or re-submits history.
+    pub(super) fn restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair(
+        &self,
+    ) -> MetaResult<()> {
+        let event_end = self.local.get_counter("nextEventSeq")?;
+        let events = self.local.read_events_range(0, event_end)?;
+        let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
+
+        for event in events {
+            match event {
+                MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                    let overlay = overlays.entry(ino).or_default();
+                    for (chunk_id, slices) in chunk_slices {
+                        overlay.chunks.insert(chunk_id, slices);
+                    }
+                }
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                    let is_unfinished = attr.upload_state != UploadState::Ready
+                        && (attr.content_epoch != attr.committed_content_epoch
+                            || attr.size != attr.committed_size);
+                    let overlay = overlays.entry(attr.ino).or_default();
+                    if !is_unfinished {
+                        overlay.reset();
+                        continue;
+                    }
+                    overlay.attr = Some(attr);
+                }
+                MetaEvent::SetAttr { attr } => {
+                    overlays.remove(&attr.ino);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveRegularFileGraph { ino }
+                | MetaEvent::RemoveAttr { ino } => {
+                    overlays.remove(&ino);
+                }
+                _ => {}
+            }
+        }
+
+        let mut restored_inodes = 0usize;
+        for (ino, overlay) in overlays {
+            if overlay.chunks.is_empty() || !overlay.has_uploaded_payload() {
+                continue;
+            }
+            let Some(attr) = overlay.attr else {
+                continue;
+            };
+
+            let current = match self.local.get_attr(ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let current_matches_candidate =
+                attrs_match_repair_identity(&current, &attr) && current.size == attr.size;
+            let current_matches_remote_projection =
+                attrs_match_repair_identity(&current, &attr) && current.size == attr.committed_size;
+            if !(current_matches_candidate || current_matches_remote_projection)
+                || self.local.has_local_regular_file_overlay(ino)?
+            {
+                continue;
+            }
+
+            self.local.apply_replica_serving_state(&[
+                MetaEvent::SetAttr { attr },
+                MetaEvent::SetRegularFileOverlaySlices {
+                    ino,
+                    chunk_slices: overlay.chunks.into_iter().collect(),
+                },
+            ])?;
+            restored_inodes = restored_inodes.saturating_add(1);
+        }
+
+        if restored_inodes > 0 {
+            self.local.rebuild_inode_lifecycle_table()?;
+            tracing::warn!(
+                restored_inodes,
+                "redb repair restored acknowledged uploaded regular-file serving overlays"
+            );
+        }
         Ok(())
     }
 

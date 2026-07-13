@@ -246,7 +246,7 @@ fn make_unstarted_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
-fn make_unstarted_test_vfs(
+pub(super) fn make_unstarted_test_vfs(
     tmp: &TempDir,
     volume_suffix: &str,
 ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
@@ -685,7 +685,7 @@ fn contract_vfs_harness_drop_inside_tokio_runtime_does_not_panic() {
     );
 }
 
-trait FileGraphMetaFixture {
+pub(super) trait FileGraphMetaFixture {
     fn stage_payload_slice(
         &self,
         ino: Ino,
@@ -9994,6 +9994,100 @@ fn flush_fh_survives_removed_inode_for_handle_with_cached_dirty_state() {
         vfs.flush_fh(fh)
             .await
             .expect("handle-backed flush must tolerate removed authoritative inode");
+    });
+}
+
+#[test]
+fn release_fh_cleans_cached_dirty_attr_after_foreign_unlink() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "release-open-foreign-unlink-cached-dirty");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let name = b"release-open-foreign-unlink-cached-dirty.txt";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state.namespace.dirty_attrs.lock().insert(ino, attr);
+        meta.unlink(ROOT_INO, name)
+            .expect("simulate foreign unlink before close");
+        vfs.handle_table.mark_orphan(ino);
+
+        vfs.release_fh(fh)
+            .await
+            .expect("last-handle release should clean a foreign-unlinked dirty inode");
+
+        assert!(!vfs.inode_has_local_dirty_state(ino));
+    });
+}
+
+#[test]
+fn release_fh_preserves_dirty_state_when_metadata_is_missing_without_orphan_marker() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "release-missing-attr-keeps-upload-state");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let name = b"release-missing-attr-keeps-upload-state.txt";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state.namespace.dirty_attrs.lock().insert(ino, attr);
+        meta.unlink(ROOT_INO, name)
+            .expect("simulate missing metadata without an invalidation tombstone");
+
+        vfs.release_fh(fh)
+            .await
+            .expect_err("unmarked missing metadata must not trigger destructive orphan cleanup");
+
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "a transient metadata miss must preserve local data queued for upload"
+        );
+    });
+}
+
+#[test]
+fn deferred_release_cleans_dirty_state_when_orphan_marker_arrives_after_action_selection() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-release-late-orphan-marker");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let name = b"deferred-release-late-orphan-marker.txt";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state.namespace.dirty_attrs.lock().insert(ino, attr);
+
+        let read_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
+            .await;
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if vfs.file_session_stats().queued_ops >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("deferred release should wait behind the file-session gate");
+
+        meta.unlink(ROOT_INO, name)
+            .expect("simulate foreign unlink after deferred action selection");
+        vfs.handle_table.mark_orphan(ino);
+        drop(read_session);
+
+        vfs.wait_for_deferred_release_inflight(ino).await;
+
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "a late orphan marker must still permit deferred last-handle cleanup"
+        );
     });
 }
 

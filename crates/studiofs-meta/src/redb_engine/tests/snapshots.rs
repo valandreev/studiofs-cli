@@ -153,6 +153,62 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
 }
 
 #[test]
+fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
+    let local = temp_engine();
+    let local_event_start = local.get_counter("nextEventSeq").unwrap();
+    local
+        .create_file(ROOT_INO, b"lost-serving-state.bin", 0, 0, 0o644)
+        .unwrap();
+    let local_event_end = local.get_counter("nextEventSeq").unwrap();
+    local
+        .set_counter("pgLastFlushedLocalEventSeq", local_event_end)
+        .unwrap();
+    local
+        .set_counter("pgRedbRepairLocalGraphRecoveryPending", 1)
+        .unwrap();
+
+    let source = temp_engine();
+    source
+        .create_file(ROOT_INO, b"remote-authoritative.bin", 0, 0, 0o644)
+        .unwrap();
+    let snapshot = source.export_snapshot().unwrap();
+
+    local
+        .import_remote_snapshot_preserving_local_event_log(&snapshot)
+        .unwrap();
+
+    assert!(
+        local.lookup(ROOT_INO, b"lost-serving-state.bin").is_err(),
+        "repair import must still replace the stale serving namespace"
+    );
+    assert!(
+        local.lookup(ROOT_INO, b"remote-authoritative.bin").is_ok(),
+        "repair import must install the authoritative remote namespace"
+    );
+    assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(
+        local
+            .read_events_range(local_event_start, local_event_end)
+            .unwrap()
+            .len(),
+        usize::try_from(local_event_end - local_event_start).unwrap(),
+        "repair import must retain the local event history needed for recovery"
+    );
+    assert_eq!(
+        local.get_counter("pgLastFlushedLocalEventSeq").unwrap(),
+        local_event_end,
+        "repair import must not reopen acknowledged local metadata"
+    );
+    assert_eq!(
+        local
+            .get_counter("pgRedbRepairLocalGraphRecoveryPending")
+            .unwrap(),
+        1,
+        "the repair marker must survive snapshot replacement until recovery completes"
+    );
+}
+
+#[test]
 fn import_remote_snapshot_preserving_local_state_keeps_local_deletes_hidden() {
     let source = temp_engine();
     let remote_file = source

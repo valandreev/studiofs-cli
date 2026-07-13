@@ -71,6 +71,10 @@ impl PgMetaEngine {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_remote_snapshot(&snapshot)?;
             }
+            StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
+                self.local
+                    .import_remote_snapshot_preserving_local_event_log(&snapshot)?;
+            }
             StartupSnapshotImportMode::PreserveLocalState => {
                 self.local
                     .import_remote_snapshot_preserving_local_state(&snapshot)?;
