@@ -611,7 +611,9 @@ mod tests {
         timeout(TEST_TIMEOUT, async {
             let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 1));
             let admitted_ticket = writes.start_request(40).expect("start admitted request");
+            assert_gauges(&writes, (1, 0, 1, 0, 0, 1));
             let reservation = writes.admit(8, |_| {}).expect("fill admission budget");
+            assert_gauges(&writes, (1, 0, 1, 1, 8, 1));
             let waiting_ticket = writes.start_request(41).expect("start waiting request");
             assert_gauges(&writes, (2, 0, 2, 1, 8, 1));
 
@@ -643,7 +645,9 @@ mod tests {
             }
 
             waiting_ticket.complete(LinuxFuseAsyncWriteCompletion::Cancelled);
+            assert_gauges(&writes, (1, 0, 1, 1, 8, 1));
             admitted_ticket.complete(LinuxFuseAsyncWriteCompletion::Success);
+            assert_gauges(&writes, (0, 0, 0, 1, 8, 0));
             drop(reservation);
             assert_gauges(&writes, (0, 0, 0, 0, 0, 0));
             assert!(writes.wait_idle(Duration::ZERO));
