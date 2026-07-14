@@ -17,7 +17,8 @@ use libc::{mode_t, off_t, size_t, stat, statvfs};
 use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
-    BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
+    BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
+    to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::{ROOT_INO, ResolvedSliceSource};
@@ -1122,17 +1123,6 @@ impl CancelableQueuedReadForTest {
     }
 }
 
-fn normalize_close_flush_result(result: Result<(), i32>) -> Result<(), i32> {
-    match result {
-        // macFUSE invokes `flush` from close(2), after an explicit fsync callback
-        // may already have reported a concurrent namespace deletion. Returning
-        // ENOENT here prevents the kernel from advancing to `release`, even
-        // though the open handle and its locally accepted payload remain valid.
-        Err(libc::ENOENT) => Ok(()),
-        other => other,
-    }
-}
-
 impl StudioVfsAdapter {
     /// Create a macFUSE adapter over a StudioVfs instance.
     #[cfg(test)]
@@ -2165,7 +2155,7 @@ impl StudioVfsAdapter {
             .runtime_handle
             .block_on(self.vfs.flush_fh(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
-        normalize_close_flush_result(result)
+        normalize_close_barrier_result(result)
     }
 
     /// Synchronize file data for a handle when available, otherwise for an inode.
@@ -2866,7 +2856,7 @@ mod open_cache_snapshot_tests {
     #[test]
     fn close_flush_ignores_namespace_enoent() {
         assert_eq!(
-            super::normalize_close_flush_result(Err(libc::ENOENT)),
+            super::normalize_close_barrier_result(Err(libc::ENOENT)),
             Ok(())
         );
     }
@@ -2874,7 +2864,7 @@ mod open_cache_snapshot_tests {
     #[test]
     fn close_flush_preserves_non_namespace_errors() {
         assert_eq!(
-            super::normalize_close_flush_result(Err(libc::EIO)),
+            super::normalize_close_barrier_result(Err(libc::EIO)),
             Err(libc::EIO)
         );
     }

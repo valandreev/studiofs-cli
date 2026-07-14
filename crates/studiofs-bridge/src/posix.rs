@@ -99,6 +99,15 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
     }
 }
 
+/// Treat a namespace disappearance during close-time flushing as an already
+/// completed close, while preserving every other local barrier error.
+pub fn normalize_close_barrier_result(result: Result<(), i32>) -> Result<(), i32> {
+    match result {
+        Err(libc::ENOENT) => Ok(()),
+        other => other,
+    }
+}
+
 /// Convert metadata attributes into the neutral bridge attribute shape.
 ///
 /// `mount_uid`/`mount_gid` remap inodes created with the legacy root owner so
@@ -159,6 +168,22 @@ mod tests {
             limit: 16,
         });
         assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
+    }
+
+    #[test]
+    fn close_barrier_ignores_namespace_enoent() {
+        assert_eq!(
+            super::normalize_close_barrier_result(Err(libc::ENOENT)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn close_barrier_preserves_non_namespace_errors() {
+        assert_eq!(
+            super::normalize_close_barrier_result(Err(libc::EIO)),
+            Err(libc::EIO)
+        );
     }
 
     #[test]
