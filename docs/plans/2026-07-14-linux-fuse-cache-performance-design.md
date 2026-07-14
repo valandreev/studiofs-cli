@@ -1,10 +1,16 @@
 # Linux FUSE cache, throughput, and CPU design
 
-Status: accepted design, pending implementation plan
+Status: accepted design, implementation plans ready
 
 Date: 2026-07-14
 
 Baseline revision: `95bfdd8fcd03`
+
+Implementation plans:
+
+- [`2026-07-14-linux-fuse-async-write-correctness.md`](../superpowers/plans/2026-07-14-linux-fuse-async-write-correctness.md)
+- [`2026-07-14-shared-os-cache-coherence.md`](../superpowers/plans/2026-07-14-shared-os-cache-coherence.md)
+- [`2026-07-14-linux-kernel-cache-validation.md`](../superpowers/plans/2026-07-14-linux-kernel-cache-validation.md)
 
 ## Summary
 
@@ -149,28 +155,37 @@ Artifacts are kept outside the source tree under
 
 ### Queue structure
 
-Keep the mount-global admission budgets for pending bytes and pending request
-count. They protect total process memory and libfuse request pressure.
+Keep the mount-global admission budgets for copied pending bytes and admitted
+detached request count. Raw callbacks waiting before the copy remain bounded by
+the configured libfuse loop-thread count on 3.12+, while older supported
+libfuse uses its single-threaded receive loop because its multithread config
+cannot enforce a worker cap.
 
-Separate those budgets from barrier ordering. Each file handle receives a
+Separate those budgets from callback ordering. Each file handle receives a
 monotonic write sequence and completion ledger:
 
-- a successfully admitted async write receives the next handle sequence;
+- an opportunistic callback receives the next handle sequence before it waits
+  for bounded admission or copies data;
 - completion records success or the first unreported error for that sequence;
 - `flush`, `fsync`, and `release` capture the handle's current watermark;
-- a barrier waits only for sequences at or below that watermark;
-- later writes and writes to other handles do not extend the wait;
+- the ledger waits only for callbacks at or below that watermark;
+- the canonical VFS `flush_fh` then supplies the existing inode-scoped local
+  durability barrier, so same-inode writes already dispatched concurrently may
+  be coalesced into it;
+- writes to other inodes do not extend the barrier;
 - global reservations are released exactly once on every success, error,
   cancellation, and shutdown path.
 
 This preserves a single global memory cap while removing mount-wide barrier
-head-of-line blocking.
+head-of-line blocking without adding a Linux-only dispatch scheduler around
+the shared VFS.
 
 ### Barrier behavior
 
 - `flush` first waits for the target handle watermark, then calls the strict
   local `flush_fh` path.
-- `fsync` remains a strict local handle or inode barrier.
+- regular-file `fsync` remains a strict local handle barrier; a callback without
+  a valid handle fails instead of substituting a mount-global wait.
 - dirty last-handle release completes synchronously and surfaces local errors.
 - clean release may remain deferred.
 - `O_SYNC` and `O_DSYNC` writes remain synchronous.
@@ -224,6 +239,13 @@ The decision contains:
 The adapter maps the decision to its platform flags. The shared module never
 chooses Linux `direct_io` or macFUSE-specific flags.
 
+FUSE adapters serialize only the short same-inode interval from shared
+preparation through the synchronous open/create reply. If libfuse rejects that
+reply, the adapter clears the prepared observation and releases the VFS handle
+before leaving the interval. Therefore a concurrent or failed `Replace` cannot
+make a later opener retain stale pages, without introducing an epoch/ack state
+machine.
+
 ### Generation identity
 
 For regular files, exact cache identity includes the visible content epoch,
@@ -252,7 +274,9 @@ correctness strength.
 Foreground read and writer state belongs to the VFS handle lifecycle, not to
 duplicated adapter maps.
 
-- opening a participating read handle starts foreground-read activity;
+- every adapter using the seam starts foreground-read activity for a read
+  handle, including Linux Direct mode where page-cache participation is
+  disabled;
 - opening a write-capable handle starts writer activity and clears cache
   identity;
 - the state remains active through the local release barrier;
@@ -277,7 +301,9 @@ The liveness module:
 
 - counts lookup references by inode rather than pathname;
 - handles hardlinks and rename-overwrite correctly;
-- closes only after the final lookup reference or final inode retirement;
+- closes after the final lookup reference; macFUSE may retain its legacy
+  explicit final-retirement close, while Linux namespace removal never
+  fabricates a kernel `forget`;
 - prevents notification of unknown or forgotten kernel inodes;
 - permits re-entrant close and unrelated inode progress without holding a
   map/shard guard across kernel IPC.
@@ -324,9 +350,10 @@ independently from the cache-policy change.
 ### Backing payload cache
 
 Linux may hold both mounted-inode pages and local backing-payload pages. The
-macOS `F_NOCACHE` solution is not portable. Measure RSS, backing-file I/O, and
-page-cache behavior before considering Linux `O_DIRECT`, `fadvise`, or another
-mechanism. Alignment-heavy direct backing-file I/O is not part of the initial
+macOS `F_NOCACHE` solution is not portable. Measure daemon RSS/anonymous
+memory, fresh-cgroup total/file memory, backing-file I/O, and page-cache
+behavior before considering Linux `O_DIRECT`, `fadvise`, or another mechanism.
+Alignment-heavy direct backing-file I/O is not part of the initial
 implementation.
 
 ## 4. CPU and observability
@@ -363,10 +390,10 @@ drain time.
 
 ### CPU measurement
 
-Use three complementary sources:
+Use complementary sources:
 
-- `studiofs devbench` 100 ms mount-process sampling for CPU, accumulated CPU
-  time, RSS, virtual memory, and disk I/O;
+- 100 ms cgroup-memory sampling plus `/proc` mount-process snapshots across
+  foreground work and upload drain;
 - `pidstat` aligned with `write_path_observability.json` for per-second upload,
   dirty-pressure, foreground, callback, and async-write correlation;
 - one separate mount with `--profile` for hotspot attribution.
@@ -381,7 +408,7 @@ Report CPU as:
 - average and peak core equivalents during foreground work;
 - average and peak core equivalents during upload drain;
 - upload drain duration;
-- peak mount RSS.
+- peak mount RSS/anonymous memory and cgroup file/total memory.
 
 If lifecycle-aware shared QoS is insufficient, compare upload concurrency and
 controller tuning over repeated runs. A change is accepted only when its CPU
@@ -415,7 +442,8 @@ Shared VFS/module tests:
 - foreground handle lifetime on success, failure, and deferred release;
 - invalidation racing generation observation;
 - bounded generation eviction;
-- hardlink, lookup, forget, final unlink, and rename-overwrite liveness.
+- hardlink, lookup, and forget liveness, plus separate OS-cache generation
+  retirement after final unlink and rename-overwrite.
 
 Linux adapter tests:
 
@@ -448,12 +476,15 @@ retargeted to the shared interface rather than duplicated internal state.
 ### Performance workloads
 
 Run each candidate three times while iterating and five times for the final
-decision. Wait for the upload queue to become idle before each clean run.
+decision. Give every `(repetition, workload, mode)` a fresh mount, local cache,
+and cgroup v2, rotate mode/workload order, and require idle local/async/upload
+gauges at foreground start and drain end.
 
 1. 4,000,000,000-byte single-file read/write using bundled
    `studiofs-bench`.
 2. 4,000 files of 1 MB each with the same total workload.
-3. 1,000 files of 128 KiB using `studiofs devbench`.
+3. Exactly 1,000 files of 128 KiB using a small standard-library client that
+   verifies every byte and reports only that phase.
 4. Stable warm reopen after upload and generation activity become idle.
 5. Same-file parallel direct-write workload.
 6. Cross-file barrier-isolation workload.
@@ -462,8 +493,11 @@ Compare at least:
 
 - baseline Direct;
 - Direct + `ASYNC_DIO`;
-- candidate Kernel policy;
-- any evidence-driven scheduler or geometry variant.
+- candidate Kernel policy.
+
+Decide Direct async against Direct serial first. Kernel compares with Direct
+async only if that candidate passes; otherwise its applicable baseline is
+Direct serial.
 
 Cold reads use a fresh file/generation. Warm reads reopen an unchanged stable
 generation. The benchmark target must be verified with `findmnt` as
@@ -471,14 +505,16 @@ generation. The benchmark target must be verified with `findmnt` as
 
 ### Acceptance gates
 
-- all correctness and mounted tests pass;
+- all required correctness and mounted tests are present as executed/non-skipped
+  results in a revision- and checksum-bound manifest;
 - no primary workload median regresses by more than 5% against its applicable
   baseline;
 - no new long callback or barrier tail appears in p95/p99/max data;
 - CPU-seconds per GiB does not regress;
 - claimed CPU improvements exceed median absolute deviation/run-to-run noise;
 - foreground CPU and upload-drain CPU are reported separately;
-- peak RSS does not show an unexplained double-cache growth;
+- daemon memory and fresh-cgroup file/total peaks do not show unexplained
+  copies beyond the one intentional Kernel page-cache working set;
 - warm reuse is demonstrated by unchanged FUSE/VFS read callback counts;
 - direct rollback is verified before Kernel becomes default.
 
