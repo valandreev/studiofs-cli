@@ -1326,6 +1326,150 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
 }
 
 #[test]
+fn startup_replay_recovers_current_epoch_pending_upload_when_metadata_graph_is_missing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-missing-graph");
+
+    let created = vfs
+        .create(1, b"startup-missing-graph.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 9_101;
+    let payload = b"locally durable payload whose metadata commit was interrupted";
+
+    vfs.local_payload_backend()
+        .put(object_id, payload, false)
+        .expect("persist local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+
+    vfs.cached_store()
+        .submit_upload(ino, 0, object_id, attr.content_epoch);
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr.clone()]);
+
+    assert_eq!(
+        (
+            vfs.live_extent_records_for_inode(ino),
+            vfs.pending_uploads_for_inode(ino),
+            vfs.local_payload_backend().contains(object_id),
+        ),
+        (
+            vec![(0, object_id, attr.content_epoch)],
+            vec![(0, object_id, attr.content_epoch)],
+            true,
+        ),
+        "startup replay must recover a durable current-epoch upload when the matching metadata graph commit was interrupted"
+    );
+}
+
+#[test]
+fn startup_replay_recovers_uploaded_pending_payload_when_metadata_graph_is_missing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-uploaded-missing-graph");
+
+    let created = vfs
+        .create(1, b"startup-uploaded-missing-graph.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 9_102;
+    let payload = b"uploaded payload whose metadata commit was interrupted";
+
+    vfs.local_payload_backend()
+        .put(object_id, payload, true)
+        .expect("persist uploaded local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+    assert!(
+        vfs.local_payload_backend().dirty_object_ids().is_empty(),
+        "uploaded payload must not be present in the dirty-only startup snapshot"
+    );
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+
+    vfs.cached_store()
+        .submit_upload(ino, 0, object_id, attr.content_epoch);
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr.clone()]);
+
+    assert_eq!(
+        (
+            vfs.live_extent_records_for_inode(ino),
+            vfs.pending_uploads_for_inode(ino),
+        ),
+        (
+            vec![(0, object_id, attr.content_epoch)],
+            vec![(0, object_id, attr.content_epoch)],
+        ),
+        "startup replay must recover an uploaded current-epoch payload when metadata commit was interrupted"
+    );
+}
+
+#[test]
+fn startup_replay_does_not_recover_pending_upload_beyond_truncated_size() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-truncated-pending-upload");
+
+    let created = vfs
+        .create(1, b"startup-truncated-pending-upload.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 9_103;
+
+    vfs.local_payload_backend()
+        .put(object_id, b"payload truncated before startup replay", false)
+        .expect("persist truncated local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync truncated local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 1;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist truncated attr");
+
+    vfs.cached_store().submit_upload(
+        ino,
+        u64::from(vfs.block_size),
+        object_id,
+        attr.content_epoch,
+    );
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    assert_eq!(
+        (
+            vfs.live_extent_records_for_inode(ino),
+            vfs.pending_uploads_for_inode(ino),
+        ),
+        (Vec::new(), Vec::new()),
+        "startup replay must cancel a pending upload whose offset is beyond the truncated file size"
+    );
+}
+
+#[test]
 fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");

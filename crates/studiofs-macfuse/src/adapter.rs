@@ -1122,6 +1122,17 @@ impl CancelableQueuedReadForTest {
     }
 }
 
+fn normalize_close_flush_result(result: Result<(), i32>) -> Result<(), i32> {
+    match result {
+        // macFUSE invokes `flush` from close(2), after an explicit fsync callback
+        // may already have reported a concurrent namespace deletion. Returning
+        // ENOENT here prevents the kernel from advancing to `release`, even
+        // though the open handle and its locally accepted payload remain valid.
+        Err(libc::ENOENT) => Ok(()),
+        other => other,
+    }
+}
+
 impl StudioVfsAdapter {
     /// Create a macFUSE adapter over a StudioVfs instance.
     #[cfg(test)]
@@ -2150,9 +2161,11 @@ impl StudioVfsAdapter {
 
     /// Flush file data through a VFS file handle.
     pub(crate) fn flush(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
-        self.runtime_handle
+        let result = self
+            .runtime_handle
             .block_on(self.vfs.flush_fh(file_handle))
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error));
+        normalize_close_flush_result(result)
     }
 
     /// Synchronize file data for a handle when available, otherwise for an inode.
@@ -2847,6 +2860,22 @@ mod open_cache_snapshot_tests {
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
             "the first read-only open after a write must drop kernel pages before cache can be kept"
+        );
+    }
+
+    #[test]
+    fn close_flush_ignores_namespace_enoent() {
+        assert_eq!(
+            super::normalize_close_flush_result(Err(libc::ENOENT)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn close_flush_preserves_non_namespace_errors() {
+        assert_eq!(
+            super::normalize_close_flush_result(Err(libc::EIO)),
+            Err(libc::EIO)
         );
     }
 
