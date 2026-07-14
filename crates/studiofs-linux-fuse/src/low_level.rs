@@ -186,6 +186,7 @@ pub(crate) struct SessionState {
     mount_uid: u32,
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
+    metric_config: LinuxFuseAsyncWriteMetricConfig,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -221,18 +222,26 @@ impl SessionState {
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             connection_config,
+            metric_config: LinuxFuseAsyncWriteMetricConfig {
+                cache_policy: linux_fuse_cache_policy_from_env(),
+                connection_config,
+            },
         }
     }
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
+#[cfg(test)]
 type FuseReplyWriteFn = unsafe extern "C" fn(*mut raw::FuseReq, size_t) -> c_int;
+#[cfg(test)]
 type FuseReplyErrorFn = unsafe extern "C" fn(*mut raw::FuseReq, c_int) -> c_int;
 
 struct FuseReqPtr {
     raw: *mut raw::FuseReq,
+    #[cfg(test)]
     reply_write_fn: FuseReplyWriteFn,
+    #[cfg(test)]
     reply_error_fn: FuseReplyErrorFn,
 }
 
@@ -244,7 +253,9 @@ impl FuseReqPtr {
     fn new(raw: *mut raw::FuseReq) -> Self {
         Self {
             raw,
+            #[cfg(test)]
             reply_write_fn: raw::fuse_reply_write,
+            #[cfg(test)]
             reply_error_fn: raw::fuse_reply_err,
         }
     }
@@ -264,12 +275,26 @@ impl FuseReqPtr {
 
     fn reply_write(self, written: size_t) -> c_int {
         // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
-        unsafe { (self.reply_write_fn)(self.raw, written) }
+        #[cfg(test)]
+        unsafe {
+            (self.reply_write_fn)(self.raw, written)
+        }
+        #[cfg(not(test))]
+        unsafe {
+            raw::fuse_reply_write(self.raw, written)
+        }
     }
 
     fn reply_error(self, errno: c_int) -> c_int {
         // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
-        unsafe { (self.reply_error_fn)(self.raw, errno) }
+        #[cfg(test)]
+        unsafe {
+            (self.reply_error_fn)(self.raw, errno)
+        }
+        #[cfg(not(test))]
+        unsafe {
+            raw::fuse_reply_err(self.raw, errno)
+        }
     }
 }
 
@@ -1758,10 +1783,7 @@ impl SessionState {
         let write_offset = request.offset;
         let writes = Arc::clone(&self.async_writes);
         let vfs = self.vfs.clone();
-        let metric_config = LinuxFuseAsyncWriteMetricConfig {
-            cache_policy: linux_fuse_cache_policy_from_env(),
-            connection_config: self.connection_config,
-        };
+        let metric_config = self.metric_config;
         let request_ticket = writes.start_request(fh)?;
         let mut guard = FuseWriteTaskGuard {
             request: Some(FuseReqPtr::new(req)),
