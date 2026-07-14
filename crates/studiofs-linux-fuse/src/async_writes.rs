@@ -347,7 +347,14 @@ impl LinuxFuseAsyncWrites {
             if let Some(ledger) = state.handles.get_mut(&fh) {
                 ledger.pending.remove(&sequence);
                 if let Some(errno) = error {
-                    ledger.unreported_errors.insert(sequence, errno);
+                    let replace = ledger
+                        .unreported_errors
+                        .first_key_value()
+                        .is_none_or(|(earliest, _)| sequence < *earliest);
+                    if replace {
+                        ledger.unreported_errors.clear();
+                        ledger.unreported_errors.insert(sequence, errno);
+                    }
                 }
             }
             state.stats.active_requests -= 1;
@@ -579,6 +586,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_failed_writes_keep_only_the_earliest_unreported_error() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 16));
+            let mut tickets = Vec::new();
+            for _ in 0..16 {
+                tickets.push(writes.start_request(22).expect("start failed write"));
+            }
+            let watermark = writes.watermark(22);
+            let earliest = tickets.remove(0);
+
+            for ticket in tickets.into_iter().rev() {
+                ticket.complete(LinuxFuseAsyncWriteCompletion::Failed(libc::EIO));
+            }
+            earliest.complete(LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+            assert_eq!(writes.stats().failed_writes, 16);
+            let (error_count, first_error) = {
+                let state = writes.state.lock().unwrap_or_else(|err| err.into_inner());
+                let ledger = state.handles.get(&22).expect("handle ledger");
+                (
+                    ledger.unreported_errors.len(),
+                    ledger
+                        .unreported_errors
+                        .first_key_value()
+                        .map(|(sequence, errno)| (*sequence, *errno)),
+                )
+            };
+            assert_eq!(error_count, 1);
+            assert_eq!(first_error, Some((1, libc::ENOSPC)));
+            assert_eq!(writes.wait_through(watermark), Err(libc::ENOSPC));
+            assert_eq!(writes.wait_through(watermark), Ok(()));
+        })
+        .await
+        .expect("bounded handle-error test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_ticket_records_task_failure_and_releases_capacity_once() {
         timeout(TEST_TIMEOUT, async {
             let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 1));
@@ -658,6 +702,43 @@ mod tests {
         })
         .await
         .expect("shutdown admission test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_reservation_admits_a_blocked_waiter_without_shutdown() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 1));
+            let holder_ticket = writes.start_request(45).expect("start budget holder");
+            let holder_reservation = writes.admit(8, |_| {}).expect("fill admission budget");
+            let waiting_ticket = writes.start_request(46).expect("start waiting request");
+
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let waiting_writes = Arc::clone(&writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                waiting_writes.admit(1, |stats| {
+                    let _ = observed_tx.send(stats);
+                })
+            });
+            let observed = observed_rx.await.expect("admission wait observation");
+            assert_eq!(observed.admission_waiters, 1);
+            assert_gauges(&writes, (2, 1, 2, 1, 8, 1));
+
+            drop(holder_reservation);
+            let waiting_reservation = match waiter.await.expect("admission waiter join") {
+                Ok(reservation) => reservation,
+                Err(errno) => panic!("capacity handoff failed with errno {errno}"),
+            };
+            assert_gauges(&writes, (2, 0, 2, 1, 1, 1));
+
+            drop(waiting_reservation);
+            assert_gauges(&writes, (2, 0, 2, 0, 0, 1));
+            holder_ticket.complete(LinuxFuseAsyncWriteCompletion::Success);
+            assert_gauges(&writes, (1, 0, 1, 0, 0, 1));
+            waiting_ticket.complete(LinuxFuseAsyncWriteCompletion::Success);
+            assert_gauges(&writes, (0, 0, 0, 0, 0, 0));
+        })
+        .await
+        .expect("normal capacity handoff test timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
