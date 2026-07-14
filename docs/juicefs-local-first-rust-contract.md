@@ -116,6 +116,12 @@ mean peer visibility.
 | `fsync` | The strict caller-requested local boundary. Durable cache mode must finish and sync the local cache/metadata state needed to recover the accepted data locally. Throughput-first Fast cache mode drains StudioFS state but does not force payload file fsync/dirsync. It does not wait for peer publication. |
 | last-handle close / release | Drains remaining dirty writer state through the local slice/cache pipeline so later opens on the same mount see coherent local state. It does not wait for peer publication. |
 
+Every failed platform-detached write request receives exactly one error reply.
+The bridge may additionally retain the earliest handle-local failure as one
+sticky barrier summary. Later failures coalesce because their write requests
+already report them; the summary clears only when a captured watermark covers
+its sequence.
+
 Crash behavior:
 
 - A crash before a local durability boundary may lose accepted bytes that lived

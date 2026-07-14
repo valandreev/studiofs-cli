@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ struct HandleLedger {
     next_sequence: u64,
     closing: bool,
     pending: BTreeSet<u64>,
-    unreported_errors: BTreeMap<u64, i32>,
+    barrier_error: Option<(u64, i32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -238,17 +238,15 @@ impl LinuxFuseAsyncWrites {
             state.stats.barrier_wait_total_ms += elapsed_ms(started);
         }
 
-        let first_error = state.handles.get(&watermark.fh).and_then(|ledger| {
-            ledger
-                .unreported_errors
-                .range(..=watermark.sequence)
-                .next()
-                .map(|(sequence, errno)| (*sequence, *errno))
-        });
-        if let Some((sequence, errno)) = first_error {
+        let barrier_error = state
+            .handles
+            .get(&watermark.fh)
+            .and_then(|ledger| ledger.barrier_error)
+            .filter(|(sequence, _)| *sequence <= watermark.sequence);
+        if let Some((_, errno)) = barrier_error {
             bump_generation(&mut state);
             if let Some(ledger) = state.handles.get_mut(&watermark.fh) {
-                ledger.unreported_errors.remove(&sequence);
+                ledger.barrier_error = None;
             }
             return Err(errno);
         }
@@ -348,12 +346,10 @@ impl LinuxFuseAsyncWrites {
                 ledger.pending.remove(&sequence);
                 if let Some(errno) = error {
                     let replace = ledger
-                        .unreported_errors
-                        .first_key_value()
-                        .is_none_or(|(earliest, _)| sequence < *earliest);
+                        .barrier_error
+                        .is_none_or(|(earliest, _)| sequence < earliest);
                     if replace {
-                        ledger.unreported_errors.clear();
-                        ledger.unreported_errors.insert(sequence, errno);
+                        ledger.barrier_error = Some((sequence, errno));
                     }
                 }
             }
@@ -524,6 +520,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failure_after_captured_watermark_stays_latched_for_later_barrier() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 2));
+            let captured = writes.start_request(8).expect("start captured write");
+            let captured_watermark = writes.watermark(8);
+            let later = writes.start_request(8).expect("start later write");
+            let later_watermark = writes.watermark(8);
+
+            later.complete(LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+            captured.complete(LinuxFuseAsyncWriteCompletion::Success);
+
+            assert_eq!(writes.wait_through(captured_watermark), Ok(()));
+            assert_eq!(writes.wait_through(later_watermark), Err(libc::ENOSPC));
+            assert_eq!(writes.wait_through(later_watermark), Ok(()));
+        })
+        .await
+        .expect("post-watermark error test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn out_of_order_completion_waits_for_every_sequence_through_watermark() {
         timeout(TEST_TIMEOUT, async {
             let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 2));
@@ -586,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn many_failed_writes_keep_only_the_earliest_unreported_error() {
+    async fn many_failed_writes_keep_only_the_earliest_barrier_error() {
         timeout(TEST_TIMEOUT, async {
             let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 16));
             let mut tickets = Vec::new();
@@ -602,19 +618,12 @@ mod tests {
             earliest.complete(LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
 
             assert_eq!(writes.stats().failed_writes, 16);
-            let (error_count, first_error) = {
+            let barrier_error = {
                 let state = writes.state.lock().unwrap_or_else(|err| err.into_inner());
                 let ledger = state.handles.get(&22).expect("handle ledger");
-                (
-                    ledger.unreported_errors.len(),
-                    ledger
-                        .unreported_errors
-                        .first_key_value()
-                        .map(|(sequence, errno)| (*sequence, *errno)),
-                )
+                ledger.barrier_error
             };
-            assert_eq!(error_count, 1);
-            assert_eq!(first_error, Some((1, libc::ENOSPC)));
+            assert_eq!(barrier_error, Some((1, libc::ENOSPC)));
             assert_eq!(writes.wait_through(watermark), Err(libc::ENOSPC));
             assert_eq!(writes.wait_through(watermark), Ok(()));
         })

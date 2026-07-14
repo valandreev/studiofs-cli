@@ -143,9 +143,11 @@ Artifacts are kept outside the source tree under
    services.
 3. **Conservative cache failure.** Unknown local cache facts drop kernel pages;
    they do not fail an otherwise valid file open.
-4. **Errors cross the next barrier.** A background write error is retained and
-   surfaced by the associated write request or the next relevant local
-   barrier.
+4. **Exact write replies, bounded barrier summary.** Every failed detached
+   write request receives exactly one error reply. The bridge also retains the
+   earliest handle-local failure as one sticky barrier summary; later failures
+   coalesce because their requests already report them, and the summary clears
+   only when a captured watermark covers it.
 5. **Evidence before policy promotion.** An experimental mechanism becomes a
    default only after repeatable correctness and performance evidence.
 6. **One controller first.** Linux activates the existing shared foreground
@@ -166,7 +168,10 @@ monotonic write sequence and completion ledger:
 
 - an opportunistic callback receives the next handle sequence before it waits
   for bounded admission or copies data;
-- completion records success or the first unreported error for that sequence;
+- every failed detached request receives one error reply and exact completion
+  accounting, while the ledger retains only the earliest handle-local failure
+  as a sticky barrier summary; later failures coalesce because their requests
+  already report them;
 - `flush`, `fsync`, and `release` capture the handle's current watermark;
 - the ledger waits only for callbacks at or below that watermark;
 - the canonical VFS `flush_fh` then supplies the existing inode-scoped local
@@ -420,9 +425,13 @@ or local-first progress.
 - An OS-cache observation failure is a conservative `Replace`, not an open
   failure.
 - VFS open errors remain VFS open errors.
-- Async write task errors are retained until reported and cannot be erased by
-  another handle's progress.
-- A barrier reports the first relevant unreported local error.
+- Every failed detached write request receives exactly one error reply and
+  exact completion accounting.
+- The bridge retains at most the earliest handle-local failure as a sticky
+  barrier summary; later failures coalesce because their requests already
+  report them.
+- A barrier reports and clears that summary only when its captured watermark
+  covers the retained sequence; another handle's progress cannot erase it.
 - Close-time `ENOENT` is normalized only for the concurrent-delete case.
 - Shutdown cancellation replies exactly once or completes the request before
   session destruction.

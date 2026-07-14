@@ -135,13 +135,22 @@ barrier_for_one_handle_does_not_wait_for_another_handle
 writes_after_a_captured_watermark_do_not_extend_the_barrier
 out_of_order_completion_waits_for_every_sequence_through_watermark
 first_handle_error_is_returned_once_and_does_not_cross_handles
+many_failed_writes_keep_only_the_earliest_barrier_error
+failure_after_captured_watermark_stays_latched_for_later_barrier
 dropped_ticket_records_task_failure_and_releases_capacity_once
 shutdown_rejects_new_admission_and_wakes_blocked_admission
+dropping_reservation_admits_a_blocked_waiter_without_shutdown
 request_waiting_for_admission_keeps_tracker_non_idle
 barrier_captures_request_waiting_for_admission
 ```
 
 Use Tokio tests plus one-second `timeout` bounds. The first two tests hold a ticket and prove the unrelated/future watermark completes through a channel. The out-of-order test completes sequence 2 before sequence 1 and asserts the waiter remains blocked until both are done. The error test injects `EIO` only on handle A and consumes it once. The drop and shutdown tests assert exact byte/request/raw-request gauges after every transition.
+
+The bounded-error test completes later failures before the earliest failure and
+proves exact failure counters plus one sticky earliest handle-local barrier
+error. The post-watermark test proves a later failure neither contaminates an
+earlier barrier nor clears before a later covering watermark. The normal
+capacity-handoff test proves reservation drop wakes admission without shutdown.
 
 - [ ] **Step 3: Verify RED**
 
@@ -158,7 +167,7 @@ Expected: compilation fails on the not-yet-defined tracker API.
 Use these concrete types and public-to-crate API:
 
 ```rust
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -202,7 +211,7 @@ struct HandleLedger {
     next_sequence: u64,
     closing: bool,
     pending: BTreeSet<u64>,
-    unreported_errors: BTreeMap<u64, i32>,
+    barrier_error: Option<(u64, i32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -289,8 +298,15 @@ Implementation rules:
   buffer. Their separate hard bound is configured `max_threads` on libfuse
   3.12+ and exactly one callback on the older single-loop path.
 - `close_handle` marks the ledger closing under the same mutex that assigns a sequence, so no write can cross the release boundary.
-- `wait_through` waits while `pending.first().is_some_and(|seq| *seq <= watermark.sequence)`, then removes and returns the first error at or below the watermark.
-- A `Failed(errno)`, `Cancelled`, or dropped ticket records `errno` (`EIO` for the latter two) in that handle only.
+- Completion counters remain exact for every `Failed`, `Cancelled`, or dropped
+  ticket. The ledger additionally retains at most one `(sequence, errno)` per
+  handle: the earliest outstanding barrier error (`EIO` for cancelled or
+  dropped tickets). Later or equal failures coalesce because their write
+  requests report errors independently.
+- `wait_through` waits while `pending.first().is_some_and(|seq| *seq <=
+  watermark.sequence)`, then returns and clears the sticky barrier error only
+  when its sequence is at or below that watermark. A post-watermark error stays
+  latched for a later barrier.
 - `forget_handle` removes only an idle ledger after release owns the final barrier.
 - Dropping `LinuxFuseWriteReservation` releases copied-byte/admitted-task capacity exactly once; completing or dropping `LinuxFuseRequestTicket` records the sequence result and raw-request completion exactly once.
 - `begin_shutdown` flips `shutting_down` and notifies the condition variable, waking admission waiters without cancelling admitted VFS writes. `request_cancellation` is the separate forced-unmount fallback that fires `task_cancellation` only after a normal drain grace period.
