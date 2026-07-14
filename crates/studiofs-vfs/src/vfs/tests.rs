@@ -14794,6 +14794,12 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         pending_writes: 3,
         pending_bytes: 256 * 1024,
         peak_pending_bytes: 512 * 1024,
+        cancelled_writes: 2,
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        max_handle_pending_writes: 4,
+        peak_handle_pending_writes: 7,
         completed_writes: 17,
         failed_writes: 2,
         task_failed_writes: 1,
@@ -14819,6 +14825,12 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.pending_writes, 3);
     assert_eq!(snapshot.fuse_async_write.pending_bytes, 256 * 1024);
     assert_eq!(snapshot.fuse_async_write.peak_pending_bytes, 512 * 1024);
+    assert_eq!(snapshot.fuse_async_write.cancelled_writes, 2);
+    assert_eq!(snapshot.fuse_async_write.active_requests, 2);
+    assert_eq!(snapshot.fuse_async_write.admission_waiters, 1);
+    assert_eq!(snapshot.fuse_async_write.pending_handles, 3);
+    assert_eq!(snapshot.fuse_async_write.max_handle_pending_writes, 4);
+    assert_eq!(snapshot.fuse_async_write.peak_handle_pending_writes, 7);
     assert_eq!(snapshot.fuse_async_write.completed_writes, 17);
     assert_eq!(snapshot.fuse_async_write.failed_writes, 2);
     assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
@@ -14884,6 +14896,29 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         snapshot.bridge.gauges["fuse_kernel_writeback_cache"].unit,
         "count"
     );
+}
+
+#[test]
+fn runtime_stats_surface_reports_fuse_async_write_gauges() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-fuse-async-write-gauges");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        pending_writes: 4,
+        pending_bytes: 4096,
+        ..Default::default()
+    });
+
+    let gauges = vfs.runtime_stats_snapshot().bridge.gauges;
+
+    assert_eq!(gauges["fuse_async_write.active_requests"].value, 2);
+    assert_eq!(gauges["fuse_async_write.admission_waiters"].value, 1);
+    assert_eq!(gauges["fuse_async_write.pending_handles"].value, 3);
+    assert_eq!(gauges["fuse_async_write.pending_writes"].value, 4);
+    assert_eq!(gauges["fuse_async_write.pending_bytes"].value, 4096);
 }
 
 #[test]
@@ -15086,6 +15121,12 @@ fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
         pending_writes: 3,
         pending_bytes: 4096,
         peak_pending_bytes: 8192,
+        cancelled_writes: 2,
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        max_handle_pending_writes: 4,
+        peak_handle_pending_writes: 7,
         completed_writes: 11,
         failed_writes: 2,
         task_failed_writes: 1,
@@ -15110,6 +15151,12 @@ fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
     assert_eq!(after.pending_writes, 0);
     assert_eq!(after.pending_bytes, 0);
     assert_eq!(after.peak_pending_bytes, 0);
+    assert_eq!(after.cancelled_writes, 0);
+    assert_eq!(after.active_requests, 0);
+    assert_eq!(after.admission_waiters, 0);
+    assert_eq!(after.pending_handles, 0);
+    assert_eq!(after.max_handle_pending_writes, 0);
+    assert_eq!(after.peak_handle_pending_writes, 0);
     assert_eq!(after.completed_writes, 0);
     assert_eq!(after.failed_writes, 0);
     assert_eq!(after.task_failed_writes, 0);
@@ -15128,6 +15175,12 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         pending_writes: 0,
         pending_bytes: 0,
         peak_pending_bytes: 8192,
+        cancelled_writes: 2,
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        max_handle_pending_writes: 4,
+        peak_handle_pending_writes: 7,
         completed_writes: 11,
         failed_writes: 2,
         task_failed_writes: 1,
@@ -15143,6 +15196,12 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         snapshot_generation: 7,
         enabled: true,
         peak_pending_bytes: 8192,
+        cancelled_writes: 2,
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        max_handle_pending_writes: 4,
+        peak_handle_pending_writes: 7,
         completed_writes: 11,
         failed_writes: 2,
         task_failed_writes: 1,
@@ -15156,6 +15215,12 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(baseline.snapshot_generation, 7);
     assert!(baseline.enabled);
     assert_eq!(baseline.peak_pending_bytes, 0);
+    assert_eq!(baseline.cancelled_writes, 0);
+    assert_eq!(baseline.active_requests, 2);
+    assert_eq!(baseline.admission_waiters, 1);
+    assert_eq!(baseline.pending_handles, 3);
+    assert_eq!(baseline.max_handle_pending_writes, 4);
+    assert_eq!(baseline.peak_handle_pending_writes, 4);
     assert_eq!(baseline.completed_writes, 0);
     assert_eq!(baseline.failed_writes, 0);
     assert_eq!(baseline.task_failed_writes, 0);
@@ -15168,6 +15233,12 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         pending_writes: 2,
         pending_bytes: 4096,
         peak_pending_bytes: 8192,
+        cancelled_writes: 5,
+        active_requests: 2,
+        admission_waiters: 1,
+        pending_handles: 3,
+        max_handle_pending_writes: 4,
+        peak_handle_pending_writes: 10,
         completed_writes: 13,
         failed_writes: 3,
         task_failed_writes: 1,
@@ -15184,6 +15255,12 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(after.pending_writes, 2);
     assert_eq!(after.pending_bytes, 4096);
     assert_eq!(after.peak_pending_bytes, 4096);
+    assert_eq!(after.cancelled_writes, 3);
+    assert_eq!(after.active_requests, 2);
+    assert_eq!(after.admission_waiters, 1);
+    assert_eq!(after.pending_handles, 3);
+    assert_eq!(after.max_handle_pending_writes, 4);
+    assert_eq!(after.peak_handle_pending_writes, 4);
     assert_eq!(after.completed_writes, 2);
     assert_eq!(after.failed_writes, 1);
     assert_eq!(after.task_failed_writes, 0);

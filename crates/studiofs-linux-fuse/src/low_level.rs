@@ -13,9 +13,15 @@ use studiofs_bridge::posix::{
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
     DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
+    VfsFuseAsyncWriteSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
+
+use crate::async_writes::{
+    LinuxFuseAsyncWriteCompletion, LinuxFuseAsyncWriteStats, LinuxFuseAsyncWrites,
+    LinuxFuseRequestTicket, LinuxFuseWriteReservation,
+};
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
@@ -221,105 +227,186 @@ impl SessionState {
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
-#[derive(Clone, Copy, Debug)]
-struct FuseReqPtr(*mut raw::FuseReq);
+type FuseReplyWriteFn = unsafe extern "C" fn(*mut raw::FuseReq, size_t) -> c_int;
+type FuseReplyErrorFn = unsafe extern "C" fn(*mut raw::FuseReq, c_int) -> c_int;
+
+struct FuseReqPtr {
+    raw: *mut raw::FuseReq,
+    reply_write_fn: FuseReplyWriteFn,
+    reply_error_fn: FuseReplyErrorFn,
+}
 
 // SAFETY: libfuse low-level requests may be replied asynchronously exactly once.
 // Async write transfers that reply obligation to the spawned task.
 unsafe impl Send for FuseReqPtr {}
 
 impl FuseReqPtr {
-    fn reply_write(self, written: size_t) {
-        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
-        unsafe { raw::fuse_reply_write(self.0, written) };
-    }
-
-    fn reply_error(self, errno: c_int) {
-        reply_error(self.0, errno);
-    }
-}
-
-#[derive(Debug)]
-struct LinuxFuseAsyncWrites {
-    limits: LinuxFuseAsyncWriteLimits,
-    state: Mutex<LinuxFuseAsyncWriteState>,
-    // Block libfuse worker threads here so write backpressure reaches the kernel.
-    idle: Condvar,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LinuxFuseAsyncWriteLimits {
-    max_pending_bytes: usize,
-    max_pending_writes: usize,
-}
-
-#[derive(Default, Debug)]
-struct LinuxFuseAsyncWriteState {
-    pending_bytes: usize,
-    pending_writes: usize,
-}
-
-struct LinuxFuseAsyncWriteReservation {
-    writes: Arc<LinuxFuseAsyncWrites>,
-    bytes: usize,
-}
-
-impl LinuxFuseAsyncWrites {
-    fn new(max_pending_bytes: usize, max_pending_writes: usize) -> Self {
+    fn new(raw: *mut raw::FuseReq) -> Self {
         Self {
-            limits: LinuxFuseAsyncWriteLimits {
-                max_pending_bytes,
-                max_pending_writes,
-            },
-            state: Mutex::new(LinuxFuseAsyncWriteState::default()),
-            idle: Condvar::new(),
-        }
-    }
-
-    fn reserve(self: &Arc<Self>, bytes: usize) -> LinuxFuseAsyncWriteReservation {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        while self.should_wait(&state, bytes) {
-            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
-        }
-        state.pending_writes += 1;
-        state.pending_bytes = state.pending_bytes.saturating_add(bytes);
-        LinuxFuseAsyncWriteReservation {
-            writes: self.clone(),
-            bytes,
-        }
-    }
-
-    fn should_wait(&self, state: &LinuxFuseAsyncWriteState, bytes: usize) -> bool {
-        state.pending_writes >= self.limits.max_pending_writes
-            || (state.pending_bytes > 0
-                && state.pending_bytes.saturating_add(bytes) > self.limits.max_pending_bytes)
-    }
-
-    fn wait_idle(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        while state.pending_writes > 0 {
-            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
+            raw,
+            reply_write_fn: raw::fuse_reply_write,
+            reply_error_fn: raw::fuse_reply_err,
         }
     }
 
     #[cfg(test)]
-    fn snapshot(&self) -> (usize, usize) {
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        (state.pending_writes, state.pending_bytes)
+    fn for_test(
+        raw: *mut raw::FuseReq,
+        reply_write_fn: FuseReplyWriteFn,
+        reply_error_fn: FuseReplyErrorFn,
+    ) -> Self {
+        Self {
+            raw,
+            reply_write_fn,
+            reply_error_fn,
+        }
     }
 
-    fn finish(&self, bytes: usize) {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        state.pending_writes = state.pending_writes.saturating_sub(1);
-        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
-        self.idle.notify_all();
+    fn reply_write(self, written: size_t) -> c_int {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
+        unsafe { (self.reply_write_fn)(self.raw, written) }
+    }
+
+    fn reply_error(self, errno: c_int) -> c_int {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
+        unsafe { (self.reply_error_fn)(self.raw, errno) }
     }
 }
 
-impl Drop for LinuxFuseAsyncWriteReservation {
-    fn drop(&mut self) {
-        self.writes.finish(self.bytes);
+#[derive(Clone, Copy)]
+struct LinuxFuseAsyncWriteMetricConfig {
+    cache_policy: LinuxFuseCachePolicy,
+    connection_config: LinuxFuseConnectionConfig,
+}
+
+struct FuseWriteTaskGuard {
+    request: Option<FuseReqPtr>,
+    request_ticket: Option<LinuxFuseRequestTicket>,
+    reservation: Option<LinuxFuseWriteReservation>,
+    writes: Arc<LinuxFuseAsyncWrites>,
+    vfs: Arc<StudioVfs>,
+    started: Instant,
+    requested_bytes: usize,
+    metric_config: LinuxFuseAsyncWriteMetricConfig,
+}
+
+enum FuseWriteTaskResult {
+    AdmissionRejected(i32),
+    Completed(Result<u32, i32>),
+    Cancelled,
+}
+
+impl FuseWriteTaskGuard {
+    fn attach_reservation(&mut self, reservation: LinuxFuseWriteReservation) {
+        self.reservation = Some(reservation);
     }
+
+    fn finish(mut self, result: FuseWriteTaskResult) {
+        let request = self.request.take().expect("request guard owns one reply");
+        let (reply_status, errored, completion) = match result {
+            FuseWriteTaskResult::AdmissionRejected(errno) => (
+                request.reply_error(errno),
+                true,
+                LinuxFuseAsyncWriteCompletion::Failed(errno),
+            ),
+            FuseWriteTaskResult::Completed(Ok(written)) => {
+                let status = request.reply_write(written as size_t);
+                let completion = if status == 0 {
+                    LinuxFuseAsyncWriteCompletion::Success
+                } else {
+                    LinuxFuseAsyncWriteCompletion::Failed(libc::EIO)
+                };
+                (status, status != 0, completion)
+            }
+            FuseWriteTaskResult::Completed(Err(errno)) => (
+                request.reply_error(errno),
+                true,
+                LinuxFuseAsyncWriteCompletion::Failed(errno),
+            ),
+            FuseWriteTaskResult::Cancelled => (
+                request.reply_error(libc::EIO),
+                true,
+                LinuxFuseAsyncWriteCompletion::Cancelled,
+            ),
+        };
+        if reply_status != 0 {
+            warn!(reply_status, "libfuse rejected async write reply");
+        }
+        self.vfs
+            .record_fuse_write_callback(self.requested_bytes, self.started.elapsed(), errored);
+        drop(self.reservation.take());
+        self.request_ticket
+            .take()
+            .expect("request sequence completes once")
+            .complete(completion);
+        record_linux_async_write_snapshot(&self.vfs, &self.writes, self.metric_config);
+    }
+}
+
+impl Drop for FuseWriteTaskGuard {
+    fn drop(&mut self) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let reply_status = request.reply_error(libc::EIO);
+        if reply_status != 0 {
+            warn!(reply_status, "libfuse rejected async write reply");
+        }
+        self.vfs
+            .record_fuse_write_callback(self.requested_bytes, self.started.elapsed(), true);
+        drop(self.reservation.take());
+        drop(self.request_ticket.take());
+        record_linux_async_write_snapshot(&self.vfs, &self.writes, self.metric_config);
+    }
+}
+
+fn record_linux_async_write_snapshot(
+    vfs: &StudioVfs,
+    writes: &LinuxFuseAsyncWrites,
+    metric_config: LinuxFuseAsyncWriteMetricConfig,
+) {
+    record_linux_async_write_stats(vfs, writes.stats(), metric_config);
+}
+
+fn record_linux_async_write_stats(
+    vfs: &StudioVfs,
+    stats: LinuxFuseAsyncWriteStats,
+    metric_config: LinuxFuseAsyncWriteMetricConfig,
+) {
+    let (profile, kernel_writeback_cache) = match metric_config.cache_policy {
+        LinuxFuseCachePolicy::Direct => ("direct", false),
+        LinuxFuseCachePolicy::Kernel => ("kernel", true),
+    };
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: stats.snapshot_generation,
+        enabled: linux_fuse_async_write_enabled(),
+        linux_fuse_profile: profile.into(),
+        fuse_max_background: u16::try_from(metric_config.connection_config.max_background).ok(),
+        fuse_congestion_threshold: u16::try_from(
+            metric_config.connection_config.congestion_threshold,
+        )
+        .ok(),
+        kernel_writeback_cache: Some(kernel_writeback_cache),
+        max_pending_bytes: Some(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES),
+        max_pending_writes: Some(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES),
+        active_requests: stats.active_requests,
+        admission_waiters: stats.admission_waiters,
+        pending_handles: stats.pending_handles,
+        pending_writes: stats.pending_writes,
+        pending_bytes: stats.pending_bytes,
+        peak_pending_bytes: stats.peak_pending_bytes,
+        max_handle_pending_writes: stats.max_handle_pending_writes,
+        peak_handle_pending_writes: stats.peak_handle_pending_writes,
+        completed_writes: stats.completed_writes,
+        failed_writes: stats.failed_writes,
+        task_failed_writes: stats.task_failed_writes,
+        cancelled_writes: stats.cancelled_writes,
+        admission_waits: stats.admission_waits,
+        admission_wait_total_ms: stats.admission_wait_total_ms,
+        barrier_waits: stats.barrier_waits,
+        barrier_wait_total_ms: stats.barrier_wait_total_ms,
+        ..VfsFuseAsyncWriteSnapshot::default()
+    });
 }
 
 struct LinuxFuseWriteRequest {
@@ -1101,13 +1188,8 @@ pub extern "C" fn studiofs_linux_fuse_write(
         return;
     };
     let started = Instant::now();
-    match state.queue_async_write(req, ino, buf, size, off, fi) {
-        Ok(true) => {
-            state
-                .vfs
-                .record_fuse_write_callback(size, started.elapsed(), false);
-            return;
-        }
+    match state.queue_async_write(req, ino, buf, size, off, fi, started) {
+        Ok(true) => return,
         Ok(false) => {}
         Err(errno) => {
             state
@@ -1662,6 +1744,7 @@ impl SessionState {
         size: usize,
         offset: off_t,
         fi: *const raw::FuseFileInfo,
+        started: Instant,
     ) -> Result<bool, i32> {
         if !linux_fuse_async_write_enabled() {
             return Ok(false);
@@ -1671,34 +1754,67 @@ impl SessionState {
             return Ok(false);
         }
 
-        let data = with_write_data_slice(buf, size, |data| {
-            let reservation = self.async_writes.reserve(data.len());
-            (reservation, Bytes::copy_from_slice(data))
-        })?;
-        let (reservation, data) = data;
         let fh = request.fh;
         let write_offset = request.offset;
+        let writes = Arc::clone(&self.async_writes);
         let vfs = self.vfs.clone();
-        let req = FuseReqPtr(req);
+        let metric_config = LinuxFuseAsyncWriteMetricConfig {
+            cache_policy: linux_fuse_cache_policy_from_env(),
+            connection_config: self.connection_config,
+        };
+        let request_ticket = writes.start_request(fh)?;
+        let mut guard = FuseWriteTaskGuard {
+            request: Some(FuseReqPtr::new(req)),
+            request_ticket: Some(request_ticket),
+            reservation: None,
+            writes: Arc::clone(&writes),
+            vfs: Arc::clone(&vfs),
+            started,
+            requested_bytes: size,
+            metric_config,
+        };
+        record_linux_async_write_snapshot(&vfs, &writes, metric_config);
+
+        let admitted = match with_write_data_slice(buf, size, |data| {
+            writes
+                .admit(data.len(), |waiting_stats| {
+                    record_linux_async_write_stats(&vfs, waiting_stats, metric_config);
+                })
+                .map(|reservation| {
+                    guard.attach_reservation(reservation);
+                    record_linux_async_write_snapshot(&vfs, &writes, metric_config);
+                    Bytes::copy_from_slice(data)
+                })
+        }) {
+            Ok(admitted) => admitted,
+            Err(errno) => {
+                guard.finish(FuseWriteTaskResult::AdmissionRejected(errno));
+                return Ok(true);
+            }
+        };
+        let data = match admitted {
+            Ok(data) => data,
+            Err(errno) => {
+                guard.finish(FuseWriteTaskResult::AdmissionRejected(errno));
+                return Ok(true);
+            }
+        };
+        let cancellation = writes.task_cancellation_token();
         self.runtime_handle.spawn(async move {
-            let result = vfs
-                .write_fh_owned_with_deferred_materialize(
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => FuseWriteTaskResult::Cancelled,
+                result = vfs.write_fh_owned_with_deferred_materialize(
                     fh,
                     ino,
                     write_offset,
                     data,
                     LocalSyncPolicy::Opportunistic,
-                )
-                .await;
-            drop(reservation);
-            match result {
-                Ok(written) => {
-                    req.reply_write(written as size_t);
-                }
-                Err(error) => {
-                    req.reply_error(vfs_err_to_errno(&error));
-                }
-            }
+                ) => FuseWriteTaskResult::Completed(
+                    result.map_err(|error| vfs_err_to_errno(&error)),
+                ),
+            };
+            guard.finish(result);
         });
         Ok(true)
     }
@@ -1735,7 +1851,7 @@ impl SessionState {
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
-        self.async_writes.wait_idle();
+        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
         if self.local_sync_policy_for_handle(fh).is_opportunistic() {
             let ino = self
                 .vfs
@@ -1754,7 +1870,7 @@ impl SessionState {
     }
 
     fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
-        self.async_writes.wait_idle();
+        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
         let result = if let Some(fh) = file_handle {
             // Handle-backed sync must preserve pending handle-local write state;
             // StudioVfs does not currently distinguish fdatasync from fsync on
@@ -1767,7 +1883,7 @@ impl SessionState {
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
-        self.async_writes.wait_idle();
+        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
         if self.local_sync_policy_for_handle(fh).is_opportunistic() {
             self.vfs
                 .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
@@ -2371,7 +2487,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 
@@ -2502,6 +2618,209 @@ mod tests {
         super::LinuxFuseConnectionConfig::default()
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum FakeFuseReply {
+        Write(usize),
+        Error(i32),
+    }
+
+    struct FakeFuseReplyState {
+        status: libc::c_int,
+        replies: Vec<FakeFuseReply>,
+        observations: Vec<(u64, usize, usize)>,
+        writes: Arc<super::LinuxFuseAsyncWrites>,
+        vfs: Arc<studiofs_vfs::StudioVfs>,
+    }
+
+    impl FakeFuseReplyState {
+        fn new(
+            status: libc::c_int,
+            writes: Arc<super::LinuxFuseAsyncWrites>,
+            vfs: Arc<studiofs_vfs::StudioVfs>,
+        ) -> Self {
+            Self {
+                status,
+                replies: Vec::new(),
+                observations: Vec::new(),
+                writes,
+                vfs,
+            }
+        }
+
+        fn record(&mut self, reply: FakeFuseReply) -> libc::c_int {
+            let callbacks = self
+                .vfs
+                .write_path_observability_snapshot()
+                .fuse_callbacks
+                .write
+                .calls;
+            let stats = self.writes.stats();
+            self.replies.push(reply);
+            self.observations
+                .push((callbacks, stats.pending_writes, stats.active_requests));
+            self.status
+        }
+    }
+
+    unsafe extern "C" fn fake_fuse_reply_write(
+        req: *mut super::raw::FuseReq,
+        written: libc::size_t,
+    ) -> libc::c_int {
+        // SAFETY: guard tests pass a live `FakeFuseReplyState` as the request pointer.
+        let state = unsafe { &mut *req.cast::<FakeFuseReplyState>() };
+        state.record(FakeFuseReply::Write(written))
+    }
+
+    unsafe extern "C" fn fake_fuse_reply_error(
+        req: *mut super::raw::FuseReq,
+        errno: libc::c_int,
+    ) -> libc::c_int {
+        // SAFETY: guard tests pass a live `FakeFuseReplyState` as the request pointer.
+        let state = unsafe { &mut *req.cast::<FakeFuseReplyState>() };
+        state.record(FakeFuseReply::Error(errno))
+    }
+
+    fn make_async_write_guard(
+        reply: &mut FakeFuseReplyState,
+        writes: &Arc<super::LinuxFuseAsyncWrites>,
+        vfs: &Arc<studiofs_vfs::StudioVfs>,
+    ) -> super::FuseWriteTaskGuard {
+        let request_ticket = writes.start_request(41).expect("start request");
+        let reservation = writes.admit(8, |_| {}).expect("admit write");
+        let request = super::FuseReqPtr::for_test(
+            (reply as *mut FakeFuseReplyState).cast(),
+            fake_fuse_reply_write,
+            fake_fuse_reply_error,
+        );
+        super::FuseWriteTaskGuard {
+            request: Some(request),
+            request_ticket: Some(request_ticket),
+            reservation: Some(reservation),
+            writes: Arc::clone(writes),
+            vfs: Arc::clone(vfs),
+            started: Instant::now(),
+            requested_bytes: 8,
+            metric_config: super::LinuxFuseAsyncWriteMetricConfig {
+                cache_policy: super::LinuxFuseCachePolicy::Direct,
+                connection_config: default_connection_config(),
+            },
+        }
+    }
+
+    #[test]
+    fn async_write_guard_successful_write_replies_before_releasing_owned_state() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("async-write-guard-success")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+        let mut reply = FakeFuseReplyState::new(0, Arc::clone(&writes), Arc::clone(&vfs));
+        let guard = make_async_write_guard(&mut reply, &writes, &vfs);
+
+        guard.finish(super::FuseWriteTaskResult::Completed(Ok(8)));
+
+        assert_eq!(reply.replies, [FakeFuseReply::Write(8)]);
+        assert_eq!(reply.observations, [(0, 1, 1)]);
+        let callback = vfs.write_path_observability_snapshot().fuse_callbacks.write;
+        assert_eq!((callback.calls, callback.errors), (1, 0));
+        let stats = writes.stats();
+        assert_eq!(
+            (
+                stats.pending_writes,
+                stats.active_requests,
+                stats.completed_writes,
+                stats.failed_writes,
+                stats.task_failed_writes,
+            ),
+            (0, 0, 1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn async_write_guard_rejected_success_reply_records_eio() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "async-write-guard-rejected-success",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+        let mut reply = FakeFuseReplyState::new(-1, Arc::clone(&writes), Arc::clone(&vfs));
+        let guard = make_async_write_guard(&mut reply, &writes, &vfs);
+        let watermark = writes.watermark(41);
+
+        guard.finish(super::FuseWriteTaskResult::Completed(Ok(8)));
+
+        assert_eq!(reply.replies, [FakeFuseReply::Write(8)]);
+        assert_eq!(writes.wait_through(watermark), Err(libc::EIO));
+        let callback = vfs.write_path_observability_snapshot().fuse_callbacks.write;
+        assert_eq!((callback.calls, callback.errors), (1, 1));
+        assert_eq!(writes.stats().failed_writes, 1);
+    }
+
+    #[test]
+    fn async_write_guard_rejected_error_reply_retains_original_errno() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "async-write-guard-rejected-error",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+        let mut reply = FakeFuseReplyState::new(-1, Arc::clone(&writes), Arc::clone(&vfs));
+        let guard = make_async_write_guard(&mut reply, &writes, &vfs);
+        let watermark = writes.watermark(41);
+
+        guard.finish(super::FuseWriteTaskResult::Completed(Err(libc::ENOSPC)));
+
+        assert_eq!(reply.replies, [FakeFuseReply::Error(libc::ENOSPC)]);
+        assert_eq!(writes.wait_through(watermark), Err(libc::ENOSPC));
+        assert_eq!(writes.stats().failed_writes, 1);
+    }
+
+    #[test]
+    fn async_write_guard_unfinished_drop_replies_eio_once() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "async-write-guard-unfinished-drop",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+        let mut reply = FakeFuseReplyState::new(0, Arc::clone(&writes), Arc::clone(&vfs));
+        let guard = make_async_write_guard(&mut reply, &writes, &vfs);
+
+        drop(guard);
+
+        assert_eq!(reply.replies, [FakeFuseReply::Error(libc::EIO)]);
+        assert_eq!(reply.observations, [(0, 1, 1)]);
+        let callback = vfs.write_path_observability_snapshot().fuse_callbacks.write;
+        assert_eq!((callback.calls, callback.errors), (1, 1));
+        let stats = writes.stats();
+        assert_eq!(
+            (
+                stats.pending_writes,
+                stats.active_requests,
+                stats.failed_writes,
+                stats.task_failed_writes,
+            ),
+            (0, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn async_write_guard_drop_after_finish_does_not_reply_twice() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "async-write-guard-finished-drop",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+        let mut reply = FakeFuseReplyState::new(0, Arc::clone(&writes), Arc::clone(&vfs));
+        let guard = make_async_write_guard(&mut reply, &writes, &vfs);
+
+        guard.finish(super::FuseWriteTaskResult::Completed(Ok(8)));
+
+        assert_eq!(reply.replies, [FakeFuseReply::Write(8)]);
+    }
+
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
         let args = super::argv_strings("demo");
@@ -2548,11 +2867,13 @@ mod tests {
     fn async_write_reservation_releases_pending_bytes_on_drop() {
         let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
 
-        let reservation = writes.reserve(8);
-        assert_eq!(writes.snapshot(), (1, 8));
+        let reservation = writes.admit(8, |_| {}).expect("admit write");
+        let pending = writes.stats();
+        assert_eq!((pending.pending_writes, pending.pending_bytes), (1, 8));
 
         drop(reservation);
-        assert_eq!(writes.snapshot(), (0, 0));
+        let released = writes.stats();
+        assert_eq!((released.pending_writes, released.pending_bytes), (0, 0));
     }
 
     #[test]

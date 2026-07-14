@@ -1026,18 +1026,30 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub max_pending_writes: Option<usize>,
     /// Maximum pending bytes admitted per file handle.
     pub per_handle_pending_bytes: Option<usize>,
+    /// Current detached write requests awaiting completion.
+    pub active_requests: usize,
+    /// Current detached write callbacks awaiting admission.
+    pub admission_waiters: usize,
+    /// Current file handles with pending detached writes.
+    pub pending_handles: usize,
     /// Current pending async write requests.
     pub pending_writes: usize,
     /// Current pending async write bytes.
     pub pending_bytes: usize,
     /// Peak pending async write bytes.
     pub peak_pending_bytes: usize,
+    /// Maximum pending writes on any current file handle.
+    pub max_handle_pending_writes: usize,
+    /// Peak pending writes observed on one file handle.
+    pub peak_handle_pending_writes: usize,
     /// Completed async writes.
     pub completed_writes: u64,
     /// Async writes completed with a VFS error.
     pub failed_writes: u64,
     /// Async write tasks dropped before explicit completion.
     pub task_failed_writes: u64,
+    /// Async writes cancelled during shutdown.
+    pub cancelled_writes: u64,
     /// Admission waits caused by pending-write caps.
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.

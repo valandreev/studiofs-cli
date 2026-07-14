@@ -7345,12 +7345,18 @@ impl StudioVfs {
             current.max_pending_bytes = snapshot.max_pending_bytes;
             current.max_pending_writes = snapshot.max_pending_writes;
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
+            current.active_requests = snapshot.active_requests;
+            current.admission_waiters = snapshot.admission_waiters;
+            current.pending_handles = snapshot.pending_handles;
             current.pending_writes = snapshot.pending_writes;
             current.pending_bytes = snapshot.pending_bytes;
             current.peak_pending_bytes = snapshot.peak_pending_bytes;
+            current.max_handle_pending_writes = snapshot.max_handle_pending_writes;
+            current.peak_handle_pending_writes = snapshot.peak_handle_pending_writes;
             current.completed_writes = snapshot.completed_writes;
             current.failed_writes = snapshot.failed_writes;
             current.task_failed_writes = snapshot.task_failed_writes;
+            current.cancelled_writes = snapshot.cancelled_writes;
             current.admission_waits = snapshot.admission_waits;
             current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
             current.barrier_waits = snapshot.barrier_waits;
@@ -7374,6 +7380,10 @@ impl StudioVfs {
             .peak_pending_bytes
             .saturating_sub(baseline.peak_pending_bytes)
             .max(snapshot.pending_bytes);
+        snapshot.peak_handle_pending_writes = snapshot
+            .peak_handle_pending_writes
+            .saturating_sub(baseline.peak_handle_pending_writes)
+            .max(snapshot.max_handle_pending_writes);
         snapshot.completed_writes = snapshot
             .completed_writes
             .saturating_sub(baseline.completed_writes);
@@ -7383,6 +7393,9 @@ impl StudioVfs {
         snapshot.task_failed_writes = snapshot
             .task_failed_writes
             .saturating_sub(baseline.task_failed_writes);
+        snapshot.cancelled_writes = snapshot
+            .cancelled_writes
+            .saturating_sub(baseline.cancelled_writes);
         snapshot.admission_waits = snapshot
             .admission_waits
             .saturating_sub(baseline.admission_waits);

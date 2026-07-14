@@ -263,6 +263,35 @@ impl StudioVfs {
                 u64::from(congestion_threshold),
             );
         }
+        for (name, unit, value) in [
+            (
+                "fuse_async_write.active_requests",
+                "count",
+                write_path.fuse_async_write.active_requests as u64,
+            ),
+            (
+                "fuse_async_write.admission_waiters",
+                "count",
+                write_path.fuse_async_write.admission_waiters as u64,
+            ),
+            (
+                "fuse_async_write.pending_handles",
+                "count",
+                write_path.fuse_async_write.pending_handles as u64,
+            ),
+            (
+                "fuse_async_write.pending_writes",
+                "count",
+                write_path.fuse_async_write.pending_writes as u64,
+            ),
+            (
+                "fuse_async_write.pending_bytes",
+                "bytes",
+                write_path.fuse_async_write.pending_bytes as u64,
+            ),
+        ] {
+            insert_gauge(&mut snapshot.bridge, name, unit, value);
+        }
         insert_latency(
             &mut snapshot.bridge,
             "callback",

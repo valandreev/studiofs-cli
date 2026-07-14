@@ -188,7 +188,7 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
         "disabled"
     };
     let has_profile_knobs = has_raw_fuse_profile_knobs(snapshot);
-    let mut lines = Vec::with_capacity(if has_profile_knobs { 6 } else { 5 });
+    let mut lines = Vec::with_capacity(if has_profile_knobs { 8 } else { 7 });
     lines.push(format!(
         "  FUSE async writes:        {mode} (profile: {})",
         snapshot.linux_fuse_profile
@@ -204,10 +204,19 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
         ));
     }
     lines.push(format!(
-        "  FUSE async pending:       {} writes, {} current, {} peak",
+        "  FUSE async pending:       {} writes on {} handles, {} current, {} peak",
         snapshot.pending_writes,
+        snapshot.pending_handles,
         format_bytes(snapshot.pending_bytes as u64),
         format_bytes(snapshot.peak_pending_bytes as u64)
+    ));
+    lines.push(format!(
+        "  FUSE async requests:      {} active, {} awaiting admission",
+        snapshot.active_requests, snapshot.admission_waiters
+    ));
+    lines.push(format!(
+        "  FUSE async handle peak:   {} current, {} peak",
+        snapshot.max_handle_pending_writes, snapshot.peak_handle_pending_writes
     ));
     lines.push(format!(
         "  FUSE async caps:          max {}, max writes {}, per-handle {}",
@@ -216,8 +225,11 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
         format_optional_bytes(snapshot.per_handle_pending_bytes)
     ));
     lines.push(format!(
-        "  FUSE async completions:   {} ok, {} errors, {} task failures",
-        snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
+        "  FUSE async completions:   {} ok, {} errors, {} task failures, {} cancelled",
+        snapshot.completed_writes,
+        snapshot.failed_writes,
+        snapshot.task_failed_writes,
+        snapshot.cancelled_writes
     ));
     lines.push(format!(
         "  FUSE async waits:         admission {}/{}, barriers {}/{}",
@@ -1099,6 +1111,12 @@ mod tests {
             pending_writes: 3,
             pending_bytes: 256 * 1024,
             peak_pending_bytes: 512 * 1024,
+            cancelled_writes: 2,
+            active_requests: 2,
+            admission_waiters: 1,
+            pending_handles: 3,
+            max_handle_pending_writes: 4,
+            peak_handle_pending_writes: 7,
             completed_writes: 17,
             failed_writes: 2,
             task_failed_writes: 1,
@@ -1116,9 +1134,11 @@ mod tests {
             [
                 "  FUSE async writes:        enabled (profile: raw-macfuse-like)",
                 "  FUSE profile knobs:       shared 300.0MiB, prefetch 1, upload 20, download 200, writeback off",
-                "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
+                "  FUSE async pending:       3 writes on 3 handles, 256.0KiB current, 512.0KiB peak",
+                "  FUSE async requests:      2 active, 1 awaiting admission",
+                "  FUSE async handle peak:   4 current, 7 peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
-                "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
+                "  FUSE async completions:   17 ok, 2 errors, 1 task failures, 2 cancelled",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
             ]
         );
