@@ -691,6 +691,7 @@ fn held_helper_parent_is_alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn held_helper_parent_is_valid(
     observed_parent_pid: u32,
     expected_parent_pid: u32,
