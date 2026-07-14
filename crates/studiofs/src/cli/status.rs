@@ -1172,12 +1172,12 @@ mod tests {
         let lines = format_fuse_async_write_diagnostics(&snapshot);
 
         assert_eq!(
-            lines[4],
+            lines[6],
             "  FUSE async waits:         admission 0/unavailable, barriers 0/unavailable"
         );
         assert_eq!(
-            lines[3],
-            "  FUSE async completions:   0 ok, 0 errors, 0 task failures"
+            lines[5],
+            "  FUSE async completions:   0 ok, 0 errors, 0 task failures, 0 cancelled"
         );
     }
 
