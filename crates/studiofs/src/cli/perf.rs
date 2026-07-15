@@ -13,8 +13,9 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use studiofs_vfs::RuntimeScalarMetric;
 use studiofs_vfs::{
-    RUNTIME_STATS_FILE_NAME_STR, RUNTIME_STATS_SECTIONS, RuntimeLatencyHistogram,
-    RuntimeStatsSection, RuntimeStatsSnapshot,
+    RUNTIME_STATS_FILE_NAME_STR, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
+    RuntimeLatencyHistogram, RuntimeStatsSection, RuntimeStatsSnapshot, VfsFuseSizeHistogram,
+    VfsWritePathStageLatencyStats,
 };
 
 use crate::diagnostics;
@@ -170,6 +171,14 @@ struct PerfLatencySample {
     sum_delta: u64,
     avg: Option<f64>,
     unit: Cow<'static, str>,
+    buckets: Vec<RuntimeLatencyBucket>,
+    p50_ns: Option<u64>,
+    p95_ns: Option<u64>,
+    p99_ns: Option<u64>,
+    interval_max_upper_ns: Option<u64>,
+    overflow: u64,
+    saturated: bool,
+    buckets_valid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -454,7 +463,22 @@ fn runtime_stats_from_diagnostics(
         &mut snapshot.bridge,
         "flush_callbacks",
         "count",
-        write_path.winfsp_callbacks.flush,
+        write_path
+            .winfsp_callbacks
+            .flush
+            .saturating_add(write_path.fuse_callbacks.flush.calls),
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "fsync_callbacks",
+        "count",
+        write_path.fuse_callbacks.fsync.calls,
+    );
+    insert_counter(
+        &mut snapshot.bridge,
+        "release_callbacks",
+        "count",
+        write_path.fuse_callbacks.release.calls,
     );
     insert_counter(
         &mut snapshot.bridge,
@@ -500,7 +524,10 @@ fn runtime_stats_from_diagnostics(
             .fuse_callbacks
             .read
             .errors
-            .saturating_add(write_path.fuse_callbacks.write.errors),
+            .saturating_add(write_path.fuse_callbacks.write.errors)
+            .saturating_add(write_path.fuse_callbacks.flush.errors)
+            .saturating_add(write_path.fuse_callbacks.fsync.errors)
+            .saturating_add(write_path.fuse_callbacks.release.errors),
     );
     insert_counter(
         &mut snapshot.bridge,
@@ -522,6 +549,40 @@ fn runtime_stats_from_diagnostics(
             .bytes
             .saturating_add(write_path.winfsp_write_path.write_bytes),
     );
+    insert_size_histogram_counters(
+        &mut snapshot.bridge,
+        "read_callback_size",
+        &write_path.fuse_callbacks.read.size_histogram,
+    );
+    insert_size_histogram_counters(
+        &mut snapshot.bridge,
+        "write_callback_size",
+        &write_path.fuse_callbacks.write.size_histogram,
+    );
+    for (name, max_ms) in [
+        (
+            "read_callback_max_ns",
+            write_path.fuse_callbacks.read.max_ms,
+        ),
+        (
+            "write_callback_max_ns",
+            write_path.fuse_callbacks.write.max_ms,
+        ),
+        (
+            "flush_callback_max_ns",
+            write_path.fuse_callbacks.flush.max_ms,
+        ),
+        (
+            "fsync_callback_max_ns",
+            write_path.fuse_callbacks.fsync.max_ms,
+        ),
+        (
+            "release_callback_max_ns",
+            write_path.fuse_callbacks.release.max_ms,
+        ),
+    ] {
+        insert_gauge(&mut snapshot.bridge, name, "ns", ms_sum_to_ns(max_ms));
+    }
     insert_latency(
         &mut snapshot.bridge,
         "callback",
@@ -538,6 +599,18 @@ fn runtime_stats_from_diagnostics(
             .saturating_add(write_path.winfsp_callbacks.read_total_ns)
             .saturating_add(ms_sum_to_ns(write_path.winfsp_write_path.callback.total_ms)),
     );
+    for (name, latency) in [
+        ("read_callback", &write_path.fuse_callbacks.read.latency),
+        ("write_callback", &write_path.fuse_callbacks.write.latency),
+        ("flush_callback", &write_path.fuse_callbacks.flush.latency),
+        ("fsync_callback", &write_path.fuse_callbacks.fsync.latency),
+        (
+            "release_callback",
+            &write_path.fuse_callbacks.release.latency,
+        ),
+    ] {
+        insert_latency_with_buckets(&mut snapshot.bridge, name, latency);
+    }
     insert_counter(
         &mut snapshot.vfs_read,
         "calls",
@@ -781,6 +854,63 @@ fn insert_latency(
     );
 }
 
+fn insert_latency_with_buckets(
+    section: &mut RuntimeStatsSection,
+    name: &str,
+    latency: &VfsWritePathStageLatencyStats,
+) {
+    let histogram = &latency.latency_histogram;
+    let count = histogram.bucket_counts.iter().sum();
+    let mut buckets = histogram
+        .bucket_upper_bounds_ns
+        .iter()
+        .copied()
+        .zip(histogram.bucket_counts.iter().copied())
+        .map(|(le_ns, count)| RuntimeLatencyBucket { le_ns, count })
+        .collect::<Vec<_>>();
+    buckets.push(RuntimeLatencyBucket {
+        le_ns: u64::MAX,
+        count: histogram
+            .bucket_counts
+            .get(histogram.bucket_upper_bounds_ns.len())
+            .copied()
+            .unwrap_or(0),
+    });
+    section.latencies.insert(
+        name.to_owned(),
+        RuntimeLatencyHistogram {
+            count,
+            sum: ms_sum_to_ns(latency.total_ms),
+            unit: "ns".into(),
+            buckets,
+        },
+    );
+}
+
+fn insert_size_histogram_counters(
+    section: &mut RuntimeStatsSection,
+    prefix: &str,
+    histogram: &VfsFuseSizeHistogram,
+) {
+    for (upper, count) in histogram
+        .bucket_upper_bounds_bytes
+        .iter()
+        .zip(&histogram.bucket_counts)
+    {
+        insert_counter(section, &format!("{prefix}_le_{upper}"), "count", *count);
+    }
+    insert_counter(
+        section,
+        &format!("{prefix}_overflow"),
+        "count",
+        histogram
+            .bucket_counts
+            .get(histogram.bucket_upper_bounds_bytes.len())
+            .copied()
+            .unwrap_or(0),
+    );
+}
+
 fn ms_sum_to_ns(value: f64) -> u64 {
     (value.max(0.0) * 1_000_000.0).round() as u64
 }
@@ -900,12 +1030,104 @@ fn build_latency_sample(
     let previous_sum = previous.map_or(0, |histogram| histogram.sum);
     let count_delta = reset_aware_delta(previous_count, current.count);
     let sum_delta = reset_aware_delta(previous_sum, current.sum);
+    let structure_valid = latency_bucket_structure_valid(previous, current);
+    let interval_buckets = if structure_valid {
+        current
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(index, bucket)| RuntimeLatencyBucket {
+                le_ns: bucket.le_ns,
+                count: bucket.count.saturating_sub(
+                    previous
+                        .and_then(|histogram| histogram.buckets.get(index))
+                        .map_or(0, |previous| previous.count),
+                ),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let overflow = interval_buckets
+        .iter()
+        .find(|bucket| bucket.le_ns == u64::MAX)
+        .map_or(0, |bucket| bucket.count);
+    let buckets_valid =
+        structure_valid && overflow == 0 && interval_buckets.iter().any(|bucket| bucket.count > 0);
+    let buckets = if buckets_valid {
+        interval_buckets
+    } else {
+        Vec::new()
+    };
+    let interval_max_upper_ns = buckets
+        .iter()
+        .rev()
+        .find(|bucket| bucket.count > 0)
+        .map(|bucket| bucket.le_ns);
     PerfLatencySample {
         count_delta,
         sum_delta,
         avg: (count_delta > 0).then_some(sum_delta as f64 / count_delta as f64),
         unit: current.unit.clone(),
+        p50_ns: latency_percentile_upper_ns(&buckets, 0.50),
+        p95_ns: latency_percentile_upper_ns(&buckets, 0.95),
+        p99_ns: latency_percentile_upper_ns(&buckets, 0.99),
+        interval_max_upper_ns,
+        buckets,
+        overflow,
+        saturated: overflow > 0,
+        buckets_valid,
     }
+}
+
+fn latency_bucket_structure_valid(
+    previous: Option<&RuntimeLatencyHistogram>,
+    current: &RuntimeLatencyHistogram,
+) -> bool {
+    let valid_snapshot = |histogram: &RuntimeLatencyHistogram| {
+        histogram
+            .buckets
+            .windows(2)
+            .all(|pair| pair[0].le_ns < pair[1].le_ns)
+            && histogram
+                .buckets
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>()
+                == histogram.count
+    };
+    if !valid_snapshot(current) {
+        return false;
+    }
+    let Some(previous) = previous else {
+        return true;
+    };
+    valid_snapshot(previous)
+        && current.count >= previous.count
+        && current.buckets.len() == previous.buckets.len()
+        && current
+            .buckets
+            .iter()
+            .zip(&previous.buckets)
+            .all(|(current, previous)| {
+                current.le_ns == previous.le_ns && current.count >= previous.count
+            })
+}
+
+fn latency_percentile_upper_ns(buckets: &[RuntimeLatencyBucket], percentile: f64) -> Option<u64> {
+    let total = buckets.iter().map(|bucket| bucket.count).sum::<u64>();
+    if total == 0 {
+        return None;
+    }
+    let target = ((total as f64 * percentile).ceil() as u64).max(1);
+    let mut cumulative = 0u64;
+    for bucket in buckets {
+        cumulative = cumulative.saturating_add(bucket.count);
+        if cumulative >= target {
+            return (bucket.le_ns != u64::MAX).then_some(bucket.le_ns);
+        }
+    }
+    None
 }
 
 fn reset_aware_delta(previous: u64, current: u64) -> u64 {
@@ -1426,6 +1648,21 @@ mod tests {
         diagnostics.write_path.winfsp_callbacks.read_total_ns = 23_000_000;
         diagnostics.write_path.fuse_callbacks.read.bytes = 3 * 1024 * 1024;
         diagnostics.write_path.fuse_callbacks.read.total_ms = 5.0;
+        diagnostics.write_path.fuse_callbacks.read.max_ms = 4.0;
+        diagnostics.write_path.fuse_callbacks.read.size_histogram = VfsFuseSizeHistogram {
+            bucket_upper_bounds_bytes: vec![4096],
+            bucket_counts: vec![2, 0],
+        };
+        diagnostics.write_path.fuse_callbacks.read.latency = VfsWritePathStageLatencyStats {
+            calls: 2,
+            total_ms: 5.0,
+            max_ms: 4.0,
+            latency_histogram: studiofs_vfs::VfsLatencyHistogramSnapshot {
+                bucket_upper_bounds_ns: vec![1_000_000, 5_000_000],
+                bucket_counts: vec![1, 1, 0],
+            },
+            ..VfsWritePathStageLatencyStats::default()
+        };
         diagnostics.write_path.winfsp_write_path.write_bytes = 2048;
         diagnostics.write_path.winfsp_write_path.callback.total_ms = 7.0;
         diagnostics.write_path.vfs_read_path.calls = 5;
@@ -1479,6 +1716,20 @@ mod tests {
         assert_eq!(snapshot.bridge.counters["write_callback_bytes"].value, 2048);
         assert_eq!(snapshot.bridge.latencies["callback"].count, 22);
         assert_eq!(snapshot.bridge.latencies["callback"].sum, 35_000_000);
+        assert_eq!(
+            snapshot.bridge.counters["read_callback_size_le_4096"].value,
+            2
+        );
+        assert_eq!(
+            snapshot.bridge.counters["read_callback_size_overflow"].value,
+            0
+        );
+        assert_eq!(
+            snapshot.bridge.gauges["read_callback_max_ns"].value,
+            4_000_000
+        );
+        assert_eq!(snapshot.bridge.latencies["read_callback"].count, 2);
+        assert_eq!(snapshot.bridge.latencies["read_callback"].buckets.len(), 3);
         assert_eq!(snapshot.vfs_read.counters["calls"].value, 5);
         assert_eq!(snapshot.vfs_read.counters["requested_bytes"].value, 4096);
         assert_eq!(snapshot.vfs_write.counters["calls"].value, 7);
@@ -1780,6 +2031,81 @@ mod tests {
             sample.sections["object_io"].latencies["get"].avg,
             Some(1000.0)
         );
+        let latency = &sample.sections["object_io"].latencies["get"];
+        assert_eq!(
+            latency.buckets,
+            vec![RuntimeLatencyBucket {
+                le_ns: 1000,
+                count: 2
+            }]
+        );
+        assert_eq!(latency.p50_ns, Some(1000));
+        assert_eq!(latency.p95_ns, Some(1000));
+        assert_eq!(latency.p99_ns, Some(1000));
+        assert_eq!(latency.interval_max_upper_ns, Some(1000));
+        assert_eq!(latency.overflow, 0);
+        assert!(!latency.saturated);
+        assert!(latency.buckets_valid);
+
+        let before = snapshot_at(1_000, 100, 0);
+        let mut changed_bounds = snapshot_at(2_000, 300, 0);
+        changed_bounds
+            .object_io
+            .latencies
+            .get_mut("get")
+            .expect("get latency")
+            .buckets[0]
+            .le_ns = 2_000;
+        let invalid = build_sample(&before, &changed_bounds, &options);
+        let invalid_latency = &invalid.sections["object_io"].latencies["get"];
+        assert!(!invalid_latency.buckets_valid);
+        assert!(invalid_latency.buckets.is_empty());
+        assert_eq!(invalid_latency.p50_ns, None);
+        assert_eq!(invalid_latency.p95_ns, None);
+        assert_eq!(invalid_latency.p99_ns, None);
+        assert_eq!(invalid_latency.interval_max_upper_ns, None);
+
+        let mut before_overflow = snapshot_at(1_000, 100, 0);
+        before_overflow
+            .object_io
+            .latencies
+            .get_mut("get")
+            .expect("get latency")
+            .buckets
+            .push(RuntimeLatencyBucket {
+                le_ns: u64::MAX,
+                count: 0,
+            });
+        let mut after_overflow = snapshot_at(2_000, 300, 0);
+        let after_histogram = after_overflow
+            .object_io
+            .latencies
+            .get_mut("get")
+            .expect("get latency");
+        after_histogram.buckets[0].count = 2;
+        after_histogram.buckets.push(RuntimeLatencyBucket {
+            le_ns: u64::MAX,
+            count: 1,
+        });
+        let overflow_sample = build_sample(&before_overflow, &after_overflow, &options);
+        let overflow_latency = &overflow_sample.sections["object_io"].latencies["get"];
+        assert!(!overflow_latency.buckets_valid);
+        assert!(overflow_latency.buckets.is_empty());
+        assert_eq!(overflow_latency.overflow, 1);
+        assert!(overflow_latency.saturated);
+        assert_eq!(overflow_latency.p99_ns, None);
+        assert_eq!(overflow_latency.interval_max_upper_ns, None);
+
+        let zero_sample = build_sample(
+            &snapshot_at(1_000, 100, 0),
+            &snapshot_at(2_000, 100, 0),
+            &options,
+        );
+        let zero_latency = &zero_sample.sections["object_io"].latencies["get"];
+        assert!(!zero_latency.buckets_valid);
+        assert!(zero_latency.buckets.is_empty());
+        assert_eq!(zero_latency.p50_ns, None);
+        assert_eq!(zero_latency.interval_max_upper_ns, None);
     }
 
     #[test]

@@ -19,9 +19,9 @@ use studiofs_bridge::{
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, OsCacheDisposition,
-    OsCacheOpenDecision, OsCacheParticipation, StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot,
-    VfsFuseConnectionSnapshot, VfsFuseLivenessSnapshot,
+    DirEntryWithAttr, FuseBarrierKind, KernelInvalidator, LocalSyncPolicy, OpenFlags,
+    OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, StatFs, StudioVfs,
+    VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseLivenessSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -456,9 +456,13 @@ fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 type FuseReplyWriteFn = unsafe extern "C" fn(*mut raw::FuseReq, size_t) -> c_int;
 #[cfg(test)]
 type FuseReplyErrorFn = unsafe extern "C" fn(*mut raw::FuseReq, c_int) -> c_int;
+#[cfg(test)]
+type FuseReplyBufFn = unsafe extern "C" fn(*mut raw::FuseReq, *const c_char, size_t) -> c_int;
 
 struct FuseReqPtr {
     raw: *mut raw::FuseReq,
+    #[cfg(test)]
+    reply_buf_fn: FuseReplyBufFn,
     #[cfg(test)]
     reply_write_fn: FuseReplyWriteFn,
     #[cfg(test)]
@@ -474,6 +478,8 @@ impl FuseReqPtr {
         Self {
             raw,
             #[cfg(test)]
+            reply_buf_fn: raw::fuse_reply_buf,
+            #[cfg(test)]
             reply_write_fn: raw::fuse_reply_write,
             #[cfg(test)]
             reply_error_fn: raw::fuse_reply_err,
@@ -488,8 +494,36 @@ impl FuseReqPtr {
     ) -> Self {
         Self {
             raw,
+            reply_buf_fn: raw::fuse_reply_buf,
             reply_write_fn,
             reply_error_fn,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_sync_test(
+        raw: *mut raw::FuseReq,
+        reply_buf_fn: FuseReplyBufFn,
+        reply_error_fn: FuseReplyErrorFn,
+    ) -> Self {
+        Self {
+            raw,
+            reply_buf_fn,
+            reply_write_fn: raw::fuse_reply_write,
+            reply_error_fn,
+        }
+    }
+
+    fn reply_buf(self, buffer: &[u8]) -> c_int {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer,
+        // and `buffer` remains valid until the synchronous reply returns.
+        #[cfg(test)]
+        unsafe {
+            (self.reply_buf_fn)(self.raw, buffer.as_ptr().cast::<c_char>(), buffer.len())
+        }
+        #[cfg(not(test))]
+        unsafe {
+            raw::fuse_reply_buf(self.raw, buffer.as_ptr().cast::<c_char>(), buffer.len())
         }
     }
 
@@ -516,6 +550,41 @@ impl FuseReqPtr {
             raw::fuse_reply_err(self.raw, errno)
         }
     }
+}
+
+fn finish_fuse_read_reply(
+    vfs: &StudioVfs,
+    request: FuseReqPtr,
+    requested_bytes: usize,
+    started: Instant,
+    result: Result<Vec<u8>, c_int>,
+) {
+    let (returned_bytes, errored) = match result {
+        Ok(buffer) => {
+            let status = request.reply_buf(&buffer);
+            (if status == 0 { buffer.len() } else { 0 }, status != 0)
+        }
+        Err(errno) => {
+            let _ = request.reply_error(errno);
+            (0, true)
+        }
+    };
+    vfs.record_fuse_read_callback(requested_bytes, returned_bytes, started.elapsed(), errored);
+}
+
+fn finish_fuse_barrier_reply(
+    vfs: &StudioVfs,
+    request: FuseReqPtr,
+    kind: FuseBarrierKind,
+    started: Instant,
+    result: Result<(), c_int>,
+) {
+    let (errno, operation_errored) = match result {
+        Ok(()) => (0, false),
+        Err(errno) => (errno, true),
+    };
+    let status = request.reply_error(errno);
+    vfs.record_fuse_barrier_callback(kind, started.elapsed(), operation_errored || status != 0);
 }
 
 #[derive(Clone, Copy)]
@@ -547,9 +616,10 @@ impl FuseWriteTaskGuard {
 
     fn finish(mut self, result: FuseWriteTaskResult) {
         let request = self.request.take().expect("request guard owns one reply");
-        let (reply_status, errored, completion) = match result {
+        let (reply_status, returned_bytes, errored, completion) = match result {
             FuseWriteTaskResult::AdmissionRejected(errno) => (
                 request.reply_error(errno),
+                0,
                 true,
                 LinuxFuseAsyncWriteCompletion::Failed(errno),
             ),
@@ -560,15 +630,22 @@ impl FuseWriteTaskGuard {
                 } else {
                     LinuxFuseAsyncWriteCompletion::Failed(libc::EIO)
                 };
-                (status, status != 0, completion)
+                (
+                    status,
+                    if status == 0 { written as usize } else { 0 },
+                    status != 0,
+                    completion,
+                )
             }
             FuseWriteTaskResult::Completed(Err(errno)) => (
                 request.reply_error(errno),
+                0,
                 true,
                 LinuxFuseAsyncWriteCompletion::Failed(errno),
             ),
             FuseWriteTaskResult::Cancelled => (
                 request.reply_error(libc::EIO),
+                0,
                 true,
                 LinuxFuseAsyncWriteCompletion::Cancelled,
             ),
@@ -578,8 +655,12 @@ impl FuseWriteTaskGuard {
             ASYNC_WRITE_REPLY_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(reply_status, "libfuse rejected async write reply");
         }
-        self.vfs
-            .record_fuse_write_callback(self.requested_bytes, self.started.elapsed(), errored);
+        self.vfs.record_fuse_write_callback(
+            self.requested_bytes,
+            returned_bytes,
+            self.started.elapsed(),
+            errored,
+        );
         drop(self.reservation.take());
         self.request_ticket
             .take()
@@ -601,7 +682,7 @@ impl Drop for FuseWriteTaskGuard {
             warn!(reply_status, "libfuse rejected async write reply");
         }
         self.vfs
-            .record_fuse_write_callback(self.requested_bytes, self.started.elapsed(), true);
+            .record_fuse_write_callback(self.requested_bytes, 0, self.started.elapsed(), true);
         drop(self.reservation.take());
         drop(self.request_ticket.take());
         record_linux_async_write_snapshot(&self.vfs, &self.writes, self.metric_config);
@@ -1602,6 +1683,7 @@ pub extern "C" fn studiofs_linux_fuse_read(
     off: off_t,
     fi: *mut raw::FuseFileInfo,
 ) {
+    let started = Instant::now();
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -1616,22 +1698,8 @@ pub extern "C" fn studiofs_linux_fuse_read(
         }
         return;
     }
-    let started = Instant::now();
-    match state.read(ino, size, off, fi) {
-        Ok(buffer) => {
-            state
-                .vfs
-                .record_fuse_read_callback(buffer.len(), started.elapsed(), false);
-            // SAFETY: `buffer` is valid for this synchronous reply.
-            unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
-        }
-        Err(errno) => {
-            state
-                .vfs
-                .record_fuse_read_callback(size, started.elapsed(), true);
-            reply_error(req, errno);
-        }
-    }
+    let result = state.read(ino, size, off, fi);
+    finish_fuse_read_reply(&state.vfs, FuseReqPtr::new(req), size, started, result);
 }
 
 #[unsafe(no_mangle)]
@@ -1659,35 +1727,37 @@ pub extern "C" fn studiofs_linux_fuse_write(
     off: off_t,
     fi: *mut raw::FuseFileInfo,
 ) {
+    let started = Instant::now();
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    let started = Instant::now();
     match state.queue_async_write(req, ino, buf, size, off, fi, started) {
         Ok(true) => return,
         Ok(false) => {}
         Err(errno) => {
+            let _ = FuseReqPtr::new(req).reply_error(errno);
             state
                 .vfs
-                .record_fuse_write_callback(size, started.elapsed(), true);
-            reply_error(req, errno);
+                .record_fuse_write_callback(size, 0, started.elapsed(), true);
             return;
         }
     }
     match state.write(ino, buf, size, off, fi) {
         Ok(written) => {
-            state
-                .vfs
-                .record_fuse_write_callback(size, started.elapsed(), false);
-            // SAFETY: `req` is live and this consumes the callback reply.
-            unsafe { raw::fuse_reply_write(req, written as size_t) };
+            let status = FuseReqPtr::new(req).reply_write(written as size_t);
+            state.vfs.record_fuse_write_callback(
+                size,
+                if status == 0 { written as usize } else { 0 },
+                started.elapsed(),
+                status != 0,
+            );
         }
         Err(errno) => {
+            let _ = FuseReqPtr::new(req).reply_error(errno);
             state
                 .vfs
-                .record_fuse_write_callback(size, started.elapsed(), true);
-            reply_error(req, errno);
+                .record_fuse_write_callback(size, 0, started.elapsed(), true);
         }
     }
 }
@@ -1698,17 +1768,26 @@ pub extern "C" fn studiofs_linux_fuse_flush(
     _ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
+    let started = Instant::now();
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    match file_handle(fi)
-        .ok_or(libc::EBADF)
-        .and_then(|fh| state.flush(fh))
-    {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+    let fh = file_handle(fi);
+    if let Some(runtime_fh) = fh.filter(|fh| state.is_runtime_stats_handle(*fh)) {
+        let result = state.flush(runtime_fh);
+        let errno = result.err().unwrap_or(0);
+        let _ = FuseReqPtr::new(req).reply_error(errno);
+        return;
     }
+    let result = fh.ok_or(libc::EBADF).and_then(|fh| state.flush(fh));
+    finish_fuse_barrier_reply(
+        &state.vfs,
+        FuseReqPtr::new(req),
+        FuseBarrierKind::Flush,
+        started,
+        result,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -1718,14 +1797,24 @@ pub extern "C" fn studiofs_linux_fuse_fsync(
     datasync: c_int,
     fi: *mut raw::FuseFileInfo,
 ) {
+    let started = Instant::now();
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    match state.fsync(file_handle(fi), ino, datasync != 0) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+    let fh = file_handle(fi);
+    if fh.is_some_and(|fh| state.is_runtime_stats_handle(fh)) {
+        let _ = FuseReqPtr::new(req).reply_error(0);
+        return;
     }
+    let result = state.fsync(fh, ino, datasync != 0);
+    finish_fuse_barrier_reply(
+        &state.vfs,
+        FuseReqPtr::new(req),
+        FuseBarrierKind::Fsync,
+        started,
+        result,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -1734,17 +1823,26 @@ pub extern "C" fn studiofs_linux_fuse_release(
     _ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
+    let started = Instant::now();
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    match file_handle(fi)
-        .ok_or(libc::EBADF)
-        .and_then(|fh| state.release(fh))
-    {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+    let fh = file_handle(fi);
+    if let Some(runtime_fh) = fh.filter(|fh| state.is_runtime_stats_handle(*fh)) {
+        let result = state.release(runtime_fh);
+        let errno = result.err().unwrap_or(0);
+        let _ = FuseReqPtr::new(req).reply_error(errno);
+        return;
     }
+    let result = fh.ok_or(libc::EBADF).and_then(|fh| state.release(fh));
+    finish_fuse_barrier_reply(
+        &state.vfs,
+        FuseReqPtr::new(req),
+        FuseBarrierKind::Release,
+        started,
+        result,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -2216,6 +2314,15 @@ impl SessionState {
             buffer.truncate(read as usize);
             Ok(buffer)
         })())
+    }
+
+    fn is_runtime_stats_handle(&self, fh: u64) -> bool {
+        fh >= RUNTIME_STATS_FH_START
+            && self
+                .runtime_stats_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&fh)
     }
 
     fn read(
@@ -3229,7 +3336,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -3590,6 +3697,140 @@ mod tests {
         // SAFETY: guard tests pass a live `FakeFuseReplyState` as the request pointer.
         let state = unsafe { &mut *req.cast::<FakeFuseReplyState>() };
         state.record(FakeFuseReply::Error(errno))
+    }
+
+    struct FakeSyncReplyState {
+        status: libc::c_int,
+        reply_size: AtomicUsize,
+        reply_errno: AtomicI32,
+        entered: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+        release: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl FakeSyncReplyState {
+        fn new(status: libc::c_int) -> Self {
+            Self {
+                status,
+                reply_size: AtomicUsize::new(0),
+                reply_errno: AtomicI32::new(i32::MIN),
+                entered: std::sync::Mutex::new(None),
+                release: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn wait_at_reply_boundary(&self) {
+            if let Some(entered) = self.entered.lock().expect("reply entered lock").take() {
+                entered.send(()).expect("signal reply boundary");
+            }
+            if let Some(release) = self.release.lock().expect("reply release lock").take() {
+                release.recv().expect("release reply boundary");
+            }
+        }
+    }
+
+    unsafe extern "C" fn fake_sync_reply_buf(
+        req: *mut super::raw::FuseReq,
+        _buffer: *const libc::c_char,
+        size: libc::size_t,
+    ) -> libc::c_int {
+        // SAFETY: sync reply tests pass a live `FakeSyncReplyState` request pointer.
+        let state = unsafe { &*req.cast::<FakeSyncReplyState>() };
+        state.reply_size.store(size, Ordering::Relaxed);
+        state.wait_at_reply_boundary();
+        state.status
+    }
+
+    unsafe extern "C" fn fake_sync_reply_error(
+        req: *mut super::raw::FuseReq,
+        errno: libc::c_int,
+    ) -> libc::c_int {
+        // SAFETY: sync reply tests pass a live `FakeSyncReplyState` request pointer.
+        let state = unsafe { &*req.cast::<FakeSyncReplyState>() };
+        state.reply_errno.store(errno, Ordering::Relaxed);
+        state.wait_at_reply_boundary();
+        state.status
+    }
+
+    #[test]
+    fn linux_read_callback_metrics_cover_reply_and_use_requested_size() {
+        let fixture = ContractVfsFixture::new("linux-read-callback-reply-boundary")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let mut reply = Box::new(FakeSyncReplyState::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *reply.entered.lock().expect("reply entered lock") = Some(entered_tx);
+        *reply.release.lock().expect("reply release lock") = Some(release_rx);
+        let request = super::FuseReqPtr::for_sync_test(
+            (&mut *reply as *mut FakeSyncReplyState).cast(),
+            fake_sync_reply_buf,
+            fake_sync_reply_error,
+        );
+        let callback_vfs = Arc::clone(&vfs);
+        let callback = thread::spawn(move || {
+            super::finish_fuse_read_reply(
+                &callback_vfs,
+                request,
+                64 * 1024,
+                Instant::now(),
+                Ok(vec![1, 2, 3]),
+            );
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read reply reaches boundary");
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .fuse_callbacks
+                .read
+                .calls,
+            0,
+            "metrics must be recorded after the synchronous reply returns",
+        );
+        thread::sleep(Duration::from_millis(20));
+        release_tx.send(()).expect("release read reply");
+        callback.join().expect("join read reply callback");
+
+        let read = vfs.write_path_observability_snapshot().fuse_callbacks.read;
+        assert_eq!((read.calls, read.bytes, read.errors), (1, 3, 0));
+        assert_eq!(read.size_histogram.bucket_counts, [0, 0, 1, 0, 0, 0, 0]);
+        assert!(
+            read.total_ms >= 10.0,
+            "reply wait must be inside callback latency"
+        );
+        assert!(
+            read.max_ms >= 10.0,
+            "reply wait must be inside callback max"
+        );
+        assert_eq!(reply.reply_size.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn linux_barrier_callback_metrics_cover_reply_and_count_reply_rejection() {
+        let fixture = ContractVfsFixture::new("linux-barrier-callback-reply-boundary")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+
+        for kind in [
+            studiofs_vfs::FuseBarrierKind::Flush,
+            studiofs_vfs::FuseBarrierKind::Fsync,
+            studiofs_vfs::FuseBarrierKind::Release,
+        ] {
+            let mut reply = Box::new(FakeSyncReplyState::new(-1));
+            let request = super::FuseReqPtr::for_sync_test(
+                (&mut *reply as *mut FakeSyncReplyState).cast(),
+                fake_sync_reply_buf,
+                fake_sync_reply_error,
+            );
+            super::finish_fuse_barrier_reply(&vfs, request, kind, Instant::now(), Ok(()));
+            assert_eq!(reply.reply_errno.load(Ordering::Relaxed), 0);
+        }
+
+        let callbacks = vfs.write_path_observability_snapshot().fuse_callbacks;
+        assert_eq!((callbacks.flush.calls, callbacks.flush.errors), (1, 1));
+        assert_eq!((callbacks.fsync.calls, callbacks.fsync.errors), (1, 1));
+        assert_eq!((callbacks.release.calls, callbacks.release.errors), (1, 1));
     }
 
     fn make_async_write_guard(
@@ -4281,7 +4522,7 @@ mod tests {
 
         fixture
             .vfs()
-            .record_fuse_read_callback(17, Duration::from_millis(1), false);
+            .record_fuse_read_callback(17, 17, Duration::from_millis(1), false);
         let second = state
             .open_runtime_stats(ino, libc::O_RDONLY)
             .expect("runtime stats inode")

@@ -1381,14 +1381,18 @@ impl StudioVfsAdapter {
                 .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
         match result {
             Ok(written) => {
-                self.vfs
-                    .record_fuse_read_callback(written as usize, started.elapsed(), false);
+                self.vfs.record_fuse_read_callback(
+                    size_usize,
+                    written as usize,
+                    started.elapsed(),
+                    false,
+                );
                 out.truncate(written as usize);
                 Ok(out)
             }
             Err(error) => {
                 self.vfs
-                    .record_fuse_read_callback(size_usize, started.elapsed(), true);
+                    .record_fuse_read_callback(size_usize, 0, started.elapsed(), true);
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -1438,9 +1442,12 @@ impl StudioVfsAdapter {
             &mut out,
         ) {
             out.truncate(copied);
-            state
-                .vfs
-                .record_fuse_read_callback(copied, started.elapsed(), false);
+            state.vfs.record_fuse_read_callback(
+                request.size as usize,
+                copied,
+                started.elapsed(),
+                false,
+            );
             return Ok(out);
         }
 
@@ -1462,9 +1469,12 @@ impl StudioVfsAdapter {
             Ok(written) => {
                 let written = written as usize;
                 let reply_len = written.min(size_usize);
-                state
-                    .vfs
-                    .record_fuse_read_callback(reply_len, started.elapsed(), false);
+                state.vfs.record_fuse_read_callback(
+                    request.size as usize,
+                    reply_len,
+                    started.elapsed(),
+                    false,
+                );
                 if written > size_usize {
                     let remainder_len = written - reply_len;
                     let mut remainder = state
@@ -1495,9 +1505,12 @@ impl StudioVfsAdapter {
                 Ok(out)
             }
             Err(error) => {
-                state
-                    .vfs
-                    .record_fuse_read_callback(size_usize, started.elapsed(), true);
+                state.vfs.record_fuse_read_callback(
+                    request.size as usize,
+                    0,
+                    started.elapsed(),
+                    true,
+                );
                 state
                     .shared
                     .read_windows
@@ -1782,8 +1795,12 @@ impl StudioVfsAdapter {
                 LocalSyncPolicy::Opportunistic,
             ))
             .map_err(|error| vfs_err_to_errno(&error));
-        self.vfs
-            .record_fuse_write_callback(data.len(), started.elapsed(), result.is_err());
+        self.vfs.record_fuse_write_callback(
+            data.len(),
+            result.as_ref().copied().unwrap_or(0) as usize,
+            started.elapsed(),
+            result.is_err(),
+        );
         let written = result?;
         self.shared.read_windows.invalidate_inode(ino);
         Ok(written)

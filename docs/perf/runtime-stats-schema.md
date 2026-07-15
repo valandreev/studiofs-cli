@@ -13,8 +13,9 @@ The current schema version is `1`.
 Mounted StudioFS volumes expose the live text representation through the
 root-local hidden file `.studiofs-runtime-stats`. Windows WinFSP, macFUSE, and
 Linux FUSE bridges all use this same file name and the same parser-compatible
-text format. The file is synthetic: it is not persisted in volume metadata, and
-readers should treat each open/read as a fresh point-in-time snapshot.
+text format. The file is synthetic: it is not persisted in volume metadata.
+Each open captures one immutable point-in-time snapshot; all reads through that
+handle see the same bytes, and a new open captures fresh values.
 
 ## Snapshot Shape
 
@@ -42,7 +43,8 @@ Each section contains:
 Latency histograms must expose `count` and `sum` so readers can compute interval
 average latency by subtracting two snapshots. Bucket upper bounds are always
 stored as inclusive nanoseconds in `le_ns`; the histogram `unit` identifies the
-unit used by `sum`.
+unit used by `sum`. FUSE callback histograms use mutually exclusive monotonic
+bucket counts and include an explicit overflow bucket with `le_ns = u64::MAX`.
 
 ## Stable Units
 
@@ -65,7 +67,7 @@ Producers should prefer these names when the signal exists:
 
 | Section | Counters |
 | --- | --- |
-| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors` |
+| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `fsync_callbacks`, `release_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors` |
 | `vfs_read` | `calls`, `requested_bytes`, `served_bytes`, `cache_hit_reads`, `cache_miss_reads`, `errors` |
 | `vfs_write` | `calls`, `accepted_bytes`, `synced_bytes`, `flush_barrier_calls`, `backpressure_events`, `errors` |
 | `cache` | `hits`, `misses`, `evictions`, `staged_payloads`, `staged_bytes`, `materialized_payloads`, `materialized_bytes` |
@@ -78,7 +80,7 @@ Recommended gauges:
 | Section | Gauges |
 | --- | --- |
 | `system` | `uptime_ms`, `rss_bytes`, `worker_threads` |
-| `bridge` | `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache` |
+| `bridge` | `fuse_negotiated_max_read_bytes`, `fuse_negotiated_max_write_bytes`, `fuse_negotiated_max_readahead_bytes`, `fuse_negotiated_max_background`, `fuse_negotiated_congestion_threshold`, `fuse_negotiated_async_dio`, `fuse_negotiated_writeback_cache`, `fuse_parallel_direct_writes_supported`, `fuse_single_thread_receive_loop`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_shared_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `read_callback_max_ns`, `write_callback_max_ns`, `flush_callback_max_ns`, `fsync_callback_max_ns`, `release_callback_max_ns` |
 | `cache` | `resident_bytes`, `dirty_bytes`, `evictable_bytes`, `prefetch_queue_depth` |
 | `upload_queue` | `pending_depth`, `pending_bytes`, `active_uploads`, `oldest_pending_age_ms` |
 | `metadata` | `pending_ops`, `inflight_ops` |
@@ -87,7 +89,7 @@ Recommended latency names:
 
 | Section | Latencies |
 | --- | --- |
-| `bridge` | `read_callback`, `write_callback`, `flush_callback` |
+| `bridge` | `read_callback`, `write_callback`, `flush_callback`, `fsync_callback`, `release_callback` |
 | `vfs_read` | `read`, `fetch`, `local_cache_io` |
 | `vfs_write` | `write`, `sync_data`, `payload_persist` |
 | `cache` | `materialize_batch`, `cache_get`, `cache_put` |
@@ -114,3 +116,22 @@ The supported line kinds are `counter`, `gauge`, `histogram_count`,
 `histogram_sum`, and `histogram_bucket`. Readers must ignore comments and blank
 lines. Schema readers should accept missing newer sections or fields and treat
 them as defaults.
+
+## FUSE Callback Histograms
+
+The `bridge` section publishes read and write request-size buckets as counters
+named `read_callback_size_le_<bytes>` and
+`write_callback_size_le_<bytes>`, plus one `_overflow` counter for each
+direction. The inclusive finite bounds are 4096, 16384, 65536, 262144,
+1048576, and 4194304 bytes. These counters classify the requested callback
+size; `read_callback_bytes` and `write_callback_bytes` count bytes actually
+acknowledged to the kernel.
+
+For interval latency quantiles, readers must require identical ordered bounds
+in both snapshots and subtract each monotonic bucket count. A decreasing count,
+changed bound, overflow observation, saturated quantile, or zero-sample
+interval makes the interval invalid. Recompute p50, p95, and p99 from the
+bucket deltas; never subtract snapshot quantiles or cumulative maxima.
+`interval_max_upper_ms` is the finite upper bound of the last nonzero delta
+bucket. If the last nonzero bucket is overflow, fail the run rather than
+guessing a maximum.

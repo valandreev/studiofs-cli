@@ -76,17 +76,18 @@ pub use metrics::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
-    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
-    VfsFuseConnectionSnapshot, VfsFuseIoStats, VfsFuseLivenessSnapshot, VfsIngressLane,
-    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheStats,
-    VfsNamespaceCacheSnapshot, VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseBarrierStats, VfsFuseCallbackStats,
+    VfsFuseConnectionSnapshot, VfsFuseIoStats, VfsFuseLivenessSnapshot, VfsFuseSizeHistogram,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsOsCacheStats,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2143,6 +2144,72 @@ async fn run_epoch_finalization_until_shutdown<T>(
     }
 }
 
+/// FUSE durability or lifecycle callback measured at the platform bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FuseBarrierKind {
+    /// Flush callback.
+    Flush,
+    /// Fsync callback.
+    Fsync,
+    /// Release callback.
+    Release,
+}
+
+const FUSE_SIZE_BUCKET_UPPER_BOUNDS_BYTES: [u64; 6] = [
+    4 * 1024,
+    16 * 1024,
+    64 * 1024,
+    256 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+];
+const FUSE_SIZE_BUCKET_COUNT: usize = FUSE_SIZE_BUCKET_UPPER_BOUNDS_BYTES.len() + 1;
+
+struct FuseSizeHistogram {
+    buckets: [AtomicU64; FUSE_SIZE_BUCKET_COUNT],
+}
+
+impl Default for FuseSizeHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl FuseSizeHistogram {
+    fn observe(&self, requested_bytes: usize) {
+        let requested_bytes = requested_bytes as u64;
+        let bucket = FUSE_SIZE_BUCKET_UPPER_BOUNDS_BYTES
+            .iter()
+            .position(|upper| requested_bytes <= *upper)
+            .unwrap_or(FUSE_SIZE_BUCKET_COUNT - 1);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> VfsFuseSizeHistogram {
+        VfsFuseSizeHistogram {
+            bucket_upper_bounds_bytes: FUSE_SIZE_BUCKET_UPPER_BOUNDS_BYTES.to_vec(),
+            bucket_counts: self
+                .buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FuseHistogramResetBaseline {
+    read_size: Vec<u64>,
+    write_size: Vec<u64>,
+    read_latency: Vec<u64>,
+    write_latency: Vec<u64>,
+    flush_latency: Vec<u64>,
+    fsync_latency: Vec<u64>,
+    release_latency: Vec<u64>,
+}
+
 struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: OrderedMutex<IgnoredEntryRegistry>,
@@ -2304,15 +2371,37 @@ struct MetricsState {
     winfsp_flush_barrier_skipped_clean: AtomicU64,
     winfsp_close_barrier_skipped_clean: AtomicU64,
     fuse_read_callbacks: AtomicU64,
+    fuse_read_callback_requested_bytes: AtomicU64,
     fuse_read_callback_bytes: AtomicU64,
     fuse_read_callback_errors: AtomicU64,
     fuse_read_callback_total_ns: AtomicU64,
     fuse_read_callback_max_ns: AtomicU64,
+    fuse_read_callback_size_histogram: FuseSizeHistogram,
+    fuse_read_callback_latency_histogram: LatencyHistogram,
     fuse_write_callbacks: AtomicU64,
+    fuse_write_callback_requested_bytes: AtomicU64,
     fuse_write_callback_bytes: AtomicU64,
     fuse_write_callback_errors: AtomicU64,
     fuse_write_callback_total_ns: AtomicU64,
     fuse_write_callback_max_ns: AtomicU64,
+    fuse_write_callback_size_histogram: FuseSizeHistogram,
+    fuse_write_callback_latency_histogram: LatencyHistogram,
+    fuse_flush_callbacks: AtomicU64,
+    fuse_flush_callback_errors: AtomicU64,
+    fuse_flush_callback_total_ns: AtomicU64,
+    fuse_flush_callback_max_ns: AtomicU64,
+    fuse_flush_callback_latency_histogram: LatencyHistogram,
+    fuse_fsync_callbacks: AtomicU64,
+    fuse_fsync_callback_errors: AtomicU64,
+    fuse_fsync_callback_total_ns: AtomicU64,
+    fuse_fsync_callback_max_ns: AtomicU64,
+    fuse_fsync_callback_latency_histogram: LatencyHistogram,
+    fuse_release_callbacks: AtomicU64,
+    fuse_release_callback_errors: AtomicU64,
+    fuse_release_callback_total_ns: AtomicU64,
+    fuse_release_callback_max_ns: AtomicU64,
+    fuse_release_callback_latency_histogram: LatencyHistogram,
+    fuse_histogram_reset_baseline: Mutex<FuseHistogramResetBaseline>,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2483,15 +2572,37 @@ impl MetricsState {
             winfsp_flush_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_close_barrier_skipped_clean: AtomicU64::new(0),
             fuse_read_callbacks: AtomicU64::new(0),
+            fuse_read_callback_requested_bytes: AtomicU64::new(0),
             fuse_read_callback_bytes: AtomicU64::new(0),
             fuse_read_callback_errors: AtomicU64::new(0),
             fuse_read_callback_total_ns: AtomicU64::new(0),
             fuse_read_callback_max_ns: AtomicU64::new(0),
+            fuse_read_callback_size_histogram: FuseSizeHistogram::default(),
+            fuse_read_callback_latency_histogram: LatencyHistogram::default(),
             fuse_write_callbacks: AtomicU64::new(0),
+            fuse_write_callback_requested_bytes: AtomicU64::new(0),
             fuse_write_callback_bytes: AtomicU64::new(0),
             fuse_write_callback_errors: AtomicU64::new(0),
             fuse_write_callback_total_ns: AtomicU64::new(0),
             fuse_write_callback_max_ns: AtomicU64::new(0),
+            fuse_write_callback_size_histogram: FuseSizeHistogram::default(),
+            fuse_write_callback_latency_histogram: LatencyHistogram::default(),
+            fuse_flush_callbacks: AtomicU64::new(0),
+            fuse_flush_callback_errors: AtomicU64::new(0),
+            fuse_flush_callback_total_ns: AtomicU64::new(0),
+            fuse_flush_callback_max_ns: AtomicU64::new(0),
+            fuse_flush_callback_latency_histogram: LatencyHistogram::default(),
+            fuse_fsync_callbacks: AtomicU64::new(0),
+            fuse_fsync_callback_errors: AtomicU64::new(0),
+            fuse_fsync_callback_total_ns: AtomicU64::new(0),
+            fuse_fsync_callback_max_ns: AtomicU64::new(0),
+            fuse_fsync_callback_latency_histogram: LatencyHistogram::default(),
+            fuse_release_callbacks: AtomicU64::new(0),
+            fuse_release_callback_errors: AtomicU64::new(0),
+            fuse_release_callback_total_ns: AtomicU64::new(0),
+            fuse_release_callback_max_ns: AtomicU64::new(0),
+            fuse_release_callback_latency_histogram: LatencyHistogram::default(),
+            fuse_histogram_reset_baseline: Mutex::new(FuseHistogramResetBaseline::default()),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2640,19 +2751,63 @@ impl MetricsState {
             winfsp_flush_barrier_skipped_clean,
             winfsp_close_barrier_skipped_clean,
             fuse_read_callbacks,
+            fuse_read_callback_requested_bytes,
             fuse_read_callback_bytes,
             fuse_read_callback_errors,
             fuse_read_callback_total_ns,
             fuse_read_callback_max_ns,
             fuse_write_callbacks,
+            fuse_write_callback_requested_bytes,
             fuse_write_callback_bytes,
             fuse_write_callback_errors,
             fuse_write_callback_total_ns,
             fuse_write_callback_max_ns,
+            fuse_flush_callbacks,
+            fuse_flush_callback_errors,
+            fuse_flush_callback_total_ns,
+            fuse_flush_callback_max_ns,
+            fuse_fsync_callbacks,
+            fuse_fsync_callback_errors,
+            fuse_fsync_callback_total_ns,
+            fuse_fsync_callback_max_ns,
+            fuse_release_callbacks,
+            fuse_release_callback_errors,
+            fuse_release_callback_total_ns,
+            fuse_release_callback_max_ns,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
         );
+        *self.fuse_histogram_reset_baseline.lock() = FuseHistogramResetBaseline {
+            read_size: self
+                .fuse_read_callback_size_histogram
+                .snapshot()
+                .bucket_counts,
+            write_size: self
+                .fuse_write_callback_size_histogram
+                .snapshot()
+                .bucket_counts,
+            read_latency: self
+                .fuse_read_callback_latency_histogram
+                .snapshot()
+                .bucket_counts,
+            write_latency: self
+                .fuse_write_callback_latency_histogram
+                .snapshot()
+                .bucket_counts,
+            flush_latency: self
+                .fuse_flush_callback_latency_histogram
+                .snapshot()
+                .bucket_counts,
+            fsync_latency: self
+                .fuse_fsync_callback_latency_histogram
+                .snapshot()
+                .bucket_counts,
+            release_latency: self
+                .fuse_release_callback_latency_histogram
+                .snapshot()
+                .bucket_counts,
+        };
         self.local_cache_io_handoff_histogram.reset();
         self.local_cache_io_backend_histogram.reset();
         self.payload_store_sync_data_histogram.reset();
@@ -6746,9 +6901,9 @@ impl StudioVfs {
         calls: u64,
         bytes: u64,
         errors: u64,
-        total_ns: u64,
-        max_ns: u64,
-        elapsed: Duration,
+        requested_mib_per_sec: f64,
+        size_histogram: VfsFuseSizeHistogram,
+        latency: VfsWritePathStageLatencyStats,
     ) -> VfsFuseIoStats {
         VfsFuseIoStats {
             calls,
@@ -6759,14 +6914,67 @@ impl StudioVfs {
                 bytes as f64 / calls as f64
             },
             errors,
-            total_ms: total_ns as f64 / 1_000_000.0,
-            avg_ms: if calls == 0 {
-                0.0
-            } else {
-                (total_ns as f64 / calls as f64) / 1_000_000.0
-            },
-            max_ms: max_ns as f64 / 1_000_000.0,
-            requested_mib_per_sec: Self::per_second(bytes, elapsed) / (1024.0 * 1024.0),
+            total_ms: latency.total_ms,
+            avg_ms: latency.avg_ms,
+            max_ms: latency.max_ms,
+            requested_mib_per_sec,
+            size_histogram,
+            latency,
+        }
+    }
+
+    fn build_fuse_barrier_stats(
+        calls: u64,
+        errors: u64,
+        total_ns: u64,
+        max_ns: u64,
+        histogram: LatencyHistogramSnapshot,
+        elapsed: Duration,
+    ) -> VfsFuseBarrierStats {
+        let latency_calls = histogram.bucket_counts.iter().sum();
+        let latency =
+            Self::build_stage_latency_stats(latency_calls, total_ns, max_ns, histogram, elapsed);
+        VfsFuseBarrierStats {
+            calls,
+            errors,
+            total_ms: latency.total_ms,
+            avg_ms: latency.avg_ms,
+            max_ms: latency.max_ms,
+            latency,
+        }
+    }
+
+    fn subtract_histogram_baseline(
+        snapshot: LatencyHistogramSnapshot,
+        baseline: &[u64],
+    ) -> LatencyHistogramSnapshot {
+        LatencyHistogramSnapshot {
+            bucket_upper_bounds_ns: snapshot.bucket_upper_bounds_ns,
+            bucket_counts: snapshot
+                .bucket_counts
+                .into_iter()
+                .enumerate()
+                .map(|(index, count)| {
+                    count.saturating_sub(baseline.get(index).copied().unwrap_or(0))
+                })
+                .collect(),
+        }
+    }
+
+    fn subtract_size_histogram_baseline(
+        snapshot: VfsFuseSizeHistogram,
+        baseline: &[u64],
+    ) -> VfsFuseSizeHistogram {
+        VfsFuseSizeHistogram {
+            bucket_upper_bounds_bytes: snapshot.bucket_upper_bounds_bytes,
+            bucket_counts: snapshot
+                .bucket_counts
+                .into_iter()
+                .enumerate()
+                .map(|(index, count)| {
+                    count.saturating_sub(baseline.get(index).copied().unwrap_or(0))
+                })
+                .collect(),
         }
     }
 
@@ -7280,52 +7488,109 @@ impl StudioVfs {
     pub fn record_fuse_read_callback(
         &self,
         requested_bytes: usize,
+        returned_bytes: usize,
         callback_elapsed: Duration,
         errored: bool,
     ) {
         let metrics = &self.state.metrics;
-        metrics.fuse_read_callbacks.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .fuse_read_callback_requested_bytes
+            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
         metrics
             .fuse_read_callback_bytes
-            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
+            .fetch_add(returned_bytes as u64, Ordering::Relaxed);
+        metrics
+            .fuse_read_callback_size_histogram
+            .observe(requested_bytes);
         if errored {
             metrics
                 .fuse_read_callback_errors
                 .fetch_add(1, Ordering::Relaxed);
         }
         let elapsed_ns = Self::duration_ns_u64(callback_elapsed);
-        metrics
-            .fuse_read_callback_total_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
-        metrics
-            .fuse_read_callback_max_ns
-            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        Self::observe_latency_counter(
+            &metrics.fuse_read_callbacks,
+            &metrics.fuse_read_callback_total_ns,
+            &metrics.fuse_read_callback_max_ns,
+            &metrics.fuse_read_callback_latency_histogram,
+            elapsed_ns,
+        );
     }
 
     /// Record FUSE write callback observability.
     pub fn record_fuse_write_callback(
         &self,
         requested_bytes: usize,
+        returned_bytes: usize,
         callback_elapsed: Duration,
         errored: bool,
     ) {
         let metrics = &self.state.metrics;
-        metrics.fuse_write_callbacks.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .fuse_write_callback_requested_bytes
+            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
         metrics
             .fuse_write_callback_bytes
-            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
+            .fetch_add(returned_bytes as u64, Ordering::Relaxed);
+        metrics
+            .fuse_write_callback_size_histogram
+            .observe(requested_bytes);
         if errored {
             metrics
                 .fuse_write_callback_errors
                 .fetch_add(1, Ordering::Relaxed);
         }
         let elapsed_ns = Self::duration_ns_u64(callback_elapsed);
-        metrics
-            .fuse_write_callback_total_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
-        metrics
-            .fuse_write_callback_max_ns
-            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        Self::observe_latency_counter(
+            &metrics.fuse_write_callbacks,
+            &metrics.fuse_write_callback_total_ns,
+            &metrics.fuse_write_callback_max_ns,
+            &metrics.fuse_write_callback_latency_histogram,
+            elapsed_ns,
+        );
+    }
+
+    /// Record a FUSE durability or lifecycle callback.
+    pub fn record_fuse_barrier_callback(
+        &self,
+        kind: FuseBarrierKind,
+        callback_elapsed: Duration,
+        errored: bool,
+    ) {
+        let metrics = &self.state.metrics;
+        let (calls, errors, total_ns, max_ns, histogram) = match kind {
+            FuseBarrierKind::Flush => (
+                &metrics.fuse_flush_callbacks,
+                &metrics.fuse_flush_callback_errors,
+                &metrics.fuse_flush_callback_total_ns,
+                &metrics.fuse_flush_callback_max_ns,
+                &metrics.fuse_flush_callback_latency_histogram,
+            ),
+            FuseBarrierKind::Fsync => (
+                &metrics.fuse_fsync_callbacks,
+                &metrics.fuse_fsync_callback_errors,
+                &metrics.fuse_fsync_callback_total_ns,
+                &metrics.fuse_fsync_callback_max_ns,
+                &metrics.fuse_fsync_callback_latency_histogram,
+            ),
+            FuseBarrierKind::Release => (
+                &metrics.fuse_release_callbacks,
+                &metrics.fuse_release_callback_errors,
+                &metrics.fuse_release_callback_total_ns,
+                &metrics.fuse_release_callback_max_ns,
+                &metrics.fuse_release_callback_latency_histogram,
+            ),
+        };
+        if errored {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
+        Self::observe_latency_counter(
+            calls,
+            total_ns,
+            max_ns,
+            histogram,
+            Self::duration_ns_u64(callback_elapsed),
+        );
     }
 
     /// Replace the latest configured and negotiated FUSE connection snapshot.
@@ -7832,15 +8097,29 @@ impl StudioVfs {
             winfsp_read_callback_bytes: winfsp_read_callback_bytes,
             winfsp_read_callback_total_ns: winfsp_read_callback_total_ns,
             fuse_read_callbacks: fuse_read_callbacks,
+            fuse_read_callback_requested_bytes: fuse_read_callback_requested_bytes,
             fuse_read_callback_bytes: fuse_read_callback_bytes,
             fuse_read_callback_errors: fuse_read_callback_errors,
             fuse_read_callback_total_ns: fuse_read_callback_total_ns,
             fuse_read_callback_max_ns: fuse_read_callback_max_ns,
             fuse_write_callbacks: fuse_write_callbacks,
+            fuse_write_callback_requested_bytes: fuse_write_callback_requested_bytes,
             fuse_write_callback_bytes: fuse_write_callback_bytes,
             fuse_write_callback_errors: fuse_write_callback_errors,
             fuse_write_callback_total_ns: fuse_write_callback_total_ns,
             fuse_write_callback_max_ns: fuse_write_callback_max_ns,
+            fuse_flush_callbacks: fuse_flush_callbacks,
+            fuse_flush_callback_errors: fuse_flush_callback_errors,
+            fuse_flush_callback_total_ns: fuse_flush_callback_total_ns,
+            fuse_flush_callback_max_ns: fuse_flush_callback_max_ns,
+            fuse_fsync_callbacks: fuse_fsync_callbacks,
+            fuse_fsync_callback_errors: fuse_fsync_callback_errors,
+            fuse_fsync_callback_total_ns: fuse_fsync_callback_total_ns,
+            fuse_fsync_callback_max_ns: fuse_fsync_callback_max_ns,
+            fuse_release_callbacks: fuse_release_callbacks,
+            fuse_release_callback_errors: fuse_release_callback_errors,
+            fuse_release_callback_total_ns: fuse_release_callback_total_ns,
+            fuse_release_callback_max_ns: fuse_release_callback_max_ns,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -7872,6 +8151,59 @@ impl StudioVfs {
             eager_flush_skipped_empty: eager_flush_skipped_empty,
             eager_flush_skipped_below_threshold: eager_flush_skipped_below_threshold,
         );
+        let fuse_histogram_baseline = self.state.metrics.fuse_histogram_reset_baseline.lock();
+        let fuse_read_size_histogram = Self::subtract_size_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_read_callback_size_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.read_size,
+        );
+        let fuse_write_size_histogram = Self::subtract_size_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_write_callback_size_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.write_size,
+        );
+        let fuse_read_latency_histogram = Self::subtract_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_read_callback_latency_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.read_latency,
+        );
+        let fuse_write_latency_histogram = Self::subtract_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_write_callback_latency_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.write_latency,
+        );
+        let fuse_flush_latency_histogram = Self::subtract_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_flush_callback_latency_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.flush_latency,
+        );
+        let fuse_fsync_latency_histogram = Self::subtract_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_fsync_callback_latency_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.fsync_latency,
+        );
+        let fuse_release_latency_histogram = Self::subtract_histogram_baseline(
+            self.state
+                .metrics
+                .fuse_release_callback_latency_histogram
+                .snapshot(),
+            &fuse_histogram_baseline.release_latency,
+        );
+        drop(fuse_histogram_baseline);
+        let fuse_read_latency_calls = fuse_read_latency_histogram.bucket_counts.iter().sum();
+        let fuse_write_latency_calls = fuse_write_latency_histogram.bucket_counts.iter().sum();
         let local_cache_handoff_histogram = self
             .state
             .metrics
@@ -8481,16 +8813,54 @@ impl StudioVfs {
                     fuse_read_callbacks,
                     fuse_read_callback_bytes,
                     fuse_read_callback_errors,
-                    fuse_read_callback_total_ns,
-                    fuse_read_callback_max_ns,
-                    elapsed,
+                    Self::per_second(fuse_read_callback_requested_bytes, elapsed)
+                        / (1024.0 * 1024.0),
+                    fuse_read_size_histogram,
+                    Self::build_stage_latency_stats(
+                        fuse_read_latency_calls,
+                        fuse_read_callback_total_ns,
+                        fuse_read_callback_max_ns,
+                        fuse_read_latency_histogram,
+                        elapsed,
+                    ),
                 ),
                 write: Self::build_fuse_io_stats(
                     fuse_write_callbacks,
                     fuse_write_callback_bytes,
                     fuse_write_callback_errors,
-                    fuse_write_callback_total_ns,
-                    fuse_write_callback_max_ns,
+                    Self::per_second(fuse_write_callback_requested_bytes, elapsed)
+                        / (1024.0 * 1024.0),
+                    fuse_write_size_histogram,
+                    Self::build_stage_latency_stats(
+                        fuse_write_latency_calls,
+                        fuse_write_callback_total_ns,
+                        fuse_write_callback_max_ns,
+                        fuse_write_latency_histogram,
+                        elapsed,
+                    ),
+                ),
+                flush: Self::build_fuse_barrier_stats(
+                    fuse_flush_callbacks,
+                    fuse_flush_callback_errors,
+                    fuse_flush_callback_total_ns,
+                    fuse_flush_callback_max_ns,
+                    fuse_flush_latency_histogram,
+                    elapsed,
+                ),
+                fsync: Self::build_fuse_barrier_stats(
+                    fuse_fsync_callbacks,
+                    fuse_fsync_callback_errors,
+                    fuse_fsync_callback_total_ns,
+                    fuse_fsync_callback_max_ns,
+                    fuse_fsync_latency_histogram,
+                    elapsed,
+                ),
+                release: Self::build_fuse_barrier_stats(
+                    fuse_release_callbacks,
+                    fuse_release_callback_errors,
+                    fuse_release_callback_total_ns,
+                    fuse_release_callback_max_ns,
+                    fuse_release_latency_histogram,
                     elapsed,
                 ),
             },

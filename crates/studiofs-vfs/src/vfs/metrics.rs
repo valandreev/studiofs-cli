@@ -675,7 +675,7 @@ pub struct VfsIngressStats {
 }
 
 /// Write-path latency quantile measurements in milliseconds.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct VfsWritePathLatencyQuantilesMs {
     /// 50th percentile value.
     pub p50: f64,
@@ -686,7 +686,7 @@ pub struct VfsWritePathLatencyQuantilesMs {
 }
 
 /// Flags indicating whether quantile values are saturated.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct VfsWritePathLatencyQuantilesSaturated {
     /// Indicates saturation for `p50`.
     pub p50: bool,
@@ -697,7 +697,7 @@ pub struct VfsWritePathLatencyQuantilesSaturated {
 }
 
 /// Histogram snapshot with bucket bounds and counts.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct VfsLatencyHistogramSnapshot {
     /// Upper bounds (nanoseconds) for histogram buckets.
     pub bucket_upper_bounds_ns: Vec<u64>,
@@ -914,6 +914,15 @@ pub struct VfsFuseCallbackStats {
     /// FUSE write callback metrics.
     #[serde(default)]
     pub write: VfsFuseIoStats,
+    /// FUSE flush callback metrics.
+    #[serde(default)]
+    pub flush: VfsFuseBarrierStats,
+    /// FUSE fsync callback metrics.
+    #[serde(default)]
+    pub fsync: VfsFuseBarrierStats,
+    /// FUSE release callback metrics.
+    #[serde(default)]
+    pub release: VfsFuseBarrierStats,
 }
 
 /// Platform-neutral FUSE inode lookup-liveness counters.
@@ -1195,9 +1204,9 @@ pub struct VfsFuseAsyncReadSnapshot {
 pub struct VfsFuseIoStats {
     /// Total callback count.
     pub calls: u64,
-    /// Total requested bytes observed at the FUSE boundary.
+    /// Total bytes acknowledged to the kernel at the FUSE boundary.
     pub bytes: u64,
-    /// Average request size in bytes.
+    /// Average bytes acknowledged to the kernel per callback.
     pub avg_bytes: f64,
     /// Callback errors.
     pub errors: u64,
@@ -1209,6 +1218,38 @@ pub struct VfsFuseIoStats {
     pub max_ms: f64,
     /// Requested MiB per second over process uptime.
     pub requested_mib_per_sec: f64,
+    /// Distribution of requested callback sizes.
+    #[serde(default)]
+    pub size_histogram: VfsFuseSizeHistogram,
+    /// Callback wall-time distribution and quantiles.
+    #[serde(default)]
+    pub latency: VfsWritePathStageLatencyStats,
+}
+
+/// Request-size histogram for one FUSE I/O callback direction.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VfsFuseSizeHistogram {
+    /// Inclusive upper bounds (bytes) for finite histogram buckets.
+    pub bucket_upper_bounds_bytes: Vec<u64>,
+    /// Mutually exclusive bucket counts, including one overflow bucket.
+    pub bucket_counts: Vec<u64>,
+}
+
+/// Metrics for one FUSE durability or lifecycle callback.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VfsFuseBarrierStats {
+    /// Total callback count.
+    pub calls: u64,
+    /// Callback errors, including rejected FUSE replies.
+    pub errors: u64,
+    /// Total callback wall time in milliseconds.
+    pub total_ms: f64,
+    /// Average callback wall time in milliseconds.
+    pub avg_ms: f64,
+    /// Maximum callback wall time in milliseconds.
+    pub max_ms: f64,
+    /// Callback wall-time distribution and quantiles.
+    pub latency: VfsWritePathStageLatencyStats,
 }
 
 /// VFS read callback counters.
@@ -1429,7 +1470,7 @@ pub struct VfsWritePathBurstStats {
 }
 
 /// Latency statistics for a single stage in the write pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct VfsWritePathStageLatencyStats {
     /// Total call count.
     pub calls: u64,

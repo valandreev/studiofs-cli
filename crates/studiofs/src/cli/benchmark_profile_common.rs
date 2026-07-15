@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use std::convert::TryFrom;
 use std::fs;
 use std::path::Path;
-use studiofs_vfs::VfsWritePathObservabilitySnapshot;
+use studiofs_vfs::{VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats};
 
 const WINFSP_CLEANUP_REGRESSION_ISSUE: &str = "SFS-192";
 
@@ -275,6 +275,51 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.fuse_callbacks.write.errors
     ));
     out.push_str(&format!(
+        "fuse_read_size_histogram: bounds_bytes={:?} counts={:?}\n",
+        snapshot
+            .fuse_callbacks
+            .read
+            .size_histogram
+            .bucket_upper_bounds_bytes,
+        snapshot.fuse_callbacks.read.size_histogram.bucket_counts,
+    ));
+    out.push_str(&format!(
+        "fuse_write_size_histogram: bounds_bytes={:?} counts={:?}\n",
+        snapshot
+            .fuse_callbacks
+            .write
+            .size_histogram
+            .bucket_upper_bounds_bytes,
+        snapshot.fuse_callbacks.write.size_histogram.bucket_counts,
+    ));
+    append_fuse_latency_summary(
+        &mut out,
+        "read",
+        snapshot.fuse_callbacks.read.calls,
+        snapshot.fuse_callbacks.read.errors,
+        &snapshot.fuse_callbacks.read.latency,
+    );
+    append_fuse_latency_summary(
+        &mut out,
+        "write",
+        snapshot.fuse_callbacks.write.calls,
+        snapshot.fuse_callbacks.write.errors,
+        &snapshot.fuse_callbacks.write.latency,
+    );
+    for (name, barrier) in [
+        ("flush", &snapshot.fuse_callbacks.flush),
+        ("fsync", &snapshot.fuse_callbacks.fsync),
+        ("release", &snapshot.fuse_callbacks.release),
+    ] {
+        append_fuse_latency_summary(
+            &mut out,
+            name,
+            barrier.calls,
+            barrier.errors,
+            &barrier.latency,
+        );
+    }
+    out.push_str(&format!(
         "vfs_write_foreground_ms: pre_drain_avg={:.2} throttle_avg={:.2} file_session_avg={:.2} record_stack_avg={:.2} getattr_avg={:.2} spawn_deferred_avg={:.2}\n",
         snapshot.vfs_write_path.pre_drain.avg_ms,
         snapshot.vfs_write_path.admission_throttle.avg_ms,
@@ -348,19 +393,44 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
     Ok(out)
 }
 
+fn append_fuse_latency_summary(
+    out: &mut String,
+    name: &str,
+    calls: u64,
+    errors: u64,
+    latency: &VfsWritePathStageLatencyStats,
+) {
+    out.push_str(&format!(
+        "fuse_{name}_callback: calls={calls} errors={errors} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} saturated={}/{}/{}\n",
+        latency.latency_quantiles_ms.p50,
+        latency.latency_quantiles_ms.p95,
+        latency.latency_quantiles_ms.p99,
+        latency.max_ms,
+        latency.latency_quantiles_saturated.p50,
+        latency.latency_quantiles_saturated.p95,
+        latency.latency_quantiles_saturated.p99,
+    ));
+    out.push_str(&format!(
+        "fuse_{name}_latency_histogram: bounds_ns={:?} counts={:?}\n",
+        latency.latency_histogram.bucket_upper_bounds_ns, latency.latency_histogram.bucket_counts,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{collect_write_path_artifacts, render_write_path_summary};
     use crate::cli::benchmark_profile_types::ProfileArtifactKind;
     use studiofs_vfs::{
-        VfsFetchStats, VfsUploadStats, VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats,
-        VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
+        VfsFetchStats, VfsFuseSizeHistogram, VfsLatencyHistogramSnapshot, VfsUploadStats,
+        VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+        VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
+        VfsWritePathStageLatencyStats, VfsWritePathWinfspCallbackStats,
         VfsWritePathWinfspForegroundFlushStats,
     };
 
     #[test]
     fn render_write_path_summary_includes_winfsp_callback_breakdown() {
-        let snapshot = VfsWritePathObservabilitySnapshot {
+        let mut snapshot = VfsWritePathObservabilitySnapshot {
             backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 write: 11,
@@ -381,6 +451,33 @@ mod tests {
             },
             ..Default::default()
         };
+        snapshot.fuse_callbacks.read.calls = 3;
+        snapshot.fuse_callbacks.read.errors = 1;
+        snapshot.fuse_callbacks.read.size_histogram = VfsFuseSizeHistogram {
+            bucket_upper_bounds_bytes: vec![4096],
+            bucket_counts: vec![2, 1],
+        };
+        snapshot.fuse_callbacks.read.latency = VfsWritePathStageLatencyStats {
+            calls: 3,
+            max_ms: 6_000.0,
+            latency_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                p50: 1.0,
+                p95: 5_000.0,
+                p99: 5_000.0,
+            },
+            latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                p50: false,
+                p95: true,
+                p99: true,
+            },
+            latency_histogram: VfsLatencyHistogramSnapshot {
+                bucket_upper_bounds_ns: vec![1_000_000, 5_000_000_000],
+                bucket_counts: vec![2, 0, 1],
+            },
+            ..Default::default()
+        };
+        snapshot.fuse_callbacks.release.calls = 1;
+        snapshot.fuse_callbacks.release.latency = snapshot.fuse_callbacks.read.latency.clone();
 
         let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
         let summary = render_write_path_summary(&bytes).expect("render summary");
@@ -390,6 +487,12 @@ mod tests {
         ));
         assert!(summary.contains("winfsp_foreground_flushes: cleanup=0 cleanup_skipped_clean=0 flush=2 flush_skipped_clean=3 close=3 close_skipped_clean=4"));
         assert!(summary.contains("winfsp_validation: cleanup_non_delete=cleanup-deferred cleanup_non_delete_barriers=0 cleanup_non_delete_skipped_clean=0 cleanup_flush_fh=0 flush_barriers=2 close_barriers=3"));
+        assert!(summary.contains("fuse_read_size_histogram: bounds_bytes=[4096] counts=[2, 1]"));
+        assert!(summary.contains("fuse_read_callback: calls=3 errors=1 p50_ms=1.000 p95_ms=5000.000 p99_ms=5000.000 max_ms=6000.000 saturated=false/true/true"));
+        assert!(summary.contains(
+            "fuse_read_latency_histogram: bounds_ns=[1000000, 5000000000] counts=[2, 0, 1]"
+        ));
+        assert!(summary.contains("fuse_release_callback: calls=1 errors=0"));
     }
 
     #[test]

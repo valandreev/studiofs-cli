@@ -11,7 +11,8 @@ use studiofs_cache::runtime::{
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
 use studiofs_vfs::{
-    VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsWritePathObservabilitySnapshot,
+    VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseConnectionSnapshot,
+    VfsWritePathObservabilitySnapshot,
 };
 #[cfg(test)]
 use uuid::Uuid;
@@ -115,6 +116,96 @@ fn format_quantile_ms(value: f64, saturated: bool) -> String {
     } else {
         format_ms(value)
     }
+}
+
+fn format_fuse_callback_histograms(callbacks: &VfsFuseCallbackStats) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "  FUSE read size bounds/counts/overflow: {:?}/{:?}/{}",
+            callbacks.read.size_histogram.bucket_upper_bounds_bytes,
+            callbacks.read.size_histogram.bucket_counts,
+            callbacks
+                .read
+                .size_histogram
+                .bucket_counts
+                .last()
+                .copied()
+                .unwrap_or(0),
+        ),
+        format!(
+            "  FUSE write size bounds/counts/overflow: {:?}/{:?}/{}",
+            callbacks.write.size_histogram.bucket_upper_bounds_bytes,
+            callbacks.write.size_histogram.bucket_counts,
+            callbacks
+                .write
+                .size_histogram
+                .bucket_counts
+                .last()
+                .copied()
+                .unwrap_or(0),
+        ),
+    ];
+    for (name, calls, errors, latency) in [
+        (
+            "read",
+            callbacks.read.calls,
+            callbacks.read.errors,
+            &callbacks.read.latency,
+        ),
+        (
+            "write",
+            callbacks.write.calls,
+            callbacks.write.errors,
+            &callbacks.write.latency,
+        ),
+        (
+            "flush",
+            callbacks.flush.calls,
+            callbacks.flush.errors,
+            &callbacks.flush.latency,
+        ),
+        (
+            "fsync",
+            callbacks.fsync.calls,
+            callbacks.fsync.errors,
+            &callbacks.fsync.latency,
+        ),
+        (
+            "release",
+            callbacks.release.calls,
+            callbacks.release.errors,
+            &callbacks.release.latency,
+        ),
+    ] {
+        lines.push(format!(
+            "  FUSE {name} calls/errors p50/p95/p99/max: {calls}/{errors} {}/{}/{}/{}",
+            format_quantile_ms(
+                latency.latency_quantiles_ms.p50,
+                latency.latency_quantiles_saturated.p50,
+            ),
+            format_quantile_ms(
+                latency.latency_quantiles_ms.p95,
+                latency.latency_quantiles_saturated.p95,
+            ),
+            format_quantile_ms(
+                latency.latency_quantiles_ms.p99,
+                latency.latency_quantiles_saturated.p99,
+            ),
+            format_ms(latency.max_ms),
+        ));
+        lines.push(format!(
+            "  FUSE {name} latency bounds/counts/overflow: {:?}/{:?}/{}",
+            latency.latency_histogram.bucket_upper_bounds_ns,
+            latency.latency_histogram.bucket_counts,
+            latency
+                .latency_histogram
+                .bucket_counts
+                .last()
+                .copied()
+                .unwrap_or(0),
+        ));
+    }
+    lines
 }
 
 fn format_staged_upload_cache_pressure_line(
@@ -929,6 +1020,9 @@ pub fn run(
                 format_bytes(snapshot.upload.encrypted_bytes_written),
                 snapshot.upload.encrypted_object_write_failures
             );
+            for line in format_fuse_callback_histograms(&snapshot.fuse_callbacks) {
+                println!("{line}");
+            }
             println!(
                 "  fetch stages avg/max ms s3_get {}/{} decode {}/{} assemble_copy {}/{} cache_put {}/{} total {}/{}",
                 format_ms(snapshot.fetch.s3_get_avg_ms),
@@ -1324,6 +1418,50 @@ mod tests {
     fn format_quantile_ms_marks_saturated_values() {
         assert_eq!(format_quantile_ms(5000.0, true), "5000.000ms+ (saturated)");
         assert_eq!(format_quantile_ms(120.5, false), "120.500ms");
+
+        let mut callbacks = VfsFuseCallbackStats::default();
+        callbacks.read.calls = 3;
+        callbacks.read.errors = 1;
+        callbacks.read.size_histogram = studiofs_vfs::VfsFuseSizeHistogram {
+            bucket_upper_bounds_bytes: vec![4096],
+            bucket_counts: vec![2, 1],
+        };
+        callbacks.read.latency = studiofs_vfs::VfsWritePathStageLatencyStats {
+            max_ms: 6_000.0,
+            latency_quantiles_ms: studiofs_vfs::VfsWritePathLatencyQuantilesMs {
+                p50: 1.0,
+                p95: 5_000.0,
+                p99: 5_000.0,
+            },
+            latency_quantiles_saturated: studiofs_vfs::VfsWritePathLatencyQuantilesSaturated {
+                p50: false,
+                p95: true,
+                p99: true,
+            },
+            latency_histogram: studiofs_vfs::VfsLatencyHistogramSnapshot {
+                bucket_upper_bounds_ns: vec![1_000_000, 5_000_000_000],
+                bucket_counts: vec![2, 0, 1],
+            },
+            ..Default::default()
+        };
+
+        let lines = format_fuse_callback_histograms(&callbacks);
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line == "  FUSE read size bounds/counts/overflow: [4096]/[2, 1]/1" })
+        );
+        assert!(lines.iter().any(|line| {
+            line == "  FUSE read calls/errors p50/p95/p99/max: 3/1 1.000ms/5000.000ms+ (saturated)/5000.000ms+ (saturated)/6000.000ms"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "  FUSE read latency bounds/counts/overflow: [1000000, 5000000000]/[2, 0, 1]/1"
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("  FUSE release calls/errors"))
+        );
     }
 
     #[test]

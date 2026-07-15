@@ -16091,8 +16091,8 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
         assert_eq!(read, Some(4096));
     });
     vfs.note_vfs_read_call(4096);
-    vfs.record_fuse_read_callback(4096, Duration::from_millis(3), false);
-    vfs.record_fuse_write_callback(128 * 1024, Duration::from_millis(5), true);
+    vfs.record_fuse_read_callback(4096, 4096, Duration::from_millis(3), false);
+    vfs.record_fuse_write_callback(128 * 1024, 0, Duration::from_millis(5), true);
 
     let snapshot = vfs.write_path_observability_snapshot();
 
@@ -16107,12 +16107,256 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
     assert_eq!(snapshot.fuse_callbacks.read.bytes, 4096);
     assert_eq!(snapshot.fuse_callbacks.read.errors, 0);
     assert_eq!(snapshot.fuse_callbacks.write.calls, 1);
-    assert_eq!(snapshot.fuse_callbacks.write.bytes, 128 * 1024);
+    assert_eq!(snapshot.fuse_callbacks.write.bytes, 0);
     assert_eq!(snapshot.fuse_callbacks.write.errors, 1);
     assert!(
         snapshot.fuse_callbacks.write.avg_ms >= snapshot.fuse_callbacks.read.avg_ms,
         "write callback latency should reflect the longer recorded duration"
     );
+}
+
+#[test]
+fn fuse_read_size_histogram_places_boundary_values_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-read-size-histogram-boundaries");
+    let bounds = [
+        4 * 1024,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    ];
+
+    for size in bounds {
+        vfs.record_fuse_read_callback(size, size, Duration::ZERO, false);
+    }
+
+    let histogram = vfs
+        .write_path_observability_snapshot()
+        .fuse_callbacks
+        .read
+        .size_histogram;
+    assert_eq!(
+        histogram.bucket_upper_bounds_bytes,
+        bounds.map(|value| value as u64)
+    );
+    assert_eq!(histogram.bucket_counts, [1, 1, 1, 1, 1, 1, 0]);
+}
+
+#[test]
+fn fuse_write_size_histogram_places_overflow_values_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-write-size-histogram-overflow");
+
+    vfs.record_fuse_write_callback(
+        4 * 1024 * 1024 + 1,
+        4 * 1024 * 1024 + 1,
+        Duration::ZERO,
+        false,
+    );
+
+    let histogram = vfs
+        .write_path_observability_snapshot()
+        .fuse_callbacks
+        .write
+        .size_histogram;
+    assert_eq!(histogram.bucket_counts, [0, 0, 0, 0, 0, 0, 1]);
+}
+
+#[test]
+fn fuse_callback_latency_reports_p50_p95_p99_and_max() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-callback-latency-quantiles");
+
+    for _ in 0..50 {
+        vfs.record_fuse_read_callback(1, 1, Duration::from_millis(1), false);
+    }
+    for _ in 0..45 {
+        vfs.record_fuse_read_callback(1, 1, Duration::from_millis(100), false);
+    }
+    for _ in 0..4 {
+        vfs.record_fuse_read_callback(1, 1, Duration::from_millis(500), false);
+    }
+    vfs.record_fuse_read_callback(1, 1, Duration::from_secs(6), false);
+
+    let read = vfs.write_path_observability_snapshot().fuse_callbacks.read;
+    assert_eq!(
+        (
+            read.latency.latency_quantiles_ms.p50,
+            read.latency.latency_quantiles_ms.p95,
+            read.latency.latency_quantiles_ms.p99,
+            read.latency.max_ms,
+        ),
+        (1.0, 100.0, 500.0, 6_000.0),
+    );
+}
+
+#[test]
+fn fuse_flush_fsync_release_histograms_are_independent() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-barrier-latency-independent");
+
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Flush, Duration::from_millis(1), false);
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Fsync, Duration::from_millis(2), true);
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Release, Duration::from_millis(5), false);
+
+    let callbacks = vfs.write_path_observability_snapshot().fuse_callbacks;
+    assert_eq!((callbacks.flush.calls, callbacks.flush.errors), (1, 0));
+    assert_eq!((callbacks.fsync.calls, callbacks.fsync.errors), (1, 1));
+    assert_eq!((callbacks.release.calls, callbacks.release.errors), (1, 0));
+    assert_eq!(callbacks.flush.latency.latency_quantiles_ms.p50, 1.0);
+    assert_eq!(callbacks.fsync.latency.latency_quantiles_ms.p50, 2.0);
+    assert_eq!(callbacks.release.latency.latency_quantiles_ms.p50, 5.0);
+    assert_eq!(callbacks.flush.total_ms, 1.0);
+    assert_eq!(callbacks.fsync.avg_ms, 2.0);
+    assert_eq!(callbacks.release.max_ms, 5.0);
+}
+
+#[test]
+fn fuse_histogram_reset_baseline_subtracts_monotonic_buckets() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-histogram-reset-baseline");
+
+    vfs.record_fuse_read_callback(4096, 4096, Duration::from_millis(1), false);
+    let raw_before = vfs
+        .state
+        .metrics
+        .fuse_read_callback_latency_histogram
+        .snapshot();
+    let raw_size_before = vfs
+        .state
+        .metrics
+        .fuse_read_callback_size_histogram
+        .snapshot()
+        .bucket_counts;
+    assert_eq!(raw_before.bucket_counts.iter().sum::<u64>(), 1);
+
+    vfs.reset_diagnostics_observability();
+
+    let after_reset = vfs.write_path_observability_snapshot().fuse_callbacks.read;
+    let raw_after = vfs
+        .state
+        .metrics
+        .fuse_read_callback_latency_histogram
+        .snapshot();
+    let raw_size_after = vfs
+        .state
+        .metrics
+        .fuse_read_callback_size_histogram
+        .snapshot()
+        .bucket_counts;
+    assert_eq!(after_reset.latency.latency_histogram.bucket_counts, [0; 17]);
+    assert_eq!(after_reset.size_histogram.bucket_counts, [0; 7]);
+    assert_eq!(raw_after.bucket_counts, raw_before.bucket_counts);
+    assert_eq!(raw_size_after, raw_size_before);
+
+    vfs.record_fuse_read_callback(16 * 1024, 7, Duration::from_millis(2), false);
+    let after_new = vfs.write_path_observability_snapshot().fuse_callbacks.read;
+    assert_eq!(
+        after_new
+            .latency
+            .latency_histogram
+            .bucket_counts
+            .iter()
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        after_new.size_histogram.bucket_counts,
+        [0, 1, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn fuse_latency_snapshot_exports_raw_monotonic_buckets_and_saturation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-latency-raw-buckets");
+
+    vfs.record_fuse_write_callback(1, 1, Duration::from_secs(6), false);
+
+    let latency = vfs
+        .write_path_observability_snapshot()
+        .fuse_callbacks
+        .write
+        .latency;
+    assert_eq!(latency.latency_histogram.bucket_upper_bounds_ns.len(), 16);
+    assert_eq!(latency.latency_histogram.bucket_counts.len(), 17);
+    assert_eq!(latency.latency_histogram.bucket_counts[16], 1);
+    assert!(latency.latency_quantiles_saturated.p50);
+    assert!(latency.latency_quantiles_saturated.p95);
+    assert!(latency.latency_quantiles_saturated.p99);
+}
+
+#[test]
+fn runtime_stats_surface_exports_each_fuse_callback_histogram() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-fuse-callback-histograms");
+
+    vfs.record_fuse_read_callback(4096, 1024, Duration::from_millis(1), false);
+    vfs.record_fuse_write_callback(8192, 4096, Duration::from_millis(2), false);
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Flush, Duration::from_millis(5), false);
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Fsync, Duration::from_millis(10), false);
+    vfs.record_fuse_barrier_callback(FuseBarrierKind::Release, Duration::from_millis(25), false);
+
+    let callbacks = vfs.write_path_observability_snapshot().fuse_callbacks;
+    for (name, latency) in [
+        ("read", &callbacks.read.latency),
+        ("write", &callbacks.write.latency),
+        ("flush", &callbacks.flush.latency),
+        ("fsync", &callbacks.fsync.latency),
+        ("release", &callbacks.release.latency),
+    ] {
+        assert_eq!(
+            latency.calls,
+            latency.latency_histogram.bucket_counts.iter().sum::<u64>(),
+            "latency count must match buckets for {name}",
+        );
+    }
+    let bridge = vfs.runtime_stats_snapshot().bridge;
+    let latencies = &bridge.latencies;
+    for name in [
+        "read_callback",
+        "write_callback",
+        "flush_callback",
+        "fsync_callback",
+        "release_callback",
+    ] {
+        let histogram = &latencies[name];
+        assert_eq!(histogram.count, 1, "histogram {name}");
+        assert_eq!(histogram.buckets.len(), 17, "histogram {name}");
+    }
+    assert!(latencies.contains_key("callback"));
+    assert_eq!(bridge.counters["read_callback_size_le_4096"].value, 1);
+    assert_eq!(bridge.counters["write_callback_size_le_16384"].value, 1);
+    assert_eq!(bridge.counters["read_callback_size_overflow"].value, 0);
+    assert_eq!(bridge.counters["write_callback_size_overflow"].value, 0);
+    for (name, expected_ns) in [
+        ("read_callback_max_ns", 1_000_000),
+        ("write_callback_max_ns", 2_000_000),
+        ("flush_callback_max_ns", 5_000_000),
+        ("fsync_callback_max_ns", 10_000_000),
+        ("release_callback_max_ns", 25_000_000),
+    ] {
+        assert_eq!(bridge.gauges[name].value, expected_ns, "gauge {name}");
+    }
+}
+
+#[test]
+fn runtime_stats_surface_exports_latency_overflow_bucket() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-fuse-latency-overflow");
+
+    vfs.record_fuse_read_callback(1, 1, Duration::from_secs(6), false);
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    let overflow = snapshot.bridge.latencies["read_callback"]
+        .buckets
+        .last()
+        .copied()
+        .expect("overflow bucket");
+    assert_eq!(overflow.le_ns, u64::MAX);
+    assert_eq!(overflow.count, 1);
 }
 
 #[test]

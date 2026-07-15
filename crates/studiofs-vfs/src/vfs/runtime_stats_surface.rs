@@ -1,8 +1,8 @@
 use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
 
 use super::{
-    RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
-    StudioVfs,
+    RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection,
+    RuntimeStatsSnapshot, StudioVfs, VfsFuseSizeHistogram, VfsWritePathStageLatencyStats,
 };
 use crate::utils::now_unix_millis;
 
@@ -114,7 +114,22 @@ impl StudioVfs {
             &mut snapshot.bridge,
             "flush_callbacks",
             "count",
-            write_path.winfsp_callbacks.flush,
+            write_path
+                .winfsp_callbacks
+                .flush
+                .saturating_add(write_path.fuse_callbacks.flush.calls),
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "fsync_callbacks",
+            "count",
+            write_path.fuse_callbacks.fsync.calls,
+        );
+        insert_counter(
+            &mut snapshot.bridge,
+            "release_callbacks",
+            "count",
+            write_path.fuse_callbacks.release.calls,
         );
         insert_counter(
             &mut snapshot.bridge,
@@ -204,7 +219,10 @@ impl StudioVfs {
                 .fuse_callbacks
                 .read
                 .errors
-                .saturating_add(write_path.fuse_callbacks.write.errors),
+                .saturating_add(write_path.fuse_callbacks.write.errors)
+                .saturating_add(write_path.fuse_callbacks.flush.errors)
+                .saturating_add(write_path.fuse_callbacks.fsync.errors)
+                .saturating_add(write_path.fuse_callbacks.release.errors),
         );
         insert_counter(
             &mut snapshot.bridge,
@@ -226,6 +244,40 @@ impl StudioVfs {
                 .bytes
                 .saturating_add(write_path.winfsp_write_path.write_bytes),
         );
+        insert_size_histogram_counters(
+            &mut snapshot.bridge,
+            "read_callback_size",
+            &write_path.fuse_callbacks.read.size_histogram,
+        );
+        insert_size_histogram_counters(
+            &mut snapshot.bridge,
+            "write_callback_size",
+            &write_path.fuse_callbacks.write.size_histogram,
+        );
+        for (name, max_ms) in [
+            (
+                "read_callback_max_ns",
+                write_path.fuse_callbacks.read.max_ms,
+            ),
+            (
+                "write_callback_max_ns",
+                write_path.fuse_callbacks.write.max_ms,
+            ),
+            (
+                "flush_callback_max_ns",
+                write_path.fuse_callbacks.flush.max_ms,
+            ),
+            (
+                "fsync_callback_max_ns",
+                write_path.fuse_callbacks.fsync.max_ms,
+            ),
+            (
+                "release_callback_max_ns",
+                write_path.fuse_callbacks.release.max_ms,
+            ),
+        ] {
+            insert_gauge(&mut snapshot.bridge, name, "ns", ms_sum_to_ns(max_ms));
+        }
         for (name, unit, value) in [
             (
                 "fuse_negotiated_max_read_bytes",
@@ -394,6 +446,18 @@ impl StudioVfs {
                 .saturating_add(write_path.winfsp_callbacks.read_total_ns)
                 .saturating_add(ms_sum_to_ns(write_path.winfsp_write_path.callback.total_ms)),
         );
+        for (name, latency) in [
+            ("read_callback", &write_path.fuse_callbacks.read.latency),
+            ("write_callback", &write_path.fuse_callbacks.write.latency),
+            ("flush_callback", &write_path.fuse_callbacks.flush.latency),
+            ("fsync_callback", &write_path.fuse_callbacks.fsync.latency),
+            (
+                "release_callback",
+                &write_path.fuse_callbacks.release.latency,
+            ),
+        ] {
+            insert_latency_with_buckets(&mut snapshot.bridge, name, latency);
+        }
 
         insert_counter(
             &mut snapshot.vfs_read,
@@ -654,6 +718,63 @@ fn insert_latency(
             unit: unit.into(),
             buckets: Vec::new(),
         },
+    );
+}
+
+fn insert_latency_with_buckets(
+    section: &mut RuntimeStatsSection,
+    name: &str,
+    latency: &VfsWritePathStageLatencyStats,
+) {
+    let histogram = &latency.latency_histogram;
+    let count = histogram.bucket_counts.iter().sum();
+    let mut buckets = histogram
+        .bucket_upper_bounds_ns
+        .iter()
+        .copied()
+        .zip(histogram.bucket_counts.iter().copied())
+        .map(|(le_ns, count)| RuntimeLatencyBucket { le_ns, count })
+        .collect::<Vec<_>>();
+    buckets.push(RuntimeLatencyBucket {
+        le_ns: u64::MAX,
+        count: histogram
+            .bucket_counts
+            .get(histogram.bucket_upper_bounds_ns.len())
+            .copied()
+            .unwrap_or(0),
+    });
+    section.latencies.insert(
+        name.to_owned(),
+        RuntimeLatencyHistogram {
+            count,
+            sum: ms_sum_to_ns(latency.total_ms),
+            unit: "ns".into(),
+            buckets,
+        },
+    );
+}
+
+fn insert_size_histogram_counters(
+    section: &mut RuntimeStatsSection,
+    prefix: &str,
+    histogram: &VfsFuseSizeHistogram,
+) {
+    for (upper, count) in histogram
+        .bucket_upper_bounds_bytes
+        .iter()
+        .zip(&histogram.bucket_counts)
+    {
+        insert_counter(section, &format!("{prefix}_le_{upper}"), "count", *count);
+    }
+    insert_counter(
+        section,
+        &format!("{prefix}_overflow"),
+        "count",
+        histogram
+            .bucket_counts
+            .get(histogram.bucket_upper_bounds_bytes.len())
+            .copied()
+            .unwrap_or(0),
     );
 }
 

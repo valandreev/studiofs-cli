@@ -35,7 +35,16 @@ time_ms       section       kind      metric                               rate/
 
 Counters are reported as totals plus per-second rates computed from two
 runtime stats snapshots. Gauges are point-in-time values. Verbose mode includes
-latency averages computed from histogram `count` and `sum` deltas.
+latency averages computed from histogram `count` and `sum` deltas. Verbose
+machine-readable samples also retain valid raw bucket deltas and publish p50,
+p95, p99, a finite interval maximum upper bound, overflow/saturation state,
+and `buckets_valid`. FUSE read/write request-size buckets appear as bridge
+counters, while `*_callback_max_ns` gauges are cumulative maxima.
+
+Bucket-derived interval values are emitted only when ordered bounds match and
+every bucket remains monotonic. Invalid/reset intervals set
+`buckets_valid=false` and omit bucket deltas and derived quantiles/maxima;
+`studiofs perf` does not invent values from reset-aware bucket subtraction.
 
 `--json --count N` prints one pretty JSON array containing `N` interval samples.
 It buffers the full array until all requested samples are collected. Use
