@@ -2751,6 +2751,9 @@ mod shared_os_cache_tests {
             .expect("create file directly in metadata");
         attr.size = LOGICAL_SIZE;
         attr.committed_size = LOGICAL_SIZE;
+        attr.content_epoch = 7;
+        attr.committed_content_epoch = 6;
+        attr.upload_state = UploadState::Updating;
         meta.set_attr(&attr).expect("store initial generation");
         let vfs = fixture.vfs();
         let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
