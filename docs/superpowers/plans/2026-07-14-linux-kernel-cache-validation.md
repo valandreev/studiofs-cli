@@ -44,6 +44,7 @@ The first prerequisite supplies handle-scoped barriers, safe teardown, and the D
 ## File map
 
 - Modify: `crates/studiofs-linux-fuse/csrc/low_level_ops.c` — `forget` wiring and negotiated-connection callback.
+- Modify: `crates/studiofs-linux-fuse/Cargo.toml` — only the test dependencies required by the mounted PostgreSQL/S3 fixture.
 - Modify: `crates/studiofs-linux-fuse/src/low_level.rs` — Linux liveness, cache decisions, invalidator wrapper, reply mapping, geometry state, callback timing, unit and mounted tests.
 - Modify: `crates/studiofs-linux-fuse/src/lib.rs` — any public connection snapshot type needed by mount wiring.
 - Modify: `crates/studiofs-vfs/src/vfs/metrics.rs` — callback size/latency histograms and barrier snapshots.
@@ -201,10 +202,12 @@ Add table-driven tests for `linux_fuse_open_cache_policy_for`:
 | Kernel | false | true | GenerationChanged/Replace | false | false | false |
 | Kernel | false | true | StableGeneration/Reuse | false | true | false |
 
-Also require open and create to use the same mapper. Initialize one
-`cache_policy: LinuxFuseCachePolicy` in `SessionState` from the environment at
-mount construction and use that field for preparation, flag mapping, metrics,
-and status; callbacks must not reread the environment.
+Also require open and create to use the same mapper. Initialize both
+`cache_policy: LinuxFuseCachePolicy` and `requested_async_dio: bool` in
+`SessionState` from the environment at mount construction. Derive requested
+writeback-cache negotiation from `cache_policy`, and use these stored fields
+for init negotiation, preparation, flag mapping, metrics, and status;
+callbacks must not reread the environment.
 
 - [ ] **Step 2: Verify RED**
 
@@ -250,10 +253,9 @@ derive participation from `state.cache_policy`, call
 `prepare_os_cache_open(fh, participation)`, map flags, and issue the raw reply
 before releasing the section. The decision is non-fallible; an observation
 problem cannot turn a successful VFS open into an open error. The shared pure
-mapper receives mount policy, the prerequisite's single requested Direct async
-decision, the C-shim support bit, and `OsCacheOpenDecision`; Task 3 replaces
-that one boolean with actual negotiated acceptance without changing this
-boundary:
+mapper receives `state.cache_policy`, `state.requested_async_dio`, the C-shim
+support bit, and `OsCacheOpenDecision`; Task 3 replaces the requested async
+input with actual negotiated acceptance without changing this boundary:
 
 ```rust
 let keep_cache = cache_policy == LinuxFuseCachePolicy::Kernel
@@ -506,7 +508,7 @@ pub struct VfsFuseSizeHistogram {
 }
 ```
 
-Add `size_histogram` and `latency: VfsWritePathStageLatencyStats` to `VfsFuseIoStats` under `#[serde(default)]`. The latency snapshot must retain fixed upper bounds, raw cumulative bucket counts, overflow count, and saturation flags in addition to display quantiles; later interval analysis is impossible from quantiles alone.
+Add `size_histogram` and `latency: VfsWritePathStageLatencyStats` to `VfsFuseIoStats` under `#[serde(default)]`. The latency snapshot must retain fixed upper bounds, raw cumulative bucket counts, overflow count, and saturation flags in addition to display quantiles; later interval analysis is impossible from quantiles alone. For every read callback, record the requested callback argument `size` in this histogram on both success and error. Returned bytes stay in the existing byte counter and never define request-size buckets.
 
 - [ ] **Step 4: Add barrier snapshots and recorders**
 
@@ -592,7 +594,15 @@ Add helpers to the existing ignored Linux mounted-test fixture to:
 - inspect negotiated geometry recorded during mount;
 - unmount and join the session without using sleeps as correctness assertions.
 
-Also adapt the existing two-client PostgreSQL/S3 fixture from `crates/studiofs-vfs/tests/vfs_test.rs`: mount the reader VFS through Linux Kernel mode, keep a second writer VFS on the same volume, and expose metadata-listener plus kernel-invalidation counters. Do not add a test-only "force invalidation" hook that bypasses the production metadata listener.
+Also adapt only the minimum setup from the existing two-client PostgreSQL/S3
+fixture in `crates/studiofs-vfs/tests/vfs_test.rs`: add direct Linux test
+dependencies in `crates/studiofs-linux-fuse/Cargo.toml`, create a small local
+volume/setup helper in the Linux test module, mount the reader VFS through
+Linux Kernel mode, and keep a second writer VFS on the same volume. Do not
+extract a new shared fixture abstraction, duplicate unrelated VFS test helpers,
+or add a test-only "force invalidation" hook that bypasses the production
+metadata listener. Observe the production metadata listener through the
+existing runtime and kernel-invalidation counters.
 
 - [ ] **Step 2: Add one deterministic coherence matrix test**
 
@@ -678,7 +688,7 @@ remote-listener tests. Do not hand-edit this file.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/studiofs-linux-fuse/src/low_level.rs
+git add crates/studiofs-linux-fuse/Cargo.toml crates/studiofs-linux-fuse/src/low_level.rs Cargo.lock
 git commit -m "test(linux): prove mounted cache coherence"
 ```
 
@@ -853,9 +863,9 @@ Use embedded Python 3 standard-library programs, following the existing gate sty
 - same-file parallel writes: `min(os.cpu_count() or 1, 8)` threads use `os.pwrite` for equal disjoint 64 MiB regions, fsync once, reopen, and verify deterministic bytes; record the selected parallelism;
 - cross-file barriers: write two files concurrently, fsync/close each, record completion times, reopen, and verify exact bytes.
 
-Kernel records the same-file workload as correctness/CPU evidence but does not compare its direct-write speed to Direct. Direct serial and Direct async compare it directly. Copy each benchmark's generated JSON to the stable `client-report.json` name while retaining the original report.
+Kernel records the same-file workload as correctness/CPU evidence but does not compare its direct-write speed to Direct. Direct serial and Direct async compare it directly. Copy each benchmark's generated JSON to the stable `client-report.json` name while retaining the original report. Before real evidence, rebuild the bundled benchmark from `/home/val/dev/studiofs-bench` at the tested revision with an actual completed `run.file_count` field, copy that binary to `target/bench/studiofs-bench`, and record its SHA-256 in the manifest.
 
-Parse every client report before accepting the run. `large-single` must report exactly 4,000,000,000 configured bytes and one file; `fixed-1m` exactly 4,000 files and 4,000,000,000 bytes; `small-128k` exactly 1,000 files and 131,072,000 bytes. A tool rounding or silently adding another phase is a hard harness failure.
+Parse every client report before accepting the run. `large-single` must report exactly 4,000,000,000 configured bytes and `run.file_count == 1`; `fixed-1m` exactly 4,000,000,000 bytes and `run.file_count == 4,000`; `small-128k` exactly 1,000 files and 131,072,000 bytes. A tool rounding, partial completion, or silently adding another phase is a hard harness failure.
 
 - [ ] **Step 6: Write a stable artifact schema**
 
