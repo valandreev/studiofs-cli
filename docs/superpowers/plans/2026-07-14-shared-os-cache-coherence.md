@@ -64,6 +64,10 @@ In `crates/studiofs-bridge/src/lib.rs` add:
 #[cfg(unix)]
 /// Lookup-reference liveness shared by FUSE-style Unix adapters.
 pub mod fuse_liveness;
+
+#[cfg(unix)]
+/// Per-inode serialization for FUSE open preparation and reply.
+pub mod fuse_open_reply;
 ```
 
 In the Unix dependency section of `crates/studiofs-bridge/Cargo.toml` add:
