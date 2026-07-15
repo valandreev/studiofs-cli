@@ -266,41 +266,53 @@ fn unmount_unix_with_detach(
 
     detach(mount_point, timing.detach_timeout)?;
 
-    // Send SIGTERM after detaching the kernel mount so the FUSE background
-    // thread can return naturally instead of unmounting from inside shutdown.
-    if let Err(err) = signal(pid, libc::SIGTERM) {
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(()); // already gone
+    let wait_for_lifecycle_release = || -> Result<bool> {
+        let deadline = Instant::now() + timing.timeout;
+        loop {
+            if !is_mount_active(mount_point)? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(timing.poll_interval);
         }
-        return Err(anyhow!("failed to send SIGTERM to PID {}: {}", pid, err));
+    };
+
+    // On Linux, detaching the kernel mount makes the FUSE session return. Give
+    // the mount process time to flush VFS state and release its lifecycle lock
+    // before falling back to process signals. Other Unix backends use SIGTERM
+    // as their graceful-shutdown trigger.
+    #[cfg(target_os = "linux")]
+    {
+        if wait_for_lifecycle_release()? {
+            return Ok(());
+        }
     }
 
-    // A successfully exited child can remain visible to kill(pid, 0) as a
-    // zombie until its parent reaps it. The mountpoint state is the contract
-    // this command owns, so stop once it is no longer active.
-    let deadline = Instant::now() + timing.timeout;
-    loop {
-        std::thread::sleep(timing.poll_interval);
-        if !is_mount_active(mount_point)? {
-            break;
+    let term_sent = match signal(pid, libc::SIGTERM) {
+        Ok(()) => true,
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => false,
+        Err(err) => {
+            return Err(anyhow!("failed to send SIGTERM to PID {}: {}", pid, err));
         }
-        if let Err(err) = signal(pid, 0) {
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                break; // gone
-            }
-            break; // gone
-        }
-        if Instant::now() > deadline {
-            tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
-            let _ = signal(pid, libc::SIGKILL);
-            std::thread::sleep(timing.poll_interval);
-            if is_mount_active(mount_point)? {
-                anyhow::bail!(
-                    "mount process {pid} did not release lifecycle lock after SIGKILL; leaving mount record intact"
-                );
-            }
-            break;
-        }
+    };
+    if wait_for_lifecycle_release()? {
+        return Ok(());
+    }
+    if !term_sent {
+        anyhow::bail!(
+            "mount process {pid} no longer exists but its lifecycle lock is still active; leaving mount record intact"
+        );
+    }
+
+    tracing::warn!("mount process did not release its lifecycle lock — sending SIGKILL");
+    let _ = signal(pid, libc::SIGKILL);
+    std::thread::sleep(timing.poll_interval);
+    if is_mount_active(mount_point)? {
+        anyhow::bail!(
+            "mount process {pid} did not release lifecycle lock after SIGKILL; leaving mount record intact"
+        );
     }
 
     Ok(())
@@ -349,6 +361,9 @@ mod tests {
     static TEST_UNIX_EVENTS: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
     #[cfg(unix)]
     static TEST_UNIX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    #[cfg(target_os = "linux")]
+    static TEST_UNIX_ACTIVE_CHECKS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     fn pid_state() -> &'static Mutex<TestPidState> {
         TEST_PID_STATE.get_or_init(|| Mutex::new(TestPidState::default()))
@@ -380,6 +395,11 @@ mod tests {
     #[cfg(unix)]
     fn test_mount_active(_mount_point: &str) -> Result<bool> {
         Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_mount_active_once_then_inactive(_mount_point: &str) -> Result<bool> {
+        Ok(TEST_UNIX_ACTIVE_CHECKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0)
     }
 
     #[cfg(unix)]
@@ -483,9 +503,9 @@ mod tests {
         assert!(state.value.is_none(), "PID state should be cleared");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn unix_unmount_returns_once_mountpoint_is_inactive() {
+    fn unix_unmount_returns_after_detach_without_signaling_inactive_mount() {
         use std::time::Duration;
 
         let _guard = unix_test_lock();
@@ -506,8 +526,8 @@ mod tests {
         );
         assert_eq!(
             *unix_signal_log().lock().unwrap(),
-            vec![libc::SIGTERM],
-            "inactive mountpoint should not wait for kill(pid, 0) or send SIGKILL"
+            Vec::<libc::c_int>::new(),
+            "a mount that releases its lifecycle lock after detach must finish without SIGTERM"
         );
     }
 
@@ -534,29 +554,30 @@ mod tests {
         );
         assert_eq!(
             *unix_signal_log().lock().unwrap(),
-            vec![libc::SIGTERM, 0, libc::SIGKILL],
-            "timeout path should probe once, send SIGKILL, then return an error"
+            vec![libc::SIGTERM, libc::SIGKILL],
+            "timeout path should send SIGTERM, then SIGKILL, before returning an error"
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn unix_unmount_detaches_mount_before_signaling_mount_process() {
+    fn unix_unmount_detach_allows_natural_mount_process_exit() {
         use std::time::Duration;
 
         let _guard = unix_test_lock();
         unix_event_log().lock().unwrap().clear();
         unix_signal_log().lock().unwrap().clear();
+        TEST_UNIX_ACTIVE_CHECKS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let result = unmount_unix_with_detach(
             "/mnt/studiofs-test",
             12345,
-            test_mount_not_active,
+            test_mount_active_once_then_inactive,
             record_unix_signal,
             record_unix_detach,
             UnixUnmountTiming {
                 detach_timeout: Duration::ZERO,
-                timeout: Duration::ZERO,
+                timeout: Duration::from_secs(1),
                 poll_interval: Duration::ZERO,
             },
         );
@@ -567,8 +588,8 @@ mod tests {
         );
         assert_eq!(
             *unix_event_log().lock().unwrap(),
-            vec!["detach", "signal"],
-            "FUSE mount must be detached before the mount process receives SIGTERM"
+            vec!["detach"],
+            "FUSE detach should let the mount process finish its own VFS shutdown"
         );
     }
 }
