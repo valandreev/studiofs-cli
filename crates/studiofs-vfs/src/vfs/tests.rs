@@ -16498,7 +16498,7 @@ fn fuse_liveness_snapshot_reset_keeps_raw_generation_and_subtracts_event_baselin
 fn fuse_liveness_snapshot_publication_serializes_with_reset_baseline() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-liveness-reset-serialization");
-    let baseline_guard = vfs.state.fuse_liveness_reset_baseline.lock();
+    let snapshots_guard = vfs.state.fuse_liveness_snapshots.lock();
     let publisher = Arc::clone(&vfs);
     let (published_tx, published_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -16514,7 +16514,7 @@ fn fuse_liveness_snapshot_publication_serializes_with_reset_baseline() {
         published_rx.recv_timeout(Duration::from_millis(50)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
-    drop(baseline_guard);
+    drop(snapshots_guard);
     published_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("publisher should continue after reset guard releases");

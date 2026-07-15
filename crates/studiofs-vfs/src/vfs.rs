@@ -2763,9 +2763,7 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
-            fuse_liveness_snapshot: Mutex::new(VfsFuseLivenessSnapshot::default()),
-            fuse_liveness_raw_snapshot: Mutex::new(VfsFuseLivenessSnapshot::default()),
-            fuse_liveness_reset_baseline: Mutex::new(VfsFuseLivenessSnapshot::default()),
+            fuse_liveness_snapshots: Mutex::new(FuseLivenessSnapshots::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2808,6 +2806,12 @@ impl PrefetchedWriterStackObjectIds {
     }
 }
 
+#[derive(Default)]
+struct FuseLivenessSnapshots {
+    raw: VfsFuseLivenessSnapshot,
+    baseline: VfsFuseLivenessSnapshot,
+}
+
 struct VfsState {
     upload: UploadState,
     file_session: FileSessionState,
@@ -2825,9 +2829,7 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
-    fuse_liveness_snapshot: Mutex<VfsFuseLivenessSnapshot>,
-    fuse_liveness_raw_snapshot: Mutex<VfsFuseLivenessSnapshot>,
-    fuse_liveness_reset_baseline: Mutex<VfsFuseLivenessSnapshot>,
+    fuse_liveness_snapshots: Mutex<FuseLivenessSnapshots>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -4285,14 +4287,9 @@ impl StudioVfs {
             self.state.fuse_async_write_raw_snapshot.lock().clone();
         *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
         *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
-        let mut fuse_liveness_reset_baseline = self.state.fuse_liveness_reset_baseline.lock();
-        let fuse_liveness_raw_snapshot = *self.state.fuse_liveness_raw_snapshot.lock();
-        *fuse_liveness_reset_baseline = fuse_liveness_raw_snapshot;
-        *self.state.fuse_liveness_snapshot.lock() = VfsFuseLivenessSnapshot {
-            snapshot_generation: fuse_liveness_raw_snapshot.snapshot_generation,
-            ..Default::default()
-        };
-        drop(fuse_liveness_reset_baseline);
+        let mut fuse_liveness_snapshots = self.state.fuse_liveness_snapshots.lock();
+        fuse_liveness_snapshots.baseline = fuse_liveness_snapshots.raw;
+        drop(fuse_liveness_snapshots);
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -7385,19 +7382,11 @@ impl StudioVfs {
 
     /// Replace the latest FUSE inode liveness diagnostics snapshot.
     pub fn record_fuse_liveness_snapshot(&self, snapshot: VfsFuseLivenessSnapshot) {
-        let baseline = self.state.fuse_liveness_reset_baseline.lock();
-        let mut raw = self.state.fuse_liveness_raw_snapshot.lock();
-        if snapshot.snapshot_generation < raw.snapshot_generation {
+        let mut snapshots = self.state.fuse_liveness_snapshots.lock();
+        if snapshot.snapshot_generation < snapshots.raw.snapshot_generation {
             return;
         }
-        *raw = snapshot;
-        drop(raw);
-
-        let snapshot = Self::apply_fuse_liveness_reset_baseline(snapshot, &baseline);
-        let mut current = self.state.fuse_liveness_snapshot.lock();
-        if snapshot.snapshot_generation >= current.snapshot_generation {
-            *current = snapshot;
-        }
+        snapshots.raw = snapshot;
     }
 
     fn apply_fuse_liveness_reset_baseline(
@@ -8498,7 +8487,10 @@ impl StudioVfs {
                     elapsed,
                 ),
             },
-            fuse_liveness: *self.state.fuse_liveness_snapshot.lock(),
+            fuse_liveness: {
+                let snapshots = self.state.fuse_liveness_snapshots.lock();
+                Self::apply_fuse_liveness_reset_baseline(snapshots.raw, &snapshots.baseline)
+            },
             macfuse_open_cache: Default::default(),
             os_cache: self.os_cache.stats(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
