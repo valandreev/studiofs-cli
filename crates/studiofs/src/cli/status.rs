@@ -9,7 +9,7 @@ use studiofs_cache::runtime::{
     CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
-use studiofs_meta::counters;
+use studiofs_meta::{MetaOpenOptions, counters, open_meta_engine_with_options};
 use studiofs_vfs::{
     VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseConnectionSnapshot,
     VfsWritePathObservabilitySnapshot,
@@ -18,6 +18,12 @@ use studiofs_vfs::{
 use uuid::Uuid;
 
 const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
+
+fn status_meta_open_options() -> MetaOpenOptions {
+    MetaOpenOptions {
+        background_poll: false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CacheUsageStats {
@@ -629,7 +635,7 @@ pub fn run(
         return Ok(());
     }
 
-    let engine = match studiofs_meta::open_meta_engine(&db_path) {
+    let engine = match open_meta_engine_with_options(&db_path, status_meta_open_options()) {
         Ok(engine) => engine,
         Err(error) if verbosity.is_verbose() => {
             eprintln!(
@@ -1072,6 +1078,11 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_metadata_open_disables_background_polling() {
+        assert!(!status_meta_open_options().background_poll);
+    }
 
     #[test]
     fn scan_pending_uploads_supports_current_local_payload_runtime() {
