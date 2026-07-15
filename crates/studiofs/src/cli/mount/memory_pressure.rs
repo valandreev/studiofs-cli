@@ -134,6 +134,11 @@ impl MemoryPressureSampler {
             .await
             .context("Linux memory-pressure sampler task failed")
     }
+
+    #[cfg(test)]
+    pub(super) fn abort_for_test(&self) {
+        self.handle.abort();
+    }
 }
 
 pub(super) fn stop_memory_pressure_sampler(

@@ -896,14 +896,15 @@ fn runtime_shutdown_timeout() -> Duration {
 }
 
 fn run_mount_vfs_shutdown(
-    runtime: Runtime,
+    runtime: &Runtime,
     vfs: Arc<StudioVfs>,
     upload_drain_timeout: Duration,
-) -> anyhow::Result<Runtime> {
+) -> anyhow::Result<()> {
+    vfs_shutdown_boundary_for_test();
     if tokio::runtime::Handle::try_current().is_ok() {
+        let runtime_handle = runtime.handle().clone();
         let shutdown = std::thread::spawn(move || {
-            runtime.block_on(vfs.shutdown(upload_drain_timeout));
-            runtime
+            runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
         });
         return shutdown.join().map_err(|_| {
             anyhow::anyhow!("mount VFS shutdown runtime thread panicked during unmount")
@@ -911,7 +912,7 @@ fn run_mount_vfs_shutdown(
     }
 
     runtime.block_on(vfs.shutdown(upload_drain_timeout));
-    Ok(runtime)
+    Ok(())
 }
 
 fn stop_mount_diagnostics_host(
@@ -956,9 +957,17 @@ fn shutdown_mount_runtime(
 }
 
 #[cfg(test)]
-fn observed_runtime_shutdown_vfs_for_test() -> &'static StdMutex<(Option<Weak<StudioVfs>>, bool)> {
-    static OBSERVED: OnceLock<StdMutex<(Option<Weak<StudioVfs>>, bool)>> = OnceLock::new();
-    OBSERVED.get_or_init(|| StdMutex::new((None, false)))
+#[derive(Default)]
+struct RuntimeShutdownObservation {
+    vfs: Option<Weak<StudioVfs>>,
+    vfs_released: bool,
+    events: Vec<&'static str>,
+}
+
+#[cfg(test)]
+fn observed_runtime_shutdown_vfs_for_test() -> &'static StdMutex<RuntimeShutdownObservation> {
+    static OBSERVED: OnceLock<StdMutex<RuntimeShutdownObservation>> = OnceLock::new();
+    OBSERVED.get_or_init(|| StdMutex::new(RuntimeShutdownObservation::default()))
 }
 
 #[cfg(test)]
@@ -966,7 +975,11 @@ fn observe_runtime_shutdown_vfs_for_test(vfs: &Arc<StudioVfs>) {
     let mut observed = observed_runtime_shutdown_vfs_for_test()
         .lock()
         .expect("lock observed runtime-shutdown vfs");
-    *observed = (Some(Arc::downgrade(vfs)), false);
+    *observed = RuntimeShutdownObservation {
+        vfs: Some(Arc::downgrade(vfs)),
+        vfs_released: false,
+        events: Vec::new(),
+    };
 }
 
 #[cfg(test)]
@@ -974,16 +987,43 @@ fn runtime_shutdown_observed_vfs_was_released_for_test() -> bool {
     observed_runtime_shutdown_vfs_for_test()
         .lock()
         .expect("lock observed runtime-shutdown vfs")
-        .1
+        .vfs_released
 }
+
+#[cfg(test)]
+fn record_shutdown_event_for_test(event: &'static str) {
+    observed_runtime_shutdown_vfs_for_test()
+        .lock()
+        .expect("lock observed runtime-shutdown vfs")
+        .events
+        .push(event);
+}
+
+#[cfg(test)]
+fn shutdown_events_for_test() -> Vec<&'static str> {
+    observed_runtime_shutdown_vfs_for_test()
+        .lock()
+        .expect("lock observed runtime-shutdown vfs")
+        .events
+        .clone()
+}
+
+#[cfg(test)]
+fn vfs_shutdown_boundary_for_test() {
+    record_shutdown_event_for_test("vfs");
+}
+
+#[cfg(not(test))]
+fn vfs_shutdown_boundary_for_test() {}
 
 #[cfg(test)]
 fn runtime_shutdown_boundary_for_test() {
     let mut observed = observed_runtime_shutdown_vfs_for_test()
         .lock()
         .expect("lock observed runtime-shutdown vfs");
-    observed.1 = observed
-        .0
+    observed.events.push("runtime");
+    observed.vfs_released = observed
+        .vfs
         .as_ref()
         .is_some_and(|vfs| vfs.upgrade().is_none());
 }
@@ -1198,8 +1238,9 @@ impl PreparedMount {
             return result;
         }
 
-        self.write_pid_file()?;
-        self.print_ready()?;
+        if let Err(error) = self.write_pid_file().and_then(|()| self.print_ready()) {
+            return self.teardown_before_serve(error);
+        }
         self.launch_foreground()
     }
 
@@ -1252,12 +1293,55 @@ impl PreparedMount {
     }
 
     fn launch_foreground(mut self) -> anyhow::Result<()> {
-        let format_info = self.format_info.as_ref().context(
-            "foreground mount session is missing format metadata before foreground launch",
-        )?;
+        let format_info = match self.format_info.as_ref() {
+            Some(format_info) => format_info,
+            None => {
+                return self.teardown_before_serve(anyhow::anyhow!(
+                    "foreground mount session is missing format metadata before foreground launch"
+                ));
+            }
+        };
         let prepared = self.foreground.take().context(
             "foreground mount session is missing prepared runtime before foreground launch",
         )?;
+        let backend_name = prepared.backend.name();
+        debug!(
+            backend = backend_name,
+            mount_point = %self.plan.actual_mount_path,
+            "starting mount backend"
+        );
+        let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
+            prepared.runtime.handle(),
+            &self.plan.actual_mount_path,
+            prepared.diagnostics_source.clone(),
+            prepared.profiling_backend.clone(),
+        );
+        let serve_result = prepared.backend.serve(BackendLaunch {
+            vfs: prepared.vfs.clone(),
+            runtime_handle: prepared.runtime.handle().clone(),
+            mount_point: self.plan.actual_mount_path.clone(),
+            volume_name: format_info.name.clone(),
+            read_only: self.plan.read_only_mount,
+            #[cfg(all(unix, not(target_os = "linux")))]
+            run_in_foreground: self.plan.run_in_foreground,
+        });
+        let result = serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"));
+        self.teardown_foreground(prepared, diagnostics_host, result)
+    }
+
+    fn teardown_before_serve(mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        let prepared = self.foreground.take().context(
+            "foreground mount session is missing prepared runtime during failed launch teardown",
+        )?;
+        self.teardown_foreground(prepared, None, Err(error))
+    }
+
+    fn teardown_foreground(
+        mut self,
+        prepared: PreparedForegroundRuntime,
+        diagnostics_host: Option<LocalDiagnosticsHost>,
+        result: anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let PreparedForegroundRuntime {
             cache_path: _,
             cache_path_str: _,
@@ -1271,35 +1355,28 @@ impl PreparedMount {
             #[cfg(target_os = "linux")]
             memory_pressure_sampler,
         } = prepared;
-        let backend_name = backend.name();
-        debug!(
-            backend = backend_name,
-            mount_point = %self.plan.actual_mount_path,
-            "starting mount backend"
-        );
-        let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
-            runtime.handle(),
-            &self.plan.actual_mount_path,
-            diagnostics_source.clone(),
-            profiling_backend.clone(),
-        );
-        let serve_result = backend.serve(BackendLaunch {
-            vfs: vfs.clone(),
-            runtime_handle: runtime.handle().clone(),
-            mount_point: self.plan.actual_mount_path.clone(),
-            volume_name: format_info.name.clone(),
-            read_only: self.plan.read_only_mount,
-            #[cfg(all(unix, not(target_os = "linux")))]
-            run_in_foreground: self.plan.run_in_foreground,
-        });
+        let mut first_error = result.err();
+        let mut record_error = |result: anyhow::Result<()>| {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        };
+
         write_path_observability_publisher.stop_and_join();
         let upload_drain_timeout = shutdown_upload_drain_timeout();
         let runtime_shutdown_timeout = runtime_shutdown_timeout();
         #[cfg(target_os = "linux")]
-        stop_memory_pressure_sampler(&runtime, memory_pressure_sampler)?;
-        let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
+        {
+            let sampler_result = stop_memory_pressure_sampler(&runtime, memory_pressure_sampler);
+            #[cfg(test)]
+            record_shutdown_event_for_test("sampler");
+            record_error(sampler_result);
+        }
+        record_error(run_mount_vfs_shutdown(&runtime, vfs, upload_drain_timeout));
         if let Some(diagnostics_host) = diagnostics_host {
-            stop_mount_diagnostics_host(&runtime, diagnostics_host)?;
+            record_error(stop_mount_diagnostics_host(&runtime, diagnostics_host));
         }
         if let Some(mut finish_profiling) = profiling.take() {
             finish_profiling();
@@ -1315,10 +1392,9 @@ impl PreparedMount {
         let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
         drop(self.mount_lock.take());
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
-        shutdown_mount_runtime(runtime, runtime_shutdown_timeout)?;
+        record_error(shutdown_mount_runtime(runtime, runtime_shutdown_timeout));
 
-        serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1873,6 +1949,13 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn shutdown_lifecycle_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock shutdown lifecycle test")
     }
 
     fn seed_mount_meta_db(
@@ -2434,6 +2517,7 @@ mod tests {
 
     #[test]
     fn foreground_shutdown_releases_vfs_handles_before_runtime_shutdown() {
+        let _guard = shutdown_lifecycle_test_guard();
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
         drop(seed_engine);
@@ -2479,6 +2563,85 @@ mod tests {
         );
         RedbMetaEngine::read_format_info_readonly(meta_dir.join("demo.db"))
             .expect("clean shutdown leaves redb readable by read-only format probe");
+    }
+
+    #[test]
+    fn failed_ready_stage_still_shuts_down_vfs_before_runtime() {
+        let _guard = shutdown_lifecycle_test_guard();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(seed_engine);
+        let mount_point = startup_mount_point(&temp);
+        let settings_config = startup_settings_config(mount_point.to_string(), None, Some("64MB"));
+        let command = mount_command(
+            "demo",
+            &meta_dir,
+            Some(mount_point.to_string()),
+            None,
+            Some("64MB"),
+        );
+        let mut session =
+            MountSession::prepare_with_backend_factory(command, settings_config, || {
+                Box::new(FakeBackend {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    fail: false,
+                    inspect: None,
+                })
+            })
+            .expect("prepare foreground mount");
+        let foreground = session.prepared.foreground.as_ref().expect("foreground");
+        observe_runtime_shutdown_vfs_for_test(&foreground.vfs);
+        let observed_vfs = Arc::downgrade(&foreground.vfs);
+        session.prepared.format_info = None;
+
+        let error = session.launch().expect_err("ready stage must fail");
+
+        assert!(error.to_string().contains("missing format metadata"));
+        assert!(runtime_shutdown_observed_vfs_was_released_for_test());
+        assert!(observed_vfs.upgrade().is_none());
+        #[cfg(target_os = "linux")]
+        assert_eq!(shutdown_events_for_test(), ["sampler", "vfs", "runtime"]);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(shutdown_events_for_test(), ["vfs", "runtime"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampler_join_error_does_not_skip_vfs_or_runtime_shutdown() {
+        let _guard = shutdown_lifecycle_test_guard();
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(seed_engine);
+        let mount_point = startup_mount_point(&temp);
+        let settings_config = startup_settings_config(mount_point.to_string(), None, Some("64MB"));
+        let command = mount_command(
+            "demo",
+            &meta_dir,
+            Some(mount_point.to_string()),
+            None,
+            Some("64MB"),
+        );
+        let session = MountSession::prepare_with_backend_factory(command, settings_config, || {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare foreground mount");
+        let foreground = session.prepared.foreground.as_ref().expect("foreground");
+        observe_runtime_shutdown_vfs_for_test(&foreground.vfs);
+        let observed_vfs = Arc::downgrade(&foreground.vfs);
+        foreground.memory_pressure_sampler.abort_for_test();
+
+        let error = session
+            .launch()
+            .expect_err("aborted sampler join must fail");
+
+        assert!(error.to_string().contains("sampler task failed"));
+        assert!(runtime_shutdown_observed_vfs_was_released_for_test());
+        assert!(observed_vfs.upgrade().is_none());
+        assert_eq!(shutdown_events_for_test(), ["sampler", "vfs", "runtime"]);
     }
 
     #[test]
