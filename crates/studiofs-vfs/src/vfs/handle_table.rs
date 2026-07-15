@@ -171,6 +171,22 @@ impl HandleTable {
         self.orphans.lock().insert(ino);
     }
 
+    /// Mark an inode as orphan only while at least one handle remains open.
+    /// Returns whether final cleanup belongs to the last-handle release path.
+    pub(super) fn mark_orphan_if_open(&self, ino: Ino) -> bool {
+        // Keep handles locked through marker insertion so this serializes with open() and close().
+        let handles = self.handles.read();
+        let is_open = handles
+            .handles_by_inode
+            .get(&ino)
+            .is_some_and(|handles| !handles.is_empty());
+        if is_open {
+            self.orphans.lock().insert(ino);
+        }
+        drop(handles);
+        is_open
+    }
+
     /// Check if inode is an orphan and remove the mark. Returns true if it was.
     ///
     /// This is transient last-handle release routing, not durable cleanup-retry
@@ -265,5 +281,47 @@ mod tests {
 
         assert!(ht.take_orphan(42));
         assert!(!ht.take_orphan(42));
+    }
+
+    #[test]
+    fn mark_orphan_if_open_before_last_close_routes_cleanup_to_release() {
+        let ht = HandleTable::new();
+        let fh = ht.open(42, OpenFlags::RDWR, None, true);
+
+        assert!(ht.mark_orphan_if_open(42));
+        assert_eq!(ht.close(fh.fh).unwrap().1, 0);
+
+        assert!(ht.take_orphan(42));
+    }
+
+    #[test]
+    fn mark_orphan_if_open_after_last_close_leaves_cleanup_to_caller() {
+        let ht = HandleTable::new();
+        let fh = ht.open(42, OpenFlags::RDWR, None, true);
+        assert_eq!(ht.close(fh.fh).unwrap().1, 0);
+
+        assert!(!ht.mark_orphan_if_open(42));
+
+        assert!(!ht.take_orphan(42));
+    }
+
+    #[test]
+    fn mark_orphan_if_open_sees_handle_before_count_registration() {
+        let ht = HandleTable::new();
+        let open_file = OpenFile::new(1, 42, OpenFlags::RDWR, None, true);
+        {
+            let mut handles = ht.handles.write();
+            handles.handles.insert(open_file.fh, open_file.clone());
+            handles
+                .handles_by_inode
+                .entry(open_file.ino)
+                .or_default()
+                .insert(open_file.fh);
+        }
+        assert_eq!(ht.open_count(42), 0);
+
+        assert!(ht.mark_orphan_if_open(42));
+
+        assert!(ht.take_orphan(42));
     }
 }

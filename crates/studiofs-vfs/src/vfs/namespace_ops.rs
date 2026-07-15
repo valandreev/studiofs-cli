@@ -2435,13 +2435,11 @@ impl StudioVfs {
                 Ok(_) => {}
                 Err(MetaError::InodeNotFound(found)) if found == ino => {
                     self.retire_os_cache_inode(ino);
-                    let open_handles = self.handle_table.open_count(ino);
-                    if open_handles > 0 {
-                        self.mark_inode_deleted_for_uploads(ino);
-                        self.handle_table.mark_orphan(ino);
+                    self.mark_inode_deleted_for_uploads(ino);
+                    if self.handle_table.mark_orphan_if_open(ino) {
                         debug!(
                             displaced_ino = ino,
-                            open_handles, "VFS rename deferred open displaced target cleanup"
+                            "VFS rename deferred open displaced target cleanup"
                         );
                     } else {
                         debug!(
