@@ -20,6 +20,7 @@ studiofs-vfs.workspace = true
 
 clap.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -73,6 +74,7 @@ studiofs-linux-fuse.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full"] }
 studiofs-test-support.workspace = true

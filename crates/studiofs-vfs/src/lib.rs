@@ -71,5 +71,6 @@ pub use vfs::{
     VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
-    is_hidden_platform_root_metadata_name, read_runtime_stats_buffer,
+    derive_memory_pressure_configured_limits, is_hidden_platform_root_metadata_name,
+    read_runtime_stats_buffer,
 };

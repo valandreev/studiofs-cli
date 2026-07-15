@@ -1,6 +1,8 @@
 //! `studiofs mount` — mount a filesystem volume.
 
 mod backend;
+#[cfg(target_os = "linux")]
+mod memory_pressure;
 mod session;
 
 use clap::Args;

@@ -1518,6 +1518,28 @@ fn resolve_cache_runtime_tuning_overrides(
     }
 }
 
+/// Resolve the component ceilings used by the runtime memory-pressure model.
+#[must_use]
+pub fn derive_memory_pressure_configured_limits(
+    cache_size: u64,
+    block_size: u32,
+    memory_cache_budget_bytes: u64,
+    config: &VfsConfigValidated,
+    async_write_bytes: u64,
+) -> crate::memory_pressure::MemoryComponentLimits {
+    let tuning = resolve_cache_runtime_tuning_overrides(
+        derive_cache_runtime_tuning(cache_size, block_size, memory_cache_budget_bytes),
+        config,
+        config.cache_runtime_overrides(),
+    );
+    crate::memory_pressure::MemoryComponentLimits {
+        memory_cache_bytes: memory_cache_budget_bytes,
+        dirty_bytes: tuning.max_dirty_bytes as u64,
+        transit_bytes: tuning.transit_memory_budget_bytes as u64,
+        async_write_bytes,
+    }
+}
+
 fn derive_upload_cache_io_foreground_cost_base(upload_cache_io_slots: usize) -> u32 {
     let slots = upload_cache_io_slots.clamp(1, u32::MAX as usize) as u32;
     slots

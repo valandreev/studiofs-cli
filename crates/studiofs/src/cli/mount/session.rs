@@ -2,6 +2,11 @@
 
 use super::MountCommand;
 use super::backend::{BackendLaunch, MountBackend, default_mount_backend};
+#[cfg(target_os = "linux")]
+use super::memory_pressure::{
+    LinuxMemoryPressureProbe, MemoryPressureProbe, MemoryPressureSampler,
+    initialize_memory_pressure, stop_memory_pressure_sampler,
+};
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::runtime_tuning::PublicRuntimeTuningArgs;
 use crate::cli::{mount_profile, mount_profile_types, settings, utils};
@@ -30,6 +35,8 @@ use studiofs_meta::{
 };
 #[cfg(test)]
 use studiofs_vfs::VfsConfig;
+#[cfg(target_os = "linux")]
+use studiofs_vfs::{MemoryPressureModel, derive_memory_pressure_configured_limits};
 use studiofs_vfs::{
     StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsMeta, into_vfs_meta, parse_size_bytes,
 };
@@ -42,6 +49,10 @@ const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
     "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
+#[cfg(target_os = "linux")]
+const LINUX_ASYNC_WRITE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_NEGOTIATED_MAX_WRITE_FALLBACK_BYTES: u64 = 1024 * 1024;
 type MountProfileFinish = Box<dyn FnMut()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +119,8 @@ struct PreparedForegroundRuntime {
     profiling_backend: Arc<dyn RuntimeProfilingBackend>,
     profiling: Option<MountProfileFinish>,
     write_path_observability_publisher: WritePathObservabilityPublisher,
+    #[cfg(target_os = "linux")]
+    memory_pressure_sampler: MemoryPressureSampler,
 }
 
 trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
@@ -1049,6 +1062,25 @@ impl MountPlan {
                 cache_runtime,
             } = prepare_volume_cache_runtime(&self.base_cache_path, &format_info.uuid)?;
             let cache_size_bytes = parse_positive_size_arg(&self.cache_size)?;
+            #[cfg(target_os = "linux")]
+            let (memory_pressure, memory_pressure_model, memory_pressure_probe) = {
+                let configured = derive_memory_pressure_configured_limits(
+                    cache_size_bytes,
+                    format_info.block_size,
+                    memory_cache_budget_bytes,
+                    &self.vfs_config,
+                    LINUX_ASYNC_WRITE_CEILING_BYTES,
+                );
+                let model = MemoryPressureModel::new(
+                    configured,
+                    u64::from(format_info.block_size),
+                    LINUX_NEGOTIATED_MAX_WRITE_FALLBACK_BYTES,
+                );
+                let probe: Arc<dyn MemoryPressureProbe> =
+                    Arc::new(LinuxMemoryPressureProbe::system());
+                let (controller, model) = initialize_memory_pressure(probe.as_ref(), model);
+                (controller, model, probe)
+            };
             let profiling = build_mount_profile_finish(
                 self.command.profile,
                 &self.command.name,
@@ -1072,6 +1104,7 @@ impl MountPlan {
                 vfs_config: serde_json::to_value(self.vfs_config.as_ref())
                     .map_err(|error| anyhow::anyhow!("failed to serialize vfs config: {error}"))?,
             };
+            #[cfg(not(target_os = "linux"))]
             let vfs = StudioVfs::new_with_prepared_cache_runtime(
                 meta,
                 &data_config,
@@ -1082,9 +1115,31 @@ impl MountPlan {
                 cache_runtime,
             )
             .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
+            #[cfg(target_os = "linux")]
+            let vfs = StudioVfs::new_with_prepared_cache_runtime_and_memory_pressure(
+                meta,
+                &data_config,
+                &cache_path_str,
+                cache_size_bytes,
+                memory_cache_budget_bytes,
+                self.vfs_config.clone(),
+                cache_runtime,
+                memory_pressure.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
             vfs.start().map_err(|error| {
                 anyhow::anyhow!("failed to start vfs background workers: {error}")
             })?;
+            #[cfg(target_os = "linux")]
+            let memory_pressure_sampler = {
+                let vfs = vfs.clone();
+                MemoryPressureSampler::spawn(
+                    memory_pressure_probe,
+                    memory_pressure_model,
+                    memory_pressure,
+                    Arc::new(move || vfs.admitted_managed_bytes()),
+                )
+            };
             let write_path_observability_publisher = WritePathObservabilityPublisher::new(
                 vfs.clone(),
                 cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
@@ -1110,6 +1165,8 @@ impl MountPlan {
                 profiling_backend,
                 profiling,
                 write_path_observability_publisher,
+                #[cfg(target_os = "linux")]
+                memory_pressure_sampler,
             })
         })();
 
@@ -1211,6 +1268,8 @@ impl PreparedMount {
             profiling_backend,
             mut profiling,
             mut write_path_observability_publisher,
+            #[cfg(target_os = "linux")]
+            memory_pressure_sampler,
         } = prepared;
         let backend_name = backend.name();
         debug!(
@@ -1236,6 +1295,8 @@ impl PreparedMount {
         write_path_observability_publisher.stop_and_join();
         let upload_drain_timeout = shutdown_upload_drain_timeout();
         let runtime_shutdown_timeout = runtime_shutdown_timeout();
+        #[cfg(target_os = "linux")]
+        stop_memory_pressure_sampler(&runtime, memory_pressure_sampler)?;
         let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
         if let Some(diagnostics_host) = diagnostics_host {
             stop_mount_diagnostics_host(&runtime, diagnostics_host)?;

@@ -423,6 +423,35 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
 }
 
 #[test]
+fn configured_memory_pressure_limits_reuse_resolved_cache_tuning() {
+    let config = VfsConfigValidated::try_from(VfsConfig::default()).expect("valid config");
+    let limits = derive_memory_pressure_configured_limits(
+        100 * 1024 * 1024 * 1024,
+        16 * 1024 * 1024,
+        2 * 1024 * 1024 * 1024,
+        &config,
+        256 * 1024 * 1024,
+    );
+
+    let tuning = resolve_cache_runtime_tuning_overrides(
+        derive_cache_runtime_tuning(
+            100 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+        ),
+        &config,
+        config.cache_runtime_overrides(),
+    );
+    assert_eq!(limits.memory_cache_bytes, 2 * 1024 * 1024 * 1024);
+    assert_eq!(limits.dirty_bytes, tuning.max_dirty_bytes as u64);
+    assert_eq!(
+        limits.transit_bytes,
+        tuning.transit_memory_budget_bytes as u64
+    );
+    assert_eq!(limits.async_write_bytes, 256 * 1024 * 1024);
+}
+
+#[test]
 fn memory_pressure_cache_shrink_reclaims_hot_entries_before_snapshot() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-cache-shrink");
