@@ -196,7 +196,9 @@ impl MemoryPressureModel {
             MemoryPressureState::Normal
         };
         let transition_count = self.previous.map_or(0, |previous| {
-            previous.transition_count + u64::from(previous.state != state)
+            previous
+                .transition_count
+                .saturating_add(u64::from(previous.state != state))
         });
         let sampling_failure_count = self
             .previous
@@ -421,6 +423,28 @@ mod tests {
 
         assert_eq!(snapshot.state, MemoryPressureState::Normal);
         assert_eq!(snapshot.transition_count, 1);
+    }
+
+    #[test]
+    fn state_transition_saturates_transition_count() {
+        let mut model = model();
+        model.previous = Some(MemoryPressureSnapshot {
+            source: MemoryPressureSource::Host,
+            state: MemoryPressureState::Normal,
+            generation: 1,
+            effective_limit_bytes: gib(8),
+            available_bytes: gib(8),
+            reserve_bytes: gib(1),
+            envelope_bytes: gib(1),
+            limits: ceilings(),
+            transition_count: u64::MAX,
+            sampling_failure_count: 0,
+            overcommitted_minimum: false,
+        });
+
+        let snapshot = model.observe(Ok(input(gib(8), 0)), 0);
+
+        assert_eq!(snapshot.transition_count, u64::MAX);
     }
 
     #[test]
