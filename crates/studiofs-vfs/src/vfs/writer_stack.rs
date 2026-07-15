@@ -229,6 +229,7 @@ pub(super) struct MountedWriterStack {
     handle_shards: Box<[Mutex<HandleShard>]>,
     next_seq: AtomicU64,
     dirty_bytes: AtomicUsize,
+    dirty_reduced: tokio::sync::Notify,
 }
 
 #[allow(dead_code)]
@@ -247,6 +248,7 @@ impl MountedWriterStack {
                 .collect(),
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
+            dirty_reduced: tokio::sync::Notify::new(),
         }
     }
 
@@ -1121,12 +1123,23 @@ impl MountedWriterStack {
         self.dirty_bytes.load(Ordering::Acquire)
     }
 
+    pub(super) fn dirty_reduced(&self) -> tokio::sync::futures::Notified<'_> {
+        self.dirty_reduced.notified()
+    }
+
     fn subtract_dirty(&self, amount: usize) {
-        let _ = self
+        if amount == 0 {
+            return;
+        }
+        let reduced = self
             .dirty_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(amount))
-            });
+            })
+            .is_ok();
+        if reduced {
+            self.dirty_reduced.notify_waiters();
+        }
     }
 
     fn persist_detached_finished_slices(

@@ -573,6 +573,13 @@ impl CachedStore {
         self.upload_hot.lock().total_bytes
     }
 
+    /// Applies a runtime hot-upload limit without exceeding the configured ceiling.
+    pub fn set_hot_upload_budget_bytes(&self, limit_bytes: usize) {
+        let mut upload_hot = self.upload_hot.lock();
+        upload_hot.budget_bytes = self.config.upload_hot_bytes.min(limit_bytes);
+        upload_hot.evict_over_budget();
+    }
+
     /// Returns whether the local payload backend currently contains this object.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.contains(object_id)
@@ -2522,6 +2529,100 @@ mod tests {
         }]);
 
         assert_eq!(cached_store.hot_upload_resident_bytes(), 4);
+    }
+
+    #[test]
+    fn hot_upload_budget_shrink_evicts_oldest_entries() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(8),
+            backend,
+        )
+        .expect("open cached store");
+        cached_store.cache_hot_upload_batch(&[
+            LocalPayloadPut {
+                object_id: 1,
+                data: Bytes::from_static(b"aaaa"),
+                evictable: false,
+            },
+            LocalPayloadPut {
+                object_id: 2,
+                data: Bytes::from_static(b"bbbb"),
+                evictable: false,
+            },
+        ]);
+
+        cached_store.set_hot_upload_budget_bytes(4);
+        cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
+            object_id: 3,
+            data: Bytes::from_static(b"cccc"),
+            evictable: false,
+        }]);
+
+        assert!(cached_store.get_hot_upload(1).is_none());
+        assert!(cached_store.get_hot_upload(2).is_none());
+        assert_eq!(
+            cached_store.get_hot_upload(3).as_deref(),
+            Some(&b"cccc"[..])
+        );
+    }
+
+    #[test]
+    fn hot_upload_budget_recovery_does_not_exceed_configured_ceiling() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(4),
+            backend,
+        )
+        .expect("open cached store");
+
+        cached_store.set_hot_upload_budget_bytes(8);
+        cached_store.cache_hot_upload_batch(&[
+            LocalPayloadPut {
+                object_id: 1,
+                data: Bytes::from_static(b"aaaa"),
+                evictable: false,
+            },
+            LocalPayloadPut {
+                object_id: 2,
+                data: Bytes::from_static(b"bbbb"),
+                evictable: false,
+            },
+        ]);
+
+        assert_eq!(cached_store.hot_upload_resident_bytes(), 4);
+    }
+
+    #[test]
+    fn hot_upload_budget_shrink_does_not_invalidate_in_use_payload() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(4),
+            backend,
+        )
+        .expect("open cached store");
+        cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
+            object_id: 1,
+            data: Bytes::from_static(b"aaaa"),
+            evictable: false,
+        }]);
+        let in_use = cached_store.get_hot_upload(1).expect("hot payload");
+
+        cached_store.set_hot_upload_budget_bytes(0);
+
+        assert_eq!(in_use.as_ref(), b"aaaa");
     }
 
     #[test]

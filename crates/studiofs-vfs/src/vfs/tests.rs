@@ -356,7 +356,16 @@ fn memory_pressure_publish_clamps_transit_admission_without_revoking_guard() {
         controller.publish(constrained_memory_snapshot(u64::MAX, 1024));
 
         assert_eq!(transit.snapshot().used_bytes, 4096);
+        let waiting_transit = transit.clone();
+        let mut waiting =
+            tokio::spawn(async move { waiting_transit.acquire_foreground(2048).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
         drop(admitted);
+        let _next = tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .expect("post-shrink admission should wake after the old guard releases")
+            .expect("transit admission task should not panic");
         assert_eq!(transit.budget_bytes(), 1024);
     });
 }
@@ -372,6 +381,28 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
         make_unstarted_test_vfs_with_config(&tmp, "memory-pressure-admitted-bytes", config);
     let transit = vfs.transit_memory_budget().clone();
     rt.block_on(async {
+        vfs.cached_store()
+            .cache_hot_upload_batch(&[studiofs_cache::local::LocalPayloadPut {
+                object_id: 1,
+                data: Bytes::from_static(b"hot!"),
+                evictable: false,
+            }]);
+        let attr = vfs.create(1, b"accounted.bin", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from_static(b"dirty123"),
+            )
+            .unwrap();
         let _guard = transit.acquire_foreground(4096).await;
         vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
@@ -379,7 +410,116 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
             ..VfsFuseAsyncWriteSnapshot::default()
         });
 
-        assert_eq!(vfs.admitted_managed_bytes(), 6144);
+        assert_eq!(vfs.admitted_managed_bytes(), 6156);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+    });
+}
+
+#[test]
+fn memory_pressure_cache_shrink_reclaims_hot_entries_before_snapshot() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-cache-shrink");
+    vfs.cached_store().cache_hot_upload_batch(&[
+        studiofs_cache::local::LocalPayloadPut {
+            object_id: 1,
+            data: Bytes::from_static(b"aaaa"),
+            evictable: false,
+        },
+        studiofs_cache::local::LocalPayloadPut {
+            object_id: 2,
+            data: Bytes::from_static(b"bbbb"),
+            evictable: false,
+        },
+    ]);
+    let mut snapshot = constrained_memory_snapshot(u64::MAX, u64::MAX);
+    snapshot.limits.memory_cache_bytes = 4;
+    vfs.memory_pressure_controller().publish(snapshot);
+
+    let admitted = vfs.admitted_managed_bytes();
+
+    assert_eq!(admitted, 4);
+    assert!(vfs.cached_store().get_hot_upload(1).is_none());
+}
+
+#[test]
+fn memory_pressure_already_admitted_dirty_bytes_survive_shrink() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-admitted-dirty");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(1, b"admitted.bin", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from_static(b"already-admitted"),
+            )
+            .unwrap();
+
+        vfs.memory_pressure_controller()
+            .publish(constrained_memory_snapshot(1, u64::MAX));
+
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino), 16);
+        let completed = vfs
+            .state
+            .writer_stack
+            .finish_inode(attr.ino)
+            .expect("already-admitted write should finish after shrink");
+        assert!(!completed.is_empty());
+    });
+}
+
+#[test]
+fn memory_pressure_dirty_admission_wakes_on_drain_without_timer_polling() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-dirty-notify");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(1, b"notify.bin", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![
+                    0xAB;
+                    vfs.block_size as usize
+                        * HARD_BACKPRESSURE_DIRTY_MULTIPLIER
+                        + 1
+                ]),
+            )
+            .unwrap();
+        vfs.memory_pressure_controller()
+            .publish(constrained_memory_snapshot(1, u64::MAX));
+
+        let admission_vfs = Arc::clone(&vfs);
+        let mut admission = tokio::spawn(async move {
+            admission_vfs.maybe_throttle_write_admission(1, 0).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!admission.is_finished());
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+
+        tokio::time::timeout(Duration::from_millis(100), &mut admission)
+            .await
+            .expect("dirty reduction notification should wake admission")
+            .expect("admission task should not panic");
     });
 }
 

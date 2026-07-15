@@ -3704,6 +3704,7 @@ impl StudioVfs {
 
     /// Snapshot cache runtime state for diagnostics and API consumers.
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
+        self.apply_memory_pressure_snapshot();
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
         let transit = self.transit_memory_budget.snapshot();
@@ -6436,7 +6437,7 @@ impl StudioVfs {
     /// Current dirty-buffer memory limit.
     pub fn max_dirty_bytes(&self) -> usize {
         let configured = self.max_dirty_bytes.load(Ordering::Acquire);
-        let snapshot = self.memory_pressure.snapshot();
+        let snapshot = self.apply_memory_pressure_snapshot();
         if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
             configured
         } else {
@@ -6454,8 +6455,22 @@ impl StudioVfs {
         &self.memory_pressure
     }
 
+    fn apply_memory_pressure_snapshot(&self) -> crate::memory_pressure::MemoryPressureSnapshot {
+        let snapshot = self.memory_pressure.snapshot();
+        let memory_cache_limit =
+            if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
+                usize::MAX
+            } else {
+                usize::try_from(snapshot.limits.memory_cache_bytes).unwrap_or(usize::MAX)
+            };
+        self.cached_store
+            .set_hot_upload_budget_bytes(memory_cache_limit);
+        snapshot
+    }
+
     /// Total bytes currently admitted across VFS-owned managed-memory gauges.
     pub fn admitted_managed_bytes(&self) -> u64 {
+        self.apply_memory_pressure_snapshot();
         let memory_cache = self.cached_store.hot_upload_resident_bytes() as u64;
         let dirty = self.total_pending_write_buffer_bytes() as u64;
         let transit = self.transit_memory_budget.snapshot().used_bytes as u64;
@@ -6791,14 +6806,17 @@ impl StudioVfs {
         }
 
         let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let pressure = self.write_admission_pressure();
-        let mut pressure_bytes = pressure.total_bytes();
-
         let hard_window_bytes =
             buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
-        let mut writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
         let mut hard_wait_started = None;
-        while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
+        let pressure = loop {
+            let dirty_reduced = self.state.writer_stack.dirty_reduced();
+            let pressure = self.write_admission_pressure();
+            let writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
+            if writer_stack_pressure_bytes <= hard_window_bytes || self.shutdown_requested() {
+                break pressure;
+            }
             hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
             if self.write_debug_enabled() {
@@ -6809,7 +6827,7 @@ impl StudioVfs {
                     serde_json::json!({
                         "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
                         "writer_stack_dirty_bytes": writer_stack_pressure_bytes,
-                        "pressure_bytes": pressure_bytes,
+                        "pressure_bytes": pressure.total_bytes(),
                         "pending_upload_bytes": pressure.pending_upload_bytes,
                         "buffer_budget_bytes": buffer_budget_bytes,
                         "hard_window_bytes": hard_window_bytes,
@@ -6819,11 +6837,12 @@ impl StudioVfs {
             }
             // #endregion debug log
 
-            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
-            let pressure = self.write_admission_pressure();
-            pressure_bytes = pressure.total_bytes();
-            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
-        }
+            tokio::select! {
+                _ = dirty_reduced => {}
+                _ = shutdown.cancelled() => break pressure,
+            }
+        };
+        let pressure_bytes = pressure.total_bytes();
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
             self.state.write_admission_governor.lock().reset_stats();
