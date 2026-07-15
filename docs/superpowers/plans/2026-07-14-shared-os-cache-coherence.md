@@ -48,6 +48,8 @@ Execute this plan after `2026-07-14-linux-fuse-async-write-correctness.md`, beca
 - Modify: `crates/studiofs-vfs/src/vfs/sync_ops.rs` — finish lifecycle after local release work on every path.
 - Modify: `crates/studiofs-vfs/src/vfs/namespace_ops.rs` — retire generation state only after final unlink or final rename displacement.
 - Modify: `crates/studiofs-vfs/src/vfs/workers.rs` — clear shared generation before full invalidation callback.
+- Modify: `crates/studiofs-meta/src/redb_engine/fs_ops.rs` — avoid deferred-delete state when unlinking an open inode that still has another hardlink.
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/fs_ops.rs` — cover open-handle unlink with a surviving hardlink.
 - Modify: `crates/studiofs-vfs/src/vfs/metrics.rs` — platform-neutral OS-cache counters and legacy decode compatibility.
 - Modify: `crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs` — export active writer/foreground cache-lifecycle gauges.
 - Modify: `crates/studiofs-vfs/src/vfs/tests.rs` — lifecycle, release, invalidation, and Windows-neutral regression tests.
@@ -576,16 +578,26 @@ Add tests:
 
 ```rust
 full_kernel_invalidation_clears_generation_before_callback
+full_kernel_invalidation_deduplicates_and_clears_all_before_first_callback
 full_invalidation_clears_generation_without_platform_invalidator
+full_kernel_invalidation_clears_generation_when_callback_is_suppressed_for_active_open
 invalidation_callback_can_reenter_generation_observation
 attribute_only_invalidation_preserves_generation
-final_unlink_retires_os_cache_generation
-unlink_of_one_hardlink_preserves_os_cache_generation
-rename_overwrite_retires_only_a_removed_target_inode
-rename_overwrite_of_one_hardlink_preserves_os_cache_generation
+os_cache_generation_retirement_final_unlink_without_open_handles_clears_generation
+os_cache_generation_retirement_final_unlink_with_open_handles_clears_before_last_close
+os_cache_generation_retirement_unlink_one_hardlink_without_open_handles_preserves_generation
+os_cache_generation_retirement_unlink_one_hardlink_with_open_handles_preserves_generation_and_payload_after_release
+os_cache_generation_retirement_rename_overwrite_final_target_clears_only_target
+os_cache_generation_retirement_rename_overwrite_surviving_hardlink_preserves_generation_and_payload
+os_cache_generation_retirement_rename_overwrite_open_final_target_defers_cleanup_until_release
+unlink_open_handle_with_remaining_hardlink_does_not_record_deferred_delete
 ```
 
-The re-entrant mock invalidator must call back into a VFS cache observation and complete within one second.
+The re-entrant mock invalidator must use a fresh unprepared read handle (preferably
+for the second of two invalidated inodes) so it really enters
+`OsCacheState::observe`. Run invalidation on a spawned thread and require a
+channel result within one second so a lock-order regression fails boundedly
+instead of hanging the suite.
 
 - [ ] **Step 2: Verify RED**
 
@@ -595,6 +607,7 @@ Run:
 cargo test -p studiofs-vfs full_kernel_invalidation_ -- --nocapture
 cargo test -p studiofs-vfs attribute_only_invalidation_preserves_generation -- --nocapture
 cargo test -p studiofs-vfs os_cache_generation_retirement -- --nocapture
+cargo test -p studiofs-meta unlink_open_handle_with_remaining_hardlink_ -- --nocapture
 ```
 
 Expected: generation remains reusable after a full invalidation or ordering assertion fails.
@@ -603,20 +616,33 @@ Expected: generation remains reusable after a full invalidation or ordering asse
 
 Expose a crate-private `retire_os_cache_inode(ino)` that removes the shared generation without calling platform code. Call it from `namespace_ops.rs` as soon as successful metadata mutation confirms that the inode itself, not merely one pathname, is gone:
 
-- both open-handle and no-open-handle unlink paths only when returned `attr.nlink == 0`;
-- rename-overwrite only when a post-`rename_atomic` `get_attr(displaced_ino)` confirms the displaced inode no longer exists;
+- both open-handle and no-open-handle unlink paths only when returned
+  `attr.nlink == 0`; when an open unlink changes `nlink` from two to one, the
+  redb namespace operation must not create a deferred-delete record and VFS
+  must not mark the inode deleted/orphaned;
+- rename-overwrite only when a post-`rename_atomic`
+  `get_attr(displaced_ino)` returns exactly
+  `Err(MetaError::InodeNotFound(found)) if found == displaced_ino`; `Ok(attr)`
+  means a hardlink survives and the whole deleted-inode graph/accounting
+  cleanup branch, not only cache retirement, is skipped;
 - never for a remaining hardlink, the moved source inode, an ordinary rename, or a failed namespace mutation.
 
-Clear before deferred storage cleanup so a cleanup error after committed metadata cannot leave a reusable observation for a retired inode. Direct adapter calls must not own this rule; macFUSE and Linux receive the same VFS behavior.
+For a confirmed displaced inode with open handles, mark it orphaned and defer
+payload cleanup to the final release, but clear its generation immediately.
+Clear before deferred storage cleanup so a cleanup error after committed
+metadata cannot leave a reusable observation for a retired inode. Direct
+adapter calls must not own this rule; macFUSE and Linux receive the same VFS
+behavior. Hardlink-preservation tests must release every handle and then prove
+the remaining pathname's exact payload as well as StableGeneration reuse.
 
 - [ ] **Step 4: Change full invalidation ordering**
 
 In `invalidate_kernel_inodes`/the full-data invalidation helper in `workers.rs`:
 
-1. normalize and deduplicate eligible inodes;
-2. clear each shared OS-cache generation, even if no external invalidator is installed;
+1. normalize and deduplicate every input inode before callback eligibility is considered;
+2. clear each unique shared OS-cache generation, even if no external invalidator is installed or `should_skip_kernel_invalidation_for_active_open` later suppresses its callback;
 3. release all OS-cache locks;
-4. call `KernelInvalidator::inval_inode`.
+4. obtain the invalidator and call `KernelInvalidator::inval_inode` only for non-skipped inodes.
 
 Do not clear generations from `invalidate_kernel_inode_attrs`; attribute-only invalidation must keep page identity.
 
@@ -629,6 +655,7 @@ cargo test -p studiofs-vfs full_kernel_invalidation_ -- --nocapture
 cargo test -p studiofs-vfs invalidation_callback_can_reenter_generation_observation -- --nocapture
 cargo test -p studiofs-vfs attribute_only_invalidation_preserves_generation -- --nocapture
 cargo test -p studiofs-vfs os_cache_generation_retirement -- --nocapture
+cargo test -p studiofs-meta unlink_open_handle_with_remaining_hardlink_ -- --nocapture
 ```
 
 Expected: all pass without deadlock.
@@ -636,7 +663,7 @@ Expected: all pass without deadlock.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/studiofs-vfs/src/vfs/namespace_ops.rs crates/studiofs-vfs/src/vfs/workers.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs/tests.rs
+git add crates/studiofs-meta/src/redb_engine/fs_ops.rs crates/studiofs-meta/src/redb_engine/tests/fs_ops.rs crates/studiofs-vfs/src/vfs/namespace_ops.rs crates/studiofs-vfs/src/vfs/workers.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs/tests.rs
 git commit -m "fix(vfs): retire os cache generations at shared seams"
 ```
 
