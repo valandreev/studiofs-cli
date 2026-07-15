@@ -768,7 +768,20 @@ git commit -m "feat(vfs): report shared os cache decisions"
 
 ## Task 7: Migrate macFUSE to the shared cache seam
 
-- [ ] **Step 1: Retarget behavior tests before deleting state**
+- [ ] **Step 1: Verify the existing macOS behavior baseline**
+
+Run these commands on a native macOS host before changing the adapter:
+
+```bash
+cargo test -p studiofs-macfuse open_cache -- --nocapture
+cargo test -p studiofs-macfuse foreground_read -- --nocapture
+cargo test -p studiofs-macfuse active_writer -- --nocapture
+```
+
+Expected: the current behavior characterization passes. These filters are only
+the baseline; they are not the complete migrated matrix.
+
+- [ ] **Step 2: Retarget behavior tests before deleting state**
 
 Update existing macFUSE tests to assert `OsCacheOpenDecision` and adapter flags for:
 
@@ -790,26 +803,35 @@ rejected Replace reply -> next open replaces again
 failed open/create reply -> handle and shared lifecycle return to baseline
 ```
 
-Keep the existing tests in `macfuse/src/lib.rs` around the current generation, foreground, and active-writer cases; change their inspection seam instead of deleting coverage.
+Give the complete migrated matrix one `shared_os_cache_` test-name prefix.
+Retarget every old `.macfuse_open_cache` snapshot assertion to Task 6's
+`.os_cache`; after migration the legacy field remains default. Existing direct
+`adapter.open`/`adapter.create` tests must pass through the same successful fake
+completion helper as production so they still exercise preparation and
+`OpenReply` flags. Keep the old generation, foreground, and active-writer
+coverage; change its inspection seam instead of deleting it.
 
-- [ ] **Step 2: Verify the characterization tests pass before migration**
-
-Run:
+Run on native macOS:
 
 ```bash
-cargo test -p studiofs-macfuse open_cache -- --nocapture
-cargo test -p studiofs-macfuse foreground_read -- --nocapture
-cargo test -p studiofs-macfuse active_writer -- --nocapture
+cargo test -p studiofs-macfuse shared_os_cache_ -- --nocapture
 ```
 
-Expected: current behavior characterization passes.
+Expected: RED until the adapter consumes the shared seam.
 
 - [ ] **Step 3: Serialize shared preparation through the platform reply**
 
-Refactor ordinary-file `open` and `create` so their adapter methods return a
-small private value containing `ino`, `fh`, and `MacFuseOpenCachePolicy`, but do
-not call `prepare_os_cache_open` yet. The synthetic runtime-stats file keeps its
-existing ready-made direct-I/O reply and does not enter the shared cache seam.
+Give the adapter one owned `FuseOpenReplySerializer`. Refactor ordinary-file
+`open` and `create` to return a private `PendingOpen { ino, fh, policy }`, but do
+not call `prepare_os_cache_open` in those methods. Use a small private result
+enum so the synthetic runtime-stats file can still return its ready-made
+direct-I/O `OpenReply` without entering shared preparation or lifecycle.
+
+Use one closure-based completion helper taking
+`FnOnce(OpenReply) -> io::Result<()>` for both real replies and blocking/failing
+test closures; do not introduce a reply trait. The helper returns the
+`OsCacheOpenDecision` for assertions and owns prepare, liveness reservation,
+reply, and rejected-reply cleanup inside `with_inode`.
 
 In `studiofs_macfuse_open` and `studiofs_macfuse_create`, use the adapter's
 `FuseOpenReplySerializer` for the returned inode. Inside that one short
@@ -828,6 +850,13 @@ let open_reply = OpenReply::new(fh)
     .with_direct_io(flag_policy.direct_io)
     .with_keep_cache(keep_cache);
 ```
+
+Remove `MacFuseOpenCachePolicy.write_capable`; VFS derives mutability from the
+handle. Ordinary opens remain `direct_io=false`. Read-only opens use enabled
+participation. Write/append/truncate opens use disabled participation but are
+still prepared and must yield `WriteCapable`; `keep_cache` is true only when
+read policy permits it and the shared disposition is `Reuse`. Runtime stats
+remain `direct_io=true` and unprepared.
 
 Call `Reply::open` or `Reply::create` before releasing the serializer. Writers
 are prepared even though their adapter flag cannot keep cache. For create,
@@ -851,12 +880,16 @@ cache commit-token protocol.
 
 - [ ] **Step 4: Test ordering and rejected replies**
 
-Use a fake `Reply` seam that can block and return success or failure. Prove that
+Use the completion closure to block and return success or failure. Prove that
 a second same-inode callback cannot prepare/reply while the first reply is
 blocked, a different inode can progress, a failed `Replace` makes the next
-same-generation open `Replace` again, and rejected open/create replies return
-handle/lifecycle/liveness gauges to baseline. Use channels and one-second
-bounds, not sleeps.
+same-generation open `Replace` again, and rejected open/create replies leave
+`vfs.open_count(ino) == 0`, return shared active-writer/foreground gauges to
+zero, and restore liveness membership. Do not require monotonic liveness
+counters to return to an earlier value. Cover both a missing owned request and
+an `io::Error`. Cleanup uses synchronous `release_fh_with_outcome`, applies
+`normalize_close_barrier_result`, and logs every non-`ENOENT` error. Use
+channels and one-second bounds, not sleeps.
 
 - [ ] **Step 5: Delete duplicated adapter ownership**
 
@@ -878,9 +911,10 @@ Keep read-window invalidation and file-flag maps; they are separate platform beh
 
 - [ ] **Step 6: Verify macOS equivalence**
 
-Run:
+Run on a native macOS host:
 
 ```bash
+cargo test -p studiofs-macfuse shared_os_cache_ -- --nocapture
 cargo test -p studiofs-macfuse --lib -- --nocapture
 cargo test -p studiofs-vfs os_cache_ -- --nocapture
 ```
@@ -896,29 +930,30 @@ git commit -m "refactor(macos): consume shared os cache coherence"
 
 ## Task 8: Cross-platform focused verification
 
-- [ ] **Step 1: Run shared and macOS suites**
+- [ ] **Step 1: Run platform-neutral suites locally**
 
 ```bash
 cargo test -p studiofs-bridge --lib -- --nocapture
 cargo test -p studiofs-vfs --lib os_cache -- --nocapture
 cargo test -p studiofs-vfs --lib release -- --nocapture
-cargo test -p studiofs-macfuse --lib -- --nocapture
-```
-
-- [ ] **Step 2: Prove Windows remains an unprepared consumer**
-
-```bash
-cargo check -p studiofs-winfsp
 cargo test -p studiofs-vfs winfsp_unprepared_open_release_keeps_existing_counters -- --nocapture
 ```
 
-Expected: Windows compiles and neutral lifecycle counters remain unchanged for unprepared handles.
+- [ ] **Step 2: Require native platform jobs**
+
+Run the manual `.github/workflows/rust.yml` workflow (or equivalent native
+hosts) and require both `macos` and `windows` jobs to pass. The macOS job runs
+the real `studiofs-macfuse` library tests; the Windows job runs the real
+`studiofs-winfsp` library tests. On Linux those crates are crate-level cfg'd
+out, so a zero-test `cargo test -p studiofs-macfuse` or empty
+`cargo check -p studiofs-winfsp` is not completion evidence. The local VFS
+WinFSP-neutral regression remains useful but cannot replace the Windows job.
 
 - [ ] **Step 3: Run formatting and focused linting**
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy -p studiofs-bridge -p studiofs-vfs -p studiofs-macfuse --all-targets -- -D warnings
+cargo clippy -p studiofs-bridge -p studiofs-vfs --all-targets -- -D warnings
 git diff --check
 ```
 
