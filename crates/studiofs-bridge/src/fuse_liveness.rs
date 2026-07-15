@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use parking_lot::Mutex;
@@ -29,12 +26,7 @@ pub struct FuseInodeLivenessStats {
 #[derive(Debug)]
 pub struct FuseInodeLiveness {
     observed: DashMap<u64, Arc<Mutex<u64>>>,
-    snapshot_generation: AtomicU64,
-    observed_references: AtomicU64,
-    forgotten_references: AtomicU64,
-    retired_inodes: AtomicU64,
-    notifications_forwarded: AtomicU64,
-    notifications_suppressed: AtomicU64,
+    stats: Mutex<FuseInodeLivenessStats>,
 }
 
 impl Default for FuseInodeLiveness {
@@ -43,12 +35,7 @@ impl Default for FuseInodeLiveness {
         observed.insert(ROOT_INO, Arc::new(Mutex::new(u64::MAX)));
         Self {
             observed,
-            snapshot_generation: AtomicU64::new(0),
-            observed_references: AtomicU64::new(0),
-            forgotten_references: AtomicU64::new(0),
-            retired_inodes: AtomicU64::new(0),
-            notifications_forwarded: AtomicU64::new(0),
-            notifications_suppressed: AtomicU64::new(0),
+            stats: Mutex::new(FuseInodeLivenessStats::default()),
         }
     }
 }
@@ -77,9 +64,10 @@ impl FuseInodeLiveness {
         }
     }
 
-    fn record(&self, counter: &AtomicU64, amount: u64) {
-        counter.fetch_add(amount, Ordering::Relaxed);
-        self.snapshot_generation.fetch_add(1, Ordering::Relaxed);
+    fn record(&self, update: impl FnOnce(&mut FuseInodeLivenessStats)) {
+        let mut stats = self.stats.lock();
+        update(&mut stats);
+        stats.snapshot_generation = stats.snapshot_generation.saturating_add(1);
     }
 
     /// Count one kernel lookup reference.
@@ -90,8 +78,12 @@ impl FuseInodeLiveness {
             if self.is_current(ino, &state) {
                 let previous = *count;
                 *count = count.saturating_add(1);
-                if *count != previous {
-                    self.record(&self.observed_references, 1);
+                let changed = *count != previous;
+                drop(count);
+                if changed {
+                    self.record(|stats| {
+                        stats.observed_references = stats.observed_references.saturating_add(1);
+                    });
                 }
                 return;
             }
@@ -108,7 +100,10 @@ impl FuseInodeLiveness {
                     return false;
                 }
                 *count = 1;
-                self.record(&self.observed_references, 1);
+                drop(count);
+                self.record(|stats| {
+                    stats.observed_references = stats.observed_references.saturating_add(1);
+                });
                 return true;
             }
         }
@@ -131,8 +126,11 @@ impl FuseInodeLiveness {
             *count = 0;
             self.observed
                 .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
+            drop(count);
             if retired {
-                self.record(&self.retired_inodes, 1);
+                self.record(|stats| {
+                    stats.retired_inodes = stats.retired_inodes.saturating_add(1);
+                });
             }
             return;
         }
@@ -157,8 +155,12 @@ impl FuseInodeLiveness {
                 self.observed
                     .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
             }
+            drop(count);
             if forgotten > 0 {
-                self.record(&self.forgotten_references, forgotten);
+                self.record(|stats| {
+                    stats.forgotten_references =
+                        stats.forgotten_references.saturating_add(forgotten);
+                });
             }
             return;
         }
@@ -184,24 +186,21 @@ impl FuseInodeLiveness {
             self.is_current(ino, &state) && *count > 0
         });
         if should_notify {
-            self.record(&self.notifications_forwarded, 1);
+            self.record(|stats| {
+                stats.notifications_forwarded = stats.notifications_forwarded.saturating_add(1);
+            });
             notify();
         } else {
-            self.record(&self.notifications_suppressed, 1);
+            self.record(|stats| {
+                stats.notifications_suppressed = stats.notifications_suppressed.saturating_add(1);
+            });
         }
         should_notify
     }
 
     /// Return a monotonic snapshot of liveness operations.
     pub fn stats(&self) -> FuseInodeLivenessStats {
-        FuseInodeLivenessStats {
-            snapshot_generation: self.snapshot_generation.load(Ordering::Relaxed),
-            observed_references: self.observed_references.load(Ordering::Relaxed),
-            forgotten_references: self.forgotten_references.load(Ordering::Relaxed),
-            retired_inodes: self.retired_inodes.load(Ordering::Relaxed),
-            notifications_forwarded: self.notifications_forwarded.load(Ordering::Relaxed),
-            notifications_suppressed: self.notifications_suppressed.load(Ordering::Relaxed),
-        }
+        *self.stats.lock()
     }
 }
 
@@ -232,7 +231,11 @@ impl KernelInvalidator for LivenessCheckedKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::time::Duration;
 
     use studiofs_meta::schema::ROOT_INO;
@@ -426,5 +429,53 @@ mod tests {
                 notifications_suppressed: 1,
             }
         );
+    }
+
+    #[test]
+    fn concurrent_stats_snapshots_publish_generation_and_counter_together() {
+        const UPDATES: usize = 200_000;
+
+        let liveness = Arc::new(FuseInodeLiveness::default());
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|scope| {
+            let mutator_liveness = Arc::clone(&liveness);
+            let mutator_start = Arc::clone(&start);
+            let mutator_done = Arc::clone(&done);
+            scope.spawn(move || {
+                mutator_start.wait();
+                for _ in 0..UPDATES {
+                    mutator_liveness.notify_if_observed(42, || {});
+                }
+                mutator_done.store(true, Ordering::Release);
+            });
+
+            for _ in 0..2 {
+                let sampler_liveness = Arc::clone(&liveness);
+                let sampler_start = Arc::clone(&start);
+                let sampler_done = Arc::clone(&done);
+                scope.spawn(move || {
+                    sampler_start.wait();
+                    let mut previous = FuseInodeLivenessStats::default();
+                    while !sampler_done.load(Ordering::Acquire) {
+                        let current = sampler_liveness.stats();
+                        assert!(current.snapshot_generation >= previous.snapshot_generation);
+                        assert!(
+                            current.notifications_suppressed >= previous.notifications_suppressed
+                        );
+                        assert_eq!(
+                            current.snapshot_generation, current.notifications_suppressed,
+                            "one suppressed notification must publish one complete stats update"
+                        );
+                        previous = current;
+                    }
+                });
+            }
+        });
+
+        let final_stats = liveness.stats();
+        assert_eq!(final_stats.snapshot_generation, UPDATES as u64);
+        assert_eq!(final_stats.notifications_suppressed, UPDATES as u64);
     }
 }
