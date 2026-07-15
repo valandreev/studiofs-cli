@@ -40,6 +40,7 @@ mod metrics;
 mod misc_ops;
 mod namespace;
 mod namespace_ops;
+mod os_cache;
 mod overlay;
 mod prefetch;
 mod read_context;
@@ -91,6 +92,7 @@ pub use metrics::{
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
+pub use os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason};
 pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
@@ -115,6 +117,7 @@ use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
+use os_cache::OsCacheState;
 use overlay::ExtentRecordId;
 use prefetch::{
     PrefetchBatch, PrefetchHintRange, PrefetchHintUpdate, PrefetchReadContext, PrefetchWorkItem,
@@ -3393,6 +3396,9 @@ pub struct StudioVfs {
     landing_zone: LandingZone,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
+    /// Shared exact-generation state for OS page-cache decisions.
+    #[expect(dead_code, reason = "open preparation consumes this state in Task 3")]
+    os_cache: OsCacheState,
     /// Optional distributed lease for janitor leader election.
     janitor_lease: Option<JanitorLease>,
     janitor_interval: Duration,

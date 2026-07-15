@@ -44,6 +44,7 @@ pub use vfs::{
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
     HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LocalSyncPolicy, LockKind,
     NamespaceParent, NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags,
+    OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason,
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS,
     RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError,
