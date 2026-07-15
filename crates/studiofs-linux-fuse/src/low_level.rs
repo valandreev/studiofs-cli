@@ -33,6 +33,9 @@ const ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_EXIT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+static ASYNC_WRITE_REPLY_REJECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -281,6 +284,21 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
+    fn new_for_forced_unmount_test(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+        connection_config: LinuxFuseConnectionConfig,
+    ) -> Self {
+        let mut state = Self::new(vfs, runtime_handle, read_only, connection_config);
+        state.async_writes = Arc::new(LinuxFuseAsyncWrites::new(
+            LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
+            1,
+        ));
+        state
+    }
+
     fn shutdown_async_writes(&self) -> bool {
         shutdown_async_writes_with_timeouts(
             &self.async_writes,
@@ -428,6 +446,8 @@ impl FuseWriteTaskGuard {
             ),
         };
         if reply_status != 0 {
+            #[cfg(test)]
+            ASYNC_WRITE_REPLY_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(reply_status, "libfuse rejected async write reply");
         }
         self.vfs
@@ -448,6 +468,8 @@ impl Drop for FuseWriteTaskGuard {
         };
         let reply_status = request.reply_error(libc::EIO);
         if reply_status != 0 {
+            #[cfg(test)]
+            ASYNC_WRITE_REPLY_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(reply_status, "libfuse rejected async write reply");
         }
         self.vfs
@@ -2767,6 +2789,24 @@ mod tests {
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 
+    struct RuntimeGateRelease(Option<mpsc::Sender<()>>);
+
+    impl RuntimeGateRelease {
+        fn release(mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for RuntimeGateRelease {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
     impl UnmountGuard {
         fn new(path: std::path::PathBuf) -> Self {
             Self(Some(path))
@@ -2780,8 +2820,25 @@ mod tests {
     impl Drop for UnmountGuard {
         fn drop(&mut self) {
             if let Some(path) = &self.0 {
-                let _ = Command::new("fusermount3").arg("-u").arg(path).status();
+                let _ = Command::new("fusermount3").arg("-uz").arg(path).status();
             }
+        }
+    }
+
+    fn wait_for_async_write_stats(
+        tracker: &super::LinuxFuseAsyncWrites,
+        expected: impl Fn(&super::LinuxFuseAsyncWriteStats) -> bool,
+    ) -> Result<super::LinuxFuseAsyncWriteStats, super::LinuxFuseAsyncWriteStats> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = tracker.stats();
+            if expected(&stats) {
+                return Ok(stats);
+            }
+            if Instant::now() >= deadline {
+                return Err(stats);
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -4515,6 +4572,276 @@ mod tests {
         drop(session);
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_same_file_parallel_direct_writes_preserve_disjoint_regions() {
+        use std::os::unix::fs::FileExt;
+
+        const WRITERS: usize = 8;
+        const REGION_SIZE: usize = 1024 * 1024;
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-parallel-direct-writes",
+        )
+        .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/linux-fuse-parallel-direct-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-parallel-direct-writes")
+                .expect("mount");
+        let worker_mount_point = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(worker_mount_point.clone());
+            let path = worker_mount_point.join("parallel.dat");
+            let base = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            let start = Arc::new(std::sync::Barrier::new(WRITERS + 1));
+            let mut writers = Vec::with_capacity(WRITERS);
+            for index in 0..WRITERS {
+                let file = base.try_clone()?;
+                let start = Arc::clone(&start);
+                writers.push(std::thread::spawn(move || -> std::io::Result<()> {
+                    let region = vec![u8::try_from(index + 1).expect("writer byte"); REGION_SIZE];
+                    start.wait();
+                    file.write_all_at(&region, (index * REGION_SIZE) as u64)
+                }));
+            }
+            start.wait();
+            for writer in writers {
+                writer.join().expect("parallel writer should not panic")?;
+            }
+            base.sync_all()?;
+            drop(base);
+
+            let actual = std::fs::read(&path)?;
+            let mut expected = Vec::with_capacity(WRITERS * REGION_SIZE);
+            for index in 0..WRITERS {
+                expected.extend(std::iter::repeat_n(
+                    u8::try_from(index + 1).expect("writer byte"),
+                    REGION_SIZE,
+                ));
+            }
+            assert_eq!(actual, expected);
+
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&worker_mount_point)
+                .status();
+            if status.as_ref().is_ok_and(|status| status.success()) {
+                guard.disarm();
+            }
+            status
+        });
+
+        let run_result = session.run();
+        let worker_result = worker.join();
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+
+        run_result.expect("run libfuse3 session");
+        let unmount_status = worker_result
+            .expect("parallel write worker should not panic")
+            .expect("parallel write worker should complete");
+        assert!(unmount_status.success());
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_forced_unmount_drains_admitted_and_waiting_raw_requests() {
+        use std::os::unix::fs::FileExt;
+
+        let reply_rejections_before = super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed);
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-forced-unmount")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/linux-fuse-forced-unmount-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+
+        let state = super::SessionState::new_for_forced_unmount_test(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let tracker = Arc::clone(&state.async_writes);
+        let runtime_handle = fixture.runtime().handle().clone();
+
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-forced-unmount").expect("mount");
+        let worker_mount_point = mount_point.clone();
+        let worker_tracker = Arc::clone(&tracker);
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(worker_mount_point.clone());
+            // Synchronous kernel submissions may serialize writes to one inode.
+            // The preceding test covers that case; distinct files isolate global admission.
+            let first_path = worker_mount_point.join("forced-unmount-first.dat");
+            let second_path = worker_mount_point.join("forced-unmount-second.dat");
+            drop(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&first_path)?,
+            );
+            drop(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&second_path)?,
+            );
+            let first_file = std::fs::OpenOptions::new().write(true).open(&first_path)?;
+            let second_file = std::fs::OpenOptions::new().write(true).open(&second_path)?;
+
+            let (runtime_entered_tx, runtime_entered_rx) = mpsc::channel();
+            let (runtime_release_tx, runtime_release_rx) = mpsc::channel();
+            runtime_handle.spawn(async move {
+                let _ = runtime_entered_tx.send(());
+                let _ = runtime_release_rx.recv();
+            });
+            let runtime_gate_release = RuntimeGateRelease(Some(runtime_release_tx));
+            let mut first = None;
+            let mut second = None;
+            let observation = (|| -> Result<(), String> {
+                runtime_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| format!("runtime gate did not start: {error}"))?;
+
+                first = Some(thread::spawn(move || first_file.write_all_at(b"first", 0)));
+                wait_for_async_write_stats(&worker_tracker, |stats| {
+                    stats.active_requests == 1 && stats.pending_writes == 1
+                })
+                .map_err(|stats| format!("first write was not admitted: {stats:?}"))?;
+
+                second = Some(thread::spawn(move || {
+                    second_file.write_all_at(b"second", 4096)
+                }));
+                wait_for_async_write_stats(&worker_tracker, |stats| {
+                    stats.active_requests == 2
+                        && stats.pending_writes == 1
+                        && stats.admission_waiters == 1
+                })
+                .map_err(|stats| format!("second write did not wait for admission: {stats:?}"))?;
+                Ok(())
+            })();
+
+            if let Err(error) = observation {
+                runtime_gate_release.release();
+                let status = Command::new("fusermount3")
+                    .arg("-uz")
+                    .arg(&worker_mount_point)
+                    .status()?;
+                if status.success() {
+                    guard.disarm();
+                }
+                if let Some(first) = first {
+                    let _ = first.join();
+                }
+                if let Some(second) = second {
+                    let _ = second.join();
+                }
+                return Err(std::io::Error::other(error));
+            }
+
+            let mut unmount = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&worker_mount_point)
+                .spawn()?;
+            runtime_gate_release.release();
+            let unmount_deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = unmount.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= unmount_deadline {
+                    let lazy_status = Command::new("fusermount3")
+                        .arg("-uz")
+                        .arg(&worker_mount_point)
+                        .status()?;
+                    let _ = unmount.kill();
+                    let _ = unmount.wait();
+                    if lazy_status.success() {
+                        guard.disarm();
+                    }
+                    if let Some(first) = first.take() {
+                        let _ = first.join();
+                    }
+                    if let Some(second) = second.take() {
+                        let _ = second.join();
+                    }
+                    return Err(std::io::Error::other(
+                        "normal unmount did not finish within 5 seconds",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let _ = first
+                .take()
+                .expect("first writer exists after successful observation")
+                .join()
+                .map_err(|_| std::io::Error::other("first writer panicked"))?;
+            let _ = second
+                .take()
+                .expect("second writer exists after successful observation")
+                .join()
+                .map_err(|_| std::io::Error::other("second writer panicked"))?;
+            if status.success() {
+                guard.disarm();
+            }
+
+            assert!(
+                worker_tracker.wait_idle(Duration::from_secs(5)),
+                "async-write tracker did not become idle"
+            );
+            let stats = worker_tracker.stats();
+            assert_eq!(
+                (
+                    stats.active_requests,
+                    stats.pending_writes,
+                    stats.pending_bytes,
+                    stats.admission_waiters,
+                ),
+                (0, 0, 0, 0)
+            );
+            Ok(status)
+        });
+
+        let run_result = session.run();
+        let worker_result = worker.join();
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+
+        run_result.expect("run libfuse3 session");
+        let unmount_status = worker_result
+            .expect("forced-unmount worker should not panic")
+            .expect("forced-unmount worker should complete");
+        assert!(unmount_status.success());
+        assert!(tracker.wait_idle(Duration::from_secs(5)));
+        assert_eq!(
+            super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed),
+            reply_rejections_before,
+            "forced unmount produced a late async-write reply"
+        );
     }
 
     #[test]
