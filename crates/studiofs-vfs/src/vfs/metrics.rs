@@ -1060,6 +1060,38 @@ impl VfsOsCacheStats {
     }
 }
 
+/// Configured and negotiated FUSE connection geometry supplied by an adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VfsFuseConnectionSnapshot {
+    /// Configured maximum number of background requests.
+    pub configured_max_background: Option<u32>,
+    /// Configured request congestion threshold.
+    pub configured_congestion_threshold: Option<u32>,
+    /// Whether the adapter requested asynchronous direct I/O.
+    pub requested_async_dio: Option<bool>,
+    /// Whether the adapter requested the kernel writeback cache.
+    pub requested_writeback_cache: Option<bool>,
+    /// Negotiated maximum read size, when userspace supplied a non-zero limit.
+    pub negotiated_max_read_bytes: Option<u32>,
+    /// Negotiated maximum write size.
+    pub negotiated_max_write_bytes: Option<u32>,
+    /// Negotiated maximum readahead size.
+    pub negotiated_max_readahead_bytes: Option<u32>,
+    /// Negotiated maximum number of background requests.
+    pub negotiated_max_background: Option<u32>,
+    /// Negotiated request congestion threshold.
+    pub negotiated_congestion_threshold: Option<u32>,
+    /// Whether asynchronous direct I/O was accepted.
+    pub negotiated_async_dio: Option<bool>,
+    /// Whether the kernel writeback cache was accepted.
+    pub negotiated_writeback_cache: Option<bool>,
+    /// Whether this libfuse shim can set parallel direct writes per open.
+    pub parallel_direct_writes_supported: Option<bool>,
+    /// Whether this libfuse version uses the single-thread receive loop fallback.
+    pub single_thread_receive_loop: Option<bool>,
+}
+
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1070,13 +1102,13 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub enabled: bool,
     /// Selected Linux FUSE profile label.
     pub linux_fuse_profile: Cow<'static, str>,
-    /// Requested kernel `max_write` value.
+    /// Legacy requested `max_write` retained only for old snapshot decoding.
     pub fuse_max_write_bytes: u32,
-    /// Requested kernel `max_readahead` value.
+    /// Legacy requested `max_readahead` retained only for old snapshot decoding.
     pub fuse_max_readahead_bytes: u32,
-    /// Requested kernel `max_background` value.
+    /// Legacy requested `max_background` retained only for old snapshot decoding.
     pub fuse_max_background: Option<u16>,
-    /// Requested kernel `congestion_threshold` value.
+    /// Legacy requested congestion threshold retained only for old snapshot decoding.
     pub fuse_congestion_threshold: Option<u16>,
     /// Shared buffer budget selected by the Linux FUSE profile.
     pub shared_buffer_budget_bytes: Option<u64>,
@@ -1090,7 +1122,7 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub upload_concurrency: Option<u16>,
     /// Download concurrency selected by the Linux FUSE profile.
     pub download_concurrency: Option<u16>,
-    /// Whether the profile requested Linux kernel writeback cache.
+    /// Legacy writeback request retained only for old snapshot decoding.
     pub kernel_writeback_cache: Option<bool>,
     /// Maximum pending bytes admitted across the adapter.
     pub max_pending_bytes: Option<usize>,
@@ -1674,6 +1706,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Platform-neutral OS page-cache decisions and lifecycle gauges.
     #[serde(default)]
     pub os_cache: VfsOsCacheStats,
+    /// Configured and negotiated FUSE connection geometry.
+    #[serde(default)]
+    pub fuse_connection: VfsFuseConnectionSnapshot,
     /// Async FUSE write diagnostics.
     #[serde(default)]
     pub fuse_async_write: VfsFuseAsyncWriteSnapshot,

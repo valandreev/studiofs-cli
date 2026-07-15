@@ -41,6 +41,14 @@ impl LinuxFuseConnectionConfig {
                 "Linux FUSE max_background must be greater than 0",
             ));
         }
+        if self.max_background > u32::from(u16::MAX)
+            || self.congestion_threshold > u32::from(u16::MAX)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux FUSE background queue values must fit the protocol u16 fields",
+            ));
+        }
         if self.congestion_threshold == 0 || self.congestion_threshold > self.max_background {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -176,5 +184,20 @@ mod tests {
             config.validate().unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn connection_config_rejects_values_above_fuse_wire_limit() {
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: u32::from(u16::MAX) + 1,
+            congestion_threshold: u32::from(u16::MAX) + 1,
+        };
+
+        let error = config
+            .validate()
+            .expect_err("wire values must not truncate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("u16"));
     }
 }

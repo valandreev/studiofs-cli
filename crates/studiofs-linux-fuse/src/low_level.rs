@@ -19,7 +19,7 @@ use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
     DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, OsCacheDisposition,
     OsCacheOpenDecision, OsCacheParticipation, StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot,
-    VfsFuseLivenessSnapshot,
+    VfsFuseConnectionSnapshot, VfsFuseLivenessSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -181,9 +181,21 @@ unsafe extern "C" {
         congestion_threshold: u32,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_init_for_test(
+        userdata: *mut c_void,
+        max_read: u32,
+        max_write: u32,
+        max_readahead: u32,
+        capable_async_dio: c_int,
+        capable_writeback_cache: c_int,
+        preset_async_dio: c_int,
+        preset_writeback_cache: c_int,
+    ) -> u32;
+    #[cfg(test)]
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_uses_single_thread_loop() -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_supports_parallel_direct_writes() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_conn_wants_async_dio_after_set(capable_ext: u64) -> c_int;
@@ -211,6 +223,7 @@ pub(crate) struct SessionState {
     cache_policy: LinuxFuseCachePolicy,
     requested_async_dio: bool,
     connection_config: LinuxFuseConnectionConfig,
+    negotiated_geometry: OnceLock<LinuxFuseNegotiatedGeometry>,
     metric_config: LinuxFuseAsyncWriteMetricConfig,
 }
 
@@ -220,6 +233,19 @@ const _: fn() = assert_send_sync_static::<SessionState>;
 enum LinuxFuseCachePolicy {
     Direct,
     Kernel,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LinuxFuseNegotiatedGeometry {
+    max_read: u32,
+    max_write: u32,
+    max_readahead: u32,
+    max_background: u32,
+    congestion_threshold: u32,
+    async_dio: bool,
+    writeback_cache: bool,
+    parallel_direct_writes_supported: bool,
+    single_thread_receive_loop: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,7 +340,7 @@ impl SessionState {
         cache_policy: LinuxFuseCachePolicy,
         requested_async_dio: bool,
     ) -> Self {
-        Self {
+        let state = Self {
             vfs,
             inode_liveness: Arc::new(FuseInodeLiveness::default()),
             open_reply_serializer: FuseOpenReplySerializer::default(),
@@ -329,11 +355,11 @@ impl SessionState {
             cache_policy,
             requested_async_dio,
             connection_config,
-            metric_config: LinuxFuseAsyncWriteMetricConfig {
-                cache_policy,
-                connection_config,
-            },
-        }
+            negotiated_geometry: OnceLock::new(),
+            metric_config: LinuxFuseAsyncWriteMetricConfig { cache_policy },
+        };
+        state.publish_fuse_connection_snapshot(None);
+        state
     }
 
     #[cfg(test)]
@@ -361,6 +387,33 @@ impl SessionState {
 
     fn publish_liveness_stats(&self) {
         publish_fuse_liveness_stats(&self.vfs, &self.inode_liveness);
+    }
+
+    fn record_negotiated_geometry(&self, geometry: LinuxFuseNegotiatedGeometry) {
+        let _ = self.negotiated_geometry.set(geometry);
+        self.publish_fuse_connection_snapshot(self.negotiated_geometry.get().copied());
+    }
+
+    fn publish_fuse_connection_snapshot(&self, negotiated: Option<LinuxFuseNegotiatedGeometry>) {
+        self.vfs
+            .record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+                configured_max_background: Some(self.connection_config.max_background),
+                configured_congestion_threshold: Some(self.connection_config.congestion_threshold),
+                requested_async_dio: Some(self.requested_async_dio),
+                requested_writeback_cache: Some(self.cache_policy == LinuxFuseCachePolicy::Kernel),
+                negotiated_max_read_bytes: negotiated
+                    .and_then(|value| (value.max_read != 0).then_some(value.max_read)),
+                negotiated_max_write_bytes: negotiated.map(|value| value.max_write),
+                negotiated_max_readahead_bytes: negotiated.map(|value| value.max_readahead),
+                negotiated_max_background: negotiated.map(|value| value.max_background),
+                negotiated_congestion_threshold: negotiated.map(|value| value.congestion_threshold),
+                negotiated_async_dio: negotiated.map(|value| value.async_dio),
+                negotiated_writeback_cache: negotiated.map(|value| value.writeback_cache),
+                parallel_direct_writes_supported: negotiated
+                    .map(|value| value.parallel_direct_writes_supported),
+                single_thread_receive_loop: negotiated
+                    .map(|value| value.single_thread_receive_loop),
+            });
     }
 }
 
@@ -461,7 +514,6 @@ impl FuseReqPtr {
 #[derive(Clone, Copy)]
 struct LinuxFuseAsyncWriteMetricConfig {
     cache_policy: LinuxFuseCachePolicy,
-    connection_config: LinuxFuseConnectionConfig,
 }
 
 struct FuseWriteTaskGuard {
@@ -562,20 +614,14 @@ fn record_linux_async_write_stats(
     stats: LinuxFuseAsyncWriteStats,
     metric_config: LinuxFuseAsyncWriteMetricConfig,
 ) {
-    let (profile, kernel_writeback_cache) = match metric_config.cache_policy {
-        LinuxFuseCachePolicy::Direct => ("direct", false),
-        LinuxFuseCachePolicy::Kernel => ("kernel", true),
+    let profile = match metric_config.cache_policy {
+        LinuxFuseCachePolicy::Direct => "direct",
+        LinuxFuseCachePolicy::Kernel => "kernel",
     };
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         snapshot_generation: stats.snapshot_generation,
         enabled: linux_fuse_async_write_enabled(),
         linux_fuse_profile: profile.into(),
-        fuse_max_background: u16::try_from(metric_config.connection_config.max_background).ok(),
-        fuse_congestion_threshold: u16::try_from(
-            metric_config.connection_config.congestion_threshold,
-        )
-        .ok(),
-        kernel_writeback_cache: Some(kernel_writeback_cache),
         max_pending_bytes: Some(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES),
         max_pending_writes: Some(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES),
         active_requests: stats.active_requests,
@@ -660,6 +706,35 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
     } else {
         0
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_record_negotiated_connection(
+    userdata: *mut c_void,
+    max_read: u32,
+    max_write: u32,
+    max_readahead: u32,
+    max_background: u32,
+    congestion_threshold: u32,
+    async_dio: c_int,
+    writeback_cache: c_int,
+    parallel_direct_writes_supported: c_int,
+    single_thread_receive_loop: c_int,
+) {
+    let Some(state) = callback_state_from_userdata(userdata) else {
+        return;
+    };
+    state.record_negotiated_geometry(LinuxFuseNegotiatedGeometry {
+        max_read,
+        max_write,
+        max_readahead,
+        max_background,
+        congestion_threshold,
+        async_dio: async_dio != 0,
+        writeback_cache: writeback_cache != 0,
+        parallel_direct_writes_supported: parallel_direct_writes_supported != 0,
+        single_thread_receive_loop: single_thread_receive_loop != 0,
+    });
 }
 
 fn current_uid() -> u32 {
@@ -2794,12 +2869,11 @@ fn complete_file_open_reply_with(
             LinuxFuseCachePolicy::Kernel => OsCacheParticipation::Enabled,
         };
         let decision = state.vfs.prepare_os_cache_open(opened.fh, participation);
-        // SAFETY: this C probe only returns a compile-time feature decision.
-        let field_supported = unsafe { studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
+        let negotiated = state.negotiated_geometry.get();
         let policy = linux_fuse_open_cache_policy_for(
             state.cache_policy,
-            state.requested_async_dio,
-            field_supported,
+            negotiated.is_some_and(|geometry| geometry.async_dio),
+            negotiated.is_some_and(|geometry| geometry.parallel_direct_writes_supported),
             decision.disposition(),
         );
         let unknown = !creates_lookup_reference && !state.inode_liveness.is_observed(opened.ino);
@@ -3397,7 +3471,6 @@ mod tests {
             requested_bytes: 8,
             metric_config: super::LinuxFuseAsyncWriteMetricConfig {
                 cache_policy: super::LinuxFuseCachePolicy::Direct,
-                connection_config: default_connection_config(),
             },
         }
     }
@@ -3587,7 +3660,6 @@ mod tests {
             requested_bytes: 1,
             metric_config: super::LinuxFuseAsyncWriteMetricConfig {
                 cache_policy: super::LinuxFuseCachePolicy::Direct,
-                connection_config: default_connection_config(),
             },
         };
         let exited = Arc::new(AtomicBool::new(false));
@@ -3793,6 +3865,193 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn negotiated_geometry_preserves_requested_and_effective_values() {
+        let (_direct_fixture, direct_state) = cache_test_state(
+            "linux-negotiated-geometry-direct",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let direct_userdata = (&direct_state as *const super::SessionState)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+
+        // SAFETY: userdata points to `direct_state`, and the C fixture owns its
+        // stack-local connection for the duration of this synchronous call.
+        let direct_want = unsafe {
+            super::studiofs_linux_fuse_init_for_test(
+                direct_userdata,
+                4 * 1024 * 1024,
+                1024 * 1024,
+                512 * 1024,
+                1,
+                1,
+                1,
+                1,
+            )
+        };
+
+        assert_eq!(direct_want, 0b01, "unrequested writeback must be cleared");
+        assert_eq!(
+            direct_state.negotiated_geometry.get(),
+            Some(&super::LinuxFuseNegotiatedGeometry {
+                max_read: 4 * 1024 * 1024,
+                max_write: 1024 * 1024,
+                max_readahead: 512 * 1024,
+                max_background: 128,
+                congestion_threshold: 96,
+                async_dio: true,
+                writeback_cache: false,
+                parallel_direct_writes_supported: unsafe {
+                    super::studiofs_linux_fuse_supports_parallel_direct_writes()
+                } != 0,
+                single_thread_receive_loop: unsafe {
+                    super::studiofs_linux_fuse_uses_single_thread_loop()
+                } != 0,
+            }),
+        );
+
+        let (_kernel_fixture, kernel_state) = cache_test_state(
+            "linux-negotiated-geometry-kernel",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let kernel_userdata = (&kernel_state as *const super::SessionState)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        // SAFETY: same lifetime guarantee as the Direct fixture above.
+        let kernel_want = unsafe {
+            super::studiofs_linux_fuse_init_for_test(
+                kernel_userdata,
+                0,
+                1024 * 1024,
+                512 * 1024,
+                1,
+                1,
+                1,
+                1,
+            )
+        };
+        assert_eq!(kernel_want, 0b10, "unrequested async DIO must be cleared");
+
+        let (mismatch_fixture, mismatch_state) = cache_test_state(
+            "linux-negotiated-geometry-mismatch",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let mismatch_userdata = (&mismatch_state as *const super::SessionState)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        // SAFETY: userdata points to `mismatch_state` for this synchronous callback.
+        unsafe {
+            super::studiofs_linux_fuse_record_negotiated_connection(
+                mismatch_userdata,
+                0,
+                2 * 1024 * 1024,
+                256 * 1024,
+                64,
+                48,
+                0,
+                1,
+                1,
+                0,
+            );
+        }
+        let connection = mismatch_fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .fuse_connection;
+
+        assert_eq!(connection.configured_max_background, Some(128));
+        assert_eq!(connection.configured_congestion_threshold, Some(96));
+        assert_eq!(connection.requested_async_dio, Some(true));
+        assert_eq!(connection.requested_writeback_cache, Some(false));
+        assert_eq!(connection.negotiated_max_read_bytes, None);
+        assert_eq!(connection.negotiated_max_background, Some(64));
+        assert_eq!(connection.negotiated_congestion_threshold, Some(48));
+        assert_eq!(connection.negotiated_async_dio, Some(false));
+        assert_eq!(connection.negotiated_writeback_cache, Some(true));
+    }
+
+    #[test]
+    fn negotiated_geometry_rejected_async_disables_parallel_direct_writes() {
+        let (fixture, state) = cache_test_state(
+            "linux-negotiated-geometry-async-rejected",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"async-rejected.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+
+        let pre_init = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (pre_init_policy, _) = accept_cache_open(&state, pre_init);
+        assert!(!pre_init_policy.parallel_direct_writes);
+        release_cache_open(&fixture, pre_init);
+
+        let userdata = (&state as *const super::SessionState)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        // SAFETY: userdata points to `state`, and the C fixture owns its
+        // stack-local connection for this synchronous call.
+        let want = unsafe {
+            super::studiofs_linux_fuse_init_for_test(
+                userdata,
+                0,
+                1024 * 1024,
+                512 * 1024,
+                0,
+                1,
+                1,
+                1,
+            )
+        };
+        assert_eq!(
+            want, 0,
+            "rejected async and unrequested writeback stay clear"
+        );
+        assert_eq!(
+            state
+                .negotiated_geometry
+                .get()
+                .map(|geometry| geometry.async_dio),
+            Some(false),
+        );
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (policy, _) = accept_cache_open(&state, opened);
+
+        assert!(!policy.parallel_direct_writes);
+        release_cache_open(&fixture, opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn negotiated_geometry_missing_shim_field_disables_parallel_direct_writes() {
+        let (fixture, state) = cache_test_state(
+            "linux-negotiated-geometry-field-missing",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        state.record_negotiated_geometry(super::LinuxFuseNegotiatedGeometry {
+            async_dio: true,
+            parallel_direct_writes_supported: false,
+            ..Default::default()
+        });
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"field-missing.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (policy, _) = accept_cache_open(&state, opened);
+
+        assert!(!policy.parallel_direct_writes);
+        release_cache_open(&fixture, opened);
+        assert_cache_lifecycle_idle(&fixture);
     }
 
     #[test]

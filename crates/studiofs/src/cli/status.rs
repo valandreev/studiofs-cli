@@ -10,7 +10,9 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
-use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
+use studiofs_vfs::{
+    VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsWritePathObservabilitySnapshot,
+};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -159,6 +161,54 @@ fn format_optional_switch(value: Option<bool>) -> &'static str {
     }
 }
 
+fn format_optional_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unavailable",
+    }
+}
+
+fn format_optional_connection_bytes(value: Option<u32>) -> String {
+    value
+        .map(|bytes| format_bytes(u64::from(bytes)))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn format_optional_connection_count(value: Option<u32>) -> String {
+    value
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn format_fuse_connection_geometry(snapshot: &VfsFuseConnectionSnapshot) -> Vec<String> {
+    if *snapshot == VfsFuseConnectionSnapshot::default() {
+        return Vec::new();
+    }
+
+    vec![
+        format!(
+            "  FUSE configured:           background {}, congestion {}, async DIO {}, writeback {}",
+            format_optional_connection_count(snapshot.configured_max_background),
+            format_optional_connection_count(snapshot.configured_congestion_threshold),
+            format_optional_switch(snapshot.requested_async_dio),
+            format_optional_switch(snapshot.requested_writeback_cache),
+        ),
+        format!(
+            "  FUSE negotiated:           max read {}, max write {}, readahead {}, background {}, congestion {}, async DIO {}, writeback {}, parallel direct writes {}, single receive loop {}",
+            format_optional_connection_bytes(snapshot.negotiated_max_read_bytes),
+            format_optional_connection_bytes(snapshot.negotiated_max_write_bytes),
+            format_optional_connection_bytes(snapshot.negotiated_max_readahead_bytes),
+            format_optional_connection_count(snapshot.negotiated_max_background),
+            format_optional_connection_count(snapshot.negotiated_congestion_threshold),
+            format_optional_switch(snapshot.negotiated_async_dio),
+            format_optional_switch(snapshot.negotiated_writeback_cache),
+            format_optional_yes_no(snapshot.parallel_direct_writes_supported),
+            format_optional_yes_no(snapshot.single_thread_receive_loop),
+        ),
+    ]
+}
+
 fn has_raw_fuse_profile_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> bool {
     snapshot.shared_buffer_budget_bytes.is_some()
         || snapshot.read_buffer_budget_bytes.is_some()
@@ -166,7 +216,6 @@ fn has_raw_fuse_profile_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> bool {
         || snapshot.prefetch_concurrency.is_some()
         || snapshot.upload_concurrency.is_some()
         || snapshot.download_concurrency.is_some()
-        || snapshot.kernel_writeback_cache.is_some()
 }
 
 fn format_fuse_profile_buffer_knobs(snapshot: &VfsFuseAsyncWriteSnapshot) -> String {
@@ -195,12 +244,11 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
     ));
     if has_profile_knobs {
         lines.push(format!(
-            "  FUSE profile knobs:       {}, prefetch {}, upload {}, download {}, writeback {}",
+            "  FUSE profile knobs:       {}, prefetch {}, upload {}, download {}",
             format_fuse_profile_buffer_knobs(snapshot),
             format_optional_profile_count(snapshot.prefetch_concurrency),
             format_optional_profile_count(snapshot.upload_concurrency),
             format_optional_profile_count(snapshot.download_concurrency),
-            format_optional_switch(snapshot.kernel_writeback_cache)
         ));
     }
     lines.push(format!(
@@ -397,6 +445,9 @@ fn print_mounted_write_path_fallback(
         format_ms(snapshot.metadata_commit.avg_ms),
         format_ms(snapshot.metadata_commit.max_ms)
     );
+    for line in format_fuse_connection_geometry(&snapshot.fuse_connection) {
+        println!("{line}");
+    }
     for line in format_fuse_async_write_diagnostics(&snapshot.fuse_async_write) {
         println!("{line}");
     }
@@ -1052,6 +1103,7 @@ mod tests {
             fuse_liveness: Default::default(),
             macfuse_open_cache: Default::default(),
             os_cache: Default::default(),
+            fuse_connection: Default::default(),
             fuse_async_write: Default::default(),
             fuse_async_read: Default::default(),
             landing_zone: Default::default(),
@@ -1091,6 +1143,36 @@ mod tests {
             format_staged_upload_cache_pressure_line(&snapshot),
             "  Staged current/peak/upload/cache pressure: 512B/1.0KiB/2.0KiB/4.0KiB"
         );
+    }
+
+    #[test]
+    fn mounted_status_formats_configured_and_negotiated_fuse_geometry() {
+        let snapshot = studiofs_vfs::VfsFuseConnectionSnapshot {
+            configured_max_background: Some(128),
+            configured_congestion_threshold: Some(96),
+            requested_async_dio: Some(true),
+            requested_writeback_cache: Some(false),
+            negotiated_max_read_bytes: Some(4 * 1024 * 1024),
+            negotiated_max_write_bytes: Some(2 * 1024 * 1024),
+            negotiated_max_readahead_bytes: Some(512 * 1024),
+            negotiated_max_background: Some(64),
+            negotiated_congestion_threshold: Some(48),
+            negotiated_async_dio: Some(false),
+            negotiated_writeback_cache: Some(true),
+            parallel_direct_writes_supported: Some(true),
+            single_thread_receive_loop: Some(false),
+        };
+
+        let lines = format_fuse_connection_geometry(&snapshot);
+
+        assert_eq!(
+            lines,
+            [
+                "  FUSE configured:           background 128, congestion 96, async DIO on, writeback off",
+                "  FUSE negotiated:           max read 4.0MiB, max write 2.0MiB, readahead 512.0KiB, background 64, congestion 48, async DIO off, writeback on, parallel direct writes yes, single receive loop no",
+            ]
+        );
+        assert!(!lines[0].contains("max read"));
     }
 
     #[test]
@@ -1136,7 +1218,7 @@ mod tests {
             lines,
             [
                 "  FUSE async writes:        enabled (profile: raw-macfuse-like)",
-                "  FUSE profile knobs:       shared 300.0MiB, prefetch 1, upload 20, download 200, writeback off",
+                "  FUSE profile knobs:       shared 300.0MiB, prefetch 1, upload 20, download 200",
                 "  FUSE async pending:       3 writes on 3 handles, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async requests:      2 active, 1 awaiting admission",
                 "  FUSE async handle peak:   4 current, 7 peak",
@@ -1148,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_status_formats_fuse_writeback_when_it_is_the_only_profile_knob() {
+    fn mounted_status_ignores_legacy_fuse_writeback_as_live_profile_knob() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
             linux_fuse_profile: "raw-macfuse-like".into(),
             kernel_writeback_cache: Some(true),
@@ -1157,10 +1239,8 @@ mod tests {
 
         let lines = format_fuse_async_write_diagnostics(&snapshot);
 
-        assert_eq!(
-            lines[1],
-            "  FUSE profile knobs:       read unavailable, write unavailable, prefetch unavailable, upload unavailable, download unavailable, writeback on"
-        );
+        assert_eq!(lines.len(), 7);
+        assert!(lines.iter().all(|line| !line.contains("profile knobs")));
     }
 
     #[test]

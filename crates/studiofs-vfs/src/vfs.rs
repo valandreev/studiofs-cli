@@ -76,11 +76,11 @@ pub use metrics::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
-    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
-    VfsFuseLivenessSnapshot, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
+    VfsFuseConnectionSnapshot, VfsFuseIoStats, VfsFuseLivenessSnapshot, VfsIngressLane,
+    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheStats,
+    VfsNamespaceCacheSnapshot, VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
     VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
     VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
@@ -2759,6 +2759,7 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
+            fuse_connection_snapshot: Mutex::new(VfsFuseConnectionSnapshot::default()),
             fuse_async_write_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
@@ -2825,6 +2826,7 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     metrics: MetricsState,
+    fuse_connection_snapshot: Mutex<VfsFuseConnectionSnapshot>,
     fuse_async_write_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
@@ -7326,6 +7328,11 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    /// Replace the latest configured and negotiated FUSE connection snapshot.
+    pub fn record_fuse_connection_snapshot(&self, snapshot: VfsFuseConnectionSnapshot) {
+        *self.state.fuse_connection_snapshot.lock() = snapshot;
+    }
+
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut raw = self.state.fuse_async_write_raw_snapshot.lock();
@@ -8493,6 +8500,7 @@ impl StudioVfs {
             },
             macfuse_open_cache: Default::default(),
             os_cache: self.os_cache.stats(),
+            fuse_connection: *self.state.fuse_connection_snapshot.lock(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {

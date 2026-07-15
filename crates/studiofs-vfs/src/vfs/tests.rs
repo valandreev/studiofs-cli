@@ -16116,6 +16116,88 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
 }
 
 #[test]
+fn fuse_connection_snapshot_preserves_pre_init_absence() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-connection-pre-init");
+
+    vfs.record_fuse_connection_snapshot(crate::VfsFuseConnectionSnapshot {
+        configured_max_background: Some(128),
+        configured_congestion_threshold: Some(96),
+        requested_async_dio: Some(true),
+        requested_writeback_cache: Some(false),
+        ..Default::default()
+    });
+
+    let connection = vfs.write_path_observability_snapshot().fuse_connection;
+    assert_eq!(connection.configured_max_background, Some(128));
+    assert_eq!(connection.configured_congestion_threshold, Some(96));
+    assert_eq!(connection.requested_async_dio, Some(true));
+    assert_eq!(connection.requested_writeback_cache, Some(false));
+    assert_eq!(connection.negotiated_max_read_bytes, None);
+    assert_eq!(connection.negotiated_max_write_bytes, None);
+    assert_eq!(connection.negotiated_max_readahead_bytes, None);
+    assert_eq!(connection.negotiated_max_background, None);
+    assert_eq!(connection.negotiated_congestion_threshold, None);
+    assert_eq!(connection.negotiated_async_dio, None);
+    assert_eq!(connection.negotiated_writeback_cache, None);
+    assert_eq!(connection.parallel_direct_writes_supported, None);
+    assert_eq!(connection.single_thread_receive_loop, None);
+
+    vfs.reset_diagnostics_observability();
+    assert_eq!(
+        vfs.write_path_observability_snapshot().fuse_connection,
+        connection,
+        "diagnostics reset must preserve connection state",
+    );
+}
+
+#[test]
+fn runtime_stats_surface_reports_fuse_connection_geometry() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-fuse-connection");
+
+    vfs.record_fuse_connection_snapshot(crate::VfsFuseConnectionSnapshot {
+        configured_max_background: Some(128),
+        configured_congestion_threshold: Some(96),
+        requested_async_dio: Some(true),
+        requested_writeback_cache: Some(false),
+        negotiated_max_read_bytes: Some(4 * 1024 * 1024),
+        negotiated_max_write_bytes: Some(2 * 1024 * 1024),
+        negotiated_max_readahead_bytes: Some(512 * 1024),
+        negotiated_max_background: Some(64),
+        negotiated_congestion_threshold: Some(48),
+        negotiated_async_dio: Some(false),
+        negotiated_writeback_cache: Some(true),
+        parallel_direct_writes_supported: Some(true),
+        single_thread_receive_loop: Some(false),
+    });
+
+    let gauges = vfs.runtime_stats_snapshot().bridge.gauges;
+    for (name, expected) in [
+        ("fuse_negotiated_max_read_bytes", 4 * 1024 * 1024),
+        ("fuse_negotiated_max_write_bytes", 2 * 1024 * 1024),
+        ("fuse_negotiated_max_readahead_bytes", 512 * 1024),
+        ("fuse_negotiated_max_background", 64),
+        ("fuse_negotiated_congestion_threshold", 48),
+        ("fuse_negotiated_async_dio", 0),
+        ("fuse_negotiated_writeback_cache", 1),
+        ("fuse_parallel_direct_writes_supported", 1),
+        ("fuse_single_thread_receive_loop", 0),
+    ] {
+        assert_eq!(gauges[name].value, expected, "gauge {name}");
+    }
+    for obsolete in [
+        "fuse_max_write_bytes",
+        "fuse_max_readahead_bytes",
+        "fuse_max_background",
+        "fuse_congestion_threshold",
+        "fuse_kernel_writeback_cache",
+    ] {
+        assert!(!gauges.contains_key(obsolete), "obsolete gauge {obsolete}");
+    }
+}
+
+#[test]
 fn write_path_observability_reports_fuse_async_write_snapshot() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-async-write");
@@ -16201,46 +16283,20 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
         linux_fuse_profile: "high-throughput".into(),
-        fuse_max_write_bytes: 16 * 1024 * 1024,
-        fuse_max_readahead_bytes: 128 * 1024,
-        fuse_max_background: Some(128),
-        fuse_congestion_threshold: Some(96),
         shared_buffer_budget_bytes: Some(300 * 1024 * 1024),
         prefetch_concurrency: Some(1),
         upload_concurrency: Some(20),
         download_concurrency: Some(200),
-        kernel_writeback_cache: Some(false),
         ..Default::default()
     });
 
     let snapshot = vfs.runtime_stats_snapshot();
 
-    assert_eq!(snapshot.bridge.gauges["fuse_max_background"].value, 128);
-    assert_eq!(
-        snapshot.bridge.gauges["fuse_congestion_threshold"].value,
-        96
-    );
-    assert_eq!(
-        snapshot.bridge.gauges["fuse_max_write_bytes"].value,
-        16 * 1024 * 1024
-    );
-    assert_eq!(
-        snapshot.bridge.gauges["fuse_max_readahead_bytes"].value,
-        128 * 1024
-    );
     assert_eq!(
         snapshot.bridge.gauges["fuse_shared_buffer_budget_bytes"].value,
         300 * 1024 * 1024
     );
     assert_eq!(snapshot.bridge.gauges["fuse_upload_concurrency"].value, 20);
-    assert_eq!(
-        snapshot.bridge.gauges["fuse_kernel_writeback_cache"].value,
-        0
-    );
-    assert_eq!(
-        snapshot.bridge.gauges["fuse_kernel_writeback_cache"].unit,
-        "count"
-    );
 }
 
 #[test]

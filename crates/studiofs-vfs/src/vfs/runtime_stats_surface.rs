@@ -226,18 +226,84 @@ impl StudioVfs {
                 .bytes
                 .saturating_add(write_path.winfsp_write_path.write_bytes),
         );
-        insert_gauge(
-            &mut snapshot.bridge,
-            "fuse_max_write_bytes",
-            "bytes",
-            u64::from(write_path.fuse_async_write.fuse_max_write_bytes),
-        );
-        insert_gauge(
-            &mut snapshot.bridge,
-            "fuse_max_readahead_bytes",
-            "bytes",
-            u64::from(write_path.fuse_async_write.fuse_max_readahead_bytes),
-        );
+        for (name, unit, value) in [
+            (
+                "fuse_negotiated_max_read_bytes",
+                "bytes",
+                write_path
+                    .fuse_connection
+                    .negotiated_max_read_bytes
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_max_write_bytes",
+                "bytes",
+                write_path
+                    .fuse_connection
+                    .negotiated_max_write_bytes
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_max_readahead_bytes",
+                "bytes",
+                write_path
+                    .fuse_connection
+                    .negotiated_max_readahead_bytes
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_max_background",
+                "count",
+                write_path
+                    .fuse_connection
+                    .negotiated_max_background
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_congestion_threshold",
+                "count",
+                write_path
+                    .fuse_connection
+                    .negotiated_congestion_threshold
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_async_dio",
+                "count",
+                write_path
+                    .fuse_connection
+                    .negotiated_async_dio
+                    .map(u64::from),
+            ),
+            (
+                "fuse_negotiated_writeback_cache",
+                "count",
+                write_path
+                    .fuse_connection
+                    .negotiated_writeback_cache
+                    .map(u64::from),
+            ),
+            (
+                "fuse_parallel_direct_writes_supported",
+                "count",
+                write_path
+                    .fuse_connection
+                    .parallel_direct_writes_supported
+                    .map(u64::from),
+            ),
+            (
+                "fuse_single_thread_receive_loop",
+                "count",
+                write_path
+                    .fuse_connection
+                    .single_thread_receive_loop
+                    .map(u64::from),
+            ),
+        ] {
+            if let Some(value) = value {
+                insert_gauge(&mut snapshot.bridge, name, unit, value);
+            }
+        }
         for (name, unit, value) in [
             (
                 "fuse_shared_buffer_budget_bytes",
@@ -278,34 +344,10 @@ impl StudioVfs {
                     .download_concurrency
                     .map(u64::from),
             ),
-            (
-                "fuse_kernel_writeback_cache",
-                "count",
-                write_path
-                    .fuse_async_write
-                    .kernel_writeback_cache
-                    .map(u64::from),
-            ),
         ] {
             if let Some(value) = value {
                 insert_gauge(&mut snapshot.bridge, name, unit, value);
             }
-        }
-        if let Some(max_background) = write_path.fuse_async_write.fuse_max_background {
-            insert_gauge(
-                &mut snapshot.bridge,
-                "fuse_max_background",
-                "count",
-                u64::from(max_background),
-            );
-        }
-        if let Some(congestion_threshold) = write_path.fuse_async_write.fuse_congestion_threshold {
-            insert_gauge(
-                &mut snapshot.bridge,
-                "fuse_congestion_threshold",
-                "count",
-                u64::from(congestion_threshold),
-            );
         }
         for (name, unit, value) in [
             (
