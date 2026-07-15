@@ -6406,6 +6406,10 @@ impl StudioVfs {
         }
     }
 
+    pub(super) fn retire_os_cache_inode(&self, ino: Ino) {
+        self.os_cache.clear(ino);
+    }
+
     /// Mark a platform read-only handle as active foreground I/O.
     pub fn begin_foreground_read_handle(&self) {
         self.state.read.mark_foreground_read(now_unix_millis());

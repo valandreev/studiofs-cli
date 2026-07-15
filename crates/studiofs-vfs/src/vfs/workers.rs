@@ -544,12 +544,19 @@ impl StudioVfs {
     }
 
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
+        let mut unique = HashSet::new();
+        let unique = inodes
+            .into_iter()
+            .filter(|ino| unique.insert(*ino))
+            .collect::<Vec<_>>();
+        for &ino in &unique {
+            self.retire_os_cache_inode(ino);
+        }
         let Some(invalidator) = self.kernel_invalidator() else {
             return;
         };
-        let mut unique = HashSet::new();
-        for ino in inodes {
-            if unique.insert(ino) && !self.should_skip_kernel_invalidation_for_active_open(ino) {
+        for ino in unique {
+            if !self.should_skip_kernel_invalidation_for_active_open(ino) {
                 invalidator.inval_inode(ino);
             }
         }

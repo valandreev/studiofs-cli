@@ -172,6 +172,26 @@ impl KernelInvalidator for RecordingKernelInvalidator {
     }
 }
 
+struct CallbackKernelInvalidator {
+    callback: Box<dyn Fn(Ino) + Send + Sync>,
+}
+
+impl CallbackKernelInvalidator {
+    fn new(callback: impl Fn(Ino) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Box::new(callback),
+        }
+    }
+}
+
+impl KernelInvalidator for CallbackKernelInvalidator {
+    fn inval_inode(&self, ino: Ino) {
+        (self.callback)(ino);
+    }
+
+    fn inval_inode_attrs(&self, _ino: Ino) {}
+}
+
 #[test]
 fn published_read_plan_cache_evicts_least_recently_used_inode_when_full() {
     let read = ReadState::new(1);
@@ -7696,6 +7716,40 @@ fn os_cache_test_file(label: &str) -> (ContractVfsFixture, Arc<StudioVfs>, Inode
     (fixture, vfs, attr)
 }
 
+fn observe_os_cache_generation(vfs: &StudioVfs, attr: &InodeAttr) -> OsCacheOpenDecision {
+    let spans = vfs
+        .sync_meta()
+        .lookup_regular_file_slices(attr.ino, 0, attr.size)
+        .expect("load OS-cache generation graph");
+    vfs.os_cache.observe(attr, spans)
+}
+
+fn os_cache_payload_test_file(
+    label: &str,
+    name: &[u8],
+    payload: &[u8],
+) -> (ContractVfsFixture, Arc<StudioVfs>, InodeAttr) {
+    let fixture = ContractVfsFixture::new(label).expect("create VFS fixture");
+    let vfs = fixture.vfs();
+    let created = vfs
+        .create(ROOT_INO, name, 501, 20, 0o644)
+        .expect("create OS-cache payload file");
+    fixture.runtime().block_on(async {
+        vfs.write(created.ino, 0, payload)
+            .await
+            .expect("write OS-cache payload");
+        vfs.flush(created.ino)
+            .await
+            .expect("flush OS-cache payload");
+    });
+    let attr = vfs.getattr(created.ino).expect("load flushed file attr");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    (fixture, vfs, attr)
+}
+
 #[test]
 fn os_cache_prepare_unknown_handle_replaces_without_error() {
     let fixture = ContractVfsFixture::new("os-cache-unknown-handle").expect("create VFS fixture");
@@ -8326,6 +8380,459 @@ fn foreground_io_active_includes_active_writers() {
     assert!(
         vfs.foreground_io_active(),
         "shared writer lifetime must protect upload rereads before access classification"
+    );
+}
+
+#[test]
+fn full_kernel_invalidation_clears_generation_before_callback() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-invalidation-before-callback");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let (decision_tx, decision_rx) = std::sync::mpsc::channel();
+    let callback_vfs = Arc::downgrade(&vfs);
+    let callback_attr = attr.clone();
+    vfs.set_kernel_invalidator(Arc::new(CallbackKernelInvalidator::new(move |_| {
+        let vfs = callback_vfs.upgrade().expect("VFS remains live");
+        decision_tx
+            .send(observe_os_cache_generation(&vfs, &callback_attr))
+            .expect("record callback observation");
+    })));
+
+    vfs.invalidate_kernel_inodes([attr.ino]);
+
+    assert_eq!(
+        decision_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("invalidation callback should run"),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+}
+
+#[test]
+fn full_kernel_invalidation_deduplicates_and_clears_all_before_first_callback() {
+    let fixture = ContractVfsFixture::new("os-cache-invalidation-all-before-callback")
+        .expect("create VFS fixture");
+    let vfs = fixture.vfs();
+    let first = vfs
+        .create(ROOT_INO, b"first.bin", 501, 20, 0o644)
+        .expect("create first file");
+    let second = vfs
+        .create(ROOT_INO, b"second.bin", 501, 20, 0o644)
+        .expect("create second file");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &first),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &second),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+
+    let first_callback = Arc::new(AtomicBool::new(true));
+    let callback_once = Arc::clone(&first_callback);
+    let callback_vfs = Arc::downgrade(&vfs);
+    let callback_first = first.clone();
+    let callback_second = second.clone();
+    let (decisions_tx, decisions_rx) = std::sync::mpsc::channel();
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let callback_seen = Arc::clone(&seen);
+    vfs.set_kernel_invalidator(Arc::new(CallbackKernelInvalidator::new(move |ino| {
+        callback_seen.lock().push(ino);
+        if callback_once.swap(false, AtomicOrdering::AcqRel) {
+            let vfs = callback_vfs.upgrade().expect("VFS remains live");
+            decisions_tx
+                .send((
+                    observe_os_cache_generation(&vfs, &callback_first),
+                    observe_os_cache_generation(&vfs, &callback_second),
+                ))
+                .expect("record first callback observations");
+        }
+    })));
+
+    vfs.invalidate_kernel_inodes([first.ino, second.ino, first.ino, second.ino]);
+
+    assert_eq!(
+        decisions_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first callback should inspect both generations"),
+        (
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+        )
+    );
+    let mut seen = seen.lock().clone();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![first.ino, second.ino]);
+}
+
+#[test]
+fn full_invalidation_clears_generation_without_platform_invalidator() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-invalidation-without-platform");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+
+    vfs.invalidate_kernel_inodes([attr.ino]);
+
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+}
+
+#[test]
+fn full_kernel_invalidation_clears_generation_when_callback_is_suppressed_for_active_open() {
+    let (fixture, vfs, attr) = os_cache_test_file("os-cache-invalidation-active-open");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let writer = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open active writer");
+    fixture
+        .meta()
+        .unlink(ROOT_INO, b"os-cache.bin")
+        .expect("remove the active-open inode from the namespace");
+    assert!(vfs.best_effort_path_for_inode(attr.ino).is_none());
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
+
+    vfs.invalidate_kernel_inodes([attr.ino]);
+
+    assert!(invalidator.snapshot().is_empty());
+    assert_eq!(
+        vfs.os_cache.observe(&attr, Vec::new()),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    futures::executor::block_on(vfs.release_fh(writer)).expect("release active writer");
+}
+
+#[test]
+fn invalidation_callback_can_reenter_generation_observation() {
+    let fixture =
+        ContractVfsFixture::new("os-cache-invalidation-reentry").expect("create VFS fixture");
+    let vfs = fixture.vfs();
+    let first = vfs
+        .create(ROOT_INO, b"reentry-first.bin", 501, 20, 0o644)
+        .expect("create first file");
+    let second = vfs
+        .create(ROOT_INO, b"reentry-second.bin", 501, 20, 0o644)
+        .expect("create second file");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &first),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &second),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let fresh_read = vfs
+        .open_file(second.ino, OpenFlags::RDONLY, false)
+        .expect("open fresh unprepared reader");
+    let callback_once = Arc::new(AtomicBool::new(true));
+    let callback_gate = Arc::clone(&callback_once);
+    let callback_vfs = Arc::downgrade(&vfs);
+    let (decision_tx, decision_rx) = std::sync::mpsc::channel();
+    vfs.set_kernel_invalidator(Arc::new(CallbackKernelInvalidator::new(move |_| {
+        if callback_gate.swap(false, AtomicOrdering::AcqRel) {
+            let vfs = callback_vfs.upgrade().expect("VFS remains live");
+            decision_tx
+                .send(vfs.prepare_os_cache_open(fresh_read, OsCacheParticipation::Enabled))
+                .expect("record reentrant preparation");
+        }
+    })));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let invalidation_vfs = Arc::clone(&vfs);
+    let invalidation = std::thread::spawn(move || {
+        invalidation_vfs.invalidate_kernel_inodes([first.ino, second.ino]);
+        done_tx.send(()).expect("report invalidation completion");
+    });
+
+    assert_eq!(
+        decision_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback reentry must not deadlock"),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("invalidation must finish after callback reentry");
+    invalidation
+        .join()
+        .expect("invalidation thread should not panic");
+}
+
+#[test]
+fn attribute_only_invalidation_preserves_generation() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-attribute-invalidation");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
+
+    vfs.invalidate_kernel_inode_attrs([attr.ino]);
+
+    assert_eq!(invalidator.attr_snapshot(), vec![attr.ino]);
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::reuse()
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_final_unlink_without_open_handles_clears_generation() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-final-unlink");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+
+    vfs.unlink(ROOT_INO, b"os-cache.bin")
+        .expect("unlink final pathname");
+
+    assert_eq!(
+        vfs.os_cache.observe(&attr, Vec::new()),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_final_unlink_with_open_handles_clears_before_last_close() {
+    let (fixture, vfs, attr) = os_cache_test_file("os-cache-open-final-unlink");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open reader");
+    assert_eq!(
+        vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+        OsCacheOpenDecision::reuse()
+    );
+
+    vfs.unlink(ROOT_INO, b"os-cache.bin")
+        .expect("unlink final open pathname");
+
+    assert_eq!(
+        vfs.os_cache.observe(&attr, Vec::new()),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    fixture
+        .runtime()
+        .block_on(vfs.release_fh(reader))
+        .expect("release reader");
+}
+
+#[test]
+fn os_cache_generation_retirement_unlink_one_hardlink_without_open_handles_preserves_generation() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-hardlink-unlink");
+    vfs.link(attr.ino, ROOT_INO, b"os-cache-hardlink.bin")
+        .expect("create hardlink");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &attr),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+
+    vfs.unlink(ROOT_INO, b"os-cache.bin")
+        .expect("unlink one hardlink");
+
+    let remaining = vfs.getattr(attr.ino).expect("hardlink keeps inode alive");
+    assert_eq!(remaining.nlink, 1);
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &remaining),
+        OsCacheOpenDecision::reuse()
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_unlink_one_hardlink_with_open_handles_preserves_generation_and_payload_after_release()
+ {
+    const PAYLOAD: &[u8] = b"hardlink payload survives open unlink";
+    let (fixture, vfs, attr) = os_cache_payload_test_file(
+        "os-cache-open-hardlink-unlink",
+        b"open-hardlink-original.bin",
+        PAYLOAD,
+    );
+    vfs.link(attr.ino, ROOT_INO, b"open-hardlink-survivor.bin")
+        .expect("create surviving hardlink");
+    let reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open reader");
+    assert_eq!(
+        vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+        OsCacheOpenDecision::reuse()
+    );
+
+    vfs.unlink(ROOT_INO, b"open-hardlink-original.bin")
+        .expect("unlink one open hardlink");
+    fixture
+        .runtime()
+        .block_on(vfs.release_fh(reader))
+        .expect("release reader");
+
+    let remaining = vfs
+        .lookup(ROOT_INO, b"open-hardlink-survivor.bin")
+        .expect("surviving hardlink remains reachable");
+    let payload = fixture
+        .runtime()
+        .block_on(vfs.read(remaining.ino, 0, PAYLOAD.len() as u32))
+        .expect("read surviving hardlink payload");
+    assert_eq!(payload.as_ref(), PAYLOAD);
+    let remaining_attr = vfs.getattr(remaining.ino).expect("load surviving attr");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &remaining_attr),
+        OsCacheOpenDecision::reuse()
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_rename_overwrite_final_target_clears_only_target() {
+    let fixture =
+        ContractVfsFixture::new("os-cache-rename-final-target").expect("create VFS fixture");
+    let vfs = fixture.vfs();
+    let source = vfs
+        .create(ROOT_INO, b"rename-source.bin", 501, 20, 0o644)
+        .expect("create rename source");
+    let target = vfs
+        .create(ROOT_INO, b"rename-target.bin", 501, 20, 0o644)
+        .expect("create rename target");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &source),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &target),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+
+    vfs.rename(
+        ROOT_INO,
+        b"rename-source.bin",
+        ROOT_INO,
+        b"rename-target.bin",
+    )
+    .expect("rename over final target");
+
+    assert_eq!(
+        vfs.os_cache.observe(&target, Vec::new()),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    let moved = vfs.getattr(source.ino).expect("source inode remains live");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &moved),
+        OsCacheOpenDecision::reuse()
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_rename_overwrite_surviving_hardlink_preserves_generation_and_payload()
+ {
+    const PAYLOAD: &[u8] = b"rename hardlink payload survives displacement";
+    let (fixture, vfs, target) = os_cache_payload_test_file(
+        "os-cache-rename-surviving-hardlink",
+        b"rename-hardlink-target.bin",
+        PAYLOAD,
+    );
+    vfs.link(target.ino, ROOT_INO, b"rename-hardlink-survivor.bin")
+        .expect("create target hardlink");
+    let reader = vfs
+        .open_file(target.ino, OpenFlags::RDONLY, false)
+        .expect("open displaced target reader");
+    assert_eq!(
+        vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+        OsCacheOpenDecision::reuse()
+    );
+    vfs.create(ROOT_INO, b"rename-hardlink-source.bin", 501, 20, 0o644)
+        .expect("create rename source");
+
+    vfs.rename(
+        ROOT_INO,
+        b"rename-hardlink-source.bin",
+        ROOT_INO,
+        b"rename-hardlink-target.bin",
+    )
+    .expect("rename over one target hardlink");
+    fixture
+        .runtime()
+        .block_on(vfs.release_fh(reader))
+        .expect("release target reader");
+
+    let survivor = vfs
+        .lookup(ROOT_INO, b"rename-hardlink-survivor.bin")
+        .expect("target hardlink remains reachable");
+    let payload = fixture
+        .runtime()
+        .block_on(vfs.read(survivor.ino, 0, PAYLOAD.len() as u32))
+        .expect("read surviving target payload");
+    assert_eq!(payload.as_ref(), PAYLOAD);
+    let survivor_attr = vfs.getattr(survivor.ino).expect("load survivor attr");
+    assert_eq!(
+        observe_os_cache_generation(&vfs, &survivor_attr),
+        OsCacheOpenDecision::reuse()
+    );
+}
+
+#[test]
+fn os_cache_generation_retirement_rename_overwrite_open_final_target_defers_cleanup_until_release()
+{
+    const PAYLOAD: &[u8] = b"open rename target remains readable";
+    let (fixture, vfs, target) = os_cache_payload_test_file(
+        "os-cache-rename-open-final-target",
+        b"rename-open-target.bin",
+        PAYLOAD,
+    );
+    let target_spans = vfs
+        .sync_meta()
+        .lookup_regular_file_slices(target.ino, 0, target.size)
+        .expect("load target generation graph");
+    let reader = vfs
+        .open_file(target.ino, OpenFlags::RDONLY, false)
+        .expect("open final target reader");
+    assert_eq!(
+        vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+        OsCacheOpenDecision::reuse()
+    );
+    vfs.create(ROOT_INO, b"rename-open-source.bin", 501, 20, 0o644)
+        .expect("create rename source");
+
+    vfs.rename(
+        ROOT_INO,
+        b"rename-open-source.bin",
+        ROOT_INO,
+        b"rename-open-target.bin",
+    )
+    .expect("rename over open final target");
+
+    assert_eq!(
+        vfs.os_cache.observe(&target, target_spans),
+        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+    );
+    assert!(
+        !vfs.regular_file_graph_usage(&vfs.sync_meta(), target.ino)
+            .expect("inspect deferred target graph")
+            .object_ids
+            .is_empty(),
+        "open displaced target graph must survive until release"
+    );
+
+    fixture
+        .runtime()
+        .block_on(vfs.release_fh(reader))
+        .expect("release displaced target");
+    assert!(vfs.getattr(target.ino).is_err());
+    assert!(
+        vfs.regular_file_graph_usage(&vfs.sync_meta(), target.ino)
+            .expect("inspect released target graph")
+            .object_ids
+            .is_empty(),
+        "final release should remove the deferred target graph"
     );
 }
 

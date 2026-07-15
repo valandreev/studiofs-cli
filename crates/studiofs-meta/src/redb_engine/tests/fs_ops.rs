@@ -119,6 +119,37 @@ fn test_unlink_open_handle_keeps_inode_and_decrements_nlink() {
 }
 
 #[test]
+fn unlink_open_handle_with_remaining_hardlink_does_not_record_deferred_delete() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"open-unlink-original.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .link(attr.ino, ROOT_INO, b"open-unlink-hardlink.txt")
+        .unwrap();
+
+    let unlinked = engine
+        .unlink_open_handle(ROOT_INO, b"open-unlink-original.txt")
+        .unwrap();
+
+    assert_eq!(unlinked.nlink, 1);
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"open-unlink-hardlink.txt")
+            .unwrap()
+            .ino,
+        attr.ino
+    );
+    assert!(
+        engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .all(|record| record.ino != attr.ino)
+    );
+}
+
+#[test]
 fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
     let engine = temp_engine();
     let file = engine

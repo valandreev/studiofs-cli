@@ -1633,14 +1633,19 @@ impl StudioVfs {
             Err(err) => return Err(VfsError::Meta(err)),
         };
         if attr.nlink == 0 {
+            self.retire_os_cache_inode(attr.ino);
             self.mark_inode_deleted_for_uploads(attr.ino);
+            self.handle_table.mark_orphan(target.ino);
+            debug!(
+                "unlink ino={}: {} open handles, deferred cleanup (orphan)",
+                target.ino, target.open_handles
+            );
+        } else {
+            info!(
+                "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
+                attr.ino, attr.nlink
+            );
         }
-
-        self.handle_table.mark_orphan(target.ino);
-        debug!(
-            "unlink ino={}: {} open handles, deferred cleanup (orphan)",
-            target.ino, target.open_handles
-        );
         Ok(Some(attr))
     }
 
@@ -1665,6 +1670,7 @@ impl StudioVfs {
         };
 
         if attr.nlink == 0 {
+            self.retire_os_cache_inode(attr.ino);
             self.cleanup_deleted_inode_storage(
                 meta,
                 attr.ino,
@@ -2425,43 +2431,60 @@ impl StudioVfs {
         self.bump_acl_namespace_epoch();
 
         if let Some(ino) = rename_result.displaced_ino {
-            debug!(
-                parent,
-                name = %name_display,
-                new_parent,
-                new_name = %new_name_display,
-                displaced_ino = ino,
-                elapsed_ms = rename_started.elapsed().as_millis(),
-                "VFS rename collecting displaced target storage usage"
-            );
-            let displaced_usage = meta.get_regular_file_graph_object_usage(ino)?;
-            let total_bytes = displaced_usage
-                .iter()
-                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
-            let displaced_object_ids = displaced_usage
-                .into_iter()
-                .map(|(object_id, _)| object_id)
-                .collect();
+            match meta.get_attr(ino) {
+                Ok(_) => {}
+                Err(MetaError::InodeNotFound(found)) if found == ino => {
+                    self.retire_os_cache_inode(ino);
+                    let open_handles = self.handle_table.open_count(ino);
+                    if open_handles > 0 {
+                        self.mark_inode_deleted_for_uploads(ino);
+                        self.handle_table.mark_orphan(ino);
+                        debug!(
+                            displaced_ino = ino,
+                            open_handles, "VFS rename deferred open displaced target cleanup"
+                        );
+                    } else {
+                        debug!(
+                            parent,
+                            name = %name_display,
+                            new_parent,
+                            new_name = %new_name_display,
+                            displaced_ino = ino,
+                            elapsed_ms = rename_started.elapsed().as_millis(),
+                            "VFS rename collecting displaced target storage usage"
+                        );
+                        let displaced_usage = meta.get_regular_file_graph_object_usage(ino)?;
+                        let total_bytes = displaced_usage
+                            .iter()
+                            .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+                        let displaced_object_ids = displaced_usage
+                            .into_iter()
+                            .map(|(object_id, _)| object_id)
+                            .collect();
 
-            debug!(
-                parent,
-                name = %name_display,
-                new_parent,
-                new_name = %new_name_display,
-                displaced_ino = ino,
-                total_bytes,
-                elapsed_ms = rename_started.elapsed().as_millis(),
-                "VFS rename cleaning displaced target storage"
-            );
-            self.cleanup_deleted_inode_storage_deferred_cache_eviction(
-                &meta,
-                ino,
-                total_bytes,
-                "rename overwrite",
-                displaced_object_ids,
-            )?;
-            self.bump_directory_generation(ino);
-            self.dentry_cache_invalidate_parent(ino);
+                        debug!(
+                            parent,
+                            name = %name_display,
+                            new_parent,
+                            new_name = %new_name_display,
+                            displaced_ino = ino,
+                            total_bytes,
+                            elapsed_ms = rename_started.elapsed().as_millis(),
+                            "VFS rename cleaning displaced target storage"
+                        );
+                        self.cleanup_deleted_inode_storage_deferred_cache_eviction(
+                            &meta,
+                            ino,
+                            total_bytes,
+                            "rename overwrite",
+                            displaced_object_ids,
+                        )?;
+                    }
+                    self.bump_directory_generation(ino);
+                    self.dentry_cache_invalidate_parent(ino);
+                }
+                Err(err) => return Err(VfsError::Meta(err)),
+            }
         }
 
         meta.request_eager_flush();

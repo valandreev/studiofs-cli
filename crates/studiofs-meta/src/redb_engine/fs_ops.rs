@@ -404,6 +404,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
+        let records_deferred_delete = spec.records_deferred_delete() && attr.nlink == 0;
         let deleted_before_publish = if attr.nlink == 0
             && attr.kind == FileType::RegularFile
             && (attr.content_epoch != attr.committed_content_epoch
@@ -444,7 +445,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             None
         };
 
-        if spec.records_deferred_delete() {
+        if records_deferred_delete {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
             if deleted_before_publish.is_none() {
                 RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
@@ -464,7 +465,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         parent_attr.touch_mtime();
         RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &parent_attr)?;
 
-        if spec.records_deferred_delete() {
+        if records_deferred_delete {
             self.record_deferred_delete(spec, entry.ino)?;
         }
 
