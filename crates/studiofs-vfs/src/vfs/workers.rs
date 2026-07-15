@@ -8,6 +8,7 @@ use crate::{JanitorMeta, VfsMeta};
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
+    attrs: HashMap<Ino, InodeAttr>,
     payloads: HashMap<Ino, Vec<u64>>,
 }
 
@@ -134,17 +135,30 @@ fn should_run_invalidation_poll_sync(
 }
 
 fn metadata_attr_cache_invalidation_set(
-    previous_snapshot: &HashSet<Ino>,
-    current_snapshot: &HashSet<Ino>,
+    previous_snapshot: &HashMap<Ino, InodeAttr>,
+    current_snapshot: &HashMap<Ino, InodeAttr>,
     namespace_changed: bool,
     runtime_inodes: HashSet<Ino>,
 ) -> HashSet<Ino> {
-    let mut attr_cache_inodes = previous_snapshot.clone();
-    attr_cache_inodes.extend(current_snapshot.iter().copied());
     if namespace_changed {
+        let mut attr_cache_inodes = previous_snapshot.keys().copied().collect::<HashSet<_>>();
+        attr_cache_inodes.extend(current_snapshot.keys().copied());
         attr_cache_inodes.extend(runtime_inodes);
+        return attr_cache_inodes;
     }
-    attr_cache_inodes
+
+    let mut changed = HashSet::new();
+    for (ino, previous_attr) in previous_snapshot {
+        if current_snapshot.get(ino) != Some(previous_attr) {
+            changed.insert(*ino);
+        }
+    }
+    for ino in current_snapshot.keys() {
+        if !previous_snapshot.contains_key(ino) {
+            changed.insert(*ino);
+        }
+    }
+    changed
 }
 
 fn metadata_token_changes(
@@ -404,6 +418,7 @@ impl StudioVfs {
     ) -> MetaResult<MetadataTraversalSnapshot> {
         let mut seen = HashSet::from([ROOT_INO]);
         let mut stack = vec![ROOT_INO];
+        let mut attrs = HashMap::new();
         let mut payloads = HashMap::new();
 
         while let Some(ino) = stack.pop() {
@@ -412,7 +427,9 @@ impl StudioVfs {
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
             };
-            match attr.kind {
+            let kind = attr.kind;
+            attrs.insert(ino, attr);
+            match kind {
                 FileType::Directory => {
                     let entries = match engine.readdir(ino) {
                         Ok(entries) => entries,
@@ -443,6 +460,7 @@ impl StudioVfs {
 
         Ok(MetadataTraversalSnapshot {
             inodes: seen,
+            attrs,
             payloads,
         })
     }
@@ -640,7 +658,7 @@ impl StudioVfs {
         let initial_metadata_token = meta.metadata_version_token();
         let (mut last_namespace_token, mut last_metadata_token) =
             initial_metadata_invalidation_tokens(initial_namespace_token, initial_metadata_token);
-        let mut last_snapshot: Option<HashSet<Ino>> = None;
+        let mut last_snapshot: Option<HashMap<Ino, InodeAttr>> = None;
         let mut last_payload_snapshot: Option<HashMap<Ino, Vec<u64>>> = None;
 
         loop {
@@ -736,7 +754,7 @@ impl StudioVfs {
             let attr_cache_inodes = match &last_snapshot {
                 Some(last_snapshot) => metadata_attr_cache_invalidation_set(
                     last_snapshot,
-                    &current_snapshot.inodes,
+                    &current_snapshot.attrs,
                     namespace_changed,
                     runtime_inodes,
                 ),
@@ -763,7 +781,7 @@ impl StudioVfs {
             if namespace_changed || metadata_changed {
                 self.bump_acl_namespace_epoch();
             }
-            last_snapshot = Some(current_snapshot.inodes);
+            last_snapshot = Some(current_snapshot.attrs);
             last_payload_snapshot = Some(current_snapshot.payloads);
         }
     }
@@ -1598,6 +1616,28 @@ mod tests {
         Some(value.to_string())
     }
 
+    fn regular_attr(ino: Ino) -> InodeAttr {
+        InodeAttr {
+            ino,
+            kind: FileType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            committed_size: 0,
+            nlink: 1,
+            mtime: 0,
+            ctime: 0,
+            atime: 0,
+            parent: ROOT_INO,
+            crtime: 0,
+            win_attrs: 0,
+            content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: MetaUploadState::Ready,
+        }
+    }
+
     #[test]
     fn notify_wake_skips_poll_sync_when_backend_already_advanced_tokens() {
         assert!(!should_run_invalidation_poll_sync(
@@ -1672,8 +1712,8 @@ mod tests {
 
     #[test]
     fn metadata_background_invalidation_keeps_runtime_only_inodes_in_attr_cache_set() {
-        let previous = HashSet::from([ROOT_INO, 10]);
-        let current = HashSet::from([ROOT_INO, 20]);
+        let previous = HashMap::from([(ROOT_INO, regular_attr(ROOT_INO)), (10, regular_attr(10))]);
+        let current = HashMap::from([(ROOT_INO, regular_attr(ROOT_INO)), (20, regular_attr(20))]);
         let runtime_only = HashSet::from([30]);
 
         let attr_cache_inodes =
@@ -1687,8 +1727,12 @@ mod tests {
 
     #[test]
     fn metadata_background_invalidation_includes_metadata_only_published_inodes() {
-        let previous = HashSet::from([ROOT_INO, 10]);
-        let current = HashSet::from([ROOT_INO, 10, 20]);
+        let previous = HashMap::from([(ROOT_INO, regular_attr(ROOT_INO)), (10, regular_attr(10))]);
+        let current = HashMap::from([
+            (ROOT_INO, regular_attr(ROOT_INO)),
+            (10, regular_attr(10)),
+            (20, regular_attr(20)),
+        ]);
 
         let attr_cache_inodes =
             metadata_attr_cache_invalidation_set(&previous, &current, false, HashSet::new());
@@ -1697,6 +1741,33 @@ mod tests {
             attr_cache_inodes.contains(&20),
             "metadata-only publishes must invalidate newly reachable inode attrs"
         );
+    }
+
+    #[test]
+    fn metadata_only_invalidation_excludes_unchanged_attrs() {
+        let unchanged = regular_attr(ROOT_INO);
+        let previous = HashMap::from([(ROOT_INO, unchanged.clone())]);
+        let current = HashMap::from([(ROOT_INO, unchanged)]);
+
+        let attr_cache_inodes =
+            metadata_attr_cache_invalidation_set(&previous, &current, false, HashSet::new());
+
+        assert!(attr_cache_inodes.is_empty());
+    }
+
+    #[test]
+    fn metadata_only_invalidation_includes_exactly_the_changed_attr() {
+        let unchanged = regular_attr(ROOT_INO);
+        let previous_target = regular_attr(10);
+        let mut current_target = previous_target.clone();
+        current_target.size = 1;
+        let previous = HashMap::from([(ROOT_INO, unchanged.clone()), (10, previous_target)]);
+        let current = HashMap::from([(ROOT_INO, unchanged), (10, current_target)]);
+
+        let attr_cache_inodes =
+            metadata_attr_cache_invalidation_set(&previous, &current, false, HashSet::new());
+
+        assert_eq!(attr_cache_inodes, HashSet::from([10]));
     }
 
     #[test]
