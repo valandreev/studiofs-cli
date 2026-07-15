@@ -916,34 +916,8 @@ pub struct VfsFuseCallbackStats {
     pub write: VfsFuseIoStats,
 }
 
-/// macFUSE read-open kernel-cache decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VfsMacFuseOpenCacheDecision {
-    /// Read-only open kept kernel data cache for this handle.
-    ReadOnlyKeep,
-    /// Read-only open kept kernel data cache for a locally stable unpublished generation.
-    ReadOnlyLocalStableKeep,
-    /// Read-only open dropped cache because the inode state could not be read.
-    ReadOnlyUnknownState,
-    /// Read-only open dropped cache because the inode is not a regular file.
-    ReadOnlyNotRegularFile,
-    /// Read-only open dropped cache because the inode still has local dirty state.
-    ReadOnlyLocalDirtyState,
-    /// Read-only open dropped cache because a write-capable handle is still active.
-    ReadOnlyActiveWriter,
-    /// Read-only open dropped cache because this generation was not observed before.
-    ReadOnlyGenerationChanged,
-    /// Read-only open dropped a locally stable unpublished generation that was not observed before.
-    ReadOnlyLocalStableGenerationChanged,
-    /// Write-capable open intentionally disabled read-only cache retention.
-    WriteCapable,
-    /// Clean final write-capable release seeded a cacheable generation snapshot.
-    CleanWriteReleaseSeeded,
-    /// Final write-capable release seeded a locally stable unpublished generation snapshot.
-    LocalStableWriteReleaseSeeded,
-}
-
-/// macFUSE open-cache decision counters.
+/// Deprecated macFUSE open-cache counters retained for snapshot compatibility.
+#[deprecated(note = "use VfsOsCacheStats")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsMacFuseOpenCacheStats {
     /// Total macFUSE opens observed by the cache policy.
@@ -1632,6 +1606,7 @@ pub struct VfsCachePipelineStats {
 }
 
 /// Complete write-path observability snapshot.
+#[allow(deprecated)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
     /// Process identifier that produced the snapshot.
@@ -1669,7 +1644,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// FUSE callback metrics.
     #[serde(default)]
     pub fuse_callbacks: VfsFuseCallbackStats,
-    /// macFUSE open-cache decisions.
+    /// Deprecated macFUSE counters retained only for old snapshot decoding.
+    #[deprecated(note = "use os_cache")]
     #[serde(default)]
     pub macfuse_open_cache: VfsMacFuseOpenCacheStats,
     /// Platform-neutral OS page-cache decisions and lifecycle gauges.
@@ -2181,6 +2157,7 @@ pub struct VfsRuntimeEvent {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::vfs::{OsCacheOpenDecision, OsCacheReason};

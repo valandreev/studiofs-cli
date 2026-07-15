@@ -1030,6 +1030,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn read_write_path_observability_reads_snapshot_file() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let metrics_path = tmp.path().join(WRITE_PATH_OBSERVABILITY_FILE);

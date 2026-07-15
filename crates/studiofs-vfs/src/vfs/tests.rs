@@ -7797,6 +7797,26 @@ fn os_cache_stats_first_prepare_counts_once_and_idempotent_prepare_does_not() {
 }
 
 #[test]
+#[allow(deprecated)]
+fn os_cache_new_snapshots_leave_legacy_macfuse_counters_at_default() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-legacy-default");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read handle");
+    vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.os_cache.total, 1);
+    assert_eq!(
+        serde_json::to_value(snapshot.macfuse_open_cache)
+            .expect("serialize compatibility counters"),
+        serde_json::to_value(VfsMacFuseOpenCacheStats::default())
+            .expect("serialize compatibility default")
+    );
+}
+
+#[test]
 fn os_cache_stats_released_handle_counts_each_returned_unknown_decision() {
     let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-released-handle");
     let fh = vfs

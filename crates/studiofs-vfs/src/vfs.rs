@@ -70,6 +70,7 @@ pub use handle_drain_barrier::{
 /// Re-exported lock kind used by the public locking API.
 pub use locking::LockKind;
 /// Re-exported VFS observability snapshot and metrics types.
+#[allow(deprecated)]
 pub use metrics::{
     RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
@@ -77,15 +78,15 @@ pub use metrics::{
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsOsCacheStats,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2312,17 +2313,6 @@ struct MetricsState {
     fuse_write_callback_errors: AtomicU64,
     fuse_write_callback_total_ns: AtomicU64,
     fuse_write_callback_max_ns: AtomicU64,
-    macfuse_open_cache_read_only_keep: AtomicU64,
-    macfuse_open_cache_read_only_local_stable_keep: AtomicU64,
-    macfuse_open_cache_read_only_unknown_state: AtomicU64,
-    macfuse_open_cache_read_only_not_regular_file: AtomicU64,
-    macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
-    macfuse_open_cache_read_only_active_writer: AtomicU64,
-    macfuse_open_cache_read_only_generation_changed: AtomicU64,
-    macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64,
-    macfuse_open_cache_write_capable: AtomicU64,
-    macfuse_open_cache_clean_write_release_seeded: AtomicU64,
-    macfuse_open_cache_local_stable_write_release_seeded: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2502,17 +2492,6 @@ impl MetricsState {
             fuse_write_callback_errors: AtomicU64::new(0),
             fuse_write_callback_total_ns: AtomicU64::new(0),
             fuse_write_callback_max_ns: AtomicU64::new(0),
-            macfuse_open_cache_read_only_keep: AtomicU64::new(0),
-            macfuse_open_cache_read_only_local_stable_keep: AtomicU64::new(0),
-            macfuse_open_cache_read_only_unknown_state: AtomicU64::new(0),
-            macfuse_open_cache_read_only_not_regular_file: AtomicU64::new(0),
-            macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
-            macfuse_open_cache_read_only_active_writer: AtomicU64::new(0),
-            macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
-            macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64::new(0),
-            macfuse_open_cache_write_capable: AtomicU64::new(0),
-            macfuse_open_cache_clean_write_release_seeded: AtomicU64::new(0),
-            macfuse_open_cache_local_stable_write_release_seeded: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2670,17 +2649,6 @@ impl MetricsState {
             fuse_write_callback_errors,
             fuse_write_callback_total_ns,
             fuse_write_callback_max_ns,
-            macfuse_open_cache_read_only_keep,
-            macfuse_open_cache_read_only_local_stable_keep,
-            macfuse_open_cache_read_only_unknown_state,
-            macfuse_open_cache_read_only_not_regular_file,
-            macfuse_open_cache_read_only_local_dirty_state,
-            macfuse_open_cache_read_only_active_writer,
-            macfuse_open_cache_read_only_generation_changed,
-            macfuse_open_cache_read_only_local_stable_generation_changed,
-            macfuse_open_cache_write_capable,
-            macfuse_open_cache_clean_write_release_seeded,
-            macfuse_open_cache_local_stable_write_release_seeded,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -7321,80 +7289,6 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
-    /// Record a macFUSE open-cache decision for mounted diagnostics.
-    pub fn record_macfuse_open_cache_decision(&self, decision: VfsMacFuseOpenCacheDecision) {
-        let metrics = &self.state.metrics;
-        // Local-stable counters refine the aggregate keep/drop/seed totals. The
-        // aggregate remains the canonical summary, while the subtype explains
-        // which decisions happened before remote publication.
-        match decision {
-            VfsMacFuseOpenCacheDecision::ReadOnlyKeep => {
-                metrics
-                    .macfuse_open_cache_read_only_keep
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableKeep => {
-                metrics
-                    .macfuse_open_cache_read_only_keep
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .macfuse_open_cache_read_only_local_stable_keep
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState => {
-                metrics
-                    .macfuse_open_cache_read_only_unknown_state
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile => {
-                metrics
-                    .macfuse_open_cache_read_only_not_regular_file
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState => {
-                metrics
-                    .macfuse_open_cache_read_only_local_dirty_state
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyActiveWriter => {
-                metrics
-                    .macfuse_open_cache_read_only_active_writer
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged => {
-                metrics
-                    .macfuse_open_cache_read_only_generation_changed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableGenerationChanged => {
-                metrics
-                    .macfuse_open_cache_read_only_generation_changed
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .macfuse_open_cache_read_only_local_stable_generation_changed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::WriteCapable => {
-                metrics
-                    .macfuse_open_cache_write_capable
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded => {
-                metrics
-                    .macfuse_open_cache_clean_write_release_seeded
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            VfsMacFuseOpenCacheDecision::LocalStableWriteReleaseSeeded => {
-                metrics
-                    .macfuse_open_cache_clean_write_release_seeded
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .macfuse_open_cache_local_stable_write_release_seeded
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
     /// Record FUSE write callback observability.
     pub fn record_fuse_write_callback(
         &self,
@@ -7804,6 +7698,7 @@ impl StudioVfs {
     }
 
     /// Snapshot write-path observability counters and metrics.
+    #[allow(deprecated)]
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
         macro_rules! load_metric {
@@ -7891,22 +7786,6 @@ impl StudioVfs {
             fuse_write_callback_errors: fuse_write_callback_errors,
             fuse_write_callback_total_ns: fuse_write_callback_total_ns,
             fuse_write_callback_max_ns: fuse_write_callback_max_ns,
-            macfuse_open_cache_read_only_keep: macfuse_open_cache_read_only_keep,
-            macfuse_open_cache_read_only_local_stable_keep:
-                macfuse_open_cache_read_only_local_stable_keep,
-            macfuse_open_cache_read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
-            macfuse_open_cache_read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
-            macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
-            macfuse_open_cache_read_only_active_writer:
-                macfuse_open_cache_read_only_active_writer,
-            macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
-            macfuse_open_cache_read_only_local_stable_generation_changed:
-                macfuse_open_cache_read_only_local_stable_generation_changed,
-            macfuse_open_cache_write_capable: macfuse_open_cache_write_capable,
-            macfuse_open_cache_clean_write_release_seeded:
-                macfuse_open_cache_clean_write_release_seeded,
-            macfuse_open_cache_local_stable_write_release_seeded:
-                macfuse_open_cache_local_stable_write_release_seeded,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -8560,33 +8439,7 @@ impl StudioVfs {
                     elapsed,
                 ),
             },
-            macfuse_open_cache: {
-                let read_only_drop = macfuse_open_cache_read_only_unknown_state
-                    .saturating_add(macfuse_open_cache_read_only_not_regular_file)
-                    .saturating_add(macfuse_open_cache_read_only_local_dirty_state)
-                    .saturating_add(macfuse_open_cache_read_only_active_writer)
-                    .saturating_add(macfuse_open_cache_read_only_generation_changed);
-                VfsMacFuseOpenCacheStats {
-                    total: macfuse_open_cache_read_only_keep
-                        .saturating_add(read_only_drop)
-                        .saturating_add(macfuse_open_cache_write_capable),
-                    read_only_keep: macfuse_open_cache_read_only_keep,
-                    read_only_local_stable_keep: macfuse_open_cache_read_only_local_stable_keep,
-                    read_only_drop,
-                    read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
-                    read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
-                    read_only_not_fully_committed: 0,
-                    read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
-                    read_only_active_writer: macfuse_open_cache_read_only_active_writer,
-                    read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
-                    read_only_local_stable_generation_changed:
-                        macfuse_open_cache_read_only_local_stable_generation_changed,
-                    write_capable: macfuse_open_cache_write_capable,
-                    clean_write_release_seeded: macfuse_open_cache_clean_write_release_seeded,
-                    local_stable_write_release_seeded:
-                        macfuse_open_cache_local_stable_write_release_seeded,
-                }
-            },
+            macfuse_open_cache: Default::default(),
             os_cache: self.os_cache.stats(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),

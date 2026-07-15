@@ -528,7 +528,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let opened = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only");
         let bytes = adapter
             .read(attr.ino, opened.file_handle(), 6, 4)
@@ -599,7 +599,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let opened = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only");
 
         let bytes = adapter
@@ -631,10 +631,10 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open writer to hold read gate");
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let queued = adapter
@@ -679,10 +679,10 @@ mod tests {
             7,
         );
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open writer to hold read gate");
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         vfs.reset_diagnostics_observability();
         let held_capacity = adapter.hold_read_capacity_for_test(7);
@@ -738,7 +738,7 @@ mod tests {
             7,
         );
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         let held_capacity = adapter.hold_read_capacity_for_test(7);
 
@@ -794,7 +794,7 @@ mod tests {
             7,
         );
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         vfs.reset_diagnostics_observability();
         let held_capacity = adapter.hold_read_capacity_for_test(7);
@@ -859,7 +859,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let queued = adapter
@@ -896,7 +896,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -956,7 +956,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1017,7 +1017,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1072,7 +1072,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1144,7 +1144,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1160,10 +1160,6 @@ mod tests {
         invalidator.inval_inode_attrs(attr.ino);
 
         invalidator.inval_inode(attr.ino);
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "data invalidation must force the next open to drop cached pages"
-        );
 
         fixture
             .runtime()
@@ -1267,7 +1263,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         let held_capacity = adapter.hold_read_capacity_for_test(8);
         let queued = adapter
@@ -1334,7 +1330,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1385,7 +1381,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let first = adapter
@@ -1435,7 +1431,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         let queued = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4)
@@ -1476,7 +1472,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         let oversized_request = super::adapter::max_reusable_read_buffer_capacity_for_test() + 1;
 
@@ -1519,7 +1515,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let queued = adapter
@@ -1564,7 +1560,7 @@ mod tests {
             4,
         );
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
         let queued = adapter
@@ -1622,13 +1618,13 @@ mod tests {
         vfs.reset_diagnostics_observability();
 
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open writer through macFUSE adapter");
         let accepted = adapter
             .write(attr.ino, writer.file_handle(), 0, b"hello from macFUSE")
             .expect("write payload through macFUSE adapter");
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
         let bytes = adapter
             .read(attr.ino, reader.file_handle(), 0, 18)
@@ -1661,7 +1657,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open writer through macFUSE adapter");
         let payload = vec![0x5Au8; 5 * 1024 * 1024];
 
@@ -1712,7 +1708,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_RDWR)
+            .open_for_test(attr.ino, libc::O_RDWR)
             .expect("open writable handle through macFUSE adapter");
 
         adapter
@@ -1731,7 +1727,7 @@ mod tests {
             .release(attr.ino, writer.file_handle())
             .expect("release writable handle through macFUSE adapter");
         let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("reopen reader through macFUSE adapter");
         let bytes = adapter
             .read(attr.ino, reader.file_handle(), 0, 32)
@@ -1760,7 +1756,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_RDWR)
+            .open_for_test(attr.ino, libc::O_RDWR)
             .expect("open writable handle through macFUSE adapter");
 
         let initial = b"open handle payload";
@@ -1811,7 +1807,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_RDONLY | libc::O_APPEND)
+            .open_for_test(attr.ino, libc::O_RDONLY | libc::O_APPEND)
             .expect("open append handle through macFUSE adapter");
 
         fixture
@@ -1967,19 +1963,19 @@ mod tests {
         );
 
         assert_eq!(
-            adapter.open(attr.ino, libc::O_WRONLY).unwrap_err(),
+            adapter.open_for_test(attr.ino, libc::O_WRONLY).unwrap_err(),
             libc::EROFS
         );
         assert_eq!(
             adapter
-                .open(attr.ino, libc::O_RDONLY | libc::O_TRUNC)
+                .open_for_test(attr.ino, libc::O_RDONLY | libc::O_TRUNC)
                 .unwrap_err(),
             libc::EROFS
         );
     }
 
     #[test]
-    fn cache_policy_keeps_kernel_cache_only_for_read_only_handles() {
+    fn shared_os_cache_policy_enables_reuse_only_for_read_only_handles() {
         let read_only = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, false);
         assert!(!read_only.direct_io);
         assert!(read_only.keep_cache);
@@ -2003,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_keeps_kernel_cache_only_for_unchanged_read_only_generation() {
+    fn shared_os_cache_generation_decisions_drive_adapter_keep_cache_flags() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-generation",
         )
@@ -2021,9 +2017,15 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
-        let first_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (first_open, first_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open first read-only handle");
+        assert_eq!(
+            first_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !first_open.keep_cache(),
             "first open must invalidate unknown kernel pages: {first_open:?}"
@@ -2032,9 +2034,15 @@ mod tests {
             .release(attr.ino, first_open.file_handle())
             .expect("release first handle");
 
-        let repeated_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (repeated_open, repeated_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open repeated read-only handle");
+        assert_eq!(
+            repeated_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Reuse
+        );
         assert!(
             repeated_open.keep_cache(),
             "unchanged repeated open may keep kernel pages: {repeated_open:?}"
@@ -2046,21 +2054,29 @@ mod tests {
         vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1))
             .expect("advance visible file generation");
 
-        let changed_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (changed_open, changed_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open after visible generation changed");
+        assert_eq!(
+            changed_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !changed_open.keep_cache(),
             "changed generation must invalidate kernel pages: {changed_open:?}"
         );
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.read_only_keep, 1);
-        assert_eq!(cache_decisions.read_only_drop, 2);
-        assert_eq!(cache_decisions.read_only_generation_changed, 1);
+        let cache_decisions = vfs.write_path_observability_snapshot().os_cache;
+        assert_eq!(cache_decisions.reuse, 1);
+        assert_eq!(cache_decisions.replace, 2);
+        assert_eq!(cache_decisions.first_observation, 1);
+        assert_eq!(cache_decisions.generation_changed, 1);
+        assert_eq!(cache_decisions.stable_generation, 1);
     }
 
     #[test]
-    fn adapter_clean_write_capable_release_makes_next_read_drop_kernel_cache() {
+    fn shared_os_cache_final_writer_release_makes_next_read_replace() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-write-open",
         )
@@ -2079,13 +2095,13 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let first_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open first read-only handle");
         adapter
             .release(attr.ino, first_open.file_handle())
             .expect("release first handle");
         let repeated_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open repeated read-only handle");
         assert!(
             repeated_open.keep_cache(),
@@ -2095,40 +2111,56 @@ mod tests {
             .release(attr.ino, repeated_open.file_handle())
             .expect("release repeated handle");
 
-        let write_open = adapter
-            .open(attr.ino, libc::O_WRONLY)
+        let (write_open, write_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_WRONLY)
             .expect("open write-capable handle");
+        assert_eq!(
+            write_decision
+                .expect("regular open must have a shared decision")
+                .reason(),
+            studiofs_vfs::OsCacheReason::WriteCapable
+        );
         assert!(
             !write_open.keep_cache(),
             "write-capable open must not keep cache: {write_open:?}"
         );
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "active write-capable open must clear previous cache observation"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            1
         );
         adapter
             .release(attr.ino, write_open.file_handle())
             .expect("release write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "clean final write release must leave the first read-only open to drop kernel pages"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            0
         );
 
-        let read_after_write_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (read_after_write_open, read_after_write_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after write-capable open");
+        assert_eq!(
+            read_after_write_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !read_after_write_open.keep_cache(),
             "first read-only open after clean write release should drop cache: {read_after_write_open:?}"
         );
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.clean_write_release_seeded, 0);
-        assert_eq!(cache_decisions.read_only_generation_changed, 2);
-        assert_eq!(cache_decisions.read_only_keep, 1);
+        let cache_decisions = vfs.write_path_observability_snapshot().os_cache;
+        assert_eq!(cache_decisions.write_capable, 1);
+        assert_eq!(cache_decisions.reuse, 1);
+        assert_eq!(cache_decisions.replace, 3);
     }
 
     #[test]
-    fn adapter_read_only_handle_keeps_foreground_read_active_until_release() {
+    fn shared_os_cache_read_handle_keeps_foreground_lifecycle_until_release() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-read-handle-foreground-lease",
         )
@@ -2147,22 +2179,34 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let opened = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle");
         assert_eq!(
             vfs.foreground_reads_inflight(),
             1,
             "read-only handle must keep background disk rereads paused while UBC serves pages"
         );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_foreground_handles,
+            1
+        );
 
         adapter
             .release(attr.ino, opened.file_handle())
             .expect("release read-only handle");
         assert_eq!(vfs.foreground_reads_inflight(), 0);
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_foreground_handles,
+            0
+        );
     }
 
     #[test]
-    fn adapter_clean_write_release_drops_cache_while_read_only_handle_remains_open() {
+    fn shared_os_cache_writer_release_replaces_while_reader_remains_open() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-read-open-during-write-release",
         )
@@ -2181,37 +2225,53 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let initial_read = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open initial read-only handle");
         adapter
             .release(attr.ino, initial_read.file_handle())
             .expect("release initial read-only handle");
         let held_read = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle that remains active");
         assert!(
             held_read.keep_cache(),
             "setup should establish a cacheable read-only handle: {held_read:?}"
         );
 
-        let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+        let (writer, writer_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_WRONLY)
             .expect("open clean write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "active write-capable open must clear previous cache observation"
+        assert_eq!(
+            writer_decision
+                .expect("regular open must have a shared decision")
+                .reason(),
+            studiofs_vfs::OsCacheReason::WriteCapable
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            1
         );
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release clean write-capable handle while read-only handle remains open");
 
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "closing the last write-capable handle must clear the cache observation"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            0
         );
-        let next_read = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (next_read, next_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after clean write release");
+        assert_eq!(
+            next_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !next_read.keep_cache(),
             "first read-only open after last write-capable release should drop cache: {next_read:?}"
@@ -2219,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_clean_write_release_waits_for_all_write_capable_handles() {
+    fn shared_os_cache_writer_lifecycle_waits_for_all_write_capable_handles() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-multiple-write-release",
         )
@@ -2238,30 +2298,40 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let first_writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open first write-capable handle");
         let second_writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open second write-capable handle");
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            2
+        );
         adapter
             .release(attr.ino, first_writer.file_handle())
             .expect("release first write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "snapshot must remain cleared while another write-capable handle is active"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            1
         );
 
         adapter
             .release(attr.ino, second_writer.file_handle())
             .expect("release second write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "snapshot should remain cleared after the last write-capable handle closes"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            0
         );
     }
 
     #[test]
-    fn adapter_dirty_write_release_drops_cache_after_final_write_capable_handle() {
+    fn shared_os_cache_dirty_state_and_final_writer_release_replace() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-dirty-write-release",
         )
@@ -2280,10 +2350,10 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let first_writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open first write-capable handle");
         let second_writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open second write-capable handle");
         adapter
             .write(attr.ino, first_writer.file_handle(), 0, b"dirty write")
@@ -2292,13 +2362,21 @@ mod tests {
             .release(attr.ino, first_writer.file_handle())
             .expect("release first write-capable handle");
 
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "dirty release must not seed while another write-capable handle remains active"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            1
         );
-        let read_while_writer_active = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (read_while_writer_active, read_while_writer_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle while write-capable handle remains active");
+        assert_eq!(
+            read_while_writer_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !read_while_writer_active.keep_cache(),
             "read-only open while a write-capable handle remains active must drop cache: {read_while_writer_active:?}"
@@ -2306,20 +2384,27 @@ mod tests {
         adapter
             .release(attr.ino, read_while_writer_active.file_handle())
             .expect("release read-only handle");
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.clean_write_release_seeded, 0);
-        assert_eq!(cache_decisions.read_only_local_dirty_state, 1);
+        let cache_decisions = vfs.write_path_observability_snapshot().os_cache;
+        assert_eq!(cache_decisions.local_dirty_state, 1);
 
         adapter
             .release(attr.ino, second_writer.file_handle())
             .expect("release final write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "final write-capable release should leave the next read-only open to drop cache"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            0
         );
-        let read_after_final_writer = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (read_after_final_writer, read_after_final_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after final write release");
+        assert_eq!(
+            read_after_final_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !read_after_final_writer.keep_cache(),
             "first read-only open after final dirty write release should drop cache: {read_after_final_writer:?}"
@@ -2327,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_clean_active_writer_records_active_writer_cache_drop() {
+    fn shared_os_cache_clean_active_writer_forces_replace() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-clean-active-writer",
         )
@@ -2346,19 +2431,25 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open write-capable handle without writing");
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (reader, reader_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle while clean writer remains active");
 
+        assert_eq!(
+            reader_decision
+                .expect("regular open must have a shared decision")
+                .reason(),
+            studiofs_vfs::OsCacheReason::ActiveWriter
+        );
         assert!(
             !reader.keep_cache(),
             "read-only open while a clean writer remains active must drop cache: {reader:?}"
         );
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.read_only_active_writer, 1);
-        assert_eq!(cache_decisions.read_only_local_dirty_state, 0);
+        let cache_decisions = vfs.write_path_observability_snapshot().os_cache;
+        assert_eq!(cache_decisions.active_writer, 1);
+        assert_eq!(cache_decisions.local_dirty_state, 0);
 
         adapter
             .release(attr.ino, reader.file_handle())
@@ -2369,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_locally_materialized_write_release_drops_unpublished_kernel_cache_observation() {
+    fn shared_os_cache_locally_materialized_write_release_forces_replace() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-local-stable-write-release",
         )
@@ -2388,7 +2479,7 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let writer = adapter
-            .open(attr.ino, libc::O_WRONLY)
+            .open_for_test(attr.ino, libc::O_WRONLY)
             .expect("open write-capable handle");
         adapter
             .write(attr.ino, writer.file_handle(), 0, b"locally stable write")
@@ -2396,9 +2487,11 @@ mod tests {
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release write-capable handle");
-        assert!(
-            !adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "locally stable unpublished release should not seed a kernel cache observation"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .os_cache
+                .active_writers,
+            0
         );
         fixture
             .runtime()
@@ -2417,24 +2510,27 @@ mod tests {
             "final release should drain dirty local state before a read-only cache observation"
         );
 
-        let read_after_local_release = adapter
-            .open(attr.ino, libc::O_RDONLY)
+        let (read_after_local_release, read_after_local_decision) = adapter
+            .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after local-stable write release");
+        assert_eq!(
+            read_after_local_decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
         assert!(
             !read_after_local_release.keep_cache(),
             "first read-only open after local-stable release should drop cache: {read_after_local_release:?}"
         );
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.clean_write_release_seeded, 0);
-        assert_eq!(cache_decisions.local_stable_write_release_seeded, 0);
-        assert_eq!(cache_decisions.read_only_keep, 0);
-        assert_eq!(cache_decisions.read_only_local_stable_keep, 0);
-        assert_eq!(cache_decisions.read_only_generation_changed, 1);
-        assert_eq!(cache_decisions.read_only_local_stable_generation_changed, 1);
+        let cache_decisions = vfs.write_path_observability_snapshot().os_cache;
+        assert_eq!(cache_decisions.write_capable, 1);
+        assert_eq!(cache_decisions.reuse, 0);
+        assert_eq!(cache_decisions.replace, 2);
     }
 
     #[test]
-    fn adapter_unlink_clears_kernel_cache_observation_for_removed_inode() {
+    fn shared_os_cache_final_unlink_removes_generation_observation() {
         #[derive(Default)]
         struct RecordingInvalidator {
             data_calls: AtomicUsize,
@@ -2460,25 +2556,40 @@ mod tests {
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open first read-only handle");
         adapter
             .release(attr.ino, first_open.file_handle())
             .expect("release first handle");
         let repeated_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open repeated read-only handle");
         assert!(repeated_open.keep_cache());
         adapter
             .release(attr.ino, repeated_open.file_handle())
             .expect("release repeated handle");
-        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let pending_after_unlink = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("begin read before final unlink");
 
         adapter
             .unlink(root, b"unlink-cache.txt")
             .expect("unlink through macFUSE adapter");
 
-        assert!(!adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let (after_unlink, decision) = adapter
+            .complete_open_result_for_test(pending_after_unlink)
+            .expect("complete read opened before final unlink");
+        assert_eq!(
+            decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
+        assert!(!after_unlink.keep_cache());
+        adapter
+            .release(attr.ino, after_unlink.file_handle())
+            .expect("release read opened before unlink");
+        adapter.forget(attr.ino, 1);
         let calls_before_late_completion = inner.data_calls.load(Ordering::Acquire);
         invalidator.inval_inode(attr.ino);
         assert_eq!(
@@ -2500,7 +2611,7 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let (attr, open) = adapter
-            .create(root, b".DS_Store", 0o644, libc::O_RDWR)
+            .create_for_test(root, b".DS_Store", 0o644, libc::O_RDWR)
             .expect("create hidden Finder metadata file");
         assert!(adapter.file_flags_contains_for_test(attr.ino));
         adapter
@@ -2538,7 +2649,7 @@ mod tests {
         let inner = Arc::new(RecordingInvalidator::default());
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
         let (attr, writer) = adapter
-            .create(root, b"late-completion.bin", 0o644, libc::O_WRONLY)
+            .create_for_test(root, b"late-completion.bin", 0o644, libc::O_WRONLY)
             .expect("create file through macFUSE adapter");
         adapter
             .write(attr.ino, writer.file_handle(), 0, b"pending upload")
@@ -2561,7 +2672,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_unlink_keeps_kernel_cache_observation_for_remaining_hardlink() {
+    fn shared_os_cache_unlink_with_remaining_hardlink_retains_observation() {
         #[derive(Default)]
         struct RecordingInvalidator {
             data_calls: AtomicUsize,
@@ -2590,25 +2701,39 @@ mod tests {
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
 
         let first_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open first read-only handle");
         adapter
             .release(attr.ino, first_open.file_handle())
             .expect("release first handle");
         let repeated_open = adapter
-            .open(attr.ino, libc::O_RDONLY)
+            .open_for_test(attr.ino, libc::O_RDONLY)
             .expect("open repeated read-only handle");
         assert!(repeated_open.keep_cache());
         adapter
             .release(attr.ino, repeated_open.file_handle())
             .expect("release repeated handle");
-        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let pending_after_unlink = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("begin read before unlinking one hardlink");
 
         adapter
             .unlink(root, b"hardlink-source.txt")
             .expect("unlink one hardlink through macFUSE adapter");
 
-        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+        let (after_unlink, decision) = adapter
+            .complete_open_result_for_test(pending_after_unlink)
+            .expect("complete read after unlinking one hardlink");
+        assert_eq!(
+            decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Reuse
+        );
+        assert!(after_unlink.keep_cache());
+        adapter
+            .release(attr.ino, after_unlink.file_handle())
+            .expect("release read after hardlink unlink");
         assert_eq!(
             vfs.lookup(root, b"hardlink-remaining.txt")
                 .expect("remaining hardlink should still resolve")
@@ -2625,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_rename_closes_liveness_for_overwritten_final_link() {
+    fn shared_os_cache_rename_overwrite_final_target_removes_observation() {
         #[derive(Default)]
         struct RecordingInvalidator {
             data_calls: AtomicUsize,
@@ -2657,6 +2782,22 @@ mod tests {
         adapter
             .lookup(root, b"rename-destination.txt")
             .expect("observe overwritten destination inode");
+        let initial = adapter
+            .open_for_test(overwritten.ino, libc::O_RDONLY)
+            .expect("open initial target reader");
+        adapter
+            .release(overwritten.ino, initial.file_handle())
+            .expect("release initial target reader");
+        let repeated = adapter
+            .open_for_test(overwritten.ino, libc::O_RDONLY)
+            .expect("open repeated target reader");
+        assert!(repeated.keep_cache());
+        adapter
+            .release(overwritten.ino, repeated.file_handle())
+            .expect("release repeated target reader");
+        let pending_after_rename = adapter
+            .open(overwritten.ino, libc::O_RDONLY)
+            .expect("begin target read before rename overwrite");
         adapter
             .rename(root, b"rename-source.txt", root, b"rename-destination.txt")
             .expect("rename over final destination link");
@@ -2667,6 +2808,20 @@ mod tests {
                 .ino,
             source.ino
         );
+        let (after_rename, decision) = adapter
+            .complete_open_result_for_test(pending_after_rename)
+            .expect("complete target read after rename overwrite");
+        assert_eq!(
+            decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace
+        );
+        assert!(!after_rename.keep_cache());
+        adapter
+            .release(overwritten.ino, after_rename.file_handle())
+            .expect("release overwritten target reader");
+        adapter.forget(overwritten.ino, 1);
         invalidator.inval_inode(overwritten.ino);
         assert_eq!(
             inner.data_calls.load(Ordering::Acquire),
@@ -2776,7 +2931,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_open_cache_observations_are_bounded() {
+    fn shared_os_cache_observations_are_bounded_by_shared_capacity() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-bounded",
         )
@@ -2785,29 +2940,41 @@ mod tests {
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let limit = adapter.open_cache_snapshot_limit_for_test();
+        const SHARED_CAPACITY: usize = 8192;
+        let mut first_ino = None;
 
-        for index in 0..(limit + 3) {
+        for index in 0..(SHARED_CAPACITY + 3) {
             let name = format!("bounded-{index}.txt");
             let attr = vfs
                 .create(root, name.as_bytes(), 501, 20, 0o644)
                 .expect("create file");
-            let first_open = adapter
-                .open(attr.ino, libc::O_RDONLY)
+            first_ino.get_or_insert(attr.ino);
+            let (opened, decision) = adapter
+                .open_with_decision_for_test(attr.ino, libc::O_RDONLY)
                 .expect("open first read-only handle");
+            assert_eq!(
+                decision
+                    .expect("regular open must have a shared decision")
+                    .disposition(),
+                studiofs_vfs::OsCacheDisposition::Replace
+            );
             adapter
-                .release(attr.ino, first_open.file_handle())
+                .release(attr.ino, opened.file_handle())
                 .expect("release first handle");
-            let repeated_open = adapter
-                .open(attr.ino, libc::O_RDONLY)
-                .expect("open repeated read-only handle");
-            assert!(repeated_open.keep_cache());
-            adapter
-                .release(attr.ino, repeated_open.file_handle())
-                .expect("release repeated handle");
         }
 
-        assert!(adapter.open_cache_snapshot_count_for_test() <= limit);
+        let first_ino = first_ino.expect("test creates at least one file");
+        let (reopened, decision) = adapter
+            .open_with_decision_for_test(first_ino, libc::O_RDONLY)
+            .expect("reopen oldest observation after capacity pressure");
+        assert_eq!(
+            decision
+                .expect("regular open must have a shared decision")
+                .disposition(),
+            studiofs_vfs::OsCacheDisposition::Replace,
+            "the oldest observation must be evicted once shared capacity is exceeded"
+        );
+        assert!(!reopened.keep_cache());
     }
 
     #[test]

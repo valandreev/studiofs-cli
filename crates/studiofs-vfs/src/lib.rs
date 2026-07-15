@@ -39,6 +39,7 @@ pub use runtime::{
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;
+#[allow(deprecated)]
 pub use vfs::{
     BarrierObservabilityPort, DeferredCleanupHintPort, DeleteCleanupPort, DirEntryWithAttr,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
@@ -53,16 +54,16 @@ pub use vfs::{
     VfsCacheStateSnapshot, VfsConfig, VfsConfigRaw, VfsConfigValidated, VfsError, VfsFetchStats,
     VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsOsCacheStats, VfsPortableAllocatorStats, VfsResult, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
-    VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
-    VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
-    is_hidden_platform_root_metadata_name, read_runtime_stats_buffer,
+    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsOsCacheStats,
+    VfsPortableAllocatorStats, VfsResult, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
+    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathWinfspForegroundFlushStats, VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry,
+    VfsZeroIoHealthSignal, VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot,
+    VfsZeroIoStartupReplaySnapshot, is_hidden_platform_root_metadata_name,
+    read_runtime_stats_buffer,
 };
