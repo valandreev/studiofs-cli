@@ -1,7 +1,9 @@
 use super::*;
+use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,7 @@ const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
+const RUNTIME_STATS_FH_START: u64 = u64::MAX / 2;
 const ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_EXIT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -225,6 +228,8 @@ pub(crate) struct SessionState {
     connection_config: LinuxFuseConnectionConfig,
     negotiated_geometry: OnceLock<LinuxFuseNegotiatedGeometry>,
     metric_config: LinuxFuseAsyncWriteMetricConfig,
+    next_runtime_stats_fh: AtomicU64,
+    runtime_stats_handles: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -357,6 +362,8 @@ impl SessionState {
             connection_config,
             negotiated_geometry: OnceLock::new(),
             metric_config: LinuxFuseAsyncWriteMetricConfig { cache_policy },
+            next_runtime_stats_fh: AtomicU64::new(RUNTIME_STATS_FH_START),
+            runtime_stats_handles: Mutex::new(HashMap::new()),
         };
         state.publish_fuse_connection_snapshot(None);
         state
@@ -1579,6 +1586,9 @@ pub extern "C" fn studiofs_linux_fuse_open(
         return;
     }
     match state.open(ino, fi) {
+        Ok(opened) if state.vfs.is_runtime_stats_file_ino(ino) => {
+            reply_runtime_stats_open(req, state, fi, opened);
+        }
         Ok(opened) => reply_file_open(req, state, fi, opened),
         Err(errno) => reply_error(req, errno),
     }
@@ -1596,6 +1606,16 @@ pub extern "C" fn studiofs_linux_fuse_read(
         reply_error(req, libc::EIO);
         return;
     };
+    if let Some(result) = state.read_runtime_stats(ino, size, off, file_handle(fi)) {
+        match result {
+            Ok(buffer) => {
+                // SAFETY: `buffer` is valid for this synchronous reply.
+                unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
+            }
+            Err(errno) => reply_error(req, errno),
+        }
+        return;
+    }
     let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
@@ -2129,6 +2149,9 @@ impl SessionState {
     }
 
     fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseOpenedFile, i32> {
+        if let Some(result) = self.open_runtime_stats(ino, file_info_flags(fi)) {
+            return result;
+        }
         let attr = self.getattr_attr(ino)?;
         match attr.kind {
             FileType::RegularFile => {}
@@ -2147,6 +2170,52 @@ impl SessionState {
             .open_file_with_known_attr(&attr, open_flags, trunc)
             .map(|fh| LinuxFuseOpenedFile { fh, ino })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn open_runtime_stats(
+        &self,
+        ino: u64,
+        flags: c_int,
+    ) -> Option<Result<LinuxFuseOpenedFile, i32>> {
+        if !self.vfs.is_runtime_stats_file_ino(ino) {
+            return None;
+        }
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+        if trunc || open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR) {
+            return Some(Err(libc::EROFS));
+        }
+        let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.vfs.runtime_stats_file_text().into_bytes();
+        self.runtime_stats_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(fh, bytes);
+        Some(Ok(LinuxFuseOpenedFile { fh, ino }))
+    }
+
+    fn read_runtime_stats(
+        &self,
+        ino: u64,
+        size: usize,
+        offset: off_t,
+        fh: Option<u64>,
+    ) -> Option<Result<Vec<u8>, i32>> {
+        if !self.vfs.is_runtime_stats_file_ino(ino) {
+            return None;
+        }
+        Some((|| {
+            let fh = fh.ok_or(libc::EBADF)?;
+            let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+            let mut buffer = vec![0; clamp_read_size(size)];
+            let handles = self
+                .runtime_stats_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let bytes = handles.get(&fh).ok_or(libc::EBADF)?;
+            let read = studiofs_vfs::read_runtime_stats_buffer(bytes, offset, &mut buffer);
+            buffer.truncate(read as usize);
+            Ok(buffer)
+        })())
     }
 
     fn read(
@@ -2322,6 +2391,15 @@ impl SessionState {
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
+        if fh >= RUNTIME_STATS_FH_START
+            && self
+                .runtime_stats_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&fh)
+        {
+            return Ok(());
+        }
         let watermark = self.async_writes.watermark(fh);
         let async_result = self.async_writes.wait_through(watermark);
         let local_result = normalize_close_barrier_result(
@@ -2348,6 +2426,16 @@ impl SessionState {
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
+        if fh >= RUNTIME_STATS_FH_START
+            && self
+                .runtime_stats_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&fh)
+                .is_some()
+        {
+            return Ok(());
+        }
         let open_file = self.vfs.get_open_file(fh).ok_or(libc::EBADF)?;
         let local_sync_policy = if open_file.flags.contains(OpenFlags::SYNC) {
             LocalSyncPolicy::WriteThrough
@@ -2814,6 +2902,61 @@ fn reply_file_open_with(
         }
         reply(fi.cast_const())
     })
+}
+
+fn reply_runtime_stats_open(
+    req: *mut raw::FuseReq,
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    opened: LinuxFuseOpenedFile,
+) {
+    reply_runtime_stats_open_with(state, fi, opened, |fi| {
+        // SAFETY: `fi` is initialized and valid for this synchronous reply.
+        unsafe { raw::fuse_reply_open(req, fi) }
+    });
+}
+
+fn reply_runtime_stats_open_with(
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    opened: LinuxFuseOpenedFile,
+    reply: impl FnOnce(*const raw::FuseFileInfo) -> c_int,
+) -> LinuxFuseOpenCachePolicy {
+    debug_assert!(!fi.is_null());
+    complete_runtime_stats_open_reply_with(state, opened, |policy| {
+        // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
+        // using the exact system header layout.
+        unsafe {
+            studiofs_linux_fuse_file_info_init(
+                fi,
+                opened.fh,
+                fuse_flag(policy.direct_io),
+                fuse_flag(policy.keep_cache),
+                fuse_flag(policy.parallel_direct_writes),
+            );
+        }
+        reply(fi.cast_const())
+    })
+}
+
+fn complete_runtime_stats_open_reply_with(
+    state: &SessionState,
+    opened: LinuxFuseOpenedFile,
+    reply: impl FnOnce(LinuxFuseOpenCachePolicy) -> c_int,
+) -> LinuxFuseOpenCachePolicy {
+    let policy = LinuxFuseOpenCachePolicy {
+        direct_io: true,
+        keep_cache: false,
+        parallel_direct_writes: false,
+    };
+    if reply(policy) != 0 {
+        state
+            .runtime_stats_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&opened.fh);
+    }
+    policy
 }
 
 fn reply_create(
@@ -4071,6 +4214,317 @@ mod tests {
             );
             assert_eq!(policy.parallel_direct_writes, expected,);
         }
+    }
+
+    #[test]
+    fn linux_runtime_stats_open_is_read_only_and_captures_once() {
+        let (fixture, state) = cache_test_state(
+            "linux-runtime-stats-open",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let ino = studiofs_vfs::RUNTIME_STATS_FILE_INO;
+
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC] {
+            assert!(matches!(
+                state.open_runtime_stats(ino, flags),
+                Some(Err(errno)) if errno == libc::EROFS
+            ));
+        }
+
+        let before = fixture.vfs().write_path_observability_snapshot();
+        let before_async = state.async_writes.stats();
+        let opened = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open runtime stats");
+        let after = fixture.vfs().write_path_observability_snapshot();
+        let after_async = state.async_writes.stats();
+        assert!(fixture.vfs().get_open_file(opened.fh).is_none());
+        assert_eq!(before.fuse_liveness, after.fuse_liveness);
+        assert_eq!(
+            (
+                before.os_cache.total,
+                before.os_cache.reuse,
+                before.os_cache.replace,
+                before.os_cache.active_writers,
+                before.os_cache.active_foreground_handles,
+            ),
+            (
+                after.os_cache.total,
+                after.os_cache.reuse,
+                after.os_cache.replace,
+                after.os_cache.active_writers,
+                after.os_cache.active_foreground_handles,
+            ),
+        );
+        assert_eq!(
+            (
+                before.vfs_write_path.open_file.calls,
+                before.vfs_read_path.calls,
+                before.fuse_callbacks.read.calls,
+            ),
+            (
+                after.vfs_write_path.open_file.calls,
+                after.vfs_read_path.calls,
+                after.fuse_callbacks.read.calls,
+            ),
+        );
+        assert_eq!(before_async, after_async);
+        let captured = state
+            .runtime_stats_handles
+            .lock()
+            .expect("runtime stats handles")
+            .get(&opened.fh)
+            .expect("captured runtime stats")
+            .clone();
+
+        fixture
+            .vfs()
+            .record_fuse_read_callback(17, Duration::from_millis(1), false);
+        let second = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open second runtime stats snapshot");
+        let second_capture = state
+            .runtime_stats_handles
+            .lock()
+            .expect("runtime stats handles")
+            .get(&second.fh)
+            .expect("second captured runtime stats")
+            .clone();
+
+        assert_ne!(
+            fixture.vfs().runtime_stats_file_text().into_bytes(),
+            captured
+        );
+        assert_ne!(second.fh, opened.fh);
+        assert_ne!(second_capture, captured);
+        assert_eq!(
+            state
+                .runtime_stats_handles
+                .lock()
+                .expect("runtime stats handles")
+                .get(&opened.fh),
+            Some(&captured),
+        );
+        state.release(opened.fh).expect("release first snapshot");
+        state.release(second.fh).expect("release second snapshot");
+    }
+
+    #[test]
+    fn linux_runtime_stats_read_slices_snapshot_without_metrics() {
+        let (fixture, state) = cache_test_state(
+            "linux-runtime-stats-read",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let ino = studiofs_vfs::RUNTIME_STATS_FILE_INO;
+        let opened = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open runtime stats");
+        let captured = state
+            .runtime_stats_handles
+            .lock()
+            .expect("runtime stats handles")
+            .get(&opened.fh)
+            .expect("captured runtime stats")
+            .clone();
+        let before = fixture.vfs().write_path_observability_snapshot();
+
+        let actual = state
+            .read_runtime_stats(ino, 7, 5, Some(opened.fh))
+            .expect("runtime stats inode")
+            .expect("read runtime stats");
+        let short = state
+            .read_runtime_stats(ino, 7, captured.len() as libc::off_t - 2, Some(opened.fh))
+            .expect("runtime stats inode")
+            .expect("read short runtime stats tail");
+        let eof = state
+            .read_runtime_stats(ino, 7, captured.len() as libc::off_t, Some(opened.fh))
+            .expect("runtime stats inode")
+            .expect("read runtime stats EOF");
+        let missing = state
+            .read_runtime_stats(ino, 7, 5, Some(opened.fh + 1))
+            .expect("runtime stats inode");
+        let after = fixture.vfs().write_path_observability_snapshot();
+
+        assert_eq!(actual, captured[5..12]);
+        assert_eq!(short, captured[captured.len() - 2..]);
+        assert!(eof.is_empty());
+        assert_eq!(missing, Err(libc::EBADF));
+        assert_eq!(
+            (
+                before.fuse_callbacks.read.calls,
+                before.fuse_callbacks.read.bytes,
+                before.fuse_callbacks.read.errors,
+            ),
+            (
+                after.fuse_callbacks.read.calls,
+                after.fuse_callbacks.read.bytes,
+                after.fuse_callbacks.read.errors,
+            ),
+        );
+        assert_eq!(before.vfs_read_path.calls, after.vfs_read_path.calls);
+        assert_eq!(
+            before.vfs_write_path.open_file.calls,
+            after.vfs_write_path.open_file.calls,
+        );
+        state.release(opened.fh).expect("release runtime stats");
+    }
+
+    #[test]
+    fn linux_rejected_runtime_stats_open_reply_drops_only_synthetic_handle() {
+        let (fixture, state) = cache_test_state(
+            "linux-runtime-stats-rejected-reply",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let ino = studiofs_vfs::RUNTIME_STATS_FILE_INO;
+        let rejected = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open rejected runtime stats handle");
+        let survivor = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open surviving runtime stats handle");
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"regular.bin", 0, 0, 0o644)
+            .expect("create regular file");
+        let regular = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let before = fixture.vfs().write_path_observability_snapshot();
+        let before_async = state.async_writes.stats();
+        let mut replied_fh = None;
+
+        let mut file_info_storage = [0_u64; 32];
+        let file_info = file_info_storage
+            .as_mut_ptr()
+            .cast::<super::raw::FuseFileInfo>();
+        let policy = super::reply_runtime_stats_open_with(&state, file_info, rejected, |fi| {
+            replied_fh = super::file_handle(fi);
+            -1
+        });
+        let after = fixture.vfs().write_path_observability_snapshot();
+        let after_async = state.async_writes.stats();
+
+        assert_eq!(replied_fh, Some(rejected.fh));
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: false,
+            }
+        );
+        let handles = state
+            .runtime_stats_handles
+            .lock()
+            .expect("runtime stats handles");
+        assert!(!handles.contains_key(&rejected.fh));
+        assert!(handles.contains_key(&survivor.fh));
+        drop(handles);
+        assert!(fixture.vfs().get_open_file(regular.fh).is_some());
+        assert_eq!(before.fuse_liveness, after.fuse_liveness);
+        assert_eq!(
+            (
+                before.os_cache.total,
+                before.os_cache.active_writers,
+                before.os_cache.active_foreground_handles,
+                before.vfs_read_path.calls,
+                before.vfs_write_path.open_file.calls,
+            ),
+            (
+                after.os_cache.total,
+                after.os_cache.active_writers,
+                after.os_cache.active_foreground_handles,
+                after.vfs_read_path.calls,
+                after.vfs_write_path.open_file.calls,
+            ),
+        );
+        assert_eq!(
+            (
+                before_async.active_requests,
+                before_async.pending_handles,
+                before_async.pending_writes,
+                before_async.pending_bytes,
+            ),
+            (
+                after_async.active_requests,
+                after_async.pending_handles,
+                after_async.pending_writes,
+                after_async.pending_bytes,
+            ),
+        );
+
+        state.release(survivor.fh).expect("release survivor");
+        release_cache_open(&fixture, regular);
+    }
+
+    #[test]
+    fn linux_runtime_stats_flush_and_release_bypass_normal_lifecycle() {
+        let (fixture, state) = cache_test_state(
+            "linux-runtime-stats-flush-release",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let ino = studiofs_vfs::RUNTIME_STATS_FILE_INO;
+        let opened = state
+            .open_runtime_stats(ino, libc::O_RDONLY)
+            .expect("runtime stats inode")
+            .expect("open runtime stats");
+        let before = fixture.vfs().write_path_observability_snapshot();
+        let before_async = state.async_writes.stats();
+
+        state.flush(opened.fh).expect("flush synthetic handle");
+        state.release(opened.fh).expect("release synthetic handle");
+        let read_after_release = state
+            .read_runtime_stats(ino, 1, 0, Some(opened.fh))
+            .expect("runtime stats inode");
+        let second_release = state.release(opened.fh);
+
+        let after = fixture.vfs().write_path_observability_snapshot();
+        let after_async = state.async_writes.stats();
+        assert!(
+            !state
+                .runtime_stats_handles
+                .lock()
+                .expect("runtime stats handles")
+                .contains_key(&opened.fh)
+        );
+        assert!(fixture.vfs().get_open_file(opened.fh).is_none());
+        assert_eq!(read_after_release, Err(libc::EBADF));
+        assert_eq!(second_release, Err(libc::EBADF));
+        assert_eq!(before.flush_barrier_calls, after.flush_barrier_calls);
+        assert_eq!(before.fuse_liveness, after.fuse_liveness);
+        assert_eq!(
+            (
+                before.os_cache.total,
+                before.os_cache.active_writers,
+                before.os_cache.active_foreground_handles,
+            ),
+            (
+                after.os_cache.total,
+                after.os_cache.active_writers,
+                after.os_cache.active_foreground_handles,
+            ),
+        );
+        assert_eq!(
+            (
+                before_async.active_requests,
+                before_async.pending_handles,
+                before_async.pending_writes,
+                before_async.pending_bytes,
+            ),
+            (
+                after_async.active_requests,
+                after_async.pending_handles,
+                after_async.pending_writes,
+                after_async.pending_bytes,
+            ),
+        );
     }
 
     #[test]
