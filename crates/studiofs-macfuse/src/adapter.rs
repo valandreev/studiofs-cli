@@ -2614,7 +2614,10 @@ mod shared_os_cache_tests {
     use std::time::Duration;
 
     use studiofs_meta::UploadState;
-    use studiofs_meta::engine::{MetaFsOps, MetaInodes};
+    use studiofs_meta::engine::{MetaFsOps, MetaInodes, MetaPayloadObjects};
+    use studiofs_meta::schema::{
+        ChunkId, PayloadRef, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::{OsCacheDisposition, RUNTIME_STATS_FILE_INO};
 
@@ -2632,25 +2635,6 @@ mod shared_os_cache_tests {
         }
     }
 
-    fn complete_success(
-        adapter: &StudioVfsAdapter,
-        pending: PendingOpen,
-        reservation: LookupReservation,
-    ) -> (
-        crate::low_level::OpenReply,
-        studiofs_vfs::OsCacheOpenDecision,
-    ) {
-        let mut reply = None;
-        let decision = adapter.complete_pending_open(pending, reservation, |open| {
-            reply = Some(open);
-            Ok(())
-        });
-        (
-            reply.expect("successful completion returns reply"),
-            decision,
-        )
-    }
-
     #[test]
     fn shared_os_cache_open_result_keeps_regular_files_pending_and_runtime_stats_direct() {
         let fixture =
@@ -2662,7 +2646,8 @@ mod shared_os_cache_tests {
         let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
 
         let pending = pending_open(&adapter, attr.ino, libc::O_RDONLY);
-        let (regular, decision) = complete_success(&adapter, pending, LookupReservation::Ensure);
+        let (regular, decision) =
+            adapter.complete_pending_open_for_test(pending, LookupReservation::Ensure);
         assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
         assert!(!regular.direct_io());
         adapter
@@ -2733,7 +2718,7 @@ mod shared_os_cache_tests {
 
         let first = pending_open(&adapter, attr.ino, libc::O_RDONLY);
         let (first_reply, first_decision) =
-            complete_success(&adapter, first, LookupReservation::Ensure);
+            adapter.complete_pending_open_for_test(first, LookupReservation::Ensure);
         assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
         adapter
             .release(attr.ino, first_reply.file_handle())
@@ -2746,9 +2731,136 @@ mod shared_os_cache_tests {
 
         let second = pending_open(&adapter, attr.ino, libc::O_RDONLY);
         let (second_reply, second_decision) =
-            complete_success(&adapter, second, LookupReservation::Ensure);
+            adapter.complete_pending_open_for_test(second, LookupReservation::Ensure);
         assert_eq!(second_decision.disposition(), OsCacheDisposition::Reuse);
         assert!(second_reply.keep_cache());
+        adapter
+            .release(attr.ino, second_reply.file_handle())
+            .expect("release second reader");
+    }
+
+    #[test]
+    fn shared_os_cache_content_epoch_only_change_replaces() {
+        const LOGICAL_SIZE: u64 = 64;
+
+        let fixture =
+            ContractVfsFixture::new("macfuse-shared-epoch-only").expect("create VFS fixture");
+        let meta = fixture.meta();
+        let mut attr = meta
+            .create_file(CONTRACT_ROOT_INO, b"epoch-only.bin", 501, 20, 0o644)
+            .expect("create file directly in metadata");
+        attr.size = LOGICAL_SIZE;
+        attr.committed_size = LOGICAL_SIZE;
+        meta.set_attr(&attr).expect("store initial generation");
+        let vfs = fixture.vfs();
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let first = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (first_reply, first_decision) =
+            adapter.complete_pending_open_for_test(first, LookupReservation::Ensure);
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        adapter
+            .release(attr.ino, first_reply.file_handle())
+            .expect("release first reader");
+
+        let before_attr = meta.get_attr(attr.ino).expect("load initial attributes");
+        let before_graph = meta
+            .lookup_regular_file_slices(attr.ino, 0, before_attr.size)
+            .expect("load initial graph");
+        let mut changed_attr = before_attr.clone();
+        changed_attr.content_epoch += 1;
+        meta.set_attr(&changed_attr).expect("advance content epoch");
+
+        let stored_attr = meta.get_attr(attr.ino).expect("load changed attributes");
+        let stored_graph = meta
+            .lookup_regular_file_slices(attr.ino, 0, stored_attr.size)
+            .expect("load unchanged graph");
+        let mut without_epoch_change = stored_attr.clone();
+        without_epoch_change.content_epoch = before_attr.content_epoch;
+        assert_eq!(
+            without_epoch_change, before_attr,
+            "content epoch must be the only changed attribute"
+        );
+        assert_eq!(stored_graph, before_graph, "slice graph must remain stable");
+
+        let second = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (second_reply, second_decision) =
+            adapter.complete_pending_open_for_test(second, LookupReservation::Ensure);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Replace);
+        assert!(!second_reply.keep_cache());
+        adapter
+            .release(attr.ino, second_reply.file_handle())
+            .expect("release second reader");
+    }
+
+    #[test]
+    fn shared_os_cache_same_size_graph_only_change_replaces() {
+        const LOGICAL_SIZE: u32 = 64;
+
+        let fixture =
+            ContractVfsFixture::new("macfuse-shared-graph-only").expect("create VFS fixture");
+        let meta = fixture.meta();
+        let mut attr = meta
+            .create_file(CONTRACT_ROOT_INO, b"graph-only.bin", 501, 20, 0o644)
+            .expect("create file directly in metadata");
+        attr.size = u64::from(LOGICAL_SIZE);
+        attr.committed_size = attr.size;
+        meta.set_attr(&attr).expect("store initial generation");
+        let range = SliceRange::new(0, LOGICAL_SIZE).expect("valid slice range");
+        meta.flush_regular_file_overlay_slices(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId::default(),
+                    SliceOrder::default(),
+                    range,
+                    PayloadRef::new_partial(101, LOGICAL_SIZE),
+                )],
+            )],
+        )
+        .expect("store initial graph");
+        let vfs = fixture.vfs();
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let first = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (first_reply, first_decision) =
+            adapter.complete_pending_open_for_test(first, LookupReservation::Ensure);
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        adapter
+            .release(attr.ino, first_reply.file_handle())
+            .expect("release first reader");
+
+        let before_attr = meta.get_attr(attr.ino).expect("load initial attributes");
+        let before_graph = meta
+            .lookup_regular_file_slices(attr.ino, 0, before_attr.size)
+            .expect("load initial graph");
+        meta.flush_regular_file_overlay_slices(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId::default(),
+                    SliceOrder::default(),
+                    range,
+                    PayloadRef::new_partial(102, LOGICAL_SIZE),
+                )],
+            )],
+        )
+        .expect("replace graph at the same logical size");
+
+        let stored_attr = meta.get_attr(attr.ino).expect("load stable attributes");
+        let stored_graph = meta
+            .lookup_regular_file_slices(attr.ino, 0, stored_attr.size)
+            .expect("load changed graph");
+        assert_eq!(stored_attr, before_attr, "attributes must remain stable");
+        assert_ne!(stored_graph, before_graph, "slice graph must change");
+
+        let second = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (second_reply, second_decision) =
+            adapter.complete_pending_open_for_test(second, LookupReservation::Ensure);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Replace);
+        assert!(!second_reply.keep_cache());
         adapter
             .release(attr.ino, second_reply.file_handle())
             .expect("release second reader");
@@ -2915,7 +3027,7 @@ mod shared_os_cache_tests {
 
         let next = pending_open(&adapter, attr.ino, libc::O_RDONLY);
         let (next_reply, next_decision) =
-            complete_success(&adapter, next, LookupReservation::Ensure);
+            adapter.complete_pending_open_for_test(next, LookupReservation::Ensure);
         assert_eq!(next_decision.disposition(), OsCacheDisposition::Replace);
         adapter
             .release(attr.ino, next_reply.file_handle())
