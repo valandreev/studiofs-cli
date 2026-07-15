@@ -55,6 +55,128 @@ For SFS-598 Linux rollout evidence, use `linux-juicefs-parity-gate.sh` against
 already-mounted local, new StudioFS, old StudioFS, and JuiceFS paths. It writes
 the side-by-side gate artifacts and rollout `decision.md` under `target/perf`.
 
+## Linux kernel-cache and CPU gate
+
+The Linux cache gate separates collection, orchestration, and evaluation:
+
+- `linux-cache-gate.sh` collects one mode/workload/repetition artifact from an
+  already-mounted StudioFS instance.
+- `linux-cache-matrix.sh` runs the mounted correctness preflight and the full
+  balanced matrix, creating a fresh mount, cache directory, and cgroup for
+  every tuple.
+- `linux_cache_gate_summary.py` validates the complete evidence set, compares
+  candidates, and writes `comparison.json`, `summary.md`, and `decision.md`.
+
+The matrix always covers these three modes:
+
+- `direct-serial`: Direct cache policy with async DIO disabled
+- `direct-async`: Direct cache policy with async DIO enabled
+- `kernel`: Linux kernel cache policy
+
+Each mode runs all six workloads: `large-single`, `fixed-1m`, `small-128k`,
+`warm-reopen`, `same-file-parallel`, and `cross-file-barriers`. Diagnostic
+evidence is exactly three repetitions and is never promotion-eligible. A
+promotion run is exactly five repetitions; other real-run repetition counts
+are rejected.
+
+Real collection requires a writable delegated cgroup v2 parent with the CPU,
+memory, and PIDs controllers available. A typical user-service delegation is:
+
+```bash
+CGROUP_ROOT="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
+```
+
+The matrix creates leaf cgroups below that parent. It also isolates each tuple
+with unique mount and cache paths so neither page-cache state nor daemon CPU
+state is reused across measurements. CPU evidence is split into foreground
+workload CPU and post-workload drain CPU; use total lifecycle CPU per GiB for
+the gate, while keeping the split to identify deferred work.
+
+Runtime snapshots come from out-of-band `diagnostics-attach` evidence tied to
+the exact mount PID and mount path. Mounted-namespace stats are not an accepted
+fallback. The collector records start, foreground end, drain end, and cleanup
+end snapshots and requires three consecutive idle polls at drain boundaries.
+
+The stable matrix layout is:
+
+```text
+<matrix-root>/
+  correctness-manifest.json
+  correctness/*.log
+  schedule.json
+  <mode>/<workload>/rep-NNN/
+    environment.json  manifest.json  command.txt
+    runtime-*.json    cgroup-*.json   proc-*/
+    *-memory-samples.jsonl            pidstat.txt
+    client-report.json                cleanup.json
+    derived.json
+```
+
+Inspect the interfaces and preview a complete schedule without mounting:
+
+```bash
+bash tools/perf/linux-cache-gate.sh --help
+bash tools/perf/linux-cache-matrix.sh --help
+python3 tools/perf/linux_cache_gate_summary.py --help
+
+bash tools/perf/linux-cache-matrix.sh \
+  --volume "$VOLUME" \
+  --mount-root target/perf/linux-cache-mounts \
+  --cgroup-root "$CGROUP_ROOT" \
+  --output-root target/perf/linux-cache-dry-run \
+  --dry-run
+```
+
+Use a new output root for every real run. Run the three-repetition diagnostic
+matrix first:
+
+```bash
+RUN="target/perf/linux-cache-diagnostic-$(date -u +%Y%m%dT%H%M%SZ)"
+bash tools/perf/linux-cache-matrix.sh \
+  --volume "$VOLUME" \
+  --mount-root target/perf/linux-cache-mounts \
+  --cgroup-root "$CGROUP_ROOT" \
+  --output-root "$RUN" \
+  --diagnostic --repetitions 3
+```
+
+Collect promotion evidence only with the fixed five-repetition run:
+
+```bash
+RUN="target/perf/linux-cache-final-$(date -u +%Y%m%dT%H%M%SZ)"
+bash tools/perf/linux-cache-matrix.sh \
+  --volume "$VOLUME" \
+  --mount-root target/perf/linux-cache-mounts \
+  --cgroup-root "$CGROUP_ROOT" \
+  --output-root "$RUN" \
+  --repetitions 5
+```
+
+Analyze either matrix with its own correctness manifest:
+
+```bash
+python3 tools/perf/linux_cache_gate_summary.py \
+  --direct-serial "$RUN/direct-serial" \
+  --direct-async "$RUN/direct-async" \
+  --kernel "$RUN/kernel" \
+  --correctness-manifest "$RUN/correctness-manifest.json" \
+  --output "$RUN/analysis"
+```
+
+Do not copy a benchmark revision or checksum into commands or notes. The real
+matrix requires clean StudioFS and `studiofs-bench` checkouts, rebuilds the
+benchmark with `cargo build --release --locked`, refreshes the bundled binary
+and README, and records the current Git revisions plus binary SHA-256 values in
+the manifests. It also verifies that the running mount executable matches the
+recorded StudioFS binary.
+
+After each tuple, the matrix performs bounded unmount/process cleanup, removes
+only its owned workload, cache, mount, and empty cgroup paths, and preserves
+cleanup evidence. It stops at the first correctness, collection, or cleanup
+failure. The analyzer still writes all three result files on failure, but exits
+zero only for a promotion-eligible five-repetition matrix whose candidate gates
+all pass; diagnostics and retained-default decisions exit nonzero.
+
 ## Scope
 
 For this pass we care about two focused scenarios:
