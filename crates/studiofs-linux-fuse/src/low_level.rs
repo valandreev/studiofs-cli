@@ -126,8 +126,6 @@ pub(crate) mod raw {
 }
 
 unsafe extern "C" {
-    #[cfg(test)]
-    fn studiofs_linux_fuse_empty_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_linux_fuse_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_linux_fuse_low_level_ops_size() -> libc::size_t;
     fn studiofs_linux_fuse_session_new(
@@ -1166,40 +1164,6 @@ impl Session {
             self.signal_handlers_installed = true;
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    #[cfg(test)]
-    fn mount_empty_for_test(
-        mount_point: impl AsRef<std::path::Path>,
-        volume_name: impl AsRef<str>,
-    ) -> io::Result<Self> {
-        let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
-        // SAFETY: the C shim returns a static empty ops table; userdata is null
-        // because no callbacks are installed in this lifecycle-only smoke.
-        let raw = NonNull::new(unsafe {
-            studiofs_linux_fuse_session_new(
-                args.as_mut_ptr(),
-                studiofs_linux_fuse_empty_low_level_ops(),
-                studiofs_linux_fuse_low_level_ops_size(),
-                std::ptr::null_mut(),
-            )
-        })
-        .ok_or_else(|| io::Error::other("libfuse3 failed to create low-level session"))?;
-        // SAFETY: `raw` is a live libfuse session and `mount_point` is valid.
-        let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
-        if mount_result == 0 {
-            Ok(Self {
-                raw,
-                state: None,
-                invalidation_state: Arc::new(SessionInvalidationState::new()),
-                signal_handlers_installed: false,
-            })
-        } else {
-            // SAFETY: `raw` has not been returned and must be destroyed here.
-            unsafe { raw::fuse_session_destroy(raw.as_ptr()) };
             Err(io::Error::last_os_error())
         }
     }
@@ -2384,7 +2348,7 @@ impl SessionState {
         fi: *const raw::FuseFileInfo,
         started: Instant,
     ) -> Result<bool, i32> {
-        if !linux_fuse_async_write_enabled() {
+        if self.cache_policy == LinuxFuseCachePolicy::Kernel || !linux_fuse_async_write_enabled() {
             return Ok(false);
         }
         let request = self.prepare_write_metadata(buf, size, offset, fi)?;
@@ -3335,18 +3299,25 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::UploadState;
-    use studiofs_meta::engine::{MetaFsOps, MetaInodes};
+    use studiofs_meta::engine::{MetaFormat, MetaFsOps, MetaInodes, MetaReplication};
+    use studiofs_meta::{
+        CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
+        PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    };
     use studiofs_vfs::contract_harness::ContractVfsFixture;
     use studiofs_vfs::{
         KernelInvalidator, LocalSyncPolicy, OpenFlags, OsCacheDisposition, OsCacheReason,
+        StudioVfs, VfsConfigRaw,
     };
+    use uuid::Uuid;
 
     #[derive(Default)]
     struct RecordingLinuxInvalidator {
@@ -3396,9 +3367,550 @@ mod tests {
     impl Drop for UnmountGuard {
         fn drop(&mut self) {
             if let Some(path) = &self.0 {
-                let _ = Command::new("fusermount3").arg("-uz").arg(path).status();
+                let _ = bounded_unmount(path);
             }
         }
+    }
+
+    fn mounted_target_path(label: &str) -> std::path::PathBuf {
+        static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+        let ordinal = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/studiofs-linux-fuse-{label}-{}-{ordinal}",
+            std::process::id()
+        ))
+    }
+
+    fn run_command_bounded(
+        command: &mut Command,
+        timeout: Duration,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = command.spawn()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                let kill_result = child.kill();
+                let reap_deadline = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < reap_deadline {
+                    if child.try_wait()?.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "test command exceeded its bounded timeout; kill_result={kill_result:?}"
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn findmnt_reports_mount(path: &std::path::Path) -> std::io::Result<bool> {
+        let mut command = Command::new("findmnt");
+        command.arg("-M").arg(path);
+        run_command_bounded(&mut command, Duration::from_secs(1)).map(|status| status.success())
+    }
+
+    fn wait_for_mount_absent(path: &std::path::Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if matches!(findmnt_reports_mount(path), Ok(false)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn bounded_unmount(path: &std::path::Path) -> std::io::Result<()> {
+        let mut normal = Command::new("fusermount3");
+        normal.arg("-u").arg(path);
+        let normal_status = run_command_bounded(&mut normal, Duration::from_secs(5));
+        if normal_status.as_ref().is_ok_and(|status| status.success())
+            && wait_for_mount_absent(path, Duration::from_secs(1))
+        {
+            return Ok(());
+        }
+
+        let mut forced = Command::new("fusermount3");
+        forced.arg("-uz").arg(path);
+        let forced_status = run_command_bounded(&mut forced, Duration::from_secs(5));
+        if forced_status.as_ref().is_ok_and(|status| status.success())
+            && wait_for_mount_absent(path, Duration::from_secs(5))
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mounted-test teardown failed: normal={normal_status:?}, forced={forced_status:?}"
+            )))
+        }
+    }
+
+    fn wait_for_snapshot(
+        vfs: &studiofs_vfs::StudioVfs,
+        timeout: Duration,
+        mut ready: impl FnMut(&studiofs_vfs::VfsWritePathObservabilitySnapshot) -> bool,
+    ) -> Result<studiofs_vfs::VfsWritePathObservabilitySnapshot, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = vfs.write_path_observability_snapshot();
+            if ready(&snapshot) {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "snapshot poll timed out: dirty={}, pending_uploads={}, active_uploads={}, \
+                     async_reads={}, async_writes={}, active_foreground={}, active_writers={}",
+                    snapshot.dirty_pressure.total_dirty_bytes,
+                    snapshot.pending_uploads,
+                    snapshot.upload.active_uploads,
+                    snapshot.fuse_async_read.pending_reads,
+                    snapshot.fuse_async_write.pending_writes,
+                    snapshot.os_cache.active_foreground_handles,
+                    snapshot.os_cache.active_writers,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_local_mounted_idle(
+        vfs: &studiofs_vfs::StudioVfs,
+    ) -> studiofs_vfs::VfsWritePathObservabilitySnapshot {
+        // ContractVfsFixture has no remote store and retains publication backlog;
+        // the remote-listener test separately waits for pending and active uploads.
+        wait_for_snapshot(vfs, Duration::from_secs(10), |snapshot| {
+            snapshot.dirty_pressure.total_dirty_bytes == 0
+                && snapshot.upload.active_uploads == 0
+                && snapshot.fuse_async_read.pending_reads == 0
+                && snapshot.fuse_async_read.pending_bytes == 0
+                && snapshot.fuse_async_write.active_requests == 0
+                && snapshot.fuse_async_write.admission_waiters == 0
+                && snapshot.fuse_async_write.pending_handles == 0
+                && snapshot.fuse_async_write.pending_writes == 0
+                && snapshot.fuse_async_write.pending_bytes == 0
+                && snapshot.os_cache.active_foreground_handles == 0
+                && snapshot.os_cache.active_writers == 0
+        })
+        .unwrap_or_else(|error| panic!("mounted VFS did not become locally idle: {error}"))
+    }
+
+    fn wait_for_read_quiescence(
+        vfs: &studiofs_vfs::StudioVfs,
+    ) -> studiofs_vfs::VfsWritePathObservabilitySnapshot {
+        let mut previous = None;
+        let mut stable_polls = 0;
+        wait_for_snapshot(vfs, Duration::from_secs(10), |snapshot| {
+            let counts = (
+                snapshot.fuse_callbacks.read.calls,
+                snapshot.vfs_read_path.calls,
+            );
+            let idle = snapshot.fuse_async_read.pending_reads == 0
+                && snapshot.fuse_async_read.pending_bytes == 0
+                && snapshot.os_cache.active_foreground_handles == 0;
+            if idle && previous == Some(counts) {
+                stable_polls += 1;
+            } else {
+                stable_polls = 0;
+            }
+            previous = Some(counts);
+            idle && stable_polls >= 2
+        })
+        .unwrap_or_else(|error| panic!("mounted reads did not quiesce: {error}"))
+    }
+
+    fn run_mounted_vfs_test(
+        label: &str,
+        vfs: Arc<studiofs_vfs::StudioVfs>,
+        runtime_handle: tokio::runtime::Handle,
+        operation: impl FnOnce(&std::path::Path, &Arc<studiofs_vfs::StudioVfs>) + Send + 'static,
+    ) {
+        let mount_point = mounted_target_path(label);
+        if mount_point.exists() {
+            assert!(
+                matches!(findmnt_reports_mount(&mount_point), Ok(false)),
+                "refusing to reuse a live mounted-test path: {}",
+                mount_point.display()
+            );
+            std::fs::remove_dir_all(&mount_point).expect("remove stale mounted-test path");
+        }
+        std::fs::create_dir_all(&mount_point).expect("create mounted-test path");
+
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            runtime_handle,
+            false,
+            default_connection_config(),
+        );
+        let async_writes = Arc::clone(&state.async_writes);
+        let mut session = super::Session::mount(state, &mount_point, label).expect("mount session");
+        let invalidations = Arc::clone(&session.invalidation_state);
+        let worker_mount_point = mount_point.clone();
+        let worker_vfs = Arc::clone(&vfs);
+        let worker = thread::spawn(move || {
+            let guard = UnmountGuard::new(worker_mount_point.clone());
+            let operation_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                operation(&worker_mount_point, &worker_vfs);
+            }));
+            let unmount_result = bounded_unmount(&worker_mount_point);
+            if unmount_result.is_ok() {
+                guard.disarm();
+            }
+            (operation_result, unmount_result)
+        });
+
+        let run_result = session.run();
+        let worker_result = worker.join();
+        drop(session);
+
+        let mount_absent = wait_for_mount_absent(&mount_point, Duration::from_secs(5));
+        let invalidations_idle = invalidations.wait_for_idle(Duration::from_secs(5));
+        let writes_idle = async_writes.wait_idle(Duration::from_secs(5));
+        let write_stats = async_writes.stats();
+        let snapshot = wait_for_local_mounted_idle(&vfs);
+        let remove_result = std::fs::remove_dir_all(&mount_point);
+
+        run_result.expect("run mounted libfuse3 session");
+        let (operation_result, unmount_result) =
+            worker_result.expect("mounted-test worker should not panic outside its operation");
+        unmount_result.expect("unmount mounted-test session");
+        assert!(mount_absent, "findmnt still reports the mounted-test path");
+        assert!(
+            invalidations_idle,
+            "kernel invalidation remained active at teardown"
+        );
+        assert!(
+            writes_idle,
+            "async writes did not drain at teardown: {write_stats:?}"
+        );
+        assert_eq!(
+            (
+                write_stats.active_requests,
+                write_stats.pending_writes,
+                write_stats.pending_bytes,
+                write_stats.admission_waiters,
+            ),
+            (0, 0, 0, 0),
+            "async write tracker retained live work"
+        );
+        assert_eq!(
+            (
+                snapshot.fuse_async_read.pending_reads,
+                snapshot.fuse_async_read.pending_bytes,
+                snapshot.os_cache.active_foreground_handles,
+                snapshot.os_cache.active_writers,
+            ),
+            (0, 0, 0, 0),
+            "mounted lifecycle gauges were not zero at teardown"
+        );
+        remove_result.expect("remove mounted-test path");
+        if let Err(payload) = operation_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    struct TargetTestDirectory(std::path::PathBuf);
+
+    impl TargetTestDirectory {
+        fn new(label: &str) -> Self {
+            let path = mounted_target_path(label);
+            std::fs::create_dir_all(&path).expect("create target test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TargetTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RemoteTestEnvironment {
+        pg_dsn: String,
+        s3_endpoint: String,
+        s3_bucket: String,
+        s3_access_key: String,
+        s3_secret_key: String,
+    }
+
+    fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
+        static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+        VARS.get_or_init(|| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env");
+            dotenvy::from_path_iter(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect()
+        })
+    }
+
+    fn remote_env_value(primary: &str, legacy: Option<&str>) -> Option<String> {
+        let non_empty = |value: String| (!value.trim().is_empty()).then_some(value);
+        std::env::var(primary)
+            .ok()
+            .and_then(non_empty)
+            .or_else(|| {
+                legacy
+                    .and_then(|key| std::env::var(key).ok())
+                    .and_then(non_empty)
+            })
+            .or_else(|| {
+                workspace_dotenv_vars()
+                    .get(primary)
+                    .cloned()
+                    .and_then(non_empty)
+            })
+            .or_else(|| {
+                legacy
+                    .and_then(|key| workspace_dotenv_vars().get(key).cloned())
+                    .and_then(non_empty)
+            })
+    }
+
+    fn remote_test_environment() -> Option<RemoteTestEnvironment> {
+        let pg_dsn = remote_env_value("STUDIOFS_TEST_PG_DSN", None);
+        let s3_endpoint = remote_env_value(
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            Some("STUDIOFS_S3_ENDPOINT"),
+        );
+        let s3_bucket =
+            remote_env_value("STUDIOFS_TEST_ONLINE_S3_BUCKET", Some("STUDIOFS_S3_BUCKET"));
+        let s3_access_key = remote_env_value(
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            Some("STUDIOFS_S3_ACCESS_KEY"),
+        );
+        let s3_secret_key = remote_env_value(
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+            Some("STUDIOFS_S3_SECRET_KEY"),
+        );
+        let mut missing = Vec::new();
+        if pg_dsn.is_none() {
+            missing.push("STUDIOFS_TEST_PG_DSN");
+        }
+        if s3_endpoint.is_none() {
+            missing.push("STUDIOFS_TEST_ONLINE_S3_ENDPOINT/STUDIOFS_S3_ENDPOINT");
+        }
+        if s3_bucket.is_none() {
+            missing.push("STUDIOFS_TEST_ONLINE_S3_BUCKET/STUDIOFS_S3_BUCKET");
+        }
+        if s3_access_key.is_none() {
+            missing.push("STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY/STUDIOFS_S3_ACCESS_KEY");
+        }
+        if s3_secret_key.is_none() {
+            missing.push("STUDIOFS_TEST_ONLINE_S3_SECRET_KEY/STUDIOFS_S3_SECRET_KEY");
+        }
+        if !missing.is_empty() {
+            let reason = format!(
+                "test=mounted_kernel_remote_listener_invalidation reason=missing_environment keys={}",
+                missing.join(",")
+            );
+            let required = std::env::var("STUDIOFS_REQUIRE_REMOTE_INVALIDATION_TEST")
+                .ok()
+                .is_some_and(|value| super::linux_fuse_env_flag_value(&value));
+            if required {
+                panic!("required remote invalidation test cannot skip: {reason}");
+            }
+            eprintln!("SKIP {reason}");
+            return None;
+        }
+        Some(RemoteTestEnvironment {
+            pg_dsn: pg_dsn.expect("checked PG DSN"),
+            s3_endpoint: s3_endpoint.expect("checked S3 endpoint"),
+            s3_bucket: s3_bucket.expect("checked S3 bucket"),
+            s3_access_key: s3_access_key.expect("checked S3 access key"),
+            s3_secret_key: s3_secret_key.expect("checked S3 secret key"),
+        })
+    }
+
+    struct RemotePgVolume {
+        dsn: String,
+        volume_id: i64,
+        name: String,
+        uuid: String,
+    }
+
+    impl RemotePgVolume {
+        fn new(raw_dsn: &str, runtime: &tokio::runtime::Runtime) -> Self {
+            let dsn = runtime
+                .block_on(async { ensure_studiofs_database(raw_dsn).await })
+                .map(|database| database.metadata_dsn)
+                .unwrap_or_else(|_| panic!("configured PostgreSQL environment is unreachable"));
+            let name = format!(
+                "linux-fuse-remote-invalidation-{}-{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            );
+            let uuid = Uuid::new_v4().to_string();
+            let volume_id = runtime
+                .block_on(async {
+                    let (mut client, connection) =
+                        tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                            .await
+                            .map_err(|_| ())?;
+                    let connection_task = tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    let result = async {
+                        let transaction = client.transaction().await.map_err(|_| ())?;
+                        let row = transaction
+                            .query_one(
+                                "INSERT INTO volumes (name, uuid, block_size) \
+                                 VALUES ($1, $2, $3) RETURNING vol",
+                                &[&name, &uuid, &(4_i32 * 1024 * 1024)],
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                        let volume_id: i64 = row.get(0);
+                        transaction
+                            .execute(
+                                "INSERT INTO metadata_state (vol, version, snapshot) \
+                                 VALUES ($1, 0, $2) ON CONFLICT (vol) DO NOTHING",
+                                &[&volume_id, &Vec::<u8>::new()],
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                        transaction.commit().await.map_err(|_| ())?;
+                        Ok::<i64, ()>(volume_id)
+                    }
+                    .await;
+                    connection_task.abort();
+                    result
+                })
+                .unwrap_or_else(|_| panic!("failed to provision configured PostgreSQL volume"));
+            Self {
+                dsn,
+                volume_id,
+                name,
+                uuid,
+            }
+        }
+
+        fn format_info(&self, environment: &RemoteTestEnvironment) -> FormatInfo {
+            FormatInfo {
+                format_version: CURRENT_FORMAT_VERSION,
+                name: self.name.clone(),
+                uuid: self.uuid.clone(),
+                endpoint: environment.s3_endpoint.clone(),
+                bucket: environment.s3_bucket.clone(),
+                access_key: environment.s3_access_key.clone(),
+                secret_key: environment.s3_secret_key.clone(),
+                region: "us-east-1".to_owned(),
+                data_prefix: format!("{}/objects/", self.name),
+                metadata: MetadataConfig {
+                    backend: MetadataBackend::Postgres,
+                    remote: None,
+                    postgres: Some(PostgresConfig {
+                        url: self.dsn.clone(),
+                        volume_id: self.volume_id,
+                    }),
+                },
+                encryption: studiofs_meta::EncryptionConfig::new(
+                    [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+                ),
+                block_size: 4 * 1024 * 1024,
+            }
+        }
+    }
+
+    impl Drop for RemotePgVolume {
+        fn drop(&mut self) {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                let Ok((client, connection)) =
+                    tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls).await
+                else {
+                    return;
+                };
+                let connection_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let _ = client
+                    .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
+                    .await;
+                connection_task.abort();
+            });
+        }
+    }
+
+    fn seed_remote_local_metadata(path: &std::path::Path, format_info: &FormatInfo) {
+        let seed = RedbMetaEngine::open(path).expect("open remote-test seed metadata");
+        seed.set_format_info(format_info)
+            .expect("seed remote-test format info");
+        seed.init_root(0, 0).expect("seed remote-test root");
+        let next_event_seq = seed
+            .get_counter("nextEventSeq")
+            .expect("read remote-test event sequence");
+        seed.set_counter("pgLastFlushedLocalEventSeq", next_event_seq)
+            .expect("seed remote-test flushed event sequence");
+    }
+
+    fn make_remote_vfs(
+        meta: Arc<dyn MetaEngine>,
+        format_info: &FormatInfo,
+        cache_dir: &std::path::Path,
+    ) -> Arc<StudioVfs> {
+        let config = VfsConfigRaw {
+            metadata_invalidation_sync_interval_ms: Some(300_000),
+            max_dirty_bytes: Some(1),
+            upload_delay_ms: Some(0),
+            upload_worker_count: Some(1),
+            upload_request_timeout_secs: Some(10),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("validate remote-test VFS config");
+        let data_config = DataStoreConfig::from(format_info);
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("remote-test cache path UTF-8"),
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            config,
+        )
+        .expect("create remote-test VFS");
+        vfs.start().expect("start remote-test VFS");
+        vfs
+    }
+
+    fn remote_publish_timeout() -> Duration {
+        Duration::from_secs(
+            remote_env_value("STUDIOFS_TEST_ONLINE_PUBLISH_TIMEOUT_SECS", None)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60)
+                .max(1),
+        )
+    }
+
+    fn regular_file_payload_ids(vfs: &StudioVfs, ino: u64) -> Vec<u64> {
+        let mut ids: Vec<_> = vfs
+            .meta()
+            .get_regular_file_graph_object_usage(ino)
+            .expect("read regular-file payload IDs")
+            .into_iter()
+            .map(|(object_id, _)| object_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     // Keep the terminal full snapshot on timeout for deterministic test diagnostics.
@@ -6654,94 +7166,65 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_smoke_mounts_and_unmounts_cleanly() {
-        let mount_point =
-            std::env::temp_dir().join(format!("studiofs-linux-fuse-smoke-{}", std::process::id()));
-        std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
+        let fixture = ContractVfsFixture::new("linux-fuse-smoke").expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
 
-        let mut session = super::Session::mount_empty_for_test(&mount_point, "studiofs-smoke")
-            .expect("mount libfuse3 session");
-        let mount_point_for_unmount = mount_point.clone();
-        let unmount = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mount_point_for_unmount)
-                .status()
-                .expect("run fusermount3 -u")
+        run_mounted_vfs_test("smoke", vfs, runtime_handle, |mount_point, vfs| {
+            std::fs::metadata(mount_point).expect("probe mounted root");
+            wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                snapshot.fuse_connection.negotiated_async_dio.is_some()
+            })
+            .expect("FUSE init did not publish smoke-test negotiation");
         });
-
-        session
-            .install_signal_handlers()
-            .expect("install libfuse3 signal handlers");
-        session.run().expect("run libfuse3 session");
-        assert!(unmount.join().expect("join unmount thread").success());
-        drop(session);
-        std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
     }
 
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_regular_file_io_is_visible_across_reopen() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-regular-io")
-                .expect("create VFS fixture");
+        let fixture = ContractVfsFixture::new("linux-fuse-regular-io").expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
-        let mount_point = std::env::temp_dir().join(format!(
-            "studiofs-linux-fuse-regular-io-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
 
-        let state = super::SessionState::new(
-            fixture.vfs(),
-            fixture.runtime().handle().clone(),
-            false,
-            default_connection_config(),
-        );
-        let mut session =
-            super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
-        let mount_point_for_worker = mount_point.clone();
-        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            let guard = UnmountGuard::new(mount_point_for_worker.clone());
-            let path = mount_point_for_worker.join("regular.txt");
+        run_mounted_vfs_test("regular-io", vfs, runtime_handle, |mount_point, _| {
+            let path = mount_point.join("regular.txt");
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .read(true)
                 .write(true)
-                .open(&path)?;
-            file.write_all(b"hello local-first")?;
-            file.flush()?;
-            file.seek(SeekFrom::Start(0))?;
+                .open(&path)
+                .expect("create mounted regular file");
+            file.write_all(b"hello local-first")
+                .expect("write mounted regular file");
+            file.flush().expect("flush mounted regular file");
+            file.seek(SeekFrom::Start(0))
+                .expect("seek mounted regular file");
             let mut same_handle = String::new();
-            file.read_to_string(&mut same_handle)?;
+            file.read_to_string(&mut same_handle)
+                .expect("read mounted regular file through same handle");
             assert_eq!(same_handle, "hello local-first");
-            file.sync_all()?;
+            file.sync_all().expect("fsync mounted regular file");
             drop(file);
 
-            assert_eq!(std::fs::read_to_string(&path)?, "hello local-first");
-            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-            file.set_len(5)?;
-            file.sync_data()?;
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reopen mounted regular file"),
+                "hello local-first"
+            );
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open mounted regular file for truncate");
+            file.set_len(5).expect("truncate mounted regular file");
+            file.sync_data()
+                .expect("fdatasync truncated mounted regular file");
             drop(file);
-            assert_eq!(std::fs::read_to_string(&path)?, "hello");
-
-            let status = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mount_point_for_worker)
-                .status();
-            guard.disarm();
-            status
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reopen truncated mounted regular file"),
+                "hello"
+            );
         });
-
-        session.run().expect("run libfuse3 session");
-        let unmount_status = worker
-            .join()
-            .expect("mounted I/O worker should not panic")
-            .expect("mounted I/O worker should complete");
-        assert!(unmount_status.success());
-        drop(session);
-        drop(fixture);
-        std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
     }
 
     #[test]
@@ -6763,90 +7246,86 @@ mod tests {
             super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
             "parallel direct-write regression requires async DIO"
         );
-        // SAFETY: this C probe only reports compile-time field support.
-        assert!(
-            unsafe { super::studiofs_linux_fuse_supports_parallel_direct_writes() } != 0,
-            "parallel direct-write regression requires libfuse field support"
-        );
-
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "linux-fuse-parallel-direct-writes",
         )
         .expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
-        let mount_point = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../target/linux-fuse-parallel-direct-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
 
-        let state = super::SessionState::new(
-            fixture.vfs(),
-            fixture.runtime().handle().clone(),
-            false,
-            default_connection_config(),
+        run_mounted_vfs_test(
+            "parallel-direct",
+            vfs,
+            runtime_handle,
+            |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted parallel-write root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot.fuse_connection.negotiated_async_dio.is_some()
+                        && snapshot
+                            .fuse_connection
+                            .parallel_direct_writes_supported
+                            .is_some()
+                })
+                .expect("FUSE init did not publish Direct async negotiation");
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_async_dio,
+                    Some(true),
+                    "same-file parallel writes require negotiated async DIO"
+                );
+                if negotiation.fuse_connection.parallel_direct_writes_supported == Some(false) {
+                    eprintln!(
+                        "SKIP \
+                         test=mounted_same_file_parallel_direct_writes_preserve_disjoint_regions \
+                         reason=unsupported_capability parallel_direct_writes_supported=false"
+                    );
+                    return;
+                }
+                assert_eq!(
+                    negotiation.fuse_connection.parallel_direct_writes_supported,
+                    Some(true)
+                );
+
+                let path = mount_point.join("parallel.dat");
+                let base = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("create parallel-write file");
+                let start = Arc::new(std::sync::Barrier::new(WRITERS + 1));
+                let mut writers = Vec::with_capacity(WRITERS);
+                for index in 0..WRITERS {
+                    let file = base.try_clone().expect("clone parallel-write file");
+                    let start = Arc::clone(&start);
+                    writers.push(std::thread::spawn(move || -> std::io::Result<()> {
+                        let region =
+                            vec![u8::try_from(index + 1).expect("writer byte"); REGION_SIZE];
+                        start.wait();
+                        file.write_all_at(&region, (index * REGION_SIZE) as u64)
+                    }));
+                }
+                start.wait();
+                for writer in writers {
+                    writer
+                        .join()
+                        .expect("parallel writer should not panic")
+                        .expect("parallel write should complete");
+                }
+                base.sync_all().expect("fsync parallel-write file");
+                drop(base);
+
+                let actual = std::fs::read(&path).expect("read parallel-write file");
+                let mut expected = Vec::with_capacity(WRITERS * REGION_SIZE);
+                for index in 0..WRITERS {
+                    expected.extend(std::iter::repeat_n(
+                        u8::try_from(index + 1).expect("writer byte"),
+                        REGION_SIZE,
+                    ));
+                }
+                assert_eq!(actual, expected);
+            },
         );
-        let mut session =
-            super::Session::mount(state, &mount_point, "studiofs-parallel-direct-writes")
-                .expect("mount");
-        let worker_mount_point = mount_point.clone();
-        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            let guard = UnmountGuard::new(worker_mount_point.clone());
-            let path = worker_mount_point.join("parallel.dat");
-            let base = std::fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            let start = Arc::new(std::sync::Barrier::new(WRITERS + 1));
-            let mut writers = Vec::with_capacity(WRITERS);
-            for index in 0..WRITERS {
-                let file = base.try_clone()?;
-                let start = Arc::clone(&start);
-                writers.push(std::thread::spawn(move || -> std::io::Result<()> {
-                    let region = vec![u8::try_from(index + 1).expect("writer byte"); REGION_SIZE];
-                    start.wait();
-                    file.write_all_at(&region, (index * REGION_SIZE) as u64)
-                }));
-            }
-            start.wait();
-            for writer in writers {
-                writer.join().expect("parallel writer should not panic")?;
-            }
-            base.sync_all()?;
-            drop(base);
-
-            let actual = std::fs::read(&path)?;
-            let mut expected = Vec::with_capacity(WRITERS * REGION_SIZE);
-            for index in 0..WRITERS {
-                expected.extend(std::iter::repeat_n(
-                    u8::try_from(index + 1).expect("writer byte"),
-                    REGION_SIZE,
-                ));
-            }
-            assert_eq!(actual, expected);
-
-            let status = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&worker_mount_point)
-                .status()?;
-            if status.success() {
-                guard.disarm();
-            }
-            Ok(status)
-        });
-
-        let run_result = session.run();
-        let worker_result = worker.join();
-        drop(session);
-        drop(fixture);
-        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
-
-        run_result.expect("run libfuse3 session");
-        let unmount_status = worker_result
-            .expect("parallel write worker should not panic")
-            .expect("parallel write worker should complete");
-        assert!(unmount_status.success());
     }
 
     #[test]
@@ -6859,14 +7338,12 @@ mod tests {
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-forced-unmount")
                 .expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
-        let mount_point = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../target/linux-fuse-forced-unmount-{}",
-            std::process::id()
-        ));
+        let mount_point = mounted_target_path("forced-unmount");
         std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let vfs = fixture.vfs();
 
         let state = super::SessionState::new_for_forced_unmount_test(
-            fixture.vfs(),
+            Arc::clone(&vfs),
             fixture.runtime().handle().clone(),
             false,
             default_connection_config(),
@@ -6876,6 +7353,7 @@ mod tests {
 
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-forced-unmount").expect("mount");
+        let invalidations = Arc::clone(&session.invalidation_state);
         let shutdown_probe = Arc::new(AtomicBool::new(false));
         let watcher_probe = Arc::clone(&shutdown_probe);
         let test_watcher =
@@ -6885,8 +7363,20 @@ mod tests {
         let worker_mount_point = mount_point.clone();
         let worker_tracker = Arc::clone(&tracker);
         let worker_shutdown_probe = Arc::clone(&shutdown_probe);
-        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+        let worker_vfs = Arc::clone(&vfs);
+        let worker = std::thread::spawn(move || -> std::io::Result<()> {
             let guard = UnmountGuard::new(worker_mount_point.clone());
+            std::fs::metadata(&worker_mount_point)?;
+            let negotiation = wait_for_snapshot(&worker_vfs, Duration::from_secs(5), |snapshot| {
+                snapshot.fuse_connection.negotiated_async_dio.is_some()
+            })
+            .map_err(std::io::Error::other)?;
+            if negotiation.fuse_connection.negotiated_async_dio != Some(true) {
+                return Err(std::io::Error::other(format!(
+                    "forced-unmount admission test requires negotiated async DIO: {:?}",
+                    negotiation.fuse_connection.negotiated_async_dio
+                )));
+            }
             // Synchronous kernel submissions may serialize writes to one inode.
             // The preceding test covers that case; distinct files isolate global admission.
             let first_path = worker_mount_point.join("forced-unmount-first.dat");
@@ -6954,6 +7444,10 @@ mod tests {
             });
             if let Err(error) = transition {
                 runtime_gate_release.release();
+                let unmount_result = bounded_unmount(&worker_mount_point);
+                if unmount_result.is_ok() {
+                    guard.disarm();
+                }
                 let first_status = first.take().map(|writer| match writer.join() {
                     Ok(result) => format!("{result:?}"),
                     Err(_) => "panicked".to_owned(),
@@ -6962,15 +7456,8 @@ mod tests {
                     Ok(result) => format!("{result:?}"),
                     Err(_) => "panicked".to_owned(),
                 });
-                let unmount_status = Command::new("fusermount3")
-                    .arg("-uz")
-                    .arg(&worker_mount_point)
-                    .status();
-                if unmount_status.as_ref().is_ok_and(|status| status.success()) {
-                    guard.disarm();
-                }
                 return Err(std::io::Error::other(format!(
-                    "{error}; fallback_unmount={unmount_status:?}; \
+                    "{error}; fallback_unmount={unmount_result:?}; \
                      first_writer={first_status:?}; second_writer={second_status:?}"
                 )));
             }
@@ -7016,118 +7503,1017 @@ mod tests {
                      before={reply_rejections_before}, after={reply_rejections}, stats={stats:?}"
                 )));
             }
-            let status = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&worker_mount_point)
-                .status()?;
-            if status.success() {
-                guard.disarm();
-            }
-            Ok(status)
+            bounded_unmount(&worker_mount_point)?;
+            guard.disarm();
+            Ok(())
         });
 
         let run_result = session.run();
         test_watcher.stop();
         let worker_result = worker.join();
         drop(session);
-        drop(fixture);
-        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+        let mount_absent = wait_for_mount_absent(&mount_point, Duration::from_secs(5));
+        let invalidations_idle = invalidations.wait_for_idle(Duration::from_secs(5));
+        let writes_idle = tracker.wait_idle(Duration::from_secs(5));
+        let write_stats = tracker.stats();
+        let snapshot = wait_for_local_mounted_idle(&vfs);
+        let remove_result = std::fs::remove_dir_all(&mount_point);
 
         run_result.expect("run libfuse3 session");
-        let unmount_status = worker_result
+        worker_result
             .expect("forced-unmount worker should not panic")
             .expect("forced-unmount worker should complete");
-        assert!(unmount_status.success());
+        assert!(
+            mount_absent,
+            "findmnt still reports the forced-unmount path"
+        );
+        assert!(
+            invalidations_idle,
+            "kernel invalidation remained active at teardown"
+        );
+        assert!(
+            writes_idle,
+            "async writes did not drain at teardown: {write_stats:?}"
+        );
+        assert_eq!(
+            (
+                write_stats.active_requests,
+                write_stats.pending_writes,
+                write_stats.pending_bytes,
+                write_stats.admission_waiters,
+            ),
+            (0, 0, 0, 0),
+            "forced-unmount tracker retained live work"
+        );
+        assert_eq!(
+            (
+                snapshot.fuse_async_read.pending_reads,
+                snapshot.fuse_async_read.pending_bytes,
+                snapshot.os_cache.active_foreground_handles,
+                snapshot.os_cache.active_writers,
+            ),
+            (0, 0, 0, 0),
+            "forced-unmount lifecycle gauges were not zero at teardown"
+        );
+        remove_result.expect("remove forced-unmount path");
     }
 
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_namespace_mutations_are_visible_through_readdir() {
         let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-namespace-mutate")
-                .expect("create VFS fixture");
+            ContractVfsFixture::new("linux-fuse-namespace-mutate").expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
-        let mount_point = std::env::temp_dir().join(format!(
-            "studiofs-linux-fuse-namespace-mutate-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
 
-        let state = super::SessionState::new(
+        run_mounted_vfs_test("namespace-mutate", vfs, runtime_handle, |mount_point, _| {
+            let result = (|| -> std::io::Result<()> {
+                let dir = mount_point.join("dir");
+                let file = dir.join("file.txt");
+                let hardlink = dir.join("hardlink.txt");
+                let symlink = dir.join("symlink.txt");
+                let mknod_file = dir.join("mknod.txt");
+                let renamed = dir.join("renamed.txt");
+                let xattr_name = b"user.studiofs.test";
+                std::fs::create_dir(&dir)?;
+                mknod_regular_file(&mknod_file)?;
+                assert!(mknod_file.is_file());
+                std::fs::remove_file(&mknod_file)?;
+                std::fs::write(&file, b"namespace")?;
+                std::fs::rename(&file, &renamed)?;
+                std::fs::hard_link(&renamed, &hardlink)?;
+                assert_eq!(std::fs::read_to_string(&hardlink)?, "namespace");
+                assert!(std::fs::metadata(&renamed)?.nlink() >= 2);
+                std::os::unix::fs::symlink("renamed.txt", &symlink)?;
+                assert_eq!(
+                    std::fs::read_link(&symlink)?,
+                    std::path::PathBuf::from("renamed.txt")
+                );
+                set_xattr(&renamed, xattr_name, b"value")?;
+                assert_eq!(get_xattr(&renamed, xattr_name)?, b"value");
+                assert!(list_xattrs(&renamed)?.iter().any(|name| name == xattr_name));
+                remove_xattr(&renamed, xattr_name)?;
+                assert_eq!(
+                    get_xattr(&renamed, xattr_name)
+                        .expect_err("removed xattr should be missing")
+                        .raw_os_error(),
+                    Some(libc::ENODATA)
+                );
+                let mut names = std::fs::read_dir(&dir)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                names.sort();
+                assert_eq!(
+                    names,
+                    vec![
+                        std::ffi::OsString::from("hardlink.txt"),
+                        std::ffi::OsString::from("renamed.txt"),
+                        std::ffi::OsString::from("symlink.txt")
+                    ]
+                );
+                std::fs::remove_file(&symlink)?;
+                std::fs::remove_file(&hardlink)?;
+                std::fs::remove_file(&renamed)?;
+                std::fs::remove_dir(&dir)?;
+                Ok(())
+            })();
+            result.expect("complete mounted namespace operations");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_kernel_cache_coherence_matrix() {
+        assert_eq!(
+            super::linux_fuse_cache_policy_from_env(),
+            super::LinuxFuseCachePolicy::Kernel,
+            "Kernel coherence matrix requires STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel"
+        );
+        let fixture = ContractVfsFixture::new("linux-fuse-kernel-coherence")
+            .expect("create Kernel coherence fixture");
+        fixture.start().expect("start Kernel coherence fixture");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
+
+        run_mounted_vfs_test(
+            "kernel-coherence",
+            Arc::clone(&vfs),
+            runtime_handle,
+            move |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot
+                        .fuse_connection
+                        .negotiated_writeback_cache
+                        .is_some()
+                        && snapshot.fuse_connection.negotiated_async_dio.is_some()
+                })
+                .unwrap_or_else(|error| panic!("FUSE init did not publish negotiation: {error}"));
+                assert_eq!(
+                    negotiation.fuse_connection.requested_writeback_cache,
+                    Some(true)
+                );
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_async_dio,
+                    Some(false)
+                );
+
+                let basic = mount_point.join("write-fsync-reopen.bin");
+                let basic_before = vfs.write_path_observability_snapshot();
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&basic)
+                    .expect("create basic file");
+                file.write_all(b"write-fsync-close-reopen")
+                    .expect("write basic file");
+                file.sync_all().expect("fsync basic file");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&basic).expect("reopen basic file"),
+                    b"write-fsync-close-reopen"
+                );
+                let basic_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    basic_after.fuse_callbacks.write.calls
+                        > basic_before.fuse_callbacks.write.calls
+                );
+                assert!(
+                    basic_after.fuse_callbacks.fsync.calls
+                        > basic_before.fuse_callbacks.fsync.calls
+                );
+                assert!(
+                    basic_after.fuse_callbacks.release.calls
+                        > basic_before.fuse_callbacks.release.calls
+                );
+
+                let append = mount_point.join("append.bin");
+                std::fs::write(&append, b"prefix").expect("seed append file");
+                let append_before = wait_for_local_mounted_idle(vfs);
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&append)
+                    .expect("open append file");
+                file.write_all(b"-suffix").expect("append bytes");
+                file.sync_all().expect("fsync append file");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&append).expect("read appended file"),
+                    b"prefix-suffix"
+                );
+                let append_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    append_after.fuse_callbacks.write.calls
+                        > append_before.fuse_callbacks.write.calls
+                );
+
+                let truncate = mount_point.join("truncate.bin");
+                std::fs::write(&truncate, b"abcdefgh").expect("seed truncate file");
+                let truncate_before = wait_for_local_mounted_idle(vfs);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&truncate)
+                    .expect("open truncate file");
+                file.set_len(3).expect("truncate smaller");
+                file.sync_all().expect("fsync smaller truncate");
+                drop(file);
+                assert_eq!(std::fs::read(&truncate).expect("read smaller file"), b"abc");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&truncate)
+                    .expect("reopen truncate file");
+                file.set_len(8).expect("truncate larger");
+                file.sync_all().expect("fsync larger truncate");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&truncate).expect("read extended file"),
+                    b"abc\0\0\0\0\0"
+                );
+                let truncate_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    truncate_after.fuse_callbacks.fsync.calls
+                        >= truncate_before.fuse_callbacks.fsync.calls + 2
+                );
+
+                let overwrite = mount_point.join("same-size-overwrite.bin");
+                std::fs::write(&overwrite, b"version-one").expect("seed overwrite file");
+                let overwrite_before = wait_for_local_mounted_idle(vfs);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&overwrite)
+                    .expect("open overwrite file");
+                file.write_all(b"version-two").expect("overwrite same size");
+                file.sync_all().expect("fsync overwrite");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&overwrite).expect("read overwrite file"),
+                    b"version-two"
+                );
+                let overwrite_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    overwrite_after.fuse_callbacks.write.calls
+                        > overwrite_before.fuse_callbacks.write.calls
+                );
+
+                let sparse = mount_point.join("sparse.bin");
+                let sparse_before = vfs.write_path_observability_snapshot();
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&sparse)
+                    .expect("create sparse file");
+                file.seek(SeekFrom::Start(4096)).expect("seek sparse hole");
+                file.write_all(b"tail").expect("write sparse tail");
+                file.sync_all().expect("fsync sparse file");
+                drop(file);
+                let mut expected_sparse = vec![0; 4096];
+                expected_sparse.extend_from_slice(b"tail");
+                assert_eq!(
+                    std::fs::read(&sparse).expect("read sparse file"),
+                    expected_sparse
+                );
+                let sparse_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    sparse_after.fuse_callbacks.write.calls
+                        > sparse_before.fuse_callbacks.write.calls
+                );
+
+                let open_reader = mount_point.join("reader-open.bin");
+                std::fs::write(&open_reader, b"old-content").expect("seed open-reader file");
+                wait_for_local_mounted_idle(vfs);
+                let mut reader = std::fs::File::open(&open_reader).expect("open reader");
+                let reader_before = vfs.write_path_observability_snapshot();
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&open_reader)
+                    .expect("open concurrent writer");
+                writer
+                    .write_all(b"new-content")
+                    .expect("write concurrent content");
+                writer.sync_all().expect("fsync concurrent writer");
+                drop(writer);
+                reader.seek(SeekFrom::Start(0)).expect("rewind open reader");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .expect("read through open reader");
+                drop(reader);
+                assert_eq!(actual, b"new-content");
+                let reader_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    reader_after.os_cache.replace > reader_before.os_cache.replace,
+                    "active writer must force a reader cache replacement"
+                );
+
+                let rename_from = mount_point.join("rename-open-from.bin");
+                let rename_to = mount_point.join("rename-open-to.bin");
+                std::fs::write(&rename_from, b"rename-visible").expect("seed rename file");
+                wait_for_local_mounted_idle(vfs);
+                let mut open = std::fs::File::open(&rename_from).expect("open rename source");
+                let rename_before = vfs.write_path_observability_snapshot();
+                std::fs::rename(&rename_from, &rename_to).expect("rename while open");
+                let mut actual = Vec::new();
+                open.read_to_end(&mut actual)
+                    .expect("read renamed open file");
+                drop(open);
+                assert_eq!(actual, b"rename-visible");
+                assert_eq!(
+                    std::fs::read(&rename_to).expect("reopen rename target"),
+                    b"rename-visible"
+                );
+                assert_eq!(
+                    std::fs::metadata(&rename_from)
+                        .expect_err("rename source should be absent")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                let rename_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    rename_after.fuse_callbacks.release.calls
+                        > rename_before.fuse_callbacks.release.calls
+                );
+
+                let unlink = mount_point.join("unlink-open.bin");
+                std::fs::write(&unlink, b"unlink-visible").expect("seed unlink file");
+                wait_for_local_mounted_idle(vfs);
+                let mut open = std::fs::File::open(&unlink).expect("open unlink file");
+                let unlink_before = vfs.write_path_observability_snapshot();
+                std::fs::remove_file(&unlink).expect("unlink while open");
+                let mut actual = Vec::new();
+                open.read_to_end(&mut actual)
+                    .expect("read unlinked open file");
+                drop(open);
+                assert_eq!(actual, b"unlink-visible");
+                assert_eq!(
+                    std::fs::metadata(&unlink)
+                        .expect_err("unlinked path should be absent")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                let unlink_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    unlink_after.fuse_callbacks.release.calls
+                        > unlink_before.fuse_callbacks.release.calls
+                );
+
+                let hard_original = mount_point.join("hardlink-original.bin");
+                let hard_link = mount_point.join("hardlink-peer.bin");
+                std::fs::write(&hard_original, b"hardlink-old").expect("seed hardlink file");
+                let hard_before = wait_for_local_mounted_idle(vfs);
+                std::fs::hard_link(&hard_original, &hard_link).expect("create hardlink");
+                wait_for_local_mounted_idle(vfs);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&hard_link)
+                    .expect("open hardlink writer");
+                file.write_all(b"hardlink-new").expect("update hardlink");
+                file.sync_all().expect("fsync hardlink update");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&hard_original).expect("read original hardlink"),
+                    b"hardlink-new"
+                );
+                std::fs::remove_file(&hard_original).expect("remove original hardlink");
+                assert_eq!(
+                    std::fs::read(&hard_link).expect("read surviving hardlink"),
+                    b"hardlink-new"
+                );
+                std::fs::remove_file(&hard_link).expect("retire final hardlink");
+                assert_eq!(
+                    std::fs::metadata(&hard_link)
+                        .expect_err("final hardlink should be absent")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                let hard_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    hard_after.fuse_liveness.observed_references
+                        > hard_before.fuse_liveness.observed_references
+                );
+
+                let warm = mount_point.join("warm-cache.bin");
+                let warm_payload: Vec<u8> = (0..256 * 1024)
+                    .map(|index| u8::try_from(index % 251).expect("warm byte"))
+                    .collect();
+                std::fs::write(&warm, &warm_payload).expect("seed warm-cache file");
+                wait_for_local_mounted_idle(vfs);
+                let checksum = |bytes: &[u8]| {
+                    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
+                };
+                let expected_checksum = checksum(&warm_payload);
+                let first_before = wait_for_read_quiescence(vfs);
+                let first = std::fs::read(&warm).expect("first fresh warm read");
+                assert_eq!(first, warm_payload);
+                assert_eq!(checksum(&first), expected_checksum);
+                let first_after = wait_for_read_quiescence(vfs);
+                assert!(
+                    first_after.fuse_callbacks.read.calls > first_before.fuse_callbacks.read.calls,
+                    "first fresh warm read must prove a FUSE read callback"
+                );
+                assert!(
+                    first_after.vfs_read_path.calls > first_before.vfs_read_path.calls,
+                    "first fresh warm read must prove a VFS read"
+                );
+                assert_eq!(
+                    first_after.os_cache.replace,
+                    first_before.os_cache.replace + 1,
+                    "first stable reopen must replace cached pages"
+                );
+
+                let second_before = wait_for_read_quiescence(vfs);
+                let second = std::fs::read(&warm).expect("second fresh warm read");
+                assert_eq!(second, warm_payload);
+                assert_eq!(checksum(&second), expected_checksum);
+                let second_after = wait_for_read_quiescence(vfs);
+                assert_eq!(
+                    second_after.os_cache.reuse,
+                    second_before.os_cache.reuse + 1,
+                    "second identical stable reopen must reuse cached pages"
+                );
+                assert_eq!(
+                    second_after.fuse_callbacks.read.calls, second_before.fuse_callbacks.read.calls,
+                    "second warm read must add zero FUSE read callbacks"
+                );
+                assert_eq!(
+                    second_after.vfs_read_path.calls, second_before.vfs_read_path.calls,
+                    "second warm read must add zero VFS reads"
+                );
+            },
+        );
+
+        drop(fixture);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_kernel_writeback_flush_and_release_are_locally_durable() {
+        assert_eq!(
+            super::linux_fuse_cache_policy_from_env(),
+            super::LinuxFuseCachePolicy::Kernel,
+            "Kernel writeback test requires STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel"
+        );
+        let fixture = ContractVfsFixture::new("linux-fuse-kernel-writeback")
+            .expect("create Kernel writeback fixture");
+        fixture.start().expect("start Kernel writeback fixture");
+        let callback_runtime = fixture.runtime().handle().clone();
+        let operation_runtime = callback_runtime.clone();
+        run_mounted_vfs_test(
+            "kernel-writeback",
+            fixture.vfs(),
+            callback_runtime,
+            move |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot
+                        .fuse_connection
+                        .negotiated_writeback_cache
+                        .is_some()
+                })
+                .expect("wait for negotiation");
+                if negotiation.fuse_connection.negotiated_writeback_cache == Some(false) {
+                    eprintln!(
+                        "SKIP mounted_kernel_writeback_flush_and_release_are_locally_durable: \
+                         kernel rejected FUSE writeback cache"
+                    );
+                    return;
+                }
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_writeback_cache,
+                    Some(true)
+                );
+                let path = mount_point.join("truncate-write.bin");
+                std::fs::write(&path, b"truncate-old").expect("seed file");
+                wait_for_local_mounted_idle(vfs);
+                let baseline = vfs.write_path_observability_snapshot();
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("open truncate writer");
+                file.write_all(b"truncate-new").expect("write replacement");
+                file.sync_all().expect("sync replacement");
+                let ino = std::fs::metadata(&path).expect("stat replacement").ino();
+                let local = operation_runtime
+                    .block_on(vfs.read(ino, 0, 12))
+                    .expect("read locally durable replacement");
+                assert_eq!(local.as_ref(), b"truncate-new");
+                drop(file);
+                assert_eq!(
+                    std::fs::read(&path).expect("reopen replacement after release"),
+                    b"truncate-new"
+                );
+                let after = wait_for_local_mounted_idle(vfs);
+                assert!(after.fuse_callbacks.write.calls > baseline.fuse_callbacks.write.calls);
+                assert!(after.fuse_callbacks.fsync.calls > baseline.fuse_callbacks.fsync.calls);
+                assert!(after.fuse_callbacks.flush.calls > baseline.fuse_callbacks.flush.calls);
+                assert!(after.fuse_callbacks.release.calls > baseline.fuse_callbacks.release.calls);
+                assert_eq!(
+                    (
+                        after.fuse_async_write.active_requests,
+                        after.fuse_async_write.pending_writes,
+                        after.fuse_async_write.pending_bytes,
+                    ),
+                    (0, 0, 0),
+                    "Kernel writeback must not retain detached writes"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL, S3, /dev/fuse, and fusermount3"]
+    fn mounted_kernel_remote_listener_invalidation() {
+        let Some(environment) = remote_test_environment() else {
+            return;
+        };
+        assert_eq!(
+            super::linux_fuse_cache_policy_from_env(),
+            super::LinuxFuseCachePolicy::Kernel,
+            "remote invalidation test requires STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel"
+        );
+
+        let root = TargetTestDirectory::new("remote-listener");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("build remote-test runtime");
+        let volume = RemotePgVolume::new(&environment.pg_dsn, &runtime);
+        let format_info = volume.format_info(&environment);
+        let writer_db = root.path().join("writer.redb");
+        let reader_db = root.path().join("reader.redb");
+        seed_remote_local_metadata(&writer_db, &format_info);
+        seed_remote_local_metadata(&reader_db, &format_info);
+
+        let writer_meta = PgMetaEngine::open(&writer_db)
+            .unwrap_or_else(|_| panic!("open configured writer PostgreSQL metadata"));
+        let reader_meta = PgMetaEngine::open(&reader_db)
+            .unwrap_or_else(|_| panic!("open configured reader PostgreSQL metadata"));
+        let writer_meta_dyn: Arc<dyn MetaEngine> = writer_meta.clone();
+        let reader_meta_dyn: Arc<dyn MetaEngine> = reader_meta.clone();
+        let (writer_vfs, reader_vfs) = {
+            let _runtime = runtime.enter();
+            (
+                make_remote_vfs(
+                    writer_meta_dyn,
+                    &format_info,
+                    &root.path().join("writer-cache"),
+                ),
+                make_remote_vfs(
+                    reader_meta_dyn,
+                    &format_info,
+                    &root.path().join("reader-cache"),
+                ),
+            )
+        };
+        let callback_runtime = runtime.handle().clone();
+        let operation_runtime = callback_runtime.clone();
+        let writer_for_test = Arc::clone(&writer_vfs);
+        let writer_meta_for_test = writer_meta.clone();
+        let reader_meta_for_test = reader_meta.clone();
+        let publish_timeout = remote_publish_timeout();
+
+        run_mounted_vfs_test(
+            "remote-listener-mount",
+            Arc::clone(&reader_vfs),
+            callback_runtime,
+            move |mount_point, reader_vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted remote reader root");
+                wait_for_snapshot(reader_vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot
+                        .fuse_connection
+                        .negotiated_writeback_cache
+                        .is_some()
+                })
+                .expect("wait for remote reader negotiation");
+                wait_for_snapshot(reader_vfs, Duration::from_secs(15), |_| {
+                    let diagnostics = reader_meta_for_test.metadata_invalidation_diagnostics();
+                    diagnostics.last_successful_sync_unix_ms.is_some()
+                        && diagnostics.sync_errors == 0
+                })
+                .unwrap_or_else(|_| {
+                    panic!("configured PostgreSQL metadata listener did not become ready")
+                });
+
+                let v1: Vec<u8> = (0..512 * 1024)
+                    .map(|index| u8::try_from(index % 251).expect("v1 byte"))
+                    .collect();
+                let v2: Vec<u8> = (0..512 * 1024)
+                    .map(|index| u8::try_from((index + 97) % 251).expect("v2 byte"))
+                    .collect();
+                let remote_name = b"remote-listener.bin";
+                let writer_attr = writer_for_test
+                    .create(ROOT_INO, remote_name, 0, 0, 0o644)
+                    .expect("create remote writer file");
+                operation_runtime
+                    .block_on(writer_for_test.write(writer_attr.ino, 0, &v1))
+                    .expect("write remote v1");
+                operation_runtime
+                    .block_on(writer_for_test.flush(writer_attr.ino))
+                    .expect("flush remote v1");
+                wait_for_snapshot(&writer_for_test, publish_timeout, |snapshot| {
+                    let replication = writer_meta_for_test.replication_backlog();
+                    snapshot.dirty_pressure.total_dirty_bytes == 0
+                        && snapshot.pending_uploads == 0
+                        && snapshot.upload.active_uploads == 0
+                        && replication.pending_ops == 0
+                        && replication.inflight_ops == 0
+                        && writer_meta_for_test
+                            .get_attr(writer_attr.ino)
+                            .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+                })
+                .unwrap_or_else(|_| panic!("configured S3 backend did not publish remote v1"));
+                let writer_v1_ids = regular_file_payload_ids(&writer_for_test, writer_attr.ino);
+                assert!(!writer_v1_ids.is_empty(), "remote v1 has no payload IDs");
+
+                wait_for_snapshot(reader_vfs, Duration::from_secs(15), |_| {
+                    reader_meta_for_test
+                        .get_attr(writer_attr.ino)
+                        .is_ok_and(|attr| {
+                            attr.upload_state == UploadState::Ready && attr.size == v1.len() as u64
+                        })
+                        && regular_file_payload_ids(reader_vfs, writer_attr.ino) == writer_v1_ids
+                })
+                .unwrap_or_else(|_| {
+                    panic!("production listener did not apply the remote v1 payload graph")
+                });
+
+                let mounted_path = mount_point.join("remote-listener.bin");
+                wait_for_snapshot(reader_vfs, Duration::from_secs(15), |_| {
+                    std::fs::metadata(&mounted_path).is_ok()
+                })
+                .unwrap_or_else(|_| panic!("remote v1 did not appear through the mounted reader"));
+                let mounted_ino = std::fs::metadata(&mounted_path)
+                    .expect("stat mounted remote v1")
+                    .ino();
+                assert_eq!(mounted_ino, writer_attr.ino);
+
+                let checksum = |bytes: &[u8]| {
+                    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
+                };
+                let v1_checksum = checksum(&v1);
+                let v1_first_before = wait_for_read_quiescence(reader_vfs);
+                let v1_first = std::fs::read(&mounted_path).expect("read mounted remote v1");
+                assert_eq!(v1_first, v1);
+                assert_eq!(checksum(&v1_first), v1_checksum);
+                let v1_first_after = wait_for_read_quiescence(reader_vfs);
+                assert!(
+                    v1_first_after.fuse_callbacks.read.calls
+                        > v1_first_before.fuse_callbacks.read.calls
+                );
+                assert_eq!(
+                    v1_first_after.os_cache.replace,
+                    v1_first_before.os_cache.replace + 1
+                );
+                let reuse_deadline = Instant::now() + Duration::from_secs(10);
+                let mut v1_reuse_before = v1_first_after;
+                loop {
+                    let reopened = std::fs::read(&mounted_path).expect("reopen mounted remote v1");
+                    assert_eq!(reopened, v1);
+                    assert_eq!(checksum(&reopened), v1_checksum);
+                    let after = wait_for_read_quiescence(reader_vfs);
+                    if after.os_cache.reuse > v1_reuse_before.os_cache.reuse {
+                        assert_eq!(after.os_cache.reuse, v1_reuse_before.os_cache.reuse + 1);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < reuse_deadline,
+                        "remote v1 did not reach stable cache reuse: before={:?}, after={:?}",
+                        (
+                            v1_reuse_before.os_cache.replace,
+                            v1_reuse_before.os_cache.reuse
+                        ),
+                        (after.os_cache.replace, after.os_cache.reuse)
+                    );
+                    v1_reuse_before = after;
+                }
+
+                let reader_v1_ids = regular_file_payload_ids(reader_vfs, writer_attr.ino);
+                assert_eq!(reader_v1_ids, writer_v1_ids);
+                let mut stable_baseline = None;
+                let mut stable_polls = 0;
+                wait_for_snapshot(reader_vfs, Duration::from_secs(5), |snapshot| {
+                    let diagnostics = reader_meta_for_test.metadata_invalidation_diagnostics();
+                    let current = (
+                        diagnostics.notifications_received,
+                        diagnostics.fallback_poll_discoveries,
+                        diagnostics.sync_errors,
+                        snapshot.fuse_liveness.notifications_forwarded,
+                        snapshot.fuse_liveness.notifications_suppressed,
+                    );
+                    if stable_baseline == Some(current) {
+                        stable_polls += 1;
+                    } else {
+                        stable_baseline = Some(current);
+                        stable_polls = 0;
+                    }
+                    stable_polls >= 200
+                })
+                .expect("settle remote v1 listener baseline");
+                let listener_before = reader_meta_for_test.metadata_invalidation_diagnostics();
+                let reader_metadata_token_before = reader_meta_for_test.metadata_version_token();
+                let reader_namespace_token_before = reader_meta_for_test.namespace_version_token();
+                let liveness_before = reader_vfs.write_path_observability_snapshot().fuse_liveness;
+
+                operation_runtime
+                    .block_on(writer_for_test.write(writer_attr.ino, 0, &v2))
+                    .expect("write same-inode same-size remote v2");
+                operation_runtime
+                    .block_on(writer_for_test.flush(writer_attr.ino))
+                    .expect("flush remote v2");
+                wait_for_snapshot(&writer_for_test, publish_timeout, |snapshot| {
+                    let replication = writer_meta_for_test.replication_backlog();
+                    snapshot.dirty_pressure.total_dirty_bytes == 0
+                        && snapshot.pending_uploads == 0
+                        && snapshot.upload.active_uploads == 0
+                        && replication.pending_ops == 0
+                        && replication.inflight_ops == 0
+                        && writer_meta_for_test
+                            .get_attr(writer_attr.ino)
+                            .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+                })
+                .unwrap_or_else(|_| panic!("configured S3 backend did not publish remote v2"));
+                let writer_v2_ids = regular_file_payload_ids(&writer_for_test, writer_attr.ino);
+                assert!(!writer_v2_ids.is_empty(), "remote v2 has no payload IDs");
+                assert_ne!(writer_v2_ids, writer_v1_ids);
+
+                wait_for_snapshot(reader_vfs, Duration::from_secs(15), |snapshot| {
+                    let diagnostics = reader_meta_for_test.metadata_invalidation_diagnostics();
+                    assert!(
+                        diagnostics.fallback_poll_discoveries
+                            <= listener_before.fallback_poll_discoveries,
+                        "fallback poll, not production listener, discovered remote v2: \
+                         notifications {}->{}, fallback {}->{}",
+                        listener_before.notifications_received,
+                        diagnostics.notifications_received,
+                        listener_before.fallback_poll_discoveries,
+                        diagnostics.fallback_poll_discoveries,
+                    );
+                    assert!(
+                        diagnostics.sync_errors <= listener_before.sync_errors,
+                        "remote v2 listener recorded a sync error"
+                    );
+                    assert!(
+                        snapshot.fuse_liveness.notifications_forwarded
+                            <= liveness_before.notifications_forwarded + 1,
+                        "remote v2 forwarded more than one inode invalidation: forwarded {}->{}, \
+                         suppressed {}->{}, notifications {}->{}, fallback {}->{}, sync_errors \
+                         {}->{}, metadata_token_changed={}, namespace_token_changed={}",
+                        liveness_before.notifications_forwarded,
+                        snapshot.fuse_liveness.notifications_forwarded,
+                        liveness_before.notifications_suppressed,
+                        snapshot.fuse_liveness.notifications_suppressed,
+                        listener_before.notifications_received,
+                        diagnostics.notifications_received,
+                        listener_before.fallback_poll_discoveries,
+                        diagnostics.fallback_poll_discoveries,
+                        listener_before.sync_errors,
+                        diagnostics.sync_errors,
+                        reader_metadata_token_before
+                            != reader_meta_for_test.metadata_version_token(),
+                        reader_namespace_token_before
+                            != reader_meta_for_test.namespace_version_token(),
+                    );
+                    assert!(
+                        snapshot.fuse_liveness.notifications_suppressed
+                            <= liveness_before.notifications_suppressed,
+                        "remote v2 unexpectedly suppressed an inode invalidation"
+                    );
+                    diagnostics.notifications_received > listener_before.notifications_received
+                        && diagnostics.fallback_poll_discoveries
+                            == listener_before.fallback_poll_discoveries
+                        && diagnostics.sync_errors == listener_before.sync_errors
+                        && regular_file_payload_ids(reader_vfs, writer_attr.ino) == writer_v2_ids
+                        && snapshot.fuse_liveness.notifications_forwarded
+                            == liveness_before.notifications_forwarded + 1
+                        && snapshot.fuse_liveness.notifications_suppressed
+                            == liveness_before.notifications_suppressed
+                })
+                .unwrap_or_else(|_| {
+                    panic!("production listener did not deliver exact remote v2 invalidation")
+                });
+                let reader_v2_ids = regular_file_payload_ids(reader_vfs, writer_attr.ino);
+                assert_eq!(reader_v2_ids, writer_v2_ids);
+                assert_ne!(reader_v2_ids, reader_v1_ids);
+
+                let v2_checksum = checksum(&v2);
+                let v2_first_before = wait_for_read_quiescence(reader_vfs);
+                let v2_first = std::fs::read(&mounted_path).expect("read invalidated remote v2");
+                assert_eq!(v2_first, v2);
+                assert_eq!(checksum(&v2_first), v2_checksum);
+                let v2_first_after = wait_for_read_quiescence(reader_vfs);
+                assert!(
+                    v2_first_after.fuse_callbacks.read.calls
+                        > v2_first_before.fuse_callbacks.read.calls,
+                    "invalidated v2 read must cross the FUSE/VFS boundary"
+                );
+                assert_eq!(
+                    v2_first_after.os_cache.replace,
+                    v2_first_before.os_cache.replace + 1,
+                    "stale remote generation must replace cached pages"
+                );
+                let v2_second_before = wait_for_read_quiescence(reader_vfs);
+                let v2_second = std::fs::read(&mounted_path).expect("reopen stable remote v2");
+                assert_eq!(v2_second, v2);
+                assert_eq!(checksum(&v2_second), v2_checksum);
+                let v2_second_after = wait_for_read_quiescence(reader_vfs);
+                assert_eq!(
+                    v2_second_after.os_cache.reuse,
+                    v2_second_before.os_cache.reuse + 1,
+                    "stable remote v2 must be reusable after replacement"
+                );
+            },
+        );
+
+        runtime.block_on(async {
+            writer_vfs.shutdown(Duration::from_secs(15)).await;
+            reader_vfs.shutdown(Duration::from_secs(15)).await;
+        });
+        drop(writer_vfs);
+        drop(reader_vfs);
+        drop(writer_meta);
+        drop(reader_meta);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_cross_file_fsync_and_close_do_not_share_async_watermark() {
+        let cache_policy = super::linux_fuse_cache_policy_from_env();
+        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+        assert_eq!(
+            cache_policy,
+            super::LinuxFuseCachePolicy::Direct,
+            "cross-file watermark test requires Direct cache policy"
+        );
+        assert!(
+            super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            "cross-file watermark test requires async DIO"
+        );
+        let fixture = ContractVfsFixture::new("linux-fuse-cross-file-watermark")
+            .expect("create cross-file fixture");
+        fixture.start().expect("start cross-file fixture");
+        run_mounted_vfs_test(
+            "cross-file-watermark",
             fixture.vfs(),
             fixture.runtime().handle().clone(),
-            false,
-            default_connection_config(),
+            move |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot.fuse_connection.negotiated_async_dio.is_some()
+                })
+                .expect("wait for Direct async negotiation");
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_async_dio,
+                    Some(true),
+                    "Direct async profile requires negotiated async DIO"
+                );
+
+                let first_path = mount_point.join("fsync-watermark.bin");
+                let second_path = mount_point.join("close-watermark.bin");
+                let first_payload = vec![0x31; 256 * 1024];
+                let second_payload = vec![0x72; 256 * 1024];
+                let before = vfs.write_path_observability_snapshot();
+                let first_file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&first_path)
+                    .expect("create fsync-watermark file");
+                let second_file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&second_path)
+                    .expect("create close-watermark file");
+                let start = Arc::new(std::sync::Barrier::new(3));
+                let (completed_tx, completed_rx) = mpsc::channel();
+
+                let first_start = Arc::clone(&start);
+                let first_completed = completed_tx.clone();
+                let first_expected = first_payload.clone();
+                let first = thread::spawn(move || {
+                    let result = (|| -> std::io::Result<()> {
+                        let mut file = first_file;
+                        first_start.wait();
+                        file.write_all(&first_expected)?;
+                        file.sync_all()
+                    })();
+                    let _ = first_completed.send(("fsync", result));
+                });
+
+                let second_start = Arc::clone(&start);
+                let second_completed = completed_tx;
+                let second_expected = second_payload.clone();
+                let second = thread::spawn(move || {
+                    let result = (|| -> std::io::Result<()> {
+                        let mut file = second_file;
+                        second_start.wait();
+                        file.write_all(&second_expected)?;
+                        drop(file);
+                        Ok(())
+                    })();
+                    let _ = second_completed.send(("close", result));
+                });
+
+                start.wait();
+                for _ in 0..2 {
+                    let (label, result) = completed_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("cross-file fsync/close must make bounded progress");
+                    result.unwrap_or_else(|error| panic!("cross-file {label} failed: {error}"));
+                }
+                first.join().expect("join fsync worker");
+                second.join().expect("join close worker");
+
+                assert_eq!(
+                    std::fs::read(mount_point.join("fsync-watermark.bin"))
+                        .expect("read fsync file"),
+                    first_payload
+                );
+                assert_eq!(
+                    std::fs::read(mount_point.join("close-watermark.bin"))
+                        .expect("read close file"),
+                    second_payload
+                );
+                let after = wait_for_local_mounted_idle(vfs);
+                assert!(after.fuse_callbacks.fsync.calls > before.fuse_callbacks.fsync.calls);
+                assert!(
+                    after.fuse_callbacks.release.calls >= before.fuse_callbacks.release.calls + 2
+                );
+                assert!(
+                    after.fuse_async_write.completed_writes
+                        >= before.fuse_async_write.completed_writes + 2
+                );
+                assert_eq!(
+                    (
+                        after.fuse_async_write.active_requests,
+                        after.fuse_async_write.pending_handles,
+                        after.fuse_async_write.pending_writes,
+                        after.fuse_async_write.pending_bytes,
+                    ),
+                    (0, 0, 0, 0),
+                    "cross-file barriers retained async watermark state"
+                );
+            },
         );
-        let mut session =
-            super::Session::mount(state, &mount_point, "studiofs-namespace-mutate").expect("mount");
-        let mount_point_for_worker = mount_point.clone();
-        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-            let guard = UnmountGuard::new(mount_point_for_worker.clone());
-            let dir = mount_point_for_worker.join("dir");
-            let file = dir.join("file.txt");
-            let hardlink = dir.join("hardlink.txt");
-            let symlink = dir.join("symlink.txt");
-            let mknod_file = dir.join("mknod.txt");
-            let renamed = dir.join("renamed.txt");
-            let xattr_name = b"user.studiofs.test";
-            std::fs::create_dir(&dir)?;
-            mknod_regular_file(&mknod_file)?;
-            assert!(mknod_file.is_file());
-            std::fs::remove_file(&mknod_file)?;
-            std::fs::write(&file, b"namespace")?;
-            std::fs::rename(&file, &renamed)?;
-            std::fs::hard_link(&renamed, &hardlink)?;
-            assert_eq!(std::fs::read_to_string(&hardlink)?, "namespace");
-            assert!(std::fs::metadata(&renamed)?.nlink() >= 2);
-            std::os::unix::fs::symlink("renamed.txt", &symlink)?;
-            assert_eq!(
-                std::fs::read_link(&symlink)?,
-                std::path::PathBuf::from("renamed.txt")
-            );
-            set_xattr(&renamed, xattr_name, b"value")?;
-            assert_eq!(get_xattr(&renamed, xattr_name)?, b"value");
-            assert!(list_xattrs(&renamed)?.iter().any(|name| name == xattr_name));
-            remove_xattr(&renamed, xattr_name)?;
-            assert_eq!(
-                get_xattr(&renamed, xattr_name)
-                    .expect_err("removed xattr should be missing")
-                    .raw_os_error(),
-                Some(libc::ENODATA)
-            );
-            let mut names = std::fs::read_dir(&dir)?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            names.sort();
-            assert_eq!(
-                names,
-                vec![
-                    std::ffi::OsString::from("hardlink.txt"),
-                    std::ffi::OsString::from("renamed.txt"),
-                    std::ffi::OsString::from("symlink.txt")
-                ]
-            );
-            std::fs::remove_file(&symlink)?;
-            std::fs::remove_file(&hardlink)?;
-            std::fs::remove_file(&renamed)?;
-            std::fs::remove_dir(&dir)?;
+    }
 
-            let status = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mount_point_for_worker)
-                .status();
-            guard.disarm();
-            status
-        });
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_direct_rollback_preserves_reopen_visibility() {
+        let cache_policy = super::linux_fuse_cache_policy_from_env();
+        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+        assert_eq!(
+            cache_policy,
+            super::LinuxFuseCachePolicy::Direct,
+            "Direct rollback test requires Direct cache policy"
+        );
+        assert!(
+            !super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            "Direct rollback test requires STUDIOFS_FUSE_ASYNC_DIO=0"
+        );
+        let fixture = ContractVfsFixture::new("linux-fuse-direct-rollback")
+            .expect("create Direct rollback fixture");
+        fixture.start().expect("start Direct rollback fixture");
+        run_mounted_vfs_test(
+            "direct-rollback",
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            move |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot.fuse_connection.negotiated_async_dio.is_some()
+                })
+                .expect("wait for Direct rollback negotiation");
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_async_dio,
+                    Some(false),
+                    "Direct rollback requires negotiated async DIO false"
+                );
 
-        session.run().expect("run libfuse3 session");
-        let unmount_status = worker
-            .join()
-            .expect("mounted namespace worker should not panic")
-            .expect("mounted namespace worker should complete");
-        assert!(unmount_status.success());
-        drop(session);
-        drop(fixture);
-        std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+                let path = mount_point.join("rollback-visible.bin");
+                let payload: Vec<u8> = (0..128 * 1024)
+                    .map(|index| u8::try_from(index % 239).expect("rollback byte"))
+                    .collect();
+                let before = vfs.write_path_observability_snapshot();
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("create rollback file");
+                file.write_all(&payload).expect("write rollback payload");
+                file.sync_all().expect("fsync rollback payload");
+                drop(file);
+                assert_eq!(std::fs::read(&path).expect("reopen rollback file"), payload);
+                let after = wait_for_local_mounted_idle(vfs);
+                assert!(after.fuse_callbacks.write.calls > before.fuse_callbacks.write.calls);
+                assert!(after.fuse_callbacks.fsync.calls > before.fuse_callbacks.fsync.calls);
+                assert!(after.fuse_callbacks.release.calls > before.fuse_callbacks.release.calls);
+            },
+        );
     }
 }

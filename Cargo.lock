@@ -4903,14 +4903,18 @@ version = "0.1.1"
 dependencies = [
  "bytes",
  "cc",
+ "dotenvy",
  "libc",
  "pkg-config",
  "studiofs-bridge",
+ "studiofs-data",
  "studiofs-meta",
  "studiofs-vfs",
  "tokio",
+ "tokio-postgres",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

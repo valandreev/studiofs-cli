@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <fuse_lowlevel.h>
 
-static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
 static int studiofs_linux_fuse_configure_capability(struct fuse_conn_info *conn,
                                                      uint64_t flag,
@@ -140,10 +139,6 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
         writeback_cache,
         studiofs_linux_fuse_supports_parallel_direct_writes(),
         studiofs_linux_fuse_uses_single_thread_loop());
-}
-
-const struct fuse_lowlevel_ops *studiofs_linux_fuse_empty_low_level_ops(void) {
-    return &STUDIOFS_EMPTY_LOW_LEVEL_OPS;
 }
 
 const struct fuse_lowlevel_ops *studiofs_linux_fuse_low_level_ops(void) {
