@@ -47,6 +47,8 @@ The first prerequisite supplies handle-scoped barriers, safe teardown, and the D
 - Modify: `crates/studiofs-linux-fuse/Cargo.toml` — only the test dependencies required by the mounted PostgreSQL/S3 fixture.
 - Modify: `crates/studiofs-linux-fuse/src/low_level.rs` — Linux liveness, cache decisions, invalidator wrapper, reply mapping, geometry state, callback timing, unit and mounted tests.
 - Modify: `crates/studiofs-linux-fuse/src/lib.rs` — any public connection snapshot type needed by mount wiring.
+- Modify: `crates/studiofs-bridge/src/fuse_liveness.rs` — keep Linux unknown-open observations in the same coherent liveness snapshot generation.
+- Modify: `crates/studiofs-vfs/src/lib.rs` — export the extended neutral liveness snapshot.
 - Modify: `crates/studiofs-vfs/src/vfs/metrics.rs` — callback size/latency histograms and barrier snapshots.
 - Modify: `crates/studiofs-vfs/src/vfs.rs` — atomic recorders, snapshot/reset behavior, exports.
 - Modify: `crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs` — separate bridge callback/barrier histograms and negotiated gauges.
@@ -76,6 +78,7 @@ In Linux low-level tests add these exact cases:
 
 ```text
 linux_low_level_ops_installs_forget_callback
+linux_forget_without_callback_state_still_replies_none
 linux_forget_decrements_exact_lookup_count
 linux_forget_zero_count_is_a_noop
 linux_entry_reply_reserves_before_reply_and_rolls_back_failure
@@ -102,7 +105,10 @@ Expected: tests fail because Linux has no `forget` callback or liveness field.
 
 - [ ] **Step 3: Add the raw reply and Rust callback**
 
-Declare `fuse_reply_none` in the Linux raw bindings and add:
+Declare `fuse_reply_none` in the Linux raw bindings. Factor the body through a
+small closure-based helper so a test can prove the reply is unconditional even
+without callback state; opaque fake `fuse_req_t` values must not be passed to
+the exported callback. The production callback remains:
 
 ```rust
 #[unsafe(no_mangle)]
@@ -136,7 +142,13 @@ Add `.forget = studiofs_linux_fuse_forget` immediately after `.lookup` in `STUDI
 
 Change `reply_entry_result` and `reply_create` to reserve with `state.inode_liveness.observe(attr.ino)` immediately before `fuse_reply_entry`/`fuse_reply_create`. Inspect the returned `c_int`; on nonzero return, immediately call `forget(attr.ino, 1)` to roll back the rejected entry. This ordering prevents a kernel `forget` dispatched on another loop thread from arriving before the reference exists.
 
-For `open`, call only `is_observed(ino)`. A false result increments `open_unknown_inode` and emits a rate-limited invariant warning; successful or failed `fuse_reply_open` never changes lookup counts. The existing failed-reply handle cleanup in Task 2 is independent of lookup liveness.
+For `open`, call only `is_observed(ino)`. A false result calls a new tracker
+method that increments `open_unknown_inode` under the existing
+`FuseInodeLiveness` stats mutex and advances that same `snapshot_generation`;
+do not use a separate Linux atomic that could publish conflicting values for
+one generation. Emit a rate-limited invariant warning. Successful or failed
+`fuse_reply_open` never changes lookup counts. The existing failed-reply handle
+cleanup in Task 2 is independent of lookup liveness.
 
 Do not observe `getattr` or directory reads, and do not retain a reference after a failed entry reply.
 
@@ -165,15 +177,19 @@ Arc::new(PublishingLinuxKernelInvalidator::new(
 
 The outer wrapper publishes after forwarded or suppressed notification attempts. It may retain only the VFS plus liveness tracker, not the whole session state.
 
-Add a neutral `VfsFuseLivenessSnapshot` to VFS observability with the shared monotonic fields plus Linux `open_unknown_inode`. Export them from `.studiofs-runtime-stats`; the benchmark gate uses deltas to prove lookup/forget and notification forwarding/suppression actually occurred. Include `snapshot_generation`, update it in the tracker with every counter change, and reject a concurrently published snapshot older than the current generation so monotonic values cannot move backward.
+Add `open_unknown_inode` to the shared `FuseInodeLivenessStats` and neutral
+`VfsFuseLivenessSnapshot`. Export them from `.studiofs-runtime-stats`; the
+benchmark gate uses deltas to prove lookup/forget and notification
+forwarding/suppression actually occurred. Include `snapshot_generation`, update
+it in the tracker with every counter change, and reject a concurrently
+published snapshot older than the current generation so monotonic values
+cannot move backward.
 
 - [ ] **Step 8: Verify GREEN**
 
 ```bash
 cargo test -p studiofs-bridge fuse_liveness -- --nocapture
-cargo test -p studiofs-linux-fuse linux_forget_ -- --nocapture
-cargo test -p studiofs-linux-fuse linux_entry_reply_reserves_ -- --nocapture
-cargo test -p studiofs-linux-fuse linux_invalidator_ -- --nocapture
+cargo test -p studiofs-linux-fuse linux_ -- --nocapture
 cargo test -p studiofs-vfs runtime_stats_surface_reports_fuse_liveness -- --nocapture
 ```
 
@@ -182,7 +198,7 @@ Expected: all tests pass; external invalidation remains outside liveness locks.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/studiofs-linux-fuse/csrc/low_level_ops.c crates/studiofs-linux-fuse/src/low_level.rs crates/studiofs-vfs/src/vfs/metrics.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs crates/studiofs-vfs/src/vfs/tests.rs
+git add crates/studiofs-bridge/src/fuse_liveness.rs crates/studiofs-linux-fuse/csrc/low_level_ops.c crates/studiofs-linux-fuse/src/low_level.rs crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs/metrics.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs crates/studiofs-vfs/src/vfs/tests.rs
 git commit -m "feat(linux): track fuse inode liveness"
 ```
 
@@ -207,7 +223,11 @@ Also require open and create to use the same mapper. Initialize both
 `SessionState` from the environment at mount construction. Derive requested
 writeback-cache negotiation from `cache_policy`, and use these stored fields
 for init negotiation, preparation, flag mapping, metrics, and status;
-callbacks must not reread the environment.
+callbacks must not reread the environment. Add an internal constructor taking
+explicit cache settings for parallel-safe tests rather than mutating the
+process environment. `Session::mount` must also build argv through
+`argv_strings_for_cache_policy(volume_name, state.cache_policy)`; production
+must not fall back to `argv_strings(volume_name)` and reread policy indirectly.
 
 - [ ] **Step 2: Verify RED**
 
@@ -242,20 +262,22 @@ decision cannot be overtaken by another same-inode reply.
 
 - [ ] **Step 4: Map the decision only at the adapter boundary**
 
-Change `reply_file_open` and `reply_create` to accept `&SessionState` plus
-`LinuxFuseOpenedFile` and return a private `LinuxFuseOpenReplyOutcome {
-delivered: bool, reply_status: c_int }`. Validate `fuse_file_info` before cache
-preparation; a null pointer replies `EINVAL`, releases the unprepared VFS
-handle, and returns `delivered: false`.
+Validate `fuse_file_info` with the existing `require_file_info(fi)` before the
+VFS open/create because its flags are needed to open the handle. Remove the
+unreachable post-open null-fi cleanup branch and do not add a reply-outcome
+struct.
 
-For a valid pointer, acquire the inode's `FuseOpenReplySerializer` section,
-derive participation from `state.cache_policy`, call
-`prepare_os_cache_open(fh, participation)`, map flags, and issue the raw reply
-before releasing the section. The decision is non-fallible; an observation
-problem cannot turn a successful VFS open into an open error. The shared pure
-mapper receives `state.cache_policy`, `state.requested_async_dio`, the C-shim
-support bit, and `OsCacheOpenDecision`; Task 3 replaces the requested async
-input with actual negotiated acceptance without changing this boundary:
+Use one closure-based completion helper shared by open/create tests and
+production. Inside the inode's `FuseOpenReplySerializer` section it derives
+participation from `state.cache_policy`, calls
+`prepare_os_cache_open(fh, participation)`, maps flags, and invokes the reply
+closure before releasing the section. Production alone mutates opaque
+`fuse_file_info`; tests can block or fail the closure safely. The decision is
+non-fallible; an observation problem cannot turn a successful VFS open into an
+open error. The shared pure mapper receives `state.cache_policy`,
+`state.requested_async_dio`, the C-shim support bit, and
+`OsCacheOpenDecision`; Task 3 replaces the requested async input with actual
+negotiated acceptance without changing this boundary:
 
 ```rust
 let keep_cache = cache_policy == LinuxFuseCachePolicy::Kernel
@@ -275,13 +297,12 @@ For create, reserve the lookup reference immediately before the combined reply,
 inside the same serialized section, and roll it back if libfuse returns
 nonzero. Open still only checks `is_observed` and never mutates lookup counts.
 
-If a prepared raw reply returns nonzero, call `vfs.abort_os_cache_open(fh)`
-before releasing the serializer. Then synchronously call
-`release_fh_with_outcome(fh)` through the mount runtime, normalize only
-close-time `ENOENT`, and log any other cleanup error because the kernel request
-can no longer be replied. The null-`fi` path skips abort because no preparation
-occurred but performs the same release. This local-only cleanup removes the VFS
-handle and finishes shared foreground/writer lifecycle.
+If a prepared raw reply returns nonzero, perform create-reference rollback,
+call `vfs.abort_os_cache_open(fh)`, and synchronously call
+`release_fh_with_outcome(fh)` through the mount runtime before leaving the
+serializer. Normalize only close-time `ENOENT`, and log any other cleanup error
+because the kernel request can no longer be replied. This local-only cleanup
+removes the VFS handle and finishes shared foreground/writer lifecycle.
 
 - [ ] **Step 5: Add Linux integration tests over the shared seam**
 
@@ -301,7 +322,6 @@ linux_different_inode_reply_progresses_while_one_reply_is_blocked
 linux_rejected_replace_reply_makes_next_open_replace_again
 linux_failed_open_reply_releases_handle_and_lifecycle
 linux_failed_create_reply_releases_handle_and_lifecycle
-linux_null_file_info_releases_handle_and_lifecycle
 ```
 
 Use a blocking fake-reply seam and channels for the concurrency cases. For
@@ -312,10 +332,7 @@ foreground/writer gauges return to their baseline.
 
 ```bash
 cargo test -p studiofs-vfs os_cache_ -- --nocapture
-cargo test -p studiofs-linux-fuse linux_kernel_ -- --nocapture
-cargo test -p studiofs-linux-fuse linux_direct_open_ -- --nocapture
-STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct STUDIOFS_FUSE_ASYNC_DIO=0 \
-  cargo test -p studiofs-linux-fuse linux_cache_decision_flags_ -- --nocapture
+cargo test -p studiofs-linux-fuse linux_ -- --nocapture
 ```
 
 Expected: all tests pass and Direct never sets `keep_cache`.
@@ -331,7 +348,26 @@ git commit -m "feat(linux): consume shared os cache decisions"
 
 - [ ] **Step 1: Add failing configured-versus-negotiated tests**
 
-Require independent configured and negotiated fields for max write/readahead, background, congestion, `ASYNC_DIO`, and `WRITEBACK_CACHE`. `max_read` has only a negotiated field because StudioFS does not currently configure it; do not invent a requested value. One fixture sets configured and negotiated values differently and proves the snapshot preserves both. A second requests Direct async while recording `negotiated_async_dio = false` and asserts the open reply leaves `parallel_direct_writes` false. A third records accepted async on a shim without the per-open field and also expects false.
+Add these exact tests:
+
+```text
+negotiated_geometry_preserves_requested_and_effective_values
+negotiated_geometry_rejected_async_disables_parallel_direct_writes
+negotiated_geometry_missing_shim_field_disables_parallel_direct_writes
+fuse_connection_snapshot_preserves_pre_init_absence
+runtime_stats_surface_reports_fuse_connection_geometry
+mounted_status_formats_configured_and_negotiated_fuse_geometry
+```
+
+Require independent configured and negotiated fields for background,
+congestion, `ASYNC_DIO`, and `WRITEBACK_CACHE`. Max read/write/readahead have
+only negotiated fields because StudioFS does not currently configure them; do
+not invent requested values that are always absent. One fixture sets configured
+and negotiated background/congestion differently and proves the snapshot
+preserves both. A second requests Direct async while recording
+`negotiated_async_dio = false` and asserts the open reply leaves
+`parallel_direct_writes` false. A third records accepted async on a shim without
+the per-open field and also expects false.
 The fixture also reports whether this header selected the pre-3.12 single
 receive loop; it is support state, not a requested geometry value.
 
@@ -339,7 +375,7 @@ receive loop; it is support state, not a requested geometry value.
 
 ```bash
 cargo test -p studiofs-linux-fuse negotiated_geometry_ -- --nocapture
-cargo test -p studiofs-vfs fuse_connection_snapshot -- --nocapture
+cargo test -p studiofs-vfs fuse_connection_snapshot_preserves_pre_init_absence -- --nocapture
 ```
 
 Expected: compilation fails because the neutral connection snapshot does not exist.
@@ -363,15 +399,14 @@ struct LinuxFuseNegotiatedGeometry {
 }
 ```
 
-Store it as `Mutex<Option<LinuxFuseNegotiatedGeometry>>` in `SessionState`;
-`None` means the init callback has not reported a real connection yet and must
-never be rendered as negotiated zeroes. Before negotiation, the open/create
-mapper conservatively treats async acceptance as false. Add
+Store it as `OnceLock<LinuxFuseNegotiatedGeometry>` in `SessionState`; init
+writes it once and every open reads it without a mutex. An unset lock means the
+init callback has not reported a real connection yet and must never be rendered
+as negotiated zeroes. Before negotiation, the open/create mapper
+conservatively treats async acceptance as false. Add
 `VfsFuseConnectionSnapshot` with:
 
 ```rust
-pub configured_max_write_bytes: Option<u32>,
-pub configured_max_readahead_bytes: Option<u32>,
 pub configured_max_background: Option<u32>,
 pub configured_congestion_threshold: Option<u32>,
 pub requested_async_dio: Option<bool>,
@@ -407,19 +442,23 @@ extern void studiofs_linux_fuse_record_negotiated_connection(
     int single_thread_receive_loop);
 ```
 
-At the end of `studiofs_linux_fuse_init`, after both prerequisite
-compatibility-helper calls, pass the five connection fields, whether each
-capability is present in the helper's resulting `want`/`want_ext`,
+At the end of `studiofs_linux_fuse_init`, capture the return value from each of
+the two prerequisite capability-request helper calls and pass those exact
+accepted booleans together with the five connection fields,
 `studiofs_linux_fuse_supports_parallel_direct_writes()`, and the prerequisite's
 single-loop probe. Do not call `fuse_set/get_feature_flag` directly: those
 symbols are unavailable on the supported libfuse 3.10 path. The Rust callback
-replaces `None` with the negotiated state and republishes VFS observability.
+sets the previously empty `OnceLock` and republishes VFS observability.
 Once this state exists, change the open/create mapper input from the requested
 Direct async decision to
-`geometry.as_ref().is_some_and(|value| value.async_dio)` plus
+`geometry.get().is_some_and(|value| value.async_dio)` plus
 `parallel_direct_writes_supported`, so the per-open bit is false before init,
 when the kernel rejected `FUSE_CAP_ASYNC_DIO`, or when the installed header
 lacks the field.
+
+Add a small C-shim init callback fixture that exercises this wiring and checks
+the exact accepted booleans; Rust-only synthetic snapshot tests are not enough
+to prove the real init path records them.
 
 - [ ] **Step 5: Render configured and negotiated values distinctly**
 
@@ -443,8 +482,9 @@ In status output label real inputs `configured` and connection results `negotiat
 
 ```bash
 cargo test -p studiofs-linux-fuse negotiated_geometry_ -- --nocapture
-cargo test -p studiofs-vfs runtime_stats_surface_reports_fuse_ -- --nocapture
-cargo test -p studiofs mounted_status_formats_fuse_async_write_diagnostics -- --nocapture
+cargo test -p studiofs-vfs fuse_connection_snapshot_preserves_pre_init_absence -- --nocapture
+cargo test -p studiofs-vfs runtime_stats_surface_reports_fuse_connection_geometry -- --nocapture
+cargo test -p studiofs mounted_status_formats_configured_and_negotiated_fuse_geometry -- --nocapture
 ```
 
 Expected: all tests pass and a mismatched requested/actual fixture remains visibly mismatched.
@@ -470,6 +510,9 @@ fuse_flush_fsync_release_histograms_are_independent
 fuse_histogram_reset_baseline_subtracts_monotonic_buckets
 fuse_latency_snapshot_exports_raw_monotonic_buckets_and_saturation
 runtime_stats_surface_exports_each_fuse_callback_histogram
+runtime_stats_surface_exports_latency_overflow_bucket
+linux_read_callback_metrics_cover_reply_and_use_requested_size
+linux_barrier_callback_metrics_cover_reply_and_count_reply_rejection
 ```
 
 Use exact observations at every bucket boundary plus one overflow value.
@@ -510,6 +553,14 @@ pub struct VfsFuseSizeHistogram {
 
 Add `size_histogram` and `latency: VfsWritePathStageLatencyStats` to `VfsFuseIoStats` under `#[serde(default)]`. The latency snapshot must retain fixed upper bounds, raw cumulative bucket counts, overflow count, and saturation flags in addition to display quantiles; later interval analysis is impossible from quantiles alone. For every read callback, record the requested callback argument `size` in this histogram on both success and error. Returned bytes stay in the existing byte counter and never define request-size buckets.
 
+For the reused `LatencyHistogramSnapshot`, `bucket_counts` are mutually
+exclusive monotonic buckets and `bucket_counts.len() ==
+bucket_upper_bounds_ns.len() + 1`; the final count is overflow. Diagnostics
+reset must capture per-histogram baselines and saturating-subtract them in
+`write_path_observability_snapshot`. It must not call `.reset()` on live FUSE
+histograms because interval collectors require monotonic raw counters. Test
+observations before reset, immediately after reset, and after new observations.
+
 - [ ] **Step 4: Add barrier snapshots and recorders**
 
 Add:
@@ -547,7 +598,20 @@ pub fn record_fuse_barrier_callback(
 
 - [ ] **Step 5: Measure through the reply boundary**
 
-For read, flush, fsync, and release: make the narrow Rust reply helpers return libfuse's `c_int` and create `Instant` as the first instruction in each exported Rust callback, before callback-state validation. Execute the session operation, call the libfuse reply, then record elapsed time and whether the operation or reply failed. The async-write prerequisite already measures through `reply_write`; route it into the histogram without double-counting. Synchronous writes use the same recorder once.
+For read, flush, fsync, and release: make the narrow Rust reply helpers return
+libfuse's `c_int` and create `Instant` as the first instruction in each exported
+Rust callback, before callback-state validation. Execute the session operation,
+call the libfuse reply, then record elapsed time with `errored =
+operation_failed || reply_status != 0` on every synchronous success/error path.
+The async-write prerequisite already measures through `reply_write`; route it
+into the histogram without double-counting. Synchronous writes use the same
+recorder once.
+
+Under `cfg(test)`, extend the existing narrow request/reply seam (for example
+`FuseReqPtr`) with buffer and error reply closures. Use it to prove read metrics
+cover a blocked reply and bucket the requested size, and that a rejected
+flush/fsync/release reply increments errors. Do not pass opaque fake requests
+to exported callbacks.
 
 - [ ] **Step 6: Export separate runtime histograms**
 
@@ -561,6 +625,11 @@ fsync_callback
 release_callback
 ```
 
+`insert_latency_with_buckets` zips the normal bounds/counts, then explicitly
+appends `RuntimeLatencyBucket { le_ns: u64::MAX, count:
+counts[bounds.len()] }`. A runtime-surface test must assert that exact final
+bucket so 5s+ latency cannot disappear from gate evidence.
+
 Preserve aggregate `callback` for one compatibility cycle, deriving it from snapshots instead of maintaining a second live recorder. Update benchmark-profile, perf, and status outputs with p50/p95/p99/cumulative-max, size buckets, raw latency buckets, overflow, and saturation.
 
 Document the interval rule used by the gate: require identical bounds, subtract cumulative bucket counts, reject any negative delta, overflow, saturation, or zero-sample interval, and recompute p50/p95/p99 from the delta buckets. Never subtract two precomputed quantiles or cumulative maxima. Define `interval_max_upper_ms` as the upper bound of the last nonzero delta bucket; if that bucket is overflow, the run fails instead of guessing a maximum.
@@ -570,6 +639,8 @@ Document the interval rule used by the gate: require identical bounds, subtract 
 ```bash
 cargo test -p studiofs-vfs fuse_ -- --nocapture
 cargo test -p studiofs-vfs runtime_stats_surface_exports_each_fuse_callback_histogram -- --nocapture
+cargo test -p studiofs-linux-fuse linux_read_callback_metrics_ -- --nocapture
+cargo test -p studiofs-linux-fuse linux_barrier_callback_metrics_ -- --nocapture
 cargo test -p studiofs benchmark_profile -- --nocapture
 cargo test -p studiofs perf_ -- --nocapture
 ```
