@@ -124,7 +124,7 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
-    fn studiofs_linux_fuse_session_loop_mt(
+    fn studiofs_linux_fuse_session_loop_bounded(
         session: *mut raw::FuseSession,
         max_threads: c_uint,
         max_idle_threads: c_uint,
@@ -169,6 +169,9 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_uses_single_thread_loop() -> c_int;
+    fn studiofs_linux_fuse_supports_parallel_direct_writes() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_conn_wants_async_dio_after_set(capable_ext: u64) -> c_int;
     #[cfg(test)]
@@ -548,7 +551,9 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
     _userdata: *mut c_void,
 ) -> c_int {
-    if linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO") {
+    let cache_policy = linux_fuse_cache_policy_from_env();
+    let override_value = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+    if linux_fuse_async_dio_enabled_for(cache_policy, override_value.as_deref()) {
         1
     } else {
         0
@@ -584,10 +589,46 @@ fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
         .unwrap_or(LinuxFuseCachePolicy::Direct)
 }
 
-fn linux_fuse_env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| linux_fuse_env_flag_value(&value))
+fn linux_fuse_async_dio_enabled_for(
+    cache_policy: LinuxFuseCachePolicy,
+    override_value: Option<&str>,
+) -> bool {
+    cache_policy == LinuxFuseCachePolicy::Direct
+        && override_value.is_none_or(linux_fuse_env_flag_value)
+}
+
+fn linux_fuse_parallel_direct_writes_enabled(
+    async_dio_enabled: bool,
+    field_supported: bool,
+) -> bool {
+    async_dio_enabled && field_supported
+}
+
+#[cfg(test)]
+fn linux_fuse_has_bounded_loop_config_for(version: (u32, u32, u32)) -> bool {
+    version >= (3, 12, 0)
+}
+
+#[cfg(test)]
+fn linux_fuse_supports_parallel_direct_writes_for(version: (u32, u32, u32)) -> bool {
+    version >= (3, 14, 1)
+}
+
+#[cfg(test)]
+fn linux_fuse_has_extended_conn_caps_for(version: (u32, u32, u32)) -> bool {
+    version >= (3, 17, 1)
+}
+
+#[cfg(test)]
+fn linux_fuse_bounded_loop_selection_for(
+    version: (u32, u32, u32),
+    max_threads: u32,
+) -> (bool, u32) {
+    if linux_fuse_has_bounded_loop_config_for(version) {
+        (false, max_threads)
+    } else {
+        (true, 1)
+    }
 }
 
 fn linux_fuse_env_flag_value(value: &str) -> bool {
@@ -920,7 +961,7 @@ impl Session {
         // Keep idle workers equal to the cap so bursty filesystem I/O does not
         // pay thread create/destroy overhead between request spikes.
         let result = unsafe {
-            studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), loop_threads, loop_threads)
+            studiofs_linux_fuse_session_loop_bounded(self.raw.as_ptr(), loop_threads, loop_threads)
         };
         if let Some(watcher) = watcher {
             watcher.stop();
@@ -2416,18 +2457,29 @@ fn with_write_data_slice<T>(
 }
 
 fn linux_fuse_open_cache_policy(flags: c_int) -> LinuxFuseOpenCachePolicy {
-    linux_fuse_open_cache_policy_for(flags, linux_fuse_cache_policy_from_env())
+    let cache_policy = linux_fuse_cache_policy_from_env();
+    let override_value = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+    let async_dio_enabled =
+        linux_fuse_async_dio_enabled_for(cache_policy, override_value.as_deref());
+    // SAFETY: this C probe only returns a compile-time feature decision.
+    let field_supported = unsafe { studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
+    linux_fuse_open_cache_policy_for(flags, cache_policy, async_dio_enabled, field_supported)
 }
 
 fn linux_fuse_open_cache_policy_for(
     flags: c_int,
     cache_policy: LinuxFuseCachePolicy,
+    async_dio_enabled: bool,
+    field_supported: bool,
 ) -> LinuxFuseOpenCachePolicy {
     if cache_policy == LinuxFuseCachePolicy::Direct {
         return LinuxFuseOpenCachePolicy {
             direct_io: true,
             keep_cache: false,
-            parallel_direct_writes: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+            parallel_direct_writes: linux_fuse_parallel_direct_writes_enabled(
+                async_dio_enabled,
+                field_supported,
+            ),
         };
     }
 
@@ -3294,6 +3346,107 @@ mod tests {
     }
 
     #[test]
+    fn async_dio_policy_table_matches_cache_policy_and_override() {
+        let cases = [
+            (super::LinuxFuseCachePolicy::Direct, None, true),
+            (super::LinuxFuseCachePolicy::Direct, Some("0"), false),
+            (super::LinuxFuseCachePolicy::Direct, Some("1"), true),
+            (super::LinuxFuseCachePolicy::Kernel, None, false),
+            (super::LinuxFuseCachePolicy::Kernel, Some("1"), false),
+        ];
+
+        for (cache_policy, override_value, expected) in cases {
+            assert_eq!(
+                super::linux_fuse_async_dio_enabled_for(cache_policy, override_value),
+                expected,
+                "cache_policy={cache_policy:?}, override={override_value:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn async_dio_policy_parallel_open_bit_requires_c_field_support() {
+        let cases = [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ];
+
+        for (async_dio_enabled, field_supported, expected) in cases {
+            let policy = super::linux_fuse_open_cache_policy_for(
+                libc::O_RDWR,
+                super::LinuxFuseCachePolicy::Direct,
+                async_dio_enabled,
+                field_supported,
+            );
+            assert_eq!(policy.parallel_direct_writes, expected,);
+        }
+    }
+
+    #[test]
+    fn async_dio_policy_current_c_field_support_matches_version_mapper() {
+        let version = (
+            env!("STUDIOFS_LIBFUSE_VERSION_MAJOR").parse().unwrap(),
+            env!("STUDIOFS_LIBFUSE_VERSION_MINOR").parse().unwrap(),
+            env!("STUDIOFS_LIBFUSE_VERSION_PATCH").parse().unwrap(),
+        );
+        // SAFETY: this C probe only returns a compile-time feature decision.
+        let c_supports_field =
+            unsafe { super::studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
+
+        assert_eq!(
+            c_supports_field,
+            super::linux_fuse_supports_parallel_direct_writes_for(version),
+        );
+    }
+
+    #[test]
+    fn libfuse_compatibility_threshold_tables_are_exact() {
+        assert!(!super::linux_fuse_has_bounded_loop_config_for((3, 11, 99)));
+        assert!(super::linux_fuse_has_bounded_loop_config_for((3, 12, 0)));
+        assert!(!super::linux_fuse_supports_parallel_direct_writes_for((
+            3, 14, 0
+        )));
+        assert!(super::linux_fuse_supports_parallel_direct_writes_for((
+            3, 14, 1
+        )));
+        assert!(!super::linux_fuse_has_extended_conn_caps_for((3, 17, 0)));
+        assert!(super::linux_fuse_has_extended_conn_caps_for((3, 17, 1)));
+    }
+
+    #[test]
+    fn bounded_loop_selection_table_matches_header_threshold() {
+        assert_eq!(
+            super::linux_fuse_bounded_loop_selection_for((3, 11, 99), 8),
+            (true, 1),
+        );
+        assert_eq!(
+            super::linux_fuse_bounded_loop_selection_for((3, 12, 0), 8),
+            (false, 8),
+        );
+    }
+
+    #[test]
+    fn bounded_loop_selection_current_c_probe_matches_version_mapper() {
+        let version = (
+            env!("STUDIOFS_LIBFUSE_VERSION_MAJOR").parse().unwrap(),
+            env!("STUDIOFS_LIBFUSE_VERSION_MINOR").parse().unwrap(),
+            env!("STUDIOFS_LIBFUSE_VERSION_PATCH").parse().unwrap(),
+        );
+        // SAFETY: this C probe only returns a compile-time feature decision.
+        let c_uses_single_thread =
+            unsafe { super::studiofs_linux_fuse_uses_single_thread_loop() } != 0;
+
+        assert_eq!(
+            (
+                c_uses_single_thread,
+                if c_uses_single_thread { 1 } else { 8 }
+            ),
+            super::linux_fuse_bounded_loop_selection_for(version, 8),
+        );
+    }
+
+    #[test]
     fn async_write_reservation_releases_pending_bytes_on_drop() {
         let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
 
@@ -3407,12 +3560,14 @@ mod tests {
     }
 
     #[test]
-    fn multithread_loop_uses_fuse_loop_config_api() {
+    fn libfuse_compatibility_loop_config_probe_matches_single_thread_probe() {
         // SAFETY: the C shim returns its compile-time libfuse API selection.
         let uses_loop_config_api =
             unsafe { super::studiofs_linux_fuse_loop_config_uses_loop_config_api() };
+        // SAFETY: this C probe only returns a compile-time feature decision.
+        let uses_single_thread = unsafe { super::studiofs_linux_fuse_uses_single_thread_loop() };
 
-        assert_eq!(uses_loop_config_api, 1);
+        assert_eq!(uses_loop_config_api, 1 - uses_single_thread);
     }
 
     #[test]
@@ -3530,8 +3685,11 @@ mod tests {
     fn file_info_init_sets_requested_cache_flags() {
         // SAFETY: the C shim initializes and inspects a stack-local fuse_file_info.
         let flags = unsafe { super::studiofs_linux_fuse_file_info_flags_after_init(0, 1, 1) };
+        // SAFETY: this C probe only returns a compile-time feature decision.
+        let parallel_supported =
+            unsafe { super::studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
 
-        assert_eq!(flags, 6);
+        assert_eq!(flags, if parallel_supported { 6 } else { 2 });
     }
 
     #[test]
@@ -3539,6 +3697,8 @@ mod tests {
         let policy = super::linux_fuse_open_cache_policy_for(
             libc::O_RDONLY,
             super::LinuxFuseCachePolicy::Kernel,
+            false,
+            true,
         );
 
         assert_eq!(
@@ -3556,6 +3716,8 @@ mod tests {
         let policy = super::linux_fuse_open_cache_policy_for(
             libc::O_RDWR,
             super::LinuxFuseCachePolicy::Kernel,
+            false,
+            true,
         );
 
         assert_eq!(

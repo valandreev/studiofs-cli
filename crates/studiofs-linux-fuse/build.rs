@@ -23,19 +23,45 @@ fn main() {
     let fuse_version = (
         version_parts.next().unwrap_or(0),
         version_parts.next().unwrap_or(0),
+        version_parts.next().unwrap_or(0),
     );
-    if fuse_version < (3, 2) {
+    if fuse_version < (3, 2, 0) {
         panic!(
             "libfuse3 >= 3.2 is required for StudioFS Linux mounts; found {}",
             fuse3.version
         );
     }
-    let fuse_api_version = if fuse_version >= (3, 12) { "312" } else { "32" };
+    let fuse_api_version = if fuse_version >= (3, 12, 0) {
+        "312"
+    } else {
+        "32"
+    };
+    println!(
+        "cargo:rustc-env=STUDIOFS_LIBFUSE_VERSION_MAJOR={}",
+        fuse_version.0
+    );
+    println!(
+        "cargo:rustc-env=STUDIOFS_LIBFUSE_VERSION_MINOR={}",
+        fuse_version.1
+    );
+    println!(
+        "cargo:rustc-env=STUDIOFS_LIBFUSE_VERSION_PATCH={}",
+        fuse_version.2
+    );
 
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");
     build.define("_FILE_OFFSET_BITS", "64");
     build.define("FUSE_USE_VERSION", fuse_api_version);
+    if fuse_version >= (3, 12, 0) {
+        build.define("STUDIOFS_FUSE_HAS_BOUNDED_LOOP_CONFIG", None);
+    }
+    if fuse_version >= (3, 14, 1) {
+        build.define("STUDIOFS_FUSE_HAS_PARALLEL_DIRECT_WRITES", None);
+    }
+    if fuse_version >= (3, 17, 1) {
+        build.define("STUDIOFS_FUSE_HAS_EXTENDED_CONN_CAPS", None);
+    }
     for include_path in fuse3.include_paths {
         build.include(include_path);
     }
