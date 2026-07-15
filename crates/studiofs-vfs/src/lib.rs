@@ -14,6 +14,7 @@ pub mod fetch;
 pub mod incarnation;
 mod landing_zone;
 pub mod lock_order;
+pub mod memory_pressure;
 mod ordered_mutex;
 /// Quality-of-service policies and controller plumbing for write-path behavior.
 pub mod qos;
@@ -30,6 +31,10 @@ pub use incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
 pub use lock_order::{LockOrderGuard, LockTier, debug_lock_stack, is_validation_enabled};
+pub use memory_pressure::{
+    MemoryComponentLimits, MemoryPressureInput, MemoryPressureModel, MemoryPressureReadError,
+    MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
+};
 pub use ordered_mutex::OrderedMutex;
 pub use qos::QosController;
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
