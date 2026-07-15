@@ -3704,7 +3704,6 @@ impl StudioVfs {
 
     /// Snapshot cache runtime state for diagnostics and API consumers.
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
-        self.apply_memory_pressure_snapshot();
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
         let transit = self.transit_memory_budget.snapshot();
@@ -6437,7 +6436,7 @@ impl StudioVfs {
     /// Current dirty-buffer memory limit.
     pub fn max_dirty_bytes(&self) -> usize {
         let configured = self.max_dirty_bytes.load(Ordering::Acquire);
-        let snapshot = self.apply_memory_pressure_snapshot();
+        let snapshot = self.memory_pressure.snapshot();
         if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
             configured
         } else {
@@ -6455,22 +6454,8 @@ impl StudioVfs {
         &self.memory_pressure
     }
 
-    fn apply_memory_pressure_snapshot(&self) -> crate::memory_pressure::MemoryPressureSnapshot {
-        let snapshot = self.memory_pressure.snapshot();
-        let memory_cache_limit =
-            if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
-                usize::MAX
-            } else {
-                usize::try_from(snapshot.limits.memory_cache_bytes).unwrap_or(usize::MAX)
-            };
-        self.cached_store
-            .set_hot_upload_budget_bytes(memory_cache_limit);
-        snapshot
-    }
-
     /// Total bytes currently admitted across VFS-owned managed-memory gauges.
     pub fn admitted_managed_bytes(&self) -> u64 {
-        self.apply_memory_pressure_snapshot();
         let memory_cache = self.cached_store.hot_upload_resident_bytes() as u64;
         let dirty = self.total_pending_write_buffer_bytes() as u64;
         let transit = self.transit_memory_budget.snapshot().used_bytes as u64;
@@ -6812,6 +6797,10 @@ impl StudioVfs {
         let shutdown = self.state.shutdown.background_shutdown_token.clone();
         let pressure = loop {
             let dirty_reduced = self.state.writer_stack.dirty_reduced();
+            tokio::pin!(dirty_reduced);
+            // Register before rechecking pressure so a concurrent drain cannot
+            // notify between the check and the await and leave this writer asleep.
+            let _ = dirty_reduced.as_mut().enable();
             let pressure = self.write_admission_pressure();
             let writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
             if writer_stack_pressure_bytes <= hard_window_bytes || self.shutdown_requested() {
@@ -6838,7 +6827,7 @@ impl StudioVfs {
             // #endregion debug log
 
             tokio::select! {
-                _ = dirty_reduced => {}
+                _ = &mut dirty_reduced => {}
                 _ = shutdown.cancelled() => break pressure,
             }
         };

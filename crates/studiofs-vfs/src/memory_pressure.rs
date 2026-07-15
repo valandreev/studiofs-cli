@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -85,6 +86,7 @@ impl MemoryPressureSnapshot {
 #[derive(Debug, Clone)]
 pub struct MemoryPressureController {
     snapshot: Arc<RwLock<MemoryPressureSnapshot>>,
+    memory_cache_limit_bytes: Arc<AtomicU64>,
 }
 
 impl MemoryPressureController {
@@ -92,6 +94,7 @@ impl MemoryPressureController {
     pub fn new(initial: MemoryPressureSnapshot) -> Self {
         Self {
             snapshot: Arc::new(RwLock::new(initial)),
+            memory_cache_limit_bytes: Arc::new(AtomicU64::new(initial.limits.memory_cache_bytes)),
         }
     }
 
@@ -106,7 +109,14 @@ impl MemoryPressureController {
     }
 
     pub fn publish(&self, snapshot: MemoryPressureSnapshot) {
+        self.memory_cache_limit_bytes
+            .store(snapshot.limits.memory_cache_bytes, Ordering::Release);
         *self.snapshot.write() = snapshot;
+    }
+
+    #[must_use]
+    pub fn memory_cache_limit_bytes(&self) -> Arc<AtomicU64> {
+        self.memory_cache_limit_bytes.clone()
     }
 }
 
@@ -346,6 +356,18 @@ mod controller_tests {
         controller.publish(snapshot(64 * MIB));
 
         assert_eq!(controller.snapshot().limits.dirty_bytes, 64 * MIB);
+    }
+
+    #[test]
+    fn controller_publish_updates_shared_memory_cache_limit() {
+        let controller = MemoryPressureController::new(snapshot(512 * MIB));
+        let memory_cache_limit = controller.memory_cache_limit_bytes();
+        let mut constrained = snapshot(64 * MIB);
+        constrained.limits.memory_cache_bytes = 64 * MIB;
+
+        controller.publish(constrained);
+
+        assert_eq!(memory_cache_limit.load(Ordering::Acquire), 64 * MIB);
     }
 
     #[test]

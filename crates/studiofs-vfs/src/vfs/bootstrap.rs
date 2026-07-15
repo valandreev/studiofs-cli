@@ -322,7 +322,9 @@ impl VfsBootstrapResources {
         );
 
         let (cached_store, upload_rx) = CachedStore::open(
-            CachedStoreConfig::new(cache_dir).with_upload_hot_bytes(upload_hot_bytes),
+            CachedStoreConfig::new(cache_dir)
+                .with_upload_hot_bytes(upload_hot_bytes)
+                .with_upload_hot_runtime_ceiling(memory_pressure.memory_cache_limit_bytes()),
             local_payload_backend.clone(),
         )
         .map_err(VfsError::Io)?;

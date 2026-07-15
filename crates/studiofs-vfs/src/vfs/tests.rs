@@ -434,10 +434,14 @@ fn memory_pressure_cache_shrink_reclaims_hot_entries_before_snapshot() {
     let mut snapshot = constrained_memory_snapshot(u64::MAX, u64::MAX);
     snapshot.limits.memory_cache_bytes = 4;
     vfs.memory_pressure_controller().publish(snapshot);
+    vfs.cached_store()
+        .cache_hot_upload_batch(&[studiofs_cache::local::LocalPayloadPut {
+            object_id: 3,
+            data: Bytes::from_static(b"cccc"),
+            evictable: false,
+        }]);
 
-    let admitted = vfs.admitted_managed_bytes();
-
-    assert_eq!(admitted, 4);
+    assert_eq!(vfs.cached_store().hot_upload_resident_bytes(), 4);
     assert!(vfs.cached_store().get_hot_upload(1).is_none());
 }
 

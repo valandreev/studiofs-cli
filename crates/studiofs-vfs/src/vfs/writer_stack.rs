@@ -1851,6 +1851,23 @@ mod tests {
         assert!(!stack.has_dirty_writers(7));
     }
 
+    #[tokio::test]
+    async fn dirty_reduction_notification_survives_between_recheck_and_await() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+        stack
+            .write_bytes(write_spec(99, 7, 0, 300), Bytes::from_static(b"dirty"))
+            .expect("write");
+        let notified = stack.dirty_reduced();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+
+        stack.clear_inode(7);
+
+        tokio::time::timeout(Duration::from_millis(100), &mut notified)
+            .await
+            .expect("enabled notification must retain a wake before await");
+    }
+
     #[test]
     fn writer_stack_append_updates_visible_length_without_finishing() {
         let (_dir, stack, _rx) = temp_stack(16, 8);

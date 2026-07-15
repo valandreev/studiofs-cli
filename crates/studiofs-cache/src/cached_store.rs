@@ -36,6 +36,7 @@ pub struct CachedStoreConfig {
     pub cache_dir: PathBuf,
     /// In-memory budget (bytes) for the hot-upload buffer. `0` disables it.
     pub upload_hot_bytes: usize,
+    upload_hot_runtime_ceiling: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,12 +308,19 @@ impl CachedStoreConfig {
         Self {
             cache_dir: cache_dir.into(),
             upload_hot_bytes: 0,
+            upload_hot_runtime_ceiling: None,
         }
     }
 
     /// Sets the hot-upload in-memory buffer budget (bytes).
     pub fn with_upload_hot_bytes(mut self, upload_hot_bytes: usize) -> Self {
         self.upload_hot_bytes = upload_hot_bytes;
+        self
+    }
+
+    /// Shares a live runtime ceiling for hot-upload admission.
+    pub fn with_upload_hot_runtime_ceiling(mut self, ceiling: Arc<AtomicU64>) -> Self {
+        self.upload_hot_runtime_ceiling = Some(ceiling);
         self
     }
 }
@@ -481,6 +489,15 @@ pub struct CachedStore {
 }
 
 impl CachedStore {
+    fn refresh_hot_upload_budget(&self, upload_hot: &mut UploadHotState) {
+        if let Some(runtime_ceiling) = &self.config.upload_hot_runtime_ceiling {
+            let runtime_ceiling = runtime_ceiling.load(Ordering::Acquire);
+            let runtime_ceiling = usize::try_from(runtime_ceiling).unwrap_or(usize::MAX);
+            upload_hot.budget_bytes = self.config.upload_hot_bytes.min(runtime_ceiling);
+        }
+        upload_hot.evict_over_budget();
+    }
+
     /// Opens the cached store and returns an upload receiver for new pending uploads.
     pub fn open(
         config: CachedStoreConfig,
@@ -575,9 +592,16 @@ impl CachedStore {
 
     /// Applies a runtime hot-upload limit without exceeding the configured ceiling.
     pub fn set_hot_upload_budget_bytes(&self, limit_bytes: usize) {
+        if let Some(runtime_ceiling) = &self.config.upload_hot_runtime_ceiling {
+            runtime_ceiling.store(limit_bytes as u64, Ordering::Release);
+        }
         let mut upload_hot = self.upload_hot.lock();
-        upload_hot.budget_bytes = self.config.upload_hot_bytes.min(limit_bytes);
-        upload_hot.evict_over_budget();
+        if self.config.upload_hot_runtime_ceiling.is_some() {
+            self.refresh_hot_upload_budget(&mut upload_hot);
+        } else {
+            upload_hot.budget_bytes = self.config.upload_hot_bytes.min(limit_bytes);
+            upload_hot.evict_over_budget();
+        }
     }
 
     /// Returns whether the local payload backend currently contains this object.
@@ -665,6 +689,7 @@ impl CachedStore {
             return;
         }
         let mut upload_hot = self.upload_hot.lock();
+        self.refresh_hot_upload_budget(&mut upload_hot);
         if upload_hot.budget_bytes == 0 {
             return;
         }
@@ -1335,6 +1360,7 @@ impl CachedStoreWriterSlice {
         can_reuse_payload: bool,
     ) {
         let mut upload_hot = self.store.upload_hot.lock();
+        self.store.refresh_hot_upload_budget(&mut upload_hot);
         if upload_hot.budget_bytes > 0 {
             let payload = if can_reuse_payload {
                 payload
@@ -2623,6 +2649,29 @@ mod tests {
         cached_store.set_hot_upload_budget_bytes(0);
 
         assert_eq!(in_use.as_ref(), b"aaaa");
+    }
+
+    #[test]
+    fn hot_upload_runtime_ceiling_applies_to_writer_slice_admission() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let runtime_ceiling = Arc::new(AtomicU64::new(4));
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path())
+                .with_upload_hot_bytes(64)
+                .with_upload_hot_runtime_ceiling(runtime_ceiling),
+            backend,
+        )
+        .expect("open cached store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        writer.flush_to(8).expect("flush full block");
+
+        assert_eq!(cached_store.hot_upload_resident_bytes(), 0);
     }
 
     #[test]
