@@ -9,6 +9,7 @@ use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::{
     fuse_liveness::{FuseInodeLiveness, LivenessCheckedKernelInvalidator},
+    fuse_open_reply::FuseOpenReplySerializer,
     posix::{
         BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
         to_bridge_attr, vfs_err_to_errno,
@@ -16,8 +17,9 @@ use studiofs_bridge::{
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
-    VfsFuseAsyncWriteSnapshot, VfsFuseLivenessSnapshot,
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, OsCacheDisposition,
+    OsCacheOpenDecision, OsCacheParticipation, StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot,
+    VfsFuseLivenessSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -200,11 +202,14 @@ unsafe extern "C" {
 pub(crate) struct SessionState {
     vfs: Arc<StudioVfs>,
     inode_liveness: Arc<FuseInodeLiveness>,
+    open_reply_serializer: FuseOpenReplySerializer,
     runtime_handle: Handle,
     async_writes: Arc<LinuxFuseAsyncWrites>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
+    cache_policy: LinuxFuseCachePolicy,
+    requested_async_dio: bool,
     connection_config: LinuxFuseConnectionConfig,
     metric_config: LinuxFuseAsyncWriteMetricConfig,
 }
@@ -268,6 +273,18 @@ struct LinuxFuseOpenCachePolicy {
     parallel_direct_writes: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LinuxFuseOpenedFile {
+    fh: u64,
+    ino: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LinuxFuseCreatedFile {
+    attr: InodeAttr,
+    opened: LinuxFuseOpenedFile,
+}
+
 impl SessionState {
     pub(crate) fn new(
         vfs: Arc<StudioVfs>,
@@ -275,9 +292,32 @@ impl SessionState {
         read_only: bool,
         connection_config: LinuxFuseConnectionConfig,
     ) -> Self {
+        let cache_policy = linux_fuse_cache_policy_from_env();
+        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+        let requested_async_dio =
+            linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref());
+        Self::new_with_cache_settings(
+            vfs,
+            runtime_handle,
+            read_only,
+            connection_config,
+            cache_policy,
+            requested_async_dio,
+        )
+    }
+
+    fn new_with_cache_settings(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+        connection_config: LinuxFuseConnectionConfig,
+        cache_policy: LinuxFuseCachePolicy,
+        requested_async_dio: bool,
+    ) -> Self {
         Self {
             vfs,
             inode_liveness: Arc::new(FuseInodeLiveness::default()),
+            open_reply_serializer: FuseOpenReplySerializer::default(),
             runtime_handle,
             async_writes: Arc::new(LinuxFuseAsyncWrites::new(
                 LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
@@ -286,9 +326,11 @@ impl SessionState {
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
+            cache_policy,
+            requested_async_dio,
             connection_config,
             metric_config: LinuxFuseAsyncWriteMetricConfig {
-                cache_policy: linux_fuse_cache_policy_from_env(),
+                cache_policy,
                 connection_config,
             },
         }
@@ -598,11 +640,9 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) -> c_int {
-    let cache_policy = linux_fuse_cache_policy_from_env();
-    let override_value = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
-    if linux_fuse_async_dio_enabled_for(cache_policy, override_value.as_deref()) {
+    if callback_state_from_userdata(userdata).is_some_and(|state| state.requested_async_dio) {
         1
     } else {
         0
@@ -611,9 +651,11 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) -> c_int {
-    if linux_fuse_cache_policy_from_env() == LinuxFuseCachePolicy::Kernel {
+    if callback_state_from_userdata(userdata)
+        .is_some_and(|state| state.cache_policy == LinuxFuseCachePolicy::Kernel)
+    {
         1
     } else {
         0
@@ -736,6 +778,7 @@ fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy>
     }
 }
 
+#[cfg(test)]
 fn argv_strings(volume_name: &str) -> Vec<String> {
     argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env())
 }
@@ -908,7 +951,10 @@ impl Session {
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
+        let mut args = OwnedFuseArgs::new(argv_strings_for_cache_policy(
+            volume_name.as_ref(),
+            state.cache_policy,
+        ))?;
         let mut state = Box::new(state);
         let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
         // SAFETY: the C shim expands libfuse's versioned session constructor.
@@ -1308,7 +1354,7 @@ pub extern "C" fn studiofs_linux_fuse_create(
     let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
-        Ok((attr, fh)) => reply_create(req, state, fi, &attr, fh),
+        Ok(created) => reply_create(req, state, fi, created),
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1458,7 +1504,7 @@ pub extern "C" fn studiofs_linux_fuse_open(
         return;
     }
     match state.open(ino, fi) {
-        Ok(fh) => reply_file_open(req, state, ino, fi, fh),
+        Ok(opened) => reply_file_open(req, state, fi, opened),
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1881,7 +1927,7 @@ impl SessionState {
         name: &[u8],
         mode: mode_t,
         fi: *const raw::FuseFileInfo,
-    ) -> Result<(InodeAttr, u64), i32> {
+    ) -> Result<LinuxFuseCreatedFile, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1910,7 +1956,10 @@ impl SessionState {
             .vfs
             .open_created_file_with_known_attr(&attr, open_flags, trunc)
             .map_err(|error| vfs_err_to_errno(&error))?;
-        Ok((attr, fh))
+        Ok(LinuxFuseCreatedFile {
+            opened: LinuxFuseOpenedFile { fh, ino: attr.ino },
+            attr,
+        })
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
@@ -2004,7 +2053,7 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
+    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseOpenedFile, i32> {
         let attr = self.getattr_attr(ino)?;
         match attr.kind {
             FileType::RegularFile => {}
@@ -2021,6 +2070,7 @@ impl SessionState {
         }
         self.vfs
             .open_file_with_known_attr(&attr, open_flags, trunc)
+            .map(|fh| LinuxFuseOpenedFile { fh, ino })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -2569,42 +2619,18 @@ fn with_write_data_slice<T>(
     }))
 }
 
-fn linux_fuse_open_cache_policy(flags: c_int) -> LinuxFuseOpenCachePolicy {
-    let cache_policy = linux_fuse_cache_policy_from_env();
-    let override_value = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
-    let async_dio_enabled =
-        linux_fuse_async_dio_enabled_for(cache_policy, override_value.as_deref());
-    // SAFETY: this C probe only returns a compile-time feature decision.
-    let field_supported = unsafe { studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
-    linux_fuse_open_cache_policy_for(flags, cache_policy, async_dio_enabled, field_supported)
-}
-
 fn linux_fuse_open_cache_policy_for(
-    flags: c_int,
     cache_policy: LinuxFuseCachePolicy,
     async_dio_enabled: bool,
     field_supported: bool,
+    disposition: OsCacheDisposition,
 ) -> LinuxFuseOpenCachePolicy {
-    if cache_policy == LinuxFuseCachePolicy::Direct {
-        return LinuxFuseOpenCachePolicy {
-            direct_io: true,
-            keep_cache: false,
-            parallel_direct_writes: linux_fuse_parallel_direct_writes_enabled(
-                async_dio_enabled,
-                field_supported,
-            ),
-        };
-    }
-
-    let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-    let write_capable = trunc
-        || open_flags.contains(OpenFlags::WRONLY)
-        || open_flags.contains(OpenFlags::RDWR)
-        || flags & libc::O_APPEND != 0;
     LinuxFuseOpenCachePolicy {
-        direct_io: false,
-        keep_cache: !write_capable,
-        parallel_direct_writes: false,
+        direct_io: cache_policy == LinuxFuseCachePolicy::Direct,
+        keep_cache: cache_policy == LinuxFuseCachePolicy::Kernel
+            && disposition == OsCacheDisposition::Reuse,
+        parallel_direct_writes: cache_policy == LinuxFuseCachePolicy::Direct
+            && linux_fuse_parallel_direct_writes_enabled(async_dio_enabled, field_supported),
     }
 }
 
@@ -2651,10 +2677,12 @@ fn reply_entry_with(
         attr_timeout: TTL_SECONDS,
         entry_timeout: TTL_SECONDS,
     };
-    state.inode_liveness.observe(attr.ino);
+    let reservation = state.inode_liveness.reserve_lookup_reply(attr.ino);
     let status = reply(&entry);
-    if status != 0 {
-        state.inode_liveness.forget(attr.ino, 1);
+    if status == 0 {
+        reservation.accept();
+    } else {
+        reservation.reject();
     }
     state.publish_liveness_stats();
 }
@@ -2681,15 +2709,10 @@ fn reply_dir_open(
 fn reply_file_open(
     req: *mut raw::FuseReq,
     state: &SessionState,
-    ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
-    fh: u64,
+    opened: LinuxFuseOpenedFile,
 ) {
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    reply_file_open_with(state, ino, fi, fh, |fi| {
+    reply_file_open_with(state, fi, opened, |fi| {
         // SAFETY: `fi` is initialized and valid for this synchronous reply.
         unsafe { raw::fuse_reply_open(req, fi) }
     });
@@ -2697,50 +2720,34 @@ fn reply_file_open(
 
 fn reply_file_open_with(
     state: &SessionState,
-    ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
-    fh: u64,
+    opened: LinuxFuseOpenedFile,
     reply: impl FnOnce(*const raw::FuseFileInfo) -> c_int,
-) {
+) -> OsCacheOpenDecision {
     debug_assert!(!fi.is_null());
-    // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
-    // using the exact system header layout.
-    unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
-        studiofs_linux_fuse_file_info_init(
-            fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
-        );
-    }
-    let unknown = !state.inode_liveness.is_observed(ino);
-    let _ = reply(fi.cast_const());
-    if unknown {
-        let occurrence = state.inode_liveness.record_open_unknown_inode();
-        state.publish_liveness_stats();
-        if occurrence.is_power_of_two() {
-            warn!(
-                ino,
-                occurrence, "Linux FUSE open reply has no observed lookup reference"
+    complete_file_open_reply_with(state, opened, false, |policy| {
+        // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
+        // using the exact system header layout.
+        unsafe {
+            studiofs_linux_fuse_file_info_init(
+                fi,
+                opened.fh,
+                fuse_flag(policy.direct_io),
+                fuse_flag(policy.keep_cache),
+                fuse_flag(policy.parallel_direct_writes),
             );
         }
-    }
+        reply(fi.cast_const())
+    })
 }
 
 fn reply_create(
     req: *mut raw::FuseReq,
     state: &SessionState,
     fi: *mut raw::FuseFileInfo,
-    attr: &InodeAttr,
-    fh: u64,
+    created: LinuxFuseCreatedFile,
 ) {
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    reply_create_with(state, fi, attr, fh, |entry, fi| {
+    reply_create_with(state, fi, created, |entry, fi| {
         // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
         unsafe { raw::fuse_reply_create(req, entry, fi) }
     });
@@ -2749,35 +2756,95 @@ fn reply_create(
 fn reply_create_with(
     state: &SessionState,
     fi: *mut raw::FuseFileInfo,
-    attr: &InodeAttr,
-    fh: u64,
+    created: LinuxFuseCreatedFile,
     reply: impl FnOnce(&raw::FuseEntryParam, *const raw::FuseFileInfo) -> c_int,
-) {
+) -> OsCacheOpenDecision {
     debug_assert!(!fi.is_null());
     let entry = raw::FuseEntryParam {
-        ino: attr.ino,
+        ino: created.attr.ino,
         generation: 1,
-        attr: state.attr_to_stat(attr),
+        attr: state.attr_to_stat(&created.attr),
         attr_timeout: TTL_SECONDS,
         entry_timeout: TTL_SECONDS,
     };
-    // SAFETY: the C shim writes fields using the exact system header layout.
-    unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
-        studiofs_linux_fuse_file_info_init(
-            fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
+    complete_file_open_reply_with(state, created.opened, true, |policy| {
+        // SAFETY: the C shim writes fields using the exact system header layout.
+        unsafe {
+            studiofs_linux_fuse_file_info_init(
+                fi,
+                created.opened.fh,
+                fuse_flag(policy.direct_io),
+                fuse_flag(policy.keep_cache),
+                fuse_flag(policy.parallel_direct_writes),
+            );
+        }
+        reply(&entry, fi.cast_const())
+    })
+}
+
+fn complete_file_open_reply_with(
+    state: &SessionState,
+    opened: LinuxFuseOpenedFile,
+    creates_lookup_reference: bool,
+    reply: impl FnOnce(LinuxFuseOpenCachePolicy) -> c_int,
+) -> OsCacheOpenDecision {
+    state.open_reply_serializer.with_inode(opened.ino, || {
+        let participation = match state.cache_policy {
+            LinuxFuseCachePolicy::Direct => OsCacheParticipation::Disabled,
+            LinuxFuseCachePolicy::Kernel => OsCacheParticipation::Enabled,
+        };
+        let decision = state.vfs.prepare_os_cache_open(opened.fh, participation);
+        // SAFETY: this C probe only returns a compile-time feature decision.
+        let field_supported = unsafe { studiofs_linux_fuse_supports_parallel_direct_writes() } != 0;
+        let policy = linux_fuse_open_cache_policy_for(
+            state.cache_policy,
+            state.requested_async_dio,
+            field_supported,
+            decision.disposition(),
         );
-    }
-    state.inode_liveness.observe(attr.ino);
-    let status = reply(&entry, fi.cast_const());
-    if status != 0 {
-        state.inode_liveness.forget(attr.ino, 1);
-    }
-    state.publish_liveness_stats();
+        let unknown = !creates_lookup_reference && !state.inode_liveness.is_observed(opened.ino);
+        let lookup_reservation =
+            creates_lookup_reference.then(|| state.inode_liveness.reserve_lookup_reply(opened.ino));
+
+        let status = reply(policy);
+        if let Some(reservation) = lookup_reservation {
+            if status == 0 {
+                reservation.accept();
+            } else {
+                reservation.reject();
+            }
+        }
+        if status != 0 {
+            state.vfs.abort_os_cache_open(opened.fh);
+            let cleanup_result = state
+                .runtime_handle
+                .block_on(state.vfs.release_fh_with_outcome(opened.fh))
+                .map(|_| ())
+                .map_err(|error| vfs_err_to_errno(&error));
+            if let Err(errno) = normalize_close_barrier_result(cleanup_result) {
+                warn!(
+                    ino = opened.ino,
+                    file_handle = opened.fh,
+                    errno,
+                    "Linux FUSE rejected open cleanup failed"
+                );
+            }
+        }
+
+        if unknown {
+            let occurrence = state.inode_liveness.record_open_unknown_inode();
+            if occurrence.is_power_of_two() {
+                warn!(
+                    ino = opened.ino,
+                    occurrence, "Linux FUSE open reply has no observed lookup reference"
+                );
+            }
+        }
+        if creates_lookup_reference || unknown {
+            state.publish_liveness_stats();
+        }
+        decision
+    })
 }
 
 fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
@@ -2950,7 +3017,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy};
+    use studiofs_meta::UploadState;
+    use studiofs_meta::engine::{MetaFsOps, MetaInodes};
+    use studiofs_vfs::contract_harness::ContractVfsFixture;
+    use studiofs_vfs::{
+        KernelInvalidator, LocalSyncPolicy, OpenFlags, OsCacheDisposition, OsCacheReason,
+    };
 
     #[derive(Default)]
     struct RecordingLinuxInvalidator {
@@ -3148,6 +3220,80 @@ mod tests {
             default_connection_config(),
         );
         (fixture, state)
+    }
+
+    fn opened_file(ino: u64, fh: u64) -> super::LinuxFuseOpenedFile {
+        super::LinuxFuseOpenedFile { fh, ino }
+    }
+
+    fn created_file(attr: &studiofs_meta::InodeAttr, fh: u64) -> super::LinuxFuseCreatedFile {
+        super::LinuxFuseCreatedFile {
+            attr: attr.clone(),
+            opened: opened_file(attr.ino, fh),
+        }
+    }
+
+    fn cache_test_state(
+        name: &str,
+        cache_policy: super::LinuxFuseCachePolicy,
+        requested_async_dio: bool,
+    ) -> (ContractVfsFixture, super::SessionState) {
+        let fixture = ContractVfsFixture::new(name).expect("create VFS fixture");
+        let state = super::SessionState::new_with_cache_settings(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+            cache_policy,
+            requested_async_dio,
+        );
+        (fixture, state)
+    }
+
+    fn begin_cache_open(
+        fixture: &ContractVfsFixture,
+        ino: u64,
+        flags: OpenFlags,
+    ) -> super::LinuxFuseOpenedFile {
+        let vfs = fixture.vfs();
+        let attr = vfs.getattr(ino).expect("load fresh open attributes");
+        let fh = vfs
+            .open_file_with_known_attr(&attr, flags, false)
+            .expect("open cache test handle");
+        opened_file(ino, fh)
+    }
+
+    fn accept_cache_open(
+        state: &super::SessionState,
+        opened: super::LinuxFuseOpenedFile,
+    ) -> (
+        super::LinuxFuseOpenCachePolicy,
+        studiofs_vfs::OsCacheOpenDecision,
+    ) {
+        let mut observed_policy = None;
+        let decision = super::complete_file_open_reply_with(state, opened, false, |policy| {
+            observed_policy = Some(policy);
+            0
+        });
+        (
+            observed_policy.expect("reply observes cache policy"),
+            decision,
+        )
+    }
+
+    fn release_cache_open(fixture: &ContractVfsFixture, opened: super::LinuxFuseOpenedFile) {
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh_with_outcome(opened.fh))
+            .expect("release cache test handle");
+    }
+
+    fn assert_cache_lifecycle_idle(fixture: &ContractVfsFixture) {
+        let cache = fixture.vfs().write_path_observability_snapshot().os_cache;
+        assert_eq!(
+            (cache.active_foreground_handles, cache.active_writers),
+            (0, 0),
+        );
     }
 
     fn write_via_linux_session(state: &super::SessionState, ino: u64, fh: u64, payload: &[u8]) {
@@ -3621,6 +3767,35 @@ mod tests {
     }
 
     #[test]
+    fn linux_connection_init_uses_stored_cache_settings() {
+        let cases = [
+            (super::LinuxFuseCachePolicy::Direct, true, (1, 0)),
+            (super::LinuxFuseCachePolicy::Kernel, false, (0, 1)),
+        ];
+
+        for (index, (cache_policy, requested_async_dio, expected)) in cases.into_iter().enumerate()
+        {
+            let (_fixture, state) = cache_test_state(
+                &format!("linux-connection-stored-cache-{index}"),
+                cache_policy,
+                requested_async_dio,
+            );
+            let userdata = (&state as *const super::SessionState)
+                .cast_mut()
+                .cast::<std::ffi::c_void>();
+            // SAFETY: userdata points to `state`, which outlives both synchronous callbacks.
+            let actual = unsafe {
+                (
+                    super::studiofs_linux_fuse_connection_wants_async_dio(userdata),
+                    super::studiofs_linux_fuse_connection_wants_writeback_cache(userdata),
+                )
+            };
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn async_dio_policy_parallel_open_bit_requires_c_field_support() {
         let cases = [
             (true, true, true),
@@ -3630,13 +3805,548 @@ mod tests {
 
         for (async_dio_enabled, field_supported, expected) in cases {
             let policy = super::linux_fuse_open_cache_policy_for(
-                libc::O_RDWR,
                 super::LinuxFuseCachePolicy::Direct,
                 async_dio_enabled,
                 field_supported,
+                studiofs_vfs::OsCacheDisposition::Reuse,
             );
             assert_eq!(policy.parallel_direct_writes, expected,);
         }
+    }
+
+    #[test]
+    fn linux_cache_decision_flags_truth_table() {
+        use studiofs_vfs::OsCacheDisposition::{Replace, Reuse};
+
+        let cases = [
+            (
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+                true,
+                Replace,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: true,
+                    keep_cache: false,
+                    parallel_direct_writes: true,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+                true,
+                Reuse,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: true,
+                    keep_cache: false,
+                    parallel_direct_writes: true,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+                false,
+                Reuse,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: true,
+                    keep_cache: false,
+                    parallel_direct_writes: false,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Direct,
+                false,
+                true,
+                Reuse,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: true,
+                    keep_cache: false,
+                    parallel_direct_writes: false,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Kernel,
+                false,
+                true,
+                Replace,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: false,
+                    keep_cache: false,
+                    parallel_direct_writes: false,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Kernel,
+                false,
+                true,
+                Replace,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: false,
+                    keep_cache: false,
+                    parallel_direct_writes: false,
+                },
+            ),
+            (
+                super::LinuxFuseCachePolicy::Kernel,
+                false,
+                true,
+                Reuse,
+                super::LinuxFuseOpenCachePolicy {
+                    direct_io: false,
+                    keep_cache: true,
+                    parallel_direct_writes: false,
+                },
+            ),
+        ];
+
+        for (cache_policy, async_dio, field_supported, disposition, expected) in cases {
+            assert_eq!(
+                super::linux_fuse_open_cache_policy_for(
+                    cache_policy,
+                    async_dio,
+                    field_supported,
+                    disposition,
+                ),
+                expected,
+                "cache_policy={cache_policy:?}, async_dio={async_dio}, field_supported={field_supported}, disposition={disposition:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn linux_kernel_first_stable_read_replaces_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-first-stable-read",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"first.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+
+        let (policy, decision) = accept_cache_open(&state, opened);
+
+        assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(decision.reason(), OsCacheReason::FirstObservation);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_kernel_second_identical_read_reuses_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-identical-read",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"stable.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let first = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (_, first_decision) = accept_cache_open(&state, first);
+        release_cache_open(&fixture, first);
+
+        let second = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (policy, second_decision) = accept_cache_open(&state, second);
+
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Reuse);
+        assert!(policy.keep_cache);
+        release_cache_open(&fixture, second);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_kernel_changed_generation_replaces_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-changed-generation",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let meta = fixture.meta();
+        let mut attr = meta
+            .create_file(studiofs_meta::ROOT_INO, b"generation.bin", 0, 0, 0o644)
+            .expect("create file");
+        attr.content_epoch = 7;
+        attr.committed_content_epoch = 6;
+        attr.upload_state = UploadState::Updating;
+        meta.set_attr(&attr).expect("store initial generation");
+        state.inode_liveness.observe(attr.ino);
+        let first = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        accept_cache_open(&state, first);
+        release_cache_open(&fixture, first);
+        let mut changed = meta.get_attr(attr.ino).expect("load generation");
+        changed.content_epoch = changed.content_epoch.saturating_add(1);
+        meta.set_attr(&changed).expect("advance generation");
+
+        let second = opened_file(
+            attr.ino,
+            fixture
+                .vfs()
+                .open_file_with_known_attr(&changed, OpenFlags::RDONLY, false)
+                .expect("open changed generation"),
+        );
+        let (policy, decision) = accept_cache_open(&state, second);
+
+        assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(decision.reason(), OsCacheReason::GenerationChanged);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, second);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_kernel_dirty_inode_replaces_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-dirty-inode",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"dirty.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let writer = begin_cache_open(&fixture, attr.ino, OpenFlags::RDWR);
+        accept_cache_open(&state, writer);
+        fixture
+            .runtime()
+            .block_on(vfs.write_fh(writer.fh, attr.ino, 0, b"dirty"))
+            .expect("write dirty payload");
+        let reader = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+
+        let (policy, decision) = accept_cache_open(&state, reader);
+
+        assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(decision.reason(), OsCacheReason::LocalDirtyState);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, reader);
+        release_cache_open(&fixture, writer);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_kernel_active_writer_replaces_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-active-writer",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"writer.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let writer = begin_cache_open(&fixture, attr.ino, OpenFlags::RDWR);
+        accept_cache_open(&state, writer);
+        let reader = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+
+        let (policy, decision) = accept_cache_open(&state, reader);
+
+        assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(decision.reason(), OsCacheReason::ActiveWriter);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, reader);
+        release_cache_open(&fixture, writer);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_writer_open_never_keeps_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-kernel-writer-no-keep-cache",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"writer.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let writer = begin_cache_open(&fixture, attr.ino, OpenFlags::WRONLY);
+
+        let (policy, decision) = accept_cache_open(&state, writer);
+
+        assert_eq!(decision.reason(), OsCacheReason::WriteCapable);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, writer);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_direct_open_enrolls_foreground_lifetime_without_keep_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-direct-foreground-lifetime",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"direct.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+
+        let (policy, decision) = accept_cache_open(&state, opened);
+
+        let active = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .os_cache
+            .active_foreground_handles;
+        assert_eq!(decision.reason(), OsCacheReason::PolicyDisabled);
+        assert!(policy.direct_io);
+        assert!(!policy.keep_cache);
+        assert_eq!(active, 1);
+        release_cache_open(&fixture, opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_open_prepare_is_counted_once() {
+        let (fixture, state) = cache_test_state(
+            "linux-open-prepare-once",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"once.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let before = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .os_cache
+            .total;
+
+        accept_cache_open(&state, opened);
+
+        let after = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .os_cache
+            .total;
+        assert_eq!(after, before + 1);
+        release_cache_open(&fixture, opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_same_inode_prepare_reply_is_serialized() {
+        let (fixture, state) = cache_test_state(
+            "linux-same-inode-serialized",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"same.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let first_opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let second_opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let state = Arc::new(state);
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_state = Arc::clone(&state);
+        let first = thread::spawn(move || {
+            super::complete_file_open_reply_with(&first_state, first_opened, false, |_| {
+                first_entered_tx.send(()).expect("signal first reply");
+                release_first_rx.recv().expect("release first reply");
+                0
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first reply enters");
+        let (second_replied_tx, second_replied_rx) = mpsc::channel();
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second_state = Arc::clone(&state);
+        let second = thread::spawn(move || {
+            second_started_tx
+                .send(())
+                .expect("signal second completion attempt");
+            super::complete_file_open_reply_with(&second_state, second_opened, false, |policy| {
+                second_replied_tx.send(policy).expect("signal second reply");
+                0
+            })
+        });
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second completion starts");
+        let early_policy = second_replied_rx
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+        let progressed_early = early_policy.is_some();
+        release_first_tx.send(()).expect("release first reply");
+        let second_policy = early_policy.unwrap_or_else(|| {
+            second_replied_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second reply follows first")
+        });
+        let first_decision = first.join().expect("join first reply");
+        let second_decision = second.join().expect("join second reply");
+
+        assert!(!progressed_early, "same-inode reply must remain serialized");
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Reuse);
+        assert!(second_policy.keep_cache);
+        release_cache_open(&fixture, first_opened);
+        release_cache_open(&fixture, second_opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_different_inode_reply_progresses_while_one_reply_is_blocked() {
+        let (fixture, state) = cache_test_state(
+            "linux-different-inode-progress",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let first_attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"first.bin", 0, 0, 0o644)
+            .expect("create first file");
+        let second_attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"second.bin", 0, 0, 0o644)
+            .expect("create second file");
+        state.inode_liveness.observe(first_attr.ino);
+        state.inode_liveness.observe(second_attr.ino);
+        let first_opened = begin_cache_open(&fixture, first_attr.ino, OpenFlags::RDONLY);
+        let second_opened = begin_cache_open(&fixture, second_attr.ino, OpenFlags::RDONLY);
+        let state = Arc::new(state);
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_state = Arc::clone(&state);
+        let first = thread::spawn(move || {
+            super::complete_file_open_reply_with(&first_state, first_opened, false, |_| {
+                first_entered_tx.send(()).expect("signal first reply");
+                release_first_rx.recv().expect("release first reply");
+                0
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first reply enters");
+        let (second_replied_tx, second_replied_rx) = mpsc::channel();
+        let second_state = Arc::clone(&state);
+        let second = thread::spawn(move || {
+            super::complete_file_open_reply_with(&second_state, second_opened, false, |_| {
+                second_replied_tx.send(()).expect("signal second reply");
+                0
+            })
+        });
+        let second_progress = second_replied_rx.recv_timeout(Duration::from_secs(1));
+        release_first_tx.send(()).expect("release first reply");
+        second_progress.expect("different inode reply progresses");
+        let second_decision = second.join().expect("join second reply");
+        let first_decision = first.join().expect("join first reply");
+
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Replace);
+        release_cache_open(&fixture, first_opened);
+        release_cache_open(&fixture, second_opened);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_rejected_replace_reply_makes_next_open_replace_again() {
+        let (fixture, state) = cache_test_state(
+            "linux-rejected-replace",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"rejected.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let rejected = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+
+        let rejected_decision =
+            super::complete_file_open_reply_with(&state, rejected, false, |_| -libc::EIO);
+
+        assert_eq!(rejected_decision.disposition(), OsCacheDisposition::Replace);
+        assert_eq!(fixture.vfs().open_count(attr.ino), 0);
+        assert_cache_lifecycle_idle(&fixture);
+        let next = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (policy, next_decision) = accept_cache_open(&state, next);
+        assert_eq!(next_decision.disposition(), OsCacheDisposition::Replace);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, next);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_failed_open_reply_releases_handle_and_lifecycle() {
+        let (fixture, state) = cache_test_state(
+            "linux-failed-open-reply",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"failed-open.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let before_liveness = state.inode_liveness.stats();
+        let opened = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let mut file_info = [0_u64; 32];
+
+        super::reply_file_open_with(&state, file_info.as_mut_ptr().cast(), opened, |_| {
+            -libc::EIO
+        });
+
+        assert_eq!(fixture.vfs().open_count(attr.ino), 0);
+        assert_eq!(state.inode_liveness.stats(), before_liveness);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_failed_create_reply_releases_handle_and_lifecycle() {
+        let (fixture, state) = cache_test_state(
+            "linux-failed-create-reply",
+            super::LinuxFuseCachePolicy::Kernel,
+            false,
+        );
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"failed-create.bin", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::WRONLY, false)
+            .expect("open created file");
+        let created = created_file(&attr, fh);
+        let before_liveness = state.inode_liveness.stats();
+        let mut file_info = [0_u64; 32];
+
+        let decision =
+            super::reply_create_with(&state, file_info.as_mut_ptr().cast(), created, |_, _| {
+                assert!(state.inode_liveness.is_observed(attr.ino));
+                -libc::EIO
+            });
+
+        let after_liveness = state.inode_liveness.stats();
+        assert_eq!(decision.reason(), OsCacheReason::WriteCapable);
+        assert_eq!(vfs.open_count(attr.ino), 0);
+        assert!(!state.inode_liveness.is_observed(attr.ino));
+        assert_eq!(
+            after_liveness.observed_references,
+            before_liveness.observed_references
+        );
+        assert_eq!(
+            after_liveness.forgotten_references,
+            before_liveness.forgotten_references
+        );
+        assert_cache_lifecycle_idle(&fixture);
     }
 
     #[test]
@@ -3883,13 +4593,23 @@ mod tests {
             assert!(state.inode_liveness.is_observed(accepted.ino));
             0
         });
+        let before_rejected = state.inode_liveness.stats();
         super::reply_entry_with(&state, &rejected, |_| {
             assert!(state.inode_liveness.is_observed(rejected.ino));
             -libc::ENOENT
         });
+        let after_rejected = state.inode_liveness.stats();
 
         assert!(state.inode_liveness.is_observed(accepted.ino));
         assert!(!state.inode_liveness.is_observed(rejected.ino));
+        assert_eq!(
+            after_rejected.observed_references,
+            before_rejected.observed_references
+        );
+        assert_eq!(
+            after_rejected.forgotten_references,
+            before_rejected.forgotten_references
+        );
     }
 
     #[test]
@@ -3909,26 +4629,34 @@ mod tests {
         super::reply_create_with(
             &state,
             accepted_info.as_mut_ptr().cast(),
-            &accepted,
-            7,
+            created_file(&accepted, 7),
             |_, _| {
                 assert!(state.inode_liveness.is_observed(accepted.ino));
                 0
             },
         );
+        let before_rejected = state.inode_liveness.stats();
         super::reply_create_with(
             &state,
             rejected_info.as_mut_ptr().cast(),
-            &rejected,
-            8,
+            created_file(&rejected, 8),
             |_, _| {
                 assert!(state.inode_liveness.is_observed(rejected.ino));
                 -libc::ENOENT
             },
         );
+        let after_rejected = state.inode_liveness.stats();
 
         assert!(state.inode_liveness.is_observed(accepted.ino));
         assert!(!state.inode_liveness.is_observed(rejected.ino));
+        assert_eq!(
+            after_rejected.observed_references,
+            before_rejected.observed_references
+        );
+        assert_eq!(
+            after_rejected.forgotten_references,
+            before_rejected.forgotten_references
+        );
     }
 
     #[test]
@@ -3940,10 +4668,18 @@ mod tests {
         let mut accepted_info = [0_u64; 32];
         let mut rejected_info = [0_u64; 32];
 
-        super::reply_file_open_with(&state, 42, accepted_info.as_mut_ptr().cast(), 7, |_| 0);
-        super::reply_file_open_with(&state, 42, rejected_info.as_mut_ptr().cast(), 8, |_| {
-            -libc::ENOENT
-        });
+        super::reply_file_open_with(
+            &state,
+            accepted_info.as_mut_ptr().cast(),
+            opened_file(42, 7),
+            |_| 0,
+        );
+        super::reply_file_open_with(
+            &state,
+            rejected_info.as_mut_ptr().cast(),
+            opened_file(42, 8),
+            |_| -libc::ENOENT,
+        );
 
         assert_eq!(state.inode_liveness.stats(), before);
         state.inode_liveness.forget(42, 1);
@@ -3955,10 +4691,15 @@ mod tests {
         let (_fixture, state) = liveness_test_state("linux-open-unknown-inode");
         let mut file_info = [0_u64; 32];
 
-        super::reply_file_open_with(&state, 42, file_info.as_mut_ptr().cast(), 7, |_| {
-            assert!(!state.inode_liveness.is_observed(42));
-            0
-        });
+        super::reply_file_open_with(
+            &state,
+            file_info.as_mut_ptr().cast(),
+            opened_file(42, 7),
+            |_| {
+                assert!(!state.inode_liveness.is_observed(42));
+                0
+            },
+        );
 
         assert!(!state.inode_liveness.is_observed(42));
         assert_eq!(state.inode_liveness.stats().observed_references, 0);
@@ -4227,10 +4968,10 @@ mod tests {
     #[test]
     fn kernel_cache_policy_keeps_read_only_open_cache() {
         let policy = super::linux_fuse_open_cache_policy_for(
-            libc::O_RDONLY,
             super::LinuxFuseCachePolicy::Kernel,
             false,
             true,
+            studiofs_vfs::OsCacheDisposition::Reuse,
         );
 
         assert_eq!(
@@ -4246,10 +4987,10 @@ mod tests {
     #[test]
     fn kernel_cache_policy_drops_write_capable_open_cache() {
         let policy = super::linux_fuse_open_cache_policy_for(
-            libc::O_RDWR,
             super::LinuxFuseCachePolicy::Kernel,
             false,
             true,
+            studiofs_vfs::OsCacheDisposition::Replace,
         );
 
         assert_eq!(
