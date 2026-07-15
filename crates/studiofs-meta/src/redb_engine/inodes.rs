@@ -589,9 +589,18 @@ impl MetaInodes for RedbMetaEngine {
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         let txn = self.begin_read_txn()?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let prefer_current = Self::current_inode_attr_differs_from_base(&current, &base, ino)?;
+        Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, prefer_current)
     }
 
     fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {

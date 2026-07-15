@@ -468,6 +468,31 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    pub(super) fn current_inode_attr_differs_from_base<TCurrent, TBase>(
+        current: &TCurrent,
+        base: &TBase,
+        ino: Ino,
+    ) -> MetaResult<bool>
+    where
+        TCurrent: ReadableTable<u64, &'static [u8]>,
+        TBase: ReadableTable<u64, &'static [u8]>,
+    {
+        let Some(current_bytes) = current
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let base_bytes = base
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        Ok(match base_bytes {
+            Some(base_bytes) => current_bytes.value() != base_bytes.value(),
+            None => true,
+        })
+    }
+
     pub(super) fn resolve_attr_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,

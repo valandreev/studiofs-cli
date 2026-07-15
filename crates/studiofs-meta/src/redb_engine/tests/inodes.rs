@@ -239,6 +239,30 @@ fn test_getattr_falls_back_to_base_when_no_local_overlay() {
 }
 
 #[test]
+fn test_getattr_ignores_unrelated_regular_file_chunk_rows() {
+    let engine = temp_engine();
+    let target = engine
+        .create_file(ROOT_INO, b"target.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let unrelated_key = encode_regular_file_chunk_key(target.ino + 1, ChunkId(0));
+    let malformed_chunk = [0xff];
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        overlay
+            .insert(unrelated_key.as_slice(), malformed_chunk.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let loaded = engine
+        .get_attr(target.ino)
+        .expect("getattr must not decode another inode's chunk graph");
+    assert_eq!(loaded.ino, target.ino);
+}
+
+#[test]
 fn test_get_attr_merged_in_write_txn_matches_read_get_attr() {
     let source = temp_engine();
     let base_file = source
