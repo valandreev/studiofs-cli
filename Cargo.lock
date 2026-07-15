@@ -4828,7 +4828,9 @@ dependencies = [
 name = "studiofs-bridge"
 version = "0.1.1"
 dependencies = [
+ "dashmap",
  "libc",
+ "parking_lot",
  "studiofs-meta",
  "studiofs-vfs",
 ]

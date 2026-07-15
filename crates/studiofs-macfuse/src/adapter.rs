@@ -12,10 +12,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use dashmap::{DashMap, mapref::entry::Entry as DashMapEntry};
+use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
+use studiofs_bridge::fuse_liveness::{FuseInodeLiveness, LivenessCheckedKernelInvalidator};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
     to_bridge_attr, vfs_err_to_errno,
@@ -100,132 +101,12 @@ pub(crate) struct StudioVfsAdapter {
 #[derive(Debug)]
 struct AdapterSharedState {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    kernel_inode_liveness: Arc<KernelInodeLiveness>,
+    kernel_inode_liveness: Arc<FuseInodeLiveness>,
     read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
-}
-
-#[derive(Debug)]
-struct KernelInodeLiveness {
-    observed: DashMap<u64, Arc<ParkingMutex<u64>>>,
-}
-
-impl Default for KernelInodeLiveness {
-    fn default() -> Self {
-        let observed = DashMap::new();
-        observed.insert(ROOT_INO, Arc::new(ParkingMutex::new(u64::MAX)));
-        Self { observed }
-    }
-}
-
-impl KernelInodeLiveness {
-    fn current(&self, ino: u64) -> Option<Arc<ParkingMutex<u64>>> {
-        self.observed
-            .get(&ino)
-            .map(|entry| Arc::clone(entry.value()))
-    }
-
-    fn is_current(&self, ino: u64, state: &Arc<ParkingMutex<u64>>) -> bool {
-        self.observed
-            .get(&ino)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), state))
-    }
-
-    fn current_or_insert(&self, ino: u64) -> Arc<ParkingMutex<u64>> {
-        match self.observed.entry(ino) {
-            DashMapEntry::Occupied(entry) => Arc::clone(entry.get()),
-            DashMapEntry::Vacant(entry) => {
-                let state = Arc::new(ParkingMutex::new(0));
-                entry.insert(Arc::clone(&state));
-                state
-            }
-        }
-    }
-
-    fn observe(&self, ino: u64) {
-        loop {
-            let state = self.current_or_insert(ino);
-            let mut count = state.lock();
-            if self.is_current(ino, &state) {
-                *count = count.saturating_add(1);
-                return;
-            }
-        }
-    }
-
-    fn ensure_observed(&self, ino: u64) {
-        loop {
-            let state = self.current_or_insert(ino);
-            let mut count = state.lock();
-            if self.is_current(ino, &state) {
-                *count = (*count).max(1);
-                return;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn contains(&self, ino: u64) -> bool {
-        self.current(ino).is_some_and(|state| *state.lock() > 0)
-    }
-
-    fn close(&self, ino: u64) {
-        if ino == ROOT_INO {
-            return;
-        }
-        loop {
-            let Some(state) = self.current(ino) else {
-                return;
-            };
-            let mut count = state.lock();
-            if !self.is_current(ino, &state) {
-                continue;
-            }
-            *count = 0;
-            self.observed
-                .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
-            return;
-        }
-    }
-
-    fn forget(&self, ino: u64, nlookup: u64) {
-        if ino == ROOT_INO || nlookup == 0 {
-            return;
-        }
-        loop {
-            let Some(state) = self.current(ino) else {
-                return;
-            };
-            let mut count = state.lock();
-            if !self.is_current(ino, &state) {
-                continue;
-            }
-            if *count <= nlookup {
-                *count = 0;
-                self.observed
-                    .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
-            } else {
-                *count -= nlookup;
-            }
-            return;
-        }
-    }
-
-    fn notify_if_observed(&self, ino: u64, notify: impl FnOnce()) {
-        let Some(state) = self.current(ino) else {
-            return;
-        };
-        let should_notify = {
-            let count = state.lock();
-            self.is_current(ino, &state) && *count > 0
-        };
-        if should_notify {
-            notify();
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -573,23 +454,6 @@ struct ReadWindowKernelInvalidator {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
-}
-
-struct LiveKernelInvalidator {
-    kernel_inode_liveness: Arc<KernelInodeLiveness>,
-    inner: Arc<dyn KernelInvalidator>,
-}
-
-impl KernelInvalidator for LiveKernelInvalidator {
-    fn inval_inode(&self, ino: u64) {
-        self.kernel_inode_liveness
-            .notify_if_observed(ino, || self.inner.inval_inode(ino));
-    }
-
-    fn inval_inode_attrs(&self, ino: u64) {
-        self.kernel_inode_liveness
-            .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
-    }
 }
 
 impl KernelInvalidator for ReadWindowKernelInvalidator {
@@ -1167,7 +1031,7 @@ impl StudioVfsAdapter {
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
                 ))),
-                kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
+                kernel_inode_liveness: Arc::new(FuseInodeLiveness::default()),
                 read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_windows: Arc::new(ReadWindowStore::default()),
@@ -1252,10 +1116,10 @@ impl StudioVfsAdapter {
         &self,
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
-        let inner: Arc<dyn KernelInvalidator> = Arc::new(LiveKernelInvalidator {
-            kernel_inode_liveness: Arc::clone(&self.shared.kernel_inode_liveness),
+        let inner: Arc<dyn KernelInvalidator> = Arc::new(LivenessCheckedKernelInvalidator::new(
+            Arc::clone(&self.shared.kernel_inode_liveness),
             inner,
-        });
+        ));
         self.shared
             .kernel_invalidations
             .set_inner(Arc::clone(&inner));
@@ -1396,7 +1260,9 @@ impl StudioVfsAdapter {
         }
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
-            .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
+            .inspect(|_| {
+                self.shared.kernel_inode_liveness.ensure_observed(ino);
+            })
     }
 
     fn open_with_result(
@@ -4519,118 +4385,6 @@ mod tests {
             pool.last_available_capacity()
                 .is_some_and(|capacity| capacity >= 5),
             "rejected stale cache buffer should be returned to the reusable pool"
-        );
-    }
-
-    #[test]
-    fn kernel_inode_liveness_closes_only_after_all_lookup_references_are_forgotten() {
-        let liveness = KernelInodeLiveness::default();
-        let ino = 42;
-        liveness.observe(ino);
-        liveness.observe(ino);
-
-        liveness.forget(ino, 1);
-        assert!(
-            liveness.contains(ino),
-            "one remaining lookup reference must keep notification live"
-        );
-
-        liveness.forget(ino, 1);
-        assert!(
-            !liveness.contains(ino),
-            "the final forget must close the notification gate"
-        );
-    }
-
-    #[test]
-    fn kernel_inode_liveness_close_does_not_wait_for_external_notification() {
-        let liveness = Arc::new(KernelInodeLiveness::default());
-        let ino = 42;
-        liveness.observe(ino);
-        let entered_notification = Arc::new(std::sync::Barrier::new(2));
-        let release_notification = Arc::new(std::sync::Barrier::new(2));
-        let notifier_liveness = Arc::clone(&liveness);
-        let notifier_entered = Arc::clone(&entered_notification);
-        let notifier_release = Arc::clone(&release_notification);
-        let notifier = std::thread::spawn(move || {
-            notifier_liveness.notify_if_observed(ino, || {
-                notifier_entered.wait();
-                notifier_release.wait();
-            });
-        });
-        entered_notification.wait();
-
-        let closer_liveness = Arc::clone(&liveness);
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-        let closer = std::thread::spawn(move || {
-            closer_liveness.close(ino);
-            closed_tx.send(()).expect("signal closed gate");
-        });
-        closed_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("final unlink must not wait for an external notification callback");
-
-        release_notification.wait();
-        notifier.join().expect("notification thread exits");
-        closer.join().expect("close thread exits");
-        assert!(!liveness.contains(ino));
-    }
-
-    #[test]
-    fn kernel_inode_liveness_notification_can_reenter_close() {
-        let liveness = Arc::new(KernelInodeLiveness::default());
-        let ino = 42;
-        liveness.observe(ino);
-        let callback_liveness = Arc::clone(&liveness);
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-        let notifier = std::thread::spawn(move || {
-            callback_liveness.notify_if_observed(ino, || {
-                callback_liveness.close(ino);
-                closed_tx.send(()).expect("signal re-entrant close");
-            });
-        });
-
-        closed_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("notification callback must not deadlock when close re-enters liveness");
-        notifier.join().expect("notification thread exits");
-        assert!(!liveness.contains(ino));
-    }
-
-    #[test]
-    fn kernel_inode_liveness_notification_does_not_block_unrelated_inode_updates() {
-        let liveness = Arc::new(KernelInodeLiveness::default());
-        let notifying_ino = 42;
-        liveness.observe(notifying_ino);
-        let entered_notification = Arc::new(std::sync::Barrier::new(2));
-        let release_notification = Arc::new(std::sync::Barrier::new(2));
-        let notifier_liveness = Arc::clone(&liveness);
-        let notifier_entered = Arc::clone(&entered_notification);
-        let notifier_release = Arc::clone(&release_notification);
-        let notifier = std::thread::spawn(move || {
-            notifier_liveness.notify_if_observed(notifying_ino, || {
-                notifier_entered.wait();
-                notifier_release.wait();
-            });
-        });
-        entered_notification.wait();
-
-        let updater_liveness = Arc::clone(&liveness);
-        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
-        let updater = std::thread::spawn(move || {
-            for ino in 1_000..5_096 {
-                updater_liveness.ensure_observed(ino);
-            }
-            updated_tx.send(()).expect("signal unrelated updates");
-        });
-        let unrelated_updates_completed = updated_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-        release_notification.wait();
-        notifier.join().expect("notification thread exits");
-        updater.join().expect("unrelated inode updater exits");
-        assert!(
-            unrelated_updates_completed,
-            "kernel IPC for one inode must not retain a DashMap shard guard and block unrelated inode updates"
         );
     }
 

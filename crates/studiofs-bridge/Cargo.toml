@@ -13,4 +13,6 @@ studiofs-meta.workspace = true
 studiofs-vfs.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+dashmap.workspace = true
 libc.workspace = true
+parking_lot.workspace = true

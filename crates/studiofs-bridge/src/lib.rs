@@ -8,5 +8,11 @@
 #![forbid(unsafe_code)]
 
 #[cfg(unix)]
+/// Lookup-reference liveness shared by FUSE-style Unix adapters.
+pub mod fuse_liveness;
+#[cfg(unix)]
+/// Per-inode serialization for FUSE open preparation and replies.
+pub mod fuse_open_reply;
+#[cfg(unix)]
 /// POSIX bridge conversions shared by Unix bridge adapters.
 pub mod posix;
