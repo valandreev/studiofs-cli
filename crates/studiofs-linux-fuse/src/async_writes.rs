@@ -295,10 +295,14 @@ impl LinuxFuseAsyncWrites {
         let result = self
             .changed
             .wait_timeout_while(state, timeout, |state| {
-                state.stats.active_requests != 0 || state.stats.pending_writes != 0
+                state.stats.active_requests != 0
+                    || state.stats.admission_waiters != 0
+                    || state.stats.pending_writes != 0
             })
             .unwrap_or_else(|err| err.into_inner());
-        result.0.stats.active_requests == 0 && result.0.stats.pending_writes == 0
+        result.0.stats.active_requests == 0
+            && result.0.stats.admission_waiters == 0
+            && result.0.stats.pending_writes == 0
     }
 
     pub(crate) fn stats(&self) -> LinuxFuseAsyncWriteStats {
@@ -838,5 +842,74 @@ mod tests {
         })
         .await
         .expect("waiting-request barrier test timed out");
+    }
+
+    #[test]
+    fn async_write_shutdown_begin_is_idempotent() {
+        let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 1));
+
+        writes.begin_shutdown();
+        let first_generation = writes.stats().snapshot_generation;
+        writes.begin_shutdown();
+
+        assert_eq!(writes.stats().snapshot_generation, first_generation);
+        assert_eq!(writes.start_request(70).err(), Some(libc::EIO));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_write_shutdown_admission_waiter_without_ticket_keeps_tracker_non_idle() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 0));
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let waiting_writes = Arc::clone(&writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                waiting_writes.admit(1, |stats| {
+                    let _ = observed_tx.send(stats);
+                })
+            });
+
+            let observed = observed_rx.await.expect("admission wait observation");
+            assert_eq!(
+                (
+                    observed.active_requests,
+                    observed.admission_waiters,
+                    observed.pending_writes,
+                    observed.pending_bytes,
+                ),
+                (0, 1, 0, 0),
+            );
+            let was_idle = writes.wait_idle(Duration::from_millis(20));
+
+            writes.begin_shutdown();
+            match waiter.await.expect("admission waiter join") {
+                Err(errno) => assert_eq!(errno, libc::EIO),
+                Ok(_) => panic!("shutdown unexpectedly admitted a write"),
+            }
+            assert!(!was_idle);
+            assert!(writes.wait_idle(Duration::ZERO));
+            assert_gauges(&writes, (0, 0, 0, 0, 0, 0));
+        })
+        .await
+        .expect("ticket-free admission waiter shutdown test timed out");
+    }
+
+    #[test]
+    fn async_write_shutdown_cancellation_clears_all_live_gauges() {
+        let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 1));
+        let ticket = writes.start_request(71).expect("start request");
+        let reservation = writes.admit(8, |_| {}).expect("admit request");
+        let cancellation = writes.task_cancellation_token();
+
+        writes.begin_shutdown();
+        assert!(!cancellation.is_cancelled());
+        assert!(!writes.wait_idle(Duration::ZERO));
+        writes.request_cancellation();
+        assert!(cancellation.is_cancelled());
+
+        drop(reservation);
+        ticket.complete(LinuxFuseAsyncWriteCompletion::Cancelled);
+        assert!(writes.wait_idle(Duration::ZERO));
+        assert_gauges(&writes, (0, 0, 0, 0, 0, 0));
+        assert_eq!(writes.stats().cancelled_writes, 1);
     }
 }

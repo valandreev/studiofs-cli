@@ -29,6 +29,9 @@ const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
+const ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_EXIT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
@@ -104,6 +107,7 @@ pub(crate) mod raw {
         ) -> c_int;
         pub(crate) fn fuse_session_unmount(session: *mut FuseSession);
         pub(crate) fn fuse_session_destroy(session: *mut FuseSession);
+        pub(crate) fn fuse_session_exited(session: *mut FuseSession) -> c_int;
         pub(crate) fn fuse_set_signal_handlers(session: *mut FuseSession) -> c_int;
         pub(crate) fn fuse_remove_signal_handlers(session: *mut FuseSession);
     }
@@ -273,6 +277,27 @@ impl SessionState {
             },
         }
     }
+
+    fn shutdown_async_writes(&self) -> bool {
+        shutdown_async_writes_with_timeouts(
+            &self.async_writes,
+            ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
+            ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
+        )
+    }
+}
+
+fn shutdown_async_writes_with_timeouts(
+    async_writes: &LinuxFuseAsyncWrites,
+    drain_timeout: Duration,
+    cancel_timeout: Duration,
+) -> bool {
+    async_writes.begin_shutdown();
+    if async_writes.wait_idle(drain_timeout) {
+        return true;
+    }
+    async_writes.request_cancellation();
+    async_writes.wait_idle(cancel_timeout)
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
@@ -710,6 +735,82 @@ pub(crate) struct Session {
     signal_handlers_installed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct BorrowedFuseSession(NonNull<raw::FuseSession>);
+
+// SAFETY: the watcher only queries the session while `Session::run` is active,
+// and it is stopped and joined before the session can be destroyed.
+unsafe impl Send for BorrowedFuseSession {}
+
+impl BorrowedFuseSession {
+    fn exited(self) -> bool {
+        // SAFETY: the caller keeps the session live while the watcher can call this.
+        unsafe { raw::fuse_session_exited(self.0.as_ptr()) != 0 }
+    }
+}
+
+struct SessionExitWatcher {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SessionExitWatcher {
+    fn start(session: NonNull<raw::FuseSession>, async_writes: Arc<LinuxFuseAsyncWrites>) -> Self {
+        let session = BorrowedFuseSession(session);
+        Self::start_with_probe(async_writes, move || session.exited())
+    }
+
+    fn start_with_probe(
+        async_writes: Arc<LinuxFuseAsyncWrites>,
+        session_exited: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            loop {
+                if session_exited() {
+                    async_writes.begin_shutdown();
+                    break;
+                }
+
+                let (lock, changed) = &*thread_stop;
+                let stopped = lock.lock().unwrap_or_else(|err| err.into_inner());
+                let result = changed
+                    .wait_timeout_while(stopped, SESSION_EXIT_WATCH_INTERVAL, |stopped| !*stopped)
+                    .unwrap_or_else(|err| err.into_inner());
+                if *result.0 {
+                    break;
+                }
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        let (lock, changed) = &*self.stop;
+        *lock.lock().unwrap_or_else(|err| err.into_inner()) = true;
+        changed.notify_all();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            warn!("Linux FUSE session-exit watcher panicked");
+        }
+    }
+}
+
+impl Drop for SessionExitWatcher {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 impl Session {
     pub(crate) fn mount(
         state: SessionState,
@@ -811,12 +912,24 @@ impl Session {
             .map(|state| state.connection_config.max_background)
             .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background);
         let loop_threads = linux_fuse_loop_thread_count(max_background);
+        let watcher = self
+            .state
+            .as_ref()
+            .map(|state| SessionExitWatcher::start(self.raw, Arc::clone(&state.async_writes)));
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
         // Keep idle workers equal to the cap so bursty filesystem I/O does not
         // pay thread create/destroy overhead between request spikes.
         let result = unsafe {
             studiofs_linux_fuse_session_loop_mt(self.raw.as_ptr(), loop_threads, loop_threads)
         };
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
+        if let Some(state) = &self.state
+            && !state.shutdown_async_writes()
+        {
+            warn!("Linux FUSE session loop exited before async write replies drained");
+        }
         if result == 0
             || result == libc::SIGINT
             || result == libc::SIGTERM
@@ -2540,19 +2653,34 @@ impl DirectoryEntryBuffer {
     }
 }
 
+fn retain_unsafe_session<Raw, State>(raw: Raw, state: Option<Box<State>>) {
+    std::mem::forget((raw, state));
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if let Some(state) = &self.state {
             state.vfs.clear_kernel_invalidator();
         }
         self.invalidation_state.begin_shutdown();
-        let safe_to_destroy = self
+        let async_writes_idle = self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.shutdown_async_writes());
+        let invalidations_idle = self
             .invalidation_state
             .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
-        if !safe_to_destroy {
+        let safe_to_destroy = async_writes_idle && invalidations_idle;
+        if !async_writes_idle {
+            warn!(
+                "Linux FUSE session shutdown timed out waiting for async write replies; \
+                 unmounting and retaining session ownership to avoid use-after-free"
+            );
+        }
+        if !invalidations_idle {
             warn!(
                 "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
-                 unmounting and leaking raw session handles to avoid use-after-free"
+                 unmounting and retaining session ownership to avoid use-after-free"
             );
         }
         if self.signal_handlers_installed {
@@ -2563,7 +2691,7 @@ impl Drop for Session {
         // it is needed after signal-triggered exits to avoid a stuck mount.
         unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
         if !safe_to_destroy {
-            // An active notification may still hold this session pointer.
+            retain_unsafe_session(self.raw, self.state.take());
             return;
         }
         // SAFETY: `self.raw` is owned by this wrapper and destroyed once.
@@ -2578,6 +2706,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2931,6 +3060,195 @@ mod tests {
         guard.finish(super::FuseWriteTaskResult::Completed(Ok(8)));
 
         assert_eq!(reply.replies, [FakeFuseReply::Write(8)]);
+    }
+
+    #[test]
+    fn async_write_shutdown_watcher_observes_exit_and_stops_promptly() {
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(8, 1));
+        let exited = Arc::new(AtomicBool::new(false));
+        let watcher_exited = Arc::clone(&exited);
+        let watcher = super::SessionExitWatcher::start_with_probe(Arc::clone(&writes), move || {
+            watcher_exited.load(Ordering::Acquire)
+        });
+
+        exited.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while writes.start_request(61).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(writes.start_request(61), Err(errno) if errno == libc::EIO));
+
+        let stop_started = Instant::now();
+        watcher.stop();
+        assert!(stop_started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn async_write_shutdown_watcher_stop_interrupts_poll_wait() {
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(8, 1));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let watcher_probes = Arc::clone(&probes);
+        let watcher = super::SessionExitWatcher::start_with_probe(Arc::clone(&writes), move || {
+            watcher_probes.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while probes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_ne!(probes.load(Ordering::Relaxed), 0);
+
+        let stop_started = Instant::now();
+        watcher.stop();
+        assert!(stop_started.elapsed() < Duration::from_millis(100));
+        assert!(writes.start_request(64).is_ok());
+    }
+
+    #[test]
+    fn async_write_shutdown_watcher_wakes_blocked_callback_with_eio_reply() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "async-write-shutdown-blocked-callback",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(8, 0));
+        let mut reply = Box::new(FakeFuseReplyState::new(
+            0,
+            Arc::clone(&writes),
+            Arc::clone(&vfs),
+        ));
+        let request_ticket = writes.start_request(62).expect("start request");
+        let request = super::FuseReqPtr::for_test(
+            (&mut *reply as *mut FakeFuseReplyState).cast(),
+            fake_fuse_reply_write,
+            fake_fuse_reply_error,
+        );
+        let mut guard = super::FuseWriteTaskGuard {
+            request: Some(request),
+            request_ticket: Some(request_ticket),
+            reservation: None,
+            writes: Arc::clone(&writes),
+            vfs,
+            started: Instant::now(),
+            requested_bytes: 1,
+            metric_config: super::LinuxFuseAsyncWriteMetricConfig {
+                cache_policy: super::LinuxFuseCachePolicy::Direct,
+                connection_config: default_connection_config(),
+            },
+        };
+        let exited = Arc::new(AtomicBool::new(false));
+        let watcher_exited = Arc::clone(&exited);
+        let watcher = super::SessionExitWatcher::start_with_probe(Arc::clone(&writes), move || {
+            watcher_exited.load(Ordering::Acquire)
+        });
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let callback_writes = Arc::clone(&writes);
+        let callback = thread::spawn(move || {
+            match callback_writes.admit(1, |_| {
+                waiting_tx.send(()).expect("report blocked admission")
+            }) {
+                Err(errno) => guard.finish(super::FuseWriteTaskResult::AdmissionRejected(errno)),
+                Ok(reservation) => {
+                    guard.attach_reservation(reservation);
+                    guard.finish(super::FuseWriteTaskResult::Cancelled);
+                }
+            }
+            completed_tx.send(()).expect("report callback completion");
+        });
+
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback should block in admission");
+        exited.store(true, Ordering::Release);
+        let callback_woke = completed_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if !callback_woke {
+            writes.begin_shutdown();
+        }
+        callback.join().expect("join callback");
+        watcher.stop();
+
+        assert!(callback_woke, "session-exit watcher did not wake callback");
+        assert_eq!(reply.replies, [FakeFuseReply::Error(libc::EIO)]);
+        let stats = writes.stats();
+        assert_eq!(
+            (
+                stats.active_requests,
+                stats.admission_waiters,
+                stats.pending_writes,
+                stats.pending_bytes,
+            ),
+            (0, 0, 0, 0),
+        );
+    }
+
+    #[test]
+    fn async_write_shutdown_cancels_only_after_drain_grace_period() {
+        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(8, 1));
+        let ticket = writes.start_request(63).expect("start request");
+        let reservation = writes.admit(1, |_| {}).expect("admit request");
+        let cancellation = writes.task_cancellation_token();
+        let shutdown_writes = Arc::clone(&writes);
+        let drain_timeout = Duration::from_millis(80);
+        let started = Instant::now();
+        let shutdown = thread::spawn(move || {
+            super::shutdown_async_writes_with_timeouts(
+                &shutdown_writes,
+                drain_timeout,
+                Duration::from_secs(1),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!cancellation.is_cancelled());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !cancellation.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cancellation.is_cancelled());
+        assert!(started.elapsed() >= drain_timeout);
+
+        drop(reservation);
+        ticket.complete(super::LinuxFuseAsyncWriteCompletion::Cancelled);
+        assert!(shutdown.join().expect("join shutdown"));
+        let stats = writes.stats();
+        assert_eq!(
+            (
+                stats.active_requests,
+                stats.admission_waiters,
+                stats.pending_handles,
+                stats.pending_writes,
+                stats.pending_bytes,
+                stats.max_handle_pending_writes,
+            ),
+            (0, 0, 0, 0, 0, 0),
+        );
+    }
+
+    #[test]
+    fn async_write_shutdown_forced_timeout_retains_raw_and_boxed_owner() {
+        struct DropSentinel(Arc<AtomicUsize>);
+
+        impl Drop for DropSentinel {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let state_drops = Arc::new(AtomicUsize::new(0));
+        super::retain_unsafe_session(
+            DropSentinel(Arc::clone(&raw_drops)),
+            Some(Box::new(DropSentinel(Arc::clone(&state_drops)))),
+        );
+
+        assert_eq!(
+            (
+                raw_drops.load(Ordering::Relaxed),
+                state_drops.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+        );
     }
 
     #[test]
