@@ -32,8 +32,8 @@ pub use incarnation::{
 };
 pub use lock_order::{LockOrderGuard, LockTier, debug_lock_stack, is_validation_enabled};
 pub use memory_pressure::{
-    MemoryComponentLimits, MemoryPressureInput, MemoryPressureModel, MemoryPressureReadError,
-    MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
+    MemoryComponentLimits, MemoryPressureController, MemoryPressureInput, MemoryPressureModel,
+    MemoryPressureReadError, MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
 };
 pub use ordered_mutex::OrderedMutex;
 pub use qos::QosController;

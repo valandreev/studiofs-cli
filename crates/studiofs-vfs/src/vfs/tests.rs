@@ -1,5 +1,8 @@
 use super::*;
 use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
+use crate::{
+    MemoryComponentLimits, MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -292,6 +295,92 @@ fn make_test_vfs_with_config(
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
+}
+
+fn constrained_memory_snapshot(dirty_bytes: u64, transit_bytes: u64) -> MemoryPressureSnapshot {
+    MemoryPressureSnapshot {
+        source: MemoryPressureSource::Host,
+        state: MemoryPressureState::Constrained,
+        generation: 1,
+        effective_limit_bytes: 8 * 1024 * 1024 * 1024,
+        available_bytes: 1024 * 1024 * 1024,
+        reserve_bytes: 1024 * 1024 * 1024,
+        envelope_bytes: 512 * 1024 * 1024,
+        limits: MemoryComponentLimits {
+            memory_cache_bytes: 256 * 1024 * 1024,
+            dirty_bytes,
+            transit_bytes,
+            async_write_bytes: 32 * 1024 * 1024,
+        },
+        transition_count: 1,
+        sampling_failure_count: 0,
+        overcommitted_minimum: false,
+    }
+}
+
+#[test]
+fn memory_pressure_publish_clamps_vfs_dirty_limit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-dirty-limit");
+    let configured = vfs.max_dirty_bytes();
+    let controller = vfs.memory_pressure_controller().clone();
+
+    controller.publish(constrained_memory_snapshot(64 * 1024 * 1024, u64::MAX));
+
+    assert_eq!(vfs.max_dirty_bytes(), configured.min(64 * 1024 * 1024));
+}
+
+#[test]
+fn disabled_memory_pressure_preserves_runtime_dirty_override() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-disabled");
+
+    vfs.set_max_dirty_bytes(123_456);
+
+    assert_eq!(vfs.max_dirty_bytes(), 123_456);
+}
+
+#[test]
+fn memory_pressure_publish_clamps_transit_admission_without_revoking_guard() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        transit_memory_budget_bytes: 8192,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "memory-pressure-transit-limit", config);
+    let controller = vfs.memory_pressure_controller().clone();
+    let transit = vfs.transit_memory_budget().clone();
+    rt.block_on(async move {
+        let admitted = transit.acquire_foreground(4096).await;
+        controller.publish(constrained_memory_snapshot(u64::MAX, 1024));
+
+        assert_eq!(transit.snapshot().used_bytes, 4096);
+        drop(admitted);
+        assert_eq!(transit.budget_bytes(), 1024);
+    });
+}
+
+#[test]
+fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        transit_memory_budget_bytes: 8192,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "memory-pressure-admitted-bytes", config);
+    let transit = vfs.transit_memory_budget().clone();
+    rt.block_on(async {
+        let _guard = transit.acquire_foreground(4096).await;
+        vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+            snapshot_generation: 1,
+            pending_bytes: 2048,
+            ..VfsFuseAsyncWriteSnapshot::default()
+        });
+
+        assert_eq!(vfs.admitted_managed_bytes(), 6144);
+    });
 }
 
 fn runtime_stats_test_tempdir() -> TempDir {

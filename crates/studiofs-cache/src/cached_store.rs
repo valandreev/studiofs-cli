@@ -568,6 +568,11 @@ impl CachedStore {
         self.upload_hot.lock().get(object_id)
     }
 
+    /// Returns bytes currently retained by the in-memory hot-upload buffer.
+    pub fn hot_upload_resident_bytes(&self) -> usize {
+        self.upload_hot.lock().total_bytes
+    }
+
     /// Returns whether the local payload backend currently contains this object.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.contains(object_id)
@@ -2496,6 +2501,27 @@ mod tests {
             cached_store.get_hot_upload(3).as_deref(),
             Some(&b"cccc"[..])
         );
+    }
+
+    #[test]
+    fn hot_upload_resident_bytes_reports_retained_payloads() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(8),
+            backend,
+        )
+        .expect("open cached store");
+        cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
+            object_id: 1,
+            data: Bytes::from_static(b"aaaa"),
+            evictable: false,
+        }]);
+
+        assert_eq!(cached_store.hot_upload_resident_bytes(), 4);
     }
 
     #[test]

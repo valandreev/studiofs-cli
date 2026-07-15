@@ -278,6 +278,7 @@ impl VfsBootstrapResources {
         plan: &VfsBootstrapPlan,
         config: &VfsConfigValidated,
         cache_runtime: Option<PreparedLocalPayloadRuntime>,
+        memory_pressure: crate::memory_pressure::MemoryPressureController,
     ) -> VfsResult<Self> {
         remove_retired_ingress_spill(Path::new(cache_dir))?;
 
@@ -344,8 +345,10 @@ impl VfsBootstrapResources {
         );
 
         let qos = Arc::new(QosController::from_config(config));
-        let transit_memory_budget =
-            TransitMemoryBudget::new(plan.cache_runtime_tuning.transit_memory_budget_bytes);
+        let transit_memory_budget = TransitMemoryBudget::new_with_memory_pressure(
+            plan.cache_runtime_tuning.transit_memory_budget_bytes,
+            memory_pressure,
+        );
         let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
             data_read,
             cached_store.clone(),
@@ -387,9 +390,14 @@ struct VfsBootstrap {
     config: VfsConfigValidated,
     plan: VfsBootstrapPlan,
     resources: VfsBootstrapResources,
+    memory_pressure: crate::memory_pressure::MemoryPressureController,
 }
 
 impl VfsBootstrap {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bootstrap already takes the complete mount configuration; memory pressure is one additional runtime input"
+    )]
     fn prepare<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,
@@ -398,6 +406,7 @@ impl VfsBootstrap {
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
         cache_runtime: Option<PreparedLocalPayloadRuntime>,
+        memory_pressure: Option<crate::memory_pressure::MemoryPressureController>,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -409,14 +418,35 @@ impl VfsBootstrap {
             memory_cache_budget_bytes,
             &config,
         )?;
+        let memory_pressure = memory_pressure.unwrap_or_else(|| {
+            crate::memory_pressure::MemoryPressureController::disabled(
+                crate::memory_pressure::MemoryComponentLimits {
+                    memory_cache_bytes: derive_upload_hot_buffer_bytes(
+                        plan.max_dirty_bytes,
+                        plan.cache_runtime_tuning.transit_memory_budget_bytes,
+                        plan.block_size(),
+                    ) as u64,
+                    dirty_bytes: plan.max_dirty_bytes as u64,
+                    transit_bytes: plan.cache_runtime_tuning.transit_memory_budget_bytes as u64,
+                    async_write_bytes: 0,
+                },
+            )
+        });
         plan.log_summary(cache_size, &config);
-        let resources =
-            VfsBootstrapResources::open(data_config, cache_dir, &plan, &config, cache_runtime)?;
+        let resources = VfsBootstrapResources::open(
+            data_config,
+            cache_dir,
+            &plan,
+            &config,
+            cache_runtime,
+            memory_pressure.clone(),
+        )?;
         Ok(Self {
             meta,
             config,
             plan,
             resources,
+            memory_pressure,
         })
     }
 
@@ -426,6 +456,7 @@ impl VfsBootstrap {
             config,
             plan,
             resources,
+            memory_pressure,
         } = self;
         let block_size = plan.block_size();
         let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
@@ -462,6 +493,7 @@ impl VfsBootstrap {
                 upload_cache_io_slots as u32
             },
             transit_memory_budget: resources.transit_memory_budget,
+            memory_pressure,
             qos: resources.qos,
             upload_cache_io_foreground_cost_base: plan.upload_cache_io_foreground_cost_base,
             upload_cache_io_foreground_cost_step: plan.upload_cache_io_foreground_cost_step,
@@ -561,6 +593,7 @@ impl StudioVfs {
             memory_cache_budget_bytes,
             config,
             None,
+            None,
         )
     }
 
@@ -585,9 +618,44 @@ impl StudioVfs {
             memory_cache_budget_bytes,
             config,
             Some(cache_runtime),
+            None,
         )
     }
 
+    /// Create a VFS with a prepared cache runtime and shared memory-pressure controller.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "this mirrors the existing prepared-cache constructor with one shared controller"
+    )]
+    pub fn new_with_prepared_cache_runtime_and_memory_pressure<M>(
+        meta: Arc<M>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        memory_cache_budget_bytes: u64,
+        config: VfsConfigValidated,
+        cache_runtime: PreparedLocalPayloadRuntime,
+        memory_pressure: crate::memory_pressure::MemoryPressureController,
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            memory_cache_budget_bytes,
+            config,
+            Some(cache_runtime),
+            Some(memory_pressure),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal constructor mirrors the public mount inputs without an options wrapper"
+    )]
     fn new_impl<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,
@@ -596,6 +664,7 @@ impl StudioVfs {
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
         cache_runtime: Option<PreparedLocalPayloadRuntime>,
+        memory_pressure: Option<crate::memory_pressure::MemoryPressureController>,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -608,6 +677,7 @@ impl StudioVfs {
             memory_cache_budget_bytes,
             config,
             cache_runtime,
+            memory_pressure,
         )?
         .finish()
     }

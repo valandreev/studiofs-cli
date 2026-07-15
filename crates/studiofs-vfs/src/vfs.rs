@@ -3480,6 +3480,7 @@ pub struct StudioVfs {
     upload_cache_io_slots_max: u32,
     /// Global memory-credit budget for active in-flight I/O buffers.
     transit_memory_budget: Arc<TransitMemoryBudget>,
+    memory_pressure: crate::memory_pressure::MemoryPressureController,
     qos: Arc<QosController>,
     /// Baseline slot cost per upload op while foreground reads are active.
     upload_cache_io_foreground_cost_base: u32,
@@ -6434,12 +6435,35 @@ impl StudioVfs {
 
     /// Current dirty-buffer memory limit.
     pub fn max_dirty_bytes(&self) -> usize {
-        self.max_dirty_bytes.load(Ordering::Acquire)
+        let configured = self.max_dirty_bytes.load(Ordering::Acquire);
+        let snapshot = self.memory_pressure.snapshot();
+        if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
+            configured
+        } else {
+            configured.min(usize::try_from(snapshot.limits.dirty_bytes).unwrap_or(usize::MAX))
+        }
     }
 
     /// Update the dirty-buffer memory limit at runtime.
     pub fn set_max_dirty_bytes(&self, value: usize) {
         self.max_dirty_bytes.store(value, Ordering::Release);
+    }
+
+    /// Shared memory-pressure snapshot controller.
+    pub fn memory_pressure_controller(&self) -> &crate::memory_pressure::MemoryPressureController {
+        &self.memory_pressure
+    }
+
+    /// Total bytes currently admitted across VFS-owned managed-memory gauges.
+    pub fn admitted_managed_bytes(&self) -> u64 {
+        let memory_cache = self.cached_store.hot_upload_resident_bytes() as u64;
+        let dirty = self.total_pending_write_buffer_bytes() as u64;
+        let transit = self.transit_memory_budget.snapshot().used_bytes as u64;
+        let async_write = self.state.fuse_async_write_snapshot.lock().pending_bytes as u64;
+        memory_cache
+            .saturating_add(dirty)
+            .saturating_add(transit)
+            .saturating_add(async_write)
     }
 
     /// Number of foreground reads currently in-flight.
@@ -9166,7 +9190,7 @@ impl StudioVfs {
     /// the in-memory dirty buffer or would hit local backpressure.
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
         let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
-        let dirty_mem_limit = self.max_dirty_bytes.load(Ordering::Acquire);
+        let dirty_mem_limit = self.max_dirty_bytes();
         let lane = if dirty_mem_bytes == 0
             || dirty_mem_bytes.saturating_add(next_bytes) <= dirty_mem_limit
         {

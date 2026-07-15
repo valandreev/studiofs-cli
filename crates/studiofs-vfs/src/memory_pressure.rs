@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
@@ -76,6 +79,34 @@ impl MemoryPressureSnapshot {
             sampling_failure_count: 0,
             overcommitted_minimum: false,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryPressureController {
+    snapshot: Arc<RwLock<MemoryPressureSnapshot>>,
+}
+
+impl MemoryPressureController {
+    #[must_use]
+    pub fn new(initial: MemoryPressureSnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    #[must_use]
+    pub fn disabled(configured_limits: MemoryComponentLimits) -> Self {
+        Self::new(MemoryPressureSnapshot::disabled(configured_limits))
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> MemoryPressureSnapshot {
+        *self.snapshot.read()
+    }
+
+    pub fn publish(&self, snapshot: MemoryPressureSnapshot) {
+        *self.snapshot.write() = snapshot;
     }
 }
 
@@ -280,6 +311,53 @@ fn bounded_growth(previous: u64, target: u64, configured_ceiling: u64) -> u64 {
         target
     } else {
         target.min(previous.saturating_add(configured_ceiling / 4))
+    }
+}
+
+#[cfg(test)]
+mod controller_tests {
+    use super::*;
+
+    fn snapshot(dirty_bytes: u64) -> MemoryPressureSnapshot {
+        MemoryPressureSnapshot {
+            source: MemoryPressureSource::Host,
+            state: MemoryPressureState::Normal,
+            generation: 1,
+            effective_limit_bytes: 8 * GIB,
+            available_bytes: 3 * GIB,
+            reserve_bytes: GIB,
+            envelope_bytes: 2 * GIB,
+            limits: MemoryComponentLimits {
+                memory_cache_bytes: 512 * MIB,
+                dirty_bytes,
+                transit_bytes: 256 * MIB,
+                async_write_bytes: 128 * MIB,
+            },
+            transition_count: 0,
+            sampling_failure_count: 0,
+            overcommitted_minimum: false,
+        }
+    }
+
+    #[test]
+    fn controller_publish_replaces_shared_snapshot() {
+        let controller = MemoryPressureController::new(snapshot(512 * MIB));
+
+        controller.publish(snapshot(64 * MIB));
+
+        assert_eq!(controller.snapshot().limits.dirty_bytes, 64 * MIB);
+    }
+
+    #[test]
+    fn disabled_controller_preserves_configured_limits() {
+        let limits = snapshot(512 * MIB).limits;
+
+        let controller = MemoryPressureController::disabled(limits);
+
+        assert_eq!(
+            controller.snapshot(),
+            MemoryPressureSnapshot::disabled(limits)
+        );
     }
 }
 

@@ -111,6 +111,7 @@ pub struct TransitMemorySnapshot {
 /// In-memory budget tracker for limiting transient transit-memory usage.
 pub struct TransitMemoryBudget {
     budget_bytes: AtomicUsize,
+    memory_pressure: Option<crate::memory_pressure::MemoryPressureController>,
     state: Mutex<TransitMemoryBudgetState>,
     notify: Notify,
 }
@@ -137,6 +138,19 @@ impl TransitMemoryBudget {
     pub fn new(budget_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
+            memory_pressure: None,
+            state: Mutex::new(TransitMemoryBudgetState::default()),
+            notify: Notify::new(),
+        })
+    }
+
+    pub(crate) fn new_with_memory_pressure(
+        budget_bytes: usize,
+        memory_pressure: crate::memory_pressure::MemoryPressureController,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
+            memory_pressure: Some(memory_pressure),
             state: Mutex::new(TransitMemoryBudgetState::default()),
             notify: Notify::new(),
         })
@@ -144,7 +158,18 @@ impl TransitMemoryBudget {
 
     /// Returns the current total budget in bytes.
     pub fn budget_bytes(&self) -> usize {
-        self.budget_bytes.load(Ordering::Acquire)
+        let configured = self.budget_bytes.load(Ordering::Acquire);
+        self.memory_pressure
+            .as_ref()
+            .map_or(configured, |controller| {
+                let snapshot = controller.snapshot();
+                if snapshot.state == crate::memory_pressure::MemoryPressureState::Disabled {
+                    configured
+                } else {
+                    configured
+                        .min(usize::try_from(snapshot.limits.transit_bytes).unwrap_or(usize::MAX))
+                }
+            })
     }
 
     /// Update the transit memory budget at runtime.
