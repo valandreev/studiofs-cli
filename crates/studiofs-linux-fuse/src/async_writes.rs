@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,13 +55,13 @@ struct LinuxFuseAsyncWriteLimits {
 #[derive(Debug, Default)]
 struct LinuxFuseAsyncWriteState {
     shutting_down: bool,
+    active_max_pending_bytes: usize,
     stats: LinuxFuseAsyncWriteStats,
     handles: HashMap<u64, HandleLedger>,
 }
 
 pub(crate) struct LinuxFuseAsyncWrites {
     limits: LinuxFuseAsyncWriteLimits,
-    active_max_pending_bytes: AtomicUsize,
     state: Mutex<LinuxFuseAsyncWriteState>,
     changed: Condvar,
     task_cancellation: CancellationToken,
@@ -88,8 +87,10 @@ impl LinuxFuseAsyncWrites {
                 max_pending_bytes,
                 max_pending_writes,
             },
-            active_max_pending_bytes: AtomicUsize::new(max_pending_bytes),
-            state: Mutex::new(LinuxFuseAsyncWriteState::default()),
+            state: Mutex::new(LinuxFuseAsyncWriteState {
+                active_max_pending_bytes: max_pending_bytes,
+                ..LinuxFuseAsyncWriteState::default()
+            }),
             changed: Condvar::new(),
             task_cancellation: CancellationToken::new(),
         }
@@ -97,10 +98,10 @@ impl LinuxFuseAsyncWrites {
 
     pub(crate) fn set_active_max_pending_bytes(&self, max_pending_bytes: usize) {
         let max_pending_bytes = max_pending_bytes.min(self.limits.max_pending_bytes);
-        let previous = self
-            .active_max_pending_bytes
-            .swap(max_pending_bytes, Ordering::AcqRel);
-        if previous != max_pending_bytes {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if state.active_max_pending_bytes != max_pending_bytes {
+            state.active_max_pending_bytes = max_pending_bytes;
+            drop(state);
             self.changed.notify_all();
         }
     }
@@ -137,6 +138,15 @@ impl LinuxFuseAsyncWrites {
         bytes: usize,
         on_wait: impl FnOnce(LinuxFuseAsyncWriteStats),
     ) -> Result<LinuxFuseWriteReservation, i32> {
+        self.admit_with_before_wait(bytes, on_wait, || {})
+    }
+
+    fn admit_with_before_wait(
+        self: &Arc<Self>,
+        bytes: usize,
+        on_wait: impl FnOnce(LinuxFuseAsyncWriteStats),
+        mut before_wait: impl FnMut(),
+    ) -> Result<LinuxFuseWriteReservation, i32> {
         if bytes > self.limits.max_pending_bytes {
             return Err(libc::E2BIG);
         }
@@ -154,9 +164,8 @@ impl LinuxFuseAsyncWrites {
             }
 
             let bytes_exhausted = bytes
-                > self
+                > state
                     .active_max_pending_bytes
-                    .load(Ordering::Acquire)
                     .saturating_sub(state.stats.pending_bytes);
             let writes_exhausted = state.stats.pending_writes >= self.limits.max_pending_writes;
             if !bytes_exhausted && !writes_exhausted {
@@ -190,6 +199,7 @@ impl LinuxFuseAsyncWrites {
                 }
                 state = self.state.lock().unwrap_or_else(|err| err.into_inner());
             } else {
+                before_wait();
                 state = self
                     .changed
                     .wait(state)
@@ -456,6 +466,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use tokio::sync::oneshot;
@@ -823,6 +834,51 @@ mod tests {
         })
         .await
         .expect("active-limit recovery test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_limit_update_between_predicate_and_wait_is_not_lost() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 2));
+            writes.set_active_max_pending_bytes(4);
+            let admitted = writes.admit(4, |_| {}).expect("fill active budget");
+            let (waiting_tx, waiting_rx) = oneshot::channel();
+            let (at_wait_tx, at_wait_rx) = mpsc::channel();
+            let (setter_started_tx, setter_started_rx) = mpsc::channel();
+            let waiting_writes = Arc::clone(&writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                waiting_writes.admit_with_before_wait(
+                    4,
+                    |stats| {
+                        let _ = waiting_tx.send(stats);
+                    },
+                    || {
+                        at_wait_tx.send(()).expect("signal predicate evaluated");
+                        setter_started_rx
+                            .recv()
+                            .expect("setter starts before condvar wait");
+                    },
+                )
+            });
+            waiting_rx.await.expect("admission wait observation");
+            at_wait_rx.recv().expect("waiter reached condvar boundary");
+
+            let setter_writes = Arc::clone(&writes);
+            let setter = tokio::task::spawn_blocking(move || {
+                setter_started_tx.send(()).expect("signal setter start");
+                setter_writes.set_active_max_pending_bytes(8);
+            });
+            setter.await.expect("setter join");
+            let recovered = waiter
+                .await
+                .expect("waiter join")
+                .expect("limit update wakes admission");
+            assert_eq!(writes.stats().pending_bytes, 8);
+            drop(recovered);
+            drop(admitted);
+        })
+        .await
+        .expect("condvar boundary test timed out");
     }
 
     #[test]

@@ -90,6 +90,19 @@ pub struct MemoryPressureController {
     changed: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Debug, Clone, Default)]
+/// Read-only subscription to memory-pressure snapshot changes.
+pub struct MemoryPressureChangeListener {
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl MemoryPressureChangeListener {
+    /// Wait for the next published snapshot.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
+
 impl MemoryPressureController {
     #[must_use]
     pub fn new(initial: MemoryPressureSnapshot) -> Self {
@@ -125,8 +138,11 @@ impl MemoryPressureController {
     }
 
     #[must_use]
-    pub fn change_notify(&self) -> Arc<tokio::sync::Notify> {
-        self.changed.clone()
+    /// Create a read-only listener for snapshot publications.
+    pub fn change_listener(&self) -> MemoryPressureChangeListener {
+        MemoryPressureChangeListener {
+            changed: self.changed.clone(),
+        }
     }
 }
 

@@ -4,7 +4,6 @@ use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -238,7 +237,6 @@ pub(crate) struct SessionState {
 struct MemoryPressureAsyncWriteWatcher {
     cancellation: CancellationToken,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    finished: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl MemoryPressureAsyncWriteWatcher {
@@ -260,8 +258,7 @@ impl MemoryPressureAsyncWriteWatcher {
         ));
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let changed = vfs.memory_pressure_controller().change_notify();
-        let (finished_tx, finished_rx) = mpsc::channel();
+        let changed = vfs.memory_pressure_controller().change_listener();
         let task = runtime_handle.spawn(async move {
             loop {
                 let notification = changed.notified();
@@ -277,42 +274,49 @@ impl MemoryPressureAsyncWriteWatcher {
                     () = &mut notification => {}
                 }
             }
-            let _ = finished_tx.send(());
         });
         Some(Self {
             cancellation,
             task: Mutex::new(Some(task)),
-            finished: Mutex::new(Some(finished_rx)),
         })
     }
 
-    fn stop_and_join(&self) -> bool {
+    async fn stop_and_join(&self) -> bool {
         self.cancellation.cancel();
-        let task = self
+        let Some(mut task) = self
             .task
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .take();
-        let finished = self
-            .finished
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .take();
-        let Some(finished) = finished else {
+            .take()
+        else {
             return true;
         };
-        if finished
-            .recv_timeout(MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT)
-            .is_ok()
-        {
-            return true;
+        match tokio::time::timeout(MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => error.is_cancelled(),
+            Err(_) => {
+                task.abort();
+                task.await.is_err_and(|error| error.is_cancelled())
+            }
         }
-        if let Some(task) = task {
+    }
+
+    fn cancel_and_abort(&self) {
+        self.cancellation.cancel();
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+        {
             task.abort();
         }
-        finished
-            .recv_timeout(MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT)
-            .is_ok()
+    }
+}
+
+impl Drop for MemoryPressureAsyncWriteWatcher {
+    fn drop(&mut self) {
+        self.cancel_and_abort();
     }
 }
 
@@ -478,8 +482,8 @@ impl SessionState {
         state
     }
 
-    fn shutdown_async_writes(&self) -> bool {
-        let watcher_stopped = self.shutdown_memory_pressure_watcher();
+    async fn shutdown_async_writes(&self) -> bool {
+        let watcher_stopped = self.shutdown_memory_pressure_watcher().await;
         let writes_stopped = shutdown_async_writes_with_timeouts(
             &self.async_writes,
             ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
@@ -488,10 +492,18 @@ impl SessionState {
         watcher_stopped && writes_stopped
     }
 
-    fn shutdown_memory_pressure_watcher(&self) -> bool {
-        self.memory_pressure_async_write_watcher
-            .as_ref()
-            .is_none_or(MemoryPressureAsyncWriteWatcher::stop_and_join)
+    async fn shutdown_memory_pressure_watcher(&self) -> bool {
+        if let Some(watcher) = &self.memory_pressure_async_write_watcher {
+            watcher.stop_and_join().await
+        } else {
+            true
+        }
+    }
+
+    fn abort_memory_pressure_watcher(&self) {
+        if let Some(watcher) = &self.memory_pressure_async_write_watcher {
+            watcher.cancel_and_abort();
+        }
     }
 
     fn publish_liveness_stats(&self) {
@@ -1246,9 +1258,7 @@ impl Drop for SessionExitWatcher {
 
 impl Drop for SessionState {
     fn drop(&mut self) {
-        if !self.shutdown_memory_pressure_watcher() {
-            warn!("Linux memory-pressure watcher did not stop before session state drop");
-        }
+        self.abort_memory_pressure_watcher();
     }
 }
 
@@ -1336,7 +1346,7 @@ impl Session {
             watcher.stop();
         }
         if let Some(state) = &self.state
-            && !state.shutdown_async_writes()
+            && !state.runtime_handle.block_on(state.shutdown_async_writes())
         {
             warn!("Linux FUSE session loop exited before async write replies drained");
         }
@@ -3405,10 +3415,14 @@ impl Drop for Session {
             state.vfs.clear_kernel_invalidator();
         }
         self.invalidation_state.begin_shutdown();
-        let async_writes_idle = self
-            .state
-            .as_ref()
-            .is_none_or(|state| state.shutdown_async_writes());
+        let async_writes_idle = self.state.as_ref().is_none_or(|state| {
+            state.abort_memory_pressure_watcher();
+            shutdown_async_writes_with_timeouts(
+                &state.async_writes,
+                ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
+                ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
+            )
+        });
         let invalidations_idle = self
             .invalidation_state
             .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
@@ -5100,7 +5114,7 @@ mod tests {
             assert_eq!(state.async_writes.stats().pending_bytes, 8);
             drop(recovered);
             drop(admitted);
-            assert!(state.shutdown_memory_pressure_watcher());
+            assert!(state.shutdown_memory_pressure_watcher().await);
         })
         .await
         .expect("memory-pressure watcher test timed out");
@@ -5115,6 +5129,70 @@ mod tests {
         );
 
         assert!(state.memory_pressure_async_write_watcher.is_none());
+    }
+
+    #[test]
+    fn current_thread_runtime_explicitly_joins_memory_pressure_watcher() {
+        let fixture = ContractVfsFixture::new("linux-pressure-watcher-current-thread-shutdown")
+            .expect("create VFS fixture");
+        let controller = fixture.vfs().memory_pressure_controller().clone();
+        let mut snapshot = controller.snapshot();
+        snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+        snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+        controller.publish(snapshot);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        let state = super::SessionState::new_with_cache_settings(
+            fixture.vfs(),
+            runtime.handle().clone(),
+            false,
+            default_connection_config(),
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+
+        assert!(runtime.block_on(state.shutdown_memory_pressure_watcher()));
+    }
+
+    #[test]
+    fn current_thread_runtime_drop_aborts_watcher_without_waiting_for_runtime_progress() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let fixture = ContractVfsFixture::new("linux-pressure-watcher-current-thread-drop")
+                .expect("create VFS fixture");
+            let controller = fixture.vfs().memory_pressure_controller().clone();
+            let mut snapshot = controller.snapshot();
+            snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+            snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+            controller.publish(snapshot);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            let state = super::SessionState::new_with_cache_settings(
+                fixture.vfs(),
+                runtime.handle().clone(),
+                false,
+                default_connection_config(),
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+            );
+            ready_tx.send(()).expect("signal state ready");
+            drop_rx.recv().expect("receive drop request");
+            drop(state);
+            dropped_tx.send(()).expect("signal state dropped");
+        });
+        ready_rx.recv().expect("wait for state construction");
+
+        drop_tx.send(()).expect("request state drop");
+        dropped_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("SessionState drop blocked on current-thread Tokio task");
+        thread.join().expect("drop regression thread join");
     }
 
     #[test]

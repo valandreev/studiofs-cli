@@ -6814,7 +6814,7 @@ impl StudioVfs {
 
         let mut hard_wait_started = None;
         let shutdown = self.state.shutdown.background_shutdown_token.clone();
-        let memory_pressure_changed = self.memory_pressure.change_notify();
+        let memory_pressure_changed = self.memory_pressure.change_listener();
         let (pressure, buffer_budget_bytes) = loop {
             let dirty_reduced = self.state.writer_stack.dirty_reduced();
             let pressure_changed = memory_pressure_changed.notified();

@@ -112,7 +112,7 @@ pub struct TransitMemorySnapshot {
 pub struct TransitMemoryBudget {
     budget_bytes: AtomicUsize,
     memory_pressure: Option<crate::memory_pressure::MemoryPressureController>,
-    memory_pressure_notify: Arc<Notify>,
+    memory_pressure_notify: crate::memory_pressure::MemoryPressureChangeListener,
     state: Mutex<TransitMemoryBudgetState>,
     notify: Notify,
 }
@@ -140,7 +140,7 @@ impl TransitMemoryBudget {
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
             memory_pressure: None,
-            memory_pressure_notify: Arc::new(Notify::new()),
+            memory_pressure_notify: crate::memory_pressure::MemoryPressureChangeListener::default(),
             state: Mutex::new(TransitMemoryBudgetState::default()),
             notify: Notify::new(),
         })
@@ -150,7 +150,7 @@ impl TransitMemoryBudget {
         budget_bytes: usize,
         memory_pressure: crate::memory_pressure::MemoryPressureController,
     ) -> Arc<Self> {
-        let memory_pressure_notify = memory_pressure.change_notify();
+        let memory_pressure_notify = memory_pressure.change_listener();
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
             memory_pressure: Some(memory_pressure),
