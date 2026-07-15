@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
-    BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
+    BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
+    to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
@@ -195,6 +196,50 @@ const _: fn() = assert_send_sync_static::<SessionState>;
 enum LinuxFuseCachePolicy {
     Direct,
     Kernel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxFuseReleaseMode {
+    Synchronous,
+    Deferred,
+}
+
+fn linux_fuse_release_mode(
+    local_sync_policy: LocalSyncPolicy,
+    has_local_dirty_state: bool,
+) -> LinuxFuseReleaseMode {
+    if local_sync_policy.is_opportunistic() && !has_local_dirty_state {
+        LinuxFuseReleaseMode::Deferred
+    } else {
+        LinuxFuseReleaseMode::Synchronous
+    }
+}
+
+fn merge_async_and_local_barrier_results(
+    async_result: Result<(), i32>,
+    local_result: Result<(), i32>,
+) -> Result<(), i32> {
+    match async_result {
+        Err(errno) => Err(errno),
+        Ok(()) => local_result,
+    }
+}
+
+struct LinuxFuseHandleLedgerGuard {
+    async_writes: Arc<LinuxFuseAsyncWrites>,
+    fh: u64,
+}
+
+impl LinuxFuseHandleLedgerGuard {
+    fn new(async_writes: Arc<LinuxFuseAsyncWrites>, fh: u64) -> Self {
+        Self { async_writes, fh }
+    }
+}
+
+impl Drop for LinuxFuseHandleLedgerGuard {
+    fn drop(&mut self) {
+        self.async_writes.forget_handle(self.fh);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1873,47 +1918,61 @@ impl SessionState {
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
-        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
-        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
-            let ino = self
-                .vfs
-                .get_open_file(fh)
-                .map(|open_file| open_file.ino)
-                .ok_or(libc::EBADF)?;
-            return self
-                .runtime_handle
-                .block_on(self.vfs.flush_fuse_writeback_with_outcome(ino, fh))
-                .map(|_| ())
-                .map_err(|error| vfs_err_to_errno(&error));
-        }
-        self.runtime_handle
-            .block_on(self.vfs.flush_fh(fh))
-            .map_err(|error| vfs_err_to_errno(&error))
+        let watermark = self.async_writes.watermark(fh);
+        let async_result = self.async_writes.wait_through(watermark);
+        let local_result = normalize_close_barrier_result(
+            self.runtime_handle
+                .block_on(self.vfs.flush_fh(fh))
+                .map_err(|error| vfs_err_to_errno(&error)),
+        );
+        merge_async_and_local_barrier_results(async_result, local_result)
     }
 
-    fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
-        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
-        let result = if let Some(fh) = file_handle {
-            // Handle-backed sync must preserve pending handle-local write state;
-            // StudioVfs does not currently distinguish fdatasync from fsync on
-            // this path, so both use the handle flush barrier.
-            self.runtime_handle.block_on(self.vfs.flush_fh(fh))
-        } else {
-            self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
-        };
-        result.map_err(|error| vfs_err_to_errno(&error))
+    fn fsync(&self, file_handle: Option<u64>, _ino: u64, _datasync: bool) -> Result<(), i32> {
+        let fh = file_handle
+            .filter(|fh| self.vfs.get_open_file(*fh).is_some())
+            .ok_or(libc::EBADF)?;
+        let watermark = self.async_writes.watermark(fh);
+        let async_result = self.async_writes.wait_through(watermark);
+        // StudioVfs does not currently distinguish fdatasync from fsync on
+        // this handle-backed path, so both use the strict handle flush barrier.
+        let local_result = self
+            .runtime_handle
+            .block_on(self.vfs.flush_fh(fh))
+            .map_err(|error| vfs_err_to_errno(&error));
+        merge_async_and_local_barrier_results(async_result, local_result)
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
-        while !self.async_writes.wait_idle(Duration::from_secs(1)) {}
-        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
-            self.vfs
-                .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
-            return Ok(());
-        }
-        self.runtime_handle
-            .block_on(self.vfs.release_fh(fh))
-            .map_err(|error| vfs_err_to_errno(&error))
+        let open_file = self.vfs.get_open_file(fh).ok_or(libc::EBADF)?;
+        let local_sync_policy = if open_file.flags.contains(OpenFlags::SYNC) {
+            LocalSyncPolicy::WriteThrough
+        } else {
+            LocalSyncPolicy::Opportunistic
+        };
+        let watermark = self.async_writes.close_handle(fh);
+        let _forget_guard = LinuxFuseHandleLedgerGuard::new(Arc::clone(&self.async_writes), fh);
+        let async_result = self.async_writes.wait_through(watermark);
+        let mode = linux_fuse_release_mode(
+            local_sync_policy,
+            self.vfs.inode_has_local_dirty_state(open_file.ino),
+        );
+        let local_result = match mode {
+            LinuxFuseReleaseMode::Synchronous => self
+                .runtime_handle
+                .block_on(self.vfs.release_fh_with_outcome(fh))
+                .map(|_| ())
+                .map_err(|error| vfs_err_to_errno(&error)),
+            LinuxFuseReleaseMode::Deferred => {
+                self.vfs
+                    .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+                Ok(())
+            }
+        };
+        merge_async_and_local_barrier_results(
+            async_result,
+            normalize_close_barrier_result(local_result),
+        )
     }
 
     fn vfs_file_handle(&self, fi: *const raw::FuseFileInfo) -> Option<u64> {
@@ -2511,6 +2570,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use studiofs_vfs::LocalSyncPolicy;
+
     struct UnmountGuard(Option<std::path::PathBuf>);
 
     impl UnmountGuard {
@@ -2638,6 +2699,23 @@ mod tests {
 
     fn default_connection_config() -> super::LinuxFuseConnectionConfig {
         super::LinuxFuseConnectionConfig::default()
+    }
+
+    fn write_via_linux_session(state: &super::SessionState, ino: u64, fh: u64, payload: &[u8]) {
+        let mut file_info_storage = [0_u64; 32];
+        let file_info = file_info_storage
+            .as_mut_ptr()
+            .cast::<super::raw::FuseFileInfo>();
+        // SAFETY: the aligned scratch storage outlives this synchronous callback
+        // and is large enough for the system libfuse `fuse_file_info` value.
+        unsafe {
+            super::studiofs_linux_fuse_file_info_init(file_info, fh, 1, 0, 0);
+        }
+
+        assert_eq!(
+            state.write(ino, payload.as_ptr().cast(), payload.len(), 0, file_info),
+            Ok(payload.len() as u32),
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -3203,6 +3281,408 @@ mod tests {
         assert_eq!(
             state.local_sync_policy_for_handle(fh),
             studiofs_vfs::LocalSyncPolicy::WriteThrough
+        );
+    }
+
+    #[test]
+    fn dirty_opportunistic_release_is_synchronous() {
+        assert_eq!(
+            super::linux_fuse_release_mode(LocalSyncPolicy::Opportunistic, true),
+            super::LinuxFuseReleaseMode::Synchronous,
+        );
+    }
+
+    #[test]
+    fn clean_opportunistic_release_is_deferred() {
+        assert_eq!(
+            super::linux_fuse_release_mode(LocalSyncPolicy::Opportunistic, false),
+            super::LinuxFuseReleaseMode::Deferred,
+        );
+    }
+
+    #[test]
+    fn write_through_release_is_synchronous() {
+        assert_eq!(
+            super::linux_fuse_release_mode(LocalSyncPolicy::WriteThrough, false),
+            super::LinuxFuseReleaseMode::Synchronous,
+        );
+    }
+
+    #[test]
+    fn merge_async_and_local_barrier_results_uses_computed_local_error() {
+        let async_result = Ok(());
+        let local_result = Err(libc::EIO);
+
+        assert_eq!(
+            super::merge_async_and_local_barrier_results(async_result, local_result),
+            Err(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn merge_async_and_local_barrier_results_prefers_async_error_when_both_fail() {
+        let async_result = Err(libc::ENOSPC);
+        let local_result = Err(libc::EIO);
+
+        assert_eq!(
+            super::merge_async_and_local_barrier_results(async_result, local_result),
+            Err(libc::ENOSPC),
+        );
+    }
+
+    #[test]
+    fn flush_runs_vfs_barrier_after_async_error() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-flush-after-async-error",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"flush-error.dat", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        write_via_linux_session(&state, attr.ino, fh, b"local bytes");
+        let failed = state
+            .async_writes
+            .start_request(fh)
+            .expect("start failed async write");
+        failed.complete(super::LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+        let result = state.flush(fh);
+
+        assert_eq!(
+            (result, vfs.inode_has_local_dirty_state(attr.ino)),
+            (Err(libc::ENOSPC), false),
+        );
+        state.release(fh).expect("release file");
+    }
+
+    #[test]
+    fn handle_backed_fsync_runs_vfs_barrier_after_async_error() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-fsync-after-async-error",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"fsync-error.dat", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        write_via_linux_session(&state, attr.ino, fh, b"fsync local bytes");
+        let failed = state
+            .async_writes
+            .start_request(fh)
+            .expect("start failed async write");
+        failed.complete(super::LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+        let result = state.fsync(Some(fh), attr.ino, true);
+
+        assert_eq!(
+            (result, vfs.inode_has_local_dirty_state(attr.ino)),
+            (Err(libc::ENOSPC), false),
+        );
+        state.release(fh).expect("release file");
+    }
+
+    #[test]
+    fn release_closes_vfs_handle_after_async_error() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-release-after-async-error",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"release-error.dat", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let failed = state
+            .async_writes
+            .start_request(fh)
+            .expect("start failed async write");
+        failed.complete(super::LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+        let result = state.release(fh);
+
+        assert_eq!(
+            (
+                result,
+                vfs.get_open_file(fh).is_none(),
+                vfs.file_session_stats().open_handles,
+            ),
+            (Err(libc::ENOSPC), true, 0),
+        );
+    }
+
+    #[test]
+    fn linux_flush_is_a_strict_local_durability_barrier() {
+        let mut fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-strict-flush")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"strict-flush.dat", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let payload: &[u8] = b"strict local durability";
+        write_via_linux_session(&state, ino, fh, payload);
+        assert!(vfs.inode_has_local_dirty_state(ino));
+
+        state.flush(fh).expect("flush file");
+
+        assert!(!vfs.inode_has_local_dirty_state(ino));
+        state.release(fh).expect("release file");
+        drop(state);
+        drop(vfs);
+
+        let reopened = fixture.reopen_vfs().expect("reopen VFS fixture");
+        let read_fh = reopened
+            .open_file(ino, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open reopened file");
+        let mut readback = vec![0; payload.len()];
+        let read = fixture
+            .runtime()
+            .block_on(reopened.read_into_fh(read_fh, ino, 0, &mut readback))
+            .expect("read reopened file");
+        fixture
+            .runtime()
+            .block_on(reopened.release_fh(read_fh))
+            .expect("release reopened file");
+
+        assert_eq!(
+            (read as usize, readback.as_slice()),
+            (payload.len(), payload)
+        );
+    }
+
+    #[test]
+    fn linux_flush_after_async_error_still_materializes_prior_local_state() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-flush-error-materializes",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_meta::ROOT_INO,
+                b"flush-error-bytes.dat",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let payload: &[u8] = b"bytes before async error";
+        write_via_linux_session(&state, attr.ino, fh, payload);
+        let failed = state
+            .async_writes
+            .start_request(fh)
+            .expect("start failed async write");
+        failed.complete(super::LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+        let flush_result = state.flush(fh);
+        let mut readback = vec![0; payload.len()];
+        let read = fixture
+            .runtime()
+            .block_on(vfs.read_into_fh(fh, attr.ino, 0, &mut readback))
+            .expect("read flushed file");
+
+        assert_eq!(
+            (
+                flush_result,
+                vfs.inode_has_local_dirty_state(attr.ino),
+                read as usize,
+                readback.as_slice(),
+            ),
+            (Err(libc::ENOSPC), false, payload.len(), payload),
+        );
+        state.release(fh).expect("release file");
+    }
+
+    #[test]
+    fn linux_release_after_async_error_removes_handle_and_lifecycle() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-release-error-lifecycle",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_meta::ROOT_INO,
+                b"release-error-lifecycle.dat",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        write_via_linux_session(&state, attr.ino, fh, b"dirty release bytes");
+        let failed = state
+            .async_writes
+            .start_request(fh)
+            .expect("start failed async write");
+        failed.complete(super::LinuxFuseAsyncWriteCompletion::Failed(libc::ENOSPC));
+
+        let release_result = state.release(fh);
+        let sessions = vfs.file_session_stats();
+
+        assert_eq!(
+            (
+                release_result,
+                vfs.get_open_file(fh).is_none(),
+                sessions.open_handles,
+                sessions.active_sessions,
+                vfs.inode_has_local_dirty_state(attr.ino),
+            ),
+            (Err(libc::ENOSPC), true, 0, 0, false),
+        );
+    }
+
+    #[test]
+    fn linux_barrier_does_not_wait_for_another_inode() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-inode-scoped-barrier",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let target = vfs
+            .create(studiofs_meta::ROOT_INO, b"barrier-target.dat", 0, 0, 0o644)
+            .expect("create target file");
+        let unrelated = vfs
+            .create(
+                studiofs_meta::ROOT_INO,
+                b"barrier-unrelated.dat",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create unrelated file");
+        let target_fh = vfs
+            .open_file(target.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open target file");
+        let unrelated_fh = vfs
+            .open_file(unrelated.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open unrelated file");
+        let state = Arc::new(super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        ));
+        write_via_linux_session(&state, target.ino, target_fh, b"target bytes");
+        let unrelated_write = state
+            .async_writes
+            .start_request(unrelated_fh)
+            .expect("start unrelated async write");
+        let (result_tx, result_rx) = mpsc::channel();
+        let barrier_state = Arc::clone(&state);
+        let barrier = thread::spawn(move || {
+            let _ = result_tx.send(barrier_state.flush(target_fh));
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_millis(750));
+        unrelated_write.complete(super::LinuxFuseAsyncWriteCompletion::Success);
+        barrier.join().expect("join target barrier");
+        state.release(target_fh).expect("release target file");
+        state.release(unrelated_fh).expect("release unrelated file");
+
+        assert_eq!(
+            result.expect("target barrier waited for unrelated inode"),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn regular_file_fsync_without_handle_returns_ebadf_without_mount_global_wait() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-fsync-without-handle",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let target = vfs
+            .create(studiofs_meta::ROOT_INO, b"target.dat", 0, 0, 0o644)
+            .expect("create target file");
+        let unrelated = vfs
+            .create(studiofs_meta::ROOT_INO, b"unrelated.dat", 0, 0, 0o644)
+            .expect("create unrelated file");
+        let unrelated_fh = vfs
+            .open_file(unrelated.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open unrelated file");
+        let state = Arc::new(super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        ));
+        let pending = state
+            .async_writes
+            .start_request(unrelated_fh)
+            .expect("start unrelated async write");
+        let (result_tx, result_rx) = mpsc::channel();
+        let fsync_state = Arc::clone(&state);
+        let fsync = thread::spawn(move || {
+            let _ = result_tx.send(fsync_state.fsync(None, target.ino, false));
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_millis(250));
+        pending.complete(super::LinuxFuseAsyncWriteCompletion::Success);
+        fsync.join().expect("join fsync callback");
+        fixture
+            .runtime()
+            .block_on(vfs.release_fh(unrelated_fh))
+            .expect("release unrelated handle");
+
+        assert_eq!(
+            result.expect("handle-less fsync waited for unrelated async write"),
+            Err(libc::EBADF),
         );
     }
 
