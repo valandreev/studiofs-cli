@@ -1220,11 +1220,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 );
             }
         }
-        let foreground_active = self
-            .vfs
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let foreground_active = self.vfs.foreground_io_active();
         let defer_delay = upload_disk_reread_defer_delay(
             foreground_active,
             false,
@@ -1289,11 +1285,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         if self.vfs.shutdown_requested() {
             return Ok(None);
         }
-        let foreground_active = self
-            .vfs
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let foreground_active = self.vfs.foreground_io_active();
         let foreground_cost = self
             .vfs
             .state

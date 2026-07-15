@@ -112,7 +112,7 @@ use config::{
     PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
     WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
-use file_session::{FileSessionOperation, FileSessionState};
+use file_session::{FileSessionOperation, FileSessionState, OsCacheHandleLifecycle};
 use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
@@ -3397,7 +3397,6 @@ pub struct StudioVfs {
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Shared exact-generation state for OS page-cache decisions.
-    #[expect(dead_code, reason = "open preparation consumes this state in Task 3")]
     os_cache: OsCacheState,
     /// Optional distributed lease for janitor leader election.
     janitor_lease: Option<JanitorLease>,
@@ -4637,10 +4636,7 @@ impl StudioVfs {
     ) {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
-        let foreground_active = self
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
+        let foreground_active = self.foreground_io_active();
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6315,6 +6311,99 @@ impl StudioVfs {
             .read
             .foreground_reads_inflight
             .load(Ordering::Relaxed)
+    }
+
+    fn foreground_io_active(&self) -> bool {
+        self.state
+            .read
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace)
+            || self.os_cache.has_any_active_writer()
+    }
+
+    /// Prepare a regular-file handle for adapter-owned OS page-cache flags.
+    pub fn prepare_os_cache_open(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+    ) -> OsCacheOpenDecision {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+        };
+
+        open_file.prepare_os_cache(|| {
+            if open_file.active_open_overlay {
+                self.os_cache.begin_writer(open_file.ino);
+                self.os_cache.clear(open_file.ino);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::WriteCapable),
+                    Some(OsCacheHandleLifecycle::Writer { ino: open_file.ino }),
+                );
+            }
+
+            self.os_cache.begin_foreground_handle();
+            self.begin_foreground_read_handle();
+            let lifecycle = Some(OsCacheHandleLifecycle::ForegroundRead);
+            if participation == OsCacheParticipation::Disabled {
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::PolicyDisabled),
+                    lifecycle,
+                );
+            }
+
+            let Some(attr) = open_file.open_attr() else {
+                self.os_cache.clear(open_file.ino);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::UnknownLocalState),
+                    lifecycle,
+                );
+            };
+            if attr.kind != FileType::RegularFile {
+                self.os_cache.clear(open_file.ino);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::NotRegularFile),
+                    lifecycle,
+                );
+            }
+            if self.inode_has_local_dirty_state(open_file.ino) {
+                self.os_cache.clear(open_file.ino);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::LocalDirtyState),
+                    lifecycle,
+                );
+            }
+            if self.handle_table.has_active_open_overlay(open_file.ino)
+                || self.os_cache.has_active_writer(open_file.ino)
+            {
+                self.os_cache.clear(open_file.ino);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter),
+                    lifecycle,
+                );
+            }
+
+            let spans =
+                match self
+                    .sync_meta()
+                    .lookup_regular_file_slices(open_file.ino, 0, attr.size)
+                {
+                    Ok(spans) => spans,
+                    Err(_) => {
+                        self.os_cache.clear(open_file.ino);
+                        return (
+                            OsCacheOpenDecision::replace(OsCacheReason::UnknownLocalState),
+                            lifecycle,
+                        );
+                    }
+                };
+            (self.os_cache.observe(&attr, spans), lifecycle)
+        })
+    }
+
+    /// Forget an observation after a prepared platform reply is rejected.
+    pub fn abort_os_cache_open(&self, fh: u64) {
+        if let Some(open_file) = self.handle_table.get(fh) {
+            self.os_cache.clear(open_file.ino);
+        }
     }
 
     /// Mark a platform read-only handle as active foreground I/O.

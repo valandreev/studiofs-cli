@@ -36,7 +36,7 @@ use crate::vfs::{
     FOREGROUND_READ_SPEEDOMETER_SHARDS, MIN_UPLOAD_WORKER_COUNT,
 };
 
-use super::{OpenFile, VfsError, VfsResult};
+use super::{OpenFile, OsCacheHandleLifecycle, VfsError, VfsResult};
 
 /// Maximum runtime dirty budget for large cache classes.
 pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 800 * 1024 * 1024;
@@ -151,6 +151,8 @@ pub(super) struct HandleReleaseContext {
     pub(super) open_file: OpenFile,
     /// Inode associated with the handle.
     pub(super) ino: Ino,
+    /// Shared OS-cache lifetime owned until final local release work completes.
+    pub(super) os_cache_lifecycle: Option<OsCacheHandleLifecycle>,
 }
 
 /// Target inode and open-handle count for unlink handling.

@@ -11,6 +11,8 @@ use tracing::debug;
 
 use crate::utils::now_unix_millis;
 
+use super::{OsCacheOpenDecision, OsCacheReason};
+
 // =============================================================================
 // Open File Handle Tracking
 // =============================================================================
@@ -111,6 +113,23 @@ impl std::ops::BitOrAssign for OpenFlags {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum OsCacheHandleLifecycle {
+    ForegroundRead,
+    Writer { ino: Ino },
+}
+
+#[derive(Debug, Default)]
+pub(super) enum OsCacheHandleState {
+    #[default]
+    Unprepared,
+    Prepared {
+        decision: OsCacheOpenDecision,
+        lifecycle: Option<OsCacheHandleLifecycle>,
+    },
+    Released,
+}
+
 /// Information about a single open file descriptor.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
@@ -122,6 +141,7 @@ pub struct OpenFile {
     pub flags: OpenFlags,
     pub(super) open_attr: Arc<RwLock<Option<Arc<InodeAttr>>>>,
     pub(super) active_open_overlay: bool,
+    pub(super) os_cache_state: Arc<Mutex<OsCacheHandleState>>,
     access_state: Arc<Mutex<HandleAccessState>>,
     read_window: Arc<Mutex<ReadWindowState>>,
 }
@@ -140,6 +160,7 @@ impl OpenFile {
             flags,
             open_attr: Arc::new(RwLock::new(open_attr.map(Arc::new))),
             active_open_overlay,
+            os_cache_state: Arc::new(Mutex::new(OsCacheHandleState::default())),
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
             read_window: Arc::new(Mutex::new(ReadWindowState::default())),
         }
@@ -147,6 +168,37 @@ impl OpenFile {
 
     pub(super) fn open_attr(&self) -> Option<InodeAttr> {
         self.open_attr.read().as_deref().cloned()
+    }
+
+    pub(super) fn prepare_os_cache(
+        &self,
+        prepare: impl FnOnce() -> (OsCacheOpenDecision, Option<OsCacheHandleLifecycle>),
+    ) -> OsCacheOpenDecision {
+        let mut state = self.os_cache_state.lock();
+        match &*state {
+            OsCacheHandleState::Prepared { decision, .. } => return *decision,
+            OsCacheHandleState::Released => {
+                return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+            }
+            OsCacheHandleState::Unprepared => {}
+        }
+
+        let (decision, lifecycle) = prepare();
+        *state = OsCacheHandleState::Prepared {
+            decision,
+            lifecycle,
+        };
+        decision
+    }
+
+    pub(super) fn take_os_cache_lifecycle_for_release(&self) -> Option<OsCacheHandleLifecycle> {
+        match std::mem::replace(
+            &mut *self.os_cache_state.lock(),
+            OsCacheHandleState::Released,
+        ) {
+            OsCacheHandleState::Prepared { lifecycle, .. } => lifecycle,
+            OsCacheHandleState::Unprepared | OsCacheHandleState::Released => None,
+        }
     }
 
     pub(super) fn set_open_attr(&self, attr: InodeAttr) {

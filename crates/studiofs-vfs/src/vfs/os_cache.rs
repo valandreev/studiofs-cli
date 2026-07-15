@@ -2,6 +2,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::{HashMap, hash_map::Entry};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::schema::{ResolvedSliceSource, ResolvedSliceSpan};
 use studiofs_meta::types::{Ino, InodeAttr};
 
@@ -47,10 +48,6 @@ pub struct OsCacheOpenDecision {
     reason: OsCacheReason,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "open preparation consumes constructors in Task 3")
-)]
 impl OsCacheOpenDecision {
     pub(super) const fn replace(reason: OsCacheReason) -> Self {
         Self {
@@ -84,10 +81,6 @@ struct OsCacheGeneration {
     graph: Vec<OsCacheGraphSpan>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "open preparation observes generations in Task 3")
-)]
 impl OsCacheGeneration {
     fn from_metadata(attr: &InodeAttr, spans: Vec<ResolvedSliceSpan>) -> Self {
         Self {
@@ -146,13 +139,10 @@ fn source_tag(source: ResolvedSliceSource) -> u8 {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "open preparation consumes owned state in Task 3")
-)]
 pub(super) struct OsCacheState {
     generations: Mutex<LruCache<Ino, OsCacheGeneration>>,
     active_writers: Mutex<HashMap<Ino, usize>>,
+    active_foreground_handles: AtomicU64,
 }
 
 impl Default for OsCacheState {
@@ -161,19 +151,13 @@ impl Default for OsCacheState {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "handle lifecycle consumes state methods in Task 3"
-    )
-)]
 impl OsCacheState {
     fn with_capacity(capacity: usize) -> Self {
         let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             generations: Mutex::new(LruCache::new(capacity)),
             active_writers: Mutex::new(HashMap::new()),
+            active_foreground_handles: AtomicU64::new(0),
         }
     }
 
@@ -201,6 +185,27 @@ impl OsCacheState {
         *self.active_writers.lock().entry(ino).or_default() += 1;
     }
 
+    pub(super) fn begin_foreground_handle(&self) {
+        self.active_foreground_handles
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn end_foreground_handle(&self) {
+        self.active_foreground_handles
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 publishes this exact gauge")
+    )]
+    pub(super) fn active_foreground_handle_count(&self) -> u64 {
+        self.active_foreground_handles.load(Ordering::Relaxed)
+    }
+
     /// Return true only when this call removes the inode's final writer.
     pub(super) fn end_writer(&self, ino: Ino) -> bool {
         match self.active_writers.lock().entry(ino) {
@@ -218,6 +223,22 @@ impl OsCacheState {
 
     pub(super) fn has_active_writer(&self, ino: Ino) -> bool {
         self.active_writers.lock().contains_key(&ino)
+    }
+
+    pub(super) fn has_any_active_writer(&self) -> bool {
+        !self.active_writers.lock().is_empty()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 publishes this exact gauge")
+    )]
+    pub(super) fn active_writer_count(&self) -> u64 {
+        self.active_writers
+            .lock()
+            .values()
+            .map(|count| *count as u64)
+            .sum()
     }
 }
 
@@ -379,6 +400,16 @@ mod tests {
         assert!(!state.end_writer(42));
         assert!(state.end_writer(42));
         assert!(!state.has_active_writer(42));
+    }
+
+    #[test]
+    fn active_writer_count_sums_handles_instead_of_inodes() {
+        let state = OsCacheState::with_capacity(8);
+        state.begin_writer(42);
+        state.begin_writer(42);
+        state.begin_writer(84);
+
+        assert_eq!(state.active_writer_count(), 3);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, MetaUploadState,
-    OpenFile, OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy,
-    StudioVfs, VfsResult,
+    OpenFile, OpenFlags, OsCacheHandleLifecycle, PrefetchedWriterStackObjectIds, ReleaseFhOutcome,
+    StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use bytes::Bytes;
 use std::collections::BTreeSet;
@@ -18,6 +18,44 @@ use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
+
+struct BorrowedOsCacheLifecycleGuard<'a> {
+    vfs: &'a StudioVfs,
+    lifecycle: Option<OsCacheHandleLifecycle>,
+}
+
+impl<'a> BorrowedOsCacheLifecycleGuard<'a> {
+    fn new(vfs: &'a StudioVfs, lifecycle: Option<OsCacheHandleLifecycle>) -> Self {
+        Self { vfs, lifecycle }
+    }
+}
+
+impl Drop for BorrowedOsCacheLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            self.vfs.finish_os_cache_handle_lifecycle(lifecycle);
+        }
+    }
+}
+
+struct OwnedOsCacheLifecycleGuard {
+    vfs: Arc<StudioVfs>,
+    lifecycle: Option<OsCacheHandleLifecycle>,
+}
+
+impl OwnedOsCacheLifecycleGuard {
+    fn new(vfs: Arc<StudioVfs>, lifecycle: Option<OsCacheHandleLifecycle>) -> Self {
+        Self { vfs, lifecycle }
+    }
+}
+
+impl Drop for OwnedOsCacheLifecycleGuard {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            self.vfs.finish_os_cache_handle_lifecycle(lifecycle);
+        }
+    }
+}
 
 enum VfsWritePayload<'a> {
     Borrowed(&'a [u8]),
@@ -55,6 +93,20 @@ pub(super) fn merge_write_dirty_attr(attr: &mut InodeAttr, base_attr: &InodeAttr
 }
 
 impl StudioVfs {
+    fn finish_os_cache_handle_lifecycle(&self, lifecycle: OsCacheHandleLifecycle) {
+        match lifecycle {
+            OsCacheHandleLifecycle::ForegroundRead => {
+                self.os_cache.end_foreground_handle();
+                self.end_foreground_read_handle();
+            }
+            OsCacheHandleLifecycle::Writer { ino } => {
+                if self.os_cache.end_writer(ino) {
+                    self.os_cache.clear(ino);
+                }
+            }
+        }
+    }
+
     /// Spawn a background task that replays landing-zone segments left from a previous run.
     ///
     /// This is used during startup to recover data that was durably written locally but not
@@ -631,6 +683,7 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
+        let os_cache_lifecycle = open_file.take_os_cache_lifecycle_for_release();
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
         if open_file.active_open_overlay {
@@ -644,13 +697,20 @@ impl StudioVfs {
         self.clear_access_tracking_for_stream(ino, stream_id);
         self.debug_pending_inode_state(ino, "release_handle_closed");
         if remaining > 0 {
+            if let Some(lifecycle) = os_cache_lifecycle {
+                self.finish_os_cache_handle_lifecycle(lifecycle);
+            }
             return None;
         }
         if self.inode_has_local_dirty_state(ino) {
             self.invalidate_kernel_inode_attrs([ino]);
         }
         self.debug_pending_inode_state(ino, "release_last_handle");
-        Some(HandleReleaseContext { open_file, ino })
+        Some(HandleReleaseContext {
+            open_file,
+            ino,
+            os_cache_lifecycle,
+        })
     }
 
     async fn cleanup_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
@@ -826,12 +886,14 @@ impl StudioVfs {
     /// Release a handle and report whether this close owned the actual
     /// last-handle path, plus whether it had to drain local dirty state there.
     pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
-        let Some(context) = self.close_handle_for_release(fh) else {
+        let Some(mut context) = self.close_handle_for_release(fh) else {
             // Non-final handle closes stop here and never enter the
             // last-handle drain path, so any error returned by this method
             // necessarily comes from the final release flow below.
             return Ok(ReleaseFhOutcome::default());
         };
+        let _os_cache_lifecycle =
+            BorrowedOsCacheLifecycleGuard::new(self, context.os_cache_lifecycle.take());
         let ino = context.ino;
         if let Some(action) = self.take_ignored_entry_release_action(ino) {
             let result = self.execute_last_handle_release_action(ino, action).await;
@@ -860,22 +922,28 @@ impl StudioVfs {
         fh: u64,
         runtime: &tokio::runtime::Handle,
     ) -> ReleaseFhOutcome {
-        let Some(context) = self.close_handle_for_release(fh) else {
+        let Some(mut context) = self.close_handle_for_release(fh) else {
             return ReleaseFhOutcome::default();
         };
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
+        let os_cache_lifecycle = context.os_cache_lifecycle.take();
         let flushed_local_dirty_state = matches!(action, LastHandleReleaseAction::LocalSync { .. });
         if matches!(
             action,
             LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
         ) {
+            if let Some(lifecycle) = os_cache_lifecycle {
+                self.finish_os_cache_handle_lifecycle(lifecycle);
+            }
             self.state.file_session.gc_if_idle(ino);
             return ReleaseFhOutcome {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
             };
         }
+        let os_cache_lifecycle =
+            OwnedOsCacheLifecycleGuard::new(Arc::clone(self), os_cache_lifecycle);
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
@@ -897,6 +965,7 @@ impl StudioVfs {
                     "deferred last-handle release barrier failed"
                 );
             }
+            drop(os_cache_lifecycle);
             // Drop the registry entry before releasing the async guard so waiters cannot
             // wake up and observe an unlocked but still-registered barrier.
             drop(barrier);
