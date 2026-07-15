@@ -31,6 +31,56 @@ pub struct FuseInodeLiveness {
     stats: Mutex<FuseInodeLivenessStats>,
 }
 
+/// One lookup reference reserved while libfuse accepts or rejects an entry reply.
+#[must_use = "lookup reply reservations must be accepted or rejected"]
+pub struct FuseLookupReplyReservation<'a> {
+    liveness: &'a FuseInodeLiveness,
+    ino: u64,
+    state: Arc<Mutex<u64>>,
+    reserved: bool,
+}
+
+impl FuseLookupReplyReservation<'_> {
+    /// Commit an accepted reply to the observed-reference counters.
+    pub fn accept(mut self) {
+        if self.reserved {
+            self.reserved = false;
+            self.liveness.record(|stats| {
+                stats.observed_references = stats.observed_references.saturating_add(1);
+            });
+        }
+    }
+
+    /// Remove a rejected reply reservation without recording a kernel forget.
+    pub fn reject(mut self) {
+        self.rollback();
+    }
+
+    fn rollback(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        self.reserved = false;
+
+        let mut count = self.state.lock();
+        if !self.liveness.is_current(self.ino, &self.state) || *count == 0 {
+            return;
+        }
+        *count -= 1;
+        if *count == 0 {
+            self.liveness
+                .observed
+                .remove_if(&self.ino, |_, current| Arc::ptr_eq(current, &self.state));
+        }
+    }
+}
+
+impl Drop for FuseLookupReplyReservation<'_> {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
 impl Default for FuseInodeLiveness {
     fn default() -> Self {
         let observed = DashMap::new();
@@ -74,20 +124,25 @@ impl FuseInodeLiveness {
 
     /// Count one kernel lookup reference.
     pub fn observe(&self, ino: u64) {
+        self.reserve_lookup_reply(ino).accept();
+    }
+
+    /// Reserve one lookup reference until an entry reply is accepted or rejected.
+    pub fn reserve_lookup_reply(&self, ino: u64) -> FuseLookupReplyReservation<'_> {
         loop {
             let state = self.current_or_insert(ino);
             let mut count = state.lock();
             if self.is_current(ino, &state) {
                 let previous = *count;
                 *count = count.saturating_add(1);
-                let changed = *count != previous;
+                let reserved = *count != previous;
                 drop(count);
-                if changed {
-                    self.record(|stats| {
-                        stats.observed_references = stats.observed_references.saturating_add(1);
-                    });
-                }
-                return;
+                return FuseLookupReplyReservation {
+                    liveness: self,
+                    ino,
+                    state,
+                    reserved,
+                };
             }
         }
     }
@@ -302,6 +357,80 @@ mod tests {
 
         assert!(!liveness.is_observed(42));
         assert_eq!(liveness.stats(), FuseInodeLivenessStats::default());
+    }
+
+    #[test]
+    fn lookup_reply_reservation_is_visible_before_completion_without_recording_stats() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup_reply(42);
+
+        assert_eq!(
+            (liveness.is_observed(42), liveness.stats()),
+            (true, FuseInodeLivenessStats::default())
+        );
+
+        reservation.reject();
+    }
+
+    #[test]
+    fn accepted_lookup_reply_reservation_records_one_observed_reference() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup_reply(42);
+
+        reservation.accept();
+
+        assert_eq!(
+            (liveness.is_observed(42), liveness.stats()),
+            (
+                true,
+                FuseInodeLivenessStats {
+                    snapshot_generation: 1,
+                    observed_references: 1,
+                    ..Default::default()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn rejected_lookup_reply_reservation_removes_membership_without_recording_stats() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup_reply(42);
+
+        reservation.reject();
+
+        assert_eq!(
+            (liveness.is_observed(42), liveness.stats()),
+            (false, FuseInodeLivenessStats::default())
+        );
+    }
+
+    #[test]
+    fn accepted_lookup_reply_reservation_records_only_an_actual_count_change() {
+        let liveness = FuseInodeLiveness::default();
+        let saturated = liveness.current_or_insert(42);
+        *saturated.lock() = u64::MAX;
+
+        liveness.reserve_lookup_reply(ROOT_INO).accept();
+        liveness.reserve_lookup_reply(42).accept();
+
+        assert_eq!(liveness.stats(), FuseInodeLivenessStats::default());
+    }
+
+    #[test]
+    fn rejected_stale_lookup_reply_reservation_does_not_remove_new_membership() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup_reply(42);
+        liveness.close(42);
+        liveness.observe(42);
+        let before_rejection = liveness.stats();
+
+        reservation.reject();
+
+        assert_eq!(
+            (liveness.is_observed(42), liveness.stats()),
+            (true, before_rejection)
+        );
     }
 
     #[test]
