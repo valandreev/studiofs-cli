@@ -360,6 +360,15 @@ git add crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs.rs crates/stu
 git commit -m "feat(vfs): own exact os cache generations"
 ```
 
+## Tasks 3–4 execution rule
+
+Execute Tasks 3 and 4 as one implementation and review unit. Preparation can
+race a cloned `OpenFile` against handle-table removal, so Task 3 is not allowed
+to land while release still lacks the terminal state transition and lifecycle
+ownership added by Task 4. Keep the prepare-versus-release tests red through
+the intermediate Task 3 implementation, finish Task 4, then run the combined
+GREEN suite and create one commit.
+
 ## Task 3: Attach idempotent cache participation to `OpenFile`
 
 - [ ] **Step 1: Add prepare-policy tests**
@@ -376,13 +385,20 @@ os_cache_prepare_active_writer_replaces_read_open
 os_cache_prepare_unprepared_write_handle_replaces_read_open
 os_cache_prepare_unprepared_truncating_handle_replaces_read_open
 os_cache_prepare_unknown_graph_replaces
-os_cache_prepare_is_idempotent_and_counts_once
+os_cache_prepare_is_idempotent_and_enrolls_lifecycle_once
 os_cache_aborted_open_clears_observation_for_next_replace
 os_cache_release_before_prepare_is_terminal_without_lifecycle_leak
 os_cache_prepare_racing_release_finishes_lifecycle_exactly_once
+os_cache_prepared_writer_keeps_foreground_qos_active_before_write_classification
 ```
 
 The disabled test must assert that foreground I/O is active until release even though the decision is `Replace(PolicyDisabled)`. This is the Direct-mode CPU/QoS contract.
+
+The prepared-writer QoS test must exercise a write-capable handle before any
+read/write access classifier marks it as a writer, and include an
+`O_RDONLY|O_TRUNC` case. Wire the real `StudioVfs` foreground predicate used by
+upload backpressure to OR in shared active-writer state; the existing
+`AccessClass::SequentialWriter` unit test is not evidence for this lifecycle.
 
 - [ ] **Step 2: Verify RED**
 
@@ -469,14 +485,14 @@ cargo test -p studiofs-vfs foreground_io_active_includes_active_writers -- --noc
 cargo test -p studiofs-vfs handle_read_access_tracking_promotes_active_class_counts -- --nocapture
 ```
 
-Expected: all tests pass with no counter underflow.
+Expected at this intermediate point: pure prepare-policy tests pass. The two
+prepare-versus-release tests remain red until Task 4 installs the terminal
+release transition; do not commit this partial state.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Continue directly into Task 4**
 
-```bash
-git add crates/studiofs-vfs/src/vfs/file_session.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/tests.rs
-git commit -m "feat(vfs): attach os cache lifetime to handles"
-```
+Keep the worktree uncommitted and complete Task 4 in the same implementation
+and review unit.
 
 ## Task 4: Own lifecycle through every release path
 
@@ -548,8 +564,8 @@ Expected: lifecycle tests and existing release tests pass; Windows compiles with
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/studiofs-vfs/src/vfs/config.rs crates/studiofs-vfs/src/vfs/file_session.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs/sync_ops.rs crates/studiofs-vfs/src/vfs/tests.rs
-git commit -m "fix(vfs): retain cache lifetime through release barriers"
+git add crates/studiofs-vfs/src/vfs/config.rs crates/studiofs-vfs/src/vfs/file_session.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/sync_ops.rs crates/studiofs-vfs/src/vfs/tests.rs
+git commit -m "feat(vfs): own os cache handle lifetime"
 ```
 
 ## Task 5: Clear generation on invalidation and final inode retirement
