@@ -1829,7 +1829,7 @@ impl SessionState {
         let writes = Arc::clone(&self.async_writes);
         let vfs = self.vfs.clone();
         let metric_config = self.metric_config;
-        let request_ticket = writes.start_request(fh)?;
+        let request_ticket = self.start_live_async_write_request(fh)?;
         let mut guard = FuseWriteTaskGuard {
             request: Some(FuseReqPtr::new(req)),
             request_ticket: Some(request_ticket),
@@ -1884,6 +1884,18 @@ impl SessionState {
             guard.finish(result);
         });
         Ok(true)
+    }
+
+    fn start_live_async_write_request(&self, fh: u64) -> Result<LinuxFuseRequestTicket, i32> {
+        let request_ticket = self.async_writes.start_request(fh)?;
+        if self.vfs.get_open_file(fh).is_some() {
+            return Ok(request_ticket);
+        }
+
+        request_ticket.complete(LinuxFuseAsyncWriteCompletion::Failed(libc::EBADF));
+        self.async_writes.forget_handle(fh);
+        record_linux_async_write_snapshot(&self.vfs, &self.async_writes, self.metric_config);
+        Err(libc::EBADF)
     }
 
     fn prepare_write_metadata(
@@ -2974,6 +2986,63 @@ mod tests {
         drop(reservation);
         let released = writes.stats();
         assert_eq!((released.pending_writes, released.pending_bytes), (0, 0));
+    }
+
+    #[test]
+    fn async_write_registration_after_release_returns_ebadf_without_orphan_ledger() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-async-write-release-race",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"release-race.dat", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let payload = b"race";
+        let mut file_info_storage = [0_u64; 32];
+        let file_info = file_info_storage
+            .as_mut_ptr()
+            .cast::<super::raw::FuseFileInfo>();
+        // SAFETY: the aligned scratch storage outlives this synchronous test
+        // and is large enough for the system libfuse `fuse_file_info` value.
+        unsafe {
+            super::studiofs_linux_fuse_file_info_init(file_info, fh, 1, 0, 0);
+        }
+        let prepared = state
+            .prepare_write_metadata(payload.as_ptr().cast(), payload.len(), 0, file_info)
+            .expect("prepare async write");
+
+        state.release(fh).expect("release file before registration");
+        let result = state.start_live_async_write_request(prepared.fh);
+        let stats = state.async_writes.stats();
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+
+        assert!(matches!(result, Err(errno) if errno == libc::EBADF));
+        assert_eq!(
+            (
+                stats.active_requests,
+                stats.pending_handles,
+                stats.pending_writes,
+                stats.pending_bytes,
+                stats.failed_writes,
+                snapshot.active_requests,
+                snapshot.pending_handles,
+                snapshot.pending_writes,
+                snapshot.pending_bytes,
+                snapshot.failed_writes,
+                vfs.get_open_file(fh).is_none(),
+            ),
+            (0, 0, 0, 0, 1, 0, 0, 0, 0, 1, true),
+        );
     }
 
     #[test]
