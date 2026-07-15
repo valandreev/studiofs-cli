@@ -207,20 +207,22 @@ Current Linux callbacks:
 | `removexattr` | `remove_xattr()`; missing attributes return `ENODATA` |
 
 Linux regular-file opens use `direct_io` by default and keep kernel writeback
-caching out of the default path. The bridge installs the shared VFS
-`KernelInvalidator` through libfuse3 low-level inode notifications, so
-StudioFS attr/data invalidation signals still reach the kernel even when
-regular files use direct I/O. Callback dispatch runs through libfuse3's
-multithreaded low-level loop while the connection init callback caps the kernel
-background queue (`max_background=16`, `congestion_threshold=12`) so heavy
-callback workloads apply backpressure instead of growing unbounded request
-memory. The Linux bridge request can override those queue bounds before
-mounting. StudioFS uses the libfuse3 `fuse_loop_config` multithreaded loop API:
-libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and an
-adaptive worker-pool limit based on available CPU parallelism, capped by the
-configured `max_background` queue. Older supported 3.x headers use the public
-pre-3.12 `struct fuse_loop_config` fallback with the same `clone_fd=0` and
-adaptive `max_idle_threads` cap.
+caching out of the default path. Direct mode requests `ASYNC_DIO`, which permits
+parallel direct writes when negotiation succeeds; it does not enable the FUSE
+kernel page cache. The bridge installs the shared VFS `KernelInvalidator`
+through libfuse3 low-level inode notifications, so StudioFS attr/data
+invalidation signals still reach the kernel even when regular files use direct
+I/O. The connection init callback caps the kernel background queue
+(`max_background=128`, `congestion_threshold=96`) so heavy callback workloads
+apply backpressure instead of growing unbounded request memory. The Linux
+bridge request can override those queue bounds before mounting.
+
+StudioFS uses the libfuse3 `fuse_loop_config` multithreaded loop API on libfuse
+3.12+ builds, with opaque config setters, `clone_fd=0`, and an adaptive
+worker-pool limit based on available CPU parallelism. Older supported 3.x
+headers use `fuse_session_loop`, a single-thread receive loop, because their
+public pre-3.12 loop configuration cannot express the required bounded worker
+behavior safely.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 9.4+ (system `fuse3-devel` is currently 3.10.x, so it uses the pre-3.12

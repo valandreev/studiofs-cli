@@ -176,7 +176,10 @@ Notes:
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - AIMD fetch/upload windows reset to their initial window after an idle gap by default. Advanced tuning can set `fetch_idle_reset_secs` and `upload_idle_reset_secs` independently; `0` disables idle reset for that traffic class.
 - On Windows and macOS, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
-- Linux mount is not implemented after SFS-600; the legacy raw `/dev/fuse` bridge and `STUDIOFS_FUSE_ASYNC_*` toggles are removed.
+- Linux mounts use the libfuse3 low-level bridge. Regular files use Direct mode
+  and request `ASYNC_DIO` by default; `STUDIOFS_FUSE_ASYNC_DIO=0` is the
+  internal serial rollback control. `STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel`
+  remains an internal experiment rather than a supported production default.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

@@ -1,5 +1,9 @@
 # SFS-473 Linux async FUSE opt-in benchmark
 
+> Historical baseline. Its synchronous-default decision was superseded by the
+> current Direct + `ASYNC_DIO` default documented in
+> [Linux cache and CPU validation](linux-cache-performance-result.md).
+
 Date: 2026-05-31
 
 Host:

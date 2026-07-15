@@ -69,9 +69,12 @@ The Linux cache gate separates collection, orchestration, and evaluation:
 
 The matrix always covers these three modes:
 
-- `direct-serial`: Direct cache policy with async DIO disabled
-- `direct-async`: Direct cache policy with async DIO enabled
-- `kernel`: Linux kernel cache policy
+- `direct-serial`: Direct cache policy with async DIO disabled; rollback control
+- `direct-async`: production Direct policy with async DIO enabled by default
+- `kernel`: experimental Linux kernel cache policy; not promoted
+
+See [`docs/perf/linux-cache-performance-result.md`](../../docs/perf/linux-cache-performance-result.md)
+for the measured default decision, CPU result, and remaining 4 GB tail limit.
 
 Each mode runs all six workloads: `large-single`, `fixed-1m`, `small-128k`,
 `warm-reopen`, `same-file-parallel`, and `cross-file-barriers`. Diagnostic

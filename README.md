@@ -238,7 +238,9 @@ matrix (Quality Gates, Linux, macOS, Windows) and the contributor rules for
 platform-specific changes. macOS and Windows jobs include explicit named steps
 for their backend crates (`studiofs-macfuse` on macOS, `studiofs-winfsp` on
 Windows) so regressions in platform-specific code are immediately attributable
-in the CI log. Linux mount is not implemented after SFS-600.
+in the CI log. Linux mounts use the `studiofs-linux-fuse` libfuse3 bridge; the
+current Direct-cache decision and measured evidence are documented in
+[`docs/perf/linux-cache-performance-result.md`](docs/perf/linux-cache-performance-result.md).
 
 Infra-heavy ignored suite:
 
