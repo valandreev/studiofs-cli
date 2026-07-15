@@ -359,14 +359,21 @@ fn memory_pressure_publish_clamps_transit_admission_without_revoking_guard() {
         let waiting_transit = transit.clone();
         let mut waiting =
             tokio::spawn(async move { waiting_transit.acquire_foreground(2048).await });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while transit.snapshot().waiting_foreground == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter should register under the constrained limit");
         assert!(!waiting.is_finished());
-        drop(admitted);
+        controller.publish(constrained_memory_snapshot(u64::MAX, 8192));
         let _next = tokio::time::timeout(Duration::from_millis(100), &mut waiting)
             .await
-            .expect("post-shrink admission should wake after the old guard releases")
+            .expect("transit recovery publish should wake admission without a guard release")
             .expect("transit admission task should not panic");
-        assert_eq!(transit.budget_bytes(), 1024);
+        assert_eq!(transit.snapshot().used_bytes, 5120);
+        drop(admitted);
     });
 }
 
@@ -434,12 +441,6 @@ fn memory_pressure_cache_shrink_reclaims_hot_entries_before_snapshot() {
     let mut snapshot = constrained_memory_snapshot(u64::MAX, u64::MAX);
     snapshot.limits.memory_cache_bytes = 4;
     vfs.memory_pressure_controller().publish(snapshot);
-    vfs.cached_store()
-        .cache_hot_upload_batch(&[studiofs_cache::local::LocalPayloadPut {
-            object_id: 3,
-            data: Bytes::from_static(b"cccc"),
-            evictable: false,
-        }]);
 
     assert_eq!(vfs.cached_store().hot_upload_resident_bytes(), 4);
     assert!(vfs.cached_store().get_hot_upload(1).is_none());

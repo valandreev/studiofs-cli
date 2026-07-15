@@ -87,6 +87,7 @@ impl MemoryPressureSnapshot {
 pub struct MemoryPressureController {
     snapshot: Arc<RwLock<MemoryPressureSnapshot>>,
     memory_cache_limit_bytes: Arc<AtomicU64>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl MemoryPressureController {
@@ -95,6 +96,7 @@ impl MemoryPressureController {
         Self {
             snapshot: Arc::new(RwLock::new(initial)),
             memory_cache_limit_bytes: Arc::new(AtomicU64::new(initial.limits.memory_cache_bytes)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -109,14 +111,22 @@ impl MemoryPressureController {
     }
 
     pub fn publish(&self, snapshot: MemoryPressureSnapshot) {
+        let mut current = self.snapshot.write();
         self.memory_cache_limit_bytes
             .store(snapshot.limits.memory_cache_bytes, Ordering::Release);
-        *self.snapshot.write() = snapshot;
+        *current = snapshot;
+        drop(current);
+        self.changed.notify_waiters();
     }
 
     #[must_use]
     pub fn memory_cache_limit_bytes(&self) -> Arc<AtomicU64> {
         self.memory_cache_limit_bytes.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn change_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
     }
 }
 
@@ -368,6 +378,36 @@ mod controller_tests {
         controller.publish(constrained);
 
         assert_eq!(memory_cache_limit.load(Ordering::Acquire), 64 * MIB);
+    }
+
+    #[test]
+    fn concurrent_publish_keeps_snapshot_and_cache_limit_consistent() {
+        for _ in 0..64 {
+            let controller = MemoryPressureController::new(snapshot(512 * MIB));
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let mut handles = Vec::new();
+            for limit in [64 * MIB, 128 * MIB] {
+                let controller = controller.clone();
+                let start = start.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut next = snapshot(limit);
+                    next.limits.memory_cache_bytes = limit;
+                    start.wait();
+                    controller.publish(next);
+                }));
+            }
+            start.wait();
+            for handle in handles {
+                handle.join().expect("publisher should not panic");
+            }
+
+            assert_eq!(
+                controller
+                    .memory_cache_limit_bytes()
+                    .load(Ordering::Acquire),
+                controller.snapshot().limits.memory_cache_bytes
+            );
+        }
     }
 
     #[test]

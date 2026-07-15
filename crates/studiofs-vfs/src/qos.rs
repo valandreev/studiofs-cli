@@ -112,6 +112,7 @@ pub struct TransitMemorySnapshot {
 pub struct TransitMemoryBudget {
     budget_bytes: AtomicUsize,
     memory_pressure: Option<crate::memory_pressure::MemoryPressureController>,
+    memory_pressure_notify: Arc<Notify>,
     state: Mutex<TransitMemoryBudgetState>,
     notify: Notify,
 }
@@ -139,6 +140,7 @@ impl TransitMemoryBudget {
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
             memory_pressure: None,
+            memory_pressure_notify: Arc::new(Notify::new()),
             state: Mutex::new(TransitMemoryBudgetState::default()),
             notify: Notify::new(),
         })
@@ -148,9 +150,11 @@ impl TransitMemoryBudget {
         budget_bytes: usize,
         memory_pressure: crate::memory_pressure::MemoryPressureController,
     ) -> Arc<Self> {
+        let memory_pressure_notify = memory_pressure.change_notify();
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
             memory_pressure: Some(memory_pressure),
+            memory_pressure_notify,
             state: Mutex::new(TransitMemoryBudgetState::default()),
             notify: Notify::new(),
         })
@@ -237,6 +241,11 @@ impl TransitMemoryBudget {
 
         loop {
             let notified = self.notify.notified();
+            let memory_pressure_changed = self.memory_pressure_notify.notified();
+            tokio::pin!(notified);
+            tokio::pin!(memory_pressure_changed);
+            let _ = notified.as_mut().enable();
+            let _ = memory_pressure_changed.as_mut().enable();
             {
                 let current_budget = self.budget_bytes();
                 // Re-clamp after a potential budget shrink so we don't block
@@ -253,7 +262,10 @@ impl TransitMemoryBudget {
                 }
                 waiter.ensure_registered(&mut state);
             }
-            notified.await;
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = &mut memory_pressure_changed => {}
+            }
         }
     }
 

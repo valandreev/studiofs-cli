@@ -587,21 +587,9 @@ impl CachedStore {
 
     /// Returns bytes currently retained by the in-memory hot-upload buffer.
     pub fn hot_upload_resident_bytes(&self) -> usize {
-        self.upload_hot.lock().total_bytes
-    }
-
-    /// Applies a runtime hot-upload limit without exceeding the configured ceiling.
-    pub fn set_hot_upload_budget_bytes(&self, limit_bytes: usize) {
-        if let Some(runtime_ceiling) = &self.config.upload_hot_runtime_ceiling {
-            runtime_ceiling.store(limit_bytes as u64, Ordering::Release);
-        }
         let mut upload_hot = self.upload_hot.lock();
-        if self.config.upload_hot_runtime_ceiling.is_some() {
-            self.refresh_hot_upload_budget(&mut upload_hot);
-        } else {
-            upload_hot.budget_bytes = self.config.upload_hot_bytes.min(limit_bytes);
-            upload_hot.evict_over_budget();
-        }
+        self.refresh_hot_upload_budget(&mut upload_hot);
+        upload_hot.total_bytes
     }
 
     /// Returns whether the local payload backend currently contains this object.
@@ -2564,8 +2552,11 @@ mod tests {
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
                 .backend;
+        let runtime_ceiling = Arc::new(AtomicU64::new(8));
         let (cached_store, _rx) = CachedStore::open(
-            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(8),
+            CachedStoreConfig::new(dir.path())
+                .with_upload_hot_bytes(8)
+                .with_upload_hot_runtime_ceiling(runtime_ceiling.clone()),
             backend,
         )
         .expect("open cached store");
@@ -2582,7 +2573,7 @@ mod tests {
             },
         ]);
 
-        cached_store.set_hot_upload_budget_bytes(4);
+        runtime_ceiling.store(4, Ordering::Release);
         cached_store.cache_hot_upload_batch(&[LocalPayloadPut {
             object_id: 3,
             data: Bytes::from_static(b"cccc"),
@@ -2604,13 +2595,16 @@ mod tests {
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
                 .backend;
+        let runtime_ceiling = Arc::new(AtomicU64::new(4));
         let (cached_store, _rx) = CachedStore::open(
-            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(4),
+            CachedStoreConfig::new(dir.path())
+                .with_upload_hot_bytes(4)
+                .with_upload_hot_runtime_ceiling(runtime_ceiling.clone()),
             backend,
         )
         .expect("open cached store");
 
-        cached_store.set_hot_upload_budget_bytes(8);
+        runtime_ceiling.store(8, Ordering::Release);
         cached_store.cache_hot_upload_batch(&[
             LocalPayloadPut {
                 object_id: 1,
@@ -2634,8 +2628,11 @@ mod tests {
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
                 .backend;
+        let runtime_ceiling = Arc::new(AtomicU64::new(4));
         let (cached_store, _rx) = CachedStore::open(
-            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(4),
+            CachedStoreConfig::new(dir.path())
+                .with_upload_hot_bytes(4)
+                .with_upload_hot_runtime_ceiling(runtime_ceiling.clone()),
             backend,
         )
         .expect("open cached store");
@@ -2646,7 +2643,7 @@ mod tests {
         }]);
         let in_use = cached_store.get_hot_upload(1).expect("hot payload");
 
-        cached_store.set_hot_upload_budget_bytes(0);
+        runtime_ceiling.store(0, Ordering::Release);
 
         assert_eq!(in_use.as_ref(), b"aaaa");
     }
