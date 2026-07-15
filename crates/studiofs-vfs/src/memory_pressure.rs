@@ -125,7 +125,7 @@ impl MemoryPressureController {
     }
 
     #[must_use]
-    pub(crate) fn change_notify(&self) -> Arc<tokio::sync::Notify> {
+    pub fn change_notify(&self) -> Arc<tokio::sync::Notify> {
         self.changed.clone()
     }
 }

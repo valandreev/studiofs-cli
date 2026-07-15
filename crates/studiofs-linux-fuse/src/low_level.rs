@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ use studiofs_vfs::{
     VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseLivenessSnapshot,
 };
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::async_writes::{
@@ -39,6 +41,7 @@ const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
 const RUNTIME_STATS_FH_START: u64 = u64::MAX / 2;
 const ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_EXIT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -218,6 +221,8 @@ pub(crate) struct SessionState {
     open_reply_serializer: FuseOpenReplySerializer,
     runtime_handle: Handle,
     async_writes: Arc<LinuxFuseAsyncWrites>,
+    negotiated_max_write: Arc<AtomicUsize>,
+    memory_pressure_async_write_watcher: Option<MemoryPressureAsyncWriteWatcher>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
@@ -228,6 +233,87 @@ pub(crate) struct SessionState {
     metric_config: LinuxFuseAsyncWriteMetricConfig,
     next_runtime_stats_fh: AtomicU64,
     runtime_stats_handles: Mutex<HashMap<u64, Vec<u8>>>,
+}
+
+struct MemoryPressureAsyncWriteWatcher {
+    cancellation: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    finished: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl MemoryPressureAsyncWriteWatcher {
+    fn start(
+        runtime_handle: &Handle,
+        vfs: Arc<StudioVfs>,
+        writes: Arc<LinuxFuseAsyncWrites>,
+        negotiated_max_write: Arc<AtomicUsize>,
+    ) -> Option<Self> {
+        if vfs.memory_pressure_controller().snapshot().state
+            == studiofs_vfs::MemoryPressureState::Disabled
+        {
+            return None;
+        }
+
+        writes.set_active_max_pending_bytes(linux_fuse_async_write_active_limit_bytes(
+            vfs.memory_pressure_controller().snapshot(),
+            negotiated_max_write.load(Ordering::Acquire),
+        ));
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let changed = vfs.memory_pressure_controller().change_notify();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let task = runtime_handle.spawn(async move {
+            loop {
+                let notification = changed.notified();
+                tokio::pin!(notification);
+                let _ = notification.as_mut().enable();
+                writes.set_active_max_pending_bytes(linux_fuse_async_write_active_limit_bytes(
+                    vfs.memory_pressure_controller().snapshot(),
+                    negotiated_max_write.load(Ordering::Acquire),
+                ));
+                tokio::select! {
+                    biased;
+                    () = task_cancellation.cancelled() => break,
+                    () = &mut notification => {}
+                }
+            }
+            let _ = finished_tx.send(());
+        });
+        Some(Self {
+            cancellation,
+            task: Mutex::new(Some(task)),
+            finished: Mutex::new(Some(finished_rx)),
+        })
+    }
+
+    fn stop_and_join(&self) -> bool {
+        self.cancellation.cancel();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        let Some(finished) = finished else {
+            return true;
+        };
+        if finished
+            .recv_timeout(MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT)
+            .is_ok()
+        {
+            return true;
+        }
+        if let Some(task) = task {
+            task.abort();
+        }
+        finished
+            .recv_timeout(MEMORY_PRESSURE_WATCHER_SHUTDOWN_TIMEOUT)
+            .is_ok()
+    }
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -343,15 +429,25 @@ impl SessionState {
         cache_policy: LinuxFuseCachePolicy,
         requested_async_dio: bool,
     ) -> Self {
+        let async_writes = Arc::new(LinuxFuseAsyncWrites::new(
+            LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
+            LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES,
+        ));
+        let negotiated_max_write = Arc::new(AtomicUsize::new(0));
+        let memory_pressure_async_write_watcher = MemoryPressureAsyncWriteWatcher::start(
+            &runtime_handle,
+            Arc::clone(&vfs),
+            Arc::clone(&async_writes),
+            Arc::clone(&negotiated_max_write),
+        );
         let state = Self {
             vfs,
             inode_liveness: Arc::new(FuseInodeLiveness::default()),
             open_reply_serializer: FuseOpenReplySerializer::default(),
             runtime_handle,
-            async_writes: Arc::new(LinuxFuseAsyncWrites::new(
-                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
-                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES,
-            )),
+            async_writes,
+            negotiated_max_write,
+            memory_pressure_async_write_watcher,
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
@@ -383,11 +479,19 @@ impl SessionState {
     }
 
     fn shutdown_async_writes(&self) -> bool {
-        shutdown_async_writes_with_timeouts(
+        let watcher_stopped = self.shutdown_memory_pressure_watcher();
+        let writes_stopped = shutdown_async_writes_with_timeouts(
             &self.async_writes,
             ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
             ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
-        )
+        );
+        watcher_stopped && writes_stopped
+    }
+
+    fn shutdown_memory_pressure_watcher(&self) -> bool {
+        self.memory_pressure_async_write_watcher
+            .as_ref()
+            .is_none_or(MemoryPressureAsyncWriteWatcher::stop_and_join)
     }
 
     fn publish_liveness_stats(&self) {
@@ -396,6 +500,8 @@ impl SessionState {
 
     fn record_negotiated_geometry(&self, geometry: LinuxFuseNegotiatedGeometry) {
         let _ = self.negotiated_geometry.set(geometry);
+        self.negotiated_max_write
+            .store(geometry.max_write as usize, Ordering::Release);
         self.refresh_async_write_active_limit();
         self.publish_fuse_connection_snapshot(self.negotiated_geometry.get().copied());
     }
@@ -743,13 +849,21 @@ fn linux_fuse_async_write_active_limit(
     vfs: &StudioVfs,
     negotiated: Option<LinuxFuseNegotiatedGeometry>,
 ) -> usize {
-    let snapshot = vfs.memory_pressure_controller().snapshot();
+    linux_fuse_async_write_active_limit_bytes(
+        vfs.memory_pressure_controller().snapshot(),
+        negotiated.map_or(0, |geometry| geometry.max_write as usize),
+    )
+}
+
+fn linux_fuse_async_write_active_limit_bytes(
+    snapshot: studiofs_vfs::MemoryPressureSnapshot,
+    negotiated_max_write: usize,
+) -> usize {
     if snapshot.state == studiofs_vfs::MemoryPressureState::Disabled {
         return LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES;
     }
 
     let pressure_limit = usize::try_from(snapshot.limits.async_write_bytes).unwrap_or(usize::MAX);
-    let negotiated_max_write = negotiated.map_or(0, |geometry| geometry.max_write as usize);
     pressure_limit
         .max(negotiated_max_write)
         .min(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES)
@@ -1127,6 +1241,14 @@ impl SessionExitWatcher {
 impl Drop for SessionExitWatcher {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        if !self.shutdown_memory_pressure_watcher() {
+            warn!("Linux memory-pressure watcher did not stop before session state drop");
+        }
     }
 }
 
@@ -4933,6 +5055,66 @@ mod tests {
             super::linux_fuse_async_write_active_limit(&state.vfs, None),
             super::LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pressure_publish_wakes_async_write_admission_without_queue_completion() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let fixture = ContractVfsFixture::new("linux-async-write-pressure-watcher")
+                .expect("create VFS fixture");
+            let controller = fixture.vfs().memory_pressure_controller().clone();
+            let mut snapshot = controller.snapshot();
+            snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+            snapshot.state = studiofs_vfs::MemoryPressureState::Constrained;
+            snapshot.limits.async_write_bytes = 4;
+            controller.publish(snapshot);
+            let state = super::SessionState::new_with_cache_settings(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                false,
+                default_connection_config(),
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+            );
+            let admitted = state
+                .async_writes
+                .admit(4, |_| {})
+                .expect("fill constrained budget");
+
+            let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+            let writes = Arc::clone(&state.async_writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                writes.admit(4, |stats| {
+                    let _ = waiting_tx.send(stats);
+                })
+            });
+            waiting_rx.await.expect("admission wait observation");
+
+            snapshot.generation += 1;
+            snapshot.limits.async_write_bytes = 8;
+            controller.publish(snapshot);
+            let recovered = waiter
+                .await
+                .expect("admission waiter join")
+                .expect("controller recovery admits write");
+            assert_eq!(state.async_writes.stats().pending_bytes, 8);
+            drop(recovered);
+            drop(admitted);
+            assert!(state.shutdown_memory_pressure_watcher());
+        })
+        .await
+        .expect("memory-pressure watcher test timed out");
+    }
+
+    #[test]
+    fn disabled_memory_pressure_does_not_start_async_write_watcher() {
+        let (_fixture, state) = cache_test_state(
+            "linux-async-write-pressure-watcher-disabled",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+
+        assert!(state.memory_pressure_async_write_watcher.is_none());
     }
 
     #[test]
