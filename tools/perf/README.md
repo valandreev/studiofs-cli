@@ -140,7 +140,7 @@ bash tools/perf/linux-cache-matrix.sh \
   --mount-root target/perf/linux-cache-mounts \
   --cgroup-root "$CGROUP_ROOT" \
   --output-root "$RUN" \
-  --diagnostic --repetitions 3
+  --diagnostic
 ```
 
 Collect promotion evidence only with the fixed five-repetition run:
@@ -151,8 +151,7 @@ bash tools/perf/linux-cache-matrix.sh \
   --volume "$VOLUME" \
   --mount-root target/perf/linux-cache-mounts \
   --cgroup-root "$CGROUP_ROOT" \
-  --output-root "$RUN" \
-  --repetitions 5
+  --output-root "$RUN"
 ```
 
 Analyze either matrix with its own correctness manifest:

@@ -7,8 +7,6 @@ repo_root="$(cd "$script_dir/../.." && pwd)"
 volume=""
 mount_root=""
 cgroup_root=""
-repetitions=""
-repetitions_set=false
 output_root="$repo_root/target/perf/linux-cache-matrix"
 bench_bin="$repo_root/target/bench/studiofs-bench"
 bench_repo="$repo_root/../studiofs-bench"
@@ -29,7 +27,6 @@ Required:
   --cgroup-root PATH     Delegated cgroup v2 parent for unique per-tuple cgroups.
 
 Options:
-  --repetitions N        Repetitions. Defaults to 5, or 3 with --diagnostic.
   --output-root PATH     Matrix artifact root. Defaults to target/perf/linux-cache-matrix.
   --bench PATH           studiofs-bench binary. Defaults to target/bench/studiofs-bench.
   --bench-repo PATH      studiofs-bench source checkout. Defaults to ../studiofs-bench.
@@ -38,7 +35,7 @@ Options:
   --dry-run              Write correctness commands, schedule, and tuple artifacts only.
   -h, --help             Show this help.
 
-Dry-run accepts any positive repetition count and never mounts, creates a
+Dry-run uses the same schedule size as a real run and never mounts, creates a
 cgroup, or executes either binary.
 USAGE
 }
@@ -52,15 +49,6 @@ require_value() {
   local option="$1"
   local value="${2:-}"
   [[ -n "$value" ]] || die "$option requires a value"
-}
-
-positive_int() {
-  local option="$1"
-  local value="$2"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "$option must be a positive integer"
-  value="$((10#$value))"
-  ((value > 0)) || die "$option must be a positive integer"
-  printf '%s' "$value"
 }
 
 json_escape() {
@@ -94,12 +82,6 @@ while (($# > 0)); do
     --cgroup-root)
       require_value "$1" "${2:-}"
       cgroup_root="$2"
-      shift 2
-      ;;
-    --repetitions)
-      require_value "$1" "${2:-}"
-      repetitions="$(positive_int "$1" "$2")"
-      repetitions_set=true
       shift 2
       ;;
     --output-root)
@@ -144,21 +126,10 @@ done
 [[ -n "$mount_root" ]] || die "--mount-root is required"
 [[ -n "$cgroup_root" ]] || die "--cgroup-root is required"
 
-if [[ "$repetitions_set" == false ]]; then
-  if [[ "$diagnostic" == true ]]; then
-    repetitions=3
-  else
-    repetitions=5
-  fi
-fi
-
-if [[ "$dry_run" == false ]]; then
-  if [[ "$diagnostic" == true && "$repetitions" -ne 3 ]]; then
-    die "diagnostic evidence requires exactly 3 repetitions"
-  fi
-  if [[ "$diagnostic" == false && "$repetitions" -ne 5 ]]; then
-    die "promotion evidence requires exactly 5 repetitions"
-  fi
+if [[ "$diagnostic" == true ]]; then
+  repetitions=3
+else
+  repetitions=5
 fi
 
 mount_root="$(realpath -m -- "$mount_root")"
@@ -581,7 +552,6 @@ for ((repetition = 1; repetition <= repetitions; repetition++)); do
         --workload "$workload"
         --mount-point "$mount_point"
         --mount-pid '<mount-pid>'
-        --runs 1
         --cgroup "$cgroup"
         --bench "$bench_bin"
         --bench-repo "$bench_repo"
@@ -1425,7 +1395,6 @@ run_real_tuple() {
       --workload "${tuple_workloads[$index]}"
       --mount-point "$active_mount_point"
       --mount-pid "$active_mount_pid"
-      --runs 1
       --cgroup "$active_cgroup"
       --bench "$bench_bin"
       --bench-repo "$bench_repo"

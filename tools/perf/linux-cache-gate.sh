@@ -8,7 +8,6 @@ mode=""
 workload=""
 mount_point=""
 mount_pid=""
-runs=1
 cgroup=""
 bench_bin="$repo_root/target/bench/studiofs-bench"
 bench_repo="$repo_root/../studiofs-bench"
@@ -32,7 +31,6 @@ Options:
                                   cross-file-barriers.
   --mount-point <path>            Mounted StudioFS path.
   --mount-pid <pid>               StudioFS mount process PID.
-  --runs <n>                      Runs against this mount. Defaults to 1.
   --cgroup <path>                 Delegated cgroup v2 directory (real runs).
   --bench <path>                  Benchmark binary. Defaults to target/bench/studiofs-bench.
   --bench-repo <path>             Benchmark source checkout. Defaults to ../studiofs-bench.
@@ -715,7 +713,6 @@ while [[ $# -gt 0 ]]; do
     --workload) require_value "$1" "${2:-}"; workload="$2"; shift 2 ;;
     --mount-point) require_value "$1" "${2:-}"; mount_point="$2"; shift 2 ;;
     --mount-pid) require_value "$1" "${2:-}"; mount_pid="$(positive_int "$1" "$2")"; shift 2 ;;
-    --runs) require_value "$1" "${2:-}"; runs="$(positive_int "$1" "$2")"; shift 2 ;;
     --cgroup) require_value "$1" "${2:-}"; cgroup="$2"; shift 2 ;;
     --bench) require_value "$1" "${2:-}"; bench_bin="$2"; shift 2 ;;
     --bench-repo) require_value "$1" "${2:-}"; bench_repo="$2"; shift 2 ;;
@@ -802,7 +799,7 @@ cat > "$artifact_dir/environment.json" <<JSON
   "workload": "$(json_escape "$workload")",
   "mount_point": "$(json_escape "$mount_point")",
   "mount_pid": $mount_pid,
-  "runs": $runs,
+  "runs": 1,
   "cgroup": $cgroup_json,
   "bench": "$(json_escape "$bench_bin")",
   "bench_repo": "$(json_escape "$bench_repo")",
@@ -822,7 +819,7 @@ cat > "$artifact_dir/manifest.json" <<JSON
   "artifact_dir": "$(json_escape "$artifact_dir")",
   "mode": "$(json_escape "$mode")",
   "workload": "$(json_escape "$workload")",
-  "runs": $runs,
+  "runs": 1,
   "diagnostic": $diagnostic,
   "promotion_eligible": false,
   "correctness_manifest_path": $correctness_manifest_json,
@@ -836,7 +833,7 @@ mode=$mode
 workload=$workload
 mount_point=$mount_point
 mount_pid=$mount_pid
-runs=$runs
+runs=1
 workload_bytes=$workload_bytes
 COMMAND
 
@@ -903,8 +900,6 @@ if [[ "${STUDIOFS_CACHE_GATE_TEST_FIXTURE:-}" == 1 ]]; then
 elif (( ${#cache_gate_override_names[@]} != 0 )); then
   die "STUDIOFS_CACHE_GATE_* overrides require the explicit test-fixture path"
 fi
-
-[[ "$runs" -eq 1 ]] || die "real collection requires exactly one run per fresh mount"
 
 idle_poll_interval=0.5
 memory_sample_interval=0.1
@@ -1270,7 +1265,6 @@ CACHE_GATE_VOLUME="$volume_name" \
 CACHE_GATE_MOUNT_ROOT="$mount_root" \
 CACHE_GATE_CACHE_DIR="$cache_dir" \
 CACHE_GATE_CACHE_BACKING_JSON="$cache_backing_json" \
-CACHE_GATE_RUNS="$runs" \
 CACHE_GATE_CGROUP="$cgroup" \
 CACHE_GATE_BENCH="$bench_bin" \
 CACHE_GATE_STUDIOFS="$studiofs_bin" \
@@ -1347,7 +1341,7 @@ manifest = {
     "mount_point": e["CACHE_GATE_MOUNT_POINT"],
     "mount_pid": int(e["CACHE_GATE_MOUNT_PID"]),
     "mount_pid_start_time": e["CACHE_GATE_MOUNT_PID_START_TIME"],
-    "runs": int(e["CACHE_GATE_RUNS"]),
+    "runs": 1,
     "workload_bytes": int(e["CACHE_GATE_WORKLOAD_BYTES"]),
     "git_revision": e["CACHE_GATE_GIT_REVISION"],
     "git_dirty": False,
@@ -1389,7 +1383,7 @@ environment = {
     "mount_pid": int(e["CACHE_GATE_MOUNT_PID"]),
     "mount_pid_start_time": e["CACHE_GATE_MOUNT_PID_START_TIME"],
     "mount_findmnt": e["CACHE_GATE_MOUNT_FINDMNT"],
-    "runs": int(e["CACHE_GATE_RUNS"]),
+    "runs": 1,
     "cgroup": e["CACHE_GATE_CGROUP"],
     "bench": e["CACHE_GATE_BENCH"],
     "studiofs": e["CACHE_GATE_STUDIOFS"],

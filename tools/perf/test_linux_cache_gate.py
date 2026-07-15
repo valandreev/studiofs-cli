@@ -2429,7 +2429,6 @@ class ShellContractTest(unittest.TestCase):
                     "--volume",
                     "--mount-root",
                     "--cgroup-root",
-                    "--repetitions",
                     "--bench-repo",
                     "--diagnostic",
                     "--dry-run",
@@ -2442,6 +2441,17 @@ class ShellContractTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 for option in expected_options:
                     self.assertIn(option, completed.stdout)
+
+    def test_single_choice_count_options_are_not_public_cli(self) -> None:
+        cases = (
+            (self.collector, "--runs", "1"),
+            (self.matrix, "--repetitions", "5"),
+        )
+        for script, option, value in cases:
+            with self.subTest(script=script.name, option=option):
+                completed = self.run_script(script, option, value)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(f"unknown argument: {option}", completed.stderr)
 
     def test_collector_dry_run_writes_stable_warm_reopen_skeleton(self) -> None:
         output_root = self.root / "collector"
@@ -2519,8 +2529,6 @@ class ShellContractTest(unittest.TestCase):
             str(self.root / "mounts"),
             "--cgroup-root",
             str(self.root / "cgroups"),
-            "--repetitions",
-            "3",
             "--output-root",
             str(output_root),
             "--bench-repo",
