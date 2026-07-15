@@ -1982,6 +1982,8 @@ impl SessionState {
         .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    // Mirrors libfuse write callback inputs plus the request start timestamp.
+    #[allow(clippy::too_many_arguments)]
     fn queue_async_write(
         &self,
         req: *mut raw::FuseReq,
@@ -2825,6 +2827,8 @@ mod tests {
         }
     }
 
+    // Keep the terminal full snapshot on timeout for deterministic test diagnostics.
+    #[allow(clippy::result_large_err)]
     fn wait_for_async_write_stats(
         tracker: &super::LinuxFuseAsyncWrites,
         expected: impl Fn(&super::LinuxFuseAsyncWriteStats) -> bool,
