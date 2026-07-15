@@ -152,6 +152,18 @@ impl StudioVfs {
             "bytes",
             write_path.winfsp_callbacks.os_cache_miss_read_bytes,
         );
+        insert_gauge(
+            &mut snapshot.bridge,
+            "os_cache.active_writers",
+            "count",
+            write_path.os_cache.active_writers,
+        );
+        insert_gauge(
+            &mut snapshot.bridge,
+            "os_cache.active_foreground_handles",
+            "count",
+            write_path.os_cache.active_foreground_handles,
+        );
         insert_counter(
             &mut snapshot.bridge,
             "callback_errors",

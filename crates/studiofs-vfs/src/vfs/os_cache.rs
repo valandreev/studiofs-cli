@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::schema::{ResolvedSliceSource, ResolvedSliceSpan};
 use studiofs_meta::types::{Ino, InodeAttr};
 
+use super::metrics::VfsOsCacheStats;
+
 const OS_CACHE_GENERATION_CAPACITY: usize = 8192;
 
 /// Whether an adapter enables OS page-cache reuse for an open handle.
@@ -139,10 +141,91 @@ fn source_tag(source: ResolvedSliceSource) -> u8 {
     }
 }
 
+#[derive(Default)]
+struct OsCacheDecisionCounters {
+    policy_disabled: AtomicU64,
+    write_capable: AtomicU64,
+    unknown_handle: AtomicU64,
+    unknown_local_state: AtomicU64,
+    not_regular_file: AtomicU64,
+    local_dirty_state: AtomicU64,
+    active_writer: AtomicU64,
+    first_observation: AtomicU64,
+    generation_changed: AtomicU64,
+    stable_generation: AtomicU64,
+}
+
+impl OsCacheDecisionCounters {
+    fn record(&self, decision: OsCacheOpenDecision) {
+        let counter = match decision.reason() {
+            OsCacheReason::PolicyDisabled => &self.policy_disabled,
+            OsCacheReason::WriteCapable => &self.write_capable,
+            OsCacheReason::UnknownHandle => &self.unknown_handle,
+            OsCacheReason::UnknownLocalState => &self.unknown_local_state,
+            OsCacheReason::NotRegularFile => &self.not_regular_file,
+            OsCacheReason::LocalDirtyState => &self.local_dirty_state,
+            OsCacheReason::ActiveWriter => &self.active_writer,
+            OsCacheReason::FirstObservation => &self.first_observation,
+            OsCacheReason::GenerationChanged => &self.generation_changed,
+            OsCacheReason::StableGeneration => &self.stable_generation,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> VfsOsCacheStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let mut stats = VfsOsCacheStats::default();
+        for (decision, count) in [
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::PolicyDisabled),
+                load(&self.policy_disabled),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::WriteCapable),
+                load(&self.write_capable),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle),
+                load(&self.unknown_handle),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::UnknownLocalState),
+                load(&self.unknown_local_state),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::NotRegularFile),
+                load(&self.not_regular_file),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::LocalDirtyState),
+                load(&self.local_dirty_state),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter),
+                load(&self.active_writer),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+                load(&self.first_observation),
+            ),
+            (
+                OsCacheOpenDecision::replace(OsCacheReason::GenerationChanged),
+                load(&self.generation_changed),
+            ),
+            (OsCacheOpenDecision::reuse(), load(&self.stable_generation)),
+        ] {
+            stats.add_decision(decision, count);
+        }
+        stats
+    }
+}
+
 pub(super) struct OsCacheState {
     generations: Mutex<LruCache<Ino, OsCacheGeneration>>,
     active_writers: Mutex<HashMap<Ino, usize>>,
     active_foreground_handles: AtomicU64,
+    decision_counters: OsCacheDecisionCounters,
+    reset_baseline: Mutex<VfsOsCacheStats>,
 }
 
 impl Default for OsCacheState {
@@ -158,6 +241,8 @@ impl OsCacheState {
             generations: Mutex::new(LruCache::new(capacity)),
             active_writers: Mutex::new(HashMap::new()),
             active_foreground_handles: AtomicU64::new(0),
+            decision_counters: OsCacheDecisionCounters::default(),
+            reset_baseline: Mutex::new(VfsOsCacheStats::default()),
         }
     }
 
@@ -198,10 +283,6 @@ impl OsCacheState {
             .ok();
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 publishes this exact gauge")
-    )]
     pub(super) fn active_foreground_handle_count(&self) -> u64 {
         self.active_foreground_handles.load(Ordering::Relaxed)
     }
@@ -229,16 +310,33 @@ impl OsCacheState {
         !self.active_writers.lock().is_empty()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 publishes this exact gauge")
-    )]
     pub(super) fn active_writer_count(&self) -> u64 {
         self.active_writers
             .lock()
             .values()
             .map(|count| *count as u64)
             .sum()
+    }
+
+    pub(super) fn record_decision(&self, decision: OsCacheOpenDecision) {
+        self.decision_counters.record(decision);
+    }
+
+    pub(super) fn stats(&self) -> VfsOsCacheStats {
+        let baseline = self.reset_baseline.lock();
+        let mut stats = self
+            .decision_counters
+            .snapshot()
+            .subtract_counters(&baseline);
+        drop(baseline);
+        stats.active_writers = self.active_writer_count();
+        stats.active_foreground_handles = self.active_foreground_handle_count();
+        stats
+    }
+
+    pub(super) fn reset_stats(&self) {
+        let mut baseline = self.reset_baseline.lock();
+        *baseline = self.decision_counters.snapshot();
     }
 }
 

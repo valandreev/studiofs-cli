@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::file_session::VfsFileSessionStats;
+use super::os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheReason};
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Current version of the cross-platform runtime stats snapshot schema.
@@ -263,12 +264,6 @@ impl RuntimeStatsSnapshot {
             return Err(RuntimeStatsParseError::new(
                 line,
                 "metric section and key must not be empty",
-            ));
-        }
-        if key.contains('.') {
-            return Err(RuntimeStatsParseError::new(
-                line,
-                "metric key must not contain dots",
             ));
         }
         Ok((section, key))
@@ -988,6 +983,89 @@ pub struct VfsMacFuseOpenCacheStats {
     pub local_stable_write_release_seeded: u64,
 }
 
+/// Platform-neutral OS page-cache decision counters and lifecycle gauges.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VfsOsCacheStats {
+    /// Total prepared or rejected handle decisions.
+    pub total: u64,
+    /// Decisions that allow reuse of the observed generation.
+    pub reuse: u64,
+    /// Decisions that require cached pages to be replaced.
+    pub replace: u64,
+    /// Replacements because adapter policy disables cache participation.
+    pub policy_disabled: u64,
+    /// Replacements for write-capable handles.
+    pub write_capable: u64,
+    /// Replacements because the handle is unknown or already released.
+    pub unknown_handle: u64,
+    /// Replacements because local metadata could not be observed.
+    pub unknown_local_state: u64,
+    /// Replacements because the inode is not a regular file.
+    pub not_regular_file: u64,
+    /// Replacements because local dirty state is present.
+    pub local_dirty_state: u64,
+    /// Replacements because a writer lifecycle is active.
+    pub active_writer: u64,
+    /// Replacements for the first observed generation.
+    pub first_observation: u64,
+    /// Replacements after the observed generation changes.
+    pub generation_changed: u64,
+    /// Reuses of an identical stable generation.
+    pub stable_generation: u64,
+    /// Current number of prepared writer handles.
+    pub active_writers: u64,
+    /// Current number of prepared foreground read handles.
+    pub active_foreground_handles: u64,
+}
+
+impl VfsOsCacheStats {
+    pub(super) fn add_decision(&mut self, decision: OsCacheOpenDecision, count: u64) {
+        self.total = self.total.saturating_add(count);
+        match decision.disposition() {
+            OsCacheDisposition::Reuse => self.reuse = self.reuse.saturating_add(count),
+            OsCacheDisposition::Replace => self.replace = self.replace.saturating_add(count),
+        }
+        let counter = match decision.reason() {
+            OsCacheReason::PolicyDisabled => &mut self.policy_disabled,
+            OsCacheReason::WriteCapable => &mut self.write_capable,
+            OsCacheReason::UnknownHandle => &mut self.unknown_handle,
+            OsCacheReason::UnknownLocalState => &mut self.unknown_local_state,
+            OsCacheReason::NotRegularFile => &mut self.not_regular_file,
+            OsCacheReason::LocalDirtyState => &mut self.local_dirty_state,
+            OsCacheReason::ActiveWriter => &mut self.active_writer,
+            OsCacheReason::FirstObservation => &mut self.first_observation,
+            OsCacheReason::GenerationChanged => &mut self.generation_changed,
+            OsCacheReason::StableGeneration => &mut self.stable_generation,
+        };
+        *counter = counter.saturating_add(count);
+    }
+
+    pub(super) fn subtract_counters(mut self, baseline: &Self) -> Self {
+        macro_rules! subtract {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.saturating_sub(baseline.$field);)+
+            };
+        }
+        subtract!(
+            total,
+            reuse,
+            replace,
+            policy_disabled,
+            write_capable,
+            unknown_handle,
+            unknown_local_state,
+            not_regular_file,
+            local_dirty_state,
+            active_writer,
+            first_observation,
+            generation_changed,
+            stable_generation,
+        );
+        self
+    }
+}
+
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1594,6 +1672,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// macFUSE open-cache decisions.
     #[serde(default)]
     pub macfuse_open_cache: VfsMacFuseOpenCacheStats,
+    /// Platform-neutral OS page-cache decisions and lifecycle gauges.
+    #[serde(default)]
+    pub os_cache: VfsOsCacheStats,
     /// Async FUSE write diagnostics.
     #[serde(default)]
     pub fuse_async_write: VfsFuseAsyncWriteSnapshot,
@@ -2102,6 +2183,40 @@ pub struct VfsRuntimeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::{OsCacheOpenDecision, OsCacheReason};
+
+    #[test]
+    fn os_cache_stats_maps_every_reason_and_aggregates_dispositions() {
+        let mut stats = VfsOsCacheStats::default();
+        for decision in [
+            OsCacheOpenDecision::replace(OsCacheReason::PolicyDisabled),
+            OsCacheOpenDecision::replace(OsCacheReason::WriteCapable),
+            OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle),
+            OsCacheOpenDecision::replace(OsCacheReason::UnknownLocalState),
+            OsCacheOpenDecision::replace(OsCacheReason::NotRegularFile),
+            OsCacheOpenDecision::replace(OsCacheReason::LocalDirtyState),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+            OsCacheOpenDecision::replace(OsCacheReason::GenerationChanged),
+            OsCacheOpenDecision::reuse(),
+        ] {
+            stats.add_decision(decision, 1);
+        }
+
+        assert_eq!(stats.total, 10);
+        assert_eq!(stats.reuse, 1);
+        assert_eq!(stats.replace, 9);
+        assert_eq!(stats.policy_disabled, 1);
+        assert_eq!(stats.write_capable, 1);
+        assert_eq!(stats.unknown_handle, 1);
+        assert_eq!(stats.unknown_local_state, 1);
+        assert_eq!(stats.not_regular_file, 1);
+        assert_eq!(stats.local_dirty_state, 1);
+        assert_eq!(stats.active_writer, 1);
+        assert_eq!(stats.first_observation, 1);
+        assert_eq!(stats.generation_changed, 1);
+        assert_eq!(stats.stable_generation, 1);
+    }
 
     #[test]
     fn dirty_pressure_serializes_slice_counts_for_mounted_reports() {
@@ -2153,6 +2268,39 @@ mod tests {
             .expect("deserialize macFUSE open-cache stats with renamed field");
 
         assert_eq!(stats.read_only_not_regular_file, 7);
+    }
+
+    #[test]
+    fn macfuse_open_cache_stats_deserializes_complete_legacy_snapshot_without_os_cache() {
+        let legacy = VfsWritePathObservabilitySnapshot {
+            macfuse_open_cache: VfsMacFuseOpenCacheStats {
+                total: 7,
+                read_only_keep: 5,
+                read_only_drop: 2,
+                read_only_generation_changed: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut serialized = serde_json::to_value(legacy).expect("serialize legacy snapshot");
+        assert!(
+            serialized
+                .as_object_mut()
+                .unwrap()
+                .remove("os_cache")
+                .is_some()
+        );
+
+        let decoded: VfsWritePathObservabilitySnapshot =
+            serde_json::from_value(serialized).expect("deserialize complete legacy snapshot");
+
+        assert_eq!(decoded.macfuse_open_cache.total, 7);
+        assert_eq!(decoded.macfuse_open_cache.read_only_keep, 5);
+        assert_eq!(decoded.macfuse_open_cache.read_only_drop, 2);
+        assert_eq!(
+            serde_json::to_value(&decoded.os_cache).expect("serialize neutral stats"),
+            serde_json::to_value(VfsOsCacheStats::default()).expect("serialize neutral default")
+        );
     }
 
     #[test]
@@ -2402,6 +2550,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_stats_text_round_trips_nested_metric_keys() {
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        snapshot.bridge.gauges.insert(
+            "os_cache.active_writers".to_owned(),
+            RuntimeScalarMetric {
+                value: 2,
+                unit: Cow::Borrowed("count"),
+            },
+        );
+
+        let parsed = RuntimeStatsSnapshot::parse_text(&snapshot.to_text())
+            .expect("parse nested runtime metric key");
+
+        assert_eq!(parsed.bridge.gauges["os_cache.active_writers"].value, 2);
+    }
+
+    #[test]
     fn runtime_stats_text_rejects_trailing_histogram_fields() {
         let histogram_total =
             RuntimeStatsSnapshot::parse_text("histogram_count object_io.get ns 1 unexpected\n")
@@ -2445,16 +2610,6 @@ mod tests {
                 .to_string()
                 .contains("metric section and key must not be empty")
         );
-    }
-
-    #[test]
-    fn runtime_stats_text_rejects_metric_keys_with_extra_dots() {
-        let error =
-            RuntimeStatsSnapshot::parse_text("counter vfs_read.read.failed_bytes bytes 1\n")
-                .expect_err("dotted metric key should fail");
-
-        assert_eq!(error.line(), 1);
-        assert_eq!(error.message(), "metric key must not contain dots");
     }
 
     #[test]

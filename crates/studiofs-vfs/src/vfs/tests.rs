@@ -7763,6 +7763,67 @@ fn os_cache_prepare_unknown_handle_replaces_without_error() {
 }
 
 #[test]
+fn os_cache_stats_unknown_handle_counts_each_call() {
+    let fixture =
+        ContractVfsFixture::new("os-cache-stats-unknown-handle").expect("create VFS fixture");
+    let vfs = fixture.vfs();
+
+    vfs.prepare_os_cache_open(u64::MAX, OsCacheParticipation::Enabled);
+    vfs.prepare_os_cache_open(u64::MAX, OsCacheParticipation::Enabled);
+
+    let stats = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(
+        (stats.total, stats.replace, stats.unknown_handle),
+        (2, 2, 2)
+    );
+}
+
+#[test]
+fn os_cache_stats_first_prepare_counts_once_and_idempotent_prepare_does_not() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-idempotent");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read handle");
+
+    let first = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+    let second = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
+
+    let stats = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(second, first);
+    assert_eq!(
+        (stats.total, stats.replace, stats.first_observation),
+        (1, 1, 1)
+    );
+}
+
+#[test]
+fn os_cache_stats_released_handle_counts_each_returned_unknown_decision() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-released-handle");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read handle");
+    let stale_open_file = vfs.get_open_file(fh).expect("clone open handle state");
+    futures::executor::block_on(vfs.release_fh(fh)).expect("release unprepared handle");
+
+    for _ in 0..2 {
+        let (decision, should_record) = stale_open_file
+            .prepare_os_cache(|| panic!("released handle must not execute prepare closure"));
+        assert_eq!(
+            decision,
+            OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle)
+        );
+        assert!(should_record);
+        vfs.os_cache.record_decision(decision);
+    }
+
+    let stats = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(
+        (stats.total, stats.replace, stats.unknown_handle),
+        (2, 2, 2)
+    );
+}
+
+#[test]
 fn os_cache_prepare_disabled_still_tracks_foreground_read_lifetime() {
     let (_fixture, vfs, attr) = os_cache_test_file("os-cache-disabled-foreground");
     let fh = vfs
@@ -7949,7 +8010,7 @@ fn os_cache_release_before_prepare_is_terminal_without_lifecycle_leak() {
 
     let prepare_ran = Arc::new(AtomicBool::new(false));
     let prepare_ran_in_closure = Arc::clone(&prepare_ran);
-    let decision = stale_open_file.prepare_os_cache(|| {
+    let (decision, should_record) = stale_open_file.prepare_os_cache(|| {
         prepare_ran_in_closure.store(true, AtomicOrdering::Release);
         vfs.os_cache.begin_foreground_handle();
         vfs.begin_foreground_read_handle();
@@ -7963,6 +8024,7 @@ fn os_cache_release_before_prepare_is_terminal_without_lifecycle_leak() {
         decision,
         OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle)
     );
+    assert!(should_record);
     assert!(!prepare_ran.load(AtomicOrdering::Acquire));
     assert_eq!(vfs.os_cache.active_foreground_handle_count(), 0);
     assert_eq!(vfs.foreground_reads_inflight(), 0);
@@ -8027,7 +8089,10 @@ fn os_cache_prepare_racing_release_finishes_lifecycle_exactly_once() {
         .expect("let preparation install its lifecycle");
     assert_eq!(
         prepare.join().expect("prepare thread should not panic"),
-        OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        (
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+            true
+        )
     );
     release_done_rx
         .recv_timeout(Duration::from_secs(1))
@@ -8085,6 +8150,117 @@ fn os_cache_nonfinal_writer_release_decrements_writer_once() {
 
     futures::executor::block_on(vfs.release_fh(second)).expect("release final writer");
     assert_eq!(vfs.os_cache.active_writer_count(), 0);
+}
+
+#[test]
+fn os_cache_stats_active_writer_gauge_counts_handles_not_inodes() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-writer-gauge");
+    let first = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open first writer");
+    let second = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open second writer");
+    vfs.prepare_os_cache_open(first, OsCacheParticipation::Enabled);
+    vfs.prepare_os_cache_open(second, OsCacheParticipation::Enabled);
+
+    let at_two = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_writers;
+    futures::executor::block_on(vfs.release_fh(first)).expect("release first writer");
+    let at_one = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_writers;
+    futures::executor::block_on(vfs.release_fh(second)).expect("release second writer");
+    let at_zero = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_writers;
+
+    assert_eq!([at_two, at_one, at_zero], [2, 1, 0]);
+}
+
+#[test]
+fn os_cache_stats_active_foreground_gauge_tracks_handle_lifecycle() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-foreground-gauge");
+    let first = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open first reader");
+    let second = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open second reader");
+    vfs.prepare_os_cache_open(first, OsCacheParticipation::Enabled);
+    vfs.prepare_os_cache_open(second, OsCacheParticipation::Enabled);
+
+    let at_two = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_foreground_handles;
+    futures::executor::block_on(vfs.release_fh(first)).expect("release first reader");
+    let at_one = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_foreground_handles;
+    futures::executor::block_on(vfs.release_fh(second)).expect("release second reader");
+    let at_zero = vfs
+        .write_path_observability_snapshot()
+        .os_cache
+        .active_foreground_handles;
+
+    assert_eq!([at_two, at_one, at_zero], [2, 1, 0]);
+}
+
+#[test]
+fn os_cache_stats_reset_subtracts_counters_but_preserves_active_gauges() {
+    let (_fixture, vfs, attr) = os_cache_test_file("os-cache-stats-reset");
+    let writer = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer");
+    let reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open reader");
+    vfs.prepare_os_cache_open(writer, OsCacheParticipation::Enabled);
+    vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled);
+
+    vfs.reset_diagnostics_observability();
+
+    let reset = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(
+        (
+            reset.total,
+            reset.reuse,
+            reset.replace,
+            reset.active_writers,
+            reset.active_foreground_handles,
+        ),
+        (0, 0, 0, 1, 1)
+    );
+
+    vfs.prepare_os_cache_open(reader, OsCacheParticipation::Disabled);
+    assert_eq!(vfs.write_path_observability_snapshot().os_cache.total, 0);
+
+    vfs.prepare_os_cache_open(u64::MAX, OsCacheParticipation::Enabled);
+    let after = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(
+        (
+            after.total,
+            after.replace,
+            after.unknown_handle,
+            after.active_writers,
+            after.active_foreground_handles,
+        ),
+        (1, 1, 1, 1, 1)
+    );
+
+    futures::executor::block_on(vfs.release_fh(reader)).expect("release reader");
+    futures::executor::block_on(vfs.release_fh(writer)).expect("release writer");
+    let released = vfs.write_path_observability_snapshot().os_cache;
+    assert_eq!(
+        (released.active_writers, released.active_foreground_handles),
+        (0, 0)
+    );
 }
 
 #[test]
@@ -16068,6 +16244,37 @@ fn runtime_stats_surface_reports_fuse_async_write_gauges() {
     assert_eq!(gauges["fuse_async_write.pending_handles"].value, 3);
     assert_eq!(gauges["fuse_async_write.pending_writes"].value, 4);
     assert_eq!(gauges["fuse_async_write.pending_bytes"].value, 4096);
+}
+
+#[test]
+fn runtime_stats_surface_reports_os_cache_lifecycle() {
+    let (_fixture, vfs, attr) = os_cache_test_file("runtime-stats-os-cache-lifecycle");
+    let first_writer = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open first writer");
+    let second_writer = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open second writer");
+    let first_reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open first reader");
+    let second_reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open second reader");
+    for fh in [first_writer, second_writer, first_reader, second_reader] {
+        vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+    }
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    let text = snapshot.to_text();
+
+    assert_eq!(snapshot.bridge.gauges["os_cache.active_writers"].value, 2);
+    assert_eq!(
+        snapshot.bridge.gauges["os_cache.active_foreground_handles"].value,
+        2
+    );
+    assert!(text.contains("gauge bridge.os_cache.active_writers count 2\n"));
+    assert!(text.contains("gauge bridge.os_cache.active_foreground_handles count 2\n"));
 }
 
 #[test]

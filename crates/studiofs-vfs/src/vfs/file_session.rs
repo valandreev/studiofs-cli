@@ -173,12 +173,15 @@ impl OpenFile {
     pub(super) fn prepare_os_cache(
         &self,
         prepare: impl FnOnce() -> (OsCacheOpenDecision, Option<OsCacheHandleLifecycle>),
-    ) -> OsCacheOpenDecision {
+    ) -> (OsCacheOpenDecision, bool) {
         let mut state = self.os_cache_state.lock();
         match &*state {
-            OsCacheHandleState::Prepared { decision, .. } => return *decision,
+            OsCacheHandleState::Prepared { decision, .. } => return (*decision, false),
             OsCacheHandleState::Released => {
-                return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+                return (
+                    OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle),
+                    true,
+                );
             }
             OsCacheHandleState::Unprepared => {}
         }
@@ -188,7 +191,7 @@ impl OpenFile {
             decision,
             lifecycle,
         };
-        decision
+        (decision, true)
     }
 
     pub(super) fn take_os_cache_lifecycle_for_release(&self) -> Option<OsCacheHandleLifecycle> {

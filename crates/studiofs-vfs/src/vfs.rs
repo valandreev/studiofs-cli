@@ -78,14 +78,14 @@ pub use metrics::{
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
     VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -4301,6 +4301,7 @@ impl StudioVfs {
     /// Reset diagnostics counters and event history for fresh observability baselines.
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        self.os_cache.reset_stats();
         self.state.write_admission_governor.lock().reset_stats();
         self.state
             .local_dirty
@@ -6327,10 +6328,12 @@ impl StudioVfs {
         participation: OsCacheParticipation,
     ) -> OsCacheOpenDecision {
         let Some(open_file) = self.handle_table.get(fh) else {
-            return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+            let decision = OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+            self.os_cache.record_decision(decision);
+            return decision;
         };
 
-        open_file.prepare_os_cache(|| {
+        let (decision, should_record) = open_file.prepare_os_cache(|| {
             if open_file.active_open_overlay {
                 self.os_cache.begin_writer(open_file.ino);
                 self.os_cache.clear(open_file.ino);
@@ -6396,7 +6399,11 @@ impl StudioVfs {
                     }
                 };
             (self.os_cache.observe(&attr, spans), lifecycle)
-        })
+        });
+        if should_record {
+            self.os_cache.record_decision(decision);
+        }
+        decision
     }
 
     /// Forget an observation after a prepared platform reply is rejected.
@@ -8580,6 +8587,7 @@ impl StudioVfs {
                         macfuse_open_cache_local_stable_write_release_seeded,
                 }
             },
+            os_cache: self.os_cache.stats(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {
