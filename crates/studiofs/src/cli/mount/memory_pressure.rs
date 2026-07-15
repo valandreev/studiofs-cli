@@ -188,6 +188,9 @@ fn parse_unified_cgroup_path(contents: &str) -> anyhow::Result<Option<PathBuf>> 
         return Ok(None);
     };
     let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        anyhow::bail!("unified cgroup path must be absolute");
+    }
     join_cgroup_path(Path::new("/"), &path)?;
     Ok(Some(path))
 }
@@ -273,6 +276,16 @@ mod tests {
     #[test]
     fn unified_cgroup_parser_rejects_parent_traversal() {
         assert!(parse_unified_cgroup_path("0::/../escape\n").is_err());
+    }
+
+    #[test]
+    fn unified_cgroup_parser_rejects_empty_v2_path() {
+        assert!(parse_unified_cgroup_path("0::\n").is_err());
+    }
+
+    #[test]
+    fn unified_cgroup_parser_rejects_relative_v2_path() {
+        assert!(parse_unified_cgroup_path("0::relative\n").is_err());
     }
 
     #[test]
