@@ -4582,6 +4582,23 @@ mod tests {
         const WRITERS: usize = 8;
         const REGION_SIZE: usize = 1024 * 1024;
 
+        let cache_policy = super::linux_fuse_cache_policy_from_env();
+        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+        assert_eq!(
+            cache_policy,
+            super::LinuxFuseCachePolicy::Direct,
+            "parallel direct-write regression requires Direct cache policy"
+        );
+        assert!(
+            super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            "parallel direct-write regression requires async DIO"
+        );
+        // SAFETY: this C probe only reports compile-time field support.
+        assert!(
+            unsafe { super::studiofs_linux_fuse_supports_parallel_direct_writes() } != 0,
+            "parallel direct-write regression requires libfuse field support"
+        );
+
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "linux-fuse-parallel-direct-writes",
         )
@@ -4642,11 +4659,11 @@ mod tests {
             let status = Command::new("fusermount3")
                 .arg("-u")
                 .arg(&worker_mount_point)
-                .status();
-            if status.as_ref().is_ok_and(|status| status.success()) {
+                .status()?;
+            if status.success() {
                 guard.disarm();
             }
-            status
+            Ok(status)
         });
 
         let run_result = session.run();
@@ -4689,8 +4706,15 @@ mod tests {
 
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-forced-unmount").expect("mount");
+        let shutdown_probe = Arc::new(AtomicBool::new(false));
+        let watcher_probe = Arc::clone(&shutdown_probe);
+        let test_watcher =
+            super::SessionExitWatcher::start_with_probe(Arc::clone(&tracker), move || {
+                watcher_probe.load(Ordering::Acquire)
+            });
         let worker_mount_point = mount_point.clone();
         let worker_tracker = Arc::clone(&tracker);
+        let worker_shutdown_probe = Arc::clone(&shutdown_probe);
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
             let guard = UnmountGuard::new(worker_mount_point.clone());
             // Synchronous kernel submissions may serialize writes to one inode.
@@ -4744,88 +4768,96 @@ mod tests {
                 Ok(())
             })();
 
-            if let Err(error) = observation {
+            let transition = observation.and_then(|()| {
+                worker_shutdown_probe.store(true, Ordering::Release);
+                wait_for_async_write_stats(&worker_tracker, |stats| {
+                    stats.active_requests == 1
+                        && stats.pending_writes == 1
+                        && stats.admission_waiters == 0
+                })
+                .map(|_| ())
+                .map_err(|stats| {
+                    format!(
+                        "shutdown watcher did not drain the waiting raw request: stats={stats:?}"
+                    )
+                })
+            });
+            if let Err(error) = transition {
                 runtime_gate_release.release();
-                let status = Command::new("fusermount3")
+                let first_status = first.take().map(|writer| match writer.join() {
+                    Ok(result) => format!("{result:?}"),
+                    Err(_) => "panicked".to_owned(),
+                });
+                let second_status = second.take().map(|writer| match writer.join() {
+                    Ok(result) => format!("{result:?}"),
+                    Err(_) => "panicked".to_owned(),
+                });
+                let unmount_status = Command::new("fusermount3")
                     .arg("-uz")
                     .arg(&worker_mount_point)
-                    .status()?;
-                if status.success() {
+                    .status();
+                if unmount_status.as_ref().is_ok_and(|status| status.success()) {
                     guard.disarm();
                 }
-                if let Some(first) = first {
-                    let _ = first.join();
-                }
-                if let Some(second) = second {
-                    let _ = second.join();
-                }
-                return Err(std::io::Error::other(error));
+                return Err(std::io::Error::other(format!(
+                    "{error}; fallback_unmount={unmount_status:?}; \
+                     first_writer={first_status:?}; second_writer={second_status:?}"
+                )));
             }
 
-            let mut unmount = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&worker_mount_point)
-                .spawn()?;
             runtime_gate_release.release();
-            let unmount_deadline = Instant::now() + Duration::from_secs(5);
-            let status = loop {
-                if let Some(status) = unmount.try_wait()? {
-                    break status;
-                }
-                if Instant::now() >= unmount_deadline {
-                    let lazy_status = Command::new("fusermount3")
-                        .arg("-uz")
-                        .arg(&worker_mount_point)
-                        .status()?;
-                    let _ = unmount.kill();
-                    let _ = unmount.wait();
-                    if lazy_status.success() {
-                        guard.disarm();
-                    }
-                    if let Some(first) = first.take() {
-                        let _ = first.join();
-                    }
-                    if let Some(second) = second.take() {
-                        let _ = second.join();
-                    }
-                    return Err(std::io::Error::other(
-                        "normal unmount did not finish within 5 seconds",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(10));
-            };
-            let _ = first
+            let first_join = first
                 .take()
                 .expect("first writer exists after successful observation")
-                .join()
-                .map_err(|_| std::io::Error::other("first writer panicked"))?;
-            let _ = second
+                .join();
+            let second_join = second
                 .take()
                 .expect("second writer exists after successful observation")
-                .join()
-                .map_err(|_| std::io::Error::other("second writer panicked"))?;
+                .join();
+            if first_join.is_err() || second_join.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "writer panicked during forced unmount: first={}, second={}",
+                    first_join.is_err(),
+                    second_join.is_err()
+                )));
+            }
+            if !worker_tracker.wait_idle(Duration::from_secs(5)) {
+                return Err(std::io::Error::other(format!(
+                    "async-write tracker did not become idle: {:?}",
+                    worker_tracker.stats()
+                )));
+            }
+            let stats = worker_tracker.stats();
+            let live_stats = (
+                stats.active_requests,
+                stats.pending_writes,
+                stats.pending_bytes,
+                stats.admission_waiters,
+            );
+            if live_stats != (0, 0, 0, 0) {
+                return Err(std::io::Error::other(format!(
+                    "async-write tracker retained live state: {stats:?}"
+                )));
+            }
+            let reply_rejections = super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed);
+            if reply_rejections != reply_rejections_before {
+                return Err(std::io::Error::other(format!(
+                    "forced unmount produced late async-write replies: \
+                     before={reply_rejections_before}, after={reply_rejections}, stats={stats:?}"
+                )));
+            }
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&worker_mount_point)
+                .status()?;
             if status.success() {
                 guard.disarm();
             }
-
-            assert!(
-                worker_tracker.wait_idle(Duration::from_secs(5)),
-                "async-write tracker did not become idle"
-            );
-            let stats = worker_tracker.stats();
-            assert_eq!(
-                (
-                    stats.active_requests,
-                    stats.pending_writes,
-                    stats.pending_bytes,
-                    stats.admission_waiters,
-                ),
-                (0, 0, 0, 0)
-            );
             Ok(status)
         });
 
         let run_result = session.run();
+        test_watcher.stop();
         let worker_result = worker.join();
         drop(session);
         drop(fixture);
@@ -4836,12 +4868,6 @@ mod tests {
             .expect("forced-unmount worker should not panic")
             .expect("forced-unmount worker should complete");
         assert!(unmount_status.success());
-        assert!(tracker.wait_idle(Duration::from_secs(5)));
-        assert_eq!(
-            super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed),
-            reply_rejections_before,
-            "forced unmount produced a late async-write reply"
-        );
     }
 
     #[test]
