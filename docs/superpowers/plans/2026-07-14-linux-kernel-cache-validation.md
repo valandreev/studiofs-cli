@@ -808,11 +808,11 @@ gauge upload_queue.active_uploads count 0
 Require the async/lifecycle gauges introduced by the prerequisites to be zero in those same snapshots:
 
 ```text
-gauge fuse_async_write.pending_writes count 0
-gauge fuse_async_write.pending_bytes bytes 0
-gauge fuse_async_write.pending_handles count 0
-gauge os_cache.active_writers count 0
-gauge os_cache.active_foreground_handles count 0
+gauge bridge.fuse_async_write.pending_writes count 0
+gauge bridge.fuse_async_write.pending_bytes bytes 0
+gauge bridge.fuse_async_write.pending_handles count 0
+gauge bridge.os_cache.active_writers count 0
+gauge bridge.os_cache.active_foreground_handles count 0
 ```
 
 Fail after 600 seconds and retain the final snapshots. Measure each external workload as two explicitly marked phases:

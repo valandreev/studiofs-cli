@@ -53,6 +53,7 @@ Execute this plan after `2026-07-14-linux-fuse-async-write-correctness.md`, beca
 - Modify: `crates/studiofs-vfs/src/vfs/metrics.rs` — platform-neutral OS-cache counters and legacy decode compatibility.
 - Modify: `crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs` — export active writer/foreground cache-lifecycle gauges.
 - Modify: `crates/studiofs-vfs/src/vfs/tests.rs` — lifecycle, release, invalidation, and Windows-neutral regression tests.
+- Modify: `crates/studiofs/src/cli/status.rs` — initialize the new neutral stats field in the complete public snapshot literal.
 - Modify: `crates/studiofs-macfuse/src/adapter.rs` — consume shared decision/liveness and delete duplicated ownership.
 - Modify: `crates/studiofs-macfuse/src/lib.rs` — retarget cache behavior tests to shared decisions.
 - Modify: `crates/studiofs-macfuse/Cargo.toml` — remove `lru` after the adapter snapshot store is deleted.
@@ -671,7 +672,23 @@ git commit -m "fix(vfs): retire os cache generations at shared seams"
 
 - [ ] **Step 1: Add serialization and counter tests**
 
-In `metrics.rs` and VFS tests require one counter for every `OsCacheReason`, aggregate `reuse` and `replace`, idempotent prepare counting once, and deserialization of the existing `macfuse_open_cache` field.
+In `metrics.rs` and VFS tests require one mapping assertion for every
+`OsCacheReason`, aggregate `reuse` and `replace`, and prove that a known
+handle's first `Unprepared -> Prepared` transition counts once while an
+idempotent prepare does not count again. An unknown handle has no state to
+deduplicate, so each `UnknownHandle` call counts once.
+
+Exercise two writer handles on one inode and two prepared foreground handles
+through exact gauge transitions `2 -> 1 -> 0`. The writer gauge sums the
+per-inode handle counts rather than the number of inode-map entries. Add
+`os_cache_stats_reset_subtracts_counters_but_preserves_active_gauges`: reset
+zeroes the decision-counter baseline, leaves live gauges unchanged, and counts
+later decisions from the new baseline.
+
+Deserialize a complete old `VfsWritePathObservabilitySnapshot` with a nonzero
+`macfuse_open_cache` field and no `os_cache` field. Assert that the legacy
+values survive and the neutral field defaults to zero; testing only the legacy
+leaf type is insufficient.
 
 - [ ] **Step 2: Verify RED**
 
@@ -710,17 +727,24 @@ pub struct VfsOsCacheStats {
 }
 ```
 
-Record the decision inside the first successful execution of `prepare_os_cache_open`, never in an adapter. Populate the two gauges from current shared lifecycle state. Add `os_cache: VfsOsCacheStats` to the write-path observability snapshot. Reset baseline-subtracts only monotonic decision counters; current gauges are copied unchanged.
+Record the decision inside the first successful execution of `prepare_os_cache_open`, never in an adapter. Populate the two gauges from exact shared lifecycle state owned by `OsCacheState`; do not reuse `ReadState::foreground_reads_inflight`, which also counts transient read scopes. Add `#[serde(default)] pub os_cache: VfsOsCacheStats` to the write-path observability snapshot. Reset baseline-subtracts only monotonic decision counters; current gauges are copied unchanged.
 
-Keep `VfsMacFuseOpenCacheStats` and its serialized snapshot field readable for one compatibility cycle so older saved reports still deserialize; mark both deprecated in Rust docs. New snapshots leave that legacy field at its default and publish live data only through `VfsOsCacheStats`. Do not copy Linux counters into a field named macFUSE, and do not keep a second live decision recorder.
+Keep the existing macFUSE legacy recorder and serialized field live through
+this task because the adapter has not migrated yet. Shared preparation records
+only the neutral counters, while the not-yet-migrated macFUSE path records only
+its legacy counters, so no event is double-recorded. Move legacy deprecation,
+default-only snapshots, and recorder/counter removal to Task 7 after adapter
+migration. Never copy Linux counters into a field named macFUSE.
 
 - [ ] **Step 4: Export and verify GREEN**
 
-Export `VfsOsCacheStats` through `vfs.rs` and `lib.rs`, plus these exact runtime gauges:
+Export `VfsOsCacheStats` through `vfs.rs` and `lib.rs`. Put the gauge keys in
+the existing bridge section; its text renderer prefixes them, producing these
+exact runtime lines:
 
 ```text
-os_cache.active_writers
-os_cache.active_foreground_handles
+bridge.os_cache.active_writers
+bridge.os_cache.active_foreground_handles
 ```
 
 Then run:
@@ -729,6 +753,8 @@ Then run:
 cargo test -p studiofs-vfs os_cache_stats -- --nocapture
 cargo test -p studiofs-vfs macfuse_open_cache_stats_ -- --nocapture
 cargo test -p studiofs-vfs runtime_stats_surface_reports_os_cache_lifecycle -- --nocapture
+cargo check -p studiofs
+cargo check -p studiofs-macfuse
 ```
 
 Expected: both neutral and legacy compatibility tests pass.
@@ -736,7 +762,7 @@ Expected: both neutral and legacy compatibility tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/metrics.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs crates/studiofs-vfs/src/vfs/tests.rs
+git add crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/metrics.rs crates/studiofs-vfs/src/vfs/os_cache.rs crates/studiofs-vfs/src/vfs/runtime_stats_surface.rs crates/studiofs-vfs/src/vfs/tests.rs crates/studiofs/src/cli/status.rs
 git commit -m "feat(vfs): report shared os cache decisions"
 ```
 
@@ -842,6 +868,11 @@ Remove:
 - `keep_cache_for_current_generation`, `open_cache_graph_signature`, clear/seed helpers;
 - cache snapshot removal from `ReadWindowKernelInvalidator`;
 - adapter release cleanup for shared writer/foreground state.
+
+After every macFUSE open/create path uses shared preparation, remove the old
+legacy decision recorder/counters, mark `VfsMacFuseOpenCacheStats` and its
+serialized compatibility field deprecated, and leave that legacy field at its
+default in new snapshots. Keep deserialization compatibility for old reports.
 
 Keep read-window invalidation and file-flag maps; they are separate platform behavior. Remove `lru.workspace` from `studiofs-macfuse/Cargo.toml` after `rg '\bLruCache\b' crates/studiofs-macfuse` returns no matches.
 
