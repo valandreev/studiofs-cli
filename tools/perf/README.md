@@ -171,7 +171,8 @@ matrix requires clean StudioFS and `studiofs-bench` checkouts, rebuilds the
 benchmark with `cargo build --release --locked`, refreshes the bundled binary
 and README, and records the current Git revisions plus binary SHA-256 values in
 the manifests. It also verifies that the running mount executable matches the
-recorded StudioFS binary.
+recorded StudioFS binary. The benchmark checkout defaults to the sibling
+`../studiofs-bench`; pass `--bench-repo PATH` when it lives elsewhere.
 
 After each tuple, the matrix performs bounded unmount/process cleanup, removes
 only its owned workload, cache, mount, and empty cgroup paths, and preserves

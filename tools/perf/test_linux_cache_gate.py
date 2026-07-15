@@ -2417,6 +2417,7 @@ class ShellContractTest(unittest.TestCase):
                     "--mount-point",
                     "--mount-pid",
                     "--cgroup",
+                    "--bench-repo",
                     "--correctness-manifest",
                     "--diagnostic",
                     "--dry-run",
@@ -2429,6 +2430,7 @@ class ShellContractTest(unittest.TestCase):
                     "--mount-root",
                     "--cgroup-root",
                     "--repetitions",
+                    "--bench-repo",
                     "--diagnostic",
                     "--dry-run",
                 ),
@@ -2508,6 +2510,7 @@ class ShellContractTest(unittest.TestCase):
 
     def test_matrix_dry_run_writes_exact_diagnostic_rotation(self) -> None:
         output_root = self.root / "matrix"
+        bench_repo = self.root / "studiofs-bench-source"
         completed = self.run_script(
             self.matrix,
             "--volume",
@@ -2520,6 +2523,8 @@ class ShellContractTest(unittest.TestCase):
             "3",
             "--output-root",
             str(output_root),
+            "--bench-repo",
+            str(bench_repo),
             "--diagnostic",
             "--dry-run",
         )
@@ -2617,7 +2622,8 @@ class ShellContractTest(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                item["collector_command"].endswith("--diagnostic")
+                f"--bench-repo {bench_repo}" in item["collector_command"]
+                and item["collector_command"].endswith("--diagnostic")
                 for item in tuples
             )
         )

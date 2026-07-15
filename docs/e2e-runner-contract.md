@@ -396,9 +396,9 @@ mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 Crash-style remounts do not run `studiofs umount` for the killed client. Linux
-mounted runs are disabled after SFS-600 until a new Linux bridge exists. Other
-platforms keep the existing remount path unless a platform-specific stale-mount
-cleanup is added.
+mounted runner jobs remain disabled until this runner is enabled and validated
+for the libfuse3 bridge. Other platforms keep the existing remount path unless
+a platform-specific stale-mount cleanup is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
 three peer remote volumes, one from each client, then discovers each peer-owned
@@ -761,7 +761,8 @@ Required checks:
   `docker compose up --detach --wait` with a project-scoped name and records the
   copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
-  - Linux mounted runs are disabled after SFS-600 until a new Linux bridge exists.
+  - Linux mounted runner jobs remain disabled until the runner is enabled and
+    validated for the libfuse3 bridge.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured
     WinFSP registry setting such as `MountUseMountmgrFromFSD=1`.

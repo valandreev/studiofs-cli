@@ -11,6 +11,7 @@ mount_pid=""
 runs=1
 cgroup=""
 bench_bin="$repo_root/target/bench/studiofs-bench"
+bench_repo="$repo_root/../studiofs-bench"
 studiofs_bin="$repo_root/target/release/studiofs"
 correctness_manifest=""
 output_root="$repo_root/target/perf/linux-cache-gate"
@@ -34,6 +35,7 @@ Options:
   --runs <n>                      Runs against this mount. Defaults to 1.
   --cgroup <path>                 Delegated cgroup v2 directory (real runs).
   --bench <path>                  Benchmark binary. Defaults to target/bench/studiofs-bench.
+  --bench-repo <path>             Benchmark source checkout. Defaults to ../studiofs-bench.
   --studiofs <path>               StudioFS binary. Defaults to target/release/studiofs.
   --correctness-manifest <path>   Correctness manifest (real runs).
   --output-root <path>            Artifact root. Defaults to target/perf/linux-cache-gate.
@@ -716,6 +718,7 @@ while [[ $# -gt 0 ]]; do
     --runs) require_value "$1" "${2:-}"; runs="$(positive_int "$1" "$2")"; shift 2 ;;
     --cgroup) require_value "$1" "${2:-}"; cgroup="$2"; shift 2 ;;
     --bench) require_value "$1" "${2:-}"; bench_bin="$2"; shift 2 ;;
+    --bench-repo) require_value "$1" "${2:-}"; bench_repo="$2"; shift 2 ;;
     --studiofs) require_value "$1" "${2:-}"; studiofs_bin="$2"; shift 2 ;;
     --correctness-manifest) require_value "$1" "${2:-}"; correctness_manifest="$2"; shift 2 ;;
     --output-root) require_value "$1" "${2:-}"; output_root="$2"; shift 2 ;;
@@ -749,6 +752,7 @@ case "$workload" in
 esac
 
 bench_bin="$(realpath -m -- "$bench_bin")"
+bench_repo="$(realpath -m -- "$bench_repo")"
 studiofs_bin="$(realpath -m -- "$studiofs_bin")"
 mount_point="$(realpath -m -- "$mount_point")"
 output_root="$(realpath -m -- "$output_root")"
@@ -801,6 +805,7 @@ cat > "$artifact_dir/environment.json" <<JSON
   "runs": $runs,
   "cgroup": $cgroup_json,
   "bench": "$(json_escape "$bench_bin")",
+  "bench_repo": "$(json_escape "$bench_repo")",
   "studiofs": "$(json_escape "$studiofs_bin")",
   "correctness_manifest": $correctness_manifest_json,
   "output_root": "$(json_escape "$output_root")",
@@ -1099,7 +1104,6 @@ except (json.JSONDecodeError, ValueError, gate.GateValidationError) as error:
     raise SystemExit(f"Error: {error}") from error
 PY
 
-bench_repo="/home/val/dev/studiofs-bench"
 [[ -d "$bench_repo/.git" ]] || die "benchmark source checkout is missing: $bench_repo"
 git_revision="$(git -C "$repo_root" rev-parse HEAD)"
 git_dirty_output="$(git -C "$repo_root" status --porcelain --untracked-files=all)"

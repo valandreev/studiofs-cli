@@ -87,7 +87,7 @@ tasks:
     docker: true
     run: |
       set -euo pipefail
-      echo "Linux mounted E2E is disabled: SFS-600 removed the legacy raw FUSE bridge."
+      echo "Linux mounted E2E is disabled until this runner is enabled and validated for the libfuse3 bridge."
       exit 2
 
       case "${RWX_RUN_ID:-}" in
@@ -170,7 +170,7 @@ tasks:
     timeout: 30m
     run: |
       set -euo pipefail
-      echo "Linux mounted E2E is disabled: SFS-600 removed the legacy raw FUSE bridge."
+      echo "Linux mounted E2E is disabled until this runner is enabled and validated for the libfuse3 bridge."
       exit 2
 
       case "${RWX_RUN_ID:-}" in

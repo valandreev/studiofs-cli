@@ -41,15 +41,15 @@ reads for recently written data without an upstream data store.
 
 ## Execution Model Per OS
 
-### Linux — `ubuntu-latest` (GitHub-hosted)
+### Linux — FUSE-capable Ubuntu or Rocky host
 
 | Aspect | Detail |
 |--------|--------|
-| **Runner** | `ubuntu-latest` |
-| **Driver** | `/dev/fuse` (present on GitHub-hosted Ubuntu runners) |
-| **Mount mode** | StudioFS raw `/dev/fuse`, no `libfuse3` link |
-| **Mount options** | raw macFUSE-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
-| **Feasibility** | **Disabled** — SFS-600 removed the legacy raw FUSE bridge |
+| **Runner** | Manual FUSE-capable Ubuntu 24.04+ or Rocky Linux 9.4+ host |
+| **Driver** | `/dev/fuse` with the system libfuse3 runtime |
+| **Mount mode** | `studiofs-linux-fuse` low-level libfuse3 bridge |
+| **Mount options** | Direct I/O by default; negotiated ASYNC_DIO when supported |
+| **Feasibility** | Mounted bridge tests run manually; `.rwx/e2e.yml` remains disabled until its runner is enabled and validated for libfuse3 |
 | **Gating** | Manual dispatch only |
 
 ### macOS — `macos-latest` (GitHub-hosted)

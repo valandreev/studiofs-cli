@@ -11,6 +11,7 @@ repetitions=""
 repetitions_set=false
 output_root="$repo_root/target/perf/linux-cache-matrix"
 bench_bin="$repo_root/target/bench/studiofs-bench"
+bench_repo="$repo_root/../studiofs-bench"
 studiofs_bin="$repo_root/target/release/studiofs"
 diagnostic=false
 dry_run=false
@@ -31,6 +32,7 @@ Options:
   --repetitions N        Repetitions. Defaults to 5, or 3 with --diagnostic.
   --output-root PATH     Matrix artifact root. Defaults to target/perf/linux-cache-matrix.
   --bench PATH           studiofs-bench binary. Defaults to target/bench/studiofs-bench.
+  --bench-repo PATH      studiofs-bench source checkout. Defaults to ../studiofs-bench.
   --studiofs PATH        StudioFS binary. Defaults to target/release/studiofs.
   --diagnostic           Mark an exact three-repetition real run promotion-ineligible.
   --dry-run              Write correctness commands, schedule, and tuple artifacts only.
@@ -110,6 +112,11 @@ while (($# > 0)); do
       bench_bin="$2"
       shift 2
       ;;
+    --bench-repo)
+      require_value "$1" "${2:-}"
+      bench_repo="$2"
+      shift 2
+      ;;
     --studiofs)
       require_value "$1" "${2:-}"
       studiofs_bin="$2"
@@ -158,6 +165,7 @@ mount_root="$(realpath -m -- "$mount_root")"
 cgroup_root="$(realpath -m -- "$cgroup_root")"
 output_root="$(realpath -m -- "$output_root")"
 bench_bin="$(realpath -m -- "$bench_bin")"
+bench_repo="$(realpath -m -- "$bench_repo")"
 studiofs_bin="$(realpath -m -- "$studiofs_bin")"
 
 if [[ -e "$output_root/correctness-manifest.json" || -e "$output_root/schedule.json" ]]; then
@@ -187,7 +195,6 @@ declare -a correctness_modes=(
 )
 
 correctness_manifest="$output_root/correctness-manifest.json"
-bench_repo="/home/val/dev/studiofs-bench"
 git_revision=""
 git_dirty=""
 studiofs_sha256=""
@@ -577,6 +584,7 @@ for ((repetition = 1; repetition <= repetitions; repetition++)); do
         --runs 1
         --cgroup "$cgroup"
         --bench "$bench_bin"
+        --bench-repo "$bench_repo"
         --studiofs "$studiofs_bin"
         --correctness-manifest "$correctness_manifest"
         --output-root "$artifact_dir"
@@ -1420,6 +1428,7 @@ run_real_tuple() {
       --runs 1
       --cgroup "$active_cgroup"
       --bench "$bench_bin"
+      --bench-repo "$bench_repo"
       --studiofs "$studiofs_bin"
       --correctness-manifest "$correctness_manifest"
       --output-root "$active_artifact_dir"
