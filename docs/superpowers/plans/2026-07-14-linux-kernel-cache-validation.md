@@ -665,6 +665,12 @@ Add helpers to the existing ignored Linux mounted-test fixture to:
 - inspect negotiated geometry recorded during mount;
 - unmount and join the session without using sleeps as correctness assertions.
 
+The in-process mounted fixture reads snapshots directly from its `Arc<StudioVfs>`;
+it must not read `.studiofs-runtime-stats` through the mount because that read
+would itself change Linux callback counters. Before asserting negotiated
+geometry, perform one real operation through the mount and wait with a bounded
+timeout for the init callback to publish `Some(...)`.
+
 Also adapt only the minimum setup from the existing two-client PostgreSQL/S3
 fixture in `crates/studiofs-vfs/tests/vfs_test.rs`: add direct Linux test
 dependencies in `crates/studiofs-linux-fuse/Cargo.toml`, create a small local
@@ -693,11 +699,20 @@ first stable reopen replaces and second identical reopen reuses
 second stable warm read adds zero FUSE read callbacks
 ```
 
-Every subcase asserts bytes and relevant cache-decision/liveness counter deltas. The warm subcase requires an exact checksum, a positive read-callback delta on its first fresh read, cache decisions `Replace` then `Reuse`, and zero FUSE/VFS read-callback delta on the second fresh read; zero callbacks without the first-read proof is not a pass.
+Every subcase asserts bytes and relevant cache-decision/liveness counter deltas. The warm subcase requires an exact checksum, a positive read-callback delta on its first fresh read, cache decisions `Replace` then `Reuse`, and zero FUSE/VFS read-callback delta on the second fresh read; zero callbacks without the first-read proof is not a pass. After the first read, wait for live-read gauges to reach zero and callback counters to remain stable across consecutive bounded polls before taking the second-read baseline, so late readahead cannot contaminate that interval.
 
 - [ ] **Step 3: Prove production remote invalidation with two clients**
 
-Add ignored `mounted_kernel_remote_listener_invalidation` requiring the existing PostgreSQL/S3 test environment. The writer client publishes a same-inode generation change; the mounted reader waits, with a fixed timeout, for the metadata listener to observe the remote change and for Linux liveness stats to show one forwarded kernel invalidation. A fresh read through the mount must return the writer's exact new bytes/checksum, and the cache decision must replace the stale generation before later reuse.
+Add ignored `mounted_kernel_remote_listener_invalidation` requiring the existing
+PostgreSQL/S3 test environment. Publish v1, wait for idle, and read v1 through
+the mount until the reader records stable reuse. Capture this inode's reader
+metadata payload IDs and a liveness baseline. Then publish a same-inode,
+same-size v2. Require the production listener to change the payload IDs for
+that exact inode, increment forwarded invalidation by the exact expected delta,
+and leave suppressed invalidation unchanged. A fresh read through the mount
+must return v2's exact bytes/checksum, and the cache decision must replace the
+stale generation before later reuse. This baseline prevents an initial
+full-snapshot invalidation or an old cumulative counter from passing the test.
 
 If the environment is absent, print an explicit skip reason and do not record a
 pass. When `STUDIOFS_REQUIRE_REMOTE_INVALIDATION_TEST=1`, absence of the
@@ -717,26 +732,42 @@ mounted_direct_rollback_preserves_reopen_visibility
 
 Exact cross-handle timing proof stays in deterministic ledger unit tests; mounted isolation proves bounded progress and exact content.
 
+Move every mounted-test path used by the correctness allowlist under `target/`
+and route it through one bounded teardown helper. Replace the existing smoke
+sleep with an observable readiness condition. On every outcome, attempt the
+normal unmount, fall back to the bounded forced unmount when needed, join the
+session, prove `findmnt` no longer sees the mount, and assert pending
+reply/write plus OS-cache lifecycle gauges are zero.
+
 - [ ] **Step 5: Assert actual negotiation**
 
 Only `mounted_kernel_writeback_flush_and_release_are_locally_durable` skips when `negotiated_writeback_cache == Some(false)` and emits that unsupported capability as the explicit reason. The rest of the Kernel coherence and remote-listener matrix still runs. Direct async requires `negotiated_async_dio == Some(true)`; on headers with `parallel_direct_writes_supported == false`, same-file parallelism is reported unsupported rather than passed. Direct rollback requires negotiated async false.
 
 - [ ] **Step 6: Run all three modes serially and record correctness provenance**
 
-```bash
-STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct STUDIOFS_FUSE_ASYNC_DIO=0 \
-  cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
+Run an explicit allowlist; never use the broad `mounted_` filter because the
+three modes intentionally contain mutually exclusive negotiation assertions.
+The matrix runner executes each listed test as its own cargo command and fails
+if the filter executes anything other than one test:
 
-STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct STUDIOFS_FUSE_ASYNC_DIO=1 \
-  cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
+```text
+Direct serial (`cache=direct`, `async=0`):
+  mounted_smoke_mounts_and_unmounts_cleanly
+  mounted_regular_file_io_is_visible_across_reopen
+  mounted_namespace_mutations_are_visible_through_readdir
+  mounted_direct_rollback_preserves_reopen_visibility
 
-STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel \
-  cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
+Direct async (`cache=direct`, `async=1`):
+  mounted_same_file_parallel_direct_writes_preserve_disjoint_regions
+  mounted_forced_unmount_drains_admitted_and_waiting_raw_requests
+  mounted_cross_file_fsync_and_close_do_not_share_async_watermark
 
-STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel \
-STUDIOFS_REQUIRE_REMOTE_INVALIDATION_TEST=1 \
-  cargo test -p studiofs-linux-fuse mounted_kernel_remote_listener_invalidation \
-  -- --ignored --nocapture --test-threads=1
+Kernel (`cache=kernel`):
+  mounted_kernel_cache_coherence_matrix
+  mounted_kernel_writeback_flush_and_release_are_locally_durable
+
+Kernel remote (`cache=kernel`, `STUDIOFS_REQUIRE_REMOTE_INVALIDATION_TEST=1`):
+  mounted_kernel_remote_listener_invalidation
 ```
 
 Expected: every supported case passes with zero leaked mounts, pending replies, or lifecycle gauges.
@@ -776,6 +807,7 @@ real run rejects a target whose findmnt type is not fuse.studiofs
 mode/environment mismatch is rejected
 idle parser requires three consecutive zero snapshots
 idle parser includes async reservations and foreground/writer lifecycles
+diagnostics attach snapshot must match mount pid/path/schema and has no mounted-file fallback
 median and MAD are correct for odd and even samples
 5 percent throughput boundary passes and a larger regression fails
 Direct async rejection makes Direct serial the Kernel baseline
@@ -783,6 +815,7 @@ CPU regression beyond combined MAD fails
 foreground average and sampled-peak core regressions fail
 callback, async, cancellation, or cleanup error fails
 histogram interval rejects changed bounds, negative deltas, overflow, saturation, and zero samples
+histogram applicability allows zero reads only for the Kernel second warm pass
 Kernel warm proof requires first-read callbacks, checksum, Replace-to-Reuse, then zero second-read callbacks
 negotiated geometry mismatch fails
 fresh cgroup is required for final evidence
@@ -790,8 +823,14 @@ missing, skipped, checksum-mismatched, or wrong-revision correctness manifest fa
 daemon RSS/anonymous and cgroup file-cache thresholds fail independently
 manifest text cannot waive a numeric memory failure
 workload manifests reject wrong byte or file counts
+bench report rejects stopped, cleanup error, duplicate/missing passes, wrong processed bytes, or extra JSON
+python client report rejects incomplete work or checksum mismatch
 matrix dry-run rotates mode/workload order and uses one mount per repetition
 matrix records unmount timeout or nonzero mount exit as cleanup failure
+matrix rejects missing, duplicate, or extra scheduled tuples and reused cgroups
+promotion requires exactly five repetitions; diagnostic three-run output is ineligible
+final provenance rejects dirty source trees or a mount executable checksum mismatch
+cgroup preflight requires empty counters, memory controller, and writable required files
 ```
 
 - [ ] **Step 2: Verify RED**
@@ -836,15 +875,36 @@ Read `/proc/$mount_pid/environ` internally but persist only an explicit allowlis
 
 - `direct-serial`: `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and `STUDIOFS_FUSE_ASYNC_DIO=0`;
 - `direct-async`: `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and `STUDIOFS_FUSE_ASYNC_DIO=1`;
-- `kernel`: `STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel`.
+- `kernel`: `STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel` and an explicit reproducibility-only `STUDIOFS_FUSE_ASYNC_DIO=0`.
 
-For real final evidence, require a newly created delegated cgroup v2 directory. Move the collector shell and mount PID into its `cgroup.procs`, verify both memberships via `/proc/<pid>/cgroup`, and reject a reused cgroup whose counters are already nonzero beyond a small documented bootstrap allowance. The collector's children then inherit the same cgroup. A missing/unwritable cgroup is a hard failure outside `--dry-run`.
+Implement the allowlist as literal variable names, never a `STUDIOFS_*`
+prefix. Record the mount process's captured stdout/stderr. Require the actual
+mount path to end in the requested volume name; the CLI otherwise mounts at
+`<supplied-root>/<volume>` and a collector could validate the wrong directory.
+Record normal/fallback unmount output and status plus the mount process exit.
 
-Record git revision and dirty status, `uname -a`, CPU count, memory, `findmnt`, backing block device, allowlisted mount environment, benchmark checksums, cgroup path/baseline, correctness-manifest path and SHA-256, and first runtime snapshot in `environment.json`. Reject the manifest before I/O unless its revision, dirty state, both binary checksums, and required non-skipped test results match this run.
+For real final evidence, require a newly created delegated cgroup v2 directory
+on a cgroup2 filesystem with an active memory controller, writable
+`cgroup.procs`, and readable `memory.current`, `memory.peak`, and `memory.stat`.
+Before migration require empty `cgroup.procs`, `memory.current == 0`, and
+`memory.peak == 0`; there is no bootstrap allowance. Move the collector shell
+and mount PID into it, verify both memberships via `/proc/<pid>/cgroup`, and let
+collector children inherit it. A missing/unwritable prerequisite is a hard
+failure outside `--dry-run`.
+
+Require clean StudioFS and `/home/val/dev/studiofs-bench` source trees for
+promotion evidence. Record both source revisions and dirty states, `uname -a`,
+CPU count, memory, `findmnt`, the backing filesystem/device for `--cache-dir`,
+allowlisted mount environment, StudioFS/benchmark binary checksums, cgroup
+path/baseline, correctness-manifest path and SHA-256, and first runtime snapshot
+in `environment.json`. Verify `/proc/$mount_pid/exe` has the supplied StudioFS
+binary checksum and record `/proc/$mount_pid/stat` start time to prevent PID
+reuse. Reject the manifest before I/O unless its revision, clean state, both
+binary checksums, and required non-skipped test results match this run.
 
 In the same task, create `tools/perf/linux-cache-matrix.sh` accepting volume,
-mount-root, delegated cgroup-root, repetitions, output-root, benchmark path, and
-StudioFS path. Before any performance mount it runs the Task 5 correctness
+mount-root, delegated cgroup-root, repetitions, output-root, benchmark path,
+StudioFS path, and an explicit `--diagnostic` flag. Before any performance mount it runs the Task 5 correctness
 commands and emits the machine-owned correctness manifest. It then enumerates
 all six workloads and three modes, invoking the collector with `--runs 1` and
 that manifest for every `(repetition, workload, mode)` tuple. For every tuple:
@@ -866,29 +926,54 @@ so drift is not aligned with one candidate. `--dry-run` emits the complete
 correctness commands, schedule, and cleanup actions without mounting. Never
 mask cleanup status with `|| true`.
 
-- [ ] **Step 4: Implement bounded idle and mount-process sampling**
-
-Before each workload poll `.studiofs-runtime-stats` every 500 ms until the following base gauges are zero for three consecutive snapshots:
+Write exactly this aggregation layout:
 
 ```text
-gauge cache.dirty_bytes bytes 0
-gauge upload_queue.pending_depth count 0
-gauge upload_queue.active_uploads count 0
+<matrix>/correctness-manifest.json
+<matrix>/schedule.json
+<matrix>/<mode>/<workload>/rep-NNN/...
 ```
 
-Require the async/lifecycle gauges introduced by the prerequisites to be zero in those same snapshots:
+Normal promotion runs require exactly five repetitions. Three exploratory
+repetitions are accepted only with `--diagnostic`; their manifests and outputs
+are marked promotion-ineligible. Validate the schedule against the filesystem
+and reject missing, duplicate, or extra tuples or any reused cgroup. The
+summary analyzer receives the three `<matrix>/<mode>` directories.
+
+- [ ] **Step 4: Implement bounded idle and mount-process sampling**
+
+Never obtain evidence by reading `.studiofs-runtime-stats` through the mount:
+that read is itself a Linux FUSE callback and contaminates the counters being
+measured. Every snapshot and idle poll uses the existing out-of-band local
+diagnostics transport:
+
+```bash
+"$studiofs" internal diagnostics-attach "$mount_point" \
+  --recent-events-limit 1 --log-level error
+```
+
+Parse and persist only `.runtime_snapshot`. Hard-fail when `.session.pid` does
+not equal `mount_pid`, normalized `.session.mount_point` does not equal the
+target mount, or `.runtime_snapshot` is null or lacks the expected schema.
+Final evidence has no mounted-file fallback.
+
+Poll every 500 ms until these JSON values are zero for three consecutive
+snapshots:
 
 ```text
-gauge bridge.fuse_async_write.pending_writes count 0
-gauge bridge.fuse_async_write.pending_bytes bytes 0
-gauge bridge.fuse_async_write.pending_handles count 0
-gauge bridge.os_cache.active_writers count 0
-gauge bridge.os_cache.active_foreground_handles count 0
+runtime_snapshot.ingress.dirty_mem_bytes
+runtime_snapshot.upload.pending_uploads
+runtime_snapshot.upload.active_uploads
+runtime_snapshot.write_path.fuse_async_write.pending_writes
+runtime_snapshot.write_path.fuse_async_write.pending_bytes
+runtime_snapshot.write_path.fuse_async_write.pending_handles
+runtime_snapshot.write_path.os_cache.active_writers
+runtime_snapshot.write_path.os_cache.active_foreground_handles
 ```
 
 Fail after 600 seconds and retain the final snapshots. Measure each external workload as two explicitly marked phases:
 
-1. capture runtime stats, `/proc/$mount_pid/{stat,status,smaps_rollup,io}`, `/proc/meminfo`, and cgroup `memory.current`, `memory.peak`, and `memory.stat` at `foreground_start`, then start `pidstat -urd -h -p "$mount_pid" 1` plus a 100 ms cgroup-memory sampler;
+1. capture the out-of-band runtime snapshot, `/proc/$mount_pid/{stat,status,smaps_rollup,io}`, `/proc/meminfo`, and cgroup `memory.current`, `memory.peak`, and `memory.stat` at `foreground_start`, then start `LC_ALL=C pidstat -urd -h -p "$mount_pid" 1` plus a 100 ms sampler that records cgroup memory and the mount process's `VmRSS`/`RssAnon` from `/proc/$mount_pid/status`;
 2. run the client workload, record `foreground_end`, and capture another runtime/proc snapshot;
 3. keep `pidstat` running while the same idle poll drains local dirty state and uploads;
 4. record `drain_end`, capture the final runtime/proc/cgroup snapshot, then stop and reap both samplers;
@@ -898,7 +983,12 @@ This split is mandatory even when the drain is empty. It prevents background CPU
 
 Require all idle gauges to be zero only at `foreground_start` and `drain_end`. Preserve `foreground_end` backlog as evidence; dirty bytes or uploads there are expected and must not fail the run.
 
-`pidstat` absence is a hard failure for real evidence and only an explicit warning in `--dry-run`.
+`pidstat` absence, an unusable/empty sample stream, or locale-dependent parse
+failure is a hard failure for real evidence and only an explicit warning in
+`--dry-run`. Define p95 over sampled core equivalents with nearest rank
+`ceil(0.95 * n)` after sorting, using one-second pidstat samples; sampled peak
+is the maximum. Boundary-only `/proc` snapshots are not used as RSS/anonymous
+peaks.
 
 - [ ] **Step 5: Execute exactly one selected workload per collector run**
 
@@ -909,7 +999,7 @@ Large single file:
 ```bash
 "$bench" --scripted --target "$mount_point" \
   --workload-bytes "$workload_bytes" --run-mode mounted \
-  --mode read-write --layout single-file --cache enabled --save-report
+  --mode read-write --layout single-file --cache enabled --keep-files --save-report
 ```
 
 Fixed 1 MiB files:
@@ -917,7 +1007,7 @@ Fixed 1 MiB files:
 ```bash
 "$bench" --scripted --target "$mount_point" \
   --workload-bytes "$workload_bytes" --run-mode mounted \
-  --mode read-write --file-size-mb 1 --cache enabled --save-report
+  --mode read-write --file-size-mb 1 --cache enabled --keep-files --save-report
 ```
 
 Exact small files use an embedded Python standard-library client, not the multi-phase `studiofs devbench` command. Create exactly 1,000 unique 128 KiB files, fsync/close them, reopen every file, verify size and checksum, and report exactly 131,072,000 logical bytes written plus the same bytes read:
@@ -932,41 +1022,61 @@ Use embedded Python 3 standard-library programs, following the existing gate sty
 
 - stable warm reopen: create a unique file for that run, run a Python write/fsync preparation phase, return to Bash for the same three-snapshot idle gate, then run a Python read phase with two fresh opens and per-pass counter snapshots; delete it only after the second pass and final metrics snapshot;
 - same-file parallel writes: `min(os.cpu_count() or 1, 8)` threads use `os.pwrite` for equal disjoint 64 MiB regions, fsync once, reopen, and verify deterministic bytes; record the selected parallelism;
-- cross-file barriers: write two files concurrently, fsync/close each, record completion times, reopen, and verify exact bytes.
+- cross-file barriers: write two 64 MiB files concurrently, fsync/close each, record completion times, reopen, and verify exact bytes.
 
-Kernel records the same-file workload as correctness/CPU evidence but does not compare its direct-write speed to Direct. Direct serial and Direct async compare it directly. Copy each benchmark's generated JSON to the stable `client-report.json` name while retaining the original report. Before real evidence, rebuild the bundled benchmark from `/home/val/dev/studiofs-bench` at the tested revision with an actual completed `run.file_count` field, copy that binary to `target/bench/studiofs-bench`, and record its SHA-256 in the manifest.
+Kernel records the same-file workload as correctness/CPU evidence but does not compare its direct-write speed to Direct. Direct serial and Direct async compare it directly. Require exactly one generated benchmark JSON, copy it to stable `client-report.json`, and retain the original. Before real evidence, rebuild from clean `/home/val/dev/studiofs-bench`, record its source revision (currently `34b28dc`), source dirty state and binary SHA-256 (currently `b7f4b25752eb051378216819f02d356f92409fb751c65cc5c4c4d910bfabbae2`), copy the binary to `target/bench/studiofs-bench`, and refresh the bundled README so its report schema includes `run.file_count`.
 
-Parse every client report before accepting the run. `large-single` must report exactly 4,000,000,000 configured bytes and `run.file_count == 1`; `fixed-1m` exactly 4,000,000,000 bytes and `run.file_count == 4,000`; `small-128k` exactly 1,000 files and 131,072,000 bytes. A tool rounding, partial completion, or silently adding another phase is a hard harness failure.
+For every benchmark report require exact `run.workload_bytes` and
+`run.file_count`, `run.stopped == false`, `run.cleanup_error == null`, mounted
+run mode and expected target/layout, and exactly one write plus one read pass.
+Each pass has exact `bytes_processed` and `stopped == false`. `large-single`
+uses 4,000,000,000 bytes and one file; `fixed-1m` uses 4,000,000,000 bytes and
+4,000 files.
+
+All Python clients emit one minimal common report: workload, exact file count,
+exact bytes written/read, expected and actual aggregate checksum, completion
+boolean, and cleanup error. Require checksum equality and completion. Measured
+totals are: small `131,072,000` written plus read; warm preparation is separate
+and excluded, with zero measured write bytes and `2 * workload_bytes` read;
+same-file is `parallelism * 64 MiB` written plus read; cross-file is two
+64 MiB files written plus read. Tool rounding, partial completion, an extra
+phase/report, or configured bytes substituted for processed bytes is a hard
+harness failure.
+
+Because benchmark runs keep their files, perform deletion only after the
+measured drain and final snapshot. Record a separate cleanup status and cleanup
+drain; exclude deletion work from foreground/drain CPU and throughput math.
 
 - [ ] **Step 6: Write a stable artifact schema**
 
-Each invocation writes:
+Each collector invocation owns one matrix repetition directory and writes:
 
 ```text
-<artifact>/environment.json
-<artifact>/manifest.json
-<artifact>/<workload>/run-001/command.txt
-<artifact>/<workload>/run-001/runtime-foreground-start.txt
-<artifact>/<workload>/run-001/runtime-foreground-end.txt
-<artifact>/<workload>/run-001/runtime-drain-end.txt
-<artifact>/<workload>/run-001/proc-foreground-start/{stat,status,io}.txt
-<artifact>/<workload>/run-001/proc-foreground-end/{stat,status,io}.txt
-<artifact>/<workload>/run-001/proc-drain-end/{stat,status,io}.txt
-<artifact>/<workload>/run-001/cgroup-foreground-{start,end}.json
-<artifact>/<workload>/run-001/cgroup-drain-end.json
-<artifact>/<workload>/run-001/cgroup-memory-samples.jsonl
-<artifact>/<workload>/run-001/pidstat.txt
-<artifact>/<workload>/run-001/client-report.json
-<artifact>/<workload>/run-001/derived.json
-<artifact>/summary.md
-<artifact>/decision.md
+<rep>/environment.json
+<rep>/manifest.json
+<rep>/command.txt
+<rep>/runtime-foreground-start.json
+<rep>/runtime-foreground-end.json
+<rep>/runtime-drain-end.json
+<rep>/runtime-cleanup-end.json
+<rep>/proc-foreground-start/{stat,status,smaps_rollup,io}.txt
+<rep>/proc-foreground-end/{stat,status,smaps_rollup,io}.txt
+<rep>/proc-drain-end/{stat,status,smaps_rollup,io}.txt
+<rep>/cgroup-foreground-{start,end}.json
+<rep>/cgroup-drain-end.json
+<rep>/cgroup-memory-samples.jsonl
+<rep>/process-memory-samples.jsonl
+<rep>/pidstat.txt
+<rep>/client-report.json
+<rep>/cleanup.json
+<rep>/derived.json
 ```
 
-The matrix root additionally owns one `correctness-manifest.json`; each
-artifact references its absolute path and checksum instead of copying or
-rewriting it.
+The matrix root owns `correctness-manifest.json`, `schedule.json`, and the final
+`comparison/` output; each repetition references the manifest's absolute path
+and checksum instead of copying or rewriting it.
 
-Include `smaps_rollup` beside each listed proc snapshot. `derived.json` contains verified bytes written/read, foreground wall seconds, end-to-end foreground throughput, client-reported phase throughput, foreground and drain mount CPU seconds, total lifecycle CPU seconds/GiB, foreground/drain average, p95, and sampled-peak core equivalents, drain duration, daemon RSS/anonymous peaks, cgroup total/file/anon peaks and deltas, `/proc` backing-I/O deltas, callback/barrier interval p50/p95/p99/max-upper-bound, errors/cancellations, queue peaks, negotiated geometry, liveness deltas, and warm callback/cache-decision deltas.
+`derived.json` contains verified bytes written/read, foreground wall seconds, end-to-end foreground throughput, client-reported phase throughput, foreground and drain mount CPU seconds, total lifecycle CPU seconds/GiB, foreground/drain average, nearest-rank p95, and sampled-peak core equivalents, drain duration, sampled daemon RSS/anonymous peaks, cgroup total/file/anon peaks and deltas, `/proc` backing-I/O deltas, callback/barrier interval p50/p95/p99/max-upper-bound, errors/cancellations, queue peaks, negotiated geometry, liveness deltas, and warm callback/cache-decision deltas. Cgroup total peak remains diagnostic; daemon `VmRSS`/`RssAnon` and cgroup file memory own the independent gates because total also includes unsynchronized kernel/slab memory.
 
 Define `processed_gib = (verified_bytes_written + verified_bytes_read) / 2^30` and `CPU-seconds/GiB = mount_user_plus_system_cpu_seconds / processed_gib`; cleanup/deletion bytes are excluded. Compute mount CPU from `/proc/<pid>/stat` fields 14+15 divided by `getconf CLK_TCK`; the client process CPU is never substituted. Rebuild callback/barrier interval statistics from raw bucket deltas as specified in Task 4.
 
@@ -984,6 +1094,19 @@ Create `tools/perf/linux_cache_gate_summary.py` with:
 
 Use `statistics.median`; MAD is the median absolute deviation from the median. The primary throughput is verified processed bytes divided by measured foreground wall time, not the benchmark's lifecycle-excluding phase average. Primary cold workloads are the 4 GB single file, 4,000 fixed 1 MB files, and the exact 1,000 x 128 KiB client. First decide Direct async against Direct serial. If Direct async passes every applicable gate, use it as Kernel's baseline; otherwise use Direct serial and label that choice in every output. Compare the same-file parallel workload only between Direct serial and Direct async.
 
+For promotion, require the complete scheduled set with exactly five
+repetitions per mode/workload and reject missing, duplicate, or extra tuples.
+Diagnostic three-repetition inputs are reported but never promotion-eligible.
+Direct serial must itself pass correctness, provenance, geometry, histogram,
+cleanup, CPU, and memory eligibility; an invalid Direct-serial baseline makes
+every promotion decision ineligible. Direct async rejection may select Direct
+serial for Kernel only when that baseline is fully eligible.
+
+Define applicable histogram kinds per workload. Require a nonempty interval
+only where that callback is expected. In particular, zero read callbacks on
+Kernel's second stable-warm pass is the success condition, not a missing-sample
+failure; its first pass must still provide the positive callback/control proof.
+
 Fail a candidate when any condition holds:
 
 - any correctness result, command, callback, task, cancellation, or cleanup failed;
@@ -1000,7 +1123,6 @@ Fail a candidate when any condition holds:
   `max(2 * (baseline_mad + candidate_mad), 0.10 * workload_bytes)`; this
   accounts for one intentional kernel-cache copy but rejects additional
   unexplained copies;
-- cgroup total `memory.peak` contradicts the independently derived anon-plus-file bound; manifest prose may annotate a failure but never waive it;
 - Kernel's stable second warm read adds a FUSE or VFS read callback; Direct modes report their callback deltas as controls without this reuse gate;
 - any required idle gauge is nonzero at `foreground_start` or `drain_end` (the `foreground_end` backlog is evidence, not a failure).
 
@@ -1048,6 +1170,7 @@ Use the matrix orchestrator so every mode/workload repetition receives a fresh m
 
 ```bash
 bash tools/perf/linux-cache-matrix.sh \
+  --diagnostic \
   --volume "$VOLUME" \
   --mount-root target/perf/linux-cache-exploratory/mounts \
   --cgroup-root "$DELEGATED_CGROUP_ROOT" \
@@ -1055,7 +1178,7 @@ bash tools/perf/linux-cache-matrix.sh \
   --output-root target/perf/linux-cache-exploratory
 ```
 
-The orchestrator supplies explicit variables for Direct serial, Direct async, and Kernel, and records the balanced schedule. Stop and fix correctness, instrumentation, or harness defects. Do not tune thresholds after seeing a failing performance result.
+The orchestrator supplies explicit variables for Direct serial, Direct async, and Kernel, records the balanced schedule, and marks this three-run output promotion-ineligible. Stop and fix correctness, instrumentation, or harness defects. Do not tune thresholds after seeing a failing performance result.
 
 - [ ] **Step 3: Take one separate profile per viable candidate**
 
@@ -1073,7 +1196,7 @@ Implement only the smallest measured fix, rebuild, and restart exploratory runs 
 
 - [ ] **Step 5: Run five clean final repetitions**
 
-Repeat Step 2 with `--repetitions 5` and:
+Repeat Step 2 without `--diagnostic`, with `--repetitions 5` and:
 
 ```text
 target/perf/linux-cache-final
@@ -1085,9 +1208,9 @@ Verify every `environment.json` has the same git revision and binary checksums.
 
 ```bash
 python3 tools/perf/linux_cache_gate_summary.py \
-  --direct-serial "$DIRECT_SERIAL_ARTIFACT" \
-  --direct-async "$DIRECT_ASYNC_ARTIFACT" \
-  --kernel "$KERNEL_ARTIFACT" \
+  --direct-serial target/perf/linux-cache-final/direct-serial \
+  --direct-async target/perf/linux-cache-final/direct-async \
+  --kernel target/perf/linux-cache-final/kernel \
   --correctness-manifest target/perf/linux-cache-final/correctness-manifest.json \
   --output target/perf/linux-cache-final/comparison
 ```
@@ -1135,15 +1258,17 @@ Distinguish stable configuration from benchmark overrides, current default from 
 ```bash
 cargo test -p studiofs-linux-fuse cache_policy_ -- --nocapture
 cargo test -p studiofs-linux-fuse async_dio_policy_ -- --nocapture
-env -u STUDIOFS_LINUX_FUSE_CACHE_POLICY -u STUDIOFS_FUSE_ASYNC_DIO \
-  cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct STUDIOFS_FUSE_ASYNC_DIO=0 \
   cargo test -p studiofs-linux-fuse mounted_direct_rollback_preserves_reopen_visibility \
   -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs --test architecture_vocabulary_test -- --nocapture
 ```
 
-Expected: selected default and both explicit rollback paths match docs and evidence.
+Additionally run exactly one unfiltered-environment mounted test matching the
+selected branch (Direct serial rollback visibility, Direct async same-file
+parallelism, or Kernel coherence matrix). Do not use `mounted_`: it includes
+mutually exclusive mode assertions. Expected: selected default and both
+explicit rollback paths match docs and evidence.
 
 - [ ] **Step 5: Commit exactly one policy branch**
 
@@ -1192,6 +1317,12 @@ Windows: cargo test -p studiofs-winfsp --lib -- --nocapture --test-threads=1
 ```
 
 Record job URLs/revisions in the evidence document. Linux cfg-elided invocations of those crates are not acceptable substitutes.
+
+On the current host the local libfuse 3.18 path, cgroup v2 delegation,
+`pidstat`, and `findmnt` are available, but no `rwx` CLI is installed. Rocky,
+macOS, and Windows therefore require configured remote runners. Keep final
+completion pending until those real jobs have run and their revision-matched
+URLs are recorded; absence of the runner is not a passing signal.
 
 - [ ] **Step 4: Audit evidence against measured binaries**
 
