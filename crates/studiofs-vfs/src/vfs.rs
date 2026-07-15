@@ -6790,21 +6790,25 @@ impl StudioVfs {
             return;
         }
 
-        let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let hard_window_bytes =
-            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
         let mut hard_wait_started = None;
         let shutdown = self.state.shutdown.background_shutdown_token.clone();
-        let pressure = loop {
+        let memory_pressure_changed = self.memory_pressure.change_notify();
+        let (pressure, buffer_budget_bytes) = loop {
             let dirty_reduced = self.state.writer_stack.dirty_reduced();
+            let pressure_changed = memory_pressure_changed.notified();
             tokio::pin!(dirty_reduced);
+            tokio::pin!(pressure_changed);
             // Register before rechecking pressure so a concurrent drain cannot
-            // notify between the check and the await and leave this writer asleep.
+            // or limit change cannot notify between the check and the await.
             let _ = dirty_reduced.as_mut().enable();
+            let _ = pressure_changed.as_mut().enable();
+            let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
+            let hard_window_bytes =
+                buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
             let pressure = self.write_admission_pressure();
             let writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
             if writer_stack_pressure_bytes <= hard_window_bytes || self.shutdown_requested() {
-                break pressure;
+                break (pressure, buffer_budget_bytes);
             }
             hard_wait_started.get_or_insert_with(Instant::now);
             // #region debug log
@@ -6828,7 +6832,8 @@ impl StudioVfs {
 
             tokio::select! {
                 _ = &mut dirty_reduced => {}
-                _ = shutdown.cancelled() => break pressure,
+                _ = &mut pressure_changed => {}
+                _ = shutdown.cancelled() => break (pressure, buffer_budget_bytes),
             }
         };
         let pressure_bytes = pressure.total_bytes();

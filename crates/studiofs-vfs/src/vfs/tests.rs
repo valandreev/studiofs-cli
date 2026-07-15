@@ -528,6 +528,56 @@ fn memory_pressure_dirty_admission_wakes_on_drain_without_timer_polling() {
     });
 }
 
+#[test]
+fn memory_pressure_dirty_admission_wakes_on_limit_recovery_without_drain() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-dirty-recovery");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(1, b"recovery.bin", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let dirty_bytes = vfs.block_size as usize * HARD_BACKPRESSURE_DIRTY_MULTIPLIER + 1;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xCD; dirty_bytes]),
+            )
+            .unwrap();
+        vfs.memory_pressure_controller()
+            .publish(constrained_memory_snapshot(1, u64::MAX));
+
+        let admission_vfs = Arc::clone(&vfs);
+        let mut admission = tokio::spawn(async move {
+            admission_vfs.maybe_throttle_write_admission(1, 0).await;
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!admission.is_finished());
+
+        vfs.memory_pressure_controller()
+            .publish(constrained_memory_snapshot(
+                (vfs.block_size as u64).saturating_mul(4),
+                u64::MAX,
+            ));
+
+        tokio::time::timeout(Duration::from_millis(100), &mut admission)
+            .await
+            .expect("dirty-limit recovery should wake admission without a drain")
+            .expect("admission task should not panic");
+        assert_eq!(vfs.state.writer_stack.total_dirty_bytes(), dirty_bytes);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+    });
+}
+
 fn runtime_stats_test_tempdir() -> TempDir {
     studiofs_test_support::workspace_target_tempdir("runtime-stats-")
 }
