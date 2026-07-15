@@ -41,6 +41,7 @@ Execute this plan after `2026-07-14-linux-fuse-async-write-correctness.md`, beca
 - Modify: `crates/studiofs-bridge/Cargo.toml` — Unix `dashmap` and `parking_lot` dependencies.
 - Create: `crates/studiofs-vfs/src/vfs/os_cache.rs` — decisions, exact generation, bounded store, active writer state, lifecycle cleanup, tests.
 - Modify: `crates/studiofs-vfs/src/vfs.rs` — module/export, `StudioVfs` state, prepare API, shared metrics.
+- Modify: `crates/studiofs-vfs/src/vfs/bootstrap.rs` — initialize shared OS-cache state in the single VFS assembly path.
 - Modify: `crates/studiofs-vfs/src/lib.rs` — public decision/stat exports.
 - Modify: `crates/studiofs-vfs/src/vfs/file_session.rs` — idempotent per-handle preparation/lifecycle state.
 - Modify: `crates/studiofs-vfs/src/vfs/config.rs` — carry lifecycle in final release context.
@@ -355,7 +356,7 @@ Expected: every exact-identity and eviction test passes.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/os_cache.rs
+git add crates/studiofs-vfs/src/lib.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/bootstrap.rs crates/studiofs-vfs/src/vfs/os_cache.rs
 git commit -m "feat(vfs): own exact os cache generations"
 ```
 
