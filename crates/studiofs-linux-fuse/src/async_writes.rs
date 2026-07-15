@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,7 @@ struct LinuxFuseAsyncWriteState {
 
 pub(crate) struct LinuxFuseAsyncWrites {
     limits: LinuxFuseAsyncWriteLimits,
+    active_max_pending_bytes: AtomicUsize,
     state: Mutex<LinuxFuseAsyncWriteState>,
     changed: Condvar,
     task_cancellation: CancellationToken,
@@ -86,9 +88,20 @@ impl LinuxFuseAsyncWrites {
                 max_pending_bytes,
                 max_pending_writes,
             },
+            active_max_pending_bytes: AtomicUsize::new(max_pending_bytes),
             state: Mutex::new(LinuxFuseAsyncWriteState::default()),
             changed: Condvar::new(),
             task_cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn set_active_max_pending_bytes(&self, max_pending_bytes: usize) {
+        let max_pending_bytes = max_pending_bytes.min(self.limits.max_pending_bytes);
+        let previous = self
+            .active_max_pending_bytes
+            .swap(max_pending_bytes, Ordering::AcqRel);
+        if previous != max_pending_bytes {
+            self.changed.notify_all();
         }
     }
 
@@ -142,8 +155,8 @@ impl LinuxFuseAsyncWrites {
 
             let bytes_exhausted = bytes
                 > self
-                    .limits
-                    .max_pending_bytes
+                    .active_max_pending_bytes
+                    .load(Ordering::Acquire)
                     .saturating_sub(state.stats.pending_bytes);
             let writes_exhausted = state.stats.pending_writes >= self.limits.max_pending_writes;
             if !bytes_exhausted && !writes_exhausted {
@@ -752,6 +765,73 @@ mod tests {
         })
         .await
         .expect("normal capacity handoff test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shrinking_active_byte_limit_preserves_admitted_write_and_blocks_new_admission() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 2));
+            let admitted = writes.admit(12, |_| {}).expect("admit existing write");
+            writes.set_active_max_pending_bytes(8);
+
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let waiting_writes = Arc::clone(&writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                waiting_writes.admit(1, |stats| {
+                    let _ = observed_tx.send(stats);
+                })
+            });
+            let observed = observed_rx.await.expect("admission wait observation");
+            assert_eq!(observed.pending_bytes, 12);
+
+            drop(admitted);
+            let reservation = waiter
+                .await
+                .expect("admission waiter join")
+                .expect("admit after existing write drains");
+            assert_eq!(writes.stats().pending_bytes, 1);
+            drop(reservation);
+        })
+        .await
+        .expect("active-limit shrink test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn increasing_active_byte_limit_wakes_waiter_without_a_completion() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 2));
+            writes.set_active_max_pending_bytes(4);
+            let admitted = writes.admit(4, |_| {}).expect("fill active budget");
+
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let waiting_writes = Arc::clone(&writes);
+            let waiter = tokio::task::spawn_blocking(move || {
+                waiting_writes.admit(4, |stats| {
+                    let _ = observed_tx.send(stats);
+                })
+            });
+            observed_rx.await.expect("admission wait observation");
+
+            writes.set_active_max_pending_bytes(8);
+            let second = waiter
+                .await
+                .expect("admission waiter join")
+                .expect("admit after active limit recovery");
+            assert_eq!(writes.stats().pending_bytes, 8);
+            drop(second);
+            drop(admitted);
+        })
+        .await
+        .expect("active-limit recovery test timed out");
+    }
+
+    #[test]
+    fn active_byte_limit_is_clamped_to_immutable_ceiling() {
+        let writes = Arc::new(LinuxFuseAsyncWrites::new(8, 2));
+
+        writes.set_active_max_pending_bytes(16);
+
+        assert_eq!(writes.admit(9, |_| {}).err(), Some(libc::E2BIG));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

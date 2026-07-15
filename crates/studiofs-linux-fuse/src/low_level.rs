@@ -396,7 +396,16 @@ impl SessionState {
 
     fn record_negotiated_geometry(&self, geometry: LinuxFuseNegotiatedGeometry) {
         let _ = self.negotiated_geometry.set(geometry);
+        self.refresh_async_write_active_limit();
         self.publish_fuse_connection_snapshot(self.negotiated_geometry.get().copied());
+    }
+
+    fn refresh_async_write_active_limit(&self) {
+        self.async_writes
+            .set_active_max_pending_bytes(linux_fuse_async_write_active_limit(
+                &self.vfs,
+                self.negotiated_geometry.get().copied(),
+            ));
     }
 
     fn publish_fuse_connection_snapshot(&self, negotiated: Option<LinuxFuseNegotiatedGeometry>) {
@@ -728,6 +737,22 @@ fn record_linux_async_write_stats(
         barrier_wait_total_ms: stats.barrier_wait_total_ms,
         ..VfsFuseAsyncWriteSnapshot::default()
     });
+}
+
+fn linux_fuse_async_write_active_limit(
+    vfs: &StudioVfs,
+    negotiated: Option<LinuxFuseNegotiatedGeometry>,
+) -> usize {
+    let snapshot = vfs.memory_pressure_controller().snapshot();
+    if snapshot.state == studiofs_vfs::MemoryPressureState::Disabled {
+        return LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES;
+    }
+
+    let pressure_limit = usize::try_from(snapshot.limits.async_write_bytes).unwrap_or(usize::MAX);
+    let negotiated_max_write = negotiated.map_or(0, |geometry| geometry.max_write as usize);
+    pressure_limit
+        .max(negotiated_max_write)
+        .min(LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES)
 }
 
 struct LinuxFuseWriteRequest {
@@ -2362,6 +2387,7 @@ impl SessionState {
         let vfs = self.vfs.clone();
         let metric_config = self.metric_config;
         let request_ticket = self.start_live_async_write_request(fh)?;
+        self.refresh_async_write_active_limit();
         let mut guard = FuseWriteTaskGuard {
             request: Some(FuseReqPtr::new(req)),
             request_ticket: Some(request_ticket),
@@ -4869,6 +4895,44 @@ mod tests {
         assert_eq!(connection.negotiated_congestion_threshold, Some(48));
         assert_eq!(connection.negotiated_async_dio, Some(false));
         assert_eq!(connection.negotiated_writeback_cache, Some(true));
+    }
+
+    #[test]
+    fn async_write_active_limit_follows_memory_pressure_with_negotiated_write_floor() {
+        let (_fixture, state) = cache_test_state(
+            "linux-async-write-pressure-limit",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let controller = state.vfs.memory_pressure_controller();
+        let mut snapshot = controller.snapshot();
+        snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+        snapshot.state = studiofs_vfs::MemoryPressureState::Constrained;
+        snapshot.limits.async_write_bytes = 512 * 1024;
+        controller.publish(snapshot);
+        let geometry = super::LinuxFuseNegotiatedGeometry {
+            max_write: 1024 * 1024,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::linux_fuse_async_write_active_limit(&state.vfs, Some(geometry)),
+            1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn disabled_memory_pressure_keeps_async_write_ceiling() {
+        let (_fixture, state) = cache_test_state(
+            "linux-async-write-pressure-disabled",
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+
+        assert_eq!(
+            super::linux_fuse_async_write_active_limit(&state.vfs, None),
+            super::LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
+        );
     }
 
     #[test]
