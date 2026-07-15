@@ -164,6 +164,38 @@ impl StudioVfs {
             "count",
             write_path.os_cache.active_foreground_handles,
         );
+        for (name, value) in [
+            (
+                "fuse_liveness.snapshot_generation",
+                write_path.fuse_liveness.snapshot_generation,
+            ),
+            (
+                "fuse_liveness.observed_references",
+                write_path.fuse_liveness.observed_references,
+            ),
+            (
+                "fuse_liveness.forgotten_references",
+                write_path.fuse_liveness.forgotten_references,
+            ),
+            (
+                "fuse_liveness.retired_inodes",
+                write_path.fuse_liveness.retired_inodes,
+            ),
+            (
+                "fuse_liveness.open_unknown_inode",
+                write_path.fuse_liveness.open_unknown_inode,
+            ),
+            (
+                "fuse_liveness.notifications_forwarded",
+                write_path.fuse_liveness.notifications_forwarded,
+            ),
+            (
+                "fuse_liveness.notifications_suppressed",
+                write_path.fuse_liveness.notifications_suppressed,
+            ),
+        ] {
+            insert_counter(&mut snapshot.bridge, name, "count", value);
+        }
         insert_counter(
             &mut snapshot.bridge,
             "callback_errors",

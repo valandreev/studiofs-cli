@@ -16,6 +16,8 @@ pub struct FuseInodeLivenessStats {
     pub forgotten_references: u64,
     /// Live inodes explicitly retired after final removal.
     pub retired_inodes: u64,
+    /// Open replies attempted for inodes without a lookup reference.
+    pub open_unknown_inode: u64,
     /// Notifications forwarded for observed inodes.
     pub notifications_forwarded: u64,
     /// Notifications suppressed for unknown inodes.
@@ -179,6 +181,14 @@ impl FuseInodeLiveness {
         }
     }
 
+    /// Record an open reply for an inode without a lookup reference.
+    pub fn record_open_unknown_inode(&self) -> u64 {
+        let mut stats = self.stats.lock();
+        stats.open_unknown_inode = stats.open_unknown_inode.saturating_add(1);
+        stats.snapshot_generation = stats.snapshot_generation.saturating_add(1);
+        stats.open_unknown_inode
+    }
+
     /// Invoke `notify` only while the inode is still observed.
     pub fn notify_if_observed(&self, ino: u64, notify: impl FnOnce()) -> bool {
         let should_notify = self.current(ino).is_some_and(|state| {
@@ -292,6 +302,23 @@ mod tests {
 
         assert!(!liveness.is_observed(42));
         assert_eq!(liveness.stats(), FuseInodeLivenessStats::default());
+    }
+
+    #[test]
+    fn open_unknown_inode_counter_shares_snapshot_generation() {
+        let liveness = FuseInodeLiveness::default();
+
+        liveness.record_open_unknown_inode();
+        liveness.record_open_unknown_inode();
+
+        assert_eq!(
+            liveness.stats(),
+            FuseInodeLivenessStats {
+                snapshot_generation: 2,
+                open_unknown_inode: 2,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -425,6 +452,7 @@ mod tests {
                 observed_references: 3,
                 forgotten_references: 2,
                 retired_inodes: 1,
+                open_unknown_inode: 0,
                 notifications_forwarded: 1,
                 notifications_suppressed: 1,
             }

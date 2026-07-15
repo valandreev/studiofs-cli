@@ -7,14 +7,17 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
-use studiofs_bridge::posix::{
-    BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
-    to_bridge_attr, vfs_err_to_errno,
+use studiofs_bridge::{
+    fuse_liveness::{FuseInodeLiveness, LivenessCheckedKernelInvalidator},
+    posix::{
+        BridgeFileAttr, BridgeFileType, normalize_close_barrier_result, posix_flags_to_open_flags,
+        to_bridge_attr, vfs_err_to_errno,
+    },
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{
     DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
-    VfsFuseAsyncWriteSnapshot,
+    VfsFuseAsyncWriteSnapshot, VfsFuseLivenessSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -82,6 +85,7 @@ pub(crate) mod raw {
     #[link(name = "fuse3")]
     unsafe extern "C" {
         pub(crate) fn fuse_reply_err(req: *mut FuseReq, err: c_int) -> c_int;
+        pub(crate) fn fuse_reply_none(req: *mut FuseReq);
         pub(crate) fn fuse_reply_entry(req: *mut FuseReq, entry: *const FuseEntryParam) -> c_int;
         pub(crate) fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: f64) -> c_int;
         pub(crate) fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
@@ -153,6 +157,10 @@ unsafe extern "C" {
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_forget_callback(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
@@ -191,6 +199,7 @@ unsafe extern "C" {
 
 pub(crate) struct SessionState {
     vfs: Arc<StudioVfs>,
+    inode_liveness: Arc<FuseInodeLiveness>,
     runtime_handle: Handle,
     async_writes: Arc<LinuxFuseAsyncWrites>,
     read_only: bool,
@@ -268,6 +277,7 @@ impl SessionState {
     ) -> Self {
         Self {
             vfs,
+            inode_liveness: Arc::new(FuseInodeLiveness::default()),
             runtime_handle,
             async_writes: Arc::new(LinuxFuseAsyncWrites::new(
                 LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
@@ -306,6 +316,23 @@ impl SessionState {
             ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
         )
     }
+
+    fn publish_liveness_stats(&self) {
+        publish_fuse_liveness_stats(&self.vfs, &self.inode_liveness);
+    }
+}
+
+fn publish_fuse_liveness_stats(vfs: &StudioVfs, liveness: &FuseInodeLiveness) {
+    let stats = liveness.stats();
+    vfs.record_fuse_liveness_snapshot(VfsFuseLivenessSnapshot {
+        snapshot_generation: stats.snapshot_generation,
+        observed_references: stats.observed_references,
+        forgotten_references: stats.forgotten_references,
+        retired_inodes: stats.retired_inodes,
+        open_unknown_inode: stats.open_unknown_inode,
+        notifications_forwarded: stats.notifications_forwarded,
+        notifications_suppressed: stats.notifications_suppressed,
+    });
 }
 
 fn shutdown_async_writes_with_timeouts(
@@ -1007,10 +1034,60 @@ impl Session {
     }
 
     pub(crate) fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
-        Arc::new(LinuxFuseKernelInvalidator {
-            session: self.raw,
-            state: Arc::clone(&self.invalidation_state),
-        })
+        let platform_invalidator: Arc<dyn KernelInvalidator> =
+            Arc::new(LinuxFuseKernelInvalidator {
+                session: self.raw,
+                state: Arc::clone(&self.invalidation_state),
+            });
+        let state = self
+            .state
+            .as_ref()
+            .expect("mounted session owns callback state");
+        let checked: Arc<dyn KernelInvalidator> = Arc::new(LivenessCheckedKernelInvalidator::new(
+            Arc::clone(&state.inode_liveness),
+            platform_invalidator,
+        ));
+        Arc::new(PublishingLinuxKernelInvalidator::new(
+            checked,
+            Arc::clone(&state.inode_liveness),
+            Arc::clone(&state.vfs),
+        ))
+    }
+}
+
+struct PublishingLinuxKernelInvalidator {
+    inner: Arc<dyn KernelInvalidator>,
+    inode_liveness: Arc<FuseInodeLiveness>,
+    vfs: Arc<StudioVfs>,
+}
+
+impl PublishingLinuxKernelInvalidator {
+    fn new(
+        inner: Arc<dyn KernelInvalidator>,
+        inode_liveness: Arc<FuseInodeLiveness>,
+        vfs: Arc<StudioVfs>,
+    ) -> Self {
+        Self {
+            inner,
+            inode_liveness,
+            vfs,
+        }
+    }
+
+    fn publish_liveness_stats(&self) {
+        publish_fuse_liveness_stats(&self.vfs, &self.inode_liveness);
+    }
+}
+
+impl KernelInvalidator for PublishingLinuxKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.inner.inval_inode(ino);
+        self.publish_liveness_stats();
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.inner.inval_inode_attrs(ino);
+        self.publish_liveness_stats();
     }
 }
 
@@ -1146,6 +1223,18 @@ pub extern "C" fn studiofs_linux_fuse_lookup(
     let result =
         with_name_bytes(name, |name| state.lookup(parent, name)).unwrap_or(Err(libc::EINVAL));
     reply_entry_result(req, state, result);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_forget(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    nlookup: u64,
+) {
+    reply_forget_with(callback_state(req), ino, nlookup, || {
+        // SAFETY: libfuse owns this request and forget callbacks require exactly one none reply.
+        unsafe { raw::fuse_reply_none(req) };
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -1369,7 +1458,7 @@ pub extern "C" fn studiofs_linux_fuse_open(
         return;
     }
     match state.open(ino, fi) {
-        Ok(fh) => reply_file_open(req, fi, fh),
+        Ok(fh) => reply_file_open(req, state, ino, fi, fh),
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -2523,26 +2612,51 @@ fn fuse_flag(value: bool) -> c_int {
     if value { 1 } else { 0 }
 }
 
+fn reply_forget_with(
+    state: Option<&SessionState>,
+    ino: raw::FuseIno,
+    nlookup: u64,
+    reply_none: impl FnOnce(),
+) {
+    if let Some(state) = state {
+        state.inode_liveness.forget(ino, nlookup);
+        state.publish_liveness_stats();
+    }
+    reply_none();
+}
+
 fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
     result: Result<InodeAttr, i32>,
 ) {
     match result {
-        Ok(attr) => {
-            let stat = state.attr_to_stat(&attr);
-            let entry = raw::FuseEntryParam {
-                ino: attr.ino,
-                generation: 1,
-                attr: stat,
-                attr_timeout: TTL_SECONDS,
-                entry_timeout: TTL_SECONDS,
-            };
+        Ok(attr) => reply_entry_with(state, &attr, |entry| {
             // SAFETY: `entry` is initialized and valid for this synchronous reply.
-            unsafe { raw::fuse_reply_entry(req, &entry) };
-        }
+            unsafe { raw::fuse_reply_entry(req, entry) }
+        }),
         Err(errno) => reply_error(req, errno),
     }
+}
+
+fn reply_entry_with(
+    state: &SessionState,
+    attr: &InodeAttr,
+    reply: impl FnOnce(&raw::FuseEntryParam) -> c_int,
+) {
+    let entry = raw::FuseEntryParam {
+        ino: attr.ino,
+        generation: 1,
+        attr: state.attr_to_stat(attr),
+        attr_timeout: TTL_SECONDS,
+        entry_timeout: TTL_SECONDS,
+    };
+    state.inode_liveness.observe(attr.ino);
+    let status = reply(&entry);
+    if status != 0 {
+        state.inode_liveness.forget(attr.ino, 1);
+    }
+    state.publish_liveness_stats();
 }
 
 fn reply_dir_open(
@@ -2564,11 +2678,31 @@ fn reply_dir_open(
     }
 }
 
-fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) {
+fn reply_file_open(
+    req: *mut raw::FuseReq,
+    state: &SessionState,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+    fh: u64,
+) {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
         return;
     }
+    reply_file_open_with(state, ino, fi, fh, |fi| {
+        // SAFETY: `fi` is initialized and valid for this synchronous reply.
+        unsafe { raw::fuse_reply_open(req, fi) }
+    });
+}
+
+fn reply_file_open_with(
+    state: &SessionState,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+    fh: u64,
+    reply: impl FnOnce(*const raw::FuseFileInfo) -> c_int,
+) {
+    debug_assert!(!fi.is_null());
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
@@ -2580,7 +2714,18 @@ fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) 
             fuse_flag(policy.keep_cache),
             fuse_flag(policy.parallel_direct_writes),
         );
-        raw::fuse_reply_open(req, fi);
+    }
+    let unknown = !state.inode_liveness.is_observed(ino);
+    let _ = reply(fi.cast_const());
+    if unknown {
+        let occurrence = state.inode_liveness.record_open_unknown_inode();
+        state.publish_liveness_stats();
+        if occurrence.is_power_of_two() {
+            warn!(
+                ino,
+                occurrence, "Linux FUSE open reply has no observed lookup reference"
+            );
+        }
     }
 }
 
@@ -2595,15 +2740,28 @@ fn reply_create(
         reply_error(req, libc::EINVAL);
         return;
     }
-    let stat = state.attr_to_stat(attr);
+    reply_create_with(state, fi, attr, fh, |entry, fi| {
+        // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+        unsafe { raw::fuse_reply_create(req, entry, fi) }
+    });
+}
+
+fn reply_create_with(
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    attr: &InodeAttr,
+    fh: u64,
+    reply: impl FnOnce(&raw::FuseEntryParam, *const raw::FuseFileInfo) -> c_int,
+) {
+    debug_assert!(!fi.is_null());
     let entry = raw::FuseEntryParam {
         ino: attr.ino,
         generation: 1,
-        attr: stat,
+        attr: state.attr_to_stat(attr),
         attr_timeout: TTL_SECONDS,
         entry_timeout: TTL_SECONDS,
     };
-    // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+    // SAFETY: the C shim writes fields using the exact system header layout.
     unsafe {
         let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
         studiofs_linux_fuse_file_info_init(
@@ -2613,8 +2771,13 @@ fn reply_create(
             fuse_flag(policy.keep_cache),
             fuse_flag(policy.parallel_direct_writes),
         );
-        raw::fuse_reply_create(req, &entry, fi);
     }
+    state.inode_liveness.observe(attr.ino);
+    let status = reply(&entry, fi.cast_const());
+    if status != 0 {
+        state.inode_liveness.forget(attr.ino, 1);
+    }
+    state.publish_liveness_stats();
 }
 
 fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
@@ -2787,7 +2950,22 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use studiofs_vfs::LocalSyncPolicy;
+    use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy};
+
+    #[derive(Default)]
+    struct RecordingLinuxInvalidator {
+        inode_calls: AtomicUsize,
+    }
+
+    impl KernelInvalidator for RecordingLinuxInvalidator {
+        fn inval_inode(&self, _ino: u64) {
+            self.inode_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn inval_inode_attrs(&self, _ino: u64) {
+            self.inode_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 
@@ -2953,6 +3131,23 @@ mod tests {
 
     fn default_connection_config() -> super::LinuxFuseConnectionConfig {
         super::LinuxFuseConnectionConfig::default()
+    }
+
+    fn liveness_test_state(
+        name: &str,
+    ) -> (
+        studiofs_vfs::contract_harness::ContractVfsFixture,
+        super::SessionState,
+    ) {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(name)
+            .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        (fixture, state)
     }
 
     fn write_via_linux_session(state: &super::SessionState, ino: u64, fh: u64, payload: &[u8]) {
@@ -3618,6 +3813,282 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn linux_low_level_ops_installs_forget_callback() {
+        // SAFETY: the C shim only inspects one callback pointer in a static table.
+        let has_callback = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_forget_callback(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callback, 1);
+    }
+
+    #[test]
+    fn linux_forget_without_callback_state_still_replies_none() {
+        let replies = AtomicUsize::new(0);
+
+        super::reply_forget_with(None, 42, 1, || {
+            replies.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(replies.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn linux_forget_decrements_exact_lookup_count() {
+        let (_fixture, state) = liveness_test_state("linux-forget-exact-count");
+        state.inode_liveness.observe(42);
+        state.inode_liveness.observe(42);
+        state.inode_liveness.observe(42);
+
+        super::reply_forget_with(Some(&state), 42, 2, || {});
+
+        assert!(state.inode_liveness.is_observed(42));
+        assert_eq!(state.inode_liveness.stats().forgotten_references, 2);
+
+        super::reply_forget_with(Some(&state), 42, 1, || {});
+        assert!(!state.inode_liveness.is_observed(42));
+        assert_eq!(state.inode_liveness.stats().forgotten_references, 3);
+    }
+
+    #[test]
+    fn linux_forget_zero_count_is_a_noop() {
+        let (_fixture, state) = liveness_test_state("linux-forget-zero-count");
+        state.inode_liveness.observe(42);
+        let before = state.inode_liveness.stats();
+
+        super::reply_forget_with(Some(&state), 42, 0, || {});
+
+        assert!(state.inode_liveness.is_observed(42));
+        assert_eq!(state.inode_liveness.stats(), before);
+    }
+
+    #[test]
+    fn linux_entry_reply_reserves_before_reply_and_rolls_back_failure() {
+        let (fixture, state) = liveness_test_state("linux-entry-reply-liveness");
+        let accepted = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"accepted", 0, 0, 0o644)
+            .expect("create accepted entry");
+        let rejected = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"rejected", 0, 0, 0o644)
+            .expect("create rejected entry");
+
+        super::reply_entry_with(&state, &accepted, |_| {
+            assert!(state.inode_liveness.is_observed(accepted.ino));
+            0
+        });
+        super::reply_entry_with(&state, &rejected, |_| {
+            assert!(state.inode_liveness.is_observed(rejected.ino));
+            -libc::ENOENT
+        });
+
+        assert!(state.inode_liveness.is_observed(accepted.ino));
+        assert!(!state.inode_liveness.is_observed(rejected.ino));
+    }
+
+    #[test]
+    fn linux_create_reply_reserves_before_reply_and_rolls_back_failure() {
+        let (fixture, state) = liveness_test_state("linux-create-reply-liveness");
+        let accepted = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"accepted", 0, 0, 0o644)
+            .expect("create accepted entry");
+        let rejected = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"rejected", 0, 0, 0o644)
+            .expect("create rejected entry");
+        let mut accepted_info = [0_u64; 32];
+        let mut rejected_info = [0_u64; 32];
+
+        super::reply_create_with(
+            &state,
+            accepted_info.as_mut_ptr().cast(),
+            &accepted,
+            7,
+            |_, _| {
+                assert!(state.inode_liveness.is_observed(accepted.ino));
+                0
+            },
+        );
+        super::reply_create_with(
+            &state,
+            rejected_info.as_mut_ptr().cast(),
+            &rejected,
+            8,
+            |_, _| {
+                assert!(state.inode_liveness.is_observed(rejected.ino));
+                -libc::ENOENT
+            },
+        );
+
+        assert!(state.inode_liveness.is_observed(accepted.ino));
+        assert!(!state.inode_liveness.is_observed(rejected.ino));
+    }
+
+    #[test]
+    fn linux_open_reply_does_not_change_lookup_reference_count() {
+        let (_fixture, state) = liveness_test_state("linux-open-reply-liveness");
+        state.inode_liveness.observe(42);
+        state.inode_liveness.observe(42);
+        let before = state.inode_liveness.stats();
+        let mut accepted_info = [0_u64; 32];
+        let mut rejected_info = [0_u64; 32];
+
+        super::reply_file_open_with(&state, 42, accepted_info.as_mut_ptr().cast(), 7, |_| 0);
+        super::reply_file_open_with(&state, 42, rejected_info.as_mut_ptr().cast(), 8, |_| {
+            -libc::ENOENT
+        });
+
+        assert_eq!(state.inode_liveness.stats(), before);
+        state.inode_liveness.forget(42, 1);
+        assert!(state.inode_liveness.is_observed(42));
+    }
+
+    #[test]
+    fn linux_open_of_unobserved_inode_records_invariant_without_creating_reference() {
+        let (_fixture, state) = liveness_test_state("linux-open-unknown-inode");
+        let mut file_info = [0_u64; 32];
+
+        super::reply_file_open_with(&state, 42, file_info.as_mut_ptr().cast(), 7, |_| {
+            assert!(!state.inode_liveness.is_observed(42));
+            0
+        });
+
+        assert!(!state.inode_liveness.is_observed(42));
+        assert_eq!(state.inode_liveness.stats().observed_references, 0);
+        assert_eq!(state.inode_liveness.stats().open_unknown_inode, 1);
+    }
+
+    #[test]
+    fn linux_unlink_does_not_force_drop_lookup_reference() {
+        let (fixture, state) = liveness_test_state("linux-unlink-keeps-lookup-reference");
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"unlinked", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+
+        state
+            .unlink(studiofs_meta::ROOT_INO, b"unlinked")
+            .expect("unlink file");
+
+        assert!(state.inode_liveness.is_observed(attr.ino));
+    }
+
+    #[test]
+    fn linux_rename_overwrite_does_not_force_drop_lookup_reference() {
+        let (fixture, state) = liveness_test_state("linux-rename-keeps-lookup-reference");
+        fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"source", 0, 0, 0o644)
+            .expect("create source");
+        let replaced = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"target", 0, 0, 0o644)
+            .expect("create target");
+        state.inode_liveness.observe(replaced.ino);
+
+        state
+            .rename(
+                studiofs_meta::ROOT_INO,
+                b"source",
+                studiofs_meta::ROOT_INO,
+                b"target",
+            )
+            .expect("rename over target");
+
+        assert!(state.inode_liveness.is_observed(replaced.ino));
+    }
+
+    #[test]
+    fn linux_unlinked_open_inode_remains_observed_until_forget() {
+        let (fixture, state) = liveness_test_state("linux-unlinked-open-liveness");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"open-unlinked", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        state.inode_liveness.observe(attr.ino);
+
+        state
+            .unlink(studiofs_meta::ROOT_INO, b"open-unlinked")
+            .expect("unlink open file");
+        state.release(fh).expect("release file");
+
+        assert!(state.inode_liveness.is_observed(attr.ino));
+        super::reply_forget_with(Some(&state), attr.ino, 1, || {});
+        assert!(!state.inode_liveness.is_observed(attr.ino));
+    }
+
+    #[test]
+    fn linux_invalidator_suppresses_unknown_or_forgotten_inode() {
+        let (fixture, state) = liveness_test_state("linux-invalidator-liveness");
+        let recorder = Arc::new(RecordingLinuxInvalidator::default());
+        let checked: Arc<dyn KernelInvalidator> = Arc::new(
+            studiofs_bridge::fuse_liveness::LivenessCheckedKernelInvalidator::new(
+                Arc::clone(&state.inode_liveness),
+                recorder.clone(),
+            ),
+        );
+        let invalidator = super::PublishingLinuxKernelInvalidator::new(
+            checked,
+            Arc::clone(&state.inode_liveness),
+            fixture.vfs(),
+        );
+
+        invalidator.inval_inode(42);
+        state.inode_liveness.observe(42);
+        invalidator.inval_inode(42);
+        state.inode_liveness.forget(42, 1);
+        invalidator.inval_inode(42);
+
+        assert_eq!(recorder.inode_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.inode_liveness.stats().notifications_forwarded, 1);
+        assert_eq!(state.inode_liveness.stats().notifications_suppressed, 2);
+    }
+
+    #[test]
+    fn linux_liveness_runtime_stats_publish_reference_and_notification_deltas() {
+        let (fixture, state) = liveness_test_state("linux-liveness-runtime-deltas");
+        let vfs = fixture.vfs();
+        let recorder = Arc::new(RecordingLinuxInvalidator::default());
+        let checked: Arc<dyn KernelInvalidator> = Arc::new(
+            studiofs_bridge::fuse_liveness::LivenessCheckedKernelInvalidator::new(
+                Arc::clone(&state.inode_liveness),
+                recorder,
+            ),
+        );
+        let invalidator = super::PublishingLinuxKernelInvalidator::new(
+            checked,
+            Arc::clone(&state.inode_liveness),
+            Arc::clone(&vfs),
+        );
+
+        state.inode_liveness.observe(41);
+        state.publish_liveness_stats();
+        invalidator.inval_inode(41);
+        vfs.reset_diagnostics_observability();
+
+        state.inode_liveness.observe(42);
+        state.publish_liveness_stats();
+        super::reply_forget_with(Some(&state), 41, 1, || {});
+        invalidator.inval_inode(42);
+        invalidator.inval_inode(99);
+
+        let counters = vfs.runtime_stats_snapshot().bridge.counters;
+        assert_eq!(counters["fuse_liveness.snapshot_generation"].value, 6);
+        assert_eq!(counters["fuse_liveness.observed_references"].value, 1);
+        assert_eq!(counters["fuse_liveness.forgotten_references"].value, 1);
+        assert_eq!(counters["fuse_liveness.notifications_forwarded"].value, 1);
+        assert_eq!(counters["fuse_liveness.notifications_suppressed"].value, 1);
     }
 
     #[test]

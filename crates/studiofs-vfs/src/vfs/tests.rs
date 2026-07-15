@@ -16267,6 +16267,32 @@ fn runtime_stats_surface_reports_fuse_async_write_gauges() {
 }
 
 #[test]
+fn runtime_stats_surface_reports_fuse_liveness() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-fuse-liveness");
+
+    vfs.record_fuse_liveness_snapshot(VfsFuseLivenessSnapshot {
+        snapshot_generation: 7,
+        observed_references: 11,
+        forgotten_references: 5,
+        retired_inodes: 2,
+        open_unknown_inode: 3,
+        notifications_forwarded: 13,
+        notifications_suppressed: 17,
+    });
+
+    let counters = vfs.runtime_stats_snapshot().bridge.counters;
+
+    assert_eq!(counters["fuse_liveness.snapshot_generation"].value, 7);
+    assert_eq!(counters["fuse_liveness.observed_references"].value, 11);
+    assert_eq!(counters["fuse_liveness.forgotten_references"].value, 5);
+    assert_eq!(counters["fuse_liveness.retired_inodes"].value, 2);
+    assert_eq!(counters["fuse_liveness.open_unknown_inode"].value, 3);
+    assert_eq!(counters["fuse_liveness.notifications_forwarded"].value, 13);
+    assert_eq!(counters["fuse_liveness.notifications_suppressed"].value, 17);
+}
+
+#[test]
 fn runtime_stats_surface_reports_os_cache_lifecycle() {
     let (_fixture, vfs, attr) = os_cache_test_file("runtime-stats-os-cache-lifecycle");
     let first_writer = vfs
@@ -16378,6 +16404,136 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
     assert_eq!(snapshot.admission_wait_total_ms, 4.0);
     assert_eq!(snapshot.barrier_waits, 5);
     assert_eq!(snapshot.barrier_wait_total_ms, 6.0);
+}
+
+#[test]
+fn fuse_liveness_snapshot_rejects_stale_generation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-liveness-stale-snapshot");
+
+    let current = VfsFuseLivenessSnapshot {
+        snapshot_generation: 3,
+        observed_references: 5,
+        forgotten_references: 2,
+        retired_inodes: 1,
+        open_unknown_inode: 1,
+        notifications_forwarded: 7,
+        notifications_suppressed: 11,
+    };
+    vfs.record_fuse_liveness_snapshot(current);
+    vfs.record_fuse_liveness_snapshot(VfsFuseLivenessSnapshot {
+        snapshot_generation: 2,
+        observed_references: 50,
+        forgotten_references: 20,
+        retired_inodes: 10,
+        open_unknown_inode: 10,
+        notifications_forwarded: 70,
+        notifications_suppressed: 110,
+    });
+
+    assert_eq!(
+        vfs.write_path_observability_snapshot().fuse_liveness,
+        current
+    );
+}
+
+#[test]
+fn fuse_liveness_snapshot_reset_keeps_raw_generation_and_subtracts_event_baseline() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-liveness-baseline");
+
+    let baseline = VfsFuseLivenessSnapshot {
+        snapshot_generation: 7,
+        observed_references: 11,
+        forgotten_references: 5,
+        retired_inodes: 2,
+        open_unknown_inode: 3,
+        notifications_forwarded: 13,
+        notifications_suppressed: 17,
+    };
+    vfs.record_fuse_liveness_snapshot(baseline);
+    vfs.reset_diagnostics_observability();
+
+    assert_eq!(
+        vfs.write_path_observability_snapshot().fuse_liveness,
+        VfsFuseLivenessSnapshot {
+            snapshot_generation: 7,
+            ..Default::default()
+        }
+    );
+
+    vfs.record_fuse_liveness_snapshot(baseline);
+    assert_eq!(
+        vfs.write_path_observability_snapshot().fuse_liveness,
+        VfsFuseLivenessSnapshot {
+            snapshot_generation: 7,
+            ..Default::default()
+        }
+    );
+
+    vfs.record_fuse_liveness_snapshot(VfsFuseLivenessSnapshot {
+        snapshot_generation: 8,
+        observed_references: 13,
+        forgotten_references: 6,
+        retired_inodes: 4,
+        open_unknown_inode: 4,
+        notifications_forwarded: 16,
+        notifications_suppressed: 21,
+    });
+    assert_eq!(
+        vfs.write_path_observability_snapshot().fuse_liveness,
+        VfsFuseLivenessSnapshot {
+            snapshot_generation: 8,
+            observed_references: 2,
+            forgotten_references: 1,
+            retired_inodes: 2,
+            open_unknown_inode: 1,
+            notifications_forwarded: 3,
+            notifications_suppressed: 4,
+        }
+    );
+}
+
+#[test]
+fn fuse_liveness_snapshot_publication_serializes_with_reset_baseline() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-liveness-reset-serialization");
+    let baseline_guard = vfs.state.fuse_liveness_reset_baseline.lock();
+    let publisher = Arc::clone(&vfs);
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        publisher.record_fuse_liveness_snapshot(VfsFuseLivenessSnapshot {
+            snapshot_generation: 1,
+            observed_references: 1,
+            ..Default::default()
+        });
+        published_tx.send(()).expect("signal published snapshot");
+    });
+
+    assert!(matches!(
+        published_rx.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(baseline_guard);
+    published_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("publisher should continue after reset guard releases");
+    worker.join().expect("publisher thread exits");
+}
+
+#[test]
+fn fuse_liveness_snapshot_deserializes_legacy_write_path_snapshot_with_default() {
+    let mut legacy = serde_json::to_value(VfsWritePathObservabilitySnapshot::default())
+        .expect("serialize write-path snapshot");
+    legacy
+        .as_object_mut()
+        .expect("write-path snapshot is an object")
+        .remove("fuse_liveness");
+
+    let decoded: VfsWritePathObservabilitySnapshot =
+        serde_json::from_value(legacy).expect("deserialize legacy write-path snapshot");
+
+    assert_eq!(decoded.fuse_liveness, VfsFuseLivenessSnapshot::default());
 }
 
 #[test]

@@ -77,16 +77,16 @@ pub use metrics::{
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
-    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot, VfsOsCacheStats,
-    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsFuseLivenessSnapshot, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
+    VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
+    VfsOsCacheStats, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2763,6 +2763,9 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            fuse_liveness_snapshot: Mutex::new(VfsFuseLivenessSnapshot::default()),
+            fuse_liveness_raw_snapshot: Mutex::new(VfsFuseLivenessSnapshot::default()),
+            fuse_liveness_reset_baseline: Mutex::new(VfsFuseLivenessSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2822,6 +2825,9 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    fuse_liveness_snapshot: Mutex<VfsFuseLivenessSnapshot>,
+    fuse_liveness_raw_snapshot: Mutex<VfsFuseLivenessSnapshot>,
+    fuse_liveness_reset_baseline: Mutex<VfsFuseLivenessSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -4279,6 +4285,14 @@ impl StudioVfs {
             self.state.fuse_async_write_raw_snapshot.lock().clone();
         *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
         *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
+        let mut fuse_liveness_reset_baseline = self.state.fuse_liveness_reset_baseline.lock();
+        let fuse_liveness_raw_snapshot = *self.state.fuse_liveness_raw_snapshot.lock();
+        *fuse_liveness_reset_baseline = fuse_liveness_raw_snapshot;
+        *self.state.fuse_liveness_snapshot.lock() = VfsFuseLivenessSnapshot {
+            snapshot_generation: fuse_liveness_raw_snapshot.snapshot_generation,
+            ..Default::default()
+        };
+        drop(fuse_liveness_reset_baseline);
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -7369,6 +7383,51 @@ impl StudioVfs {
         *self.state.fuse_async_read_snapshot.lock() = snapshot;
     }
 
+    /// Replace the latest FUSE inode liveness diagnostics snapshot.
+    pub fn record_fuse_liveness_snapshot(&self, snapshot: VfsFuseLivenessSnapshot) {
+        let baseline = self.state.fuse_liveness_reset_baseline.lock();
+        let mut raw = self.state.fuse_liveness_raw_snapshot.lock();
+        if snapshot.snapshot_generation < raw.snapshot_generation {
+            return;
+        }
+        *raw = snapshot;
+        drop(raw);
+
+        let snapshot = Self::apply_fuse_liveness_reset_baseline(snapshot, &baseline);
+        let mut current = self.state.fuse_liveness_snapshot.lock();
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            *current = snapshot;
+        }
+    }
+
+    fn apply_fuse_liveness_reset_baseline(
+        mut snapshot: VfsFuseLivenessSnapshot,
+        baseline: &VfsFuseLivenessSnapshot,
+    ) -> VfsFuseLivenessSnapshot {
+        if snapshot.snapshot_generation < baseline.snapshot_generation {
+            return snapshot;
+        }
+        snapshot.observed_references = snapshot
+            .observed_references
+            .saturating_sub(baseline.observed_references);
+        snapshot.forgotten_references = snapshot
+            .forgotten_references
+            .saturating_sub(baseline.forgotten_references);
+        snapshot.retired_inodes = snapshot
+            .retired_inodes
+            .saturating_sub(baseline.retired_inodes);
+        snapshot.open_unknown_inode = snapshot
+            .open_unknown_inode
+            .saturating_sub(baseline.open_unknown_inode);
+        snapshot.notifications_forwarded = snapshot
+            .notifications_forwarded
+            .saturating_sub(baseline.notifications_forwarded);
+        snapshot.notifications_suppressed = snapshot
+            .notifications_suppressed
+            .saturating_sub(baseline.notifications_suppressed);
+        snapshot
+    }
+
     fn apply_fuse_async_write_reset_baseline(
         mut snapshot: VfsFuseAsyncWriteSnapshot,
         baseline: &VfsFuseAsyncWriteSnapshot,
@@ -8439,6 +8498,7 @@ impl StudioVfs {
                     elapsed,
                 ),
             },
+            fuse_liveness: *self.state.fuse_liveness_snapshot.lock(),
             macfuse_open_cache: Default::default(),
             os_cache: self.os_cache.stats(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),

@@ -916,6 +916,26 @@ pub struct VfsFuseCallbackStats {
     pub write: VfsFuseIoStats,
 }
 
+/// Platform-neutral FUSE inode lookup-liveness counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VfsFuseLivenessSnapshot {
+    /// Raw monotonic generation of the bridge snapshot.
+    pub snapshot_generation: u64,
+    /// Lookup references added by successful entry replies.
+    pub observed_references: u64,
+    /// Lookup references retired by kernel forgets.
+    pub forgotten_references: u64,
+    /// Inodes explicitly retired by bridges that own that lifecycle.
+    pub retired_inodes: u64,
+    /// Open replies attempted without a matching lookup reference.
+    pub open_unknown_inode: u64,
+    /// Kernel notifications forwarded for observed inodes.
+    pub notifications_forwarded: u64,
+    /// Kernel notifications suppressed for unknown inodes.
+    pub notifications_suppressed: u64,
+}
+
 /// Deprecated macFUSE open-cache counters retained for snapshot compatibility.
 #[deprecated(note = "use VfsOsCacheStats")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1644,6 +1664,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// FUSE callback metrics.
     #[serde(default)]
     pub fuse_callbacks: VfsFuseCallbackStats,
+    /// FUSE inode lookup-liveness counters.
+    #[serde(default)]
+    pub fuse_liveness: VfsFuseLivenessSnapshot,
     /// Deprecated macFUSE counters retained only for old snapshot decoding.
     #[deprecated(note = "use os_cache")]
     #[serde(default)]
