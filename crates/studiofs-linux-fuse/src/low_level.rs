@@ -527,12 +527,33 @@ impl SessionState {
         &self,
         join_watcher: impl FnOnce(Handle, MemoryPressureWatcherShutdown) -> bool,
     ) -> SessionWriteShutdownOutcome {
+        self.shutdown_async_writes_after_run_with_boundary(
+            join_watcher,
+            |entered, join_watcher, runtime_handle, watcher| {
+                tokio::task::block_in_place(move || {
+                    entered.store(true, Ordering::Relaxed);
+                    join_watcher(runtime_handle, watcher)
+                })
+            },
+        )
+    }
+
+    fn shutdown_async_writes_after_run_with_boundary<JoinWatcher, RunInPlace>(
+        &self,
+        join_watcher: JoinWatcher,
+        run_in_place: RunInPlace,
+    ) -> SessionWriteShutdownOutcome
+    where
+        JoinWatcher: FnOnce(Handle, MemoryPressureWatcherShutdown) -> bool,
+        RunInPlace:
+            FnOnce(Arc<AtomicBool>, JoinWatcher, Handle, MemoryPressureWatcherShutdown) -> bool,
+    {
         let runtime_handle = self.runtime_handle.clone();
         let watcher = self
             .memory_pressure_async_write_watcher
             .as_ref()
             .map(MemoryPressureAsyncWriteWatcher::shutdown_handle);
-        let mut entered_panic = None;
+        let mut deferred_panic = None;
         let watcher_stopped = if let Some(watcher) = watcher {
             if runtime_handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
                 watcher.cancel_and_abort();
@@ -546,21 +567,20 @@ impl SessionState {
                 });
                 if caller_is_multi_thread {
                     let entered = Arc::new(AtomicBool::new(false));
-                    let entered_in_shutdown = Arc::clone(&entered);
+                    let entered_in_boundary = Arc::clone(&entered);
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        tokio::task::block_in_place(move || {
-                            entered_in_shutdown.store(true, Ordering::Relaxed);
-                            join_watcher(runtime_handle, watcher)
-                        })
+                        run_in_place(entered_in_boundary, join_watcher, runtime_handle, watcher)
                     })) {
                         Ok(stopped) => stopped,
                         Err(payload) => {
-                            if entered.load(Ordering::Relaxed) {
-                                entered_panic = Some(payload);
-                            } else {
+                            let expected_context_rejection = !entered.load(Ordering::Relaxed)
+                                && is_tokio_block_in_place_context_panic(payload.as_ref());
+                            if expected_context_rejection {
                                 warn!(
                                     "Linux FUSE memory-pressure watcher shutdown cannot block in this Tokio context"
                                 );
+                            } else {
+                                deferred_panic = Some(payload);
                             }
                             false
                         }
@@ -584,7 +604,7 @@ impl SessionState {
             watcher_stopped,
             writes_stopped,
         };
-        if let Some(payload) = entered_panic {
+        if let Some(payload) = deferred_panic {
             std::panic::resume_unwind(payload);
         }
         outcome
@@ -668,6 +688,18 @@ fn shutdown_memory_pressure_watcher_on_helper(
             false
         }
     }
+}
+
+fn is_tokio_block_in_place_context_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    // Tokio 1.x uses this message when `block_in_place` rejects LocalSet and
+    // current-thread contexts before invoking the supplied closure.
+    const MESSAGE: &str = "can call blocking only when running on the multi-threaded runtime";
+    payload
+        .downcast_ref::<&str>()
+        .is_some_and(|message| message.contains(MESSAGE))
+        || payload
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains(MESSAGE))
 }
 
 fn publish_fuse_liveness_stats(vfs: &StudioVfs, liveness: &FuseInodeLiveness) {
@@ -5458,6 +5490,54 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(3), shutdown)
             .await
             .expect("entered panic shutdown timed out")
+            .expect("runtime worker panicked");
+        assert_eq!(result, (PANIC_PAYLOAD, true, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_pre_entry_panic_resumes_only_after_queue_teardown() {
+        const PANIC_PAYLOAD: u64 = 0x005f_5f50_5245_494e;
+        let fixture = ContractVfsFixture::new("linux-pressure-watcher-pre-entry-panic")
+            .expect("create VFS fixture");
+        let controller = fixture.vfs().memory_pressure_controller().clone();
+        let mut snapshot = controller.snapshot();
+        snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+        snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+        controller.publish(snapshot);
+        let state = super::SessionState::new_with_cache_settings(
+            fixture.vfs(),
+            tokio::runtime::Handle::current(),
+            false,
+            default_connection_config(),
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let shutdown = tokio::spawn(async move {
+            let writes = Arc::clone(&state.async_writes);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.shutdown_async_writes_after_run_with_boundary(
+                    |_, _| true,
+                    |_, _, _, _| std::panic::panic_any(PANIC_PAYLOAD),
+                )
+            }))
+            .expect_err("unexpected pre-entry panic was swallowed");
+            let payload = *panic.downcast::<u64>().expect("preserve panic payload");
+            let writes_stopped = matches!(writes.start_request(u64::MAX), Err(libc::EIO));
+            let task_taken = state
+                .memory_pressure_async_write_watcher
+                .as_ref()
+                .expect("enabled watcher")
+                .shutdown
+                .task
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_none();
+            (payload, writes_stopped, task_taken)
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("pre-entry panic shutdown timed out")
             .expect("runtime worker panicked");
         assert_eq!(result, (PANIC_PAYLOAD, true, true));
     }
