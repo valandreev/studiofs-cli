@@ -497,6 +497,168 @@ fn runtime_snapshot_request_returns_structured_sections() {
 }
 
 #[test]
+fn runtime_snapshot_deserializes_missing_memory_pressure_as_empty() {
+    let mut encoded =
+        serde_json::to_value(DiagnosticsRuntimeSnapshot::default()).expect("serialize snapshot");
+    encoded
+        .as_object_mut()
+        .expect("snapshot must serialize as an object")
+        .remove("memory_pressure");
+
+    let decoded: DiagnosticsRuntimeSnapshot =
+        serde_json::from_value(encoded).expect("deserialize legacy snapshot");
+
+    assert_eq!(
+        decoded.memory_pressure,
+        studiofs_vfs::RuntimeStatsSection::default()
+    );
+}
+
+#[test]
+fn runtime_snapshot_serializes_memory_pressure_section() {
+    let snapshot = DiagnosticsRuntimeSnapshot {
+        memory_pressure: serde_json::from_value(serde_json::json!({
+            "counters": {},
+            "gauges": {
+                "state": { "value": 2, "unit": "count" }
+            },
+            "latencies": {}
+        }))
+        .expect("deserialize runtime stats section"),
+        ..DiagnosticsRuntimeSnapshot::default()
+    };
+
+    let encoded = serde_json::to_value(snapshot).expect("serialize snapshot");
+
+    assert_eq!(
+        encoded["memory_pressure"],
+        serde_json::json!({
+            "counters": {},
+            "gauges": {
+                "state": { "value": 2, "unit": "count" }
+            },
+            "latencies": {}
+        })
+    );
+}
+
+#[test]
+fn live_runtime_snapshot_uses_vfs_memory_pressure_and_write_geometry() {
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_vfs::{
+        MemoryComponentLimits, MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
+        VfsConfig, VfsFuseConnectionSnapshot,
+    };
+
+    let temp = mounts_dir_temp();
+    let meta = Arc::new(
+        RedbMetaEngine::open(temp.path().join("meta.redb")).expect("open metadata engine"),
+    );
+    meta.init_root(0, 0).expect("initialize root");
+    let format_info = FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
+        name: "diagnostics-pressure".to_string(),
+        uuid: "diagnostics-pressure-uuid".to_string(),
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        bucket: "studiofs-test".to_string(),
+        access_key: "test".to_string(),
+        secret_key: "test".to_string(),
+        region: "us-east-1".to_string(),
+        data_prefix: "diagnostics-pressure/objects/".to_string(),
+        metadata: MetadataConfig::default(),
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
+        block_size: 4 * 1024 * 1024,
+    };
+    meta.set_format_info(&format_info)
+        .expect("store format info");
+    let data_config = studiofs_data::DataStoreConfig::from(&format_info);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = runtime.enter();
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        temp.path().join("cache").to_str().expect("cache path"),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfig::default().try_into().expect("valid VFS config"),
+    )
+    .expect("create VFS");
+    vfs.memory_pressure_controller()
+        .publish(MemoryPressureSnapshot {
+            source: MemoryPressureSource::HostAndCgroup,
+            state: MemoryPressureState::Constrained,
+            generation: 7,
+            effective_limit_bytes: 8_000,
+            available_bytes: 3_000,
+            reserve_bytes: 1_000,
+            envelope_bytes: 1_500,
+            limits: MemoryComponentLimits {
+                memory_cache_bytes: 600,
+                dirty_bytes: 375,
+                transit_bytes: 225,
+                async_write_bytes: 150,
+            },
+            transition_count: 2,
+            sampling_failure_count: 3,
+            overcommitted_minimum: true,
+        });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        negotiated_max_write_bytes: Some(2 * 1024 * 1024),
+        ..VfsFuseConnectionSnapshot::default()
+    });
+    let source = LiveMountDiagnosticsSource::new(
+        &format_info,
+        "/mnt/diagnostics-pressure",
+        temp.path(),
+        std::process::id(),
+        false,
+        LiveMountRuntimeFingerprint {
+            bridge: "Linux FUSE".to_string(),
+            cache_size: None,
+            endpoint_override: None,
+            snapshot_id: None,
+            vfs_config: serde_json::json!({}),
+        },
+        vfs,
+    );
+
+    let snapshot = source.runtime_snapshot();
+    let pressure_values = [
+        "source",
+        "state",
+        "envelope_bytes",
+        "memory_cache_limit_bytes",
+        "dirty_limit_bytes",
+        "transit_limit_bytes",
+        "async_write_limit_bytes",
+    ]
+    .map(|name| (name, snapshot.memory_pressure.gauges[name].value));
+
+    assert_eq!(
+        pressure_values,
+        [
+            ("source", 3),
+            ("state", 2),
+            ("envelope_bytes", 1_500),
+            ("memory_cache_limit_bytes", 600),
+            ("dirty_limit_bytes", 375),
+            ("transit_limit_bytes", 225),
+            ("async_write_limit_bytes", 150),
+        ]
+    );
+    assert_eq!(
+        snapshot
+            .write_path
+            .fuse_connection
+            .negotiated_max_write_bytes,
+        Some(2 * 1024 * 1024)
+    );
+}
+
+#[test]
 fn snapshot_sections_for_scope_includes_zeroio_section() {
     let snapshot = DiagnosticsRuntimeSnapshot {
         zeroio: VfsZeroIoRuntimeSnapshot {

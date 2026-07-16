@@ -86,6 +86,8 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub process: DiagnosticsProcessSnapshot,
     pub ingress: VfsIngressStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
+    #[serde(default)]
+    pub memory_pressure: RuntimeStatsSection,
     pub upload: VfsUploadStats,
     #[serde(default)]
     pub zeroio: VfsZeroIoRuntimeSnapshot,
@@ -102,6 +104,7 @@ impl DiagnosticsRuntimeSnapshot {
             process: DiagnosticsProcessSnapshot::default(),
             ingress: health.ingress,
             write_path: health.write_path,
+            memory_pressure: RuntimeStatsSection::default(),
             cache: DiagnosticsCacheSnapshot::default(),
             synchronization: DiagnosticsSynchronizationSnapshot {
                 state: VfsSynchronizationStateSnapshot {

@@ -102,6 +102,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
     }
 
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
+        let memory_pressure = self.vfs.runtime_stats_snapshot().memory_pressure;
         let health = self.health_snapshot();
         DiagnosticsRuntimeSnapshot {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
@@ -109,6 +110,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             process: self.process_sampler.lock().sample(),
             ingress: health.ingress,
             write_path: health.write_path,
+            memory_pressure,
             upload: health.upload,
             zeroio: health.zeroio,
             cache: DiagnosticsCacheSnapshot {
