@@ -888,6 +888,22 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateValidationError, "sampling failures increased"):
             self.validate(evidence=sampling_failed)
 
+        for mode in ("direct-async", "kernel"):
+            with self.subTest(profile_transition=mode):
+                transitioned = self.evidence()
+                transitioned["runtime_samples"]["pressure"][1][
+                    "transition_count"
+                ] = 3
+                for sample in (
+                    transitioned["runtime_samples"]["recovery_boundary"],
+                    *transitioned["runtime_samples"]["recovery"],
+                ):
+                    sample["transition_count"] = 3
+                with self.assertRaisesRegex(
+                    gate.GateValidationError, "state changed during the profile"
+                ):
+                    self.validate(mode=mode, evidence=transitioned)
+
     def test_pressure_and_recovery_require_the_same_measurer(self) -> None:
         evidence = self.evidence()
         evidence["throughput_mb_per_second"]["method"] = "different"
@@ -967,15 +983,17 @@ class PressureScenarioHelperTest(unittest.TestCase):
                 "schema_version": 1,
                 "started_monotonic_ns": 2,
                 "observed_monotonic_ns": 3,
-                "stopped_monotonic_ns": 13,
+                "stopped_monotonic_ns": 14,
+                "feeder_pid": 4242,
+                "feeder_start_time": "123456",
                 "exit_status": 0,
             },
             "holder": {
                 "schema_version": 1,
                 "started_monotonic_ns": 4,
                 "ready_monotonic_ns": 5,
-                "released_monotonic_ns": 14,
-                "exited_monotonic_ns": 15,
+                "released_monotonic_ns": 15,
+                "exited_monotonic_ns": 16,
                 "exit_status": 0,
             },
             "runtime_before_profile": {
@@ -983,40 +1001,65 @@ class PressureScenarioHelperTest(unittest.TestCase):
                 "captured_monotonic_ns": 6,
             },
             "pressure": boundary("pressure", 7),
-            "profile": {"schema_version": 1, "completed_monotonic_ns": 8},
+            "profile": {
+                "schema_version": 1,
+                "profile": "small-128k",
+                "runner": "inline",
+                "workload_pid": 4343,
+                "workload_start_time": "234567",
+                "feeder_pid": 4242,
+                "feeder_start_time": "123456",
+                "feeder_live_before_profile": True,
+                "feeder_live_after_profile": True,
+                "started_monotonic_ns": 8,
+                "completed_monotonic_ns": 9,
+                "exit_status": 0,
+                "source_report_sha256": "a" * 64,
+                "read_throughput_mb_per_second": 79.0,
+            },
             "pressure_measure": {
                 "schema_version": 1,
                 "method": "inline-unbuffered-read-v1",
                 "chunk_bytes": 1 << 20,
                 "bytes_read": 1024,
                 "throughput_mb_per_second": 80.0,
-                "started_monotonic_ns": 9,
-                "completed_monotonic_ns": 10,
+                "started_monotonic_ns": 10,
+                "completed_monotonic_ns": 11,
+                "exit_status": 0,
             },
-            "pressure_hash": {"schema_version": 1, "completed_monotonic_ns": 11},
+            "pressure_hash": {
+                "schema_version": 1,
+                "completed_monotonic_ns": 12,
+                "exit_status": 0,
+            },
             "runtime_after_profile": {
                 "schema_version": 2,
-                "captured_monotonic_ns": 12,
+                "captured_monotonic_ns": 13,
             },
-            "after_holder_release": boundary("after-holder-release", 16),
+            "after_holder_release": boundary("after-holder-release", 17),
             "recovery_measure": {
                 "schema_version": 1,
                 "method": "inline-unbuffered-read-v1",
                 "chunk_bytes": 1 << 20,
                 "bytes_read": 1024,
                 "throughput_mb_per_second": 81.0,
-                "started_monotonic_ns": 17,
-                "completed_monotonic_ns": 18,
+                "started_monotonic_ns": 18,
+                "completed_monotonic_ns": 19,
+                "exit_status": 0,
             },
-            "recovery_hash": {"schema_version": 1, "completed_monotonic_ns": 19},
-            "drain": boundary("drain-end", 20),
-            "after": boundary("after", 21),
+            "recovery_hash": {
+                "schema_version": 1,
+                "completed_monotonic_ns": 20,
+                "exit_status": 0,
+            },
+            "drain": boundary("drain-end", 21),
+            "after": boundary("after", 22),
             "cleanup": {
                 "schema_version": 1,
-                "cleanup_ended_monotonic_ns": 22,
+                "cleanup_ended_monotonic_ns": 23,
                 "unmount_exit_status": 0,
-                "unmount_started_monotonic_ns": 23,
-                "unmount_ended_monotonic_ns": 24,
+                "unmount_started_monotonic_ns": 24,
+                "unmount_ended_monotonic_ns": 25,
             },
         }
 
@@ -1027,13 +1070,27 @@ class PressureScenarioHelperTest(unittest.TestCase):
             ("setup", "schema_version", True, "integer"),
             ("pressure", "phase", "wrong", "phase"),
             ("recovery_measure", "started_monotonic_ns", 25, "order"),
-            ("holder", "exit_status", False, "integer"),
         )
         for artifact, field, value, message in cases:
             with self.subTest(field=field):
                 raw = self.raw_contract()
                 raw[artifact][field] = value
                 with self.assertRaisesRegex(gate.GateValidationError, message):
+                    gate.validate_pressure_artifact_contract(raw)
+
+        for artifact in (
+            "holder",
+            "setup",
+            "profile",
+            "pressure_measure",
+            "pressure_hash",
+            "recovery_measure",
+            "recovery_hash",
+        ):
+            with self.subTest(bool_exit=artifact):
+                raw = self.raw_contract()
+                raw[artifact]["exit_status"] = False
+                with self.assertRaisesRegex(gate.GateValidationError, "integer"):
                     gate.validate_pressure_artifact_contract(raw)
 
         mismatched = self.raw_contract()
@@ -1068,28 +1125,38 @@ class PressureScenarioHelperTest(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
     def test_pid_reuse_guard_does_not_signal_mismatched_identity(self) -> None:
-        result = Path.cwd() / "target/perf/test-helper-pid-reuse.json"
-        result.unlink(missing_ok=True)
-        completed = subprocess.run(
-            ["bash", "tools/perf/linux-cache-gate.sh"],
-            cwd=Path.cwd(),
-            env={
-                **os.environ,
-                "CACHE_GATE_INTERNAL_PID_REUSE_FIXTURE": "true",
-                "CACHE_GATE_INTERNAL_PID_REUSE_RESULT": str(result),
-            },
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        try:
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            payload = json.loads(result.read_text())
-            self.assertTrue(payload["mismatched_identity_was_not_signaled"])
-            self.assertGreater(payload["pid"], 0)
-            self.assertTrue(payload["start_time"].isdigit())
-        finally:
-            result.unlink(missing_ok=True)
+        for helper_kind in (
+            "pidstat",
+            "memory-sampler",
+            "memory-holder",
+            "pressure-setup",
+            "pressure-workload",
+        ):
+            with self.subTest(helper_kind=helper_kind):
+                result = Path.cwd() / f"target/perf/test-{helper_kind}-pid-reuse.json"
+                result.unlink(missing_ok=True)
+                completed = subprocess.run(
+                    ["bash", "tools/perf/linux-cache-gate.sh"],
+                    cwd=Path.cwd(),
+                    env={
+                        **os.environ,
+                        "CACHE_GATE_INTERNAL_PID_REUSE_FIXTURE": "true",
+                        "CACHE_GATE_INTERNAL_PID_REUSE_RESULT": str(result),
+                        "CACHE_GATE_INTERNAL_PID_REUSE_HELPER_KIND": helper_kind,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                try:
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    payload = json.loads(result.read_text())
+                    self.assertEqual(payload["helper_kind"], helper_kind)
+                    self.assertTrue(payload["mismatched_identity_was_not_signaled"])
+                    self.assertGreater(payload["pid"], 0)
+                    self.assertTrue(payload["start_time"].isdigit())
+                finally:
+                    result.unlink(missing_ok=True)
 
     def test_json_readers_reject_symlinks(self) -> None:
         root = Path.cwd() / "target/perf/test-pressure-artifact-symlink"
@@ -1560,6 +1627,16 @@ class CorrectnessAndProvenanceTest(unittest.TestCase):
             ({**valid, "git_revision": "other-revision"}, "revision"),
             ({**valid, "git_revision": ""}, "revision"),
             ({**valid, "bench_git_revision": ""}, "revision"),
+            (
+                {
+                    **valid,
+                    "tests": [
+                        {**valid["tests"][0], "exit_status": False},
+                        *valid["tests"][1:],
+                    ],
+                },
+                "integer",
+            ),
             ({**valid, "schema_version": 2}, "schema"),
             ({**valid, "kind": "other"}, "kind"),
             ({**valid, "dry_run": True}, "dry-run"),
@@ -2136,6 +2213,16 @@ class ScheduleValidationTest(unittest.TestCase):
                     ],
                 },
                 "collector",
+            ),
+            (
+                {
+                    **valid,
+                    "tuples": [
+                        {**valid["tuples"][0], "collector_exit_status": False},
+                        *valid["tuples"][1:],
+                    ],
+                },
+                "integer",
             ),
             (
                 {
@@ -2819,15 +2906,37 @@ class AnalyzerCliTest(unittest.TestCase):
                     )
                 self.write_json(run_dir / "memory-holder.json", pressure_evidence["holder"])
                 self.write_json(run_dir / "pressure-setup.json", pressure_evidence["setup"])
+                profile_report = (
+                    self.bench_report(workload, expectation, mount_point)
+                    if workload == "large-single"
+                    else self.client_report(workload, expectation)
+                )
+                profile_report_bytes = (
+                    json.dumps(profile_report, indent=2, sort_keys=True) + "\n"
+                ).encode()
                 self.write_json(
                     run_dir / "pressure-profile.json",
                     {
                         "schema_version": 1,
                         "profile": workload,
+                        "runner": "bench" if workload == "large-single" else "inline",
+                        "workload_pid": 4343,
+                        "workload_start_time": "234567",
+                        "feeder_pid": pressure_evidence["setup"]["feeder_pid"],
+                        "feeder_start_time": pressure_evidence["setup"][
+                            "feeder_start_time"
+                        ],
+                        "feeder_live_before_profile": True,
+                        "feeder_live_after_profile": True,
+                        "started_monotonic_ns": 550_000_000,
                         "read_throughput_mb_per_second": pressure_evidence[
                             "throughput_mb_per_second"
                         ]["pressure"][0],
                         "completed_monotonic_ns": 600_000_000,
+                        "exit_status": 0,
+                        "source_report_sha256": hashlib.sha256(
+                            profile_report_bytes
+                        ).hexdigest(),
                     },
                 )
                 measurer = pressure_evidence["throughput_mb_per_second"]
@@ -2841,6 +2950,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "throughput_mb_per_second": measurer["pressure"][0],
                         "started_monotonic_ns": 650_000_000,
                         "completed_monotonic_ns": 700_000_000,
+                        "exit_status": 0,
                     },
                 )
                 self.write_json(
@@ -2850,6 +2960,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "bytes_read": pressure_evidence["verification"]["bytes_read"],
                         "sha256": pressure_evidence["verification"]["pressure_sha256"],
                         "completed_monotonic_ns": 750_000_000,
+                        "exit_status": 0,
                     },
                 )
                 self.write_json(
@@ -2862,6 +2973,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "throughput_mb_per_second": measurer["recovery"][0],
                         "started_monotonic_ns": 1_200_000_000,
                         "completed_monotonic_ns": 1_300_000_000,
+                        "exit_status": 0,
                     },
                 )
                 self.write_json(
@@ -2871,6 +2983,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "bytes_read": pressure_evidence["verification"]["bytes_read"],
                         "sha256": pressure_evidence["verification"]["recovery_sha256"],
                         "completed_monotonic_ns": 1_400_000_000,
+                        "exit_status": 0,
                     },
                 )
                 samples = pressure_evidence["runtime_samples"]
@@ -3139,6 +3252,20 @@ class AnalyzerCliTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         comparison = json.loads((output / "comparison.json").read_text())
         self.assertIn("raw memory pressure", comparison["direct_async"]["errors"][0])
+
+    def test_pressure_profile_must_match_validated_source_report(self) -> None:
+        run_dir = self.root / "direct-async" / "large-single" / "rep-001"
+        profile_path = run_dir / "pressure-profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["source_report_sha256"] = "b" * 64
+        self.write_json(profile_path, profile)
+        derived = json.loads((run_dir / "derived.json").read_text())
+
+        with self.assertRaisesRegex(gate.GateValidationError, "source report mismatch"):
+            gate.validate_memory_pressure_artifacts(
+                run_dir,
+                derived["memory_pressure"],
+            )
 
     def test_cli_rejects_benchmark_report_copy_mismatch(self) -> None:
         original = (

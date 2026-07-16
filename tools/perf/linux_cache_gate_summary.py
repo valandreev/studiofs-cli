@@ -874,6 +874,8 @@ def validate_memory_pressure_evidence(
     constrained = pressure_samples
     if any(sample.get("state") != "constrained" for sample in constrained):
         raise GateValidationError("pressure samples must remain constrained around the profile")
+    if constrained[0]["transition_count"] != constrained[1]["transition_count"]:
+        raise GateValidationError("memory pressure state changed during the profile")
     if any(
         sample["envelope_bytes"] == 0 or sample["overcommitted_minimum"] is not False
         for sample in constrained
@@ -1063,7 +1065,7 @@ def validate_correctness_manifest(
             raise GateValidationError(f"correctness test was not executed: {name}")
         if result.get("skipped") is not False:
             raise GateValidationError(f"correctness test was skipped: {name}")
-        if result.get("exit_status") != 0:
+        if _nonnegative_integer(result.get("exit_status"), "correctness exit status") != 0:
             raise GateValidationError(f"correctness test failed: {name}")
         for field in ("command", "started_at", "ended_at", "log_path"):
             if not isinstance(result.get(field), str) or not result[field]:
@@ -1707,7 +1709,12 @@ def validate_schedule(
             raise GateValidationError("schedule tuple is invalid")
         if item.get("status") != "passed":
             raise GateValidationError("schedule tuple status is not passed")
-        if item.get("collector_exit_status") != 0:
+        if (
+            _nonnegative_integer(
+                item.get("collector_exit_status"), "collector exit status"
+            )
+            != 0
+        ):
             raise GateValidationError("schedule tuple collector failed")
         if item.get("cleanup_error") is not None:
             raise GateValidationError("schedule tuple cleanup failed")
@@ -1840,10 +1847,48 @@ def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
     recovery_measure = artifacts["recovery_measure"]
     recovery_hash = artifacts["recovery_hash"]
     cleanup = artifacts["cleanup"]
-    if _nonnegative_integer(holder.get("exit_status"), "holder exit status") != 0:
-        raise GateValidationError("memory holder failed to exit cleanly")
-    if _nonnegative_integer(setup.get("exit_status"), "setup exit status") != 0:
-        raise GateValidationError("pressure setup exit status is nonzero")
+    for name, payload in (
+        ("holder", holder),
+        ("setup", setup),
+        ("profile", profile),
+        ("pressure measure", pressure_measure),
+        ("pressure hash", pressure_hash),
+        ("recovery measure", recovery_measure),
+        ("recovery hash", recovery_hash),
+    ):
+        if _nonnegative_integer(payload.get("exit_status"), f"{name} exit status") != 0:
+            raise GateValidationError(f"{name} exit status is nonzero")
+    profile_name = profile.get("profile")
+    expected_runner = {"large-single": "bench", "small-128k": "inline"}.get(
+        profile_name
+    )
+    if expected_runner is None or profile.get("runner") != expected_runner:
+        raise GateValidationError("pressure workload profile is invalid")
+    for field in ("workload_pid", "feeder_pid"):
+        if _nonnegative_integer(profile.get(field), f"profile {field}") == 0:
+            raise GateValidationError(f"profile {field} must be positive")
+    for field in ("workload_start_time", "feeder_start_time"):
+        value = profile.get(field)
+        if not isinstance(value, str) or not value.isdigit() or int(value) == 0:
+            raise GateValidationError(f"profile {field} is invalid")
+    for field in ("feeder_live_before_profile", "feeder_live_after_profile"):
+        if profile.get(field) is not True:
+            raise GateValidationError("pressure feeder was not live around workload profile")
+    if (
+        profile.get("feeder_pid") != setup.get("feeder_pid")
+        or profile.get("feeder_start_time") != setup.get("feeder_start_time")
+    ):
+        raise GateValidationError("pressure profile feeder identity mismatch")
+    if not _is_sha256(profile.get("source_report_sha256")):
+        raise GateValidationError("pressure profile source report hash is invalid")
+    diagnostic_throughput = profile.get("read_throughput_mb_per_second")
+    if (
+        not isinstance(diagnostic_throughput, (int, float))
+        or isinstance(diagnostic_throughput, bool)
+        or not math.isfinite(diagnostic_throughput)
+        or diagnostic_throughput <= 0
+    ):
+        raise GateValidationError("pressure profile diagnostic throughput is invalid")
     pressure_measurer = (
         pressure_measure.get("method"),
         _nonnegative_integer(pressure_measure.get("chunk_bytes"), "pressure chunk bytes"),
@@ -1884,6 +1929,7 @@ def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
             artifacts["runtime_before_profile"].get("captured_monotonic_ns"),
         ),
         ("pressure", artifacts["pressure"].get("monotonic_ns")),
+        ("profile started", profile.get("started_monotonic_ns")),
         ("profile completed", profile.get("completed_monotonic_ns")),
         ("pressure measure started", pressure_measure.get("started_monotonic_ns")),
         (
@@ -1998,6 +2044,10 @@ def memory_pressure_evidence_from_artifacts(
             "cleanup": cleanup,
         }
     )
+    if profile.get("source_report_sha256") != _file_sha256(
+        run_dir / "client-report.json"
+    ):
+        raise GateValidationError("pressure profile source report mismatch")
     if any(
         artifact.get("bytes_read") != verified_read
         for artifact in (
@@ -2065,6 +2115,7 @@ def memory_pressure_evidence_from_artifacts(
             "method": pressure_measure.get("method"),
             "chunk_bytes": pressure_measure.get("chunk_bytes"),
             "bytes_read": pressure_measure.get("bytes_read"),
+            # The workload profile proves behavior; recovery compares this identical measurer.
             "pressure": [pressure_measure.get("throughput_mb_per_second")],
             "recovery": [recovery_measure.get("throughput_mb_per_second")],
         },

@@ -280,7 +280,9 @@ wait_for_idle_boundary() {
 }
 
 pidstat_pid=""
+pidstat_start_time=""
 memory_sampler_pid=""
+memory_sampler_start_time=""
 memory_holder_pid=""
 memory_holder_start_time=""
 memory_holder_start=""
@@ -296,7 +298,7 @@ pressure_workload_start_time=""
 helper_pid_matches_start_time() {
   local pid="$1"
   local expected="$2"
-  local root="${CACHE_GATE_INTERNAL_HELPER_PROC_ROOT:-/proc}"
+  local root="${proc_root:-/proc}"
   local actual=""
   [[ -n "$expected" && -r "$root/$pid/stat" ]] || return 1
   actual="$(mount_start_time "$root/$pid/stat")" || return 1
@@ -306,7 +308,7 @@ helper_pid_matches_start_time() {
 helper_pid_is_live() {
   local pid="$1"
   local expected_start_time="${2:-}"
-  local root="${CACHE_GATE_INTERNAL_HELPER_PROC_ROOT:-/proc}"
+  local root="${proc_root:-/proc}"
   local stat_line=""
   local rest=""
   kill -0 "$pid" 2>/dev/null || return 1
@@ -333,8 +335,9 @@ wait_for_helper_exit() {
 stop_helper_bounded() {
   local pid="$1"
   local label="$2"
-  local expected_start_time="${3:-}"
+  local expected_start_time="$3"
   local exit_status=0
+  [[ -n "$expected_start_time" ]] || return 1
   if [[ -n "$expected_start_time" ]] && kill -0 "$pid" 2>/dev/null && \
     ! helper_pid_matches_start_time "$pid" "$expected_start_time"; then
     return 0
@@ -373,14 +376,19 @@ stop_helpers_on_exit() {
     pressure_workload_start_time=""
   fi
   if [[ -n "$pidstat_pid" ]]; then
-    if ! stop_helper_bounded "$pidstat_pid" pidstat; then
+    if ! stop_helper_bounded "$pidstat_pid" pidstat "$pidstat_start_time"; then
       printf 'Error: failed to stop pidstat during collector cleanup\n' >&2
     fi
+    pidstat_pid=""
+    pidstat_start_time=""
   fi
   if [[ -n "$memory_sampler_pid" ]]; then
-    if ! stop_helper_bounded "$memory_sampler_pid" memory-sampler; then
+    if ! stop_helper_bounded "$memory_sampler_pid" memory-sampler \
+      "$memory_sampler_start_time"; then
       printf 'Error: failed to stop memory sampler during collector cleanup\n' >&2
     fi
+    memory_sampler_pid=""
+    memory_sampler_start_time=""
   fi
   if [[ -n "$memory_holder_pid" ]]; then
     [[ -z "$memory_holder_release" ]] || touch "$memory_holder_release"
@@ -413,13 +421,19 @@ stop_helpers_on_exit() {
 }
 
 stop_measurement_helpers() {
-  kill -0 "$pidstat_pid" 2>/dev/null || die "pidstat exited before drain-end"
-  kill -0 "$memory_sampler_pid" 2>/dev/null || die "memory sampler exited before drain-end"
-  stop_helper_bounded "$pidstat_pid" pidstat || die "failed to stop pidstat within 10 seconds"
+  helper_pid_is_live "$pidstat_pid" "$pidstat_start_time" || \
+    die "pidstat exited before drain-end"
+  helper_pid_is_live "$memory_sampler_pid" "$memory_sampler_start_time" || \
+    die "memory sampler exited before drain-end"
+  stop_helper_bounded "$pidstat_pid" pidstat "$pidstat_start_time" || \
+    die "failed to stop pidstat within 10 seconds"
   pidstat_pid=""
-  stop_helper_bounded "$memory_sampler_pid" memory-sampler || \
+  pidstat_start_time=""
+  stop_helper_bounded "$memory_sampler_pid" memory-sampler \
+    "$memory_sampler_start_time" || \
     die "failed to stop memory sampler within 10 seconds"
   memory_sampler_pid=""
+  memory_sampler_start_time=""
 }
 
 wait_for_file() {
@@ -988,6 +1002,7 @@ elif ACTION == "profile-read-measure":
         "throughput_mb_per_second": measured_throughput,
         "started_monotonic_ns": started,
         "completed_monotonic_ns": ended,
+        "exit_status": 0,
     })
 elif ACTION == "pressure-hash":
     observed, checksum = hash_workload()
@@ -996,6 +1011,7 @@ elif ACTION == "pressure-hash":
         "bytes_read": observed,
         "sha256": checksum,
         "completed_monotonic_ns": time.monotonic_ns(),
+        "exit_status": 0,
     })
 elif ACTION == "recovery-hash":
     if len(EXTRA) != 1:
@@ -1009,6 +1025,7 @@ elif ACTION == "recovery-hash":
         "bytes_read": observed,
         "sha256": checksum,
         "completed_monotonic_ns": time.monotonic_ns(),
+        "exit_status": 0,
     })
 else:
     raise SystemExit(f"unknown inline client action: {ACTION}")
@@ -1067,16 +1084,23 @@ fi
 
 if [[ "${CACHE_GATE_INTERNAL_PID_REUSE_FIXTURE:-}" == true ]]; then
   : "${CACHE_GATE_INTERNAL_PID_REUSE_RESULT:?internal PID reuse result is required}"
+  : "${CACHE_GATE_INTERNAL_PID_REUSE_HELPER_KIND:?internal helper kind is required}"
+  reuse_kind="$CACHE_GATE_INTERNAL_PID_REUSE_HELPER_KIND"
+  case "$reuse_kind" in
+    pidstat|memory-sampler|memory-holder|pressure-setup|pressure-workload) ;;
+    *) die "invalid internal PID reuse helper kind" ;;
+  esac
   sleep 300 &
   reuse_pid=$!
   reuse_start_time="$(mount_start_time "/proc/$reuse_pid/stat")"
   wrong_start_time="$((reuse_start_time + 1))"
-  stop_helper_bounded "$reuse_pid" pid-reuse-fixture "$wrong_start_time" || \
+  stop_helper_bounded "$reuse_pid" "$reuse_kind" "$wrong_start_time" || \
     die "PID reuse fixture guard failed"
   helper_pid_is_live "$reuse_pid" "$reuse_start_time" || \
     die "PID reuse fixture signaled a mismatched process"
   PYTHONDONTWRITEBYTECODE=1 python3 - \
-    "$CACHE_GATE_INTERNAL_PID_REUSE_RESULT" "$reuse_pid" "$reuse_start_time" <<'PY'
+    "$CACHE_GATE_INTERNAL_PID_REUSE_RESULT" "$reuse_pid" "$reuse_start_time" \
+    "$reuse_kind" <<'PY'
 import json
 import pathlib
 import sys
@@ -1084,11 +1108,12 @@ import sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
     "pid": int(sys.argv[2]),
     "start_time": sys.argv[3],
+    "helper_kind": sys.argv[4],
     "mismatched_identity_was_not_signaled": True,
 }, indent=2, sort_keys=True) + "\n")
 PY
-  kill -TERM "$reuse_pid"
-  wait "$reuse_pid" 2>/dev/null || true
+  stop_helper_bounded "$reuse_pid" pressure-workload "$reuse_start_time" || \
+    die "PID reuse fixture cleanup failed"
   exit 0
 fi
 
@@ -1995,6 +2020,8 @@ esac
 LC_ALL=C "$pidstat_bin" -urd -h -p "$mount_pid" 1 \
   > "$artifact_dir/pidstat.txt" 2> "$artifact_dir/pidstat.stderr.txt" &
 pidstat_pid=$!
+pidstat_start_time="$(mount_start_time "$proc_root/$pidstat_pid/stat")"
+trap stop_helpers_on_exit EXIT
 PYTHONDONTWRITEBYTECODE=1 python3 - \
   "$proc_root/$mount_pid/status" \
   "$cgroup/memory.current" "$cgroup/memory.peak" "$cgroup/memory.stat" \
@@ -2088,10 +2115,11 @@ except (OSError, ValueError) as error:
     raise SystemExit(f"memory sampler failed: {error}") from error
 PY
 memory_sampler_pid=$!
-trap stop_helpers_on_exit EXIT
+memory_sampler_start_time="$(mount_start_time "$proc_root/$memory_sampler_pid/stat")"
 sleep "$memory_sample_interval"
-kill -0 "$pidstat_pid" 2>/dev/null || die "pidstat failed to start"
-kill -0 "$memory_sampler_pid" 2>/dev/null || die "memory sampler failed to start"
+helper_pid_is_live "$pidstat_pid" "$pidstat_start_time" || die "pidstat failed to start"
+helper_pid_is_live "$memory_sampler_pid" "$memory_sampler_start_time" || \
+  die "memory sampler failed to start"
 
 if [[ "$pressure_scenario" == true ]]; then
   pressure_setup_ready="$artifact_dir/.pressure-setup.ready"
@@ -2196,6 +2224,10 @@ fi
 
 foreground_start_ns="$(monotonic_ns)"
 command_exit_status=0
+pressure_profile_started_ns=""
+pressure_profile_completed_ns=""
+profile_workload_pid=""
+profile_workload_start_time=""
 execute_workload() {
   case "$workload" in
     large-single)
@@ -2245,15 +2277,23 @@ execute_workload() {
 }
 
 if [[ "$pressure_scenario" == true ]]; then
+  helper_pid_is_live "$pressure_setup_pid" "$pressure_setup_start_time" || \
+    die "pressure feeder identity changed before workload profile"
+  pressure_profile_started_ns="$(monotonic_ns)"
   execute_workload > "$artifact_dir/workload.stdout.txt" \
     2> "$artifact_dir/workload.stderr.txt" &
   pressure_workload_pid=$!
   pressure_workload_start_time="$(mount_start_time "$proc_root/$pressure_workload_pid/stat")"
+  profile_workload_pid="$pressure_workload_pid"
+  profile_workload_start_time="$pressure_workload_start_time"
   if wait "$pressure_workload_pid"; then
     command_exit_status=0
   else
     command_exit_status=$?
   fi
+  pressure_profile_completed_ns="$(monotonic_ns)"
+  helper_pid_is_live "$pressure_setup_pid" "$pressure_setup_start_time" || \
+    die "pressure feeder identity changed during workload profile"
   pressure_workload_pid=""
   pressure_workload_start_time=""
 elif execute_workload > "$artifact_dir/workload.stdout.txt" \
@@ -2299,13 +2339,18 @@ PY
     pressure_report="$artifact_dir/client-report.json"
     [[ "$workload_owner" != bench ]] || pressure_report="${pressure_reports[0]}"
     PYTHONDONTWRITEBYTECODE=1 python3 - \
-      "$pressure_report" "$workload" "$artifact_dir/pressure-profile.json" <<'PY'
+      "$pressure_report" "$workload" "$artifact_dir/pressure-profile.json" \
+      "$workload_owner" "$profile_workload_pid" "$profile_workload_start_time" \
+      "$pressure_setup_pid" "$pressure_setup_start_time" \
+      "$pressure_profile_started_ns" "$pressure_profile_completed_ns" \
+      "$command_exit_status" <<'PY'
+import hashlib
 import json
 import pathlib
 import sys
-import time
 
-report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+report_path = pathlib.Path(sys.argv[1])
+report = json.loads(report_path.read_text(encoding="utf-8"))
 if "phase_throughput_mb_per_second" in report:
     value = report["phase_throughput_mb_per_second"].get("read")
 else:
@@ -2316,8 +2361,19 @@ if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
 pathlib.Path(sys.argv[3]).write_text(json.dumps({
     "schema_version": 1,
     "profile": sys.argv[2],
+    "runner": sys.argv[4],
+    "workload_pid": int(sys.argv[5]),
+    "workload_start_time": sys.argv[6],
+    "feeder_pid": int(sys.argv[7]),
+    "feeder_start_time": sys.argv[8],
+    "feeder_live_before_profile": True,
+    "feeder_live_after_profile": True,
+    "started_monotonic_ns": int(sys.argv[9]),
+    "completed_monotonic_ns": int(sys.argv[10]),
+    "exit_status": int(sys.argv[11]),
+    "source_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+    # Diagnostic only: recovery gating uses the identical inline read measurer.
     "read_throughput_mb_per_second": float(value),
-    "completed_monotonic_ns": time.monotonic_ns(),
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
     run_inline_client profile-read-measure "$pressure_run_dir" \
@@ -2404,13 +2460,16 @@ foreground_pidstat_line_count="$(wc -l < "$artifact_dir/pidstat.txt")"
 capture_proc_boundary foreground-end
 capture_runtime_snapshot > "$artifact_dir/runtime-foreground-end.json"
 capture_cgroup_boundary foreground-end
-kill -0 "$pidstat_pid" 2>/dev/null || die "pidstat exited during foreground"
-kill -0 "$memory_sampler_pid" 2>/dev/null || die "memory sampler exited during foreground"
+helper_pid_is_live "$pidstat_pid" "$pidstat_start_time" || \
+  die "pidstat exited during foreground"
+helper_pid_is_live "$memory_sampler_pid" "$memory_sampler_start_time" || \
+  die "memory sampler exited during foreground"
 
 wait_for_idle_boundary "$artifact_dir/runtime-drain-end.json"
 drain_pidstat_deadline=$((SECONDS + 3))
 while (( $(wc -l < "$artifact_dir/pidstat.txt") <= foreground_pidstat_line_count )); do
-  kill -0 "$pidstat_pid" 2>/dev/null || die "pidstat exited during drain"
+  helper_pid_is_live "$pidstat_pid" "$pidstat_start_time" || \
+    die "pidstat exited during drain"
   (( SECONDS <= drain_pidstat_deadline )) || die "pidstat produced no drain sample"
   sleep 0.05
 done
