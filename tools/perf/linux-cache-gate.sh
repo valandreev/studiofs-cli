@@ -1709,6 +1709,7 @@ try:
     payload = {
         **payload,
         "schema_version": 1,
+        "negotiated_max_write_source": gate.NEGOTIATED_MAX_WRITE_SOURCE,
         "memory_max_bytes": memory_max,
         "headroom_bytes": headroom,
         "memory_current_before_bytes": current,

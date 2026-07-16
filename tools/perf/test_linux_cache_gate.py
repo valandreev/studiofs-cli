@@ -741,6 +741,7 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                         ("write_admission_wait_ns", 4, "ns"),
                     )
                 },
+                "latencies": {},
             },
         }
 
@@ -1238,30 +1239,35 @@ class PressureScenarioHelperTest(unittest.TestCase):
                 negotiated_max_write=1 << 20,
             )
 
-    def test_negotiated_max_write_is_strictly_typed_and_unit_checked(self) -> None:
+    def test_negotiated_max_write_uses_schema2_fuse_connection_field(self) -> None:
         valid = {
             "schema_version": 2,
-            "bridge": {
-                "gauges": {
-                    "fuse_negotiated_max_write_bytes": {
-                        "value": 1 << 20,
-                        "unit": "bytes",
-                    }
+            "bridge": {},
+            "write_path": {
+                "fuse_connection": {
+                    "negotiated_max_write_bytes": 1 << 20,
                 }
             }
         }
         self.assertEqual(gate.negotiated_max_write_bytes(valid), 1 << 20)
-        for snapshot in ({}, {**valid, "bridge": {"gauges": {}}}):
-            with self.assertRaisesRegex(gate.GateValidationError, "negotiated"):
-                gate.negotiated_max_write_bytes(snapshot)
-        wrong = json.loads(json.dumps(valid))
-        wrong["bridge"]["gauges"]["fuse_negotiated_max_write_bytes"]["unit"] = "count"
-        with self.assertRaisesRegex(gate.GateValidationError, "unit"):
-            gate.negotiated_max_write_bytes(wrong)
-        zero = json.loads(json.dumps(valid))
-        zero["bridge"]["gauges"]["fuse_negotiated_max_write_bytes"]["value"] = 0
-        with self.assertRaisesRegex(gate.GateValidationError, "positive"):
-            gate.negotiated_max_write_bytes(zero)
+        invalid = (
+            ({}, "schema"),
+            ({**valid, "schema_version": 3}, "schema"),
+            ({**valid, "write_path": {}}, "negotiated"),
+            ({**valid, "write_path": {"fuse_connection": {}}}, "negotiated"),
+        )
+        for snapshot, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(gate.GateValidationError, message):
+                    gate.negotiated_max_write_bytes(snapshot)
+        for value in (None, 0, -1, False, "1048576"):
+            with self.subTest(value=value):
+                snapshot = json.loads(json.dumps(valid))
+                snapshot["write_path"]["fuse_connection"][
+                    "negotiated_max_write_bytes"
+                ] = value
+                with self.assertRaises(gate.GateValidationError):
+                    gate.negotiated_max_write_bytes(snapshot)
 
     def test_holder_ready_release_exit_and_cleanup_use_target_dotfiles(self) -> None:
         root = Path.cwd() / "target/perf/test-memory-holder-helper"
@@ -2453,14 +2459,7 @@ class AnalyzerCliTest(unittest.TestCase):
             }
         return {
             "schema_version": 2,
-            "bridge": {
-                "gauges": {
-                    "fuse_negotiated_max_write_bytes": {
-                        "value": 1 << 20,
-                        "unit": "bytes",
-                    }
-                }
-            },
+            "bridge": {},
             "ingress": {"dirty_mem_bytes": 0},
             "upload": {"pending_uploads": 0, "active_uploads": 0},
             "write_path": {
@@ -2487,6 +2486,7 @@ class AnalyzerCliTest(unittest.TestCase):
                 "fuse_connection": {
                     **cls.geometry(mode),
                     "configured_max_background": 16,
+                    "negotiated_max_write_bytes": 1 << 20,
                     "parallel_direct_writes_supported": True,
                 },
                 "vfs_read_path": {"calls": vfs_read_calls},
@@ -2567,6 +2567,7 @@ class AnalyzerCliTest(unittest.TestCase):
                     name: {"value": sample[name], "unit": unit}
                     for name, unit in counter_units.items()
                 },
+                "latencies": {},
             },
         }
 
@@ -2859,6 +2860,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         ],
                         "holder_bytes": pressure_evidence["holder"]["bytes"],
                         "negotiated_max_write_bytes": 1 << 20,
+                        "negotiated_max_write_source": gate.NEGOTIATED_MAX_WRITE_SOURCE,
                         "observed_admitted_lower_bound_bytes": pressure_evidence["setup"][
                             "observed_admitted_lower_bound_bytes"
                         ],
@@ -3253,7 +3255,7 @@ class AnalyzerCliTest(unittest.TestCase):
         comparison = json.loads((output / "comparison.json").read_text())
         self.assertIn("raw memory pressure", comparison["direct_async"]["errors"][0])
 
-    def test_pressure_profile_must_match_validated_source_report(self) -> None:
+    def test_pressure_sources_must_match_validated_raw_evidence(self) -> None:
         run_dir = self.root / "direct-async" / "large-single" / "rep-001"
         profile_path = run_dir / "pressure-profile.json"
         profile = json.loads(profile_path.read_text())
@@ -3262,6 +3264,20 @@ class AnalyzerCliTest(unittest.TestCase):
         derived = json.loads((run_dir / "derived.json").read_text())
 
         with self.assertRaisesRegex(gate.GateValidationError, "source report mismatch"):
+            gate.validate_memory_pressure_artifacts(
+                run_dir,
+                derived["memory_pressure"],
+            )
+        profile["source_report_sha256"] = hashlib.sha256(
+            (run_dir / "client-report.json").read_bytes()
+        ).hexdigest()
+        self.write_json(profile_path, profile)
+        config_path = run_dir / "memory-pressure-config.json"
+        config = json.loads(config_path.read_text())
+        config["negotiated_max_write_source"] = "wrong"
+        self.write_json(config_path, config)
+
+        with self.assertRaisesRegex(gate.GateValidationError, "raw source mismatch"):
             gate.validate_memory_pressure_artifacts(
                 run_dir,
                 derived["memory_pressure"],

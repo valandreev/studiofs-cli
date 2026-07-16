@@ -14,6 +14,9 @@ from pathlib import Path
 
 
 EXPECTED_RUNTIME_SCHEMA = 2
+NEGOTIATED_MAX_WRITE_SOURCE = (
+    "runtime_snapshot.write_path.fuse_connection.negotiated_max_write_bytes"
+)
 IDLE_GAUGE_PATHS = (
     ("ingress", "dirty_mem_bytes"),
     ("upload", "pending_uploads"),
@@ -356,12 +359,19 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
 def negotiated_max_write_bytes(snapshot: dict) -> int:
     if snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
         raise GateValidationError("negotiated max_write runtime schema mismatch")
-    bridge = snapshot.get("bridge")
-    gauges = bridge.get("gauges") if isinstance(bridge, dict) else None
-    metric = gauges.get("fuse_negotiated_max_write_bytes") if isinstance(gauges, dict) else None
-    if not isinstance(metric, dict) or metric.get("unit") != "bytes":
-        raise GateValidationError("negotiated max_write bytes metric is missing or has wrong unit")
-    value = _nonnegative_integer(metric.get("value"), "negotiated max_write bytes")
+    write_path = snapshot.get("write_path")
+    connection = (
+        write_path.get("fuse_connection") if isinstance(write_path, dict) else None
+    )
+    if (
+        not isinstance(connection, dict)
+        or connection.get("negotiated_max_write_bytes") is None
+    ):
+        raise GateValidationError("negotiated max_write bytes are missing")
+    # Schema 2 types this canonical field as Option<u32>; its name carries the byte unit.
+    value = _nonnegative_integer(
+        connection.get("negotiated_max_write_bytes"), "negotiated max_write bytes"
+    )
     if value == 0:
         raise GateValidationError("negotiated max_write bytes must be positive")
     return value
@@ -2010,6 +2020,8 @@ def memory_pressure_evidence_from_artifacts(
     )
     if config.get("negotiated_max_write_bytes") != negotiated:
         raise GateValidationError("negotiated max_write raw evidence mismatch")
+    if config.get("negotiated_max_write_source") != NEGOTIATED_MAX_WRITE_SOURCE:
+        raise GateValidationError("negotiated max_write raw source mismatch")
     target = derive_pressure_target(
         effective_limit=config.get("memory_max_bytes"),
         negotiated_max_write=negotiated,
