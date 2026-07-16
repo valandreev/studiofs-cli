@@ -583,6 +583,179 @@ class RuntimeEvidenceTest(unittest.TestCase):
             )
 
 
+class MemoryPressureEvidenceTest(unittest.TestCase):
+    @staticmethod
+    def evidence(
+        expected_written: int = 131_072_000,
+        expected_read: int = 131_072_000,
+        **overrides: object,
+    ) -> dict:
+        constrained = {
+            "source": "host_and_cgroup",
+            "state": "constrained",
+            "generation": 2,
+            "envelope_bytes": 1_000,
+            "memory_cache_limit_bytes": 400,
+            "dirty_limit_bytes": 250,
+            "transit_limit_bytes": 150,
+            "async_write_limit_bytes": 100,
+            "overcommitted_minimum": False,
+        }
+        recovered = {
+            **constrained,
+            "state": "normal",
+            "generation": 4,
+        }
+        evidence = {
+            "status": "complete",
+            "cgroup": {
+                "memory_max_bytes": 2_147_483_648,
+                "memory_current_before_bytes": 536_870_912,
+                "memory_current_pressure_bytes": 1_610_612_736,
+                "memory_current_recovery_bytes": 671_088_640,
+                "events_before": {"oom": 3, "oom_kill": 1},
+                "events_after": {"oom": 3, "oom_kill": 1},
+                "events_delta": {"oom": 0, "oom_kill": 0},
+            },
+            "holder": {
+                "bytes": 536_870_912,
+                "started_monotonic_ns": 1,
+                "ready_monotonic_ns": 2,
+                "released_monotonic_ns": 4,
+                "exited_monotonic_ns": 5,
+                "exit_status": 0,
+            },
+            "runtime_samples": {
+                "pressure": [constrained],
+                "recovery": [recovered, {**recovered, "generation": 5}],
+            },
+            "verification": {
+                "bytes_written": expected_written,
+                "bytes_read": expected_read,
+                "pressure_sha256": "a" * 64,
+                "recovery_sha256": "a" * 64,
+            },
+            "throughput_mb_per_second": {
+                "pressure": [80.0],
+                "recovery": [79.0, 81.0],
+            },
+            "cpu": {
+                "foreground_seconds": 1.0,
+                "drain_seconds": 0.1,
+            },
+            "drain_completed": True,
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def validate(self, mode: str = "direct-async", evidence: dict | None = None) -> dict:
+        return gate.validate_memory_pressure_evidence(
+            mode,
+            "small-128k",
+            evidence if evidence is not None else self.evidence(),
+            expected_written=131_072_000,
+            expected_read=131_072_000,
+            promotion_eligible=True,
+        )
+
+    def test_complete_direct_pressure_evidence_passes(self) -> None:
+        result = self.validate()
+
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["recovery_passed"])
+
+    def test_runtime_snapshot_is_normalized_from_wire_metrics(self) -> None:
+        names = {
+            "source": 3,
+            "state": 2,
+            "generation": 7,
+            "envelope_bytes": 1_000,
+            "memory_cache_limit_bytes": 400,
+            "dirty_limit_bytes": 250,
+            "transit_limit_bytes": 150,
+            "async_write_limit_bytes": 100,
+            "overcommitted_minimum": 0,
+        }
+        snapshot = {
+            "schema_version": 2,
+            "memory_pressure": {
+                "gauges": {
+                    name: {"value": value, "unit": "count" if name in {"source", "state", "generation", "overcommitted_minimum"} else "bytes"}
+                    for name, value in names.items()
+                }
+            },
+        }
+
+        self.assertEqual(
+            gate.memory_pressure_sample(snapshot),
+            {
+                "source": "host_and_cgroup",
+                "state": "constrained",
+                "generation": 7,
+                "envelope_bytes": 1_000,
+                "memory_cache_limit_bytes": 400,
+                "dirty_limit_bytes": 250,
+                "transit_limit_bytes": 150,
+                "async_write_limit_bytes": 100,
+                "overcommitted_minimum": False,
+            },
+        )
+
+    def test_oom_and_oom_kill_are_rejected_separately(self) -> None:
+        for counter in ("oom", "oom_kill"):
+            with self.subTest(counter=counter):
+                evidence = self.evidence()
+                evidence["cgroup"]["events_after"][counter] += 1
+                evidence["cgroup"]["events_delta"][counter] = 1
+                with self.assertRaisesRegex(gate.GateValidationError, counter):
+                    self.validate(evidence=evidence)
+
+    def test_managed_limits_must_not_exceed_envelope_even_when_overcommitted(self) -> None:
+        evidence = self.evidence()
+        sample = evidence["runtime_samples"]["pressure"][0]
+        sample["memory_cache_limit_bytes"] += 101
+        sample["overcommitted_minimum"] = True
+
+        with self.assertRaisesRegex(gate.GateValidationError, "envelope"):
+            self.validate(evidence=evidence)
+
+    def test_hash_bytes_and_drain_fail_closed(self) -> None:
+        cases = (
+            ("verification", "recovery_sha256", "b" * 64, "hash"),
+            ("verification", "bytes_read", 1, "bytes"),
+            (None, "drain_completed", False, "drain"),
+        )
+        for section, field, value, message in cases:
+            with self.subTest(field=field):
+                evidence = self.evidence()
+                target = evidence if section is None else evidence[section]
+                target[field] = value
+                with self.assertRaisesRegex(gate.GateValidationError, message):
+                    self.validate(evidence=evidence)
+
+    def test_promotion_requires_pressure_evidence_and_recovery(self) -> None:
+        with self.assertRaisesRegex(gate.GateValidationError, "pressure evidence"):
+            self.validate(evidence={"status": "not_run"})
+
+        evidence = self.evidence()
+        evidence["throughput_mb_per_second"]["recovery"] = [70.0, 71.0]
+        with self.assertRaisesRegex(gate.GateValidationError, "recovery"):
+            self.validate(evidence=evidence)
+
+    def test_kernel_keeps_recovery_miss_diagnostic_but_rejects_correctness(self) -> None:
+        slow = self.evidence()
+        slow["throughput_mb_per_second"]["recovery"] = [70.0, 71.0]
+        result = self.validate(mode="kernel", evidence=slow)
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["recovery_passed"])
+        self.assertTrue(result["performance_diagnostic"])
+
+        corrupt = self.evidence()
+        corrupt["verification"]["recovery_sha256"] = "b" * 64
+        with self.assertRaisesRegex(gate.GateValidationError, "hash"):
+            self.validate(mode="kernel", evidence=corrupt)
+
+
 class PreflightValidationTest(unittest.TestCase):
     def test_mode_environment_mismatch_is_rejected(self) -> None:
         valid = {
@@ -619,11 +792,13 @@ class PreflightValidationTest(unittest.TestCase):
             "cgroup_procs": [],
             "memory_current": 0,
             "memory_peak": 0,
-            "writable": {"cgroup.procs": True},
+            "writable": {"cgroup.procs": True, "memory.max": True},
             "readable": {
                 "memory.current": True,
                 "memory.peak": True,
                 "memory.stat": True,
+                "memory.max": True,
+                "memory.events": True,
             },
             "fresh": True,
         }
@@ -636,6 +811,17 @@ class PreflightValidationTest(unittest.TestCase):
             ({**valid, "memory_peak": 1}, "memory.peak"),
             ({**valid, "fresh": False}, "fresh"),
             ({**valid, "path": valid["delegated_root"]}, "leaf"),
+            (
+                {**valid, "writable": {**valid["writable"], "memory.max": False}},
+                "memory.max",
+            ),
+            (
+                {
+                    **valid,
+                    "readable": {**valid["readable"], "memory.events": False},
+                },
+                "memory.events",
+            ),
         )
         for payload, message in invalid_cases:
             with self.subTest(message=message):
@@ -1128,6 +1314,8 @@ class NumericDecisionTest(unittest.TestCase):
             "verified_bytes_written": 50,
             "verified_bytes_read": 50,
             "foreground_wall_seconds": 1.0,
+            "foreground_mount_cpu_seconds": 1.0,
+            "drain_mount_cpu_seconds": 0.1,
             "total_lifecycle_cpu_seconds_per_gib": 1.0,
             "foreground_average_cores": 1.0,
             "foreground_p95_cores": 1.0,
@@ -1298,6 +1486,37 @@ class NumericDecisionTest(unittest.TestCase):
                 candidate_mode="direct-async",
                 workload_bytes=100,
             )
+
+    def test_kernel_performance_regressions_are_diagnostic(self) -> None:
+        baseline = {
+            workload: [{**self.row(), "_workload_bytes": 100}] * 3
+            for workload in gate.WORKLOADS
+        }
+        candidate = {
+            workload: [
+                {
+                    **self.row(total_lifecycle_cpu_seconds_per_gib=10.0),
+                    "_workload_bytes": 100,
+                    "_memory_pressure": {
+                        "passed": True,
+                        "recovery_passed": False,
+                    },
+                }
+            ]
+            * 3
+            for workload in gate.WORKLOADS
+        }
+
+        result = gate._compare_modes(baseline, candidate, "kernel")
+
+        self.assertTrue(result["passed"])
+        self.assertTrue(
+            all(
+                workload["performance_diagnostic"]
+                and not workload["performance_passed"]
+                for workload in result["workloads"].values()
+            )
+        )
 
 class ScheduleValidationTest(unittest.TestCase):
     def test_exact_five_run_schedule_is_promotion_eligible(self) -> None:
@@ -1625,6 +1844,34 @@ class AnalyzerCliTest(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def pressure_runtime_snapshot(sample: dict) -> dict:
+        source_codes = {"host": 1, "cgroup": 2, "host_and_cgroup": 3, "fallback": 4}
+        state_codes = {"normal": 1, "constrained": 2}
+        values = {
+            **sample,
+            "source": source_codes[sample["source"]],
+            "state": state_codes[sample["state"]],
+            "overcommitted_minimum": int(sample["overcommitted_minimum"]),
+        }
+        return {
+            "schema_version": 2,
+            "memory_pressure": {
+                "gauges": {
+                    name: {
+                        "value": value,
+                        "unit": (
+                            "count"
+                            if name
+                            in {"source", "state", "generation", "overcommitted_minimum"}
+                            else "bytes"
+                        ),
+                    }
+                    for name, value in values.items()
+                }
+            },
+        }
+
     def create_matrix(self) -> None:
         schedule = schedule_manifest()
         delegated_root = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
@@ -1686,11 +1933,13 @@ class AnalyzerCliTest(unittest.TestCase):
                 "cgroup_procs": [],
                 "memory_current": 0,
                 "memory_peak": 0,
-                "writable": {"cgroup.procs": True},
+                "writable": {"cgroup.procs": True, "memory.max": True},
                 "readable": {
                     "memory.current": True,
                     "memory.peak": True,
                     "memory.stat": True,
+                    "memory.max": True,
+                    "memory.events": True,
                 },
                 "fresh": True,
                 "collector_pid": collector_pid,
@@ -1816,6 +2065,14 @@ class AnalyzerCliTest(unittest.TestCase):
                     "second_fuse_flush": RawCallbackEvidenceTest.interval(),
                     "second_fuse_release": RawCallbackEvidenceTest.interval(),
                 }
+            pressure_evidence = (
+                MemoryPressureEvidenceTest.evidence(
+                    expectation["verified_bytes_written"],
+                    expectation["verified_bytes_read"],
+                )
+                if workload in ("large-single", "small-128k")
+                else None
+            )
             derived = {
                 "schema_version": 1,
                 "status": "complete",
@@ -1857,6 +2114,7 @@ class AnalyzerCliTest(unittest.TestCase):
                 "cgroup_file_peak_bytes": 80,
                 "cgroup_anon_peak_bytes": 60,
                 "callback_intervals": callback_intervals,
+                **({"memory_pressure": pressure_evidence} if pressure_evidence else {}),
                 **({"warm_proof": warm_proof} if warm_proof else {}),
             }
             cleanup = {
@@ -1879,6 +2137,77 @@ class AnalyzerCliTest(unittest.TestCase):
                 ("runtime-cleanup-end.json", runtime_end),
             ):
                 self.write_json(run_dir / name, runtime)
+            if pressure_evidence is not None:
+                cgroup = pressure_evidence["cgroup"]
+                self.write_json(
+                    run_dir / "memory-pressure-config.json",
+                    {
+                        "schema_version": 1,
+                        "memory_max_bytes": cgroup["memory_max_bytes"],
+                        "memory_current_before_bytes": cgroup[
+                            "memory_current_before_bytes"
+                        ],
+                        "holder_bytes": pressure_evidence["holder"]["bytes"],
+                    },
+                )
+                for phase, current, events in (
+                    (
+                        "before",
+                        cgroup["memory_current_before_bytes"],
+                        cgroup["events_before"],
+                    ),
+                    (
+                        "pressure",
+                        cgroup["memory_current_pressure_bytes"],
+                        cgroup["events_before"],
+                    ),
+                    (
+                        "after",
+                        cgroup["memory_current_recovery_bytes"],
+                        cgroup["events_after"],
+                    ),
+                ):
+                    self.write_json(
+                        run_dir / f"memory-events-{phase}.json",
+                        {
+                            "schema_version": 1,
+                            "phase": phase,
+                            "monotonic_ns": 1,
+                            "memory_max_bytes": cgroup["memory_max_bytes"],
+                            "memory_current_bytes": current,
+                            "events": events,
+                        },
+                    )
+                self.write_json(run_dir / "memory-holder.json", pressure_evidence["holder"])
+                self.write_json(
+                    run_dir / "pressure-hash.json",
+                    {
+                        "schema_version": 1,
+                        "bytes_read": pressure_evidence["verification"]["bytes_read"],
+                        "sha256": pressure_evidence["verification"]["pressure_sha256"],
+                        "throughput_mb_per_second": pressure_evidence[
+                            "throughput_mb_per_second"
+                        ]["pressure"][0],
+                    },
+                )
+                self.write_json(
+                    run_dir / "pressure-recovery.json",
+                    {
+                        "schema_version": 1,
+                        "bytes_read": pressure_evidence["verification"]["bytes_read"],
+                        "sha256": pressure_evidence["verification"]["recovery_sha256"],
+                        "throughput_mb_per_second": pressure_evidence[
+                            "throughput_mb_per_second"
+                        ]["recovery"],
+                    },
+                )
+                samples = pressure_evidence["runtime_samples"]
+                for name, sample in (
+                    ("runtime-pressure.json", samples["pressure"][0]),
+                    ("runtime-recovery-1.json", samples["recovery"][0]),
+                    ("runtime-recovery-2.json", samples["recovery"][1]),
+                ):
+                    self.write_json(run_dir / name, self.pressure_runtime_snapshot(sample))
             if warm_midpoint is not None:
                 self.write_json(
                     run_dir / "runtime-warm-first-end.json",
@@ -2010,7 +2339,14 @@ class AnalyzerCliTest(unittest.TestCase):
             for workload in comparison[candidate]["workloads"].values():
                 for metric in workload["gates"].values():
                     self.assertIsInstance(metric["improved"], bool)
+            for workload in ("large-single", "small-128k"):
+                self.assertTrue(
+                    comparison[candidate]["workloads"][workload]["memory_pressure"][
+                        "recovery_passed"
+                    ]
+                )
         self.assertIn("direct-async", (output / "summary.md").read_text())
+        self.assertIn("Memory pressure", (output / "summary.md").read_text())
         self.assertIn("direct-async", (output / "decision.md").read_text())
 
     def test_cli_rejects_missing_or_empty_stable_evidence(self) -> None:
@@ -2033,6 +2369,68 @@ class AnalyzerCliTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         comparison = json.loads((output / "comparison.json").read_text())
         self.assertIn("required artifact", comparison["errors"][0])
+
+    def test_cli_rejects_missing_promotion_pressure_evidence(self) -> None:
+        derived_path = (
+            self.root / "direct-async" / "small-128k" / "rep-001" / "derived.json"
+        )
+        derived = json.loads(derived_path.read_text())
+        derived.pop("memory_pressure")
+        self.write_json(derived_path, derived)
+        output = self.root / "missing-pressure-comparison"
+        exit_code = gate.main(
+            [
+                "--direct-serial",
+                str(self.root / "direct-serial"),
+                "--direct-async",
+                str(self.root / "direct-async"),
+                "--kernel",
+                str(self.root / "kernel"),
+                "--correctness-manifest",
+                str(self.correctness_path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(exit_code, 1)
+        comparison = json.loads((output / "comparison.json").read_text())
+        self.assertIn(
+            "memory pressure evidence",
+            comparison["direct_async"]["errors"][0],
+        )
+
+    def test_cli_rejects_pressure_derived_raw_mismatch(self) -> None:
+        path = (
+            self.root
+            / "direct-async"
+            / "large-single"
+            / "rep-001"
+            / "runtime-pressure.json"
+        )
+        snapshot = json.loads(path.read_text())
+        snapshot["memory_pressure"]["gauges"]["envelope_bytes"]["value"] += 1
+        self.write_json(path, snapshot)
+        output = self.root / "pressure-raw-mismatch"
+
+        exit_code = gate.main(
+            [
+                "--direct-serial",
+                str(self.root / "direct-serial"),
+                "--direct-async",
+                str(self.root / "direct-async"),
+                "--kernel",
+                str(self.root / "kernel"),
+                "--correctness-manifest",
+                str(self.correctness_path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(exit_code, 1)
+        comparison = json.loads((output / "comparison.json").read_text())
+        self.assertIn("raw memory pressure", comparison["direct_async"]["errors"][0])
 
     def test_cli_rejects_benchmark_report_copy_mismatch(self) -> None:
         original = (
@@ -2517,6 +2915,42 @@ class ShellContractTest(unittest.TestCase):
             ),
             {"status": "dry-run", "phase": "warm-first-end"},
         )
+
+    def test_collector_dry_run_declares_pressure_artifacts_without_starting_holder(self) -> None:
+        output_root = self.root / "pressure-collector"
+        completed = self.run_script(
+            self.collector,
+            "--mode",
+            "direct-async",
+            "--workload",
+            "small-128k",
+            "--mount-point",
+            str(self.root / "mount"),
+            "--mount-pid",
+            "4242",
+            "--output-root",
+            str(output_root),
+            "--dry-run",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        artifact_dir = Path(completed.stdout.strip())
+        for name in (
+            "memory-events-before.json",
+            "memory-events-after.json",
+            "memory-holder.json",
+            "pressure-recovery.json",
+            "runtime-pressure.json",
+            "runtime-recovery-1.json",
+            "runtime-recovery-2.json",
+        ):
+            self.assertEqual(
+                json.loads((artifact_dir / name).read_text())["status"],
+                "dry-run",
+            )
+        self.assertIn("pressure_scenario=true", (artifact_dir / "command.txt").read_text())
+        self.assertFalse((artifact_dir / "memory-holder.ready").exists())
+        self.assertFalse((artifact_dir / "memory-holder.release").exists())
 
     def test_matrix_dry_run_writes_exact_diagnostic_rotation(self) -> None:
         output_root = self.root / "matrix"

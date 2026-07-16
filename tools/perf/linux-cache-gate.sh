@@ -257,6 +257,10 @@ wait_for_idle_boundary() {
 
 pidstat_pid=""
 memory_sampler_pid=""
+memory_holder_pid=""
+memory_holder_start=""
+memory_holder_ready=""
+memory_holder_release=""
 
 helper_pid_is_live() {
   local pid="$1"
@@ -301,7 +305,7 @@ stop_helper_bounded() {
     exit_status=$?
   fi
   case "$label:$exit_status" in
-    pidstat:0|pidstat:130|pidstat:143|memory-sampler:0) return 0 ;;
+    pidstat:0|pidstat:130|pidstat:143|memory-sampler:0|memory-holder:0|memory-holder:143) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -317,6 +321,13 @@ stop_helpers_on_exit() {
       printf 'Error: failed to stop memory sampler during collector cleanup\n' >&2
     fi
   fi
+  if [[ -n "$memory_holder_pid" ]]; then
+    [[ -z "$memory_holder_release" ]] || touch "$memory_holder_release"
+    if ! stop_helper_bounded "$memory_holder_pid" memory-holder; then
+      printf 'Error: failed to stop memory holder during collector cleanup\n' >&2
+    fi
+  fi
+  rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
 }
 
 stop_measurement_helpers() {
@@ -327,6 +338,88 @@ stop_measurement_helpers() {
   stop_helper_bounded "$memory_sampler_pid" memory-sampler || \
     die "failed to stop memory sampler within 10 seconds"
   memory_sampler_pid=""
+}
+
+wait_for_file() {
+  local path="$1"
+  local label="$2"
+  local deadline=$((SECONDS + 30))
+  while [[ ! -s "$path" ]]; do
+    helper_pid_is_live "$memory_holder_pid" || die "memory holder exited before $label"
+    (( SECONDS < deadline )) || die "timed out waiting for memory holder $label"
+    sleep 0.05
+  done
+}
+
+capture_memory_event_boundary() {
+  local phase="$1"
+  local destination="$2"
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$phase" "$cgroup/memory.max" "$cgroup/memory.current" \
+    "$cgroup/memory.events" "$destination" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+phase, max_path, current_path, events_path, destination = sys.argv[1:]
+try:
+    raw_limit = pathlib.Path(max_path).read_text(encoding="utf-8").strip()
+    if raw_limit == "max":
+        raise ValueError("memory.max is not finite")
+    events = {}
+    for line in pathlib.Path(events_path).read_text(encoding="utf-8").splitlines():
+        name, raw_value = line.split()
+        value = int(raw_value)
+        if value < 0:
+            raise ValueError(f"negative memory.events counter: {name}")
+        events[name] = value
+    for required in ("oom", "oom_kill"):
+        if required not in events:
+            raise ValueError(f"memory.events is missing {required}")
+    payload = {
+        "schema_version": 1,
+        "phase": phase,
+        "monotonic_ns": time.monotonic_ns(),
+        "memory_max_bytes": int(raw_limit),
+        "memory_current_bytes": int(
+            pathlib.Path(current_path).read_text(encoding="utf-8").strip()
+        ),
+        "events": events,
+    }
+    if payload["memory_max_bytes"] <= 0 or not 0 <= payload["memory_current_bytes"] <= payload["memory_max_bytes"]:
+        raise ValueError("invalid cgroup memory boundary")
+    pathlib.Path(destination).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+except (OSError, ValueError) as error:
+    raise SystemExit(f"Error: memory event boundary failed: {error}") from error
+PY
+}
+
+wait_for_memory_pressure_state() {
+  local expected="$1"
+  local destination="$2"
+  local snapshot=""
+  local state=""
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS <= deadline )); do
+    snapshot="$(capture_runtime_snapshot)"
+    state="$(printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
+      python3 -c '
+import json
+import sys
+from tools.perf import linux_cache_gate_summary as gate
+print(gate.memory_pressure_sample(json.load(sys.stdin))["state"])
+')"
+    if [[ "$state" == "$expected" ]]; then
+      printf '%s\n' "$snapshot" > "$destination"
+      return 0
+    fi
+    sleep "$idle_poll_interval"
+  done
+  die "memory pressure state did not become $expected within 30 seconds"
 }
 
 run_inline_client() {
@@ -415,6 +508,33 @@ def throughput(byte_count: int, started_ns: int, ended_ns: int) -> float:
     if elapsed <= 0:
         raise ValueError("nonpositive workload phase duration")
     return byte_count / 1_000_000 / elapsed
+
+
+def workload_files() -> list[pathlib.Path]:
+    paths = sorted(RUN_DIR.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("pressure workload tree contains a symlink")
+    files = [path for path in paths if path.is_file()]
+    if not files:
+        raise ValueError("pressure workload tree has no files")
+    return files
+
+
+def hash_workload() -> tuple[int, str, float]:
+    digest = hashlib.sha256()
+    observed = 0
+    started = time.monotonic_ns()
+    for path in workload_files():
+        with path.open("rb", buffering=0) as handle:
+            while chunk := handle.read(MIB):
+                digest.update(chunk)
+                observed += len(chunk)
+    ended = time.monotonic_ns()
+    if observed != WORKLOAD_BYTES:
+        raise ValueError(
+            f"pressure workload byte mismatch: expected {WORKLOAD_BYTES}, got {observed}"
+        )
+    return observed, digest.hexdigest(), throughput(observed, started, ended)
 
 
 def common_report(
@@ -672,6 +792,30 @@ elif ACTION == "cross-file-barriers":
         common_start_monotonic_ns=common_start,
         file_completions=sorted(completions, key=lambda item: item["file"]),
     ))
+elif ACTION == "pressure-hash":
+    observed, checksum, measured_throughput = hash_workload()
+    write_json({
+        "schema_version": 1,
+        "bytes_read": observed,
+        "sha256": checksum,
+        "throughput_mb_per_second": measured_throughput,
+    })
+elif ACTION == "pressure-recovery":
+    if len(EXTRA) != 1:
+        raise SystemExit("pressure-recovery requires pressure hash path")
+    pressure = json.loads(pathlib.Path(EXTRA[0]).read_text(encoding="utf-8"))
+    trials = [hash_workload(), hash_workload()]
+    if any(
+        observed != pressure.get("bytes_read") or checksum != pressure.get("sha256")
+        for observed, checksum, _throughput in trials
+    ):
+        raise ValueError("pressure recovery hash verification failed")
+    write_json({
+        "schema_version": 1,
+        "bytes_read": trials[-1][0],
+        "sha256": trials[-1][1],
+        "throughput_mb_per_second": [trial[2] for trial in trials],
+    })
 else:
     raise SystemExit(f"unknown inline client action: {ACTION}")
 PY
@@ -760,6 +904,11 @@ if [[ -n "$correctness_manifest" ]]; then
   correctness_manifest="$(realpath -m -- "$correctness_manifest")"
 fi
 
+pressure_scenario=false
+if [[ "$workload" == large-single || "$workload" == small-128k ]]; then
+  pressure_scenario=true
+fi
+
 if [[ "$dry_run" == false ]]; then
   if [[ -z "$cgroup" ]]; then
     echo "Error: --cgroup is required for real runs" >&2
@@ -835,6 +984,7 @@ mount_point=$mount_point
 mount_pid=$mount_pid
 runs=1
 workload_bytes=$workload_bytes
+pressure_scenario=$pressure_scenario
 COMMAND
 
 for phase in foreground-start foreground-end drain-end cleanup-end; do
@@ -842,6 +992,15 @@ for phase in foreground-start foreground-end drain-end cleanup-end; do
 done
 if [[ "$workload" == warm-reopen ]]; then
   json_placeholder "$artifact_dir/runtime-warm-first-end.json" "warm-first-end"
+fi
+if [[ "$pressure_scenario" == true ]]; then
+  for phase in pressure recovery-1 recovery-2; do
+    json_placeholder "$artifact_dir/runtime-$phase.json" "$phase"
+  done
+  for artifact in memory-pressure-config memory-events-before memory-events-pressure \
+    memory-events-after memory-holder pressure-hash pressure-recovery; do
+    json_placeholder "$artifact_dir/$artifact.json" "$artifact"
+  done
 fi
 
 for phase in foreground-start foreground-end drain-end; do
@@ -1175,10 +1334,16 @@ try:
         "cgroup_procs": procs,
         "memory_current": memory_current,
         "memory_peak": memory_peak,
-        "writable": {"cgroup.procs": os.access(path / "cgroup.procs", os.W_OK)},
+        "writable": {
+            name: os.access(path / name, os.W_OK)
+            for name in ("cgroup.procs", "memory.max")
+        },
         "readable": {
             name: os.access(path / name, os.R_OK)
-            for name in ("memory.current", "memory.peak", "memory.stat")
+            for name in (
+                "memory.current", "memory.peak", "memory.stat",
+                "memory.max", "memory.events",
+            )
         },
     }
     gate.validate_cgroup_preflight(preflight)
@@ -1199,6 +1364,65 @@ printf '%s\n' "$$" > "$cgroup/cgroup.procs" || die "failed to move collector int
 verify_cgroup_membership "$proc_root/self/cgroup" "collector"
 printf '%s\n' "$mount_pid" > "$cgroup/cgroup.procs" || die "failed to move mount process into cgroup"
 verify_cgroup_membership "$proc_root/$mount_pid/cgroup" "mount process"
+
+if [[ "$pressure_scenario" == true ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" <<'PY'
+import json
+import pathlib
+import sys
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+cgroup = pathlib.Path(sys.argv[1])
+
+
+def finite_limit(path: pathlib.Path) -> int | None:
+    raw = path.read_text(encoding="utf-8").strip()
+    return None if raw == "max" else int(raw)
+
+
+try:
+    current = int((cgroup / "memory.current").read_text(encoding="utf-8").strip())
+    host_available = None
+    for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines():
+        if line.startswith("MemAvailable:"):
+            host_available = int(line.split()[1]) * 1024
+            break
+    if current < 0 or host_available is None or host_available < 768 * MIB:
+        raise ValueError("insufficient host headroom for the pressure scenario")
+    headroom = min(GIB, host_available - 256 * MIB)
+    leaf_limit = finite_limit(cgroup / "memory.max")
+    if leaf_limit is not None:
+        headroom = min(headroom, leaf_limit - current)
+    parent_limit = finite_limit(cgroup.parent / "memory.max")
+    if parent_limit is not None:
+        parent_current = int(
+            (cgroup.parent / "memory.current").read_text(encoding="utf-8").strip()
+        )
+        headroom = min(headroom, parent_limit - parent_current)
+    if headroom < 768 * MIB:
+        raise ValueError("delegated cgroup has less than 768 MiB headroom")
+    memory_max = current + headroom
+    holder_bytes = min(512 * MIB, headroom - 256 * MIB)
+    (cgroup / "memory.max").write_text(f"{memory_max}\n", encoding="utf-8")
+    if finite_limit(cgroup / "memory.max") != memory_max:
+        raise ValueError("memory.max did not retain the requested finite limit")
+    payload = {
+        "schema_version": 1,
+        "memory_max_bytes": memory_max,
+        "memory_current_before_bytes": current,
+        "holder_bytes": holder_bytes,
+    }
+    pathlib.Path(sys.argv[3]).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+except (OSError, ValueError) as error:
+    raise SystemExit(f"Error: cannot configure pressure cgroup: {error}") from error
+PY
+  capture_memory_event_boundary before "$artifact_dir/memory-events-before.json"
+fi
 
 idle_snapshot_file="$artifact_dir/.preflight-idle-zero.jsonl"
 first_runtime_file="$artifact_dir/.preflight-first-runtime.json"
@@ -1420,6 +1644,71 @@ for path, payload in ((pathlib.Path(sys.argv[1]), environment), (pathlib.Path(sy
 PY
 
 rm -f -- "$idle_snapshot_file" "$first_runtime_file"
+if [[ "$pressure_scenario" == true ]]; then
+  holder_bytes="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["holder_bytes"])
+' "$artifact_dir/memory-pressure-config.json")"
+  memory_holder_start="$artifact_dir/.memory-holder.start"
+  memory_holder_ready="$artifact_dir/.memory-holder.ready"
+  memory_holder_release="$artifact_dir/.memory-holder.release"
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$holder_bytes" "$memory_holder_start" "$memory_holder_ready" \
+    "$memory_holder_release" "$artifact_dir/memory-holder.json" \
+    > "$artifact_dir/memory-holder.stdout.txt" \
+    2> "$artifact_dir/memory-holder.stderr.txt" <<'PY' &
+import gc
+import json
+import pathlib
+import sys
+import time
+
+holder_bytes = int(sys.argv[1])
+start_path, ready_path, release_path, result_path = map(pathlib.Path, sys.argv[2:])
+started = time.monotonic_ns()
+while not start_path.exists():
+    time.sleep(0.05)
+allocation = bytearray(holder_bytes)
+for offset in range(0, holder_bytes, 4096):
+    allocation[offset] = 1
+ready = time.monotonic_ns()
+ready_path.write_text(
+    json.dumps({"started_monotonic_ns": started, "ready_monotonic_ns": ready}) + "\n",
+    encoding="utf-8",
+)
+while not release_path.exists():
+    time.sleep(0.05)
+released = time.monotonic_ns()
+del allocation
+gc.collect()
+exited = time.monotonic_ns()
+result_path.write_text(
+    json.dumps(
+        {
+            "bytes": holder_bytes,
+            "started_monotonic_ns": started,
+            "ready_monotonic_ns": ready,
+            "released_monotonic_ns": released,
+            "exited_monotonic_ns": exited,
+            "exit_status": 0,
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n",
+    encoding="utf-8",
+)
+PY
+  memory_holder_pid=$!
+  trap stop_helpers_on_exit EXIT
+  printf '%s\n' "$memory_holder_pid" > "$cgroup/cgroup.procs" || \
+    die "failed to move memory holder into cgroup"
+  verify_cgroup_membership "$proc_root/$memory_holder_pid/cgroup" "memory holder"
+  touch "$memory_holder_start"
+  wait_for_file "$memory_holder_ready" readiness
+  capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
+  wait_for_memory_pressure_state constrained "$artifact_dir/runtime-pressure.json"
+fi
 workload_owner=bench
 workload_run_dir=""
 inline_workload_run_dir=""
@@ -1484,6 +1773,14 @@ inline-python cross-file-barriers --run-dir "$workload_run_dir" --parallelism 2 
 COMMAND
     ;;
 esac
+if [[ "$pressure_scenario" == true ]]; then
+  cat >> "$artifact_dir/command.txt" <<COMMAND
+memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
+pressure-hash --run-dir <owned-workload-dir>
+memory-holder-release
+pressure-recovery trial-1 trial-2 --run-dir <owned-workload-dir>
+COMMAND
+fi
 
 LC_ALL=C "$pidstat_bin" -urd -h -p "$mount_pid" 1 \
   > "$artifact_dir/pidstat.txt" 2> "$artifact_dir/pidstat.stderr.txt" &
@@ -1640,6 +1937,61 @@ else
   command_exit_status=$?
 fi
 
+if [[ "$pressure_scenario" == true ]]; then
+  pressure_workload_bytes="$workload_bytes"
+  if [[ "$workload" == small-128k ]]; then
+    pressure_workload_bytes=131072000
+  fi
+  pressure_run_dir="$workload_run_dir"
+  if [[ "$workload_owner" == bench && "$command_exit_status" == 0 ]]; then
+    shopt -s nullglob
+    pressure_reports=("$artifact_dir"/studiofs-bench-report-*.json)
+    shopt -u nullglob
+    (( ${#pressure_reports[@]} == 1 )) || die "pressure workload emitted an invalid report count"
+    pressure_run_dir="$(PYTHONDONTWRITEBYTECODE=1 python3 - \
+      "${pressure_reports[0]}" "$mount_point" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raw_run_dir = report.get("run", {}).get("run_dir")
+if not isinstance(raw_run_dir, str) or not os.path.isabs(raw_run_dir):
+    raise SystemExit("Error: pressure benchmark run_dir is invalid")
+run_dir = pathlib.Path(os.path.abspath(os.path.normpath(raw_run_dir)))
+mount_point = pathlib.Path(os.path.abspath(os.path.normpath(sys.argv[2])))
+if run_dir.parent != mount_point or not run_dir.name.startswith("studiofs-bench-run-"):
+    raise SystemExit("Error: pressure benchmark run_dir is not an owned child")
+if run_dir.is_symlink() or not run_dir.is_dir():
+    raise SystemExit("Error: pressure benchmark run_dir is missing or a symlink")
+print(run_dir)
+PY
+)"
+  fi
+  if [[ "$command_exit_status" == 0 ]]; then
+    run_inline_client pressure-hash "$pressure_run_dir" \
+      "$artifact_dir/pressure-hash.json" "$pressure_workload_bytes" ""
+  fi
+  touch "$memory_holder_release"
+  wait_for_file "$artifact_dir/memory-holder.json" exit
+  if wait "$memory_holder_pid"; then
+    memory_holder_exit_status=0
+  else
+    memory_holder_exit_status=$?
+  fi
+  (( memory_holder_exit_status == 0 )) || die "memory holder exited with status $memory_holder_exit_status"
+  memory_holder_pid=""
+  rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
+  wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-1.json"
+  if [[ "$command_exit_status" == 0 ]]; then
+    run_inline_client pressure-recovery "$pressure_run_dir" \
+      "$artifact_dir/pressure-recovery.json" "$pressure_workload_bytes" "" \
+      "$artifact_dir/pressure-hash.json"
+  fi
+  wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-2.json"
+fi
+
 foreground_end_ns="$(monotonic_ns)"
 foreground_pidstat_line_count="$(wc -l < "$artifact_dir/pidstat.txt")"
 capture_proc_boundary foreground-end
@@ -1658,6 +2010,9 @@ done
 sleep 0.05
 capture_proc_boundary drain-end
 capture_cgroup_boundary drain-end
+if [[ "$pressure_scenario" == true ]]; then
+  capture_memory_event_boundary after "$artifact_dir/memory-events-after.json"
+fi
 drain_end_ns="$(monotonic_ns)"
 stop_measurement_helpers
 trap - EXIT
@@ -2289,6 +2644,24 @@ if workload == "warm-reopen":
 fixture = e["CACHE_GATE_TEST_FIXTURE"] == "true"
 diagnostic = e["CACHE_GATE_DIAGNOSTIC"] == "true"
 promotion_eligible = not fixture and not diagnostic
+memory_pressure = None
+pressure_config_path = artifact / "memory-pressure-config.json"
+if pressure_config_path.exists():
+    memory_pressure = gate.memory_pressure_evidence_from_artifacts(
+        artifact,
+        verified_written=verified_written,
+        verified_read=verified_read,
+        foreground_cpu=foreground_cpu_seconds,
+        drain_cpu=drain_cpu_seconds,
+    )
+    gate.validate_memory_pressure_evidence(
+        mode,
+        workload,
+        memory_pressure,
+        expected_written=verified_written,
+        expected_read=verified_read,
+        promotion_eligible=promotion_eligible,
+    )
 derived = {
     "schema_version": 1,
     "status": "complete",
@@ -2358,6 +2731,7 @@ derived = {
     ),
     "foreground_start_idle": True,
     "drain_end_idle": True,
+    **({"memory_pressure": memory_pressure} if memory_pressure is not None else {}),
 }
 gate.validate_raw_callback_intervals(
     mode,

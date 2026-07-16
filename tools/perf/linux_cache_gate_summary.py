@@ -288,6 +288,47 @@ def idle_streak_reached(snapshots: Sequence[dict], consecutive: int = 3) -> bool
     return False
 
 
+def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
+    """Normalize one runtime-stats memory-pressure section for gate evidence."""
+    section = snapshot.get("memory_pressure")
+    gauges = section.get("gauges") if isinstance(section, dict) else None
+    if not isinstance(gauges, dict):
+        raise GateValidationError("runtime memory_pressure gauges are missing")
+
+    def value(name: str) -> int:
+        metric = gauges.get(name)
+        if not isinstance(metric, dict):
+            raise GateValidationError(f"runtime memory_pressure gauge is missing: {name}")
+        return _nonnegative_integer(metric.get("value"), f"memory_pressure.{name}")
+
+    sources = {
+        0: "disabled",
+        1: "host",
+        2: "cgroup",
+        3: "host_and_cgroup",
+        4: "fallback",
+    }
+    states = {0: "disabled", 1: "normal", 2: "constrained"}
+    source_code = value("source")
+    state_code = value("state")
+    if source_code not in sources or state_code not in states:
+        raise GateValidationError("runtime memory_pressure wire code is invalid")
+    overcommitted = value("overcommitted_minimum")
+    if overcommitted not in (0, 1):
+        raise GateValidationError("runtime overcommitted minimum flag is invalid")
+    return {
+        "source": sources[source_code],
+        "state": states[state_code],
+        "generation": value("generation"),
+        "envelope_bytes": value("envelope_bytes"),
+        "memory_cache_limit_bytes": value("memory_cache_limit_bytes"),
+        "dirty_limit_bytes": value("dirty_limit_bytes"),
+        "transit_limit_bytes": value("transit_limit_bytes"),
+        "async_write_limit_bytes": value("async_write_limit_bytes"),
+        "overcommitted_minimum": bool(overcommitted),
+    }
+
+
 def _normalized_path(path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
 
@@ -381,10 +422,18 @@ def validate_cgroup_preflight(preflight: dict) -> None:
         raise GateValidationError("fresh cgroup memory.peak must be zero")
     if preflight.get("writable", {}).get("cgroup.procs") is not True:
         raise GateValidationError("cgroup.procs must be writable")
+    if preflight.get("writable", {}).get("memory.max") is not True:
+        raise GateValidationError("memory.max must be writable")
     readable = preflight.get("readable", {})
     missing = [
         name
-        for name in ("memory.current", "memory.peak", "memory.stat")
+        for name in (
+            "memory.current",
+            "memory.peak",
+            "memory.stat",
+            "memory.max",
+            "memory.events",
+        )
         if readable.get(name) is not True
     ]
     if missing:
@@ -447,6 +496,181 @@ def validate_run_eligibility(mode: str, derived: dict, cleanup: dict) -> None:
     if not isinstance(cleanup, dict):
         raise GateValidationError("cleanup record is missing")
     validate_cleanup_record(cleanup)
+
+
+def validate_memory_pressure_evidence(
+    mode: str,
+    workload: str,
+    evidence: object,
+    *,
+    expected_written: int,
+    expected_read: int,
+    promotion_eligible: bool,
+) -> dict[str, object]:
+    """Validate the mounted pressure proof attached to one measured run."""
+    required = (
+        promotion_eligible
+        and mode in MODES
+        and workload in ("large-single", "small-128k")
+    )
+    if not isinstance(evidence, dict) or evidence.get("status") != "complete":
+        if required:
+            raise GateValidationError("complete memory pressure evidence is required")
+        return {
+            "status": "not_run",
+            "passed": True,
+            "recovery_passed": True,
+            "performance_diagnostic": mode == "kernel",
+        }
+
+    cgroup = evidence.get("cgroup")
+    holder = evidence.get("holder")
+    runtime_samples = evidence.get("runtime_samples")
+    verification = evidence.get("verification")
+    throughput = evidence.get("throughput_mb_per_second")
+    cpu = evidence.get("cpu")
+    if not all(
+        isinstance(item, dict)
+        for item in (cgroup, holder, runtime_samples, verification, throughput, cpu)
+    ):
+        raise GateValidationError("memory pressure evidence has an invalid shape")
+    assert isinstance(cgroup, dict)
+    assert isinstance(holder, dict)
+    assert isinstance(runtime_samples, dict)
+    assert isinstance(verification, dict)
+    assert isinstance(throughput, dict)
+    assert isinstance(cpu, dict)
+
+    memory_max = _nonnegative_integer(cgroup.get("memory_max_bytes"), "memory.max")
+    if memory_max == 0:
+        raise GateValidationError("memory.max must be finite and positive")
+    for field in (
+        "memory_current_before_bytes",
+        "memory_current_pressure_bytes",
+        "memory_current_recovery_bytes",
+    ):
+        if _nonnegative_integer(cgroup.get(field), field) > memory_max:
+            raise GateValidationError(f"{field} exceeds memory.max")
+    events_before = cgroup.get("events_before")
+    events_after = cgroup.get("events_after")
+    events_delta = cgroup.get("events_delta")
+    if not all(isinstance(item, dict) for item in (events_before, events_after, events_delta)):
+        raise GateValidationError("cgroup memory.events evidence is missing")
+    assert isinstance(events_before, dict)
+    assert isinstance(events_after, dict)
+    assert isinstance(events_delta, dict)
+    for counter in ("oom", "oom_kill"):
+        before = _nonnegative_integer(events_before.get(counter), f"{counter}.before")
+        after = _nonnegative_integer(events_after.get(counter), f"{counter}.after")
+        delta = _nonnegative_integer(events_delta.get(counter), f"{counter}.delta")
+        if after - before != delta or delta != 0:
+            raise GateValidationError(f"cgroup {counter} delta must be zero")
+
+    if _nonnegative_integer(holder.get("bytes"), "holder bytes") == 0:
+        raise GateValidationError("holder bytes must be positive")
+    timestamps = [
+        _nonnegative_integer(holder.get(field), f"holder {field}")
+        for field in (
+            "started_monotonic_ns",
+            "ready_monotonic_ns",
+            "released_monotonic_ns",
+            "exited_monotonic_ns",
+        )
+    ]
+    if timestamps != sorted(timestamps) or len(set(timestamps)) != len(timestamps):
+        raise GateValidationError("holder lifecycle timestamps are not ordered")
+    if holder.get("exit_status") != 0:
+        raise GateValidationError("memory holder failed to exit cleanly")
+
+    pressure_samples = runtime_samples.get("pressure")
+    recovery_samples = runtime_samples.get("recovery")
+    if (
+        not isinstance(pressure_samples, list)
+        or not pressure_samples
+        or not isinstance(recovery_samples, list)
+        or len(recovery_samples) < 2
+    ):
+        raise GateValidationError("pressure and repeated recovery runtime samples are required")
+    samples = [*pressure_samples, *recovery_samples]
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise GateValidationError("memory pressure runtime sample is invalid")
+        if sample.get("source") not in ("host", "cgroup", "host_and_cgroup", "fallback"):
+            raise GateValidationError("memory pressure source is invalid")
+        _nonnegative_integer(sample.get("generation"), "memory pressure generation")
+        envelope = _nonnegative_integer(sample.get("envelope_bytes"), "memory envelope")
+        managed = sum(
+            _nonnegative_integer(sample.get(field), field)
+            for field in (
+                "memory_cache_limit_bytes",
+                "dirty_limit_bytes",
+                "transit_limit_bytes",
+                "async_write_limit_bytes",
+            )
+        )
+        if managed > envelope:
+            raise GateValidationError("managed memory limits exceed the envelope")
+        if not isinstance(sample.get("overcommitted_minimum"), bool):
+            raise GateValidationError("overcommitted minimum flag is invalid")
+    if not any(sample.get("state") == "constrained" for sample in pressure_samples):
+        raise GateValidationError("pressure phase never reached constrained state")
+    if recovery_samples[-1].get("state") != "normal":
+        raise GateValidationError("recovery phase did not return to normal state")
+    generations = [sample["generation"] for sample in samples]
+    if generations != sorted(generations):
+        raise GateValidationError("memory pressure generations decreased")
+    if recovery_samples[-1]["generation"] <= pressure_samples[-1]["generation"]:
+        raise GateValidationError("memory pressure generation did not advance during recovery")
+
+    for field, expected in (
+        ("bytes_written", expected_written),
+        ("bytes_read", expected_read),
+    ):
+        if verification.get(field) != expected:
+            raise GateValidationError(f"pressure verification {field} mismatch")
+    pressure_hash = verification.get("pressure_sha256")
+    recovery_hash = verification.get("recovery_sha256")
+    if not _is_sha256(pressure_hash) or pressure_hash != recovery_hash:
+        raise GateValidationError("pressure/recovery hash verification failed")
+    if evidence.get("drain_completed") is not True:
+        raise GateValidationError("memory pressure drain did not complete")
+
+    numeric_throughput = {}
+    for phase, minimum_count in (("pressure", 1), ("recovery", 2)):
+        values = throughput.get(phase)
+        if not isinstance(values, list) or len(values) < minimum_count:
+            raise GateValidationError(f"{phase} throughput evidence is missing")
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+            for value in values
+        ):
+            raise GateValidationError(f"{phase} throughput evidence is invalid")
+        numeric_throughput[phase] = values
+    for field in ("foreground_seconds", "drain_seconds"):
+        value = cpu.get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise GateValidationError(f"pressure {field} CPU evidence is invalid")
+
+    recovery_passed = (
+        statistics.median(numeric_throughput["recovery"])
+        >= statistics.median(numeric_throughput["pressure"])
+    )
+    if mode in ("direct-serial", "direct-async") and not recovery_passed:
+        raise GateValidationError("throughput recovery was absent after memory pressure")
+    return {
+        "status": "complete",
+        "passed": True,
+        "recovery_passed": recovery_passed,
+        "performance_diagnostic": mode == "kernel",
+    }
 
 
 def validate_correctness_manifest(
@@ -1266,6 +1490,94 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def memory_pressure_evidence_from_artifacts(
+    run_dir: Path,
+    *,
+    verified_written: int,
+    verified_read: int,
+    foreground_cpu: float,
+    drain_cpu: float,
+) -> dict:
+    """Build pressure evidence from retained raw artifacts and measured totals."""
+    config = _read_json(run_dir / "memory-pressure-config.json")
+    before = _read_json(run_dir / "memory-events-before.json")
+    pressure = _read_json(run_dir / "memory-events-pressure.json")
+    after = _read_json(run_dir / "memory-events-after.json")
+    holder = _read_json(run_dir / "memory-holder.json")
+    pressure_hash = _read_json(run_dir / "pressure-hash.json")
+    recovery = _read_json(run_dir / "pressure-recovery.json")
+    if (
+        pressure_hash.get("bytes_read") != verified_read
+        or recovery.get("bytes_read") != verified_read
+    ):
+        raise GateValidationError("pressure verification byte count mismatch")
+    if (
+        config.get("holder_bytes") != holder.get("bytes")
+        or any(
+            boundary.get("memory_max_bytes") != config.get("memory_max_bytes")
+            for boundary in (before, pressure, after)
+        )
+    ):
+        raise GateValidationError("pressure cgroup configuration evidence mismatch")
+    return {
+        "status": "complete",
+        "cgroup": {
+            "memory_max_bytes": config.get("memory_max_bytes"),
+            "memory_current_before_bytes": before.get("memory_current_bytes"),
+            "memory_current_pressure_bytes": pressure.get("memory_current_bytes"),
+            "memory_current_recovery_bytes": after.get("memory_current_bytes"),
+            "events_before": before.get("events"),
+            "events_after": after.get("events"),
+            "events_delta": {
+                name: _counter_delta(
+                    before.get("events", {}).get(name),
+                    after.get("events", {}).get(name),
+                    name,
+                )
+                for name in sorted(set(before.get("events", {})) & set(after.get("events", {})))
+            },
+        },
+        "holder": holder,
+        "runtime_samples": {
+            "pressure": [memory_pressure_sample(_read_json(run_dir / "runtime-pressure.json"))],
+            "recovery": [
+                memory_pressure_sample(_read_json(run_dir / "runtime-recovery-1.json")),
+                memory_pressure_sample(_read_json(run_dir / "runtime-recovery-2.json")),
+            ],
+        },
+        "verification": {
+            "bytes_written": verified_written,
+            "bytes_read": verified_read,
+            "pressure_sha256": pressure_hash.get("sha256"),
+            "recovery_sha256": recovery.get("sha256"),
+        },
+        "throughput_mb_per_second": {
+            "pressure": [pressure_hash.get("throughput_mb_per_second")],
+            "recovery": recovery.get("throughput_mb_per_second"),
+        },
+        "cpu": {
+            "foreground_seconds": foreground_cpu,
+            "drain_seconds": drain_cpu,
+        },
+        "drain_completed": True,
+    }
+
+
+def validate_memory_pressure_artifacts(run_dir: Path, evidence: dict) -> None:
+    """Require derived pressure evidence to match its retained raw artifacts."""
+    verification = evidence.get("verification", {})
+    cpu = evidence.get("cpu", {})
+    raw = memory_pressure_evidence_from_artifacts(
+        run_dir,
+        verified_written=verification.get("bytes_written"),
+        verified_read=verification.get("bytes_read"),
+        foreground_cpu=cpu.get("foreground_seconds"),
+        drain_cpu=cpu.get("drain_seconds"),
+    )
+    if raw != evidence:
+        raise GateValidationError("derived pressure evidence does not match raw memory pressure artifacts")
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -1299,6 +1611,20 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
     )
     if workload == "warm-reopen":
         required_files = (*required_files, "runtime-warm-first-end.json")
+    if workload in ("large-single", "small-128k"):
+        required_files = (
+            *required_files,
+            "memory-pressure-config.json",
+            "memory-events-before.json",
+            "memory-events-pressure.json",
+            "memory-events-after.json",
+            "memory-holder.json",
+            "pressure-hash.json",
+            "pressure-recovery.json",
+            "runtime-pressure.json",
+            "runtime-recovery-1.json",
+            "runtime-recovery-2.json",
+        )
     for name in required_files:
         path = run_dir / name
         if not path.is_file() or path.stat().st_size == 0:
@@ -1852,6 +2178,19 @@ def _load_run(
         derived=derived,
     )
     validate_run_eligibility(mode, derived, cleanup)
+    if workload in (
+        "large-single",
+        "small-128k",
+    ) and isinstance(derived.get("memory_pressure"), dict):
+        validate_memory_pressure_artifacts(run_dir, derived["memory_pressure"])
+    pressure_result = validate_memory_pressure_evidence(
+        mode,
+        workload,
+        derived.get("memory_pressure"),
+        expected_written=expected["verified_bytes_written"],
+        expected_read=expected["verified_bytes_read"],
+        promotion_eligible=promotion_eligible,
+    )
 
     runtime_start = _read_json(run_dir / "runtime-foreground-start.json")
     runtime_end = _read_json(run_dir / "runtime-foreground-end.json")
@@ -1906,6 +2245,7 @@ def _load_run(
 
     result = dict(derived)
     result["_workload_bytes"] = expected["workload_bytes"]
+    result["_memory_pressure"] = pressure_result
     return result
 
 
@@ -1933,6 +2273,10 @@ def _compare_modes(
             workload_bytes=workload_bytes,
             compare_throughput=compare_throughput,
         )
+        result["performance_passed"] = result["passed"]
+        result["performance_diagnostic"] = candidate_mode == "kernel"
+        if candidate_mode == "kernel":
+            result["passed"] = True
         result["reported_cpu"] = {
             "baseline_foreground": median_mad(
                 _numeric_samples(baseline_rows, "foreground_mount_cpu_seconds")
@@ -1947,6 +2291,14 @@ def _compare_modes(
                 _numeric_samples(candidate_rows, "drain_mount_cpu_seconds")
             ),
         }
+        if workload in ("large-single", "small-128k"):
+            pressure = [row["_memory_pressure"] for row in candidate_rows]
+            result["memory_pressure"] = {
+                "status": "complete",
+                "passed": all(item["passed"] for item in pressure),
+                "recovery_passed": all(item["recovery_passed"] for item in pressure),
+                "performance_diagnostic": candidate_mode == "kernel",
+            }
         workloads[workload] = result
     return {
         "eligible": True,
@@ -2085,12 +2437,30 @@ def _write_outputs(output: Path, comparison: dict) -> None:
         json.dumps(comparison, indent=2, sort_keys=True) + "\n"
     )
     baseline = comparison.get("kernel_baseline", "unavailable")
+    direct_pressure = all(
+        comparison.get("direct_async", {})
+        .get("workloads", {})
+        .get(workload, {})
+        .get("memory_pressure", {})
+        .get("recovery_passed", False)
+        for workload in ("large-single", "small-128k")
+    )
+    kernel_pressure = all(
+        comparison.get("kernel", {})
+        .get("workloads", {})
+        .get(workload, {})
+        .get("memory_pressure", {})
+        .get("recovery_passed", False)
+        for workload in ("large-single", "small-128k")
+    )
     summary = (
         "# Linux cache gate summary\n\n"
         f"- Promotion eligible: {'yes' if comparison.get('promotion_eligible') else 'no'}\n"
         f"- Direct async: {'PASS' if comparison.get('direct_async', {}).get('passed') else 'FAIL'}\n"
         f"- Kernel baseline: {baseline}\n"
         f"- Kernel: {'PASS' if comparison.get('kernel', {}).get('passed') else 'FAIL'}\n"
+        f"- Memory pressure recovery (Direct async): {'PASS' if direct_pressure else 'FAIL'}\n"
+        f"- Memory pressure recovery (kernel diagnostic): {'PASS' if kernel_pressure else 'MISS'}\n"
     )
     errors = comparison.get("errors", [])
     if errors:
