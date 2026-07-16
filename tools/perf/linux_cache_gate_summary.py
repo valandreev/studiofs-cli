@@ -371,7 +371,7 @@ def derive_pressure_target(*, effective_limit: int, negotiated_max_write: int) -
     """Choose the smallest non-overcommitted envelope for the live feeder."""
     gib = 1 << 30
     limit = _nonnegative_integer(effective_limit, "effective memory limit")
-    reserve = max(gib, (limit * 15 + 99) // 100)
+    reserve = max(gib, limit * 15 // 100)
     mib = 1 << 20
     max_write = _nonnegative_integer(negotiated_max_write, "negotiated max_write")
     target_allocatable = 512 * mib
@@ -667,17 +667,17 @@ def validate_cleanup_record(cleanup: dict) -> None:
         raise GateValidationError("cleanup drain did not reach idle")
     if cleanup.get("unmount_timed_out") is not False:
         raise GateValidationError("unmount timed out")
-    if cleanup.get("unmount_exit_status") != 0:
+    if _nonnegative_integer(cleanup.get("unmount_exit_status"), "unmount exit status") != 0:
         raise GateValidationError("unmount exit status is nonzero")
     if cleanup.get("mount_exit_timed_out") is not False:
         raise GateValidationError("mount process exit timed out")
-    if cleanup.get("mount_exit_status") != 0:
+    if _nonnegative_integer(cleanup.get("mount_exit_status"), "mount exit status") != 0:
         raise GateValidationError("mount process exit status is nonzero")
 
 
 def validate_run_eligibility(mode: str, derived: dict, cleanup: dict) -> None:
     """Validate non-statistical evidence required for one measured run."""
-    if derived.get("command_exit_status") != 0:
+    if _nonnegative_integer(derived.get("command_exit_status"), "command exit status") != 0:
         raise GateValidationError("workload command failed")
     for field in ("callback_errors", "async_errors", "task_errors", "cancellations"):
         value = derived.get(field)
@@ -739,6 +739,9 @@ def validate_memory_pressure_evidence(
     assert isinstance(verification, dict)
     assert isinstance(throughput, dict)
     assert isinstance(cpu, dict)
+    for name, payload in (("holder", holder), ("setup", setup)):
+        if _nonnegative_integer(payload.get("schema_version"), f"{name} schema") != 1:
+            raise GateValidationError(f"{name} schema mismatch")
 
     memory_max = _nonnegative_integer(cgroup.get("memory_max_bytes"), "memory.max")
     if memory_max == 0:
@@ -793,11 +796,17 @@ def validate_memory_pressure_evidence(
     ]
     if timestamps != sorted(timestamps) or len(set(timestamps)) != len(timestamps):
         raise GateValidationError("holder lifecycle timestamps are not ordered")
-    if holder.get("exit_status") != 0:
+    if _nonnegative_integer(holder.get("exit_status"), "holder exit status") != 0:
         raise GateValidationError("memory holder failed to exit cleanly")
     if _nonnegative_integer(setup.get("working_set_bytes"), "feeder working set") == 0:
         raise GateValidationError("pressure feeder working set must be positive")
-    _nonnegative_integer(setup.get("cumulative_bytes_written"), "feeder cumulative bytes")
+    if (
+        _nonnegative_integer(
+            setup.get("cumulative_bytes_written"), "feeder cumulative bytes"
+        )
+        == 0
+    ):
+        raise GateValidationError("pressure feeder did not complete a direct write")
     observed_admitted = _nonnegative_integer(
         setup.get("observed_admitted_lower_bound_bytes"),
         "observed admission lower bound",
@@ -808,23 +817,33 @@ def validate_memory_pressure_evidence(
     _nonnegative_integer(setup.get("observed_monotonic_ns"), "observed monotonic time")
     if _nonnegative_integer(setup.get("feeder_pid"), "pressure feeder pid") == 0:
         raise GateValidationError("pressure feeder pid must be positive")
-    if setup.get("feeder_live_at_constrained") is not True:
-        raise GateValidationError("pressure feeder was not live at constrained evidence")
-    if setup.get("exit_status") != 0:
+    feeder_start_time = setup.get("feeder_start_time")
+    if (
+        not isinstance(feeder_start_time, str)
+        or not feeder_start_time.isdigit()
+        or int(feeder_start_time) == 0
+    ):
+        raise GateValidationError("pressure feeder start time is invalid")
+    for field in ("feeder_live_before_profile", "feeder_live_after_profile"):
+        if setup.get(field) is not True:
+            raise GateValidationError("pressure feeder was not live around the profile")
+    if _nonnegative_integer(setup.get("exit_status"), "setup exit status") != 0:
         raise GateValidationError("pressure setup exit status is nonzero")
 
+    setup_observed = runtime_samples.get("setup_observed")
     pressure_samples = runtime_samples.get("pressure")
     recovery_samples = runtime_samples.get("recovery")
     recovery_boundary = runtime_samples.get("recovery_boundary")
     if (
-        not isinstance(pressure_samples, list)
-        or not pressure_samples
+        not isinstance(setup_observed, dict)
+        or not isinstance(pressure_samples, list)
+        or len(pressure_samples) != 2
         or not isinstance(recovery_samples, list)
         or not recovery_samples
         or not isinstance(recovery_boundary, dict)
     ):
         raise GateValidationError("pressure and recovery runtime samples are required")
-    samples = [*pressure_samples, recovery_boundary, *recovery_samples]
+    samples = [setup_observed, *pressure_samples, recovery_boundary, *recovery_samples]
     for sample in samples:
         if not isinstance(sample, dict):
             raise GateValidationError("memory pressure runtime sample is invalid")
@@ -852,21 +871,27 @@ def validate_memory_pressure_evidence(
             "write_admission_wait_ns",
         ):
             _nonnegative_integer(sample.get(field), field)
-    constrained = [sample for sample in pressure_samples if sample.get("state") == "constrained"]
-    if not constrained:
-        raise GateValidationError("pressure phase never reached constrained state")
+    constrained = pressure_samples
+    if any(sample.get("state") != "constrained" for sample in constrained):
+        raise GateValidationError("pressure samples must remain constrained around the profile")
     if any(
         sample["envelope_bytes"] == 0 or sample["overcommitted_minimum"] is not False
         for sample in constrained
     ):
         raise GateValidationError("constrained state must retain a positive nonminimum envelope")
-    if not any(
-        sample.get("admitted_lower_bound_bytes", 0) > sample["envelope_bytes"]
+    if any(
+        _nonnegative_integer(
+            sample.get("admitted_lower_bound_bytes"), "admitted lower bound"
+        )
+        <= sample["envelope_bytes"]
         for sample in constrained
     ):
         raise GateValidationError("constrained admission lower bound must exceed the envelope")
-    if not any(
-        sample.get("admitted_lower_bound_bytes", 0) + (64 << 20) >= observed_admitted
+    if any(
+        not (
+            sample.get("admitted_lower_bound_bytes", 0) + (64 << 20)
+            >= observed_admitted
+        )
         for sample in constrained
     ):
         raise GateValidationError("constrained admission fell below the observed feeder admission")
@@ -878,6 +903,19 @@ def validate_memory_pressure_evidence(
         raise GateValidationError("memory pressure generations decreased")
     if recovery_samples[-1]["generation"] <= pressure_samples[-1]["generation"]:
         raise GateValidationError("memory pressure generation did not advance during recovery")
+    counter_fields = (
+        "transition_count",
+        "write_admission_wait_count",
+        "write_admission_wait_ns",
+        "sampling_failure_count",
+    )
+    for field in counter_fields:
+        values = [sample[field] for sample in samples]
+        if values != sorted(values):
+            raise GateValidationError(f"memory pressure {field} decreased")
+    sampling_failures = [sample["sampling_failure_count"] for sample in samples]
+    if any(value != sampling_failures[0] for value in sampling_failures[1:]):
+        raise GateValidationError("memory pressure sampling failures increased")
 
     for field, expected in (
         ("bytes_written", expected_written),
@@ -895,6 +933,15 @@ def validate_memory_pressure_evidence(
     numeric_throughput = {}
     if throughput.get("profile") != workload:
         raise GateValidationError("pressure throughput profile mismatch")
+    if throughput.get("method") != "inline-unbuffered-read-v1":
+        raise GateValidationError("pressure/recovery measurer mismatch")
+    if _nonnegative_integer(throughput.get("chunk_bytes"), "read chunk bytes") == 0:
+        raise GateValidationError("read chunk bytes must be positive")
+    if (
+        _nonnegative_integer(throughput.get("bytes_read"), "measured bytes read")
+        != expected_read
+    ):
+        raise GateValidationError("measured read byte count mismatch")
     for phase in ("pressure", "recovery"):
         values = throughput.get(phase)
         valid = isinstance(values, list) and len(values) == 1 and not any(
@@ -1730,6 +1777,8 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _read_json(path: Path) -> dict:
+    if path.is_symlink():
+        raise GateValidationError(f"JSON artifact must not be a symlink: {path}")
     try:
         payload = json.loads(
             path.read_text(),
@@ -1743,6 +1792,8 @@ def _read_json(path: Path) -> dict:
 
 
 def _read_jsonl(path: Path) -> list[dict]:
+    if path.is_symlink():
+        raise GateValidationError(f"sampled evidence must not be a symlink: {path}")
     try:
         rows = [
             json.loads(line, parse_constant=_reject_json_constant)
@@ -1759,7 +1810,17 @@ def _read_jsonl(path: Path) -> list[dict]:
 def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
     """Validate raw pressure schemas, phases, and causal timestamp order."""
     for name, payload in artifacts.items():
-        if payload.get("schema_version") != 1:
+        expected_schema = (
+            EXPECTED_RUNTIME_SCHEMA
+            if name in ("runtime_before_profile", "runtime_after_profile")
+            else 1
+        )
+        if (
+            _nonnegative_integer(
+                payload.get("schema_version"), f"pressure artifact schema: {name}"
+            )
+            != expected_schema
+        ):
             raise GateValidationError(f"pressure artifact schema mismatch: {name}")
     for name, phase in (
         ("before", "before"),
@@ -1774,27 +1835,79 @@ def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
     holder = artifacts["holder"]
     setup = artifacts["setup"]
     profile = artifacts["profile"]
+    pressure_measure = artifacts["pressure_measure"]
     pressure_hash = artifacts["pressure_hash"]
-    recovery = artifacts["recovery"]
+    recovery_measure = artifacts["recovery_measure"]
+    recovery_hash = artifacts["recovery_hash"]
     cleanup = artifacts["cleanup"]
+    if _nonnegative_integer(holder.get("exit_status"), "holder exit status") != 0:
+        raise GateValidationError("memory holder failed to exit cleanly")
+    if _nonnegative_integer(setup.get("exit_status"), "setup exit status") != 0:
+        raise GateValidationError("pressure setup exit status is nonzero")
+    pressure_measurer = (
+        pressure_measure.get("method"),
+        _nonnegative_integer(pressure_measure.get("chunk_bytes"), "pressure chunk bytes"),
+        _nonnegative_integer(pressure_measure.get("bytes_read"), "pressure bytes read"),
+    )
+    recovery_measurer = (
+        recovery_measure.get("method"),
+        _nonnegative_integer(recovery_measure.get("chunk_bytes"), "recovery chunk bytes"),
+        _nonnegative_integer(recovery_measure.get("bytes_read"), "recovery bytes read"),
+    )
+    if (
+        pressure_measurer != recovery_measurer
+        or pressure_measurer[0] != "inline-unbuffered-read-v1"
+        or pressure_measurer[1] == 0
+        or pressure_measurer[2] == 0
+    ):
+        raise GateValidationError("pressure/recovery measurer mismatch")
+    for name, measurement in (
+        ("pressure", pressure_measure),
+        ("recovery", recovery_measure),
+    ):
+        value = measurement.get("throughput_mb_per_second")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise GateValidationError(f"{name} throughput evidence is invalid")
     timeline = (
         ("before", artifacts["before"].get("monotonic_ns")),
         ("setup started", setup.get("started_monotonic_ns")),
         ("setup observed", setup.get("observed_monotonic_ns")),
         ("holder started", holder.get("started_monotonic_ns")),
         ("holder ready", holder.get("ready_monotonic_ns")),
+        (
+            "pressure before profile",
+            artifacts["runtime_before_profile"].get("captured_monotonic_ns"),
+        ),
         ("pressure", artifacts["pressure"].get("monotonic_ns")),
-        ("setup stopped", setup.get("stopped_monotonic_ns")),
         ("profile completed", profile.get("completed_monotonic_ns")),
+        ("pressure measure started", pressure_measure.get("started_monotonic_ns")),
+        (
+            "pressure measure completed",
+            pressure_measure.get("completed_monotonic_ns"),
+        ),
         ("pressure hash completed", pressure_hash.get("completed_monotonic_ns")),
+        (
+            "pressure after profile",
+            artifacts["runtime_after_profile"].get("captured_monotonic_ns"),
+        ),
+        ("setup stopped", setup.get("stopped_monotonic_ns")),
         ("holder released", holder.get("released_monotonic_ns")),
         ("holder exited", holder.get("exited_monotonic_ns")),
         (
             "after holder release",
             artifacts["after_holder_release"].get("monotonic_ns"),
         ),
-        ("recovery started", recovery.get("started_monotonic_ns")),
-        ("recovery completed", recovery.get("completed_monotonic_ns")),
+        ("recovery measure started", recovery_measure.get("started_monotonic_ns")),
+        (
+            "recovery measure completed",
+            recovery_measure.get("completed_monotonic_ns"),
+        ),
+        ("recovery hash completed", recovery_hash.get("completed_monotonic_ns")),
         ("drain", artifacts["drain"].get("monotonic_ns")),
         ("after", artifacts["after"].get("monotonic_ns")),
         ("cleanup", cleanup.get("cleanup_ended_monotonic_ns")),
@@ -1832,11 +1945,19 @@ def memory_pressure_evidence_from_artifacts(
     holder = _read_json(run_dir / "memory-holder.json")
     setup = _read_json(run_dir / "pressure-setup.json")
     profile = _read_json(run_dir / "pressure-profile.json")
+    pressure_measure = _read_json(run_dir / "pressure-measure.json")
     pressure_hash = _read_json(run_dir / "pressure-hash.json")
-    recovery = _read_json(run_dir / "pressure-recovery.json")
+    recovery_measure = _read_json(run_dir / "recovery-measure.json")
+    recovery_hash = _read_json(run_dir / "recovery-hash.json")
+    runtime_before_profile = _read_json(
+        run_dir / "runtime-pressure-before-profile.json"
+    )
+    runtime_after_profile = _read_json(
+        run_dir / "runtime-pressure-after-profile.json"
+    )
     drain = _read_json(run_dir / "cgroup-drain-end.json")
     cleanup = _read_json(run_dir / "cleanup.json")
-    if config.get("schema_version") != 1:
+    if _nonnegative_integer(config.get("schema_version"), "config schema") != 1:
         raise GateValidationError("pressure artifact schema mismatch: config")
     negotiated = negotiated_max_write_bytes(
         _read_json(run_dir / "runtime-foreground-start.json")
@@ -1867,15 +1988,24 @@ def memory_pressure_evidence_from_artifacts(
             "holder": holder,
             "setup": setup,
             "profile": profile,
+            "pressure_measure": pressure_measure,
             "pressure_hash": pressure_hash,
-            "recovery": recovery,
+            "recovery_measure": recovery_measure,
+            "recovery_hash": recovery_hash,
+            "runtime_before_profile": runtime_before_profile,
+            "runtime_after_profile": runtime_after_profile,
             "drain": drain,
             "cleanup": cleanup,
         }
     )
-    if (
-        pressure_hash.get("bytes_read") != verified_read
-        or recovery.get("bytes_read") != verified_read
+    if any(
+        artifact.get("bytes_read") != verified_read
+        for artifact in (
+            pressure_measure,
+            pressure_hash,
+            recovery_measure,
+            recovery_hash,
+        )
     ):
         raise GateValidationError("pressure verification byte count mismatch")
     if (
@@ -1911,7 +2041,11 @@ def memory_pressure_evidence_from_artifacts(
         "holder": holder,
         "setup": setup,
         "runtime_samples": {
-            "pressure": [memory_pressure_sample(_read_json(run_dir / "runtime-pressure.json"))],
+            "setup_observed": observed_sample,
+            "pressure": [
+                memory_pressure_sample(runtime_before_profile),
+                memory_pressure_sample(runtime_after_profile),
+            ],
             "recovery_boundary": memory_pressure_sample(
                 _read_json(run_dir / "runtime-recovery-boundary.json")
             ),
@@ -1924,12 +2058,15 @@ def memory_pressure_evidence_from_artifacts(
             "bytes_written": verified_written,
             "bytes_read": verified_read,
             "pressure_sha256": pressure_hash.get("sha256"),
-            "recovery_sha256": recovery.get("sha256"),
+            "recovery_sha256": recovery_hash.get("sha256"),
         },
         "throughput_mb_per_second": {
             "profile": profile.get("profile"),
-            "pressure": [profile.get("read_throughput_mb_per_second")],
-            "recovery": recovery.get("throughput_mb_per_second"),
+            "method": pressure_measure.get("method"),
+            "chunk_bytes": pressure_measure.get("chunk_bytes"),
+            "bytes_read": pressure_measure.get("bytes_read"),
+            "pressure": [pressure_measure.get("throughput_mb_per_second")],
+            "recovery": [recovery_measure.get("throughput_mb_per_second")],
         },
         "cpu": {
             "foreground_seconds": foreground_cpu,
@@ -1967,6 +2104,8 @@ def _file_sha256(path: Path) -> str:
 
 def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
     """Require the complete stable per-repetition evidence layout."""
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise GateValidationError(f"artifact directory is invalid: {run_dir}")
     required_files = (
         "environment.json",
         "manifest.json",
@@ -1998,9 +2137,12 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
             "memory-holder.json",
             "pressure-setup.json",
             "pressure-profile.json",
+            "pressure-measure.json",
             "pressure-hash.json",
-            "pressure-recovery.json",
-            "runtime-pressure.json",
+            "recovery-measure.json",
+            "recovery-hash.json",
+            "runtime-pressure-before-profile.json",
+            "runtime-pressure-after-profile.json",
             "runtime-setup-observed.json",
             "runtime-recovery-boundary.json",
             "runtime-recovery-1.json",
@@ -2008,7 +2150,7 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
         )
     for name in required_files:
         path = run_dir / name
-        if not path.is_file() or path.stat().st_size == 0:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
             raise GateValidationError(f"required artifact is missing or empty: {path}")
     for directory in (
         "proc-foreground-start",
@@ -2016,11 +2158,15 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
         "proc-drain-end",
     ):
         path = run_dir / directory
-        if not path.is_dir():
+        if path.is_symlink() or not path.is_dir():
             raise GateValidationError(f"required artifact directory is missing: {path}")
         for name in ("stat.txt", "status.txt", "smaps_rollup.txt", "io.txt"):
             evidence = path / name
-            if not evidence.is_file() or evidence.stat().st_size == 0:
+            if (
+                evidence.is_symlink()
+                or not evidence.is_file()
+                or evidence.stat().st_size == 0
+            ):
                 raise GateValidationError(
                     f"required artifact is missing or empty: {evidence}"
                 )

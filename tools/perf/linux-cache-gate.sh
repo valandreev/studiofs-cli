@@ -170,6 +170,21 @@ print(time.monotonic_ns())
 PY
 }
 
+stamp_runtime_snapshot() {
+  local path="$1"
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$path" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+payload["captured_monotonic_ns"] = time.monotonic_ns()
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+}
+
 capture_proc_boundary() {
   local phase="$1"
   local proc_dir="$artifact_dir/proc-$phase"
@@ -267,31 +282,49 @@ wait_for_idle_boundary() {
 pidstat_pid=""
 memory_sampler_pid=""
 memory_holder_pid=""
+memory_holder_start_time=""
 memory_holder_start=""
 memory_holder_ready=""
 memory_holder_release=""
 pressure_setup_pid=""
+pressure_setup_start_time=""
 pressure_setup_ready=""
 pressure_setup_release=""
 pressure_workload_pid=""
+pressure_workload_start_time=""
+
+helper_pid_matches_start_time() {
+  local pid="$1"
+  local expected="$2"
+  local root="${CACHE_GATE_INTERNAL_HELPER_PROC_ROOT:-/proc}"
+  local actual=""
+  [[ -n "$expected" && -r "$root/$pid/stat" ]] || return 1
+  actual="$(mount_start_time "$root/$pid/stat")" || return 1
+  [[ "$actual" == "$expected" ]]
+}
 
 helper_pid_is_live() {
   local pid="$1"
+  local expected_start_time="${2:-}"
+  local root="${CACHE_GATE_INTERNAL_HELPER_PROC_ROOT:-/proc}"
   local stat_line=""
   local rest=""
   kill -0 "$pid" 2>/dev/null || return 1
-  if [[ -r "/proc/$pid/stat" ]]; then
-    IFS= read -r stat_line < "/proc/$pid/stat"
+  if [[ -r "$root/$pid/stat" ]]; then
+    IFS= read -r stat_line < "$root/$pid/stat"
     rest="${stat_line##*) }"
     [[ "${rest:0:1}" != Z ]] || return 1
   fi
+  [[ -z "$expected_start_time" ]] || \
+    helper_pid_matches_start_time "$pid" "$expected_start_time"
   return 0
 }
 
 wait_for_helper_exit() {
   local pid="$1"
+  local expected_start_time="${2:-}"
   local deadline=$((SECONDS + 5))
-  while helper_pid_is_live "$pid"; do
+  while helper_pid_is_live "$pid" "$expected_start_time"; do
     (( SECONDS < deadline )) || return 1
     sleep 0.1
   done
@@ -300,16 +333,23 @@ wait_for_helper_exit() {
 stop_helper_bounded() {
   local pid="$1"
   local label="$2"
+  local expected_start_time="${3:-}"
   local exit_status=0
-  if helper_pid_is_live "$pid"; then
-    if ! kill -TERM "$pid" 2>/dev/null && helper_pid_is_live "$pid"; then
+  if [[ -n "$expected_start_time" ]] && kill -0 "$pid" 2>/dev/null && \
+    ! helper_pid_matches_start_time "$pid" "$expected_start_time"; then
+    return 0
+  fi
+  if helper_pid_is_live "$pid" "$expected_start_time"; then
+    if ! kill -TERM "$pid" 2>/dev/null && helper_pid_is_live "$pid" "$expected_start_time"; then
       return 1
     fi
-    if ! wait_for_helper_exit "$pid" && helper_pid_is_live "$pid"; then
-      if ! kill -KILL "$pid" 2>/dev/null && helper_pid_is_live "$pid"; then
+    if ! wait_for_helper_exit "$pid" "$expected_start_time" && \
+      helper_pid_is_live "$pid" "$expected_start_time"; then
+      if ! kill -KILL "$pid" 2>/dev/null && \
+        helper_pid_is_live "$pid" "$expected_start_time"; then
         return 1
       fi
-      wait_for_helper_exit "$pid" || return 1
+      wait_for_helper_exit "$pid" "$expected_start_time" || return 1
     fi
   fi
   if wait "$pid" 2>/dev/null; then
@@ -325,10 +365,12 @@ stop_helper_bounded() {
 
 stop_helpers_on_exit() {
   if [[ -n "$pressure_workload_pid" ]]; then
-    if ! stop_helper_bounded "$pressure_workload_pid" pressure-workload; then
+    if ! stop_helper_bounded "$pressure_workload_pid" pressure-workload \
+      "$pressure_workload_start_time"; then
       printf 'Error: failed to stop pressure workload during collector cleanup\n' >&2
     fi
     pressure_workload_pid=""
+    pressure_workload_start_time=""
   fi
   if [[ -n "$pidstat_pid" ]]; then
     if ! stop_helper_bounded "$pidstat_pid" pidstat; then
@@ -342,15 +384,21 @@ stop_helpers_on_exit() {
   fi
   if [[ -n "$memory_holder_pid" ]]; then
     [[ -z "$memory_holder_release" ]] || touch "$memory_holder_release"
-    if ! stop_helper_bounded "$memory_holder_pid" memory-holder; then
+    if ! stop_helper_bounded "$memory_holder_pid" memory-holder \
+      "$memory_holder_start_time"; then
       printf 'Error: failed to stop memory holder during collector cleanup\n' >&2
     fi
+    memory_holder_pid=""
+    memory_holder_start_time=""
   fi
   if [[ -n "$pressure_setup_pid" ]]; then
     [[ -z "$pressure_setup_release" ]] || touch "$pressure_setup_release"
-    if ! stop_helper_bounded "$pressure_setup_pid" pressure-setup; then
+    if ! stop_helper_bounded "$pressure_setup_pid" pressure-setup \
+      "$pressure_setup_start_time"; then
       printf 'Error: failed to stop pressure setup during collector cleanup\n' >&2
     fi
+    pressure_setup_pid=""
+    pressure_setup_start_time=""
   fi
   rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
   rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
@@ -378,9 +426,10 @@ wait_for_file() {
   local path="$1"
   local label="$2"
   local helper_pid="${3:-$memory_holder_pid}"
+  local helper_start_time="${4:-}"
   local deadline=$((SECONDS + 30))
   while [[ ! -s "$path" ]]; do
-    helper_pid_is_live "$helper_pid" || die "helper exited before $label"
+    helper_pid_is_live "$helper_pid" "$helper_start_time" || die "helper exited before $label"
     (( SECONDS < deadline )) || die "timed out waiting for helper $label"
     sleep 0.05
   done
@@ -414,6 +463,7 @@ wait_for_memory_pressure_state() {
   local destination="$2"
   local workload_pid="${3:-}"
   local minimum_admitted="${4:-1}"
+  local workload_start_time="${5:-}"
   local snapshot=""
   local matched=""
   local deadline=$((SECONDS + 30))
@@ -434,12 +484,12 @@ if expected == "constrained":
 print("yes" if valid else "no")
 ' "$expected" "$minimum_admitted")"
     if [[ "$matched" == yes ]]; then
-      [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" || \
+      [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
         die "pressure workload exited before constrained evidence"
       printf '%s\n' "$snapshot" > "$destination"
       return 0
     fi
-    [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" || \
+    [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
       die "pressure workload exited before constrained evidence"
     sleep "$idle_poll_interval"
   done
@@ -450,11 +500,13 @@ wait_for_admitted_setup() {
   local destination="$1"
   local feeder_pid="$2"
   local required_admitted="$3"
+  local feeder_start_time="$4"
   local snapshot=""
   local admitted=""
   local deadline=$((SECONDS + 60))
   while (( SECONDS <= deadline )); do
-    helper_pid_is_live "$feeder_pid" || die "pressure feeder exited before admission target"
+    helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
+      die "pressure feeder exited before admission target"
     snapshot="$(capture_runtime_snapshot)"
     admitted="$(printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
       python3 -c '
@@ -470,6 +522,35 @@ print(gate.memory_pressure_sample(json.load(sys.stdin))["admitted_lower_bound_by
     sleep "$idle_poll_interval"
   done
   die "pressure feeder did not reach required live admission within 60 seconds"
+}
+
+capture_constrained_pressure_once() {
+  local destination="$1"
+  local feeder_pid="$2"
+  local feeder_start_time="$3"
+  local minimum_admitted="$4"
+  local snapshot=""
+  helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
+    die "pressure feeder identity changed before post-profile evidence"
+  snapshot="$(capture_runtime_snapshot)"
+  if ! printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
+    python3 -c '
+import json
+import sys
+from tools.perf import linux_cache_gate_summary as gate
+sample = gate.memory_pressure_sample(json.load(sys.stdin))
+valid = sample["source"] == "host_and_cgroup"
+valid = valid and sample["state"] == "constrained"
+valid = valid and sample["envelope_bytes"] > 0
+valid = valid and not sample["overcommitted_minimum"]
+valid = valid and sample["admitted_lower_bound_bytes"] >= int(sys.argv[1])
+raise SystemExit(0 if valid else 1)
+' "$minimum_admitted"; then
+    die "post-profile runtime sample is not constrained under the live feeder"
+  fi
+  helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
+    die "pressure feeder identity changed during post-profile evidence"
+  printf '%s\n' "$snapshot" > "$destination"
 }
 
 run_inline_client() {
@@ -572,24 +653,22 @@ def workload_files() -> list[pathlib.Path]:
     return files
 
 
-def hash_workload() -> tuple[int, str, float]:
+def hash_workload() -> tuple[int, str]:
     digest = hashlib.sha256()
     observed = 0
-    started = time.monotonic_ns()
     for path in workload_files():
         with path.open("rb", buffering=0) as handle:
             while chunk := handle.read(MIB):
                 digest.update(chunk)
                 observed += len(chunk)
-    ended = time.monotonic_ns()
     if observed != WORKLOAD_BYTES:
         raise ValueError(
             f"pressure workload byte mismatch: expected {WORKLOAD_BYTES}, got {observed}"
         )
-    return observed, digest.hexdigest(), throughput(observed, started, ended)
+    return observed, digest.hexdigest()
 
 
-def measure_workload_read() -> tuple[int, float]:
+def measure_workload_read() -> tuple[int, float, int, int]:
     observed = 0
     started = time.monotonic_ns()
     for path in workload_files():
@@ -601,7 +680,7 @@ def measure_workload_read() -> tuple[int, float]:
         raise ValueError(
             f"pressure workload byte mismatch: expected {WORKLOAD_BYTES}, got {observed}"
         )
-    return observed, throughput(observed, started, ended)
+    return observed, throughput(observed, started, ended), started, ended
 
 
 def common_report(
@@ -878,13 +957,16 @@ elif ACTION == "pressure-setup":
     aligned = mmap.mmap(-1, MIB)
     aligned[:] = payload("pressure-setup", MIB)
     try:
-        ready_path.write_text("ready\n", encoding="utf-8")
+        ready_published = False
         while not nonlocal_stop[0] and not release_path.exists():
             written = os.pwrite(fd, aligned, region)
             if written != MIB:
                 raise OSError("short O_DIRECT pressure feeder write")
             cumulative += written
             region = (region + MIB) % WORKLOAD_BYTES
+            if not ready_published:
+                ready_path.write_text("ready\n", encoding="utf-8")
+                ready_published = True
     finally:
         aligned.close()
         os.close(fd)
@@ -896,32 +978,36 @@ elif ACTION == "pressure-setup":
         "stopped_monotonic_ns": time.monotonic_ns(),
         "exit_status": 0,
     })
+elif ACTION == "profile-read-measure":
+    observed, measured_throughput, started, ended = measure_workload_read()
+    write_json({
+        "schema_version": 1,
+        "method": "inline-unbuffered-read-v1",
+        "chunk_bytes": MIB,
+        "bytes_read": observed,
+        "throughput_mb_per_second": measured_throughput,
+        "started_monotonic_ns": started,
+        "completed_monotonic_ns": ended,
+    })
 elif ACTION == "pressure-hash":
-    observed, checksum, measured_throughput = hash_workload()
+    observed, checksum = hash_workload()
     write_json({
         "schema_version": 1,
         "bytes_read": observed,
         "sha256": checksum,
-        "throughput_mb_per_second": measured_throughput,
         "completed_monotonic_ns": time.monotonic_ns(),
     })
-elif ACTION == "pressure-recovery":
+elif ACTION == "recovery-hash":
     if len(EXTRA) != 1:
-        raise SystemExit("pressure-recovery requires pressure hash path")
+        raise SystemExit("recovery-hash requires pressure hash path")
     pressure = json.loads(pathlib.Path(EXTRA[0]).read_text(encoding="utf-8"))
-    recovery_started = time.monotonic_ns()
-    measured_bytes, measured_throughput = measure_workload_read()
-    observed, checksum, _ = hash_workload()
+    observed, checksum = hash_workload()
     if observed != pressure.get("bytes_read") or checksum != pressure.get("sha256"):
         raise ValueError("pressure recovery hash verification failed")
-    if measured_bytes != observed:
-        raise ValueError("pressure recovery measured byte count mismatch")
     write_json({
         "schema_version": 1,
         "bytes_read": observed,
         "sha256": checksum,
-        "throughput_mb_per_second": [measured_throughput],
-        "started_monotonic_ns": recovery_started,
         "completed_monotonic_ns": time.monotonic_ns(),
     })
 else:
@@ -970,10 +1056,39 @@ if [[ "${CACHE_GATE_INTERNAL_FEEDER_FIXTURE:-}" == true ]]; then
     "$feeder_result" "$((8 * 1024 * 1024))" "" \
     "$feeder_ready" "$feeder_release" &
   feeder_pid=$!
-  wait_for_file "$feeder_ready" "internal feeder readiness" "$feeder_pid"
+  feeder_start_time="$(mount_start_time "/proc/$feeder_pid/stat")"
+  wait_for_file "$feeder_ready" "internal feeder readiness" \
+    "$feeder_pid" "$feeder_start_time"
   touch "$feeder_release"
   wait "$feeder_pid"
   printf '%s\n' "$feeder_result"
+  exit 0
+fi
+
+if [[ "${CACHE_GATE_INTERNAL_PID_REUSE_FIXTURE:-}" == true ]]; then
+  : "${CACHE_GATE_INTERNAL_PID_REUSE_RESULT:?internal PID reuse result is required}"
+  sleep 300 &
+  reuse_pid=$!
+  reuse_start_time="$(mount_start_time "/proc/$reuse_pid/stat")"
+  wrong_start_time="$((reuse_start_time + 1))"
+  stop_helper_bounded "$reuse_pid" pid-reuse-fixture "$wrong_start_time" || \
+    die "PID reuse fixture guard failed"
+  helper_pid_is_live "$reuse_pid" "$reuse_start_time" || \
+    die "PID reuse fixture signaled a mismatched process"
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$CACHE_GATE_INTERNAL_PID_REUSE_RESULT" "$reuse_pid" "$reuse_start_time" <<'PY'
+import json
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "pid": int(sys.argv[2]),
+    "start_time": sys.argv[3],
+    "mismatched_identity_was_not_signaled": True,
+}, indent=2, sort_keys=True) + "\n")
+PY
+  kill -TERM "$reuse_pid"
+  wait "$reuse_pid" 2>/dev/null || true
   exit 0
 fi
 
@@ -988,6 +1103,7 @@ if [[ "${CACHE_GATE_INTERNAL_TRAP_FIXTURE:-}" == true ]]; then
   move_pid_to_cgroup "$$" "$CACHE_GATE_INTERNAL_MEMBERSHIP" "fixture process"
   sleep 300 &
   pressure_workload_pid=$!
+  pressure_workload_start_time="$(mount_start_time "/proc/$pressure_workload_pid/stat")"
   printf '%s\n' "$pressure_workload_pid" > "$CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE"
   trap stop_helpers_on_exit EXIT
   exit 99
@@ -1136,12 +1252,13 @@ if [[ "$workload" == warm-reopen ]]; then
   json_placeholder "$artifact_dir/runtime-warm-first-end.json" "warm-first-end"
 fi
 if [[ "$pressure_scenario" == true ]]; then
-  for phase in setup-observed pressure recovery-boundary recovery-1 recovery-2; do
+  for phase in setup-observed pressure-before-profile pressure-after-profile \
+    recovery-boundary recovery-1 recovery-2; do
     json_placeholder "$artifact_dir/runtime-$phase.json" "$phase"
   done
   for artifact in memory-pressure-config memory-events-before memory-events-pressure \
     memory-events-after-holder-release memory-events-after memory-holder pressure-setup \
-    pressure-profile pressure-hash pressure-recovery; do
+    pressure-profile pressure-measure pressure-hash recovery-measure recovery-hash; do
     json_placeholder "$artifact_dir/$artifact.json" "$artifact"
   done
 fi
@@ -1985,14 +2102,16 @@ if [[ "$pressure_scenario" == true ]]; then
     > "$artifact_dir/pressure-setup.stdout.txt" \
     2> "$artifact_dir/pressure-setup.stderr.txt" &
   pressure_setup_pid=$!
-  wait_for_file "$pressure_setup_ready" "pressure setup readiness" "$pressure_setup_pid"
+  pressure_setup_start_time="$(mount_start_time "$proc_root/$pressure_setup_pid/stat")"
+  wait_for_file "$pressure_setup_ready" "pressure setup readiness" \
+    "$pressure_setup_pid" "$pressure_setup_start_time"
   verify_cgroup_membership "$proc_root/$pressure_setup_pid/cgroup" "pressure feeder"
   required_admitted="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["required_admitted_bytes"])
 ' "$artifact_dir/memory-pressure-config.json")"
   wait_for_admitted_setup "$artifact_dir/runtime-setup-observed.json" \
-    "$pressure_setup_pid" "$required_admitted"
+    "$pressure_setup_pid" "$required_admitted" "$pressure_setup_start_time"
   setup_observed_ns="$(monotonic_ns)"
   holder_bytes="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
     "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" \
@@ -2043,53 +2162,31 @@ run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))
     > "$artifact_dir/memory-holder.stdout.txt" \
     2> "$artifact_dir/memory-holder.stderr.txt" &
   memory_holder_pid=$!
+  memory_holder_start_time="$(mount_start_time "$proc_root/$memory_holder_pid/stat")"
   move_pid_to_cgroup "$memory_holder_pid" \
     "$proc_root/$memory_holder_pid/cgroup" "memory holder"
   touch "$memory_holder_start"
-  wait_for_file "$memory_holder_ready" readiness
+  wait_for_file "$memory_holder_ready" readiness \
+    "$memory_holder_pid" "$memory_holder_start_time"
   target_envelope="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["target_envelope_bytes"])
 ' "$artifact_dir/memory-pressure-config.json")"
-  wait_for_memory_pressure_state constrained "$artifact_dir/runtime-pressure.json" \
-    "$pressure_setup_pid" "$((target_envelope + 1))"
+  wait_for_memory_pressure_state constrained \
+    "$artifact_dir/runtime-pressure-before-profile.json" \
+    "$pressure_setup_pid" "$((target_envelope + 1))" "$pressure_setup_start_time"
+  stamp_runtime_snapshot "$artifact_dir/runtime-pressure-before-profile.json"
   capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
-  feeder_pid="$pressure_setup_pid"
-  touch "$pressure_setup_release"
-  stop_helper_bounded "$pressure_setup_pid" pressure-setup || die "pressure feeder cleanup failed"
-  pressure_setup_pid=""
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
-    "$artifact_dir/pressure-setup.json" "$artifact_dir/memory-pressure-config.json" \
-    "$feeder_pid" "$setup_observed_ns" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-payload = json.loads(path.read_text())
-config = json.loads(pathlib.Path(sys.argv[2]).read_text())
-payload.update({
-    "observed_admitted_lower_bound_bytes": config[
-        "observed_admitted_lower_bound_bytes"
-    ],
-    "observed_generation": config.get("observed_generation", 0),
-    "observed_monotonic_ns": int(sys.argv[4]),
-    "feeder_pid": int(sys.argv[3]),
-    "feeder_live_at_constrained": True,
-})
-path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-PY
-  rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
-  cleanup_target_is_safe "$pressure_setup_dir" pressure-setup || \
-    die "refusing to delete unsafe pressure setup directory"
-  rm -rf -- "$pressure_setup_dir" || die "failed to delete pressure setup directory"
   cat >> "$artifact_dir/command.txt" <<COMMAND
 pressure-feeder --o-direct --working-set "$setup_working_set_bytes"
 observe-live-admission --minimum "$required_admitted"
 memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
 constrained-boundary --require-feeder-live --admitted-gt-envelope
-pressure-feeder-stop
 profile-async --profile "$workload" --run-dir <owned-workload-dir>
+profile-read-measure --method inline-unbuffered-read-v1
+profile-hash --separate-from-timing
+constrained-boundary-after-profile --require-same-feeder-live
+pressure-feeder-stop
 memory-holder-release
 after-holder-release-boundary
 profile-recovery --profile "$workload" --run-dir <owned-workload-dir> --trials 1
@@ -2151,12 +2248,14 @@ if [[ "$pressure_scenario" == true ]]; then
   execute_workload > "$artifact_dir/workload.stdout.txt" \
     2> "$artifact_dir/workload.stderr.txt" &
   pressure_workload_pid=$!
+  pressure_workload_start_time="$(mount_start_time "$proc_root/$pressure_workload_pid/stat")"
   if wait "$pressure_workload_pid"; then
     command_exit_status=0
   else
     command_exit_status=$?
   fi
   pressure_workload_pid=""
+  pressure_workload_start_time=""
 elif execute_workload > "$artifact_dir/workload.stdout.txt" \
   2> "$artifact_dir/workload.stderr.txt"; then
   command_exit_status=0
@@ -2221,11 +2320,53 @@ pathlib.Path(sys.argv[3]).write_text(json.dumps({
     "completed_monotonic_ns": time.monotonic_ns(),
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+    run_inline_client profile-read-measure "$pressure_run_dir" \
+      "$artifact_dir/pressure-measure.json" "$pressure_workload_bytes" ""
     run_inline_client pressure-hash "$pressure_run_dir" \
       "$artifact_dir/pressure-hash.json" "$pressure_workload_bytes" ""
+    capture_constrained_pressure_once \
+      "$artifact_dir/runtime-pressure-after-profile.json" \
+      "$pressure_setup_pid" "$pressure_setup_start_time" \
+      "$((target_envelope + 1))"
+    stamp_runtime_snapshot "$artifact_dir/runtime-pressure-after-profile.json"
   fi
+  feeder_pid="$pressure_setup_pid"
+  feeder_start_time="$pressure_setup_start_time"
+  touch "$pressure_setup_release"
+  stop_helper_bounded "$pressure_setup_pid" pressure-setup \
+    "$pressure_setup_start_time" || die "pressure feeder cleanup failed"
+  pressure_setup_pid=""
+  pressure_setup_start_time=""
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$artifact_dir/pressure-setup.json" "$artifact_dir/memory-pressure-config.json" \
+    "$feeder_pid" "$feeder_start_time" "$setup_observed_ns" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+config = json.loads(pathlib.Path(sys.argv[2]).read_text())
+payload.update({
+    "observed_admitted_lower_bound_bytes": config[
+        "observed_admitted_lower_bound_bytes"
+    ],
+    "observed_generation": config["observed_generation"],
+    "observed_monotonic_ns": int(sys.argv[5]),
+    "feeder_pid": int(sys.argv[3]),
+    "feeder_start_time": sys.argv[4],
+    "feeder_live_before_profile": True,
+    "feeder_live_after_profile": True,
+})
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+  rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
+  cleanup_target_is_safe "$pressure_setup_dir" pressure-setup || \
+    die "refusing to delete unsafe pressure setup directory"
+  rm -rf -- "$pressure_setup_dir" || die "failed to delete pressure setup directory"
   touch "$memory_holder_release"
-  wait_for_file "$artifact_dir/memory-holder.json" exit
+  wait_for_file "$artifact_dir/memory-holder.json" exit \
+    "$memory_holder_pid" "$memory_holder_start_time"
   if wait "$memory_holder_pid"; then
     memory_holder_exit_status=0
   else
@@ -2233,6 +2374,7 @@ PY
   fi
   (( memory_holder_exit_status == 0 )) || die "memory holder exited with status $memory_holder_exit_status"
   memory_holder_pid=""
+  memory_holder_start_time=""
   rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
   capture_memory_event_boundary after-holder-release \
     "$artifact_dir/memory-events-after-holder-release.json"
@@ -2244,8 +2386,10 @@ PY
     wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-1.json"
   fi
   if [[ "$command_exit_status" == 0 ]]; then
-    run_inline_client pressure-recovery "$pressure_run_dir" \
-      "$artifact_dir/pressure-recovery.json" "$pressure_workload_bytes" "" \
+    run_inline_client profile-read-measure "$pressure_run_dir" \
+      "$artifact_dir/recovery-measure.json" "$pressure_workload_bytes" ""
+    run_inline_client recovery-hash "$pressure_run_dir" \
+      "$artifact_dir/recovery-hash.json" "$pressure_workload_bytes" "" \
       "$artifact_dir/pressure-hash.json"
   fi
   if [[ "$mode" == kernel ]]; then
