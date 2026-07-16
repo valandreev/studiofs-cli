@@ -234,6 +234,12 @@ pub(crate) struct SessionState {
     runtime_stats_handles: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionWriteShutdownOutcome {
+    watcher_stopped: bool,
+    writes_stopped: bool,
+}
+
 struct MemoryPressureAsyncWriteWatcher {
     shutdown: MemoryPressureWatcherShutdown,
 }
@@ -513,7 +519,7 @@ impl SessionState {
         state
     }
 
-    fn shutdown_async_writes_after_run(&self) -> bool {
+    fn shutdown_async_writes_after_run(&self) -> SessionWriteShutdownOutcome {
         let runtime_handle = self.runtime_handle.clone();
         let watcher = self
             .memory_pressure_async_write_watcher
@@ -527,21 +533,15 @@ impl SessionState {
                 );
                 false
             } else {
-                match std::thread::Builder::new()
-                    .name("studiofs-pressure-watcher-shutdown".to_owned())
-                    .spawn(move || runtime_handle.block_on(watcher.stop_and_join()))
-                {
-                    Ok(thread) => match thread.join() {
-                        Ok(stopped) => stopped,
-                        Err(_) => {
-                            warn!("Linux FUSE memory-pressure watcher shutdown thread panicked");
-                            false
-                        }
-                    },
-                    Err(error) => {
-                        warn!(%error, "failed to start Linux FUSE memory-pressure watcher shutdown thread");
-                        false
-                    }
+                let shutdown =
+                    move || shutdown_memory_pressure_watcher_on_helper(runtime_handle, watcher);
+                let caller_is_multi_thread = Handle::try_current().is_ok_and(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                });
+                if caller_is_multi_thread {
+                    tokio::task::block_in_place(shutdown)
+                } else {
+                    shutdown()
                 }
             }
         } else {
@@ -555,7 +555,10 @@ impl SessionState {
             ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
             ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
         );
-        watcher_stopped && writes_stopped
+        SessionWriteShutdownOutcome {
+            watcher_stopped,
+            writes_stopped,
+        }
     }
 
     #[cfg(test)]
@@ -613,6 +616,28 @@ impl SessionState {
                 single_thread_receive_loop: negotiated
                     .map(|value| value.single_thread_receive_loop),
             });
+    }
+}
+
+fn shutdown_memory_pressure_watcher_on_helper(
+    runtime_handle: Handle,
+    watcher: MemoryPressureWatcherShutdown,
+) -> bool {
+    match std::thread::Builder::new()
+        .name("studiofs-pressure-watcher-shutdown".to_owned())
+        .spawn(move || runtime_handle.block_on(watcher.stop_and_join()))
+    {
+        Ok(thread) => match thread.join() {
+            Ok(stopped) => stopped,
+            Err(_) => {
+                warn!("Linux FUSE memory-pressure watcher shutdown thread panicked");
+                false
+            }
+        },
+        Err(error) => {
+            warn!(%error, "failed to start Linux FUSE memory-pressure watcher shutdown thread");
+            false
+        }
     }
 }
 
@@ -1412,10 +1437,14 @@ impl Session {
         if let Some(watcher) = watcher {
             watcher.stop();
         }
-        if let Some(state) = &self.state
-            && !state.shutdown_async_writes_after_run()
-        {
-            warn!("Linux FUSE session loop exited before async write replies drained");
+        if let Some(state) = &self.state {
+            let shutdown = state.shutdown_async_writes_after_run();
+            if !shutdown.watcher_stopped {
+                warn!("Linux FUSE memory-pressure watcher was aborted during session shutdown");
+            }
+            if !shutdown.writes_stopped {
+                warn!("Linux FUSE session loop exited before async write replies drained");
+            }
         }
         if result == 0
             || result == libc::SIGINT
@@ -5241,7 +5270,7 @@ mod tests {
             true,
         );
         let shutdown = tokio::spawn(async move {
-            let stopped = state.shutdown_async_writes_after_run();
+            let outcome = state.shutdown_async_writes_after_run();
             let joined = state
                 .memory_pressure_async_write_watcher
                 .as_ref()
@@ -5251,14 +5280,62 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .is_none();
-            (stopped, joined)
+            (outcome.watcher_stopped, outcome.writes_stopped, joined)
         });
 
         let result = tokio::time::timeout(Duration::from_secs(3), shutdown)
             .await
             .expect("run-exit watcher shutdown timed out")
             .expect("runtime worker panicked");
-        assert_eq!(result, (true, true));
+        assert_eq!(result, (true, true, true));
+    }
+
+    #[test]
+    fn one_worker_runtime_run_exit_joins_watcher_and_tears_down_queue() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let fixture = ContractVfsFixture::new("linux-pressure-watcher-one-worker-shutdown")
+                .expect("create VFS fixture");
+            let controller = fixture.vfs().memory_pressure_controller().clone();
+            let mut snapshot = controller.snapshot();
+            snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+            snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+            controller.publish(snapshot);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build one-worker runtime");
+            let state = super::SessionState::new_with_cache_settings(
+                fixture.vfs(),
+                runtime.handle().clone(),
+                false,
+                default_connection_config(),
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+            );
+            let shutdown = runtime.spawn(async move {
+                let outcome = state.shutdown_async_writes_after_run();
+                let joined = state
+                    .memory_pressure_async_write_watcher
+                    .as_ref()
+                    .expect("enabled watcher")
+                    .shutdown
+                    .task
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .is_none();
+                (outcome.watcher_stopped, outcome.writes_stopped, joined)
+            });
+            let result = runtime.block_on(shutdown).expect("shutdown task join");
+            done_tx.send(result).expect("send shutdown result");
+        });
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("one-worker shutdown deadlocked");
+        worker.join().expect("one-worker regression thread join");
+        assert_eq!(result, (true, true, true));
     }
 
     #[test]
@@ -5284,7 +5361,7 @@ mod tests {
         );
 
         let result = runtime.block_on(async move {
-            let stopped = state.shutdown_async_writes_after_run();
+            let outcome = state.shutdown_async_writes_after_run();
             let aborted = state
                 .memory_pressure_async_write_watcher
                 .as_ref()
@@ -5294,10 +5371,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .is_none();
-            (stopped, aborted)
+            (outcome.watcher_stopped, outcome.writes_stopped, aborted)
         });
 
-        assert_eq!(result, (false, true));
+        assert_eq!(result, (false, true, true));
     }
 
     #[test]
