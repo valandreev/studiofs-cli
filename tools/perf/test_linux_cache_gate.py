@@ -951,6 +951,32 @@ class PressureScenarioHelperTest(unittest.TestCase):
                 with self.assertRaisesRegex(gate.GateValidationError, message):
                     gate.validate_pressure_artifact_contract(raw)
 
+    def test_inline_pressure_feeder_installs_signal_and_uses_aligned_buffer(self) -> None:
+        root = Path.cwd() / "target/perf/test-inline-pressure-feeder"
+        shutil.rmtree(root, ignore_errors=True)
+        completed = subprocess.run(
+            ["bash", "tools/perf/linux-cache-gate.sh"],
+            cwd=Path.cwd(),
+            env={
+                **os.environ,
+                "CACHE_GATE_INTERNAL_FEEDER_FIXTURE": "true",
+                "CACHE_GATE_INTERNAL_FEEDER_DIR": str(root),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        try:
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads((root / "pressure-setup.json").read_text())
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["working_set_bytes"], 8 << 20)
+            self.assertGreater(payload["cumulative_bytes_written"], 0)
+            self.assertLess(payload["started_monotonic_ns"], payload["stopped_monotonic_ns"])
+            self.assertTrue((root / ".pressure-setup.ready").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_fake_cgroup_boundary_reads_current_limit_and_events(self) -> None:
         root = Path.cwd() / "target/perf/test-pressure-cgroup"
         shutil.rmtree(root, ignore_errors=True)

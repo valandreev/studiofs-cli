@@ -191,10 +191,8 @@ capture_cgroup_boundary() {
     "$cgroup/memory.current" "$cgroup/memory.peak" "$cgroup/memory.stat" \
     "$destination" <<'PY'
 import json
-import mmap
 import os
 import pathlib
-import signal
 import sys
 import time
 
@@ -486,8 +484,10 @@ run_inline_client() {
 import concurrent.futures
 import hashlib
 import json
+import mmap
 import os
 import pathlib
+import signal
 import sys
 import threading
 import time
@@ -959,6 +959,23 @@ cleanup_target_is_safe() {
   esac
   [[ ! -L "$candidate" && -d "$candidate" ]]
 }
+
+if [[ "${CACHE_GATE_INTERNAL_FEEDER_FIXTURE:-}" == true ]]; then
+  : "${CACHE_GATE_INTERNAL_FEEDER_DIR:?internal feeder directory is required}"
+  mkdir -p -- "$CACHE_GATE_INTERNAL_FEEDER_DIR"
+  feeder_ready="$CACHE_GATE_INTERNAL_FEEDER_DIR/.pressure-setup.ready"
+  feeder_release="$CACHE_GATE_INTERNAL_FEEDER_DIR/.pressure-setup.release"
+  feeder_result="$CACHE_GATE_INTERNAL_FEEDER_DIR/pressure-setup.json"
+  run_inline_client pressure-setup "$CACHE_GATE_INTERNAL_FEEDER_DIR" \
+    "$feeder_result" "$((8 * 1024 * 1024))" "" \
+    "$feeder_ready" "$feeder_release" &
+  feeder_pid=$!
+  wait_for_file "$feeder_ready" "internal feeder readiness" "$feeder_pid"
+  touch "$feeder_release"
+  wait "$feeder_pid"
+  printf '%s\n' "$feeder_result"
+  exit 0
+fi
 
 if [[ "${CACHE_GATE_INTERNAL_TRAP_FIXTURE:-}" == true ]]; then
   : "${CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE:?internal workload pid file is required}"
