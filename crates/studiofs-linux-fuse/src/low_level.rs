@@ -539,7 +539,17 @@ impl SessionState {
                     handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
                 });
                 if caller_is_multi_thread {
-                    tokio::task::block_in_place(shutdown)
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        tokio::task::block_in_place(shutdown)
+                    })) {
+                        Ok(stopped) => stopped,
+                        Err(_) => {
+                            warn!(
+                                "Linux FUSE memory-pressure watcher shutdown cannot block in this Tokio context"
+                            );
+                            false
+                        }
+                    }
                 } else {
                     shutdown()
                 }
@@ -5336,6 +5346,54 @@ mod tests {
             .expect("one-worker shutdown deadlocked");
         worker.join().expect("one-worker regression thread join");
         assert_eq!(result, (true, true, true));
+    }
+
+    #[test]
+    fn local_set_run_exit_aborts_watcher_and_tears_down_queue_without_panicking() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let fixture = ContractVfsFixture::new("linux-pressure-watcher-local-set-shutdown")
+                .expect("create VFS fixture");
+            let controller = fixture.vfs().memory_pressure_controller().clone();
+            let mut snapshot = controller.snapshot();
+            snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+            snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+            controller.publish(snapshot);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build multi-thread runtime");
+            let state = super::SessionState::new_with_cache_settings(
+                fixture.vfs(),
+                runtime.handle().clone(),
+                false,
+                default_connection_config(),
+                super::LinuxFuseCachePolicy::Direct,
+                true,
+            );
+            let local = tokio::task::LocalSet::new();
+            let result = runtime.block_on(local.run_until(async move {
+                let outcome = state.shutdown_async_writes_after_run();
+                let task_taken = state
+                    .memory_pressure_async_write_watcher
+                    .as_ref()
+                    .expect("enabled watcher")
+                    .shutdown
+                    .task
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .is_none();
+                (outcome.watcher_stopped, outcome.writes_stopped, task_taken)
+            }));
+            done_tx.send(result).expect("send shutdown result");
+        });
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("LocalSet shutdown panicked or deadlocked");
+        worker.join().expect("LocalSet regression thread join");
+        assert_eq!(result, (false, true, true));
     }
 
     #[test]
