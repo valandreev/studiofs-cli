@@ -2,9 +2,11 @@ use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
 
 use super::{
     RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection,
-    RuntimeStatsSnapshot, StudioVfs, VfsFuseSizeHistogram, VfsWritePathStageLatencyStats,
+    RuntimeStatsSnapshot, StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseSizeHistogram,
+    VfsWritePathStageLatencyStats,
 };
 use crate::utils::now_unix_millis;
+use crate::{MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState};
 
 /// Root-local hidden file that exposes the cross-platform runtime stats text surface.
 pub const RUNTIME_STATS_FILE_NAME_STR: &str = ".studiofs-runtime-stats";
@@ -78,11 +80,14 @@ impl StudioVfs {
         let upload = self.upload_stats();
         let write_path = self.write_path_observability_snapshot();
         let cache = self.cache_state_snapshot();
+        let memory_pressure = self.memory_pressure_controller().snapshot();
 
         let mut snapshot = RuntimeStatsSnapshot {
             generated_unix_ms,
             ..RuntimeStatsSnapshot::default()
         };
+        snapshot.memory_pressure =
+            memory_pressure_runtime_stats(memory_pressure, &write_path.fuse_async_write);
 
         insert_gauge(
             &mut snapshot.system,
@@ -683,6 +688,102 @@ impl StudioVfs {
     }
 }
 
+// These numeric codes are part of runtime-stats schema v1 and must remain stable.
+const MEMORY_PRESSURE_SOURCE_DISABLED: u64 = 0;
+const MEMORY_PRESSURE_SOURCE_HOST: u64 = 1;
+const MEMORY_PRESSURE_SOURCE_CGROUP: u64 = 2;
+const MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP: u64 = 3;
+const MEMORY_PRESSURE_SOURCE_FALLBACK: u64 = 4;
+const MEMORY_PRESSURE_STATE_DISABLED: u64 = 0;
+const MEMORY_PRESSURE_STATE_NORMAL: u64 = 1;
+const MEMORY_PRESSURE_STATE_CONSTRAINED: u64 = 2;
+
+fn memory_pressure_source_code(source: MemoryPressureSource) -> u64 {
+    match source {
+        MemoryPressureSource::Disabled => MEMORY_PRESSURE_SOURCE_DISABLED,
+        MemoryPressureSource::Host => MEMORY_PRESSURE_SOURCE_HOST,
+        MemoryPressureSource::Cgroup => MEMORY_PRESSURE_SOURCE_CGROUP,
+        MemoryPressureSource::HostAndCgroup => MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP,
+        MemoryPressureSource::Fallback => MEMORY_PRESSURE_SOURCE_FALLBACK,
+    }
+}
+
+fn memory_pressure_state_code(state: MemoryPressureState) -> u64 {
+    match state {
+        MemoryPressureState::Disabled => MEMORY_PRESSURE_STATE_DISABLED,
+        MemoryPressureState::Normal => MEMORY_PRESSURE_STATE_NORMAL,
+        MemoryPressureState::Constrained => MEMORY_PRESSURE_STATE_CONSTRAINED,
+    }
+}
+
+fn memory_pressure_runtime_stats(
+    pressure: MemoryPressureSnapshot,
+    async_write: &VfsFuseAsyncWriteSnapshot,
+) -> RuntimeStatsSection {
+    let mut section = RuntimeStatsSection::default();
+    for (name, unit, value) in [
+        (
+            "source",
+            "count",
+            memory_pressure_source_code(pressure.source),
+        ),
+        ("state", "count", memory_pressure_state_code(pressure.state)),
+        ("generation", "count", pressure.generation),
+        (
+            "effective_limit_bytes",
+            "bytes",
+            pressure.effective_limit_bytes,
+        ),
+        ("available_bytes", "bytes", pressure.available_bytes),
+        ("reserve_bytes", "bytes", pressure.reserve_bytes),
+        ("envelope_bytes", "bytes", pressure.envelope_bytes),
+        (
+            "memory_cache_limit_bytes",
+            "bytes",
+            pressure.limits.memory_cache_bytes,
+        ),
+        ("dirty_limit_bytes", "bytes", pressure.limits.dirty_bytes),
+        (
+            "transit_limit_bytes",
+            "bytes",
+            pressure.limits.transit_bytes,
+        ),
+        (
+            "async_write_limit_bytes",
+            "bytes",
+            pressure.limits.async_write_bytes,
+        ),
+        (
+            "overcommitted_minimum",
+            "count",
+            u64::from(pressure.overcommitted_minimum),
+        ),
+    ] {
+        insert_gauge(&mut section, name, unit, value);
+    }
+    for (name, unit, value) in [
+        ("transition_count", "count", pressure.transition_count),
+        (
+            "sampling_failure_count",
+            "count",
+            pressure.sampling_failure_count,
+        ),
+        (
+            "write_admission_wait_count",
+            "count",
+            async_write.admission_waits,
+        ),
+        (
+            "write_admission_wait_ns",
+            "ns",
+            ms_sum_to_ns(async_write.admission_wait_total_ms),
+        ),
+    ] {
+        insert_counter(&mut section, name, unit, value);
+    }
+    section
+}
+
 fn insert_counter(section: &mut RuntimeStatsSection, name: &str, unit: &'static str, value: u64) {
     section.counters.insert(
         name.to_owned(),
@@ -780,4 +881,124 @@ fn insert_size_histogram_counters(
 
 fn ms_sum_to_ns(value: f64) -> u64 {
     (value.max(0.0) * 1_000_000.0).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{
+        MemoryComponentLimits, MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
+        VfsFuseAsyncWriteSnapshot,
+    };
+
+    fn metric(value: u64, unit: &'static str) -> RuntimeScalarMetric {
+        RuntimeScalarMetric {
+            value,
+            unit: Cow::Borrowed(unit),
+        }
+    }
+
+    #[test]
+    fn memory_pressure_runtime_stats_codes_are_stable() {
+        let sources = [
+            memory_pressure_source_code(MemoryPressureSource::Disabled),
+            memory_pressure_source_code(MemoryPressureSource::Host),
+            memory_pressure_source_code(MemoryPressureSource::Cgroup),
+            memory_pressure_source_code(MemoryPressureSource::HostAndCgroup),
+            memory_pressure_source_code(MemoryPressureSource::Fallback),
+        ];
+        let states = [
+            memory_pressure_state_code(MemoryPressureState::Disabled),
+            memory_pressure_state_code(MemoryPressureState::Normal),
+            memory_pressure_state_code(MemoryPressureState::Constrained),
+        ];
+
+        assert_eq!(sources, [0, 1, 2, 3, 4]);
+        assert_eq!(states, [0, 1, 2]);
+    }
+
+    #[test]
+    fn memory_pressure_runtime_stats_populates_snapshot_and_async_waits() {
+        let pressure = MemoryPressureSnapshot {
+            source: MemoryPressureSource::HostAndCgroup,
+            state: MemoryPressureState::Constrained,
+            generation: 7,
+            effective_limit_bytes: 8_000,
+            available_bytes: 3_000,
+            reserve_bytes: 1_000,
+            envelope_bytes: 1_500,
+            limits: MemoryComponentLimits {
+                memory_cache_bytes: 600,
+                dirty_bytes: 375,
+                transit_bytes: 225,
+                async_write_bytes: 150,
+            },
+            transition_count: 2,
+            sampling_failure_count: 3,
+            overcommitted_minimum: true,
+        };
+        let async_write = VfsFuseAsyncWriteSnapshot {
+            admission_waits: 13,
+            admission_wait_total_ms: 2.25,
+            ..VfsFuseAsyncWriteSnapshot::default()
+        };
+
+        let section = memory_pressure_runtime_stats(pressure, &async_write);
+
+        assert_eq!(
+            section.gauges,
+            BTreeMap::from([
+                ("available_bytes".to_owned(), metric(3_000, "bytes")),
+                ("async_write_limit_bytes".to_owned(), metric(150, "bytes")),
+                ("dirty_limit_bytes".to_owned(), metric(375, "bytes")),
+                ("effective_limit_bytes".to_owned(), metric(8_000, "bytes")),
+                ("envelope_bytes".to_owned(), metric(1_500, "bytes")),
+                ("generation".to_owned(), metric(7, "count")),
+                ("memory_cache_limit_bytes".to_owned(), metric(600, "bytes")),
+                ("overcommitted_minimum".to_owned(), metric(1, "count")),
+                ("reserve_bytes".to_owned(), metric(1_000, "bytes")),
+                ("source".to_owned(), metric(3, "count")),
+                ("state".to_owned(), metric(2, "count")),
+                ("transit_limit_bytes".to_owned(), metric(225, "bytes")),
+            ])
+        );
+        assert_eq!(
+            section.counters,
+            BTreeMap::from([
+                ("sampling_failure_count".to_owned(), metric(3, "count")),
+                ("transition_count".to_owned(), metric(2, "count")),
+                ("write_admission_wait_count".to_owned(), metric(13, "count"),),
+                (
+                    "write_admission_wait_ns".to_owned(),
+                    metric(2_250_000, "ns"),
+                ),
+            ])
+        );
+        assert!(section.latencies.is_empty());
+    }
+
+    #[test]
+    fn disabled_memory_pressure_runtime_stats_keeps_configured_limits() {
+        let limits = MemoryComponentLimits {
+            memory_cache_bytes: 64,
+            dirty_bytes: 32,
+            transit_bytes: 16,
+            async_write_bytes: 8,
+        };
+
+        let section = memory_pressure_runtime_stats(
+            MemoryPressureSnapshot::disabled(limits),
+            &VfsFuseAsyncWriteSnapshot::default(),
+        );
+
+        assert_eq!(section.gauges["source"].value, 0);
+        assert_eq!(section.gauges["state"].value, 0);
+        assert_eq!(section.gauges["memory_cache_limit_bytes"].value, 64);
+        assert_eq!(section.gauges["dirty_limit_bytes"].value, 32);
+        assert_eq!(section.gauges["transit_limit_bytes"].value, 16);
+        assert_eq!(section.gauges["async_write_limit_bytes"].value, 8);
+    }
 }

@@ -15,6 +15,7 @@ pub const RUNTIME_STATS_SCHEMA_VERSION: u16 = 1;
 /// Stable runtime stats sections exposed by all StudioFS bridge implementations.
 pub const RUNTIME_STATS_SECTIONS: &[&str] = &[
     "system",
+    "memory_pressure",
     "bridge",
     "vfs_read",
     "vfs_write",
@@ -35,6 +36,8 @@ pub struct RuntimeStatsSnapshot {
     /// System and runtime process counters.
     #[serde(default, deserialize_with = "deserialize_system_runtime_stats_section")]
     pub system: RuntimeStatsSection,
+    /// Host and cgroup memory-pressure state and active component limits.
+    pub memory_pressure: RuntimeStatsSection,
     /// FUSE, macFUSE, WinFSP, or future bridge callback counters.
     pub bridge: RuntimeStatsSection,
     /// VFS read-path counters.
@@ -57,6 +60,7 @@ impl Default for RuntimeStatsSnapshot {
             schema_version: RUNTIME_STATS_SCHEMA_VERSION,
             generated_unix_ms: 0,
             system: RuntimeStatsSection::default(),
+            memory_pressure: RuntimeStatsSection::default(),
             bridge: RuntimeStatsSection::default(),
             vfs_read: RuntimeStatsSection::default(),
             vfs_write: RuntimeStatsSection::default(),
@@ -231,6 +235,7 @@ impl RuntimeStatsSnapshot {
     fn sections(&self) -> impl Iterator<Item = (&'static str, &RuntimeStatsSection)> {
         [
             ("system", &self.system),
+            ("memory_pressure", &self.memory_pressure),
             ("bridge", &self.bridge),
             ("vfs_read", &self.vfs_read),
             ("vfs_write", &self.vfs_write),
@@ -245,6 +250,7 @@ impl RuntimeStatsSnapshot {
     fn section_mut(&mut self, section: &str) -> Option<&mut RuntimeStatsSection> {
         match section {
             "system" => Some(&mut self.system),
+            "memory_pressure" => Some(&mut self.memory_pressure),
             "bridge" => Some(&mut self.bridge),
             "vfs_read" => Some(&mut self.vfs_read),
             "vfs_write" => Some(&mut self.vfs_write),
@@ -2425,6 +2431,21 @@ mod tests {
     }
 
     #[test]
+    fn runtime_stats_snapshot_serializes_empty_memory_pressure_section() {
+        let serialized = serde_json::to_value(RuntimeStatsSnapshot::default())
+            .expect("serialize runtime stats snapshot");
+
+        assert_eq!(
+            serialized["memory_pressure"],
+            serde_json::json!({
+                "counters": {},
+                "gauges": {},
+                "latencies": {}
+            })
+        );
+    }
+
+    #[test]
     fn runtime_stats_snapshot_deserializes_missing_optional_fields_as_defaults() {
         let snapshot: RuntimeStatsSnapshot = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
@@ -2440,8 +2461,40 @@ mod tests {
         assert_eq!(snapshot.generated_unix_ms, 44);
         assert_eq!(snapshot.vfs_write.counters["bytes"].value, 128);
         assert!(snapshot.system.counters.is_empty());
+        assert!(snapshot.memory_pressure.gauges.is_empty());
         assert!(snapshot.bridge.gauges.is_empty());
         assert!(snapshot.metadata.latencies.is_empty());
+    }
+
+    #[test]
+    fn runtime_stats_text_round_trips_memory_pressure_metrics() {
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        snapshot.memory_pressure.gauges.insert(
+            "source".to_owned(),
+            RuntimeScalarMetric {
+                value: 3,
+                unit: Cow::Borrowed("count"),
+            },
+        );
+        snapshot.memory_pressure.gauges.insert(
+            "envelope_bytes".to_owned(),
+            RuntimeScalarMetric {
+                value: 4096,
+                unit: Cow::Borrowed("bytes"),
+            },
+        );
+        snapshot.memory_pressure.counters.insert(
+            "transition_count".to_owned(),
+            RuntimeScalarMetric {
+                value: 2,
+                unit: Cow::Borrowed("count"),
+            },
+        );
+
+        let parsed = RuntimeStatsSnapshot::parse_text(&snapshot.to_text())
+            .expect("parse memory-pressure runtime stats");
+
+        assert_eq!(parsed.memory_pressure, snapshot.memory_pressure);
     }
 
     #[test]
@@ -2705,6 +2758,7 @@ mod tests {
         assert_eq!(parsed.vfs_read.counters["calls"].value, 4);
         for section in [
             &parsed.system,
+            &parsed.memory_pressure,
             &parsed.bridge,
             &parsed.vfs_write,
             &parsed.cache,
@@ -2831,6 +2885,20 @@ mod tests {
 
     #[test]
     fn runtime_stats_sections_constant_matches_accessors() {
+        let expected = &[
+            "system",
+            "memory_pressure",
+            "bridge",
+            "vfs_read",
+            "vfs_write",
+            "cache",
+            "upload_queue",
+            "object_io",
+            "metadata",
+        ];
+        assert_eq!(RUNTIME_STATS_SCHEMA_VERSION, 1);
+        assert_eq!(RUNTIME_STATS_SECTIONS, expected);
+
         let mut snapshot = RuntimeStatsSnapshot::default();
         for section in RUNTIME_STATS_SECTIONS {
             assert!(
@@ -2840,7 +2908,7 @@ mod tests {
         }
 
         let section_names: Vec<&str> = snapshot.sections().map(|(name, _)| name).collect();
-        assert_eq!(section_names, RUNTIME_STATS_SECTIONS);
+        assert_eq!(section_names, expected);
     }
 
     #[test]
