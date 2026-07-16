@@ -1242,11 +1242,12 @@ fn runtime_stats_sections<'a>(
     &'static str,
     &'a RuntimeStatsSection,
     &'a RuntimeStatsSection,
-); 8] {
+); 9] {
     let RuntimeStatsSnapshot {
         schema_version: _,
         generated_unix_ms: _,
         system: before_system,
+        memory_pressure: before_memory_pressure,
         bridge: before_bridge,
         vfs_read: before_vfs_read,
         vfs_write: before_vfs_write,
@@ -1259,6 +1260,7 @@ fn runtime_stats_sections<'a>(
         schema_version: _,
         generated_unix_ms: _,
         system: after_system,
+        memory_pressure: after_memory_pressure,
         bridge: after_bridge,
         vfs_read: after_vfs_read,
         vfs_write: after_vfs_write,
@@ -1269,6 +1271,11 @@ fn runtime_stats_sections<'a>(
     } = after;
     [
         ("system", before_system, after_system),
+        (
+            "memory_pressure",
+            before_memory_pressure,
+            after_memory_pressure,
+        ),
         ("bridge", before_bridge, after_bridge),
         ("vfs_read", before_vfs_read, after_vfs_read),
         ("vfs_write", before_vfs_write, after_vfs_write),
@@ -1905,6 +1912,44 @@ mod tests {
             value,
             unit: unit.into(),
         }
+    }
+
+    #[test]
+    fn runtime_stats_delta_preserves_memory_pressure_gauges_and_deltas_counters() {
+        let mut before = RuntimeStatsSnapshot::default();
+        before
+            .memory_pressure
+            .gauges
+            .insert("available_bytes".to_string(), scalar(512, "bytes"));
+        before
+            .memory_pressure
+            .counters
+            .insert("transition_count".to_string(), scalar(3, "count"));
+
+        let mut after = before.clone();
+        after
+            .memory_pressure
+            .gauges
+            .get_mut("available_bytes")
+            .unwrap()
+            .value = 256;
+        after
+            .memory_pressure
+            .counters
+            .get_mut("transition_count")
+            .unwrap()
+            .value = 5;
+
+        let delta = runtime_stats_delta("memory-pressure", &before, &after);
+
+        assert_eq!(
+            (
+                delta.sections["memory_pressure"].gauges["available_bytes"].before,
+                delta.sections["memory_pressure"].gauges["available_bytes"].after,
+                delta.sections["memory_pressure"].counters["transition_count"].delta,
+            ),
+            (Some(512), 256, 2)
+        );
     }
 
     #[test]
