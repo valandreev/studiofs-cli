@@ -69,6 +69,13 @@ pub use handle_drain_barrier::{
 };
 /// Re-exported lock kind used by the public locking API.
 pub use locking::LockKind;
+/// Stable numeric wire values used by memory-pressure runtime statistics.
+pub use metrics::{
+    MEMORY_PRESSURE_SOURCE_CGROUP, MEMORY_PRESSURE_SOURCE_DISABLED,
+    MEMORY_PRESSURE_SOURCE_FALLBACK, MEMORY_PRESSURE_SOURCE_HOST,
+    MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP, MEMORY_PRESSURE_STATE_CONSTRAINED,
+    MEMORY_PRESSURE_STATE_DISABLED, MEMORY_PRESSURE_STATE_NORMAL,
+};
 /// Re-exported VFS observability snapshot and metrics types.
 #[allow(deprecated)]
 pub use metrics::{

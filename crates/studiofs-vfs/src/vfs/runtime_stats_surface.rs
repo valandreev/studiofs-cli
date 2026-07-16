@@ -1,9 +1,12 @@
 use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
 
 use super::{
-    RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection,
-    RuntimeStatsSnapshot, StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseSizeHistogram,
-    VfsWritePathStageLatencyStats,
+    MEMORY_PRESSURE_SOURCE_CGROUP, MEMORY_PRESSURE_SOURCE_DISABLED,
+    MEMORY_PRESSURE_SOURCE_FALLBACK, MEMORY_PRESSURE_SOURCE_HOST,
+    MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP, MEMORY_PRESSURE_STATE_CONSTRAINED,
+    MEMORY_PRESSURE_STATE_DISABLED, MEMORY_PRESSURE_STATE_NORMAL, RuntimeLatencyBucket,
+    RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
+    StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseSizeHistogram, VfsWritePathStageLatencyStats,
 };
 use crate::utils::now_unix_millis;
 use crate::{MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState};
@@ -688,16 +691,6 @@ impl StudioVfs {
     }
 }
 
-// These numeric codes are part of runtime-stats schema v1 and must remain stable.
-const MEMORY_PRESSURE_SOURCE_DISABLED: u64 = 0;
-const MEMORY_PRESSURE_SOURCE_HOST: u64 = 1;
-const MEMORY_PRESSURE_SOURCE_CGROUP: u64 = 2;
-const MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP: u64 = 3;
-const MEMORY_PRESSURE_SOURCE_FALLBACK: u64 = 4;
-const MEMORY_PRESSURE_STATE_DISABLED: u64 = 0;
-const MEMORY_PRESSURE_STATE_NORMAL: u64 = 1;
-const MEMORY_PRESSURE_STATE_CONSTRAINED: u64 = 2;
-
 fn memory_pressure_source_code(source: MemoryPressureSource) -> u64 {
     match source {
         MemoryPressureSource::Disabled => MEMORY_PRESSURE_SOURCE_DISABLED,
@@ -903,6 +896,18 @@ mod tests {
 
     #[test]
     fn memory_pressure_runtime_stats_codes_are_stable() {
+        let public_sources = [
+            crate::MEMORY_PRESSURE_SOURCE_DISABLED,
+            crate::MEMORY_PRESSURE_SOURCE_HOST,
+            crate::MEMORY_PRESSURE_SOURCE_CGROUP,
+            crate::MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP,
+            crate::MEMORY_PRESSURE_SOURCE_FALLBACK,
+        ];
+        let public_states = [
+            crate::MEMORY_PRESSURE_STATE_DISABLED,
+            crate::MEMORY_PRESSURE_STATE_NORMAL,
+            crate::MEMORY_PRESSURE_STATE_CONSTRAINED,
+        ];
         let sources = [
             memory_pressure_source_code(MemoryPressureSource::Disabled),
             memory_pressure_source_code(MemoryPressureSource::Host),
@@ -916,8 +921,10 @@ mod tests {
             memory_pressure_state_code(MemoryPressureState::Constrained),
         ];
 
-        assert_eq!(sources, [0, 1, 2, 3, 4]);
-        assert_eq!(states, [0, 1, 2]);
+        assert_eq!(public_sources, [0, 1, 2, 3, 4]);
+        assert_eq!(public_states, [0, 1, 2]);
+        assert_eq!(sources, public_sources);
+        assert_eq!(states, public_states);
     }
 
     #[test]

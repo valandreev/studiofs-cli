@@ -12,6 +12,24 @@ use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 /// Current version of the cross-platform runtime stats snapshot schema.
 pub const RUNTIME_STATS_SCHEMA_VERSION: u16 = 1;
 
+/// Stable runtime-stats wire value for a disabled memory-pressure source.
+pub const MEMORY_PRESSURE_SOURCE_DISABLED: u64 = 0;
+/// Stable runtime-stats wire value for host memory-pressure sampling.
+pub const MEMORY_PRESSURE_SOURCE_HOST: u64 = 1;
+/// Stable runtime-stats wire value for cgroup memory-pressure sampling.
+pub const MEMORY_PRESSURE_SOURCE_CGROUP: u64 = 2;
+/// Stable runtime-stats wire value for combined host and cgroup sampling.
+pub const MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP: u64 = 3;
+/// Stable runtime-stats wire value for fallback memory-pressure limits.
+pub const MEMORY_PRESSURE_SOURCE_FALLBACK: u64 = 4;
+
+/// Stable runtime-stats wire value for a disabled memory-pressure controller.
+pub const MEMORY_PRESSURE_STATE_DISABLED: u64 = 0;
+/// Stable runtime-stats wire value for normal memory-pressure state.
+pub const MEMORY_PRESSURE_STATE_NORMAL: u64 = 1;
+/// Stable runtime-stats wire value for constrained memory-pressure state.
+pub const MEMORY_PRESSURE_STATE_CONSTRAINED: u64 = 2;
+
 /// Stable runtime stats sections exposed by all StudioFS bridge implementations.
 pub const RUNTIME_STATS_SECTIONS: &[&str] = &[
     "system",

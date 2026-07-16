@@ -75,3 +75,9 @@ pub use vfs::{
     derive_memory_pressure_configured_limits, is_hidden_platform_root_metadata_name,
     read_runtime_stats_buffer,
 };
+pub use vfs::{
+    MEMORY_PRESSURE_SOURCE_CGROUP, MEMORY_PRESSURE_SOURCE_DISABLED,
+    MEMORY_PRESSURE_SOURCE_FALLBACK, MEMORY_PRESSURE_SOURCE_HOST,
+    MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP, MEMORY_PRESSURE_STATE_CONSTRAINED,
+    MEMORY_PRESSURE_STATE_DISABLED, MEMORY_PRESSURE_STATE_NORMAL,
+};
