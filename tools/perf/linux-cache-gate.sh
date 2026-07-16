@@ -191,8 +191,10 @@ capture_cgroup_boundary() {
     "$cgroup/memory.current" "$cgroup/memory.peak" "$cgroup/memory.stat" \
     "$destination" <<'PY'
 import json
+import mmap
 import os
 import pathlib
+import signal
 import sys
 import time
 
@@ -394,6 +396,7 @@ capture_memory_event_boundary() {
 import json
 import pathlib
 import sys
+import time
 from tools.perf import linux_cache_gate_summary as gate
 
 phase, cgroup, destination = sys.argv[1:]
@@ -429,7 +432,7 @@ valid = sample["state"] == expected and sample["source"] == "host_and_cgroup"
 if expected == "constrained":
     valid = valid and sample["envelope_bytes"] > 0
     valid = valid and not sample["overcommitted_minimum"]
-    valid = valid and sample["admitted_managed_bytes"] >= int(sys.argv[2])
+    valid = valid and sample["admitted_lower_bound_bytes"] >= int(sys.argv[2])
 print("yes" if valid else "no")
 ' "$expected" "$minimum_admitted")"
     if [[ "$matched" == yes ]]; then
@@ -443,6 +446,32 @@ print("yes" if valid else "no")
     sleep "$idle_poll_interval"
   done
   die "memory pressure state did not become $expected within 30 seconds"
+}
+
+wait_for_admitted_setup() {
+  local destination="$1"
+  local feeder_pid="$2"
+  local required_admitted="$3"
+  local snapshot=""
+  local admitted=""
+  local deadline=$((SECONDS + 60))
+  while (( SECONDS <= deadline )); do
+    helper_pid_is_live "$feeder_pid" || die "pressure feeder exited before admission target"
+    snapshot="$(capture_runtime_snapshot)"
+    admitted="$(printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
+      python3 -c '
+import json
+import sys
+from tools.perf import linux_cache_gate_summary as gate
+print(gate.memory_pressure_sample(json.load(sys.stdin))["admitted_lower_bound_bytes"])
+')"
+    if (( admitted >= required_admitted )); then
+      printf '%s\n' "$snapshot" > "$destination"
+      return 0
+    fi
+    sleep "$idle_poll_interval"
+  done
+  die "pressure feeder did not reach required live admission within 60 seconds"
 }
 
 run_inline_client() {
@@ -834,23 +863,38 @@ elif ACTION == "pressure-setup":
     if len(EXTRA) != 2:
         raise SystemExit("pressure-setup requires ready and release paths")
     ready_path, release_path = map(pathlib.Path, EXTRA)
-    block = payload("pressure-setup", MIB)
     path = RUN_DIR / "pressure-setup.bin"
     started = time.monotonic_ns()
-    with path.open("xb", buffering=0) as handle:
-        remaining = WORKLOAD_BYTES
-        while remaining:
-            chunk = block[: min(remaining, len(block))]
-            write_all(handle, chunk)
-            remaining -= len(chunk)
+    def request_stop(_signum, _frame):
+        nonlocal_stop[0] = True
+    nonlocal_stop = [False]
+    signal.signal(signal.SIGTERM, request_stop)
+    direct_flag = getattr(os, "O_DIRECT", None)
+    if direct_flag is None:
+        raise OSError("O_DIRECT is unavailable")
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | direct_flag, 0o600)
+    cumulative = 0
+    region = 0
+    aligned = mmap.mmap(-1, MIB)
+    aligned[:] = payload("pressure-setup", MIB)
+    try:
         ready_path.write_text("ready\n", encoding="utf-8")
-        while not release_path.exists():
-            time.sleep(0.01)
-        os.fsync(handle.fileno())
+        while not nonlocal_stop[0] and not release_path.exists():
+            written = os.pwrite(fd, aligned, region)
+            if written != MIB:
+                raise OSError("short O_DIRECT pressure feeder write")
+            cumulative += written
+            region = (region + MIB) % WORKLOAD_BYTES
+    finally:
+        aligned.close()
+        os.close(fd)
     write_json({
         "schema_version": 1,
-        "bytes_written": WORKLOAD_BYTES,
-        "elapsed_ns": time.monotonic_ns() - started,
+        "working_set_bytes": WORKLOAD_BYTES,
+        "cumulative_bytes_written": cumulative,
+        "started_monotonic_ns": started,
+        "stopped_monotonic_ns": time.monotonic_ns(),
+        "exit_status": 0,
     })
 elif ACTION == "pressure-hash":
     observed, checksum, measured_throughput = hash_workload()
@@ -859,11 +903,13 @@ elif ACTION == "pressure-hash":
         "bytes_read": observed,
         "sha256": checksum,
         "throughput_mb_per_second": measured_throughput,
+        "completed_monotonic_ns": time.monotonic_ns(),
     })
 elif ACTION == "pressure-recovery":
     if len(EXTRA) != 1:
         raise SystemExit("pressure-recovery requires pressure hash path")
     pressure = json.loads(pathlib.Path(EXTRA[0]).read_text(encoding="utf-8"))
+    recovery_started = time.monotonic_ns()
     measured_bytes, measured_throughput = measure_workload_read()
     observed, checksum, _ = hash_workload()
     if observed != pressure.get("bytes_read") or checksum != pressure.get("sha256"):
@@ -875,6 +921,8 @@ elif ACTION == "pressure-recovery":
         "bytes_read": observed,
         "sha256": checksum,
         "throughput_mb_per_second": [measured_throughput],
+        "started_monotonic_ns": recovery_started,
+        "completed_monotonic_ns": time.monotonic_ns(),
     })
 else:
     raise SystemExit(f"unknown inline client action: {ACTION}")
@@ -1071,7 +1119,7 @@ if [[ "$workload" == warm-reopen ]]; then
   json_placeholder "$artifact_dir/runtime-warm-first-end.json" "warm-first-end"
 fi
 if [[ "$pressure_scenario" == true ]]; then
-  for phase in pressure recovery-boundary recovery-1 recovery-2; do
+  for phase in setup-observed pressure recovery-boundary recovery-1 recovery-2; do
     json_placeholder "$artifact_dir/runtime-$phase.json" "$phase"
   done
   for artifact in memory-pressure-config memory-events-before memory-events-pressure \
@@ -1443,14 +1491,11 @@ move_pid_to_cgroup "$mount_pid" "$proc_root/$mount_pid/cgroup" "mount process"
 
 if [[ "$pressure_scenario" == true ]]; then
   pressure_negotiated_max_write="$(capture_runtime_snapshot | \
-    PYTHONDONTWRITEBYTECODE=1 python3 -c '
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 -c '
 import json
 import sys
-snapshot = json.load(sys.stdin)
-value = snapshot.get("write_path", {}).get("fuse_connection", {}).get(
-    "negotiated_max_write_bytes"
-)
-print(value if isinstance(value, int) and value > 0 else 1024 * 1024)
+from tools.perf import linux_cache_gate_summary as gate
+print(gate.negotiated_max_write_bytes(json.load(sys.stdin)))
 ')"
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
     "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" \
@@ -1485,21 +1530,28 @@ try:
         parent_available = parent_limit - parent_current
     if host_available is None:
         raise ValueError("MemAvailable is missing")
-    payload = gate.derive_pressure_scenario(
-        memory_current=current,
-        host_available=host_available,
-        leaf_limit=leaf_limit,
-        parent_available=parent_available,
+    headroom = 3 * 1024 * 1024 * 1024
+    if host_available < headroom:
+        raise ValueError("pressure scenario requires 3 GiB host headroom")
+    if leaf_limit is not None and leaf_limit - current < headroom:
+        raise ValueError("pressure scenario requires 3 GiB leaf headroom")
+    if parent_available is not None and parent_available < headroom:
+        raise ValueError("pressure scenario requires 3 GiB parent headroom")
+    memory_max = current + headroom
+    payload = gate.derive_pressure_target(
+        effective_limit=memory_max,
         negotiated_max_write=int(sys.argv[4]),
     )
     (cgroup / "memory.max").write_text(
-        f"{payload['memory_max_bytes']}\n", encoding="utf-8"
+        f"{memory_max}\n", encoding="utf-8"
     )
-    if finite_limit(cgroup / "memory.max") != payload["memory_max_bytes"]:
+    if finite_limit(cgroup / "memory.max") != memory_max:
         raise ValueError("memory.max did not retain the requested finite limit")
     payload = {
         **payload,
         "schema_version": 1,
+        "memory_max_bytes": memory_max,
+        "headroom_bytes": headroom,
         "memory_current_before_bytes": current,
     }
     pathlib.Path(sys.argv[3]).write_text(
@@ -1733,33 +1785,7 @@ PY
 
 rm -f -- "$idle_snapshot_file" "$first_runtime_file"
 if [[ "$pressure_scenario" == true ]]; then
-  holder_bytes="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
-import json
-import sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["holder_bytes"])
-' "$artifact_dir/memory-pressure-config.json")"
-  setup_bytes="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
-import json
-import sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["setup_bytes"])
-' "$artifact_dir/memory-pressure-config.json")"
-  memory_holder_start="$artifact_dir/.memory-holder.start"
-  memory_holder_ready="$artifact_dir/.memory-holder.ready"
-  memory_holder_release="$artifact_dir/.memory-holder.release"
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 -c '
-from pathlib import Path
-import sys
-from tools.perf.linux_cache_gate_summary import run_memory_holder
-run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))
-' \
-    "$holder_bytes" "$memory_holder_start" "$memory_holder_ready" \
-    "$memory_holder_release" "$artifact_dir/memory-holder.json" \
-    > "$artifact_dir/memory-holder.stdout.txt" \
-    2> "$artifact_dir/memory-holder.stderr.txt" &
-  memory_holder_pid=$!
-  trap stop_helpers_on_exit EXIT
-  move_pid_to_cgroup "$memory_holder_pid" \
-    "$proc_root/$memory_holder_pid/cgroup" "memory holder"
+  setup_working_set_bytes=$((512 * 1024 * 1024))
 fi
 workload_owner=bench
 workload_run_dir=""
@@ -1832,19 +1858,6 @@ inline-python cross-file-barriers --run-dir "$workload_run_dir" --parallelism 2 
 COMMAND
     ;;
 esac
-if [[ "$pressure_scenario" == true ]]; then
-  cat >> "$artifact_dir/command.txt" <<COMMAND
-pressure-setup --bytes "$setup_bytes" --hold-admitted
-memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
-profile-async --profile "$workload" --run-dir <owned-workload-dir>
-constrained-boundary --require-profile-live
-memory-holder-release
-after-holder-release-boundary
-profile-recovery --profile "$workload" --run-dir <owned-workload-dir> --trials 1
-recovery-hash --run-dir <owned-workload-dir>
-COMMAND
-fi
-
 LC_ALL=C "$pidstat_bin" -urd -h -p "$mount_pid" 1 \
   > "$artifact_dir/pidstat.txt" 2> "$artifact_dir/pidstat.stderr.txt" &
 pidstat_pid=$!
@@ -1950,14 +1963,121 @@ if [[ "$pressure_scenario" == true ]]; then
   pressure_setup_ready="$artifact_dir/.pressure-setup.ready"
   pressure_setup_release="$artifact_dir/.pressure-setup.release"
   run_inline_client pressure-setup "$pressure_setup_dir" \
-    "$artifact_dir/pressure-setup.json" "$setup_bytes" "" \
+    "$artifact_dir/pressure-setup.json" "$setup_working_set_bytes" "" \
     "$pressure_setup_ready" "$pressure_setup_release" \
     > "$artifact_dir/pressure-setup.stdout.txt" \
     2> "$artifact_dir/pressure-setup.stderr.txt" &
   pressure_setup_pid=$!
   wait_for_file "$pressure_setup_ready" "pressure setup readiness" "$pressure_setup_pid"
+  verify_cgroup_membership "$proc_root/$pressure_setup_pid/cgroup" "pressure feeder"
+  required_admitted="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["required_admitted_bytes"])
+' "$artifact_dir/memory-pressure-config.json")"
+  wait_for_admitted_setup "$artifact_dir/runtime-setup-observed.json" \
+    "$pressure_setup_pid" "$required_admitted"
+  setup_observed_ns="$(monotonic_ns)"
+  holder_bytes="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
+    "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" \
+    "$artifact_dir/runtime-setup-observed.json" <<'PY'
+import json
+import pathlib
+import sys
+from tools.perf import linux_cache_gate_summary as gate
+
+cgroup = pathlib.Path(sys.argv[1])
+config_path = pathlib.Path(sys.argv[3])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+sample = gate.memory_pressure_sample(json.loads(pathlib.Path(sys.argv[4]).read_text()))
+host_available = next(
+    int(line.split()[1]) * 1024
+    for line in pathlib.Path(sys.argv[2]).read_text().splitlines()
+    if line.startswith("MemAvailable:")
+)
+parent_raw = (cgroup.parent / "memory.max").read_text().strip()
+parent_available = None
+if parent_raw != "max":
+    parent_available = int(parent_raw) - int((cgroup.parent / "memory.current").read_text())
+scenario = gate.derive_pressure_scenario(
+    memory_current=int((cgroup / "memory.current").read_text()),
+    memory_max=int((cgroup / "memory.max").read_text()),
+    host_available=host_available,
+    parent_available=parent_available,
+    observed_admitted_lower_bound=sample["admitted_lower_bound_bytes"],
+    negotiated_max_write=config["negotiated_max_write_bytes"],
+)
+scenario["observed_generation"] = sample["generation"]
+config.update(scenario)
+config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+print(scenario["holder_bytes"])
+PY
+)"
+  memory_holder_start="$artifact_dir/.memory-holder.start"
+  memory_holder_ready="$artifact_dir/.memory-holder.ready"
+  memory_holder_release="$artifact_dir/.memory-holder.release"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 -c '
+from pathlib import Path
+import sys
+from tools.perf.linux_cache_gate_summary import run_memory_holder
+run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))
+' \
+    "$holder_bytes" "$memory_holder_start" "$memory_holder_ready" \
+    "$memory_holder_release" "$artifact_dir/memory-holder.json" \
+    > "$artifact_dir/memory-holder.stdout.txt" \
+    2> "$artifact_dir/memory-holder.stderr.txt" &
+  memory_holder_pid=$!
+  move_pid_to_cgroup "$memory_holder_pid" \
+    "$proc_root/$memory_holder_pid/cgroup" "memory holder"
   touch "$memory_holder_start"
   wait_for_file "$memory_holder_ready" readiness
+  target_envelope="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["target_envelope_bytes"])
+' "$artifact_dir/memory-pressure-config.json")"
+  wait_for_memory_pressure_state constrained "$artifact_dir/runtime-pressure.json" \
+    "$pressure_setup_pid" "$((target_envelope + 1))"
+  capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
+  feeder_pid="$pressure_setup_pid"
+  touch "$pressure_setup_release"
+  stop_helper_bounded "$pressure_setup_pid" pressure-setup || die "pressure feeder cleanup failed"
+  pressure_setup_pid=""
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
+    "$artifact_dir/pressure-setup.json" "$artifact_dir/memory-pressure-config.json" \
+    "$feeder_pid" "$setup_observed_ns" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+config = json.loads(pathlib.Path(sys.argv[2]).read_text())
+payload.update({
+    "observed_admitted_lower_bound_bytes": config[
+        "observed_admitted_lower_bound_bytes"
+    ],
+    "observed_generation": config.get("observed_generation", 0),
+    "observed_monotonic_ns": int(sys.argv[4]),
+    "feeder_pid": int(sys.argv[3]),
+    "feeder_live_at_constrained": True,
+})
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+  rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
+  cleanup_target_is_safe "$pressure_setup_dir" pressure-setup || \
+    die "refusing to delete unsafe pressure setup directory"
+  rm -rf -- "$pressure_setup_dir" || die "failed to delete pressure setup directory"
+  cat >> "$artifact_dir/command.txt" <<COMMAND
+pressure-feeder --o-direct --working-set "$setup_working_set_bytes"
+observe-live-admission --minimum "$required_admitted"
+memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
+constrained-boundary --require-feeder-live --admitted-gt-envelope
+pressure-feeder-stop
+profile-async --profile "$workload" --run-dir <owned-workload-dir>
+memory-holder-release
+after-holder-release-boundary
+profile-recovery --profile "$workload" --run-dir <owned-workload-dir> --trials 1
+recovery-hash --run-dir <owned-workload-dir>
+COMMAND
 fi
 
 foreground_start_ns="$(monotonic_ns)"
@@ -2014,10 +2134,6 @@ if [[ "$pressure_scenario" == true ]]; then
   execute_workload > "$artifact_dir/workload.stdout.txt" \
     2> "$artifact_dir/workload.stderr.txt" &
   pressure_workload_pid=$!
-  pressure_profile_pid="$pressure_workload_pid"
-  capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
-  wait_for_memory_pressure_state constrained \
-    "$artifact_dir/runtime-pressure.json" "$pressure_workload_pid" "$setup_bytes"
   if wait "$pressure_workload_pid"; then
     command_exit_status=0
   else
@@ -2071,6 +2187,7 @@ PY
 import json
 import pathlib
 import sys
+import time
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if "phase_throughput_mb_per_second" in report:
@@ -2084,36 +2201,12 @@ pathlib.Path(sys.argv[3]).write_text(json.dumps({
     "schema_version": 1,
     "profile": sys.argv[2],
     "read_throughput_mb_per_second": float(value),
+    "completed_monotonic_ns": time.monotonic_ns(),
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
     run_inline_client pressure-hash "$pressure_run_dir" \
       "$artifact_dir/pressure-hash.json" "$pressure_workload_bytes" ""
   fi
-  touch "$pressure_setup_release"
-  if ! wait "$pressure_setup_pid"; then
-    die "pressure setup failed"
-  fi
-  pressure_setup_pid=""
-  PYTHONDONTWRITEBYTECODE=1 python3 - \
-    "$artifact_dir/pressure-setup.json" "$workload" "$pressure_profile_pid" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-payload = json.loads(path.read_text(encoding="utf-8"))
-payload.update({
-    "profile": sys.argv[2],
-    "profile_pid": int(sys.argv[3]),
-    "profile_live_at_constrained": True,
-    "exit_status": 0,
-})
-path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-PY
-  rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
-  cleanup_target_is_safe "$pressure_setup_dir" pressure-setup || \
-    die "refusing to delete unsafe pressure setup directory"
-  rm -rf -- "$pressure_setup_dir" || die "failed to delete pressure setup directory"
   touch "$memory_holder_release"
   wait_for_file "$artifact_dir/memory-holder.json" exit
   if wait "$memory_holder_pid"; then

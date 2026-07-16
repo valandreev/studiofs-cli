@@ -290,6 +290,8 @@ def idle_streak_reached(snapshots: Sequence[dict], consecutive: int = 3) -> bool
 
 def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
     """Normalize one runtime-stats memory-pressure section for gate evidence."""
+    if snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
+        raise GateValidationError("runtime memory pressure schema mismatch")
     section = snapshot.get("memory_pressure")
     gauges = section.get("gauges") if isinstance(section, dict) else None
     counters = section.get("counters") if isinstance(section, dict) else None
@@ -347,42 +349,33 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
         "sampling_failure_count": counter("sampling_failure_count", "count"),
         "write_admission_wait_count": counter("write_admission_wait_count", "count"),
         "write_admission_wait_ns": counter("write_admission_wait_ns", "ns"),
-        "admitted_managed_bytes": admitted,
+        "admitted_lower_bound_bytes": admitted,
     }
 
 
-def derive_pressure_scenario(
-    *,
-    memory_current: int,
-    host_available: int,
-    leaf_limit: int | None,
-    parent_available: int | None,
-    negotiated_max_write: int = 0,
-) -> dict[str, int]:
-    """Derive the one supported reserve-aware pressure scenario."""
-    gib = 1 << 30
-    headroom = 3 * gib
-    current = _nonnegative_integer(memory_current, "memory.current")
-    available = _nonnegative_integer(host_available, "host available memory")
-    if available < headroom:
-        raise GateValidationError("memory pressure scenario requires 3 GiB headroom")
-    for label, boundary in (("leaf", leaf_limit), ("parent", parent_available)):
-        if boundary is None:
-            continue
-        value = _nonnegative_integer(boundary, f"{label} memory boundary")
-        usable = value - current if label == "leaf" else value
-        if usable < headroom:
-            raise GateValidationError("memory pressure scenario requires 3 GiB headroom")
+def negotiated_max_write_bytes(snapshot: dict) -> int:
+    if snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
+        raise GateValidationError("negotiated max_write runtime schema mismatch")
+    bridge = snapshot.get("bridge")
+    gauges = bridge.get("gauges") if isinstance(bridge, dict) else None
+    metric = gauges.get("fuse_negotiated_max_write_bytes") if isinstance(gauges, dict) else None
+    if not isinstance(metric, dict) or metric.get("unit") != "bytes":
+        raise GateValidationError("negotiated max_write bytes metric is missing or has wrong unit")
+    value = _nonnegative_integer(metric.get("value"), "negotiated max_write bytes")
+    if value == 0:
+        raise GateValidationError("negotiated max_write bytes must be positive")
+    return value
 
-    memory_max = current + headroom
-    reserve = max(gib, (memory_max * 15 + 99) // 100)
+
+def derive_pressure_target(*, effective_limit: int, negotiated_max_write: int) -> dict[str, int]:
+    """Choose the smallest non-overcommitted envelope for the live feeder."""
+    gib = 1 << 30
+    limit = _nonnegative_integer(effective_limit, "effective memory limit")
+    reserve = max(gib, (limit * 15 + 99) // 100)
     mib = 1 << 20
-    setup_bytes = 512 * mib
     max_write = _nonnegative_integer(negotiated_max_write, "negotiated max_write")
     target_allocatable = 512 * mib
-    minimum_holder = 768 * mib
-    maximum_allocatable = headroom - reserve - setup_bytes - minimum_holder
-    while target_allocatable <= maximum_allocatable:
+    while True:
         envelope = target_allocatable * 75 // 100
         limits = (
             max(envelope * 40 // 100, 64 * mib),
@@ -394,24 +387,59 @@ def derive_pressure_scenario(
         if managed <= envelope * 90 // 100:
             break
         target_allocatable += mib
-    else:
-        raise GateValidationError("memory pressure minima leave less than 768 MiB holder")
-    post_holder_available = reserve + setup_bytes + target_allocatable
-    holder = headroom - post_holder_available
-    if holder < minimum_holder:
-        raise GateValidationError("memory pressure holder must be at least 768 MiB")
     return {
-        "memory_max_bytes": memory_max,
-        "headroom_bytes": headroom,
         "reserve_bytes": reserve,
-        "setup_bytes": setup_bytes,
-        "holder_bytes": holder,
-        "post_holder_available_bytes": post_holder_available,
         "target_allocatable_bytes": target_allocatable,
         "target_envelope_bytes": envelope,
+        "required_admitted_bytes": envelope + 64 * mib,
         "managed_minimum_bytes": managed,
         "negotiated_max_write_bytes": max_write,
         "overcommitted_minimum": managed > envelope * 90 // 100,
+    }
+
+
+def derive_pressure_scenario(
+    *,
+    memory_current: int,
+    memory_max: int,
+    host_available: int,
+    parent_available: int | None,
+    observed_admitted_lower_bound: int,
+    negotiated_max_write: int,
+) -> dict[str, int]:
+    """Size the holder after the bounded feeder has established live admission."""
+    current = _nonnegative_integer(memory_current, "memory.current")
+    limit = _nonnegative_integer(memory_max, "memory.max")
+    host = _nonnegative_integer(host_available, "host available memory")
+    if current > limit:
+        raise GateValidationError("memory.current exceeds memory.max")
+    target = derive_pressure_target(
+        effective_limit=limit, negotiated_max_write=negotiated_max_write
+    )
+    admitted = _nonnegative_integer(
+        observed_admitted_lower_bound, "observed admitted lower bound"
+    )
+    if admitted < target["required_admitted_bytes"]:
+        raise GateValidationError("observed admission is below the pressure target")
+    available = min(host, limit - current)
+    if parent_available is not None:
+        available = min(
+            available,
+            _nonnegative_integer(parent_available, "parent available memory"),
+        )
+    desired_available = target["reserve_bytes"] + target["target_allocatable_bytes"]
+    holder = available - desired_available
+    mib = 1 << 20
+    minimum_holder = 768 * mib
+    if holder < minimum_holder:
+        raise GateValidationError("memory pressure holder must be at least 768 MiB")
+    return {
+        **target,
+        "memory_max_bytes": limit,
+        "memory_current_after_feeder_bytes": current,
+        "observed_admitted_lower_bound_bytes": admitted,
+        "holder_bytes": holder,
+        "desired_available_bytes": desired_available,
     }
 
 
@@ -444,6 +472,7 @@ def run_memory_holder(
     result_path.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "bytes": size,
                 "started_monotonic_ns": started,
                 "ready_monotonic_ns": ready,
@@ -766,14 +795,21 @@ def validate_memory_pressure_evidence(
         raise GateValidationError("holder lifecycle timestamps are not ordered")
     if holder.get("exit_status") != 0:
         raise GateValidationError("memory holder failed to exit cleanly")
-    if setup.get("bytes_written") != 512 << 20:
-        raise GateValidationError("pressure setup bytes mismatch")
-    if setup.get("profile") != workload:
-        raise GateValidationError("pressure setup profile mismatch")
-    if _nonnegative_integer(setup.get("profile_pid"), "pressure profile pid") == 0:
-        raise GateValidationError("pressure profile pid must be positive")
-    if setup.get("profile_live_at_constrained") is not True:
-        raise GateValidationError("pressure profile was not live at constrained evidence")
+    if _nonnegative_integer(setup.get("working_set_bytes"), "feeder working set") == 0:
+        raise GateValidationError("pressure feeder working set must be positive")
+    _nonnegative_integer(setup.get("cumulative_bytes_written"), "feeder cumulative bytes")
+    observed_admitted = _nonnegative_integer(
+        setup.get("observed_admitted_lower_bound_bytes"),
+        "observed admission lower bound",
+    )
+    if observed_admitted == 0:
+        raise GateValidationError("observed admission must be positive")
+    _nonnegative_integer(setup.get("observed_generation"), "observed generation")
+    _nonnegative_integer(setup.get("observed_monotonic_ns"), "observed monotonic time")
+    if _nonnegative_integer(setup.get("feeder_pid"), "pressure feeder pid") == 0:
+        raise GateValidationError("pressure feeder pid must be positive")
+    if setup.get("feeder_live_at_constrained") is not True:
+        raise GateValidationError("pressure feeder was not live at constrained evidence")
     if setup.get("exit_status") != 0:
         raise GateValidationError("pressure setup exit status is nonzero")
 
@@ -825,10 +861,15 @@ def validate_memory_pressure_evidence(
     ):
         raise GateValidationError("constrained state must retain a positive nonminimum envelope")
     if not any(
-        sample.get("admitted_managed_bytes", 0) >= setup["bytes_written"]
+        sample.get("admitted_lower_bound_bytes", 0) > sample["envelope_bytes"]
         for sample in constrained
     ):
-        raise GateValidationError("constrained state requires the admitted pressure setup")
+        raise GateValidationError("constrained admission lower bound must exceed the envelope")
+    if not any(
+        sample.get("admitted_lower_bound_bytes", 0) + (64 << 20) >= observed_admitted
+        for sample in constrained
+    ):
+        raise GateValidationError("constrained admission fell below the observed feeder admission")
     recovery_state_passed = recovery_samples[-1].get("state") == "normal"
     if mode in ("direct-serial", "direct-async") and not recovery_state_passed:
         raise GateValidationError("recovery state did not return to normal")
@@ -1715,6 +1756,63 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
+    """Validate raw pressure schemas, phases, and causal timestamp order."""
+    for name, payload in artifacts.items():
+        if payload.get("schema_version") != 1:
+            raise GateValidationError(f"pressure artifact schema mismatch: {name}")
+    for name, phase in (
+        ("before", "before"),
+        ("pressure", "pressure"),
+        ("after_holder_release", "after-holder-release"),
+        ("after", "after"),
+        ("drain", "drain-end"),
+    ):
+        if artifacts[name].get("phase") != phase:
+            raise GateValidationError(f"pressure artifact phase mismatch: {name}")
+
+    holder = artifacts["holder"]
+    setup = artifacts["setup"]
+    profile = artifacts["profile"]
+    pressure_hash = artifacts["pressure_hash"]
+    recovery = artifacts["recovery"]
+    cleanup = artifacts["cleanup"]
+    timeline = (
+        ("before", artifacts["before"].get("monotonic_ns")),
+        ("setup started", setup.get("started_monotonic_ns")),
+        ("setup observed", setup.get("observed_monotonic_ns")),
+        ("holder started", holder.get("started_monotonic_ns")),
+        ("holder ready", holder.get("ready_monotonic_ns")),
+        ("pressure", artifacts["pressure"].get("monotonic_ns")),
+        ("setup stopped", setup.get("stopped_monotonic_ns")),
+        ("profile completed", profile.get("completed_monotonic_ns")),
+        ("pressure hash completed", pressure_hash.get("completed_monotonic_ns")),
+        ("holder released", holder.get("released_monotonic_ns")),
+        ("holder exited", holder.get("exited_monotonic_ns")),
+        (
+            "after holder release",
+            artifacts["after_holder_release"].get("monotonic_ns"),
+        ),
+        ("recovery started", recovery.get("started_monotonic_ns")),
+        ("recovery completed", recovery.get("completed_monotonic_ns")),
+        ("drain", artifacts["drain"].get("monotonic_ns")),
+        ("after", artifacts["after"].get("monotonic_ns")),
+        ("cleanup", cleanup.get("cleanup_ended_monotonic_ns")),
+    )
+    values = [_nonnegative_integer(value, label) for label, value in timeline]
+    if any(left >= right for left, right in zip(values, values[1:])):
+        raise GateValidationError("pressure artifact timestamps are out of order")
+    if cleanup.get("unmount_exit_status") is not None:
+        unmount_started = _nonnegative_integer(
+            cleanup.get("unmount_started_monotonic_ns"), "unmount started"
+        )
+        unmount_ended = _nonnegative_integer(
+            cleanup.get("unmount_ended_monotonic_ns"), "unmount ended"
+        )
+        if values[-1] >= unmount_started or unmount_started >= unmount_ended:
+            raise GateValidationError("pressure artifact unmount timestamps are out of order")
+
+
 def memory_pressure_evidence_from_artifacts(
     run_dir: Path,
     *,
@@ -1736,6 +1834,45 @@ def memory_pressure_evidence_from_artifacts(
     profile = _read_json(run_dir / "pressure-profile.json")
     pressure_hash = _read_json(run_dir / "pressure-hash.json")
     recovery = _read_json(run_dir / "pressure-recovery.json")
+    drain = _read_json(run_dir / "cgroup-drain-end.json")
+    cleanup = _read_json(run_dir / "cleanup.json")
+    if config.get("schema_version") != 1:
+        raise GateValidationError("pressure artifact schema mismatch: config")
+    negotiated = negotiated_max_write_bytes(
+        _read_json(run_dir / "runtime-foreground-start.json")
+    )
+    if config.get("negotiated_max_write_bytes") != negotiated:
+        raise GateValidationError("negotiated max_write raw evidence mismatch")
+    target = derive_pressure_target(
+        effective_limit=config.get("memory_max_bytes"),
+        negotiated_max_write=negotiated,
+    )
+    if any(config.get(name) != value for name, value in target.items()):
+        raise GateValidationError("pressure target derivation raw evidence mismatch")
+    observed_sample = memory_pressure_sample(
+        _read_json(run_dir / "runtime-setup-observed.json")
+    )
+    if (
+        setup.get("observed_admitted_lower_bound_bytes")
+        != observed_sample["admitted_lower_bound_bytes"]
+        or setup.get("observed_generation") != observed_sample["generation"]
+    ):
+        raise GateValidationError("observed feeder admission raw evidence mismatch")
+    validate_pressure_artifact_contract(
+        {
+            "before": before,
+            "pressure": pressure,
+            "after_holder_release": after_holder_release,
+            "after": after,
+            "holder": holder,
+            "setup": setup,
+            "profile": profile,
+            "pressure_hash": pressure_hash,
+            "recovery": recovery,
+            "drain": drain,
+            "cleanup": cleanup,
+        }
+    )
     if (
         pressure_hash.get("bytes_read") != verified_read
         or recovery.get("bytes_read") != verified_read
@@ -1743,7 +1880,8 @@ def memory_pressure_evidence_from_artifacts(
         raise GateValidationError("pressure verification byte count mismatch")
     if (
         config.get("holder_bytes") != holder.get("bytes")
-        or config.get("setup_bytes") != setup.get("bytes_written")
+        or config.get("observed_admitted_lower_bound_bytes")
+        != setup.get("observed_admitted_lower_bound_bytes")
         or any(
             boundary.get("memory_max_bytes") != config.get("memory_max_bytes")
             for boundary in (before, pressure, after_holder_release, after)
@@ -1863,6 +2001,7 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
             "pressure-hash.json",
             "pressure-recovery.json",
             "runtime-pressure.json",
+            "runtime-setup-observed.json",
             "runtime-recovery-boundary.json",
             "runtime-recovery-1.json",
             "runtime-recovery-2.json",

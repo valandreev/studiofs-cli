@@ -67,6 +67,10 @@ quoted_command() {
   printf '%s' "${rendered% }"
 }
 
+monotonic_ns() {
+  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import time; print(time.monotonic_ns())'
+}
+
 while (($# > 0)); do
   case "$1" in
     --volume)
@@ -657,6 +661,8 @@ collector_exit_status=-1
 collector_artifacts_complete=false
 unmount_exit_status=-1
 unmount_timed_out=false
+unmount_started_monotonic_ns=0
+unmount_ended_monotonic_ns=0
 fallback_unmount_exit_status=-1
 fallback_lazy_exit_status=-1
 mount_exit_status=-1
@@ -874,6 +880,8 @@ write_matrix_cleanup_payload() {
       printf '  "cleanup_drain_idle": false,\n'
     fi
     printf '  "unmount_timed_out": %s,\n' "$unmount_timed_out"
+    printf '  "unmount_started_monotonic_ns": %d,\n' "$unmount_started_monotonic_ns"
+    printf '  "unmount_ended_monotonic_ns": %d,\n' "$unmount_ended_monotonic_ns"
     printf '  "unmount_exit_status": '
     [[ "$unmount_exit_status" -ge 0 ]] && printf '%d,\n' "$unmount_exit_status" || printf 'null,\n'
     printf '  "fallback_unmount_exit_status": '
@@ -1057,6 +1065,7 @@ cleanup_active_tuple() {
   stop_active_collector
 
   if [[ -n "$active_mount_pid" ]]; then
+    unmount_started_monotonic_ns="$(monotonic_ns)"
     run_bounded_command "$active_work_dir/unmount.stdout.txt" \
       "$active_work_dir/unmount.stderr.txt" \
       "$studiofs_bin" umount "$active_mount_point"
@@ -1084,6 +1093,7 @@ cleanup_active_tuple() {
     if mount_is_active; then
       add_cleanup_error "mount remains active after fallback unmounts"
     fi
+    unmount_ended_monotonic_ns="$(monotonic_ns)"
   fi
 
   reap_mount_process
@@ -1236,6 +1246,8 @@ reset_active_tuple() {
   collector_artifacts_complete=false
   unmount_exit_status=-1
   unmount_timed_out=false
+  unmount_started_monotonic_ns=0
+  unmount_ended_monotonic_ns=0
   fallback_unmount_exit_status=-1
   fallback_lazy_exit_status=-1
   mount_exit_status=-1

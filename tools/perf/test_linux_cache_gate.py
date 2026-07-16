@@ -604,7 +604,7 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
             "sampling_failure_count": 0,
             "write_admission_wait_count": 1,
             "write_admission_wait_ns": 1,
-            "admitted_managed_bytes": 536_870_912,
+            "admitted_lower_bound_bytes": 536_870_912,
         }
         recovered = {
             **constrained,
@@ -623,18 +623,25 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "events_delta": {"oom": 0, "oom_kill": 0},
             },
             "holder": {
+                "schema_version": 1,
                 "bytes": 536_870_912,
-                "started_monotonic_ns": 1,
-                "ready_monotonic_ns": 2,
-                "released_monotonic_ns": 4,
-                "exited_monotonic_ns": 5,
+                "started_monotonic_ns": 300_000_000,
+                "ready_monotonic_ns": 400_000_000,
+                "released_monotonic_ns": 900_000_000,
+                "exited_monotonic_ns": 1_000_000_000,
                 "exit_status": 0,
             },
             "setup": {
-                "bytes_written": 536_870_912,
-                "profile": "small-128k",
-                "profile_pid": 4242,
-                "profile_live_at_constrained": True,
+                "schema_version": 1,
+                "working_set_bytes": 536_870_912,
+                "cumulative_bytes_written": 1_073_741_824,
+                "observed_admitted_lower_bound_bytes": 469_762_048,
+                "observed_generation": 1,
+                "started_monotonic_ns": 100_000_000,
+                "observed_monotonic_ns": 200_000_000,
+                "stopped_monotonic_ns": 600_000_000,
+                "feeder_pid": 4242,
+                "feeder_live_at_constrained": True,
                 "exit_status": 0,
             },
             "runtime_samples": {
@@ -738,7 +745,7 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "sampling_failure_count": 0,
                 "write_admission_wait_count": 3,
                 "write_admission_wait_ns": 4,
-                "admitted_managed_bytes": 320,
+                "admitted_lower_bound_bytes": 320,
             },
         )
 
@@ -811,10 +818,10 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
 
     def test_setup_must_prove_admission_and_live_profile(self) -> None:
         cases = (
-            ("bytes_written", 0, "setup bytes"),
-            ("profile", "large-single", "setup profile"),
-            ("profile_pid", 0, "profile pid"),
-            ("profile_live_at_constrained", False, "live"),
+            ("working_set_bytes", 0, "working set"),
+            ("observed_admitted_lower_bound_bytes", 0, "observed admission"),
+            ("feeder_pid", 0, "feeder pid"),
+            ("feeder_live_at_constrained", False, "live"),
             ("exit_status", 1, "setup exit"),
         )
         for field, value, message in cases:
@@ -825,10 +832,9 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                     self.validate(evidence=evidence)
 
         drained = self.evidence()
-        drained["runtime_samples"]["pressure"][0]["admitted_managed_bytes"] = (
-            drained["setup"]["bytes_written"] - 1
-        )
-        with self.assertRaisesRegex(gate.GateValidationError, "admitted pressure setup"):
+        drained["setup"]["cumulative_bytes_written"] = 10 << 30
+        drained["runtime_samples"]["pressure"][0]["admitted_lower_bound_bytes"] = 1_000
+        with self.assertRaisesRegex(gate.GateValidationError, "envelope"):
             self.validate(evidence=drained)
     def test_hash_bytes_and_drain_fail_closed(self) -> None:
         cases = (
@@ -889,6 +895,62 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
 
 
 class PressureScenarioHelperTest(unittest.TestCase):
+    @staticmethod
+    def raw_contract() -> dict[str, dict]:
+        boundary = lambda phase, timestamp: {
+            "schema_version": 1,
+            "phase": phase,
+            "monotonic_ns": timestamp,
+        }
+        return {
+            "before": boundary("before", 1),
+            "setup": {
+                "schema_version": 1,
+                "started_monotonic_ns": 2,
+                "observed_monotonic_ns": 3,
+                "stopped_monotonic_ns": 7,
+            },
+            "holder": {
+                "schema_version": 1,
+                "started_monotonic_ns": 4,
+                "ready_monotonic_ns": 5,
+                "released_monotonic_ns": 10,
+                "exited_monotonic_ns": 11,
+            },
+            "pressure": boundary("pressure", 6),
+            "profile": {"schema_version": 1, "completed_monotonic_ns": 8},
+            "pressure_hash": {"schema_version": 1, "completed_monotonic_ns": 9},
+            "after_holder_release": boundary("after-holder-release", 12),
+            "recovery": {
+                "schema_version": 1,
+                "started_monotonic_ns": 13,
+                "completed_monotonic_ns": 14,
+            },
+            "drain": boundary("drain-end", 15),
+            "after": boundary("after", 16),
+            "cleanup": {
+                "schema_version": 1,
+                "cleanup_ended_monotonic_ns": 17,
+                "unmount_exit_status": 0,
+                "unmount_started_monotonic_ns": 18,
+                "unmount_ended_monotonic_ns": 19,
+            },
+        }
+
+    def test_raw_pressure_contract_rejects_schema_phase_and_order(self) -> None:
+        gate.validate_pressure_artifact_contract(self.raw_contract())
+        cases = (
+            ("before", "schema_version", 2, "schema"),
+            ("pressure", "phase", "wrong", "phase"),
+            ("recovery", "started_monotonic_ns", 20, "order"),
+        )
+        for artifact, field, value, message in cases:
+            with self.subTest(field=field):
+                raw = self.raw_contract()
+                raw[artifact][field] = value
+                with self.assertRaisesRegex(gate.GateValidationError, message):
+                    gate.validate_pressure_artifact_contract(raw)
+
     def test_fake_cgroup_boundary_reads_current_limit_and_events(self) -> None:
         root = Path.cwd() / "target/perf/test-pressure-cgroup"
         shutil.rmtree(root, ignore_errors=True)
@@ -917,20 +979,16 @@ class PressureScenarioHelperTest(unittest.TestCase):
         gib = 1 << 30
         mib = 1 << 20
         scenario = gate.derive_pressure_scenario(
-            memory_current=512 << 20,
+            memory_current=960 << 20,
+            memory_max=3584 << 20,
             host_available=4 * gib,
-            leaf_limit=None,
             parent_available=None,
+            observed_admitted_lower_bound=448 * mib,
             negotiated_max_write=32 * mib,
         )
 
-        self.assertEqual(scenario["headroom_bytes"], 3 * gib)
         self.assertGreaterEqual(scenario["holder_bytes"], gib)
-        self.assertEqual(scenario["setup_bytes"], 512 * mib)
-        after_setup_available = (
-            scenario["post_holder_available_bytes"] - scenario["setup_bytes"]
-        )
-        envelope = (after_setup_available - scenario["reserve_bytes"]) * 75 // 100
+        envelope = scenario["target_envelope_bytes"]
         self.assertGreaterEqual(envelope, 384 * mib)
         self.assertEqual(scenario["target_envelope_bytes"], envelope)
         self.assertLessEqual(
@@ -939,13 +997,40 @@ class PressureScenarioHelperTest(unittest.TestCase):
         self.assertFalse(scenario["overcommitted_minimum"])
 
     def test_scenario_fails_when_three_gib_headroom_is_unavailable(self) -> None:
-        with self.assertRaisesRegex(gate.GateValidationError, "3 GiB"):
+        with self.assertRaisesRegex(gate.GateValidationError, "768 MiB"):
             gate.derive_pressure_scenario(
-                memory_current=512 << 20,
-                host_available=(3 << 30) - 1,
-                leaf_limit=None,
+                memory_current=2 << 30,
+                memory_max=3 << 30,
+                host_available=1 << 30,
                 parent_available=None,
+                observed_admitted_lower_bound=448 << 20,
+                negotiated_max_write=1 << 20,
             )
+
+    def test_negotiated_max_write_is_strictly_typed_and_unit_checked(self) -> None:
+        valid = {
+            "schema_version": 2,
+            "bridge": {
+                "gauges": {
+                    "fuse_negotiated_max_write_bytes": {
+                        "value": 1 << 20,
+                        "unit": "bytes",
+                    }
+                }
+            }
+        }
+        self.assertEqual(gate.negotiated_max_write_bytes(valid), 1 << 20)
+        for snapshot in ({}, {**valid, "bridge": {"gauges": {}}}):
+            with self.assertRaisesRegex(gate.GateValidationError, "negotiated"):
+                gate.negotiated_max_write_bytes(snapshot)
+        wrong = json.loads(json.dumps(valid))
+        wrong["bridge"]["gauges"]["fuse_negotiated_max_write_bytes"]["unit"] = "count"
+        with self.assertRaisesRegex(gate.GateValidationError, "unit"):
+            gate.negotiated_max_write_bytes(wrong)
+        zero = json.loads(json.dumps(valid))
+        zero["bridge"]["gauges"]["fuse_negotiated_max_write_bytes"]["value"] = 0
+        with self.assertRaisesRegex(gate.GateValidationError, "positive"):
+            gate.negotiated_max_write_bytes(zero)
 
     def test_holder_ready_release_exit_and_cleanup_use_target_dotfiles(self) -> None:
         root = Path.cwd() / "target/perf/test-memory-holder-helper"
@@ -985,6 +1070,7 @@ class PressureScenarioHelperTest(unittest.TestCase):
             self.assertEqual(
                 set(payload),
                 {
+                    "schema_version",
                     "bytes",
                     "started_monotonic_ns",
                     "ready_monotonic_ns",
@@ -2100,6 +2186,14 @@ class AnalyzerCliTest(unittest.TestCase):
             }
         return {
             "schema_version": 2,
+            "bridge": {
+                "gauges": {
+                    "fuse_negotiated_max_write_bytes": {
+                        "value": 1 << 20,
+                        "unit": "bytes",
+                    }
+                }
+            },
             "ingress": {"dirty_mem_bytes": 0},
             "upload": {"pending_uploads": 0, "active_uploads": 0},
             "write_path": {
@@ -2176,7 +2270,7 @@ class AnalyzerCliTest(unittest.TestCase):
             **{
                 name: value
                 for name, value in sample.items()
-                if name not in counter_units and name != "admitted_managed_bytes"
+                if name not in counter_units and name != "admitted_lower_bound_bytes"
             },
             "source": source_codes[sample["source"]],
             "state": state_codes[sample["state"]],
@@ -2184,7 +2278,7 @@ class AnalyzerCliTest(unittest.TestCase):
         }
         return {
             "schema_version": 2,
-            "ingress": {"dirty_mem_bytes": sample.get("admitted_managed_bytes", 0)},
+            "ingress": {"dirty_mem_bytes": sample.get("admitted_lower_bound_bytes", 0)},
             "write_path": {
                 "fuse_async_read": {"pending_bytes": 0},
                 "fuse_async_write": {"pending_bytes": 0},
@@ -2458,10 +2552,15 @@ class AnalyzerCliTest(unittest.TestCase):
                 **({"warm_proof": warm_proof} if warm_proof else {}),
             }
             cleanup = {
+                "schema_version": 1,
+                "cleanup_started_monotonic_ns": 4_000_000_000,
+                "cleanup_ended_monotonic_ns": 5_000_000_000,
                 "cleanup_error": None,
                 "cleanup_drain_idle": True,
                 "unmount_timed_out": False,
                 "unmount_exit_status": 0,
+                "unmount_started_monotonic_ns": 6_000_000_000,
+                "unmount_ended_monotonic_ns": 7_000_000_000,
                 "mount_exit_timed_out": False,
                 "mount_exit_status": 0,
             }
@@ -2483,34 +2582,45 @@ class AnalyzerCliTest(unittest.TestCase):
                     run_dir / "memory-pressure-config.json",
                     {
                         "schema_version": 1,
+                        **gate.derive_pressure_target(
+                            effective_limit=cgroup["memory_max_bytes"],
+                            negotiated_max_write=1 << 20,
+                        ),
                         "memory_max_bytes": cgroup["memory_max_bytes"],
                         "memory_current_before_bytes": cgroup[
                             "memory_current_before_bytes"
                         ],
                         "holder_bytes": pressure_evidence["holder"]["bytes"],
-                        "setup_bytes": pressure_evidence["setup"]["bytes_written"],
+                        "negotiated_max_write_bytes": 1 << 20,
+                        "observed_admitted_lower_bound_bytes": pressure_evidence["setup"][
+                            "observed_admitted_lower_bound_bytes"
+                        ],
                     },
                 )
-                for phase, current, events in (
+                for phase, current, events, monotonic_ns in (
                     (
                         "before",
                         cgroup["memory_current_before_bytes"],
                         cgroup["events_before"],
+                        50_000_000,
                     ),
                     (
                         "pressure",
                         cgroup["memory_current_pressure_bytes"],
                         cgroup["events_before"],
+                        500_000_000,
                     ),
                     (
                         "after-holder-release",
                         cgroup["memory_current_after_holder_release_bytes"],
                         cgroup["events_before"],
+                        1_100_000_000,
                     ),
                     (
                         "after",
                         cgroup["memory_current_after_holder_release_bytes"],
                         cgroup["events_after"],
+                        3_500_000_000,
                     ),
                 ):
                     self.write_json(
@@ -2518,7 +2628,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         {
                             "schema_version": 1,
                             "phase": phase,
-                            "monotonic_ns": 1,
+                            "monotonic_ns": monotonic_ns,
                             "memory_max_bytes": cgroup["memory_max_bytes"],
                             "memory_current_bytes": current,
                             "events": events,
@@ -2534,6 +2644,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "read_throughput_mb_per_second": pressure_evidence[
                             "throughput_mb_per_second"
                         ]["pressure"][0],
+                        "completed_monotonic_ns": 700_000_000,
                     },
                 )
                 self.write_json(
@@ -2545,6 +2656,7 @@ class AnalyzerCliTest(unittest.TestCase):
                         "throughput_mb_per_second": pressure_evidence[
                             "throughput_mb_per_second"
                         ]["pressure"][0],
+                        "completed_monotonic_ns": 800_000_000,
                     },
                 )
                 self.write_json(
@@ -2556,10 +2668,21 @@ class AnalyzerCliTest(unittest.TestCase):
                         "throughput_mb_per_second": pressure_evidence[
                             "throughput_mb_per_second"
                         ]["recovery"],
+                        "started_monotonic_ns": 1_200_000_000,
+                        "completed_monotonic_ns": 1_300_000_000,
                     },
                 )
                 samples = pressure_evidence["runtime_samples"]
+                setup_sample = {
+                    **samples["pressure"][0],
+                    "state": "normal",
+                    "generation": pressure_evidence["setup"]["observed_generation"],
+                    "admitted_lower_bound_bytes": pressure_evidence["setup"][
+                        "observed_admitted_lower_bound_bytes"
+                    ],
+                }
                 for name, sample in (
+                    ("runtime-setup-observed.json", setup_sample),
                     ("runtime-pressure.json", samples["pressure"][0]),
                     ("runtime-recovery-boundary.json", samples["recovery_boundary"]),
                     ("runtime-recovery-1.json", samples["recovery"][0]),
@@ -3302,6 +3425,7 @@ class ShellContractTest(unittest.TestCase):
             "pressure-profile.json",
             "pressure-recovery.json",
             "runtime-pressure.json",
+            "runtime-setup-observed.json",
             "runtime-recovery-boundary.json",
             "runtime-recovery-1.json",
             "runtime-recovery-2.json",
