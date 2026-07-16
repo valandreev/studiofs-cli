@@ -1242,14 +1242,18 @@ class PressureScenarioHelperTest(unittest.TestCase):
     def test_negotiated_max_write_uses_schema2_fuse_connection_field(self) -> None:
         valid = {
             "schema_version": 2,
-            "bridge": {},
             "write_path": {
                 "fuse_connection": {
                     "negotiated_max_write_bytes": 1 << 20,
                 }
             }
         }
+        self.assertNotIn("bridge", valid)
         self.assertEqual(gate.negotiated_max_write_bytes(valid), 1 << 20)
+        valid["write_path"]["fuse_connection"][
+            "negotiated_max_write_bytes"
+        ] = (1 << 32) - 1
+        self.assertEqual(gate.negotiated_max_write_bytes(valid), (1 << 32) - 1)
         invalid = (
             ({}, "schema"),
             ({**valid, "schema_version": 3}, "schema"),
@@ -1260,7 +1264,7 @@ class PressureScenarioHelperTest(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(gate.GateValidationError, message):
                     gate.negotiated_max_write_bytes(snapshot)
-        for value in (None, 0, -1, False, "1048576"):
+        for value in (None, 0, -1, False, "1048576", 1 << 32, 1 << 40):
             with self.subTest(value=value):
                 snapshot = json.loads(json.dumps(valid))
                 snapshot["write_path"]["fuse_connection"][
@@ -2459,7 +2463,6 @@ class AnalyzerCliTest(unittest.TestCase):
             }
         return {
             "schema_version": 2,
-            "bridge": {},
             "ingress": {"dirty_mem_bytes": 0},
             "upload": {"pending_uploads": 0, "active_uploads": 0},
             "write_path": {
@@ -3117,6 +3120,16 @@ class AnalyzerCliTest(unittest.TestCase):
         self.write_json(self.root / "schedule.json", schedule)
 
     def test_cli_reads_matrix_and_writes_all_decision_outputs(self) -> None:
+        runtime = json.loads(
+            (
+                self.root
+                / "direct-serial"
+                / "large-single"
+                / "rep-001"
+                / "runtime-foreground-start.json"
+            ).read_text()
+        )
+        self.assertNotIn("bridge", runtime)
         output = self.root / "comparison"
         exit_code = gate.main(
             [

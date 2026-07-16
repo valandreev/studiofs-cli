@@ -374,6 +374,8 @@ def negotiated_max_write_bytes(snapshot: dict) -> int:
     )
     if value == 0:
         raise GateValidationError("negotiated max_write bytes must be positive")
+    if value > (1 << 32) - 1:
+        raise GateValidationError("negotiated max_write bytes must fit u32")
     return value
 
 
