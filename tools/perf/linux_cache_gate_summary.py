@@ -292,14 +292,23 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
     """Normalize one runtime-stats memory-pressure section for gate evidence."""
     section = snapshot.get("memory_pressure")
     gauges = section.get("gauges") if isinstance(section, dict) else None
-    if not isinstance(gauges, dict):
-        raise GateValidationError("runtime memory_pressure gauges are missing")
+    counters = section.get("counters") if isinstance(section, dict) else None
+    if not isinstance(gauges, dict) or not isinstance(counters, dict):
+        raise GateValidationError("runtime memory_pressure metrics are missing")
 
-    def value(name: str) -> int:
-        metric = gauges.get(name)
+    def value(metrics: dict, name: str, unit: str) -> int:
+        metric = metrics.get(name)
         if not isinstance(metric, dict):
-            raise GateValidationError(f"runtime memory_pressure gauge is missing: {name}")
+            raise GateValidationError(f"runtime memory_pressure metric is missing: {name}")
+        if metric.get("unit") != unit:
+            raise GateValidationError(f"runtime memory_pressure unit is invalid: {name}")
         return _nonnegative_integer(metric.get("value"), f"memory_pressure.{name}")
+
+    def gauge(name: str, unit: str) -> int:
+        return value(gauges, name, unit)
+
+    def counter(name: str, unit: str) -> int:
+        return value(counters, name, unit)
 
     sources = {
         0: "disabled",
@@ -309,23 +318,156 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
         4: "fallback",
     }
     states = {0: "disabled", 1: "normal", 2: "constrained"}
-    source_code = value("source")
-    state_code = value("state")
+    source_code = gauge("source", "count")
+    state_code = gauge("state", "count")
     if source_code not in sources or state_code not in states:
         raise GateValidationError("runtime memory_pressure wire code is invalid")
-    overcommitted = value("overcommitted_minimum")
+    overcommitted = gauge("overcommitted_minimum", "count")
     if overcommitted not in (0, 1):
         raise GateValidationError("runtime overcommitted minimum flag is invalid")
+    admitted = sum(
+        _nonnegative_integer(_value_at(snapshot, path), ".".join(path))
+        for path in (
+            ("ingress", "dirty_mem_bytes"),
+            ("write_path", "fuse_async_read", "pending_bytes"),
+            ("write_path", "fuse_async_write", "pending_bytes"),
+        )
+    )
     return {
         "source": sources[source_code],
         "state": states[state_code],
-        "generation": value("generation"),
-        "envelope_bytes": value("envelope_bytes"),
-        "memory_cache_limit_bytes": value("memory_cache_limit_bytes"),
-        "dirty_limit_bytes": value("dirty_limit_bytes"),
-        "transit_limit_bytes": value("transit_limit_bytes"),
-        "async_write_limit_bytes": value("async_write_limit_bytes"),
+        "generation": gauge("generation", "count"),
+        "envelope_bytes": gauge("envelope_bytes", "bytes"),
+        "memory_cache_limit_bytes": gauge("memory_cache_limit_bytes", "bytes"),
+        "dirty_limit_bytes": gauge("dirty_limit_bytes", "bytes"),
+        "transit_limit_bytes": gauge("transit_limit_bytes", "bytes"),
+        "async_write_limit_bytes": gauge("async_write_limit_bytes", "bytes"),
         "overcommitted_minimum": bool(overcommitted),
+        "transition_count": counter("transition_count", "count"),
+        "sampling_failure_count": counter("sampling_failure_count", "count"),
+        "write_admission_wait_count": counter("write_admission_wait_count", "count"),
+        "write_admission_wait_ns": counter("write_admission_wait_ns", "ns"),
+        "admitted_managed_bytes": admitted,
+    }
+
+
+def derive_pressure_scenario(
+    *,
+    memory_current: int,
+    host_available: int,
+    leaf_limit: int | None,
+    parent_available: int | None,
+) -> dict[str, int]:
+    """Derive the one supported reserve-aware pressure scenario."""
+    gib = 1 << 30
+    headroom = 3 * gib
+    current = _nonnegative_integer(memory_current, "memory.current")
+    available = _nonnegative_integer(host_available, "host available memory")
+    if available < headroom:
+        raise GateValidationError("memory pressure scenario requires 3 GiB headroom")
+    for label, boundary in (("leaf", leaf_limit), ("parent", parent_available)):
+        if boundary is None:
+            continue
+        value = _nonnegative_integer(boundary, f"{label} memory boundary")
+        usable = value - current if label == "leaf" else value
+        if usable < headroom:
+            raise GateValidationError("memory pressure scenario requires 3 GiB headroom")
+
+    memory_max = current + headroom
+    reserve = max(gib, (memory_max * 15 + 99) // 100)
+    post_holder_available = reserve + (384 << 20)
+    holder = headroom - post_holder_available
+    if holder < gib:
+        raise GateValidationError("memory pressure holder must be at least 1 GiB")
+    return {
+        "memory_max_bytes": memory_max,
+        "headroom_bytes": headroom,
+        "reserve_bytes": reserve,
+        "holder_bytes": holder,
+        "post_holder_available_bytes": post_holder_available,
+        "target_envelope_bytes": (post_holder_available - reserve) * 3 // 4,
+    }
+
+
+def run_memory_holder(
+    holder_bytes: int,
+    start_path: Path,
+    ready_path: Path,
+    release_path: Path,
+    result_path: Path,
+) -> None:
+    """Allocate and touch memory between explicit start and release signals."""
+    import time
+
+    size = _nonnegative_integer(holder_bytes, "holder bytes")
+    if size == 0:
+        raise GateValidationError("holder bytes must be positive")
+    started = time.monotonic_ns()
+    while not start_path.exists():
+        time.sleep(0.01)
+    allocation = bytearray(size)
+    for offset in range(0, size, 4096):
+        allocation[offset] = 1
+    ready = time.monotonic_ns()
+    ready_path.write_text("ready\n")
+    while not release_path.exists():
+        time.sleep(0.01)
+    released = time.monotonic_ns()
+    del allocation
+    exited = time.monotonic_ns()
+    result_path.write_text(
+        json.dumps(
+            {
+                "bytes": size,
+                "started_monotonic_ns": started,
+                "ready_monotonic_ns": ready,
+                "released_monotonic_ns": released,
+                "exited_monotonic_ns": exited,
+                "exit_status": 0,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def cleanup_memory_holder_files(*paths: Path) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def read_cgroup_memory_boundary(
+    cgroup: Path,
+    phase: str,
+    *,
+    monotonic_ns: int | None = None,
+) -> dict[str, object]:
+    """Read the cgroup files retained at one pressure boundary."""
+    import time
+
+    raw_limit = (cgroup / "memory.max").read_text().strip()
+    if raw_limit == "max":
+        raise GateValidationError("memory.max is not finite")
+    memory_max = _nonnegative_integer(int(raw_limit), "memory.max")
+    current = _nonnegative_integer(
+        int((cgroup / "memory.current").read_text().strip()), "memory.current"
+    )
+    events = {}
+    for line in (cgroup / "memory.events").read_text().splitlines():
+        name, raw_value = line.split()
+        events[name] = _nonnegative_integer(int(raw_value), f"memory.events {name}")
+    if memory_max == 0 or current > memory_max:
+        raise GateValidationError("invalid cgroup memory boundary")
+    for required in ("oom", "oom_kill"):
+        if required not in events:
+            raise GateValidationError(f"memory.events is missing {required}")
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "monotonic_ns": time.monotonic_ns() if monotonic_ns is None else monotonic_ns,
+        "memory_max_bytes": memory_max,
+        "memory_current_bytes": current,
+        "events": events,
     }
 
 
@@ -566,8 +708,22 @@ def validate_memory_pressure_evidence(
         if after - before != delta or delta != 0:
             raise GateValidationError(f"cgroup {counter} delta must be zero")
 
-    if _nonnegative_integer(holder.get("bytes"), "holder bytes") == 0:
+    holder_bytes = _nonnegative_integer(holder.get("bytes"), "holder bytes")
+    if holder_bytes == 0:
         raise GateValidationError("holder bytes must be positive")
+    current_before = _nonnegative_integer(
+        cgroup.get("memory_current_before_bytes"), "memory current before"
+    )
+    current_pressure = _nonnegative_integer(
+        cgroup.get("memory_current_pressure_bytes"), "memory current pressure"
+    )
+    current_recovery = _nonnegative_integer(
+        cgroup.get("memory_current_recovery_bytes"), "memory current recovery"
+    )
+    if current_pressure - current_before < holder_bytes // 2:
+        raise GateValidationError("cgroup memory.current rise does not prove holder pressure")
+    if current_pressure - current_recovery < holder_bytes // 2:
+        raise GateValidationError("cgroup memory.current fall does not prove holder recovery")
     timestamps = [
         _nonnegative_integer(holder.get(field), f"holder {field}")
         for field in (
@@ -588,15 +744,15 @@ def validate_memory_pressure_evidence(
         not isinstance(pressure_samples, list)
         or not pressure_samples
         or not isinstance(recovery_samples, list)
-        or len(recovery_samples) < 2
+        or not recovery_samples
     ):
-        raise GateValidationError("pressure and repeated recovery runtime samples are required")
+        raise GateValidationError("pressure and recovery runtime samples are required")
     samples = [*pressure_samples, *recovery_samples]
     for sample in samples:
         if not isinstance(sample, dict):
             raise GateValidationError("memory pressure runtime sample is invalid")
-        if sample.get("source") not in ("host", "cgroup", "host_and_cgroup", "fallback"):
-            raise GateValidationError("memory pressure source is invalid")
+        if sample.get("source") != "host_and_cgroup":
+            raise GateValidationError("memory pressure source must be host_and_cgroup")
         _nonnegative_integer(sample.get("generation"), "memory pressure generation")
         envelope = _nonnegative_integer(sample.get("envelope_bytes"), "memory envelope")
         managed = sum(
@@ -612,8 +768,23 @@ def validate_memory_pressure_evidence(
             raise GateValidationError("managed memory limits exceed the envelope")
         if not isinstance(sample.get("overcommitted_minimum"), bool):
             raise GateValidationError("overcommitted minimum flag is invalid")
-    if not any(sample.get("state") == "constrained" for sample in pressure_samples):
+        for field in (
+            "transition_count",
+            "sampling_failure_count",
+            "write_admission_wait_count",
+            "write_admission_wait_ns",
+        ):
+            _nonnegative_integer(sample.get(field), field)
+    constrained = [sample for sample in pressure_samples if sample.get("state") == "constrained"]
+    if not constrained:
         raise GateValidationError("pressure phase never reached constrained state")
+    if any(
+        sample["envelope_bytes"] == 0 or sample["overcommitted_minimum"] is not False
+        for sample in constrained
+    ):
+        raise GateValidationError("constrained state must retain a positive nonminimum envelope")
+    if not any(sample.get("admitted_managed_bytes", 0) > 0 for sample in constrained):
+        raise GateValidationError("constrained state requires admitted managed bytes")
     if recovery_samples[-1].get("state") != "normal":
         raise GateValidationError("recovery phase did not return to normal state")
     generations = [sample["generation"] for sample in samples]
@@ -636,9 +807,11 @@ def validate_memory_pressure_evidence(
         raise GateValidationError("memory pressure drain did not complete")
 
     numeric_throughput = {}
-    for phase, minimum_count in (("pressure", 1), ("recovery", 2)):
+    if throughput.get("profile") != workload:
+        raise GateValidationError("pressure throughput profile mismatch")
+    for phase in ("pressure", "recovery"):
         values = throughput.get(phase)
-        if not isinstance(values, list) or len(values) < minimum_count:
+        if not isinstance(values, list) or len(values) != 1:
             raise GateValidationError(f"{phase} throughput evidence is missing")
         if any(
             not isinstance(value, (int, float))
@@ -1504,6 +1677,7 @@ def memory_pressure_evidence_from_artifacts(
     pressure = _read_json(run_dir / "memory-events-pressure.json")
     after = _read_json(run_dir / "memory-events-after.json")
     holder = _read_json(run_dir / "memory-holder.json")
+    profile = _read_json(run_dir / "pressure-profile.json")
     pressure_hash = _read_json(run_dir / "pressure-hash.json")
     recovery = _read_json(run_dir / "pressure-recovery.json")
     if (
@@ -1552,7 +1726,8 @@ def memory_pressure_evidence_from_artifacts(
             "recovery_sha256": recovery.get("sha256"),
         },
         "throughput_mb_per_second": {
-            "pressure": [pressure_hash.get("throughput_mb_per_second")],
+            "profile": profile.get("profile"),
+            "pressure": [profile.get("read_throughput_mb_per_second")],
             "recovery": recovery.get("throughput_mb_per_second"),
         },
         "cpu": {
@@ -1619,6 +1794,7 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
             "memory-events-pressure.json",
             "memory-events-after.json",
             "memory-holder.json",
+            "pressure-profile.json",
             "pressure-hash.json",
             "pressure-recovery.json",
             "runtime-pressure.json",

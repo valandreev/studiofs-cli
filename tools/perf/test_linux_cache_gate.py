@@ -600,6 +600,11 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
             "transit_limit_bytes": 150,
             "async_write_limit_bytes": 100,
             "overcommitted_minimum": False,
+            "transition_count": 1,
+            "sampling_failure_count": 0,
+            "write_admission_wait_count": 1,
+            "write_admission_wait_ns": 1,
+            "admitted_managed_bytes": 512,
         }
         recovered = {
             **constrained,
@@ -636,8 +641,9 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "recovery_sha256": "a" * 64,
             },
             "throughput_mb_per_second": {
+                "profile": "small-128k",
                 "pressure": [80.0],
-                "recovery": [79.0, 81.0],
+                "recovery": [81.0],
             },
             "cpu": {
                 "foreground_seconds": 1.0,
@@ -678,11 +684,33 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         }
         snapshot = {
             "schema_version": 2,
+            "ingress": {"dirty_mem_bytes": 300},
+            "write_path": {
+                "fuse_async_read": {"pending_bytes": 10},
+                "fuse_async_write": {"pending_bytes": 10},
+            },
             "memory_pressure": {
                 "gauges": {
-                    name: {"value": value, "unit": "count" if name in {"source", "state", "generation", "overcommitted_minimum"} else "bytes"}
+                    name: {
+                        "value": value,
+                        "unit": (
+                            "count"
+                            if name
+                            in {"source", "state", "generation", "overcommitted_minimum"}
+                            else "bytes"
+                        ),
+                    }
                     for name, value in names.items()
-                }
+                },
+                "counters": {
+                    name: {"value": value, "unit": unit}
+                    for name, value, unit in (
+                        ("transition_count", 2, "count"),
+                        ("sampling_failure_count", 0, "count"),
+                        ("write_admission_wait_count", 3, "count"),
+                        ("write_admission_wait_ns", 4, "ns"),
+                    )
+                },
             },
         }
 
@@ -698,8 +726,28 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "transit_limit_bytes": 150,
                 "async_write_limit_bytes": 100,
                 "overcommitted_minimum": False,
+                "transition_count": 2,
+                "sampling_failure_count": 0,
+                "write_admission_wait_count": 3,
+                "write_admission_wait_ns": 4,
+                "admitted_managed_bytes": 320,
             },
         )
+
+    def test_runtime_snapshot_rejects_wrong_units(self) -> None:
+        snapshot = AnalyzerCliTest.pressure_runtime_snapshot(
+            self.evidence()["runtime_samples"]["pressure"][0]
+        )
+        for section, name in (
+            ("gauges", "envelope_bytes"),
+            ("gauges", "generation"),
+            ("counters", "write_admission_wait_ns"),
+        ):
+            with self.subTest(name=name):
+                invalid = json.loads(json.dumps(snapshot))
+                invalid["memory_pressure"][section][name]["unit"] = "wrong"
+                with self.assertRaisesRegex(gate.GateValidationError, "unit"):
+                    gate.memory_pressure_sample(invalid)
 
     def test_oom_and_oom_kill_are_rejected_separately(self) -> None:
         for counter in ("oom", "oom_kill"):
@@ -719,6 +767,39 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateValidationError, "envelope"):
             self.validate(evidence=evidence)
 
+    def test_pressure_requires_joint_source_and_cgroup_current_transitions(self) -> None:
+        cases = (
+            (
+                lambda evidence: evidence["runtime_samples"]["pressure"][0].update(
+                    source="host"
+                ),
+                "source",
+            ),
+            (
+                lambda evidence: evidence["cgroup"].update(
+                    memory_current_pressure_bytes=(
+                        evidence["cgroup"]["memory_current_before_bytes"]
+                        + evidence["holder"]["bytes"] // 3
+                    )
+                ),
+                "rise",
+            ),
+            (
+                lambda evidence: evidence["cgroup"].update(
+                    memory_current_recovery_bytes=(
+                        evidence["cgroup"]["memory_current_pressure_bytes"]
+                        - evidence["holder"]["bytes"] // 3
+                    )
+                ),
+                "fall",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                evidence = self.evidence()
+                mutate(evidence)
+                with self.assertRaisesRegex(gate.GateValidationError, message):
+                    self.validate(evidence=evidence)
     def test_hash_bytes_and_drain_fail_closed(self) -> None:
         cases = (
             ("verification", "recovery_sha256", "b" * 64, "hash"),
@@ -738,13 +819,13 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
             self.validate(evidence={"status": "not_run"})
 
         evidence = self.evidence()
-        evidence["throughput_mb_per_second"]["recovery"] = [70.0, 71.0]
+        evidence["throughput_mb_per_second"]["recovery"] = [70.0]
         with self.assertRaisesRegex(gate.GateValidationError, "recovery"):
             self.validate(evidence=evidence)
 
     def test_kernel_keeps_recovery_miss_diagnostic_but_rejects_correctness(self) -> None:
         slow = self.evidence()
-        slow["throughput_mb_per_second"]["recovery"] = [70.0, 71.0]
+        slow["throughput_mb_per_second"]["recovery"] = [70.0]
         result = self.validate(mode="kernel", evidence=slow)
         self.assertTrue(result["passed"])
         self.assertFalse(result["recovery_passed"])
@@ -754,6 +835,153 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         corrupt["verification"]["recovery_sha256"] = "b" * 64
         with self.assertRaisesRegex(gate.GateValidationError, "hash"):
             self.validate(mode="kernel", evidence=corrupt)
+
+
+class PressureScenarioHelperTest(unittest.TestCase):
+    def test_fake_cgroup_boundary_reads_current_limit_and_events(self) -> None:
+        root = Path.cwd() / "target/perf/test-pressure-cgroup"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        (root / "memory.max").write_text("4294967296\n")
+        (root / "memory.current").write_text("2147483648\n")
+        (root / "memory.events").write_text("low 2\noom 0\noom_kill 0\n")
+        try:
+            boundary = gate.read_cgroup_memory_boundary(root, "pressure", monotonic_ns=7)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+        self.assertEqual(
+            boundary,
+            {
+                "schema_version": 1,
+                "phase": "pressure",
+                "monotonic_ns": 7,
+                "memory_max_bytes": 4_294_967_296,
+                "memory_current_bytes": 2_147_483_648,
+                "events": {"low": 2, "oom": 0, "oom_kill": 0},
+            },
+        )
+
+    def test_reserve_aware_scenario_keeps_a_positive_nonminimum_envelope(self) -> None:
+        gib = 1 << 30
+        scenario = gate.derive_pressure_scenario(
+            memory_current=512 << 20,
+            host_available=4 * gib,
+            leaf_limit=None,
+            parent_available=None,
+        )
+
+        self.assertEqual(scenario["headroom_bytes"], 3 * gib)
+        self.assertGreaterEqual(scenario["holder_bytes"], gib)
+        self.assertGreater(scenario["post_holder_available_bytes"], scenario["reserve_bytes"])
+        self.assertGreaterEqual(scenario["target_envelope_bytes"], 256 << 20)
+
+    def test_scenario_fails_when_three_gib_headroom_is_unavailable(self) -> None:
+        with self.assertRaisesRegex(gate.GateValidationError, "3 GiB"):
+            gate.derive_pressure_scenario(
+                memory_current=512 << 20,
+                host_available=(3 << 30) - 1,
+                leaf_limit=None,
+                parent_available=None,
+            )
+
+    def test_holder_ready_release_exit_and_cleanup_use_target_dotfiles(self) -> None:
+        root = Path.cwd() / "target/perf/test-memory-holder-helper"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        start = root / ".memory-holder.start"
+        ready = root / ".memory-holder.ready"
+        release = root / ".memory-holder.release"
+        result = root / "memory-holder.json"
+        process = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "from tools.perf.linux_cache_gate_summary import run_memory_holder; "
+                    "import sys; "
+                    "run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))"
+                ),
+                str(8 << 20),
+                str(start),
+                str(ready),
+                str(release),
+                str(result),
+            ],
+            cwd=Path.cwd(),
+        )
+        try:
+            start.touch()
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            release.touch()
+            self.assertEqual(process.wait(timeout=5), 0)
+            payload = json.loads(result.read_text())
+            self.assertEqual(
+                set(payload),
+                {
+                    "bytes",
+                    "started_monotonic_ns",
+                    "ready_monotonic_ns",
+                    "released_monotonic_ns",
+                    "exited_monotonic_ns",
+                    "exit_status",
+                },
+            )
+        finally:
+            process.kill() if process.poll() is None else None
+            gate.cleanup_memory_holder_files(start, ready, release)
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertFalse(start.exists() or ready.exists() or release.exists())
+
+    def test_forced_holder_cleanup_removes_signals_and_membership_is_verified(self) -> None:
+        root = Path.cwd() / "target/perf/test-memory-holder-forced-cleanup"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        start = root / ".memory-holder.start"
+        ready = root / ".memory-holder.ready"
+        release = root / ".memory-holder.release"
+        result = root / "memory-holder.json"
+        process = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "from tools.perf.linux_cache_gate_summary import run_memory_holder; "
+                    "import sys; run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))"
+                ),
+                str(8 << 20),
+                str(start),
+                str(ready),
+                str(release),
+                str(result),
+            ],
+            cwd=Path.cwd(),
+        )
+        try:
+            start.touch()
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            process.terminate()
+            process.wait(timeout=5)
+            gate.cleanup_memory_holder_files(start, ready, release)
+            self.assertFalse(start.exists() or ready.exists() or release.exists())
+        finally:
+            process.kill() if process.poll() is None else None
+            shutil.rmtree(root, ignore_errors=True)
+
+        collector = (Path.cwd() / "tools/perf/linux-cache-gate.sh").read_text()
+        self.assertIn('"$memory_holder_pid" > "$cgroup/cgroup.procs"', collector)
+        self.assertIn(
+            'verify_cgroup_membership "$proc_root/$memory_holder_pid/cgroup" "memory holder"',
+            collector,
+        )
 
 
 class PreflightValidationTest(unittest.TestCase):
@@ -1848,14 +2076,29 @@ class AnalyzerCliTest(unittest.TestCase):
     def pressure_runtime_snapshot(sample: dict) -> dict:
         source_codes = {"host": 1, "cgroup": 2, "host_and_cgroup": 3, "fallback": 4}
         state_codes = {"normal": 1, "constrained": 2}
+        counter_units = {
+            "transition_count": "count",
+            "sampling_failure_count": "count",
+            "write_admission_wait_count": "count",
+            "write_admission_wait_ns": "ns",
+        }
         values = {
-            **sample,
+            **{
+                name: value
+                for name, value in sample.items()
+                if name not in counter_units and name != "admitted_managed_bytes"
+            },
             "source": source_codes[sample["source"]],
             "state": state_codes[sample["state"]],
             "overcommitted_minimum": int(sample["overcommitted_minimum"]),
         }
         return {
             "schema_version": 2,
+            "ingress": {"dirty_mem_bytes": sample.get("admitted_managed_bytes", 0)},
+            "write_path": {
+                "fuse_async_read": {"pending_bytes": 0},
+                "fuse_async_write": {"pending_bytes": 0},
+            },
             "memory_pressure": {
                 "gauges": {
                     name: {
@@ -1868,7 +2111,11 @@ class AnalyzerCliTest(unittest.TestCase):
                         ),
                     }
                     for name, value in values.items()
-                }
+                },
+                "counters": {
+                    name: {"value": sample[name], "unit": unit}
+                    for name, unit in counter_units.items()
+                },
             },
         }
 
@@ -2073,6 +2320,8 @@ class AnalyzerCliTest(unittest.TestCase):
                 if workload in ("large-single", "small-128k")
                 else None
             )
+            if pressure_evidence is not None:
+                pressure_evidence["throughput_mb_per_second"]["profile"] = workload
             derived = {
                 "schema_version": 1,
                 "status": "complete",
@@ -2179,6 +2428,16 @@ class AnalyzerCliTest(unittest.TestCase):
                         },
                     )
                 self.write_json(run_dir / "memory-holder.json", pressure_evidence["holder"])
+                self.write_json(
+                    run_dir / "pressure-profile.json",
+                    {
+                        "schema_version": 1,
+                        "profile": workload,
+                        "read_throughput_mb_per_second": pressure_evidence[
+                            "throughput_mb_per_second"
+                        ]["pressure"][0],
+                    },
+                )
                 self.write_json(
                     run_dir / "pressure-hash.json",
                     {
@@ -2939,6 +3198,7 @@ class ShellContractTest(unittest.TestCase):
             "memory-events-before.json",
             "memory-events-after.json",
             "memory-holder.json",
+            "pressure-profile.json",
             "pressure-recovery.json",
             "runtime-pressure.json",
             "runtime-recovery-1.json",
