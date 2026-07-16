@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -520,11 +520,19 @@ impl SessionState {
     }
 
     fn shutdown_async_writes_after_run(&self) -> SessionWriteShutdownOutcome {
+        self.shutdown_async_writes_after_run_with(shutdown_memory_pressure_watcher_on_helper)
+    }
+
+    fn shutdown_async_writes_after_run_with(
+        &self,
+        join_watcher: impl FnOnce(Handle, MemoryPressureWatcherShutdown) -> bool,
+    ) -> SessionWriteShutdownOutcome {
         let runtime_handle = self.runtime_handle.clone();
         let watcher = self
             .memory_pressure_async_write_watcher
             .as_ref()
             .map(MemoryPressureAsyncWriteWatcher::shutdown_handle);
+        let mut entered_panic = None;
         let watcher_stopped = if let Some(watcher) = watcher {
             if runtime_handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
                 watcher.cancel_and_abort();
@@ -533,25 +541,32 @@ impl SessionState {
                 );
                 false
             } else {
-                let shutdown =
-                    move || shutdown_memory_pressure_watcher_on_helper(runtime_handle, watcher);
                 let caller_is_multi_thread = Handle::try_current().is_ok_and(|handle| {
                     handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
                 });
                 if caller_is_multi_thread {
+                    let entered = Arc::new(AtomicBool::new(false));
+                    let entered_in_shutdown = Arc::clone(&entered);
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        tokio::task::block_in_place(shutdown)
+                        tokio::task::block_in_place(move || {
+                            entered_in_shutdown.store(true, Ordering::Relaxed);
+                            join_watcher(runtime_handle, watcher)
+                        })
                     })) {
                         Ok(stopped) => stopped,
-                        Err(_) => {
-                            warn!(
-                                "Linux FUSE memory-pressure watcher shutdown cannot block in this Tokio context"
-                            );
+                        Err(payload) => {
+                            if entered.load(Ordering::Relaxed) {
+                                entered_panic = Some(payload);
+                            } else {
+                                warn!(
+                                    "Linux FUSE memory-pressure watcher shutdown cannot block in this Tokio context"
+                                );
+                            }
                             false
                         }
                     }
                 } else {
-                    shutdown()
+                    join_watcher(runtime_handle, watcher)
                 }
             }
         } else {
@@ -565,10 +580,14 @@ impl SessionState {
             ASYNC_WRITE_SHUTDOWN_DRAIN_TIMEOUT,
             ASYNC_WRITE_SHUTDOWN_CANCEL_TIMEOUT,
         );
-        SessionWriteShutdownOutcome {
+        let outcome = SessionWriteShutdownOutcome {
             watcher_stopped,
             writes_stopped,
+        };
+        if let Some(payload) = entered_panic {
+            std::panic::resume_unwind(payload);
         }
+        outcome
     }
 
     #[cfg(test)]
@@ -5394,6 +5413,53 @@ mod tests {
             .expect("LocalSet shutdown panicked or deadlocked");
         worker.join().expect("LocalSet regression thread join");
         assert_eq!(result, (false, true, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entered_shutdown_panic_resumes_only_after_queue_teardown() {
+        const PANIC_PAYLOAD: u64 = 0x005f_5f50_414e_4943;
+        let fixture = ContractVfsFixture::new("linux-pressure-watcher-entered-panic")
+            .expect("create VFS fixture");
+        let controller = fixture.vfs().memory_pressure_controller().clone();
+        let mut snapshot = controller.snapshot();
+        snapshot.source = studiofs_vfs::MemoryPressureSource::Host;
+        snapshot.state = studiofs_vfs::MemoryPressureState::Normal;
+        controller.publish(snapshot);
+        let state = super::SessionState::new_with_cache_settings(
+            fixture.vfs(),
+            tokio::runtime::Handle::current(),
+            false,
+            default_connection_config(),
+            super::LinuxFuseCachePolicy::Direct,
+            true,
+        );
+        let shutdown = tokio::spawn(async move {
+            let writes = Arc::clone(&state.async_writes);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.shutdown_async_writes_after_run_with(|_, _| {
+                    std::panic::panic_any(PANIC_PAYLOAD)
+                })
+            }))
+            .expect_err("entered shutdown panic was swallowed");
+            let payload = *panic.downcast::<u64>().expect("preserve panic payload");
+            let writes_stopped = matches!(writes.start_request(u64::MAX), Err(libc::EIO));
+            let task_taken = state
+                .memory_pressure_async_write_watcher
+                .as_ref()
+                .expect("enabled watcher")
+                .shutdown
+                .task
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_none();
+            (payload, writes_stopped, task_taken)
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("entered panic shutdown timed out")
+            .expect("runtime worker panicked");
+        assert_eq!(result, (PANIC_PAYLOAD, true, true));
     }
 
     #[test]
