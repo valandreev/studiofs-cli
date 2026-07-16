@@ -696,10 +696,10 @@ fn is_tokio_block_in_place_context_panic(payload: &(dyn std::any::Any + Send)) -
     const MESSAGE: &str = "can call blocking only when running on the multi-threaded runtime";
     payload
         .downcast_ref::<&str>()
-        .is_some_and(|message| message.contains(MESSAGE))
+        .is_some_and(|message| *message == MESSAGE)
         || payload
             .downcast_ref::<String>()
-            .is_some_and(|message| message.contains(MESSAGE))
+            .is_some_and(|message| message == MESSAGE)
 }
 
 fn publish_fuse_liveness_stats(vfs: &StudioVfs, liveness: &FuseInodeLiveness) {
@@ -5286,6 +5286,28 @@ mod tests {
         );
 
         assert!(state.memory_pressure_async_write_watcher.is_none());
+    }
+
+    #[test]
+    fn block_in_place_context_panic_matches_exact_static_message() {
+        let message = "can call blocking only when running on the multi-threaded runtime";
+
+        assert!(super::is_tokio_block_in_place_context_panic(&message));
+    }
+
+    #[test]
+    fn block_in_place_context_panic_matches_exact_owned_message() {
+        let message =
+            "can call blocking only when running on the multi-threaded runtime".to_owned();
+
+        assert!(super::is_tokio_block_in_place_context_panic(&message));
+    }
+
+    #[test]
+    fn block_in_place_context_panic_rejects_containing_message() {
+        let message = "wrapper: can call blocking only when running on the multi-threaded runtime";
+
+        assert!(!super::is_tokio_block_in_place_context_panic(&message));
     }
 
     #[test]
