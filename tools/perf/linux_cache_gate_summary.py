@@ -357,6 +357,7 @@ def derive_pressure_scenario(
     host_available: int,
     leaf_limit: int | None,
     parent_available: int | None,
+    negotiated_max_write: int = 0,
 ) -> dict[str, int]:
     """Derive the one supported reserve-aware pressure scenario."""
     gib = 1 << 30
@@ -375,17 +376,42 @@ def derive_pressure_scenario(
 
     memory_max = current + headroom
     reserve = max(gib, (memory_max * 15 + 99) // 100)
-    post_holder_available = reserve + (384 << 20)
+    mib = 1 << 20
+    setup_bytes = 512 * mib
+    max_write = _nonnegative_integer(negotiated_max_write, "negotiated max_write")
+    target_allocatable = 512 * mib
+    minimum_holder = 768 * mib
+    maximum_allocatable = headroom - reserve - setup_bytes - minimum_holder
+    while target_allocatable <= maximum_allocatable:
+        envelope = target_allocatable * 75 // 100
+        limits = (
+            max(envelope * 40 // 100, 64 * mib),
+            max(envelope * 25 // 100, 64 * mib),
+            max(envelope * 15 // 100, 32 * mib),
+            max(envelope * 10 // 100, max(32 * mib, max_write)),
+        )
+        managed = sum(limits)
+        if managed <= envelope * 90 // 100:
+            break
+        target_allocatable += mib
+    else:
+        raise GateValidationError("memory pressure minima leave less than 768 MiB holder")
+    post_holder_available = reserve + setup_bytes + target_allocatable
     holder = headroom - post_holder_available
-    if holder < gib:
-        raise GateValidationError("memory pressure holder must be at least 1 GiB")
+    if holder < minimum_holder:
+        raise GateValidationError("memory pressure holder must be at least 768 MiB")
     return {
         "memory_max_bytes": memory_max,
         "headroom_bytes": headroom,
         "reserve_bytes": reserve,
+        "setup_bytes": setup_bytes,
         "holder_bytes": holder,
         "post_holder_available_bytes": post_holder_available,
-        "target_envelope_bytes": (post_holder_available - reserve) * 3 // 4,
+        "target_allocatable_bytes": target_allocatable,
+        "target_envelope_bytes": envelope,
+        "managed_minimum_bytes": managed,
+        "negotiated_max_write_bytes": max_write,
+        "overcommitted_minimum": managed > envelope * 90 // 100,
     }
 
 
@@ -667,17 +693,19 @@ def validate_memory_pressure_evidence(
 
     cgroup = evidence.get("cgroup")
     holder = evidence.get("holder")
+    setup = evidence.get("setup")
     runtime_samples = evidence.get("runtime_samples")
     verification = evidence.get("verification")
     throughput = evidence.get("throughput_mb_per_second")
     cpu = evidence.get("cpu")
     if not all(
         isinstance(item, dict)
-        for item in (cgroup, holder, runtime_samples, verification, throughput, cpu)
+        for item in (cgroup, holder, setup, runtime_samples, verification, throughput, cpu)
     ):
         raise GateValidationError("memory pressure evidence has an invalid shape")
     assert isinstance(cgroup, dict)
     assert isinstance(holder, dict)
+    assert isinstance(setup, dict)
     assert isinstance(runtime_samples, dict)
     assert isinstance(verification, dict)
     assert isinstance(throughput, dict)
@@ -689,7 +717,7 @@ def validate_memory_pressure_evidence(
     for field in (
         "memory_current_before_bytes",
         "memory_current_pressure_bytes",
-        "memory_current_recovery_bytes",
+        "memory_current_after_holder_release_bytes",
     ):
         if _nonnegative_integer(cgroup.get(field), field) > memory_max:
             raise GateValidationError(f"{field} exceeds memory.max")
@@ -718,7 +746,8 @@ def validate_memory_pressure_evidence(
         cgroup.get("memory_current_pressure_bytes"), "memory current pressure"
     )
     current_recovery = _nonnegative_integer(
-        cgroup.get("memory_current_recovery_bytes"), "memory current recovery"
+        cgroup.get("memory_current_after_holder_release_bytes"),
+        "memory current after holder release",
     )
     if current_pressure - current_before < holder_bytes // 2:
         raise GateValidationError("cgroup memory.current rise does not prove holder pressure")
@@ -737,17 +766,29 @@ def validate_memory_pressure_evidence(
         raise GateValidationError("holder lifecycle timestamps are not ordered")
     if holder.get("exit_status") != 0:
         raise GateValidationError("memory holder failed to exit cleanly")
+    if setup.get("bytes_written") != 512 << 20:
+        raise GateValidationError("pressure setup bytes mismatch")
+    if setup.get("profile") != workload:
+        raise GateValidationError("pressure setup profile mismatch")
+    if _nonnegative_integer(setup.get("profile_pid"), "pressure profile pid") == 0:
+        raise GateValidationError("pressure profile pid must be positive")
+    if setup.get("profile_live_at_constrained") is not True:
+        raise GateValidationError("pressure profile was not live at constrained evidence")
+    if setup.get("exit_status") != 0:
+        raise GateValidationError("pressure setup exit status is nonzero")
 
     pressure_samples = runtime_samples.get("pressure")
     recovery_samples = runtime_samples.get("recovery")
+    recovery_boundary = runtime_samples.get("recovery_boundary")
     if (
         not isinstance(pressure_samples, list)
         or not pressure_samples
         or not isinstance(recovery_samples, list)
         or not recovery_samples
+        or not isinstance(recovery_boundary, dict)
     ):
         raise GateValidationError("pressure and recovery runtime samples are required")
-    samples = [*pressure_samples, *recovery_samples]
+    samples = [*pressure_samples, recovery_boundary, *recovery_samples]
     for sample in samples:
         if not isinstance(sample, dict):
             raise GateValidationError("memory pressure runtime sample is invalid")
@@ -783,10 +824,14 @@ def validate_memory_pressure_evidence(
         for sample in constrained
     ):
         raise GateValidationError("constrained state must retain a positive nonminimum envelope")
-    if not any(sample.get("admitted_managed_bytes", 0) > 0 for sample in constrained):
-        raise GateValidationError("constrained state requires admitted managed bytes")
-    if recovery_samples[-1].get("state") != "normal":
-        raise GateValidationError("recovery phase did not return to normal state")
+    if not any(
+        sample.get("admitted_managed_bytes", 0) >= setup["bytes_written"]
+        for sample in constrained
+    ):
+        raise GateValidationError("constrained state requires the admitted pressure setup")
+    recovery_state_passed = recovery_samples[-1].get("state") == "normal"
+    if mode in ("direct-serial", "direct-async") and not recovery_state_passed:
+        raise GateValidationError("recovery state did not return to normal")
     generations = [sample["generation"] for sample in samples]
     if generations != sorted(generations):
         raise GateValidationError("memory pressure generations decreased")
@@ -811,16 +856,21 @@ def validate_memory_pressure_evidence(
         raise GateValidationError("pressure throughput profile mismatch")
     for phase in ("pressure", "recovery"):
         values = throughput.get(phase)
-        if not isinstance(values, list) or len(values) != 1:
-            raise GateValidationError(f"{phase} throughput evidence is missing")
-        if any(
+        valid = isinstance(values, list) and len(values) == 1 and not any(
             not isinstance(value, (int, float))
             or isinstance(value, bool)
             or not math.isfinite(value)
             or value <= 0
-            for value in values
-        ):
+            for value in (values if isinstance(values, list) else [])
+        )
+        if not valid:
+            if phase == "recovery" and mode == "kernel" and values == []:
+                numeric_throughput[phase] = []
+                continue
+            if not isinstance(values, list) or len(values) != 1:
+                raise GateValidationError(f"{phase} throughput evidence is missing")
             raise GateValidationError(f"{phase} throughput evidence is invalid")
+        assert isinstance(values, list)
         numeric_throughput[phase] = values
     for field in ("foreground_seconds", "drain_seconds"):
         value = cpu.get(field)
@@ -832,16 +882,18 @@ def validate_memory_pressure_evidence(
         ):
             raise GateValidationError(f"pressure {field} CPU evidence is invalid")
 
-    recovery_passed = (
-        statistics.median(numeric_throughput["recovery"])
-        >= statistics.median(numeric_throughput["pressure"])
+    throughput_recovery_passed = bool(numeric_throughput["recovery"]) and (
+        numeric_throughput["recovery"][0] >= numeric_throughput["pressure"][0]
     )
-    if mode in ("direct-serial", "direct-async") and not recovery_passed:
+    if mode in ("direct-serial", "direct-async") and not throughput_recovery_passed:
         raise GateValidationError("throughput recovery was absent after memory pressure")
+    recovery_passed = recovery_state_passed and throughput_recovery_passed
     return {
         "status": "complete",
         "passed": True,
         "recovery_passed": recovery_passed,
+        "recovery_state_passed": recovery_state_passed,
+        "throughput_recovery_passed": throughput_recovery_passed,
         "performance_diagnostic": mode == "kernel",
     }
 
@@ -1675,8 +1727,12 @@ def memory_pressure_evidence_from_artifacts(
     config = _read_json(run_dir / "memory-pressure-config.json")
     before = _read_json(run_dir / "memory-events-before.json")
     pressure = _read_json(run_dir / "memory-events-pressure.json")
+    after_holder_release = _read_json(
+        run_dir / "memory-events-after-holder-release.json"
+    )
     after = _read_json(run_dir / "memory-events-after.json")
     holder = _read_json(run_dir / "memory-holder.json")
+    setup = _read_json(run_dir / "pressure-setup.json")
     profile = _read_json(run_dir / "pressure-profile.json")
     pressure_hash = _read_json(run_dir / "pressure-hash.json")
     recovery = _read_json(run_dir / "pressure-recovery.json")
@@ -1687,9 +1743,10 @@ def memory_pressure_evidence_from_artifacts(
         raise GateValidationError("pressure verification byte count mismatch")
     if (
         config.get("holder_bytes") != holder.get("bytes")
+        or config.get("setup_bytes") != setup.get("bytes_written")
         or any(
             boundary.get("memory_max_bytes") != config.get("memory_max_bytes")
-            for boundary in (before, pressure, after)
+            for boundary in (before, pressure, after_holder_release, after)
         )
     ):
         raise GateValidationError("pressure cgroup configuration evidence mismatch")
@@ -1699,7 +1756,9 @@ def memory_pressure_evidence_from_artifacts(
             "memory_max_bytes": config.get("memory_max_bytes"),
             "memory_current_before_bytes": before.get("memory_current_bytes"),
             "memory_current_pressure_bytes": pressure.get("memory_current_bytes"),
-            "memory_current_recovery_bytes": after.get("memory_current_bytes"),
+            "memory_current_after_holder_release_bytes": after_holder_release.get(
+                "memory_current_bytes"
+            ),
             "events_before": before.get("events"),
             "events_after": after.get("events"),
             "events_delta": {
@@ -1712,8 +1771,12 @@ def memory_pressure_evidence_from_artifacts(
             },
         },
         "holder": holder,
+        "setup": setup,
         "runtime_samples": {
             "pressure": [memory_pressure_sample(_read_json(run_dir / "runtime-pressure.json"))],
+            "recovery_boundary": memory_pressure_sample(
+                _read_json(run_dir / "runtime-recovery-boundary.json")
+            ),
             "recovery": [
                 memory_pressure_sample(_read_json(run_dir / "runtime-recovery-1.json")),
                 memory_pressure_sample(_read_json(run_dir / "runtime-recovery-2.json")),
@@ -1792,12 +1855,15 @@ def validate_artifact_layout(run_dir: Path, *, workload: str) -> None:
             "memory-pressure-config.json",
             "memory-events-before.json",
             "memory-events-pressure.json",
+            "memory-events-after-holder-release.json",
             "memory-events-after.json",
             "memory-holder.json",
+            "pressure-setup.json",
             "pressure-profile.json",
             "pressure-hash.json",
             "pressure-recovery.json",
             "runtime-pressure.json",
+            "runtime-recovery-boundary.json",
             "runtime-recovery-1.json",
             "runtime-recovery-2.json",
         )

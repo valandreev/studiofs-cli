@@ -153,6 +153,15 @@ verify_cgroup_membership() {
   fi
 }
 
+move_pid_to_cgroup() {
+  local pid="$1"
+  local membership_file="$2"
+  local label="$3"
+  printf '%s\n' "$pid" > "$cgroup/cgroup.procs" || \
+    die "failed to move $label into cgroup"
+  verify_cgroup_membership "$membership_file" "$label"
+}
+
 monotonic_ns() {
   PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 import time
@@ -264,6 +273,7 @@ memory_holder_release=""
 pressure_setup_pid=""
 pressure_setup_ready=""
 pressure_setup_release=""
+pressure_workload_pid=""
 
 helper_pid_is_live() {
   local pid="$1"
@@ -308,12 +318,18 @@ stop_helper_bounded() {
     exit_status=$?
   fi
   case "$label:$exit_status" in
-    pidstat:0|pidstat:130|pidstat:143|memory-sampler:0|memory-holder:0|memory-holder:143|pressure-setup:0|pressure-setup:143) return 0 ;;
+    pidstat:0|pidstat:130|pidstat:143|memory-sampler:0|memory-holder:0|memory-holder:143|pressure-setup:0|pressure-setup:143|pressure-workload:0|pressure-workload:143) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 stop_helpers_on_exit() {
+  if [[ -n "$pressure_workload_pid" ]]; then
+    if ! stop_helper_bounded "$pressure_workload_pid" pressure-workload; then
+      printf 'Error: failed to stop pressure workload during collector cleanup\n' >&2
+    fi
+    pressure_workload_pid=""
+  fi
   if [[ -n "$pidstat_pid" ]]; then
     if ! stop_helper_bounded "$pidstat_pid" pidstat; then
       printf 'Error: failed to stop pidstat during collector cleanup\n' >&2
@@ -338,6 +354,14 @@ stop_helpers_on_exit() {
   fi
   rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
   rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
+  if [[ -n "${CACHE_GATE_INTERNAL_CLEANUP_HOOK:-}" ]]; then
+    if [[ -n "${CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE:-}" ]] && \
+      helper_pid_is_live "$(<"$CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE")"; then
+      printf 'workload-live\n' > "$CACHE_GATE_INTERNAL_CLEANUP_HOOK"
+    else
+      printf 'workload-stopped\n' > "$CACHE_GATE_INTERNAL_CLEANUP_HOOK"
+    fi
+  fi
 }
 
 stop_measurement_helpers() {
@@ -388,6 +412,7 @@ wait_for_memory_pressure_state() {
   local expected="$1"
   local destination="$2"
   local workload_pid="${3:-}"
+  local minimum_admitted="${4:-1}"
   local snapshot=""
   local matched=""
   local deadline=$((SECONDS + 30))
@@ -404,9 +429,9 @@ valid = sample["state"] == expected and sample["source"] == "host_and_cgroup"
 if expected == "constrained":
     valid = valid and sample["envelope_bytes"] > 0
     valid = valid and not sample["overcommitted_minimum"]
-    valid = valid and sample["admitted_managed_bytes"] > 0
+    valid = valid and sample["admitted_managed_bytes"] >= int(sys.argv[2])
 print("yes" if valid else "no")
-' "$expected")"
+' "$expected" "$minimum_admitted")"
     if [[ "$matched" == yes ]]; then
       [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" || \
         die "pressure workload exited before constrained evidence"
@@ -887,6 +912,22 @@ cleanup_target_is_safe() {
   [[ ! -L "$candidate" && -d "$candidate" ]]
 }
 
+if [[ "${CACHE_GATE_INTERNAL_TRAP_FIXTURE:-}" == true ]]; then
+  : "${CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE:?internal workload pid file is required}"
+  : "${CACHE_GATE_INTERNAL_CLEANUP_HOOK:?internal cleanup hook is required}"
+  : "${CACHE_GATE_INTERNAL_CGROUP:?internal cgroup is required}"
+  : "${CACHE_GATE_INTERNAL_CGROUP_MOUNT:?internal cgroup mount is required}"
+  : "${CACHE_GATE_INTERNAL_MEMBERSHIP:?internal membership file is required}"
+  cgroup="$CACHE_GATE_INTERNAL_CGROUP"
+  cgroup_mount="$CACHE_GATE_INTERNAL_CGROUP_MOUNT"
+  move_pid_to_cgroup "$$" "$CACHE_GATE_INTERNAL_MEMBERSHIP" "fixture process"
+  sleep 300 &
+  pressure_workload_pid=$!
+  printf '%s\n' "$pressure_workload_pid" > "$CACHE_GATE_INTERNAL_WORKLOAD_PID_FILE"
+  trap stop_helpers_on_exit EXIT
+  exit 99
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) require_value "$1" "${2:-}"; mode="$2"; shift 2 ;;
@@ -1030,11 +1071,12 @@ if [[ "$workload" == warm-reopen ]]; then
   json_placeholder "$artifact_dir/runtime-warm-first-end.json" "warm-first-end"
 fi
 if [[ "$pressure_scenario" == true ]]; then
-  for phase in pressure recovery-1 recovery-2; do
+  for phase in pressure recovery-boundary recovery-1 recovery-2; do
     json_placeholder "$artifact_dir/runtime-$phase.json" "$phase"
   done
   for artifact in memory-pressure-config memory-events-before memory-events-pressure \
-    memory-events-after memory-holder pressure-profile pressure-hash pressure-recovery; do
+    memory-events-after-holder-release memory-events-after memory-holder pressure-setup \
+    pressure-profile pressure-hash pressure-recovery; do
     json_placeholder "$artifact_dir/$artifact.json" "$artifact"
   done
 fi
@@ -1396,14 +1438,23 @@ shopt -u dotglob nullglob
 (( ${#existing_artifacts[@]} == 0 )) || die "real --output-root must be an empty repetition directory: $output_root"
 artifact_dir="$output_root"
 
-printf '%s\n' "$$" > "$cgroup/cgroup.procs" || die "failed to move collector into cgroup"
-verify_cgroup_membership "$proc_root/self/cgroup" "collector"
-printf '%s\n' "$mount_pid" > "$cgroup/cgroup.procs" || die "failed to move mount process into cgroup"
-verify_cgroup_membership "$proc_root/$mount_pid/cgroup" "mount process"
+move_pid_to_cgroup "$$" "$proc_root/self/cgroup" collector
+move_pid_to_cgroup "$mount_pid" "$proc_root/$mount_pid/cgroup" "mount process"
 
 if [[ "$pressure_scenario" == true ]]; then
+  pressure_negotiated_max_write="$(capture_runtime_snapshot | \
+    PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json
+import sys
+snapshot = json.load(sys.stdin)
+value = snapshot.get("write_path", {}).get("fuse_connection", {}).get(
+    "negotiated_max_write_bytes"
+)
+print(value if isinstance(value, int) and value > 0 else 1024 * 1024)
+')"
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
-    "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" <<'PY'
+    "$cgroup" "$proc_root/meminfo" "$artifact_dir/memory-pressure-config.json" \
+    "$pressure_negotiated_max_write" <<'PY'
 import json
 import pathlib
 import sys
@@ -1439,6 +1490,7 @@ try:
         host_available=host_available,
         leaf_limit=leaf_limit,
         parent_available=parent_available,
+        negotiated_max_write=int(sys.argv[4]),
     )
     (cgroup / "memory.max").write_text(
         f"{payload['memory_max_bytes']}\n", encoding="utf-8"
@@ -1686,6 +1738,11 @@ import json
 import sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["holder_bytes"])
 ' "$artifact_dir/memory-pressure-config.json")"
+  setup_bytes="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["setup_bytes"])
+' "$artifact_dir/memory-pressure-config.json")"
   memory_holder_start="$artifact_dir/.memory-holder.start"
   memory_holder_ready="$artifact_dir/.memory-holder.ready"
   memory_holder_release="$artifact_dir/.memory-holder.release"
@@ -1701,9 +1758,8 @@ run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))
     2> "$artifact_dir/memory-holder.stderr.txt" &
   memory_holder_pid=$!
   trap stop_helpers_on_exit EXIT
-  printf '%s\n' "$memory_holder_pid" > "$cgroup/cgroup.procs" || \
-    die "failed to move memory holder into cgroup"
-  verify_cgroup_membership "$proc_root/$memory_holder_pid/cgroup" "memory holder"
+  move_pid_to_cgroup "$memory_holder_pid" \
+    "$proc_root/$memory_holder_pid/cgroup" "memory holder"
 fi
 workload_owner=bench
 workload_run_dir=""
@@ -1778,10 +1834,14 @@ COMMAND
 esac
 if [[ "$pressure_scenario" == true ]]; then
   cat >> "$artifact_dir/command.txt" <<COMMAND
+pressure-setup --bytes "$setup_bytes" --hold-admitted
 memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
-pressure-hash --run-dir <owned-workload-dir>
+profile-async --profile "$workload" --run-dir <owned-workload-dir>
+constrained-boundary --require-profile-live
 memory-holder-release
-pressure-recovery trial-1 trial-2 --run-dir <owned-workload-dir>
+after-holder-release-boundary
+profile-recovery --profile "$workload" --run-dir <owned-workload-dir> --trials 1
+recovery-hash --run-dir <owned-workload-dir>
 COMMAND
 fi
 
@@ -1890,7 +1950,7 @@ if [[ "$pressure_scenario" == true ]]; then
   pressure_setup_ready="$artifact_dir/.pressure-setup.ready"
   pressure_setup_release="$artifact_dir/.pressure-setup.release"
   run_inline_client pressure-setup "$pressure_setup_dir" \
-    "$artifact_dir/pressure-setup.json" "$((512 * 1024 * 1024))" "" \
+    "$artifact_dir/pressure-setup.json" "$setup_bytes" "" \
     "$pressure_setup_ready" "$pressure_setup_release" \
     > "$artifact_dir/pressure-setup.stdout.txt" \
     2> "$artifact_dir/pressure-setup.stderr.txt" &
@@ -1954,14 +2014,16 @@ if [[ "$pressure_scenario" == true ]]; then
   execute_workload > "$artifact_dir/workload.stdout.txt" \
     2> "$artifact_dir/workload.stderr.txt" &
   pressure_workload_pid=$!
+  pressure_profile_pid="$pressure_workload_pid"
   capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
   wait_for_memory_pressure_state constrained \
-    "$artifact_dir/runtime-pressure.json" "$pressure_workload_pid"
+    "$artifact_dir/runtime-pressure.json" "$pressure_workload_pid" "$setup_bytes"
   if wait "$pressure_workload_pid"; then
     command_exit_status=0
   else
     command_exit_status=$?
   fi
+  pressure_workload_pid=""
 elif execute_workload > "$artifact_dir/workload.stdout.txt" \
   2> "$artifact_dir/workload.stderr.txt"; then
   command_exit_status=0
@@ -2032,6 +2094,22 @@ PY
     die "pressure setup failed"
   fi
   pressure_setup_pid=""
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$artifact_dir/pressure-setup.json" "$workload" "$pressure_profile_pid" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload.update({
+    "profile": sys.argv[2],
+    "profile_pid": int(sys.argv[3]),
+    "profile_live_at_constrained": True,
+    "exit_status": 0,
+})
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
   rm -f -- "$pressure_setup_ready" "$pressure_setup_release"
   cleanup_target_is_safe "$pressure_setup_dir" pressure-setup || \
     die "refusing to delete unsafe pressure setup directory"
@@ -2046,13 +2124,25 @@ PY
   (( memory_holder_exit_status == 0 )) || die "memory holder exited with status $memory_holder_exit_status"
   memory_holder_pid=""
   rm -f -- "$memory_holder_start" "$memory_holder_ready" "$memory_holder_release"
-  wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-1.json"
+  capture_memory_event_boundary after-holder-release \
+    "$artifact_dir/memory-events-after-holder-release.json"
+  capture_runtime_snapshot > "$artifact_dir/runtime-recovery-boundary.json"
+  if [[ "$mode" == kernel ]]; then
+    cp -- "$artifact_dir/runtime-recovery-boundary.json" \
+      "$artifact_dir/runtime-recovery-1.json"
+  else
+    wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-1.json"
+  fi
   if [[ "$command_exit_status" == 0 ]]; then
     run_inline_client pressure-recovery "$pressure_run_dir" \
       "$artifact_dir/pressure-recovery.json" "$pressure_workload_bytes" "" \
       "$artifact_dir/pressure-hash.json"
   fi
-  wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-2.json"
+  if [[ "$mode" == kernel ]]; then
+    capture_runtime_snapshot > "$artifact_dir/runtime-recovery-2.json"
+  else
+    wait_for_memory_pressure_state normal "$artifact_dir/runtime-recovery-2.json"
+  fi
 fi
 
 foreground_end_ns="$(monotonic_ns)"
