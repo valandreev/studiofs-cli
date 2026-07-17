@@ -255,7 +255,10 @@ impl CommitCoordinator {
             let present = dirty_attrs.contains_key(&ino);
             let newer = dirty_attrs
                 .get(&ino)
-                .filter(|attr| attr.content_epoch > content_epoch)
+                .filter(|attr| {
+                    attr.content_epoch > content_epoch
+                        || (attr.content_epoch == content_epoch && attr.size > latest_attr.size)
+                })
                 .cloned();
             let removed_matching = dirty_attrs
                 .get(&ino)

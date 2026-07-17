@@ -3515,6 +3515,84 @@ fn epoch_finalizer_preserves_larger_current_attr_at_same_epoch() {
 }
 
 #[test]
+fn epoch_finalizer_preserves_larger_same_epoch_dirty_attr_and_open_handle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "finalizer-live-same-epoch-tail");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"finalizer-live-same-epoch-tail.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+
+        let mut staged_attr = meta.get_attr(ino).expect("load created attr");
+        staged_attr.size = 4096;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&staged_attr)
+            .expect("stage sparse prefix publication");
+        meta.remove_regular_file_graph(ino)
+            .expect("stage sparse prefix graph");
+        vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(ino);
+        let (content_epoch, uploaded_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(uploaded_blocks.is_empty());
+
+        let mut live_dirty_attr = meta.get_attr(ino).expect("load unpublished prefix attr");
+        live_dirty_attr.size = 8192;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, live_dirty_attr.clone());
+        vfs.handle_table
+            .update_open_attr(fh, live_dirty_attr.clone());
+
+        let status =
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
+                .await
+                .expect("finalize sparse prefix");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+
+        let canonical_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("live same-epoch dirty attr after finalization");
+        let open_attr = vfs
+            .get_open_file(fh)
+            .and_then(|open_file| open_file.open_attr())
+            .expect("open handle attr after finalization");
+        assert_eq!(
+            (
+                canonical_dirty_attr.content_epoch,
+                canonical_dirty_attr.size
+            ),
+            (content_epoch, live_dirty_attr.size),
+            "finalization must preserve the live same-epoch tail"
+        );
+        assert_eq!(
+            (open_attr.content_epoch, open_attr.size),
+            (content_epoch, live_dirty_attr.size),
+            "finalization must preserve the open handle EOF"
+        );
+
+        vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
 fn epoch_finalizer_refreshes_open_writer_before_followup_tail_write() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "finalizer-refreshes-open-writer");
