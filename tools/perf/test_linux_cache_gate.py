@@ -1237,6 +1237,31 @@ class PressureScenarioHelperTest(unittest.TestCase):
             max(gib, ((3584 << 20) + 7) * 15 // 100),
         )
 
+    def test_scenario_requires_admission_strictly_above_envelope(self) -> None:
+        params = {
+            "memory_current": 960 << 20,
+            "memory_max": 3584 << 20,
+            "host_available": 4 << 30,
+            "parent_available": None,
+            "negotiated_max_write": 32 << 20,
+        }
+        target = gate.derive_pressure_target(
+            effective_limit=params["memory_max"],
+            negotiated_max_write=params["negotiated_max_write"],
+        )
+        envelope = target["target_envelope_bytes"]
+        scenario = gate.derive_pressure_scenario(
+            **params,
+            observed_admitted_lower_bound=envelope + 1,
+        )
+
+        self.assertEqual(scenario["required_admitted_bytes"], envelope + 1)
+        with self.assertRaisesRegex(gate.GateValidationError, "admission"):
+            gate.derive_pressure_scenario(
+                **params,
+                observed_admitted_lower_bound=envelope,
+            )
+
     def test_scenario_fails_when_three_gib_headroom_is_unavailable(self) -> None:
         with self.assertRaisesRegex(gate.GateValidationError, "768 MiB"):
             gate.derive_pressure_scenario(

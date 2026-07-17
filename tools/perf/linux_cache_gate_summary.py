@@ -398,7 +398,7 @@ def derive_pressure_target(*, effective_limit: int, negotiated_max_write: int) -
         "reserve_bytes": reserve,
         "target_allocatable_bytes": target_allocatable,
         "target_envelope_bytes": envelope,
-        "required_admitted_bytes": envelope + 64 * mib,
+        "required_admitted_bytes": envelope + 1,
         "managed_minimum_bytes": managed,
         "negotiated_max_write_bytes": max_write,
         "overcommitted_minimum": managed > envelope * 90 // 100,
