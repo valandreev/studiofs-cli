@@ -359,6 +359,8 @@ def record_post_profile_pressure_snapshot(snapshot: dict, destination: Path) -> 
     sample = memory_pressure_sample(snapshot)
     if sample["source"] != "host_and_cgroup":
         raise GateValidationError("post-profile memory pressure source is invalid")
+    if sample["state"] not in ("normal", "constrained"):
+        raise GateValidationError("post-profile memory pressure state is invalid")
     envelope = sample["envelope_bytes"]
     if envelope == 0:
         raise GateValidationError("post-profile memory envelope must be positive")
@@ -934,6 +936,8 @@ def validate_memory_pressure_evidence(
         < observed_admitted
     ):
         raise GateValidationError("constrained admission fell below the observed feeder admission")
+    if post_profile.get("state") not in ("normal", "constrained"):
+        raise GateValidationError("post-profile memory pressure state is invalid")
     if post_profile["envelope_bytes"] == 0:
         raise GateValidationError("post-profile memory envelope must be positive")
     recovery_state_passed = recovery_samples[-1].get("state") == "normal"

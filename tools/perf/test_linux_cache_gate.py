@@ -724,6 +724,25 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
 
         self.assertTrue(result["passed"])
 
+    def test_post_profile_sample_rejects_disabled_state(self) -> None:
+        evidence = self.evidence()
+        evidence["runtime_samples"]["pressure"][1]["state"] = "disabled"
+        with self.assertRaisesRegex(gate.GateValidationError, "state"):
+            self.validate(evidence=evidence)
+
+    def test_post_profile_capture_rejects_disabled_state(self) -> None:
+        destination = Path.cwd() / "target/perf/test-post-profile-disabled.json"
+        snapshot = AnalyzerCliTest.pressure_runtime_snapshot(
+            self.evidence()["runtime_samples"]["pressure"][1]
+        )
+        snapshot["memory_pressure"]["gauges"]["state"]["value"] = 0
+        destination.unlink(missing_ok=True)
+        try:
+            with self.assertRaisesRegex(gate.GateValidationError, "state"):
+                gate.record_post_profile_pressure_snapshot(snapshot, destination)
+        finally:
+            destination.unlink(missing_ok=True)
+
     def test_post_profile_snapshot_is_preserved_when_validation_fails(self) -> None:
         self.assertTrue(
             hasattr(gate, "record_post_profile_pressure_snapshot"),
