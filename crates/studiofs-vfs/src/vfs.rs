@@ -6485,10 +6485,14 @@ impl StudioVfs {
 
     /// Total bytes currently admitted across VFS-owned managed-memory gauges.
     pub fn admitted_managed_bytes(&self) -> u64 {
+        let async_write = self.state.fuse_async_write_snapshot.lock().pending_bytes as u64;
+        self.admitted_managed_bytes_with_async_write(async_write)
+    }
+
+    fn admitted_managed_bytes_with_async_write(&self, async_write: u64) -> u64 {
         let memory_cache = self.cached_store.hot_upload_resident_bytes() as u64;
         let dirty = self.total_pending_write_buffer_bytes() as u64;
         let transit = self.transit_memory_budget.snapshot().used_bytes as u64;
-        let async_write = self.state.fuse_async_write_snapshot.lock().pending_bytes as u64;
         memory_cache
             .saturating_add(dirty)
             .saturating_add(transit)

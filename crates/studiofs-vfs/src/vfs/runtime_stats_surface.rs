@@ -85,6 +85,9 @@ impl StudioVfs {
         build_memory_pressure_runtime_stats(
             self.memory_pressure_controller().snapshot(),
             &write_path.fuse_async_write,
+            self.admitted_managed_bytes_with_async_write(
+                write_path.fuse_async_write.pending_bytes as u64,
+            ),
         )
     }
 
@@ -722,6 +725,7 @@ fn memory_pressure_state_code(state: MemoryPressureState) -> u64 {
 fn build_memory_pressure_runtime_stats(
     pressure: MemoryPressureSnapshot,
     async_write: &VfsFuseAsyncWriteSnapshot,
+    admitted_managed_bytes: u64,
 ) -> RuntimeStatsSection {
     let mut section = RuntimeStatsSection::default();
     for (name, unit, value) in [
@@ -740,6 +744,7 @@ fn build_memory_pressure_runtime_stats(
         ("available_bytes", "bytes", pressure.available_bytes),
         ("reserve_bytes", "bytes", pressure.reserve_bytes),
         ("envelope_bytes", "bytes", pressure.envelope_bytes),
+        ("admitted_managed_bytes", "bytes", admitted_managed_bytes),
         (
             "memory_cache_limit_bytes",
             "bytes",
@@ -963,11 +968,12 @@ mod tests {
             ..VfsFuseAsyncWriteSnapshot::default()
         };
 
-        let section = build_memory_pressure_runtime_stats(pressure, &async_write);
+        let section = build_memory_pressure_runtime_stats(pressure, &async_write, 750);
 
         assert_eq!(
             section.gauges,
             BTreeMap::from([
+                ("admitted_managed_bytes".to_owned(), metric(750, "bytes")),
                 ("available_bytes".to_owned(), metric(3_000, "bytes")),
                 ("async_write_limit_bytes".to_owned(), metric(150, "bytes")),
                 ("dirty_limit_bytes".to_owned(), metric(375, "bytes")),
@@ -1009,6 +1015,7 @@ mod tests {
         let section = build_memory_pressure_runtime_stats(
             MemoryPressureSnapshot::disabled(limits),
             &VfsFuseAsyncWriteSnapshot::default(),
+            0,
         );
 
         assert_eq!(section.gauges["source"].value, 0);

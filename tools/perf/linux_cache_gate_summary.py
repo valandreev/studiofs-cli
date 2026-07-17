@@ -331,14 +331,7 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
     overcommitted = gauge("overcommitted_minimum", "count")
     if overcommitted not in (0, 1):
         raise GateValidationError("runtime overcommitted minimum flag is invalid")
-    admitted = sum(
-        _nonnegative_integer(_value_at(snapshot, path), ".".join(path))
-        for path in (
-            ("ingress", "dirty_mem_bytes"),
-            ("write_path", "fuse_async_read", "pending_bytes"),
-            ("write_path", "fuse_async_write", "pending_bytes"),
-        )
-    )
+    admitted = gauge("admitted_managed_bytes", "bytes")
     return {
         "source": sources[source_code],
         "state": states[state_code],

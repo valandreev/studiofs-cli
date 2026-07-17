@@ -712,6 +712,7 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
             "dirty_limit_bytes": 250,
             "transit_limit_bytes": 150,
             "async_write_limit_bytes": 100,
+            "admitted_managed_bytes": 999,
             "overcommitted_minimum": 0,
         }
         snapshot = {
@@ -763,7 +764,7 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "sampling_failure_count": 0,
                 "write_admission_wait_count": 3,
                 "write_admission_wait_ns": 4,
-                "admitted_lower_bound_bytes": 320,
+                "admitted_lower_bound_bytes": 999,
             },
         )
         for schema_version in (2.0, True):
@@ -2846,6 +2847,7 @@ class AnalyzerCliTest(unittest.TestCase):
             },
             "source": source_codes[sample["source"]],
             "state": state_codes[sample["state"]],
+            "admitted_managed_bytes": sample["admitted_lower_bound_bytes"],
             "overcommitted_minimum": int(sample["overcommitted_minimum"]),
         }
         snapshot = cls.diagnostics_runtime_snapshot()

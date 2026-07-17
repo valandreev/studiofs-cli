@@ -440,7 +440,19 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
             ..VfsFuseAsyncWriteSnapshot::default()
         });
 
-        assert_eq!(vfs.admitted_managed_bytes(), 6156);
+        let write_path = vfs.write_path_observability_snapshot();
+        let pressure = vfs.memory_pressure_runtime_stats(&write_path);
+
+        assert_eq!(
+            (
+                vfs.admitted_managed_bytes(),
+                pressure
+                    .gauges
+                    .get("admitted_managed_bytes")
+                    .map(|g| g.value),
+            ),
+            (6156, Some(6156))
+        );
         vfs.state.writer_stack.clear_inode(attr.ino);
     });
 }
