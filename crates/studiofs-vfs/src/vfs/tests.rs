@@ -434,6 +434,10 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
             )
             .unwrap();
         let _guard = transit.acquire_foreground(4096).await;
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .store(16, AtomicOrdering::Relaxed);
         vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
             snapshot_generation: 1,
             pending_bytes: 2048,
@@ -441,18 +445,28 @@ fn memory_pressure_admitted_managed_bytes_uses_existing_transit_and_fuse_gauges(
         });
 
         let write_path = vfs.write_path_observability_snapshot();
+        vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+            snapshot_generation: 2,
+            pending_bytes: 1024,
+            ..VfsFuseAsyncWriteSnapshot::default()
+        });
         let pressure = vfs.memory_pressure_runtime_stats(&write_path);
 
         assert_eq!(
             (
+                vfs.total_pending_local_dirty_bytes(),
                 vfs.admitted_managed_bytes(),
                 pressure
                     .gauges
                     .get("admitted_managed_bytes")
                     .map(|g| g.value),
             ),
-            (6156, Some(6156))
+            (16, 5148, Some(6172))
         );
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .store(0, AtomicOrdering::Relaxed);
         vfs.state.writer_stack.clear_inode(attr.ino);
     });
 }
