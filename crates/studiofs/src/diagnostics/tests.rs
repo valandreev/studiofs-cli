@@ -548,7 +548,7 @@ fn live_runtime_snapshot_uses_vfs_memory_pressure_and_write_geometry() {
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use studiofs_vfs::{
         MemoryComponentLimits, MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState,
-        VfsConfig, VfsFuseConnectionSnapshot,
+        VfsConfig, VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot,
     };
 
     let temp = mounts_dir_temp();
@@ -609,6 +609,12 @@ fn live_runtime_snapshot_uses_vfs_memory_pressure_and_write_geometry() {
         negotiated_max_write_bytes: Some(2 * 1024 * 1024),
         ..VfsFuseConnectionSnapshot::default()
     });
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 1,
+        admission_waits: 13,
+        admission_wait_total_ms: 2.25,
+        ..VfsFuseAsyncWriteSnapshot::default()
+    });
     let source = LiveMountDiagnosticsSource::new(
         &format_info,
         "/mnt/diagnostics-pressure",
@@ -655,6 +661,14 @@ fn live_runtime_snapshot_uses_vfs_memory_pressure_and_write_geometry() {
             .fuse_connection
             .negotiated_max_write_bytes,
         Some(2 * 1024 * 1024)
+    );
+    assert_eq!(
+        (
+            snapshot.write_path.fuse_async_write.admission_waits,
+            snapshot.memory_pressure.counters["write_admission_wait_count"].value,
+            snapshot.memory_pressure.counters["write_admission_wait_ns"].value,
+        ),
+        (13, 13, 2_250_000)
     );
 }
 

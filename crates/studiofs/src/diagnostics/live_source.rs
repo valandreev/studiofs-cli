@@ -102,8 +102,8 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
     }
 
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
-        let memory_pressure = self.vfs.runtime_stats_snapshot().memory_pressure;
         let health = self.health_snapshot();
+        let memory_pressure = self.vfs.memory_pressure_runtime_stats(&health.write_path);
         DiagnosticsRuntimeSnapshot {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,

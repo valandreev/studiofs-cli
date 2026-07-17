@@ -6,7 +6,8 @@ use super::{
     MEMORY_PRESSURE_SOURCE_HOST_AND_CGROUP, MEMORY_PRESSURE_STATE_CONSTRAINED,
     MEMORY_PRESSURE_STATE_DISABLED, MEMORY_PRESSURE_STATE_NORMAL, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
-    StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseSizeHistogram, VfsWritePathStageLatencyStats,
+    StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseSizeHistogram, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats,
 };
 use crate::utils::now_unix_millis;
 use crate::{MemoryPressureSnapshot, MemoryPressureSource, MemoryPressureState};
@@ -76,6 +77,17 @@ pub fn read_runtime_stats_buffer(bytes: &[u8], offset: u64, out: &mut [u8]) -> u
 }
 
 impl StudioVfs {
+    /// Build memory-pressure runtime stats from the current controller and one write-path snapshot.
+    pub fn memory_pressure_runtime_stats(
+        &self,
+        write_path: &VfsWritePathObservabilitySnapshot,
+    ) -> RuntimeStatsSection {
+        build_memory_pressure_runtime_stats(
+            self.memory_pressure_controller().snapshot(),
+            &write_path.fuse_async_write,
+        )
+    }
+
     /// Build the shared cross-platform runtime stats snapshot for mounted readers.
     pub fn runtime_stats_snapshot(&self) -> RuntimeStatsSnapshot {
         let generated_unix_ms = now_unix_millis();
@@ -83,14 +95,12 @@ impl StudioVfs {
         let upload = self.upload_stats();
         let write_path = self.write_path_observability_snapshot();
         let cache = self.cache_state_snapshot();
-        let memory_pressure = self.memory_pressure_controller().snapshot();
 
         let mut snapshot = RuntimeStatsSnapshot {
             generated_unix_ms,
             ..RuntimeStatsSnapshot::default()
         };
-        snapshot.memory_pressure =
-            memory_pressure_runtime_stats(memory_pressure, &write_path.fuse_async_write);
+        snapshot.memory_pressure = self.memory_pressure_runtime_stats(&write_path);
 
         insert_gauge(
             &mut snapshot.system,
@@ -709,7 +719,7 @@ fn memory_pressure_state_code(state: MemoryPressureState) -> u64 {
     }
 }
 
-fn memory_pressure_runtime_stats(
+fn build_memory_pressure_runtime_stats(
     pressure: MemoryPressureSnapshot,
     async_write: &VfsFuseAsyncWriteSnapshot,
 ) -> RuntimeStatsSection {
@@ -953,7 +963,7 @@ mod tests {
             ..VfsFuseAsyncWriteSnapshot::default()
         };
 
-        let section = memory_pressure_runtime_stats(pressure, &async_write);
+        let section = build_memory_pressure_runtime_stats(pressure, &async_write);
 
         assert_eq!(
             section.gauges,
@@ -996,7 +1006,7 @@ mod tests {
             async_write_bytes: 8,
         };
 
-        let section = memory_pressure_runtime_stats(
+        let section = build_memory_pressure_runtime_stats(
             MemoryPressureSnapshot::disabled(limits),
             &VfsFuseAsyncWriteSnapshot::default(),
         );

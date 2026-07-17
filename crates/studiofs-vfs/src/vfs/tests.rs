@@ -319,6 +319,29 @@ fn constrained_memory_snapshot(dirty_bytes: u64, transit_bytes: u64) -> MemoryPr
 }
 
 #[test]
+fn memory_pressure_runtime_stats_uses_supplied_write_path_snapshot() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-runtime-stats");
+    vfs.memory_pressure_controller()
+        .publish(constrained_memory_snapshot(375, 225));
+    let mut write_path = VfsWritePathObservabilitySnapshot::default();
+    write_path.fuse_async_write.admission_waits = 13;
+    write_path.fuse_async_write.admission_wait_total_ms = 2.25;
+
+    let section = vfs.memory_pressure_runtime_stats(&write_path);
+
+    assert_eq!(
+        (
+            section.gauges["dirty_limit_bytes"].value,
+            section.gauges["transit_limit_bytes"].value,
+            section.counters["write_admission_wait_count"].value,
+            section.counters["write_admission_wait_ns"].value,
+        ),
+        (375, 225, 13, 2_250_000)
+    );
+}
+
+#[test]
 fn memory_pressure_publish_clamps_vfs_dirty_limit() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "memory-pressure-dirty-limit");
