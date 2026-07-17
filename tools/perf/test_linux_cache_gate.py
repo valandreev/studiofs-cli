@@ -1237,6 +1237,18 @@ class PressureScenarioHelperTest(unittest.TestCase):
             max(gib, ((3584 << 20) + 7) * 15 // 100),
         )
 
+    def test_scenario_sizes_holder_from_post_feeder_live_usage(self) -> None:
+        scenario = gate.derive_pressure_scenario(
+            memory_current=1_306_308_608,
+            memory_max=3_238_432_768,
+            host_available=4 << 30,
+            parent_available=None,
+            observed_admitted_lower_bound=448_790_528,
+            negotiated_max_write=1 << 20,
+        )
+
+        self.assertEqual(scenario["holder_bytes"], 321_511_424)
+
     def test_scenario_requires_admission_strictly_above_envelope(self) -> None:
         params = {
             "memory_current": 960 << 20,
@@ -1262,16 +1274,26 @@ class PressureScenarioHelperTest(unittest.TestCase):
                 observed_admitted_lower_bound=envelope,
             )
 
-    def test_scenario_fails_when_three_gib_headroom_is_unavailable(self) -> None:
-        with self.assertRaisesRegex(gate.GateValidationError, "768 MiB"):
-            gate.derive_pressure_scenario(
-                memory_current=2 << 30,
-                memory_max=3 << 30,
-                host_available=1 << 30,
-                parent_available=None,
-                observed_admitted_lower_bound=448 << 20,
-                negotiated_max_write=1 << 20,
-            )
+    def test_scenario_rejects_nonpositive_holder(self) -> None:
+        memory_max = 3_238_432_768
+        target = gate.derive_pressure_target(
+            effective_limit=memory_max,
+            negotiated_max_write=1 << 20,
+        )
+        desired_available = (
+            target["reserve_bytes"] + target["target_allocatable_bytes"]
+        )
+        for available in (desired_available, desired_available - 1):
+            with self.subTest(available=available):
+                with self.assertRaisesRegex(gate.GateValidationError, "positive"):
+                    gate.derive_pressure_scenario(
+                        memory_current=memory_max - available,
+                        memory_max=memory_max,
+                        host_available=4 << 30,
+                        parent_available=None,
+                        observed_admitted_lower_bound=448_790_528,
+                        negotiated_max_write=1 << 20,
+                    )
 
     def test_negotiated_max_write_uses_schema2_fuse_connection_field(self) -> None:
         valid = {

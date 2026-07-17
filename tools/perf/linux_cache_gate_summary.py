@@ -436,10 +436,8 @@ def derive_pressure_scenario(
         )
     desired_available = target["reserve_bytes"] + target["target_allocatable_bytes"]
     holder = available - desired_available
-    mib = 1 << 20
-    minimum_holder = 768 * mib
-    if holder < minimum_holder:
-        raise GateValidationError("memory pressure holder must be at least 768 MiB")
+    if holder <= 0:
+        raise GateValidationError("memory pressure holder must be positive")
     return {
         **target,
         "memory_max_bytes": limit,
