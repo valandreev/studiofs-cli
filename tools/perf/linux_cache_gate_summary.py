@@ -293,8 +293,9 @@ def idle_streak_reached(snapshots: Sequence[dict], consecutive: int = 3) -> bool
 
 def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
     """Normalize one runtime-stats memory-pressure section for gate evidence."""
-    if snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
-        raise GateValidationError("runtime memory pressure schema mismatch")
+    _require_schema_version(
+        snapshot, EXPECTED_RUNTIME_SCHEMA, "runtime memory pressure"
+    )
     section = snapshot.get("memory_pressure")
     gauges = section.get("gauges") if isinstance(section, dict) else None
     counters = section.get("counters") if isinstance(section, dict) else None
@@ -357,8 +358,9 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
 
 
 def negotiated_max_write_bytes(snapshot: dict) -> int:
-    if snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
-        raise GateValidationError("negotiated max_write runtime schema mismatch")
+    _require_schema_version(
+        snapshot, EXPECTED_RUNTIME_SCHEMA, "negotiated max_write runtime"
+    )
     write_path = snapshot.get("write_path")
     connection = (
         write_path.get("fuse_connection") if isinstance(write_path, dict) else None
@@ -565,8 +567,7 @@ def validate_diagnostics_attach(
     snapshot = payload.get("runtime_snapshot")
     if not isinstance(snapshot, dict):
         raise GateValidationError("diagnostics runtime snapshot is missing")
-    if snapshot.get("schema_version") != expected_schema:
-        raise GateValidationError("diagnostics runtime snapshot schema mismatch")
+    _require_schema_version(snapshot, expected_schema, "diagnostics runtime snapshot")
     for path in IDLE_GAUGE_PATHS:
         _value_at(snapshot, path)
     return snapshot
@@ -604,7 +605,11 @@ def validate_negotiated_geometry(mode: str, geometry: dict) -> None:
         "requested_writeback_cache": writeback,
         "negotiated_writeback_cache": writeback,
     }
-    mismatched = [key for key, value in expected.items() if geometry.get(key) != value]
+    mismatched = [
+        key
+        for key, value in expected.items()
+        if type(geometry.get(key)) is not bool or geometry[key] is not value
+    ]
     if mismatched:
         raise GateValidationError(
             f"negotiated geometry contradicts {mode}: {', '.join(mismatched)}"
@@ -1834,13 +1839,9 @@ def validate_pressure_artifact_contract(artifacts: dict[str, dict]) -> None:
             if name in ("runtime_before_profile", "runtime_after_profile")
             else 1
         )
-        if (
-            _nonnegative_integer(
-                payload.get("schema_version"), f"pressure artifact schema: {name}"
-            )
-            != expected_schema
-        ):
-            raise GateValidationError(f"pressure artifact schema mismatch: {name}")
+        _require_schema_version(
+            payload, expected_schema, f"pressure artifact: {name}"
+        )
     for name, phase in (
         ("before", "before"),
         ("pressure", "pressure"),
@@ -2255,6 +2256,12 @@ def _nonnegative_integer(value: object, label: str) -> int:
     return value
 
 
+def _require_schema_version(payload: dict, expected: int, label: str) -> None:
+    actual = _nonnegative_integer(payload.get("schema_version"), f"{label} schema")
+    if actual != expected:
+        raise GateValidationError(f"{label} schema mismatch")
+
+
 def _proc_cpu(path: Path, expected_pid: int) -> tuple[int, int, str]:
     try:
         value = path.read_text()
@@ -2458,8 +2465,8 @@ def validate_raw_measurements(
     runtime_drain = _read_json(run_dir / "runtime-drain-end.json")
     runtime_cleanup = _read_json(run_dir / "runtime-cleanup-end.json")
     runtimes = (runtime_start, runtime_end, runtime_drain, runtime_cleanup)
-    if any(snapshot.get("schema_version") != EXPECTED_RUNTIME_SCHEMA for snapshot in runtimes):
-        raise GateValidationError("runtime snapshot schema mismatch")
+    for snapshot in runtimes:
+        _require_schema_version(snapshot, EXPECTED_RUNTIME_SCHEMA, "runtime snapshot")
     if not snapshot_is_idle(runtime_start):
         raise GateValidationError("foreground-start runtime snapshot is not idle")
     if not snapshot_is_idle(runtime_drain):
@@ -2789,8 +2796,9 @@ def _load_run(
     warm_first_end = None
     if workload == "warm-reopen":
         warm_first_end = _read_json(run_dir / "runtime-warm-first-end.json")
-        if warm_first_end.get("schema_version") != EXPECTED_RUNTIME_SCHEMA:
-            raise GateValidationError("warm midpoint runtime snapshot schema mismatch")
+        _require_schema_version(
+            warm_first_end, EXPECTED_RUNTIME_SCHEMA, "warm midpoint runtime snapshot"
+        )
         if not snapshot_is_idle(warm_first_end):
             raise GateValidationError("warm first-read boundary is not idle")
     validate_raw_callback_intervals(

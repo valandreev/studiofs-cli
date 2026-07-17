@@ -560,6 +560,8 @@ class RuntimeEvidenceTest(unittest.TestCase):
             ({"session": {"pid": 43, "mount_point": "/mnt/studio/volume"}}, "pid"),
             ({"session": {"pid": 42, "mount_point": "/mnt/other"}}, "mount point"),
             ({"runtime_snapshot": {**self.snapshot(), "schema_version": 1}}, "schema"),
+            ({"runtime_snapshot": {**self.snapshot(), "schema_version": 2.0}}, "schema"),
+            ({"runtime_snapshot": {**self.snapshot(), "schema_version": True}}, "schema"),
         ):
             invalid = {**payload, **changed}
             with self.assertRaisesRegex(gate.GateValidationError, message):
@@ -764,6 +766,12 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 "admitted_lower_bound_bytes": 320,
             },
         )
+        for schema_version in (2.0, True):
+            with self.subTest(schema_version=schema_version):
+                with self.assertRaisesRegex(gate.GateValidationError, "schema"):
+                    gate.memory_pressure_sample(
+                        {**snapshot, "schema_version": schema_version}
+                    )
 
     def test_runtime_snapshot_rejects_wrong_units(self) -> None:
         snapshot = AnalyzerCliTest.pressure_runtime_snapshot(
@@ -1257,6 +1265,8 @@ class PressureScenarioHelperTest(unittest.TestCase):
         invalid = (
             ({}, "schema"),
             ({**valid, "schema_version": 3}, "schema"),
+            ({**valid, "schema_version": 2.0}, "schema"),
+            ({**valid, "schema_version": True}, "schema"),
             ({**valid, "write_path": {}}, "negotiated"),
             ({**valid, "write_path": {"fuse_connection": {}}}, "negotiated"),
         )
@@ -1414,19 +1424,22 @@ class PreflightValidationTest(unittest.TestCase):
                 valid,
             )
 
-    def test_negotiated_geometry_mismatch_fails(self) -> None:
-        direct_async = {
-            "requested_async_dio": True,
-            "negotiated_async_dio": True,
-            "requested_writeback_cache": False,
-            "negotiated_writeback_cache": False,
-        }
-        gate.validate_negotiated_geometry("direct-async", direct_async)
-        with self.assertRaisesRegex(gate.GateValidationError, "geometry"):
-            gate.validate_negotiated_geometry(
-                "direct-async",
-                {**direct_async, "negotiated_async_dio": False},
-            )
+    def test_negotiated_geometry_requires_canonical_booleans(self) -> None:
+        for mode in ("direct-async", "kernel"):
+            expected = {
+                "requested_async_dio": mode == "direct-async",
+                "negotiated_async_dio": mode == "direct-async",
+                "requested_writeback_cache": mode == "kernel",
+                "negotiated_writeback_cache": mode == "kernel",
+            }
+            gate.validate_negotiated_geometry(mode, expected)
+            for field, value in expected.items():
+                with self.subTest(mode=mode, field=field):
+                    with self.assertRaisesRegex(gate.GateValidationError, "geometry"):
+                        gate.validate_negotiated_geometry(
+                            mode,
+                            {**expected, field: int(value)},
+                        )
 
     def test_cgroup_preflight_requires_fresh_empty_v2_memory_leaf(self) -> None:
         valid = {
@@ -2413,6 +2426,209 @@ class AnalyzerCliTest(unittest.TestCase):
             ],
         }
 
+    @staticmethod
+    def diagnostics_runtime_snapshot() -> dict:
+        def zeroed(names: tuple[str, ...]) -> dict[str, int]:
+            return {name: 0 for name in names}
+
+        namespace_cache = zeroed(
+            (
+                "hits",
+                "protected_hits",
+                "misses",
+                "negative_hits",
+                "evictions",
+                "occupancy_entries",
+                "occupancy_bytes",
+                "protected_occupancy_entries",
+                "protected_occupancy_bytes",
+                "entry_budget",
+                "byte_budget",
+            )
+        )
+        namespace_cache.update(negative_hit_ratio=0.0, hot_hit_ratio=0.0)
+        attr_cache = zeroed(
+            (
+                "hits",
+                "protected_hits",
+                "misses",
+                "evictions",
+                "occupancy_entries",
+                "occupancy_bytes",
+                "protected_occupancy_entries",
+                "protected_occupancy_bytes",
+                "entry_budget",
+                "byte_budget",
+            )
+        )
+        attr_cache["hot_hit_ratio"] = 0.0
+        foreground_reads = zeroed(
+            (
+                "speedometer_samples",
+                "window_bytes",
+                "window_coverage_ms",
+                "dominant_readahead_base_width",
+                "dominant_readahead_max_width",
+                "dominant_readahead_min_prefetch",
+                "dominant_upload_pressure_boost",
+                "active_sequential_media_reads",
+                "active_random_interactive_reads",
+                "active_sequential_writers",
+                "active_random_writers",
+                "upload_local_payload_reads",
+                "upload_local_payload_read_bytes",
+                "upload_hot_payload_reads",
+                "upload_hot_payload_read_bytes",
+                "upload_staged_payload_reads",
+                "upload_staged_payload_read_bytes",
+                "upload_fallback_deferrals",
+                "upload_fallback_rereads",
+                "upload_fallback_reread_bytes",
+                "upload_fallback_reread_cache_misses",
+                "upload_fallback_wait_ns",
+                "upload_fallback_wait_max_ns",
+                "upload_fallback_read_ns",
+                "upload_fallback_read_max_ns",
+                "foreground_local_payload_reads",
+                "foreground_local_payload_read_bytes",
+                "foreground_local_payload_read_io_ns",
+                "foreground_local_payload_read_io_max_ns",
+                "upload_cache_io_foreground_cost",
+                "upload_scheduler_penalty_ms",
+            )
+        )
+        foreground_reads.update(
+            p90_latency_ns=None,
+            throughput_bytes_per_sec=0.0,
+            dominant_access_class=None,
+            dominant_prefetch_enabled=False,
+            dominant_cache_promotion_on_read=False,
+        )
+        return {
+            "schema_version": 2,
+            "generated_unix_ms": 0,
+            "process": {"cpu_percent": 0.0, "rss_bytes": 0},
+            "ingress": zeroed(
+                (
+                    "dirty_mem_bytes",
+                    "dirty_mem_blocks",
+                    "write_backpressure_wait_ms",
+                    "write_backpressure_events",
+                    "fast_backpressure_wait_ms",
+                    "fast_backpressure_events",
+                    "fast_backpressure_stall_max_ms",
+                    "prefetch_queue_depth",
+                )
+            ),
+            "write_path": {
+                "generated_unix_ms": 0,
+                "uptime_secs": 0.0,
+                "backend_tag": "test",
+                "flush_barrier_calls": 0,
+                "flush_barrier_calls_per_sec": 0.0,
+                "payload_store_sync_data": {
+                    "calls": 0,
+                    "calls_per_sec": 0.0,
+                    "deferred_calls": 0,
+                    "synced_bytes": 0,
+                    "synced_gib": 0.0,
+                    "calls_per_gib": 0.0,
+                    "total_ms": 0.0,
+                    "avg_ms": 0.0,
+                    "max_ms": 0.0,
+                    "latency_quantiles_ms": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
+                    "latency_histogram": {
+                        "bucket_upper_bounds_ns": [],
+                        "bucket_counts": [],
+                    },
+                },
+                "winfsp_callbacks": {"write": 0, "flush": 0},
+                "write_backpressure": {
+                    "events": 0,
+                    "wait_total_ms": 0,
+                    "stall_max_ms": 0,
+                },
+            },
+            "memory_pressure": {"counters": {}, "gauges": {}, "latencies": {}},
+            "upload": {},
+            "zeroio": {
+                **zeroed(
+                    (
+                        "generated_unix_ms",
+                        "unpublished_files",
+                        "unpublished_epochs",
+                        "unpublished_payload_bytes",
+                        "uploading_epochs",
+                        "replay_backlog_epochs",
+                        "replay_backlog_bytes",
+                        "publish_ready_backlog_epochs",
+                        "replayed_after_restart_epochs",
+                        "deferred_delete_backlog_epochs",
+                        "deferred_delete_backlog_objects",
+                        "deferred_delete_backlog_bytes",
+                        "replay_failures",
+                        "publish_failures",
+                        "drilldown_truncated",
+                    )
+                ),
+                "cache_bytes": zeroed(
+                    (
+                        "total_local_bytes",
+                        "backend_evictable_bytes",
+                        "backend_non_evictable_bytes",
+                        "pinned_unpublished_bytes",
+                        "publish_ready_retained_bytes",
+                        "published_warm_bytes",
+                        "deleted_before_publish_bytes",
+                        "unclassified_non_evictable_bytes",
+                    )
+                ),
+                "startup_replay": None,
+                "last_graceful_shutdown": None,
+                "health_signals": [],
+                "drilldown": [],
+            },
+            "cache": {
+                "state": {
+                    "dentry_cache": namespace_cache,
+                    "path_shortcut_cache": dict(namespace_cache),
+                    "attr_read_cache": attr_cache,
+                    "local_backend_dirty_objects": 0,
+                    "prefetch_queue_depth": 0,
+                    "transit_memory": zeroed(
+                        (
+                            "budget_bytes",
+                            "used_bytes",
+                            "available_bytes",
+                            "waiting_foreground",
+                            "waiting_background",
+                        )
+                    ),
+                }
+            },
+            "synchronization": {
+                "state": {
+                    "file_sessions": {
+                        **zeroed(
+                            (
+                                "active_sessions",
+                                "open_handles",
+                                "queued_ops",
+                                "max_queue_depth",
+                                "wait_events",
+                                "wait_ms",
+                                "transitions",
+                            )
+                        ),
+                        "wait_reasons": [],
+                    },
+                    "foreground_reads": foreground_reads,
+                    "pending_metadata_ops": 0,
+                    "inflight_metadata_ops": 0,
+                }
+            },
+        }
+
     @classmethod
     def runtime_snapshot(
         cls,
@@ -2435,37 +2651,49 @@ class AnalyzerCliTest(unittest.TestCase):
                 if kind == "read" and read_histogram_samples is not None
                 else callback_samples
             )
-            callbacks[kind] = {
+            latency = {
+                "calls": read_calls if kind == "read" else samples,
+                "calls_per_sec": 0.0,
+                "total_ms": 0.0,
+                "avg_ms": 0.0,
+                "max_ms": 0.0,
+                "latency_quantiles_ms": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
+                "latency_quantiles_saturated": {
+                    "p50": False,
+                    "p95": False,
+                    "p99": False,
+                },
+                "latency_histogram": {
+                    "bucket_upper_bounds_ns": [10, 20, 30],
+                    "bucket_counts": [samples, 0, 0, 0],
+                },
+            }
+            callback = {
                 "calls": read_calls if kind == "read" else samples,
                 "errors": 0,
+                "total_ms": 0.0,
+                "avg_ms": 0.0,
+                "max_ms": 0.0,
+                "latency": latency,
                 **(
                     {
                         "bytes": (
                             read_bytes
                             if kind == "read"
                             else write_bytes
-                        )
+                        ),
+                        "avg_bytes": 0.0,
+                        "requested_mib_per_sec": 0.0,
                     }
                     if kind in ("read", "write")
                     else {}
                 ),
-                "latency": {
-                    "latency_histogram": {
-                        "bucket_upper_bounds_ns": [10, 20, 30],
-                        "bucket_counts": [samples, 0, 0, 0],
-                    },
-                    "latency_quantiles_saturated": {
-                        "p50": False,
-                        "p95": False,
-                        "p99": False,
-                    },
-                },
             }
-        return {
-            "schema_version": 2,
-            "ingress": {"dirty_mem_bytes": 0},
-            "upload": {"pending_uploads": 0, "active_uploads": 0},
-            "write_path": {
+            callbacks[kind] = callback
+        snapshot = cls.diagnostics_runtime_snapshot()
+        snapshot["upload"].update(pending_uploads=0, active_uploads=0)
+        snapshot["write_path"].update(
+            {
                 "fuse_async_read": {
                     "pending_reads": 0,
                     "pending_bytes": 0,
@@ -2492,10 +2720,17 @@ class AnalyzerCliTest(unittest.TestCase):
                     "negotiated_max_write_bytes": 1 << 20,
                     "parallel_direct_writes_supported": True,
                 },
-                "vfs_read_path": {"calls": vfs_read_calls},
+                "vfs_read_path": {
+                    "calls": vfs_read_calls,
+                    "requested_bytes": read_bytes,
+                    "avg_requested_bytes": 0.0,
+                    "foreground_local_payload_reads": 0,
+                    "foreground_local_payload_read_bytes": 0,
+                },
                 "fuse_callbacks": callbacks,
-            },
-        }
+            }
+        )
+        return snapshot
 
     @staticmethod
     def proc_stat(pid: int, user_ticks: int, system_ticks: int, start_time: str) -> str:
@@ -2526,8 +2761,8 @@ class AnalyzerCliTest(unittest.TestCase):
             },
         }
 
-    @staticmethod
-    def pressure_runtime_snapshot(sample: dict) -> dict:
+    @classmethod
+    def pressure_runtime_snapshot(cls, sample: dict) -> dict:
         source_codes = {"host": 1, "cgroup": 2, "host_and_cgroup": 3, "fallback": 4}
         state_codes = {"normal": 1, "constrained": 2}
         counter_units = {
@@ -2546,33 +2781,36 @@ class AnalyzerCliTest(unittest.TestCase):
             "state": state_codes[sample["state"]],
             "overcommitted_minimum": int(sample["overcommitted_minimum"]),
         }
-        return {
-            "schema_version": 2,
-            "ingress": {"dirty_mem_bytes": sample.get("admitted_lower_bound_bytes", 0)},
-            "write_path": {
+        snapshot = cls.diagnostics_runtime_snapshot()
+        snapshot["ingress"]["dirty_mem_bytes"] = sample.get(
+            "admitted_lower_bound_bytes", 0
+        )
+        snapshot["write_path"].update(
+            {
                 "fuse_async_read": {"pending_bytes": 0},
                 "fuse_async_write": {"pending_bytes": 0},
+            }
+        )
+        snapshot["memory_pressure"] = {
+            "gauges": {
+                name: {
+                    "value": value,
+                    "unit": (
+                        "count"
+                        if name
+                        in {"source", "state", "generation", "overcommitted_minimum"}
+                        else "bytes"
+                    ),
+                }
+                for name, value in values.items()
             },
-            "memory_pressure": {
-                "gauges": {
-                    name: {
-                        "value": value,
-                        "unit": (
-                            "count"
-                            if name
-                            in {"source", "state", "generation", "overcommitted_minimum"}
-                            else "bytes"
-                        ),
-                    }
-                    for name, value in values.items()
-                },
-                "counters": {
-                    name: {"value": sample[name], "unit": unit}
-                    for name, unit in counter_units.items()
-                },
-                "latencies": {},
+            "counters": {
+                name: {"value": sample[name], "unit": unit}
+                for name, unit in counter_units.items()
             },
+            "latencies": {},
         }
+        return snapshot
 
     def create_matrix(self) -> None:
         schedule = schedule_manifest()
@@ -3167,6 +3405,32 @@ class AnalyzerCliTest(unittest.TestCase):
         self.assertIn("Memory pressure", (output / "summary.md").read_text())
         self.assertIn("direct-async", (output / "decision.md").read_text())
 
+    def test_runtime_fixture_matches_diagnostics_schema2_contract(self) -> None:
+        runtime_path = (
+            self.root
+            / "direct-serial"
+            / "large-single"
+            / "rep-001"
+            / "runtime-foreground-start.json"
+        )
+        runtime = json.loads(runtime_path.read_text())
+        self.assertEqual(
+            set(runtime),
+            {
+                "schema_version",
+                "generated_unix_ms",
+                "process",
+                "ingress",
+                "write_path",
+                "memory_pressure",
+                "upload",
+                "zeroio",
+                "cache",
+                "synchronization",
+            },
+        )
+        self.assertEqual(json.loads(json.dumps(runtime)), runtime)
+
     def test_cli_rejects_missing_or_empty_stable_evidence(self) -> None:
         (self.root / "direct-serial/large-single/rep-001/pidstat.txt").unlink()
         output = self.root / "missing-artifact-comparison"
@@ -3267,6 +3531,28 @@ class AnalyzerCliTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         comparison = json.loads((output / "comparison.json").read_text())
         self.assertIn("raw memory pressure", comparison["direct_async"]["errors"][0])
+
+    def test_pressure_artifact_reconstruction_rejects_non_integer_runtime_schema(self) -> None:
+        run_dir = self.root / "direct-async" / "large-single" / "rep-001"
+        runtime_path = run_dir / "runtime-foreground-start.json"
+        runtime = json.loads(runtime_path.read_text())
+        environment = json.loads((run_dir / "environment.json").read_text())
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        derived = json.loads((run_dir / "derived.json").read_text())
+        for schema_version in (2.0, True):
+            with self.subTest(schema_version=schema_version):
+                self.write_json(
+                    runtime_path,
+                    {**runtime, "schema_version": schema_version},
+                )
+                with self.assertRaisesRegex(gate.GateValidationError, "schema"):
+                    gate.validate_raw_measurements(
+                        run_dir,
+                        mode="direct-async",
+                        environment=environment,
+                        manifest=manifest,
+                        derived=derived,
+                    )
 
     def test_pressure_sources_must_match_validated_raw_evidence(self) -> None:
         run_dir = self.root / "direct-async" / "large-single" / "rep-001"
