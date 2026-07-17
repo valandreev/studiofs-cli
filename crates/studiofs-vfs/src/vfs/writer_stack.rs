@@ -167,7 +167,6 @@ struct ChunkWriter {
 #[allow(dead_code)]
 struct FileWriter {
     ino: Ino,
-    materialization_gate: Arc<Mutex<()>>,
     visible_len: u64,
     next_object_id: u64,
     chunks: BTreeMap<ChunkId, ChunkWriter>,
@@ -306,7 +305,6 @@ impl MountedWriterStack {
             Arc::clone(shard.files.entry(spec.ino).or_insert_with(|| {
                 Arc::new(Mutex::new(FileWriter {
                     ino: spec.ino,
-                    materialization_gate: Arc::new(Mutex::new(())),
                     visible_len: spec.current_size,
                     next_object_id: spec.first_object_id,
                     chunks: BTreeMap::new(),
@@ -817,14 +815,6 @@ impl MountedWriterStack {
             };
             Arc::clone(file)
         };
-        let materialization_gate = {
-            let file = file.lock();
-            if file.ino != ino {
-                return Ok(Vec::new());
-            }
-            Arc::clone(&file.materialization_gate)
-        };
-        let _materialization_guard = materialization_gate.lock();
         let mut file = file.lock();
         if file.ino != ino {
             return Ok(Vec::new());
@@ -948,14 +938,6 @@ impl MountedWriterStack {
             };
             Arc::clone(file)
         };
-        let materialization_gate = {
-            let file = file.lock();
-            if file.ino != ino {
-                return Ok(Vec::new());
-            }
-            Arc::clone(&file.materialization_gate)
-        };
-        let _materialization_guard = materialization_gate.lock();
         let mut file = file.lock();
         if file.ino != ino {
             return Ok(Vec::new());
@@ -1124,7 +1106,6 @@ impl MountedWriterStack {
             Arc::clone(shard.files.entry(ino).or_insert_with(|| {
                 Arc::new(Mutex::new(FileWriter {
                     ino,
-                    materialization_gate: Arc::new(Mutex::new(())),
                     visible_len: 0,
                     next_object_id: 0,
                     chunks: BTreeMap::new(),
@@ -2229,63 +2210,6 @@ mod tests {
             spans[0].data.as_ref(),
             b"slow",
             "detached-but-not-yet-installed bytes must remain visible to same-mount reads"
-        );
-    }
-
-    #[test]
-    fn writer_stack_serializes_materialization_for_the_same_inode() {
-        let dir = studiofs_test_support::workspace_target_tempdir("test-");
-        let backend =
-            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000294")
-                .expect("open backend")
-                .backend;
-        let (entered_tx, entered_rx) = std_mpsc::channel();
-        let (release_tx, release_rx) = std_mpsc::channel();
-        let slow_backend = Arc::new(SlowPutBackend::new(backend, entered_tx, release_rx));
-        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), slow_backend)
-            .expect("open store");
-        let stack = Arc::new(MountedWriterStack::new(
-            store,
-            WriterStackConfig {
-                block_size: 4,
-                chunk_size: 16,
-                page_size: 4,
-                dirty_byte_limit: None,
-                max_buffer_bytes: None,
-            },
-        ));
-
-        stack
-            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"slow"))
-            .expect("write completed block");
-        let first_stack = Arc::clone(&stack);
-        let first =
-            std::thread::spawn(move || first_stack.flush_completed_blocks_for_inode(7, 900, 1));
-        entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first materializer should enter backend put");
-
-        let second_stack = Arc::clone(&stack);
-        let second =
-            std::thread::spawn(move || second_stack.flush_completed_blocks_for_inode(7, 900, 1));
-        let second_entered_while_first_inflight =
-            entered_rx.recv_timeout(Duration::from_millis(100));
-
-        release_tx.send(()).expect("release first put");
-        if second_entered_while_first_inflight.is_ok() {
-            release_tx.send(()).expect("release duplicate put");
-        }
-        let first_result = first.join().expect("first materializer thread");
-        let second_result = second.join().expect("second materializer thread");
-
-        assert!(
-            second_entered_while_first_inflight.is_err(),
-            "second materializer entered backend put while the first was still in flight"
-        );
-        assert_eq!(first_result.expect("first materialization").len(), 1);
-        assert!(
-            second_result.expect("second materialization").is_empty(),
-            "completed block must be materialized exactly once"
         );
     }
 

@@ -2951,6 +2951,7 @@ impl VfsState {
             fuse_liveness_snapshots: Mutex::new(FuseLivenessSnapshots::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
+            writer_stack_materialization_inflight: DeferredInodeGate::default(),
             deferred_materialize_inflight: DeferredInodeGate::default(),
             deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
             deferred_release_inflight: DeferredInodeGate::default(),
@@ -3018,6 +3019,7 @@ struct VfsState {
     fuse_liveness_snapshots: Mutex<FuseLivenessSnapshots>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
+    writer_stack_materialization_inflight: DeferredInodeGate,
     /// Tracks inodes that currently have a deferred materialization task
     /// in-flight. The gate keeps synchronous registry access scoped away from
     /// async waiting while preserving one background task per inode.
@@ -3148,6 +3150,18 @@ impl DeferredInodeGate {
             DeferredInodeGateEntry::new(self.clone(), ino, task_state),
             guard,
         )
+    }
+
+    async fn acquire(
+        &self,
+        ino: Ino,
+    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedSemaphorePermit) {
+        loop {
+            if let Some(guard) = self.try_register_or_update_occupied(ino, || {}) {
+                return guard;
+            }
+            self.wait(ino).await;
+        }
     }
 
     async fn wait(&self, ino: Ino) {

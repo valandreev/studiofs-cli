@@ -10341,6 +10341,55 @@ fn completed_block_materialization_uses_prefetched_object_ids() {
 }
 
 #[test]
+fn concurrent_completed_block_materialization_reserves_object_ids_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "completed-materialization-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"completed-materialization-gate.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let block = vec![0x47u8; block_size];
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &block)
+            .await
+            .unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let first_vfs = Arc::clone(&vfs);
+        let first_start = Arc::clone(&start);
+        let first = tokio::spawn(async move {
+            first_start.wait().await;
+            first_vfs
+                .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+                .await
+        });
+        let second_vfs = Arc::clone(&vfs);
+        let second_start = Arc::clone(&start);
+        let second = tokio::spawn(async move {
+            second_start.wait().await;
+            second_vfs
+                .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+                .await
+        });
+        start.wait().await;
+
+        let first_materialized = first.await.unwrap().unwrap();
+        let second_materialized = second.await.unwrap().unwrap();
+        let after = meta.next_object_ids(1).unwrap()[0];
+
+        assert_eq!(first_materialized + second_materialized, block_size);
+        assert_eq!(
+            after,
+            before + 2,
+            "same-inode materializers must share one object ID reservation"
+        );
+    });
+}
+
+#[test]
 fn completed_block_materialization_does_not_join_gapped_prefetch_batches() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-gapped-prefetch-ids");

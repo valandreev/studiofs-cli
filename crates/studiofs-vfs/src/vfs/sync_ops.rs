@@ -2078,6 +2078,11 @@ impl StudioVfs {
     ///
     /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
+        let (_entry, _guard) = self
+            .state
+            .writer_stack_materialization_inflight
+            .acquire(ino)
+            .await;
         let object_count = self
             .state
             .writer_stack
@@ -2116,6 +2121,11 @@ impl StudioVfs {
         ino: Ino,
         min_idle: Duration,
     ) -> VfsResult<usize> {
+        let (_entry, _guard) = self
+            .state
+            .writer_stack_materialization_inflight
+            .acquire(ino)
+            .await;
         let object_count = self
             .state
             .writer_stack
@@ -2153,6 +2163,11 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<usize> {
+        let (_entry, _guard) = self
+            .state
+            .writer_stack_materialization_inflight
+            .acquire(ino)
+            .await;
         let object_count = self
             .state
             .writer_stack
