@@ -174,6 +174,15 @@ impl CommitCoordinator {
             vfs.state.file_session.gc_if_idle(ino);
             return Ok(EpochFinalizeStatus::Deferred);
         }
+        let Some((_materialization_entry, _materialization_guard)) = vfs
+            .state
+            .writer_stack_materialization_inflight
+            .try_register_or_update_occupied(ino, || {})
+        else {
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
+            return Ok(EpochFinalizeStatus::Deferred);
+        };
         let publication_changes_visible_size = latest_attr.committed_size != latest_attr.size;
         let published = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)

@@ -6868,6 +6868,96 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
 }
 
 #[test]
+fn epoch_finalizer_defers_while_writer_stack_materialization_is_inflight() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-materialization-inflight");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"graph-finalizer-writer-materialization-inflight.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let durable_prefix = b"durable-prefix";
+        vfs.write(attr.ino, 0, durable_prefix)
+            .await
+            .expect("write durable prefix");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize durable prefix");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+
+        let mut staged_attr = meta.get_attr(attr.ino).expect("load published attr");
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&staged_attr)
+            .expect("stage same-size unpublished epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("stage durable prefix graph for publication");
+
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        let mut dirty_attr = unpublished_attr.clone();
+        dirty_attr.size = dirty_attr.size.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, dirty_attr.clone());
+        let lifecycle = meta
+            .get_inode_lifecycle(attr.ino)
+            .expect("load lifecycle")
+            .expect("unpublished epoch should keep lifecycle state");
+        assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+
+        let (entry, _guard) = vfs
+            .state
+            .writer_stack_materialization_inflight
+            .try_register(attr.ino)
+            .expect("test should reserve the writer materialization gate");
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            unpublished_attr.content_epoch,
+        )
+        .await
+        .expect("finalize should defer while writer materialization is in flight");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Deferred
+        ));
+        assert_ne!(
+            meta.get_attr(attr.ino)
+                .expect("load still-unpublished attr")
+                .upload_state,
+            MetaUploadState::Ready,
+            "finalize must not publish the durable prefix before the tail is installed"
+        );
+        assert_eq!(
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&attr.ino)
+                .map(|attr| (attr.content_epoch, attr.size)),
+            Some((dirty_attr.content_epoch, dirty_attr.size)),
+            "finalize must retain the same-epoch dirty tail"
+        );
+
+        drop(entry);
+    });
+}
+
+#[test]
 fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let cfg = VfsConfig {
