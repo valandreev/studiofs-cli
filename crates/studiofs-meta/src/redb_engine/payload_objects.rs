@@ -630,21 +630,17 @@ impl RedbMetaEngine {
     ) -> MetaResult<Option<InodeAttr>> {
         let txn = self.begin_write_txn()?;
 
-        if let Some(attr) = attr {
-            match Self::get_attr_merged_in_write_txn(&txn, ino) {
-                Ok(current)
-                    if current.content_epoch > attr.content_epoch
-                        || (current.content_epoch == attr.content_epoch
-                            && current.size > attr.size) =>
-                {
-                    return Ok(None);
-                }
-                Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
         let normalized_attr = if let Some(attr) = attr {
-            let mut normalized = attr.clone();
+            let mut normalized = match Self::get_attr_merged_in_write_txn(&txn, ino) {
+                Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),
+                Ok(current)
+                    if current.content_epoch == attr.content_epoch && current.size > attr.size =>
+                {
+                    current
+                }
+                Ok(_) | Err(MetaError::InodeNotFound(_)) => attr.clone(),
+                Err(error) => return Err(error),
+            };
             if normalized.kind == FileType::RegularFile {
                 let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
                     &txn,

@@ -323,6 +323,77 @@ mod tests {
     }
 
     #[test]
+    fn smaller_same_epoch_pending_slice_commit_preserves_payload_lifecycle() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-same-epoch-eof");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-same-epoch-eof.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let object_id = 9004;
+            let payload = vec![0xA5; 4096];
+            let mut current_attr = meta.get_attr(ino).expect("load current attr");
+            current_attr.size = 2 * u64::from(vfs.block_size);
+            current_attr.content_epoch = 7;
+            meta.set_attr(&current_attr).expect("store current attr");
+            let persisted_before = meta.get_attr(ino).expect("load persisted current attr");
+
+            let mut stale_attr = persisted_before.clone();
+            stale_attr.size = u64::from(vfs.block_size);
+            stale_attr.mtime = stale_attr.mtime.saturating_sub(1);
+            stale_attr.ctime = stale_attr.ctime.saturating_sub(1);
+            vfs.local_payload_backend()
+                .put(object_id, &payload, false)
+                .expect("store same-epoch local payload");
+            vfs.local_payload_backend()
+                .sync_data()
+                .expect("sync same-epoch local payload");
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, payload.len() as u32)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    object_id,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 7, Some(stale_attr))
+                .await
+                .expect("commit smaller same-epoch pending slice");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            let graph_contains_object = meta
+                .lookup_regular_file_slices(ino, 0, persisted_before.size)
+                .expect("lookup slices after same-epoch commit")
+                .iter()
+                .filter_map(|span| span.payload.as_ref())
+                .any(|payload| payload.object_id == object_id);
+            assert_eq!(
+                (
+                    persisted,
+                    graph_contains_object,
+                    vfs.pending_uploads_for_inode(ino),
+                    vfs.read_cached_block(object_id),
+                ),
+                (
+                    persisted_before,
+                    true,
+                    vec![(0, object_id, 7)],
+                    Some(bytes::Bytes::from(payload)),
+                ),
+                "same-epoch materialization must keep the current EOF and the new payload readable for upload"
+            );
+        });
+    }
+
+    #[test]
     fn subtract_pending_local_dirty_bytes_saturates_without_panicking() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-bytes-underflow");

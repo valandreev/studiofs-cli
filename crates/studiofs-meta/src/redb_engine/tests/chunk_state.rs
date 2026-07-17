@@ -825,7 +825,7 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
 }
 
 #[test]
-fn test_flush_regular_file_overlay_slices_with_attr_skips_smaller_same_epoch_attr() {
+fn test_flush_regular_file_overlay_slices_with_attr_merges_smaller_same_epoch_slices() {
     let engine = temp_engine();
     let mut current_attr = engine
         .create_file(
@@ -844,8 +844,8 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_smaller_same_epoch_att
     let current_slice = SliceRecord {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
-        range: SliceRange::new(0, 8192).expect("valid range"),
-        payload: Some(PayloadRef::new_partial(200_003, 8192)),
+        range: SliceRange::new(0, 4096).expect("valid range"),
+        payload: Some(PayloadRef::new_partial(200_003, 4096)),
         payload_state: PayloadRefState::LocalOnly,
     };
     engine
@@ -856,12 +856,15 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_smaller_same_epoch_att
         )
         .unwrap();
 
-    let mut stale_attr = current_attr.clone();
+    let persisted_before = engine.get_attr(ino).unwrap();
+    let mut stale_attr = persisted_before.clone();
     stale_attr.size = 4096;
+    stale_attr.mtime = stale_attr.mtime.saturating_sub(1);
+    stale_attr.ctime = stale_attr.ctime.saturating_sub(1);
     let stale_slice = SliceRecord {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
-        range: SliceRange::new(0, 4096).expect("valid range"),
+        range: SliceRange::new(4096, 8192).expect("valid range"),
         payload: Some(PayloadRef::new_partial(200_004, 4096)),
         payload_state: PayloadRefState::LocalOnly,
     };
@@ -874,20 +877,16 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_smaller_same_epoch_att
         )
         .unwrap();
 
-    assert!(
-        committed_attr.is_none(),
-        "a smaller same-epoch dirty snapshot must be rejected as stale"
-    );
+    assert_eq!(committed_attr.as_ref(), Some(&persisted_before));
     let persisted_attr = engine.get_attr(ino).unwrap();
-    assert_eq!(persisted_attr.size, current_attr.size);
+    assert_eq!(persisted_attr, persisted_before);
     let spans = engine.lookup_regular_file_slices(ino, 0, current_attr.size).unwrap();
     assert!(
         spans
             .iter()
-            .any(|span| {
-                u64::from(span.range.end) == current_attr.size && span.payload.is_some()
-            }),
-        "rejecting the stale EOF snapshot must preserve current overlay coverage: {spans:?}"
+            .filter_map(|span| span.payload.as_ref())
+            .any(|payload| payload.object_id == 200_004),
+        "same-epoch materialization must retain the new payload slice: {spans:?}"
     );
 }
 
