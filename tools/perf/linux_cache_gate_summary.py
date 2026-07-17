@@ -701,8 +701,16 @@ def validate_cleanup_record(cleanup: dict) -> None:
         raise GateValidationError("cleanup drain did not reach idle")
     if cleanup.get("unmount_timed_out") is not False:
         raise GateValidationError("unmount timed out")
-    if _nonnegative_integer(cleanup.get("unmount_exit_status"), "unmount exit status") != 0:
-        raise GateValidationError("unmount exit status is nonzero")
+    unmount_status = _nonnegative_integer(
+        cleanup.get("unmount_exit_status"), "unmount exit status"
+    )
+    if unmount_status != 0:
+        fallback_status = _nonnegative_integer(
+            cleanup.get("fallback_unmount_exit_status"),
+            "fallback unmount exit status",
+        )
+        if fallback_status != 0:
+            raise GateValidationError("unmount and fallback exit statuses are nonzero")
     if cleanup.get("mount_exit_timed_out") is not False:
         raise GateValidationError("mount process exit timed out")
     if _nonnegative_integer(cleanup.get("mount_exit_status"), "mount exit status") != 0:

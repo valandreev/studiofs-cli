@@ -1053,6 +1053,7 @@ cleanup_active_tuple() {
   local reason="${1:-}"
   local cgroup_member=""
   local cgroup_empty=true
+  local clean_unmount_succeeded=false
   local paths_safe_to_remove=true
   [[ "$active_index" -ge 0 ]] || return 0
   [[ "$cleanup_in_progress" == false ]] || return 1
@@ -1071,16 +1072,18 @@ cleanup_active_tuple() {
       "$studiofs_bin" umount "$active_mount_point"
     unmount_exit_status="$bounded_status"
     unmount_timed_out="$bounded_timed_out"
-    [[ "$unmount_exit_status" -eq 0 ]] || add_cleanup_error \
-      "studiofs umount exited with status $unmount_exit_status"
+    if [[ "$unmount_exit_status" -eq 0 ]] && ! mount_is_active; then
+      clean_unmount_succeeded=true
+    fi
 
     if mount_is_active; then
       run_bounded_command "$active_work_dir/fusermount.stdout.txt" \
         "$active_work_dir/fusermount.stderr.txt" \
         fusermount3 -u "$active_mount_point"
       fallback_unmount_exit_status="$bounded_status"
-      [[ "$fallback_unmount_exit_status" -eq 0 ]] || add_cleanup_error \
-        "fusermount3 normal unmount exited with status $fallback_unmount_exit_status"
+      if [[ "$fallback_unmount_exit_status" -eq 0 ]] && ! mount_is_active; then
+        clean_unmount_succeeded=true
+      fi
     fi
     if mount_is_active; then
       run_bounded_command "$active_work_dir/fusermount-lazy.stdout.txt" \
@@ -1092,6 +1095,8 @@ cleanup_active_tuple() {
     fi
     if mount_is_active; then
       add_cleanup_error "mount remains active after fallback unmounts"
+    elif [[ "$clean_unmount_succeeded" == false ]]; then
+      add_cleanup_error "no clean unmount command succeeded"
     fi
     unmount_ended_monotonic_ns="$(monotonic_ns)"
   fi

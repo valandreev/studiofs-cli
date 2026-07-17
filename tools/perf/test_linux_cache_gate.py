@@ -1642,6 +1642,25 @@ class RunEligibilityTest(unittest.TestCase):
                 self.cleanup(),
             )
 
+    def test_successful_normal_fallback_is_a_clean_unmount(self) -> None:
+        cleanup = {
+            **self.cleanup(),
+            "unmount_exit_status": 1,
+            "fallback_unmount_exit_status": 0,
+        }
+
+        try:
+            gate.validate_run_eligibility("direct-serial", self.derived(), cleanup)
+        except gate.GateValidationError as error:
+            self.fail(f"successful fallback unmount was rejected: {error}")
+
+        with self.assertRaisesRegex(gate.GateValidationError, "unmount"):
+            gate.validate_run_eligibility(
+                "direct-serial",
+                self.derived(),
+                {**cleanup, "fallback_unmount_exit_status": 1},
+            )
+
     def test_exit_statuses_reject_bool(self) -> None:
         with self.assertRaisesRegex(gate.GateValidationError, "integer"):
             gate.validate_run_eligibility(
