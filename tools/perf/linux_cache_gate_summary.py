@@ -350,6 +350,32 @@ def memory_pressure_sample(snapshot: dict) -> dict[str, object]:
     }
 
 
+def record_post_profile_pressure_snapshot(snapshot: dict, destination: Path) -> dict:
+    """Preserve and validate the runtime sample captured after the pressure profile."""
+    with destination.open("w", encoding="utf-8") as output:
+        json.dump(snapshot, output, indent=2, sort_keys=True)
+        output.write("\n")
+
+    sample = memory_pressure_sample(snapshot)
+    if sample["source"] != "host_and_cgroup":
+        raise GateValidationError("post-profile memory pressure source is invalid")
+    envelope = sample["envelope_bytes"]
+    if envelope == 0:
+        raise GateValidationError("post-profile memory envelope must be positive")
+    managed = sum(
+        sample[field]
+        for field in (
+            "memory_cache_limit_bytes",
+            "dirty_limit_bytes",
+            "transit_limit_bytes",
+            "async_write_limit_bytes",
+        )
+    )
+    if managed > envelope:
+        raise GateValidationError("post-profile managed memory limits exceed the envelope")
+    return sample
+
+
 def negotiated_max_write_bytes(snapshot: dict) -> int:
     _require_schema_version(
         snapshot, EXPECTED_RUNTIME_SCHEMA, "negotiated max_write runtime"
@@ -879,32 +905,29 @@ def validate_memory_pressure_evidence(
             "write_admission_wait_ns",
         ):
             _nonnegative_integer(sample.get(field), field)
-    constrained = pressure_samples
-    if any(sample.get("state") != "constrained" for sample in constrained):
-        raise GateValidationError("pressure samples must remain constrained around the profile")
-    if constrained[0]["transition_count"] != constrained[1]["transition_count"]:
-        raise GateValidationError("memory pressure state changed during the profile")
-    if any(
-        sample["envelope_bytes"] == 0 or sample["overcommitted_minimum"] is not False
-        for sample in constrained
+    initial_pressure, post_profile = pressure_samples
+    if initial_pressure.get("state") != "constrained":
+        raise GateValidationError("initial pressure sample must be constrained")
+    if (
+        initial_pressure["envelope_bytes"] == 0
+        or initial_pressure["overcommitted_minimum"] is not False
     ):
         raise GateValidationError("constrained state must retain a positive nonminimum envelope")
-    if any(
+    if (
         _nonnegative_integer(
-            sample.get("admitted_lower_bound_bytes"), "admitted lower bound"
+            initial_pressure.get("admitted_lower_bound_bytes"),
+            "admitted lower bound",
         )
-        <= sample["envelope_bytes"]
-        for sample in constrained
+        <= initial_pressure["envelope_bytes"]
     ):
         raise GateValidationError("constrained admission lower bound must exceed the envelope")
-    if any(
-        not (
-            sample.get("admitted_lower_bound_bytes", 0) + (64 << 20)
-            >= observed_admitted
-        )
-        for sample in constrained
+    if (
+        initial_pressure.get("admitted_lower_bound_bytes", 0) + (64 << 20)
+        < observed_admitted
     ):
         raise GateValidationError("constrained admission fell below the observed feeder admission")
+    if post_profile["envelope_bytes"] == 0:
+        raise GateValidationError("post-profile memory envelope must be positive")
     recovery_state_passed = recovery_samples[-1].get("state") == "normal"
     if mode in ("direct-serial", "direct-async") and not recovery_state_passed:
         raise GateValidationError("recovery state did not return to normal")

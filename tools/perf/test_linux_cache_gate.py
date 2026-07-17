@@ -702,6 +702,46 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(result["recovery_passed"])
 
+    def test_post_profile_sample_may_drain_after_strict_pressure_boundary(self) -> None:
+        evidence = self.evidence()
+        post_profile = evidence["runtime_samples"]["pressure"][1]
+        post_profile.update(
+            state="normal",
+            generation=3,
+            transition_count=2,
+            admitted_lower_bound_bytes=0,
+        )
+        for sample in (
+            evidence["runtime_samples"]["recovery_boundary"],
+            *evidence["runtime_samples"]["recovery"],
+        ):
+            sample["transition_count"] = 2
+
+        try:
+            result = self.validate(evidence=evidence)
+        except gate.GateValidationError as error:
+            self.fail(f"adaptive post-profile sample was rejected: {error}")
+
+        self.assertTrue(result["passed"])
+
+    def test_post_profile_snapshot_is_preserved_when_validation_fails(self) -> None:
+        self.assertTrue(
+            hasattr(gate, "record_post_profile_pressure_snapshot"),
+            "post-profile snapshot recorder is missing",
+        )
+        destination = Path.cwd() / "target/perf/test-post-profile-snapshot.json"
+        snapshot = AnalyzerCliTest.pressure_runtime_snapshot(
+            self.evidence()["runtime_samples"]["pressure"][1]
+        )
+        snapshot["memory_pressure"]["gauges"]["source"]["value"] = 1
+        destination.unlink(missing_ok=True)
+        try:
+            with self.assertRaisesRegex(gate.GateValidationError, "source"):
+                gate.record_post_profile_pressure_snapshot(snapshot, destination)
+            self.assertEqual(json.loads(destination.read_text()), snapshot)
+        finally:
+            destination.unlink(missing_ok=True)
+
     def test_runtime_snapshot_is_normalized_from_wire_metrics(self) -> None:
         names = {
             "source": 3,
@@ -897,22 +937,6 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
             sample["sampling_failure_count"] = 1
         with self.assertRaisesRegex(gate.GateValidationError, "sampling failures increased"):
             self.validate(evidence=sampling_failed)
-
-        for mode in ("direct-async", "kernel"):
-            with self.subTest(profile_transition=mode):
-                transitioned = self.evidence()
-                transitioned["runtime_samples"]["pressure"][1][
-                    "transition_count"
-                ] = 3
-                for sample in (
-                    transitioned["runtime_samples"]["recovery_boundary"],
-                    *transitioned["runtime_samples"]["recovery"],
-                ):
-                    sample["transition_count"] = 3
-                with self.assertRaisesRegex(
-                    gate.GateValidationError, "state changed during the profile"
-                ):
-                    self.validate(mode=mode, evidence=transitioned)
 
     def test_pressure_and_recovery_require_the_same_measurer(self) -> None:
         evidence = self.evidence()

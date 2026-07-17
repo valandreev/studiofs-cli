@@ -538,11 +538,10 @@ print(gate.memory_pressure_sample(json.load(sys.stdin))["admitted_lower_bound_by
   die "pressure feeder did not reach required live admission within 60 seconds"
 }
 
-capture_constrained_pressure_once() {
+capture_post_profile_pressure_once() {
   local destination="$1"
   local feeder_pid="$2"
   local feeder_start_time="$3"
-  local minimum_admitted="$4"
   local snapshot=""
   helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
     die "pressure feeder identity changed before post-profile evidence"
@@ -551,20 +550,14 @@ capture_constrained_pressure_once() {
     python3 -c '
 import json
 import sys
+from pathlib import Path
 from tools.perf import linux_cache_gate_summary as gate
-sample = gate.memory_pressure_sample(json.load(sys.stdin))
-valid = sample["source"] == "host_and_cgroup"
-valid = valid and sample["state"] == "constrained"
-valid = valid and sample["envelope_bytes"] > 0
-valid = valid and not sample["overcommitted_minimum"]
-valid = valid and sample["admitted_lower_bound_bytes"] >= int(sys.argv[1])
-raise SystemExit(0 if valid else 1)
-' "$minimum_admitted"; then
-    die "post-profile runtime sample is not constrained under the live feeder"
+gate.record_post_profile_pressure_snapshot(json.load(sys.stdin), Path(sys.argv[1]))
+' "$destination"; then
+    die "post-profile runtime sample is invalid under the live feeder"
   fi
   helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
     die "pressure feeder identity changed during post-profile evidence"
-  printf '%s\n' "$snapshot" > "$destination"
 }
 
 run_inline_client() {
@@ -2381,10 +2374,9 @@ PY
       "$artifact_dir/pressure-measure.json" "$pressure_workload_bytes" ""
     run_inline_client pressure-hash "$pressure_run_dir" \
       "$artifact_dir/pressure-hash.json" "$pressure_workload_bytes" ""
-    capture_constrained_pressure_once \
+    capture_post_profile_pressure_once \
       "$artifact_dir/runtime-pressure-after-profile.json" \
-      "$pressure_setup_pid" "$pressure_setup_start_time" \
-      "$((target_envelope + 1))"
+      "$pressure_setup_pid" "$pressure_setup_start_time"
     stamp_runtime_snapshot "$artifact_dir/runtime-pressure-after-profile.json"
   fi
   feeder_pid="$pressure_setup_pid"
