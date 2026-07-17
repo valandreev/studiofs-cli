@@ -9990,30 +9990,33 @@ fn test_run_sync_with_timeout_returns_result_before_deadline() {
     assert_eq!(result, Some(7));
 }
 
-#[test]
-fn test_run_sync_with_timeout_returns_none_on_timeout() {
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_clone = finished.clone();
-    let t0 = std::time::Instant::now();
-    let result = run_sync_with_timeout(Duration::from_millis(10), move || {
-        std::thread::sleep(Duration::from_millis(100));
-        finished_clone.store(true, AtomicOrdering::Release);
-        Ok::<_, VfsError>(())
-    })
-    .expect("timeout helper should not fail");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_with_timeout_returns_from_runtime_worker_before_operation_finishes() {
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let mut task = tokio::spawn(async move {
+        run_sync_with_timeout(Duration::from_millis(10), move || {
+            release_rx.recv().expect("release operation");
+            finished_tx.send(()).expect("report operation completion");
+            Ok::<_, VfsError>(())
+        })
+    });
 
-    // The primary timeout should report None (timed out).
+    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+    let release_result = release_tx.send(());
+    if bounded.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+    }
+
+    let result = bounded
+        .expect("timeout helper must return before the operation is released")
+        .expect("runtime worker task must not panic")
+        .expect("timeout helper should not fail");
     assert_eq!(result, None);
-    // The thread is joined to ensure clean Arc release, so the operation
-    // finishes by the time we return.
-    assert!(
-        finished.load(AtomicOrdering::Acquire),
-        "thread should have been joined after timeout"
-    );
-    assert!(
-        t0.elapsed() >= Duration::from_millis(100),
-        "run_sync_with_timeout should wait for thread join"
-    );
+    release_result.expect("release operation after timeout return");
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("detached operation must finish after release");
 }
 
 #[test]

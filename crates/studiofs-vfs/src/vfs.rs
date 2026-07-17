@@ -1324,18 +1324,26 @@ fn run_sync_with_timeout<T: Send + 'static>(
             result.map(Some)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // The operation is still running.  We must NOT abandon the thread
-            // because it holds `Arc<dyn VfsMeta>` (and transitively
-            // `Arc<redb::Database>`).  If the process exits before that Arc
-            // drops, `Database::drop()` never runs and redb is left in an
-            // unclean state.  Wait with a generous secondary cap so the
-            // database is properly closed even when PG network I/O is slow.
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
-                "run_sync_with_timeout: primary timeout reached, \
-                 waiting for thread to finish so redb closes cleanly"
+                "run_sync_with_timeout: operation still running after timeout"
             );
-            let _ = handle.join();
+            // The operation owns its captured `Arc`s until it finishes. It may
+            // complete after shutdown returns; if the process exits first, those
+            // `Arc`s are not guaranteed to be dropped cleanly.
+            if let Err(error) = std::thread::Builder::new()
+                .name("vfs-timeout-operation-reaper".into())
+                .spawn(move || {
+                    if handle.join().is_err() {
+                        warn!("run_sync_with_timeout: operation panicked after timeout");
+                    }
+                })
+            {
+                warn!(
+                    %error,
+                    "run_sync_with_timeout: failed to spawn operation reaper; thread detached"
+                );
+            }
             Ok(None)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
