@@ -6917,6 +6917,11 @@ fn epoch_finalizer_defers_while_writer_stack_materialization_is_inflight() {
             .expect("load lifecycle")
             .expect("unpublished epoch should keep lifecycle state");
         assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+        assert!(
+            !vfs.inode_has_pending_uploads(attr.ino)
+                && !vfs.inode_has_unmaterialized_overlay_for_finalize(attr.ino),
+            "setup should otherwise be ready to finalize"
+        );
 
         let (entry, _guard) = vfs
             .state
@@ -6953,6 +6958,110 @@ fn epoch_finalizer_defers_while_writer_stack_materialization_is_inflight() {
             "finalize must retain the same-epoch dirty tail"
         );
 
+        drop(entry);
+    });
+}
+
+#[test]
+fn epoch_finalizer_owns_writer_materialization_gate_through_publication() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "graph-finalizer-materialization-gate-ownership");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"graph-finalizer-materialization-gate-ownership.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let mut staged_attr = meta.get_attr(attr.ino).expect("load baseline attr");
+        staged_attr.size = 4096;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&staged_attr)
+            .expect("stage sparse size-increase epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("stage sparse graph for size-increase epoch");
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        let lifecycle = meta
+            .get_inode_lifecycle(attr.ino)
+            .expect("load lifecycle")
+            .expect("unpublished epoch should keep lifecycle state");
+        assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+        assert!(
+            !vfs.inode_has_pending_uploads(attr.ino)
+                && !vfs.inode_has_unmaterialized_overlay_for_finalize(attr.ino),
+            "setup should be ready to publish"
+        );
+
+        let (invalidation_entered_tx, invalidation_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (invalidation_release_tx, invalidation_release_rx) = std::sync::mpsc::sync_channel(1);
+        let callback_release = std::sync::Mutex::new(invalidation_release_rx);
+        let ino = attr.ino;
+        vfs.set_kernel_invalidator(Arc::new(CallbackKernelInvalidator::new(
+            move |callback_ino| {
+                invalidation_entered_tx
+                    .send(callback_ino)
+                    .expect("test should wait for kernel invalidation");
+                callback_release
+                    .lock()
+                    .expect("release receiver should not be poisoned")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test should release blocked kernel invalidation");
+            },
+        )));
+
+        let finalizer_vfs = vfs.clone();
+        let content_epoch = unpublished_attr.content_epoch;
+        let finalizer = tokio::spawn(async move {
+            super::commit::CommitCoordinator::finalize_inode_epoch(
+                &finalizer_vfs,
+                ino,
+                content_epoch,
+            )
+            .await
+        });
+
+        assert_eq!(
+            invalidation_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("finalizer should reach kernel invalidation"),
+            ino
+        );
+        let competing_registration = vfs
+            .state
+            .writer_stack_materialization_inflight
+            .try_register(attr.ino);
+        invalidation_release_tx
+            .send(())
+            .expect("release blocked kernel invalidation");
+
+        let status = tokio::time::timeout(Duration::from_secs(5), finalizer)
+            .await
+            .expect("finalizer should finish after kernel invalidation is released")
+            .expect("finalizer task should not panic")
+            .expect("finalize sparse size-increase epoch");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+        assert!(
+            competing_registration.is_none(),
+            "finalizer must own the materialization gate through publish and dirty cleanup"
+        );
+        let (entry, guard) = vfs
+            .state
+            .writer_stack_materialization_inflight
+            .try_register(attr.ino)
+            .expect("finalizer should release the materialization gate on exit");
+        drop(guard);
         drop(entry);
     });
 }
