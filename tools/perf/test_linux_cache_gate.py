@@ -2431,6 +2431,51 @@ class AnalyzerCliTest(unittest.TestCase):
         def zeroed(names: tuple[str, ...]) -> dict[str, int]:
             return {name: 0 for name in names}
 
+        # Mirrors DiagnosticsRuntimeSnapshot, VfsWritePathObservabilitySnapshot,
+        # and VfsUploadStats. `allocator` is the only omitted field: Rust uses
+        # skip_serializing_if = "Option::is_none" for it.
+        write_path = {
+            name: {}
+            for name in (
+                "local_cache_io",
+                "winfsp_callbacks",
+                "winfsp_write_path",
+                "vfs_write_path",
+                "vfs_read_path",
+                "fuse_callbacks",
+                "fuse_liveness",
+                "macfuse_open_cache",
+                "os_cache",
+                "fuse_connection",
+                "fuse_async_write",
+                "fuse_async_read",
+                "landing_zone",
+                "drain_lag",
+                "winfsp_foreground_flushes",
+                "write_backpressure",
+                "dirty_pressure",
+                "upload",
+                "fetch",
+                "foreground_reads",
+                "cache_pipeline",
+                "payload_burst",
+                "payload_persist",
+                "metadata_commit",
+                "metadata_commit_cadence",
+                "eager_flush",
+                "tuning",
+            )
+        }
+        write_path.update(
+            publisher_pid=0,
+            generated_unix_ms=0,
+            uptime_secs=0.0,
+            pending_uploads=0,
+            backend_tag="test",
+            flush_barrier_calls=0,
+            flush_barrier_calls_per_sec=0.0,
+        )
+
         namespace_cache = zeroed(
             (
                 "hits",
@@ -2504,6 +2549,56 @@ class AnalyzerCliTest(unittest.TestCase):
             dominant_prefetch_enabled=False,
             dominant_cache_promotion_on_read=False,
         )
+        write_path.update(
+            payload_store_sync_data={
+                "calls": 0,
+                "calls_per_sec": 0.0,
+                "deferred_calls": 0,
+                "synced_bytes": 0,
+                "synced_gib": 0.0,
+                "calls_per_gib": 0.0,
+                "total_ms": 0.0,
+                "avg_ms": 0.0,
+                "max_ms": 0.0,
+                "latency_quantiles_ms": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
+                "latency_histogram": {
+                    "bucket_upper_bounds_ns": [],
+                    "bucket_counts": [],
+                },
+            },
+            winfsp_callbacks={"write": 0, "flush": 0},
+            write_backpressure={
+                "events": 0,
+                "wait_total_ms": 0,
+                "stall_max_ms": 0,
+            },
+        )
+        upload = zeroed(
+            (
+                "pending_uploads",
+                "pending_upload_bytes",
+                "oldest_pending_upload_age_ms",
+                "active_uploads",
+                "pending_retry_count",
+                "max_pending_retry_count",
+                "completed_uploads",
+                "completed_upload_bytes",
+                "encrypted_objects_written",
+                "encrypted_bytes_written",
+                "encrypted_object_write_failures",
+                "upload_requeues",
+                "canceled_deleted",
+                "canceled_stale",
+                "canceled_stale_before_put",
+                "canceled_stale_after_put",
+                "canceled_stale_after_put_bytes",
+                "pending_upload_snapshot_calls",
+            )
+        )
+        upload.update(
+            completed_uploads_per_sec=0.0,
+            completed_upload_bytes_per_sec=0.0,
+        )
         return {
             "schema_version": 2,
             "generated_unix_ms": 0,
@@ -2520,37 +2615,9 @@ class AnalyzerCliTest(unittest.TestCase):
                     "prefetch_queue_depth",
                 )
             ),
-            "write_path": {
-                "generated_unix_ms": 0,
-                "uptime_secs": 0.0,
-                "backend_tag": "test",
-                "flush_barrier_calls": 0,
-                "flush_barrier_calls_per_sec": 0.0,
-                "payload_store_sync_data": {
-                    "calls": 0,
-                    "calls_per_sec": 0.0,
-                    "deferred_calls": 0,
-                    "synced_bytes": 0,
-                    "synced_gib": 0.0,
-                    "calls_per_gib": 0.0,
-                    "total_ms": 0.0,
-                    "avg_ms": 0.0,
-                    "max_ms": 0.0,
-                    "latency_quantiles_ms": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
-                    "latency_histogram": {
-                        "bucket_upper_bounds_ns": [],
-                        "bucket_counts": [],
-                    },
-                },
-                "winfsp_callbacks": {"write": 0, "flush": 0},
-                "write_backpressure": {
-                    "events": 0,
-                    "wait_total_ms": 0,
-                    "stall_max_ms": 0,
-                },
-            },
+            "write_path": write_path,
             "memory_pressure": {"counters": {}, "gauges": {}, "latencies": {}},
-            "upload": {},
+            "upload": upload,
             "zeroio": {
                 **zeroed(
                     (
@@ -3429,7 +3496,147 @@ class AnalyzerCliTest(unittest.TestCase):
                 "synchronization",
             },
         )
-        self.assertEqual(json.loads(json.dumps(runtime)), runtime)
+        expected_nested_keys = {
+            ("process",): {"cpu_percent", "rss_bytes"},
+            ("ingress",): {
+                "dirty_mem_bytes",
+                "dirty_mem_blocks",
+                "write_backpressure_wait_ms",
+                "write_backpressure_events",
+                "fast_backpressure_wait_ms",
+                "fast_backpressure_events",
+                "fast_backpressure_stall_max_ms",
+                "prefetch_queue_depth",
+            },
+            ("write_path",): {
+                "publisher_pid",
+                "generated_unix_ms",
+                "uptime_secs",
+                "pending_uploads",
+                "backend_tag",
+                "flush_barrier_calls",
+                "flush_barrier_calls_per_sec",
+                "payload_store_sync_data",
+                "local_cache_io",
+                "winfsp_callbacks",
+                "winfsp_write_path",
+                "vfs_write_path",
+                "vfs_read_path",
+                "fuse_callbacks",
+                "fuse_liveness",
+                "macfuse_open_cache",
+                "os_cache",
+                "fuse_connection",
+                "fuse_async_write",
+                "fuse_async_read",
+                "landing_zone",
+                "drain_lag",
+                "winfsp_foreground_flushes",
+                "write_backpressure",
+                "dirty_pressure",
+                "upload",
+                "fetch",
+                "foreground_reads",
+                "cache_pipeline",
+                "payload_burst",
+                "payload_persist",
+                "metadata_commit",
+                "metadata_commit_cadence",
+                "eager_flush",
+                "tuning",
+            },
+            ("memory_pressure",): {"counters", "gauges", "latencies"},
+            ("upload",): {
+                "pending_uploads",
+                "pending_upload_bytes",
+                "oldest_pending_upload_age_ms",
+                "active_uploads",
+                "pending_retry_count",
+                "max_pending_retry_count",
+                "completed_uploads",
+                "completed_upload_bytes",
+                "completed_uploads_per_sec",
+                "completed_upload_bytes_per_sec",
+                "encrypted_objects_written",
+                "encrypted_bytes_written",
+                "encrypted_object_write_failures",
+                "upload_requeues",
+                "canceled_deleted",
+                "canceled_stale",
+                "canceled_stale_before_put",
+                "canceled_stale_after_put",
+                "canceled_stale_after_put_bytes",
+                "pending_upload_snapshot_calls",
+            },
+            ("zeroio",): {
+                "generated_unix_ms",
+                "unpublished_files",
+                "unpublished_epochs",
+                "unpublished_payload_bytes",
+                "uploading_epochs",
+                "replay_backlog_epochs",
+                "replay_backlog_bytes",
+                "publish_ready_backlog_epochs",
+                "replayed_after_restart_epochs",
+                "deferred_delete_backlog_epochs",
+                "deferred_delete_backlog_objects",
+                "deferred_delete_backlog_bytes",
+                "replay_failures",
+                "publish_failures",
+                "cache_bytes",
+                "startup_replay",
+                "last_graceful_shutdown",
+                "health_signals",
+                "drilldown_truncated",
+                "drilldown",
+            },
+            ("cache", "state"): {
+                "dentry_cache",
+                "path_shortcut_cache",
+                "attr_read_cache",
+                "local_backend_dirty_objects",
+                "prefetch_queue_depth",
+                "transit_memory",
+            },
+            ("synchronization", "state"): {
+                "file_sessions",
+                "foreground_reads",
+                "pending_metadata_ops",
+                "inflight_metadata_ops",
+            },
+        }
+        for path, expected in expected_nested_keys.items():
+            with self.subTest(path=".".join(path)):
+                value = runtime
+                for key in path:
+                    value = value[key]
+                self.assertEqual(set(value), expected)
+        self.assertIs(type(runtime["schema_version"]), int)
+        self.assertIs(type(runtime["generated_unix_ms"]), int)
+        self.assertIs(type(runtime["process"]["cpu_percent"]), float)
+        self.assertIs(type(runtime["process"]["rss_bytes"]), int)
+        write_path_scalar_types = {
+            "publisher_pid": int,
+            "generated_unix_ms": int,
+            "uptime_secs": float,
+            "pending_uploads": int,
+            "backend_tag": str,
+            "flush_barrier_calls": int,
+            "flush_barrier_calls_per_sec": float,
+        }
+        for key, value in runtime["write_path"].items():
+            with self.subTest(write_path_key=key):
+                self.assertIs(
+                    type(value), write_path_scalar_types.get(key, dict)
+                )
+        upload_float_fields = {
+            "completed_uploads_per_sec",
+            "completed_upload_bytes_per_sec",
+        }
+        for key, value in runtime["upload"].items():
+            with self.subTest(upload_key=key):
+                self.assertIs(type(value), float if key in upload_float_fields else int)
+        self.assertNotIn("allocator", runtime["write_path"])
 
     def test_cli_rejects_missing_or_empty_stable_evidence(self) -> None:
         (self.root / "direct-serial/large-single/rep-001/pidstat.txt").unlink()
@@ -3553,6 +3760,47 @@ class AnalyzerCliTest(unittest.TestCase):
                         manifest=manifest,
                         derived=derived,
                     )
+
+    def test_raw_measurements_require_boolean_geometry_in_every_runtime_snapshot(self) -> None:
+        cases = (
+            ("large-single", "runtime-foreground-start.json"),
+            ("large-single", "runtime-foreground-end.json"),
+            ("large-single", "runtime-drain-end.json"),
+            ("large-single", "runtime-cleanup-end.json"),
+            ("warm-reopen", "runtime-warm-first-end.json"),
+        )
+        geometry_keys = (
+            "requested_async_dio",
+            "negotiated_async_dio",
+            "requested_writeback_cache",
+            "negotiated_writeback_cache",
+        )
+        for workload, filename in cases:
+            run_dir = self.root / "direct-async" / workload / "rep-001"
+            runtime_path = run_dir / filename
+            original = json.loads(runtime_path.read_text())
+            environment = json.loads((run_dir / "environment.json").read_text())
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            derived = json.loads((run_dir / "derived.json").read_text())
+            for key in geometry_keys:
+                with self.subTest(filename=filename, key=key):
+                    invalid = json.loads(json.dumps(original))
+                    connection = invalid["write_path"]["fuse_connection"]
+                    connection[key] = int(connection[key])
+                    self.write_json(runtime_path, invalid)
+                    try:
+                        with self.assertRaisesRegex(
+                            gate.GateValidationError, "geometry"
+                        ):
+                            gate.validate_raw_measurements(
+                                run_dir,
+                                mode="direct-async",
+                                environment=environment,
+                                manifest=manifest,
+                                derived=derived,
+                            )
+                    finally:
+                        self.write_json(runtime_path, original)
 
     def test_pressure_sources_must_match_validated_raw_evidence(self) -> None:
         run_dir = self.root / "direct-async" / "large-single" / "rep-001"

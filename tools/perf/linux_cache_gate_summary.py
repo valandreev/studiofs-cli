@@ -2465,6 +2465,9 @@ def validate_raw_measurements(
     runtime_drain = _read_json(run_dir / "runtime-drain-end.json")
     runtime_cleanup = _read_json(run_dir / "runtime-cleanup-end.json")
     runtimes = (runtime_start, runtime_end, runtime_drain, runtime_cleanup)
+    midpoint_path = run_dir / "runtime-warm-first-end.json"
+    if midpoint_path.exists():
+        runtimes += (_read_json(midpoint_path),)
     for snapshot in runtimes:
         _require_schema_version(snapshot, EXPECTED_RUNTIME_SCHEMA, "runtime snapshot")
     if not snapshot_is_idle(runtime_start):
@@ -2485,13 +2488,15 @@ def validate_raw_measurements(
         "negotiated_writeback_cache",
     )
     geometry = {key: start_connection.get(key) for key in geometry_keys}
+    validate_negotiated_geometry(mode, geometry)
     for snapshot in runtimes[1:]:
         connection = _value_at(snapshot, geometry_path)
-        if not isinstance(connection, dict) or any(
-            connection.get(key) != geometry[key] for key in geometry_keys
-        ):
+        if not isinstance(connection, dict):
+            raise GateValidationError("raw negotiated geometry is missing")
+        candidate = {key: connection.get(key) for key in geometry_keys}
+        validate_negotiated_geometry(mode, candidate)
+        if candidate != geometry:
             raise GateValidationError("negotiated geometry changed during run")
-    validate_negotiated_geometry(mode, geometry)
 
     def lifecycle_counter(path: tuple[str, ...], label: str) -> int:
         start_value = _value_at(runtime_start, path)
