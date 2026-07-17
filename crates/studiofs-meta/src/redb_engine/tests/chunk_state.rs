@@ -825,6 +825,73 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
 }
 
 #[test]
+fn test_flush_regular_file_overlay_slices_with_attr_skips_smaller_same_epoch_attr() {
+    let engine = temp_engine();
+    let mut current_attr = engine
+        .create_file(
+            ROOT_INO,
+            b"overlay-stale-same-epoch-eof.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let ino = current_attr.ino;
+    current_attr.size = 8192;
+    current_attr.content_epoch = 7;
+    engine.set_attr(&current_attr).unwrap();
+
+    let current_slice = SliceRecord {
+        slice_id: SliceId::default(),
+        order: SliceOrder::default(),
+        range: SliceRange::new(0, 8192).expect("valid range"),
+        payload: Some(PayloadRef::new_partial(200_003, 8192)),
+        payload_state: PayloadRefState::LocalOnly,
+    };
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[(ChunkId(0), vec![current_slice])],
+            Some(&current_attr),
+        )
+        .unwrap();
+
+    let mut stale_attr = current_attr.clone();
+    stale_attr.size = 4096;
+    let stale_slice = SliceRecord {
+        slice_id: SliceId::default(),
+        order: SliceOrder::default(),
+        range: SliceRange::new(0, 4096).expect("valid range"),
+        payload: Some(PayloadRef::new_partial(200_004, 4096)),
+        payload_state: PayloadRefState::LocalOnly,
+    };
+
+    let committed_attr = engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[(ChunkId(0), vec![stale_slice])],
+            Some(&stale_attr),
+        )
+        .unwrap();
+
+    assert!(
+        committed_attr.is_none(),
+        "a smaller same-epoch dirty snapshot must be rejected as stale"
+    );
+    let persisted_attr = engine.get_attr(ino).unwrap();
+    assert_eq!(persisted_attr.size, current_attr.size);
+    let spans = engine.lookup_regular_file_slices(ino, 0, current_attr.size).unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|span| {
+                u64::from(span.range.end) == current_attr.size && span.payload.is_some()
+            }),
+        "rejecting the stale EOF snapshot must preserve current overlay coverage: {spans:?}"
+    );
+}
+
+#[test]
 fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
     let engine = temp_engine();
     let mut attr = engine

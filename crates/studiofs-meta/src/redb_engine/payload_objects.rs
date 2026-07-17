@@ -632,7 +632,13 @@ impl RedbMetaEngine {
 
         if let Some(attr) = attr {
             match Self::get_attr_merged_in_write_txn(&txn, ino) {
-                Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),
+                Ok(current)
+                    if current.content_epoch > attr.content_epoch
+                        || (current.content_epoch == attr.content_epoch
+                            && current.size > attr.size) =>
+                {
+                    return Ok(None);
+                }
                 Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
                 Err(error) => return Err(error),
             }
