@@ -58,7 +58,7 @@ Run: `cargo clippy -p studiofs-vfs --all-targets --all-features --locked -- -D w
 
 Expected: both commands exit 0 without warnings.
 
-- [ ] **Step 4: Commit the Rust change**
+- [x] **Step 4: Commit the Rust change**
 
 ```bash
 git add crates/studiofs-vfs/src/memory_pressure.rs docs/superpowers/plans/2026-07-18-emergency-memory-pressure-limits.md
@@ -89,9 +89,22 @@ Run the existing Linux cache collector from a new ignored `target/perf/` artifac
 
 Expected: runtime samples remain within the calculated envelope, `overcommitted_minimum=false`, correctness gates pass, and cleanup leaves no mount, process, or owned cgroup behind.
 
-- [ ] **Step 4: Record evidence or the next concrete blocker**
+- [x] **Step 4: Record evidence or the next concrete blocker**
 
 If the collector passes, continue the four required runs from the completion plan. If it fails, preserve the new artifact path and report the first failing gate without relaxing validation.
+
+Evidence from `2026-07-18`: the fresh root
+`target/perf/linux-memory-pressure-eb01d5cc-20260718T082859Z` passed the
+HEAD/binary-bound correctness manifest 10/10 and the Direct async pressure
+boundary used `host_and_cgroup`, a positive envelope, managed limits within
+90 percent of that envelope, `overcommitted_minimum=false`, and zero OOM
+events. Tuple 1 then failed before producing `derived.json`: studiofs-bench
+reported a complete 4,000,000,000-byte write pass, but its immediate read hit
+EOF. Two later clean mounts consistently reported the persisted file size as
+556,793,840 bytes. The artifact is retained under
+`runs/direct-async/large-single/rep-001`; tuple 2-4 execution is blocked until
+the accepted-write size-publication/durability defect is reproduced by a
+focused test and fixed.
 
 ### Self-review
 
