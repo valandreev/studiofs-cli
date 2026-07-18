@@ -311,7 +311,7 @@ impl MemoryPressureModel {
     }
 
     fn limits_for(&self, envelope_bytes: u64) -> MemoryComponentLimits {
-        MemoryComponentLimits {
+        let performance = MemoryComponentLimits {
             memory_cache_bytes: percent(envelope_bytes, 40)
                 .min(self.configured.memory_cache_bytes)
                 .max(self.block_size.max(64 * MIB)),
@@ -324,6 +324,49 @@ impl MemoryPressureModel {
             async_write_bytes: percent(envelope_bytes, 10)
                 .min(self.configured.async_write_bytes)
                 .max(self.negotiated_max_write.max(32 * MIB)),
+        };
+        let managed_budget = percent(envelope_bytes, 90);
+        if performance.managed_total() <= managed_budget {
+            return performance;
+        }
+
+        let floors = MemoryComponentLimits {
+            memory_cache_bytes: self.block_size,
+            dirty_bytes: self.block_size,
+            transit_bytes: self.block_size,
+            async_write_bytes: self.block_size.max(self.negotiated_max_write),
+        };
+        let floor_total = floors.managed_total();
+        if floor_total > managed_budget {
+            return floors;
+        }
+
+        let remaining = managed_budget - floor_total;
+        MemoryComponentLimits {
+            memory_cache_bytes: floors
+                .memory_cache_bytes
+                .saturating_add(weighted_share(remaining, 40, 90))
+                .min(
+                    self.configured
+                        .memory_cache_bytes
+                        .max(floors.memory_cache_bytes),
+                ),
+            dirty_bytes: floors
+                .dirty_bytes
+                .saturating_add(weighted_share(remaining, 25, 90))
+                .min(self.configured.dirty_bytes.max(floors.dirty_bytes)),
+            transit_bytes: floors
+                .transit_bytes
+                .saturating_add(weighted_share(remaining, 15, 90))
+                .min(self.configured.transit_bytes.max(floors.transit_bytes)),
+            async_write_bytes: floors
+                .async_write_bytes
+                .saturating_add(weighted_share(remaining, 10, 90))
+                .min(
+                    self.configured
+                        .async_write_bytes
+                        .max(floors.async_write_bytes),
+                ),
         }
     }
 
@@ -335,6 +378,10 @@ impl MemoryPressureModel {
 
 fn percent(value: u64, percentage: u64) -> u64 {
     (u128::from(value) * u128::from(percentage) / 100) as u64
+}
+
+fn weighted_share(value: u64, weight: u64, total_weight: u64) -> u64 {
+    (u128::from(value) * u128::from(weight) / u128::from(total_weight)) as u64
 }
 
 fn div_ceil_ten_ninths(value: u64) -> u64 {
@@ -549,6 +596,33 @@ mod tests {
         let snapshot = model().observe(Ok(input(gib(8), gib(1))), 0);
 
         assert!(snapshot.overcommitted_minimum);
+        assert_eq!(
+            snapshot.limits,
+            MemoryComponentLimits {
+                memory_cache_bytes: mib(4),
+                dirty_bytes: mib(4),
+                transit_bytes: mib(4),
+                async_write_bytes: mib(8),
+            }
+        );
+    }
+
+    #[test]
+    fn emergency_limits_fit_finite_cgroup_budget() {
+        let mut sample = input(gib(8), gib(8));
+        sample.cgroup_limit_bytes = Some(gib(3));
+        sample.cgroup_current_bytes = Some(gib(3) - gib(1) - mib(168));
+        let snapshot =
+            MemoryPressureModel::new(ceilings(), mib(4), mib(1)).observe(Ok(sample), mib(127));
+        let managed_budget = percent(snapshot.envelope_bytes, 90);
+
+        assert_eq!(snapshot.state, MemoryPressureState::Constrained);
+        assert!(!snapshot.overcommitted_minimum);
+        assert!(snapshot.limits.managed_total() <= managed_budget);
+        assert!(snapshot.limits.memory_cache_bytes >= mib(4));
+        assert!(snapshot.limits.dirty_bytes >= mib(4));
+        assert!(snapshot.limits.transit_bytes >= mib(4));
+        assert!(snapshot.limits.async_write_bytes >= mib(4));
     }
 
     #[test]
@@ -622,7 +696,7 @@ mod tests {
 
         assert_eq!(snapshot.source, MemoryPressureSource::Fallback);
         assert_eq!(snapshot.sampling_failure_count, 1);
-        assert_eq!(snapshot.limits.memory_cache_bytes, mib(64));
+        assert_eq!(snapshot.limits.memory_cache_bytes, mib(4));
     }
 
     #[test]
