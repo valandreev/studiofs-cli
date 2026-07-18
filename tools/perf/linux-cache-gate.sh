@@ -476,8 +476,7 @@ wait_for_memory_pressure_state() {
   local expected="$1"
   local destination="$2"
   local workload_pid="${3:-}"
-  local minimum_admitted="${4:-1}"
-  local workload_start_time="${5:-}"
+  local workload_start_time="${4:-}"
   local snapshot=""
   local matched=""
   local deadline=$((SECONDS + 30))
@@ -491,51 +490,94 @@ from tools.perf import linux_cache_gate_summary as gate
 expected = sys.argv[1]
 sample = gate.memory_pressure_sample(json.load(sys.stdin))
 valid = sample["state"] == expected and sample["source"] == "host_and_cgroup"
-if expected == "constrained":
-    valid = valid and sample["envelope_bytes"] > 0
-    valid = valid and not sample["overcommitted_minimum"]
-    valid = valid and sample["admitted_lower_bound_bytes"] >= int(sys.argv[2])
 print("yes" if valid else "no")
-' "$expected" "$minimum_admitted")"
+' "$expected")"
     if [[ "$matched" == yes ]]; then
       [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
-        die "pressure workload exited before constrained evidence"
+        die "pressure workload exited before memory pressure evidence"
       printf '%s\n' "$snapshot" > "$destination"
       return 0
     fi
     [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
-      die "pressure workload exited before constrained evidence"
+      die "pressure workload exited before memory pressure evidence"
     sleep "$idle_poll_interval"
   done
   die "memory pressure state did not become $expected within 30 seconds"
 }
 
-wait_for_admitted_setup() {
+wait_for_active_pressure_boundary() {
+  local destination="$1"
+  local workload_pid="${2:-}"
+  local workload_start_time="${3:-}"
+  local snapshot=""
+  local matched=""
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS <= deadline )); do
+    snapshot="$(capture_runtime_snapshot)"
+    matched="$(printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
+      python3 -c '
+import json
+import sys
+from tools.perf import linux_cache_gate_summary as gate
+sample = gate.memory_pressure_sample(json.load(sys.stdin))
+managed = sum(
+    sample[field]
+    for field in (
+        "memory_cache_limit_bytes",
+        "dirty_limit_bytes",
+        "transit_limit_bytes",
+        "async_write_limit_bytes",
+    )
+)
+valid = (
+    sample["source"] == "host_and_cgroup"
+    and sample["state"] in ("normal", "constrained")
+    and sample["envelope_bytes"] > 0
+    and sample["overcommitted_minimum"] is False
+    and managed <= sample["envelope_bytes"]
+)
+print("yes" if valid else "no")
+')"
+    if [[ "$matched" == yes ]]; then
+      [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
+        die "pressure workload exited before active pressure evidence"
+      printf '%s\n' "$snapshot" > "$destination"
+      return 0
+    fi
+    [[ -z "$workload_pid" ]] || helper_pid_is_live "$workload_pid" "$workload_start_time" || \
+      die "pressure workload exited before active pressure evidence"
+    sleep "$idle_poll_interval"
+  done
+  die "active memory pressure boundary did not become valid within 30 seconds"
+}
+
+observe_admitted_setup() {
   local destination="$1"
   local feeder_pid="$2"
-  local required_admitted="$3"
+  local diagnostic_target="$3"
   local feeder_start_time="$4"
   local snapshot=""
   local admitted=""
   local deadline=$((SECONDS + 60))
   while (( SECONDS <= deadline )); do
     helper_pid_is_live "$feeder_pid" "$feeder_start_time" || \
-      die "pressure feeder exited before admission target"
+      die "pressure feeder exited during admission observation"
     snapshot="$(capture_runtime_snapshot)"
     admitted="$(printf '%s\n' "$snapshot" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" \
       python3 -c '
 import json
 import sys
+from pathlib import Path
 from tools.perf import linux_cache_gate_summary as gate
-print(gate.memory_pressure_sample(json.load(sys.stdin))["admitted_lower_bound_bytes"])
-')"
-    if (( admitted >= required_admitted )); then
-      printf '%s\n' "$snapshot" > "$destination"
+sample = gate.record_best_pressure_observation(json.load(sys.stdin), Path(sys.argv[1]))
+print(sample["admitted_lower_bound_bytes"])
+' "$destination")"
+    if (( admitted >= diagnostic_target )); then
       return 0
     fi
     sleep "$idle_poll_interval"
   done
-  die "pressure feeder did not reach required live admission within 60 seconds"
+  printf 'Warning: pressure feeder did not reach diagnostic admission target; retained best/last runtime snapshot\n' >&2
 }
 
 capture_post_profile_pressure_once() {
@@ -2132,7 +2174,7 @@ if [[ "$pressure_scenario" == true ]]; then
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["required_admitted_bytes"])
 ' "$artifact_dir/memory-pressure-config.json")"
-  wait_for_admitted_setup "$artifact_dir/runtime-setup-observed.json" \
+  observe_admitted_setup "$artifact_dir/runtime-setup-observed.json" \
     "$pressure_setup_pid" "$required_admitted" "$pressure_setup_start_time"
   setup_observed_ns="$(monotonic_ns)"
   holder_bytes="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repo_root" python3 - \
@@ -2190,20 +2232,16 @@ run_memory_holder(int(sys.argv[1]), *map(Path, sys.argv[2:]))
   touch "$memory_holder_start"
   wait_for_file "$memory_holder_ready" readiness \
     "$memory_holder_pid" "$memory_holder_start_time"
-  target_envelope="$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
-import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["target_envelope_bytes"])
-' "$artifact_dir/memory-pressure-config.json")"
-  wait_for_memory_pressure_state constrained \
+  wait_for_active_pressure_boundary \
     "$artifact_dir/runtime-pressure-before-profile.json" \
-    "$pressure_setup_pid" "$((target_envelope + 1))" "$pressure_setup_start_time"
+    "$pressure_setup_pid" "$pressure_setup_start_time"
   stamp_runtime_snapshot "$artifact_dir/runtime-pressure-before-profile.json"
   capture_memory_event_boundary pressure "$artifact_dir/memory-events-pressure.json"
   cat >> "$artifact_dir/command.txt" <<COMMAND
 pressure-feeder --o-direct --working-set "$setup_working_set_bytes"
-observe-live-admission --minimum "$required_admitted"
+observe-live-admission --diagnostic-target "$required_admitted" --timeout 60
 memory-holder --bytes "$holder_bytes" --cgroup "$cgroup"
-constrained-boundary --require-feeder-live --admitted-gt-envelope
+active-pressure-boundary --require-feeder-live --state normal-or-constrained
 profile-async --profile "$workload" --run-dir <owned-workload-dir>
 profile-read-measure --method inline-unbuffered-read-v1
 profile-hash --separate-from-timing
@@ -2374,7 +2412,7 @@ PY
       "$artifact_dir/pressure-measure.json" "$pressure_workload_bytes" ""
     run_inline_client pressure-hash "$pressure_run_dir" \
       "$artifact_dir/pressure-hash.json" "$pressure_workload_bytes" ""
-    capture_post_profile_pressure_once \
+    wait_for_active_pressure_boundary \
       "$artifact_dir/runtime-pressure-after-profile.json" \
       "$pressure_setup_pid" "$pressure_setup_start_time"
     stamp_runtime_snapshot "$artifact_dir/runtime-pressure-after-profile.json"

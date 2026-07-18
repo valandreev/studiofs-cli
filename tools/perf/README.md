@@ -130,6 +130,18 @@ bash tools/perf/linux-cache-matrix.sh \
   --dry-run
 ```
 
+To run only the fixed ten-test mounted correctness gate and write its
+HEAD/binary-bound manifest without scheduling performance tuples, use:
+
+```bash
+bash tools/perf/linux-cache-matrix.sh \
+  --correctness-only \
+  --volume "$VOLUME" \
+  --mount-root "$RUN/mounts" \
+  --cgroup-root "$CGROUP_ROOT" \
+  --output-root "$RUN"
+```
+
 Use a new output root for every real run. Run the three-repetition diagnostic
 matrix first:
 

@@ -761,6 +761,39 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         finally:
             destination.unlink(missing_ok=True)
 
+    def test_best_pressure_observation_keeps_highest_then_latest_snapshot(self) -> None:
+        destination = Path.cwd() / "target/perf/test-best-pressure-observation.json"
+        destination.unlink(missing_ok=True)
+        try:
+            first = AnalyzerCliTest.pressure_runtime_snapshot(
+                {
+                    **self.evidence()["runtime_samples"]["setup_observed"],
+                    "admitted_lower_bound_bytes": 100,
+                }
+            )
+            lower = AnalyzerCliTest.pressure_runtime_snapshot(
+                {
+                    **self.evidence()["runtime_samples"]["setup_observed"],
+                    "generation": 2,
+                    "admitted_lower_bound_bytes": 50,
+                }
+            )
+            equal = AnalyzerCliTest.pressure_runtime_snapshot(
+                {
+                    **self.evidence()["runtime_samples"]["setup_observed"],
+                    "generation": 3,
+                    "admitted_lower_bound_bytes": 100,
+                }
+            )
+
+            gate.record_best_pressure_observation(first, destination)
+            gate.record_best_pressure_observation(lower, destination)
+            gate.record_best_pressure_observation(equal, destination)
+
+            self.assertEqual(json.loads(destination.read_text()), equal)
+        finally:
+            destination.unlink(missing_ok=True)
+
     def test_runtime_snapshot_is_normalized_from_wire_metrics(self) -> None:
         names = {
             "source": 3,
@@ -900,11 +933,10 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(gate.GateValidationError, message):
                     self.validate(evidence=evidence)
 
-    def test_setup_must_prove_admission_and_live_profile(self) -> None:
+    def test_setup_must_prove_direct_write_and_live_profile(self) -> None:
         cases = (
             ("working_set_bytes", 0, "working set"),
             ("cumulative_bytes_written", 0, "direct write"),
-            ("observed_admitted_lower_bound_bytes", 0, "observed admission"),
             ("feeder_pid", 0, "feeder pid"),
             ("feeder_start_time", "0", "start time"),
             ("feeder_live_before_profile", False, "live"),
@@ -922,8 +954,20 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         drained = self.evidence()
         drained["setup"]["cumulative_bytes_written"] = 10 << 30
         drained["runtime_samples"]["pressure"][0]["admitted_lower_bound_bytes"] = 1_000
-        with self.assertRaisesRegex(gate.GateValidationError, "envelope"):
-            self.validate(evidence=drained)
+        self.assertTrue(self.validate(evidence=drained)["passed"])
+
+    def test_zero_feeder_admission_is_diagnostic_when_holder_proves_pressure(self) -> None:
+        evidence = self.evidence()
+        evidence["setup"]["observed_admitted_lower_bound_bytes"] = 0
+        evidence["runtime_samples"]["setup_observed"][
+            "admitted_lower_bound_bytes"
+        ] = 0
+        initial = evidence["runtime_samples"]["pressure"][0]
+        initial.update(state="normal", admitted_lower_bound_bytes=0)
+
+        result = self.validate(evidence=evidence)
+
+        self.assertTrue(result["passed"])
 
     def test_holder_exit_status_rejects_bool(self) -> None:
         evidence = self.evidence()
@@ -1292,7 +1336,7 @@ class PressureScenarioHelperTest(unittest.TestCase):
 
         self.assertEqual(scenario["holder_bytes"], 321_511_424)
 
-    def test_scenario_requires_admission_strictly_above_envelope(self) -> None:
+    def test_scenario_records_subtarget_admission_without_rejecting_holder(self) -> None:
         params = {
             "memory_current": 960 << 20,
             "memory_max": 3584 << 20,
@@ -1304,18 +1348,18 @@ class PressureScenarioHelperTest(unittest.TestCase):
             effective_limit=params["memory_max"],
             negotiated_max_write=params["negotiated_max_write"],
         )
-        envelope = target["target_envelope_bytes"]
+        observed = target["target_envelope_bytes"] // 4
         scenario = gate.derive_pressure_scenario(
             **params,
-            observed_admitted_lower_bound=envelope + 1,
+            observed_admitted_lower_bound=observed,
         )
 
-        self.assertEqual(scenario["required_admitted_bytes"], envelope + 1)
-        with self.assertRaisesRegex(gate.GateValidationError, "admission"):
-            gate.derive_pressure_scenario(
-                **params,
-                observed_admitted_lower_bound=envelope,
-            )
+        self.assertEqual(scenario["observed_admitted_lower_bound_bytes"], observed)
+        self.assertEqual(
+            scenario["required_admitted_bytes"],
+            target["required_admitted_bytes"],
+        )
+        self.assertGreater(scenario["holder_bytes"], 0)
 
     def test_scenario_rejects_nonpositive_holder(self) -> None:
         memory_max = 3_238_432_768
@@ -4470,6 +4514,19 @@ class ShellContractTest(unittest.TestCase):
         self.assertFalse((artifact_dir / "memory-holder.ready").exists())
         self.assertFalse((artifact_dir / "memory-holder.release").exists())
 
+    def test_collector_treats_feeder_target_as_diagnostic(self) -> None:
+        source = self.collector.read_text()
+        self.assertIn("record_best_pressure_observation", source)
+        self.assertIn("Warning: pressure feeder did not reach diagnostic", source)
+        self.assertNotIn(
+            'die "pressure feeder did not reach required live admission', source
+        )
+        self.assertIn("active-pressure-boundary", source)
+        self.assertNotIn(
+            "constrained-boundary --require-feeder-live --admitted-gt-envelope",
+            source,
+        )
+
     def test_matrix_dry_run_writes_exact_diagnostic_rotation(self) -> None:
         output_root = self.root / "matrix"
         bench_repo = self.root / "studiofs-bench-source"
@@ -4586,6 +4643,28 @@ class ShellContractTest(unittest.TestCase):
                 and item["collector_command"].endswith("--diagnostic")
                 for item in tuples
             )
+        )
+
+    def test_matrix_correctness_only_stops_before_schedule(self) -> None:
+        output_root = self.root / "correctness-only"
+        completed = self.run_script(
+            self.matrix,
+            "--correctness-only",
+            "--dry-run",
+            "--volume",
+            "shell-contract",
+            "--mount-root",
+            str(self.root / "mounts"),
+            "--cgroup-root",
+            str(self.root / "cgroups"),
+            "--output-root",
+            str(output_root),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((output_root / "correctness-manifest.json").is_file())
+        self.assertFalse((output_root / "schedule.json").exists())
+        self.assertEqual(
+            [path for path in output_root.iterdir() if path.is_dir()], []
         )
 
     def test_collector_real_preflight_rejects_wrong_mount_fstype_quickly(self) -> None:

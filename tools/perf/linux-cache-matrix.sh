@@ -13,6 +13,7 @@ bench_repo="$repo_root/../studiofs-bench"
 studiofs_bin="$repo_root/target/release/studiofs"
 diagnostic=false
 dry_run=false
+correctness_only=false
 
 usage() {
   cat <<'USAGE'
@@ -32,6 +33,7 @@ Options:
   --bench-repo PATH      studiofs-bench source checkout. Defaults to ../studiofs-bench.
   --studiofs PATH        StudioFS binary. Defaults to target/release/studiofs.
   --diagnostic           Mark an exact three-repetition real run promotion-ineligible.
+  --correctness-only     Run only the fixed ten-test mounted correctness gate.
   --dry-run              Write correctness commands, schedule, and tuple artifacts only.
   -h, --help             Show this help.
 
@@ -110,6 +112,10 @@ while (($# > 0)); do
       ;;
     --diagnostic)
       diagnostic=true
+      shift
+      ;;
+    --correctness-only)
+      correctness_only=true
       shift
       ;;
     --dry-run)
@@ -442,6 +448,11 @@ else
     printf 'Error: correctness evidence failed; inspect %s\n' "$correctness_manifest" >&2
     exit 1
   fi
+fi
+
+if [[ "$correctness_only" == true ]]; then
+  printf '%s\n' "$correctness_manifest"
+  exit 0
 fi
 
 declare -a modes=(direct-serial direct-async kernel)
