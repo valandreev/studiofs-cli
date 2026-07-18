@@ -34,7 +34,8 @@ use crate::async_writes::{
 
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
-const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
+const LINUX_FUSE_MAX_READ_SIZE: usize = 1024 * 1024;
+const LINUX_FUSE_MAX_READAHEAD_SIZE: u32 = 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
 const RUNTIME_STATS_FH_START: u64 = u64::MAX / 2;
@@ -1071,6 +1072,16 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_max_background(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_connection_max_read() -> u32 {
+    LINUX_FUSE_MAX_READ_SIZE as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_connection_max_readahead() -> u32 {
+    LINUX_FUSE_MAX_READAHEAD_SIZE
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
     userdata: *mut c_void,
 ) -> u32 {
@@ -1268,6 +1279,8 @@ fn argv_strings_for_cache_policy(
         "subtype=studiofs".to_owned(),
         "-o".to_owned(),
         "auto_unmount".to_owned(),
+        "-o".to_owned(),
+        format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
     ]
 }
 
@@ -5057,6 +5070,8 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert!(args.iter().any(|arg| arg == "max_read=1048576"));
+        assert!(!args.iter().any(|arg| arg.contains("max_readahead")));
         assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
@@ -5162,7 +5177,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_geometry_preserves_requested_and_effective_values() {
+    fn negotiated_geometry_applies_read_limits_and_preserves_effective_values() {
         let (_direct_fixture, direct_state) = cache_test_state(
             "linux-negotiated-geometry-direct",
             super::LinuxFuseCachePolicy::Direct,
@@ -5191,9 +5206,9 @@ mod tests {
         assert_eq!(
             direct_state.negotiated_geometry.get(),
             Some(&super::LinuxFuseNegotiatedGeometry {
-                max_read: 4 * 1024 * 1024,
+                max_read: 1024 * 1024,
                 max_write: 1024 * 1024,
-                max_readahead: 512 * 1024,
+                max_readahead: 1024 * 1024,
                 max_background: 128,
                 congestion_threshold: 96,
                 async_dio: true,

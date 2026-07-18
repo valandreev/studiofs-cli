@@ -11,6 +11,8 @@ int studiofs_linux_fuse_supports_parallel_direct_writes(void);
 int studiofs_linux_fuse_uses_single_thread_loop(void);
 extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
 extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
+extern uint32_t studiofs_linux_fuse_connection_max_read(void);
+extern uint32_t studiofs_linux_fuse_connection_max_readahead(void);
 extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
 extern void studiofs_linux_fuse_record_negotiated_connection(
@@ -118,6 +120,8 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
     if (conn == NULL) {
         return;
     }
+    conn->max_read = studiofs_linux_fuse_connection_max_read();
+    conn->max_readahead = studiofs_linux_fuse_connection_max_readahead();
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
     int async_dio = studiofs_linux_fuse_configure_capability(
