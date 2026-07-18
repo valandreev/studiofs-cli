@@ -8300,6 +8300,8 @@ mod tests {
     fn mounted_forced_unmount_drains_admitted_and_waiting_raw_requests() {
         use std::os::unix::fs::FileExt;
 
+        set_mounted_test_async_dio(true);
+
         let reply_rejections_before = super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed);
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-forced-unmount")
@@ -8593,6 +8595,7 @@ mod tests {
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_read_only_kernel_cache_reuses_stable_pages() {
         set_mounted_test_cache_policy("read-only-kernel");
+        set_mounted_test_async_dio(true);
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::ReadOnlyKernel,
