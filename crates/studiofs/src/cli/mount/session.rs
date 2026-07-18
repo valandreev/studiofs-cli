@@ -895,12 +895,29 @@ fn runtime_shutdown_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+#[cfg(test)]
+type ShutdownTestToken = Weak<StudioVfs>;
+
+#[cfg(not(test))]
+struct ShutdownTestToken;
+
+#[cfg(test)]
+fn shutdown_test_token(vfs: &Arc<StudioVfs>) -> ShutdownTestToken {
+    Arc::downgrade(vfs)
+}
+
+#[cfg(not(test))]
+fn shutdown_test_token(_vfs: &Arc<StudioVfs>) -> ShutdownTestToken {
+    ShutdownTestToken
+}
+
 fn run_mount_vfs_shutdown(
     runtime: &Runtime,
     vfs: Arc<StudioVfs>,
     upload_drain_timeout: Duration,
+    shutdown_test_token: &ShutdownTestToken,
 ) -> anyhow::Result<()> {
-    vfs_shutdown_boundary_for_test();
+    vfs_shutdown_boundary_for_test(shutdown_test_token);
     if tokio::runtime::Handle::try_current().is_ok() {
         let runtime_handle = runtime.handle().clone();
         let shutdown = std::thread::spawn(move || {
@@ -941,8 +958,9 @@ fn stop_mount_diagnostics_host(
 fn shutdown_mount_runtime(
     runtime: Runtime,
     runtime_shutdown_timeout: Duration,
+    shutdown_test_token: &ShutdownTestToken,
 ) -> anyhow::Result<()> {
-    runtime_shutdown_boundary_for_test();
+    runtime_shutdown_boundary_for_test(shutdown_test_token);
     if tokio::runtime::Handle::try_current().is_ok() {
         let shutdown = std::thread::spawn(move || {
             runtime.shutdown_timeout(runtime_shutdown_timeout);
@@ -991,12 +1009,17 @@ fn runtime_shutdown_observed_vfs_was_released_for_test() -> bool {
 }
 
 #[cfg(test)]
-fn record_shutdown_event_for_test(event: &'static str) {
-    observed_runtime_shutdown_vfs_for_test()
+fn record_shutdown_event_for_test(event: &'static str, shutdown_test_token: &ShutdownTestToken) {
+    let mut observed = observed_runtime_shutdown_vfs_for_test()
         .lock()
-        .expect("lock observed runtime-shutdown vfs")
-        .events
-        .push(event);
+        .expect("lock observed runtime-shutdown vfs");
+    if observed
+        .vfs
+        .as_ref()
+        .is_some_and(|vfs| vfs.ptr_eq(shutdown_test_token))
+    {
+        observed.events.push(event);
+    }
 }
 
 #[cfg(test)]
@@ -1009,27 +1032,31 @@ fn shutdown_events_for_test() -> Vec<&'static str> {
 }
 
 #[cfg(test)]
-fn vfs_shutdown_boundary_for_test() {
-    record_shutdown_event_for_test("vfs");
+fn vfs_shutdown_boundary_for_test(shutdown_test_token: &ShutdownTestToken) {
+    record_shutdown_event_for_test("vfs", shutdown_test_token);
 }
 
 #[cfg(not(test))]
-fn vfs_shutdown_boundary_for_test() {}
+fn vfs_shutdown_boundary_for_test(_shutdown_test_token: &ShutdownTestToken) {}
 
 #[cfg(test)]
-fn runtime_shutdown_boundary_for_test() {
+fn runtime_shutdown_boundary_for_test(shutdown_test_token: &ShutdownTestToken) {
     let mut observed = observed_runtime_shutdown_vfs_for_test()
         .lock()
         .expect("lock observed runtime-shutdown vfs");
-    observed.events.push("runtime");
-    observed.vfs_released = observed
+    if !observed
         .vfs
         .as_ref()
-        .is_some_and(|vfs| vfs.upgrade().is_none());
+        .is_some_and(|vfs| vfs.ptr_eq(shutdown_test_token))
+    {
+        return;
+    }
+    observed.events.push("runtime");
+    observed.vfs_released = shutdown_test_token.upgrade().is_none();
 }
 
 #[cfg(not(test))]
-fn runtime_shutdown_boundary_for_test() {}
+fn runtime_shutdown_boundary_for_test(_shutdown_test_token: &ShutdownTestToken) {}
 
 impl MountSession {
     pub(crate) fn prepare(command: MountCommand) -> anyhow::Result<Self> {
@@ -1367,14 +1394,20 @@ impl PreparedMount {
         write_path_observability_publisher.stop_and_join();
         let upload_drain_timeout = shutdown_upload_drain_timeout();
         let runtime_shutdown_timeout = runtime_shutdown_timeout();
+        let shutdown_test_token = shutdown_test_token(&vfs);
         #[cfg(target_os = "linux")]
         {
             let sampler_result = stop_memory_pressure_sampler(&runtime, memory_pressure_sampler);
             #[cfg(test)]
-            record_shutdown_event_for_test("sampler");
+            record_shutdown_event_for_test("sampler", &shutdown_test_token);
             record_error(sampler_result);
         }
-        record_error(run_mount_vfs_shutdown(&runtime, vfs, upload_drain_timeout));
+        record_error(run_mount_vfs_shutdown(
+            &runtime,
+            vfs,
+            upload_drain_timeout,
+            &shutdown_test_token,
+        ));
         if let Some(diagnostics_host) = diagnostics_host {
             record_error(stop_mount_diagnostics_host(&runtime, diagnostics_host));
         }
@@ -1392,7 +1425,11 @@ impl PreparedMount {
         let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
         drop(self.mount_lock.take());
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
-        record_error(shutdown_mount_runtime(runtime, runtime_shutdown_timeout));
+        record_error(shutdown_mount_runtime(
+            runtime,
+            runtime_shutdown_timeout,
+            &shutdown_test_token,
+        ));
 
         first_error.map_or(Ok(()), Err)
     }
