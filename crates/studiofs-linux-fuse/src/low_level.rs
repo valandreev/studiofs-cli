@@ -3735,6 +3735,16 @@ mod tests {
         ))
     }
 
+    fn set_mounted_test_cache_policy(policy: &str) {
+        // Mounted tests are intentionally run serially by the canonical command;
+        // set the policy they exercise instead of depending on the production default.
+        unsafe { std::env::set_var("STUDIOFS_LINUX_FUSE_CACHE_POLICY", policy) };
+    }
+
+    fn set_mounted_test_async_dio(enabled: bool) {
+        unsafe { std::env::set_var("STUDIOFS_FUSE_ASYNC_DIO", if enabled { "1" } else { "0" }) };
+    }
+
     fn run_command_bounded(
         command: &mut Command,
         timeout: Duration,
@@ -8186,6 +8196,9 @@ mod tests {
     fn mounted_same_file_parallel_direct_writes_preserve_disjoint_regions() {
         use std::os::unix::fs::FileExt;
 
+        set_mounted_test_cache_policy("direct");
+        set_mounted_test_async_dio(true);
+
         const WRITERS: usize = 8;
         const REGION_SIZE: usize = 1024 * 1024;
 
@@ -8579,6 +8592,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_read_only_kernel_cache_reuses_stable_pages() {
+        set_mounted_test_cache_policy("read-only-kernel");
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::ReadOnlyKernel,
@@ -8664,6 +8678,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_kernel_cache_coherence_matrix() {
+        set_mounted_test_cache_policy("kernel");
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::Kernel,
@@ -8990,6 +9005,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_kernel_writeback_flush_and_release_are_locally_durable() {
+        set_mounted_test_cache_policy("kernel");
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::Kernel,
@@ -9066,6 +9082,7 @@ mod tests {
     #[test]
     #[ignore = "requires PostgreSQL, S3, /dev/fuse, and fusermount3"]
     fn mounted_kernel_remote_listener_invalidation() {
+        set_mounted_test_cache_policy("kernel");
         let Some(environment) = remote_test_environment() else {
             return;
         };
@@ -9383,6 +9400,8 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_cross_file_fsync_and_close_do_not_share_async_watermark() {
+        set_mounted_test_cache_policy("direct");
+        set_mounted_test_async_dio(true);
         let cache_policy = super::linux_fuse_cache_policy_from_env();
         let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
         assert_eq!(
@@ -9504,6 +9523,8 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_direct_rollback_preserves_reopen_visibility() {
+        set_mounted_test_cache_policy("direct");
+        set_mounted_test_async_dio(false);
         let cache_policy = super::linux_fuse_cache_policy_from_env();
         let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
         assert_eq!(
