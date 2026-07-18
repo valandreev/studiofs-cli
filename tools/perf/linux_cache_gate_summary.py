@@ -918,7 +918,7 @@ def validate_memory_pressure_evidence(
         )
         if managed > envelope:
             raise GateValidationError("managed memory limits exceed the envelope")
-        if not isinstance(sample.get("overcommitted_minimum"), bool):
+        if sample.get("overcommitted_minimum") is not False:
             raise GateValidationError("overcommitted minimum flag is invalid")
         for field in (
             "transition_count",

@@ -899,6 +899,13 @@ class MemoryPressureEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateValidationError, "envelope"):
             self.validate(evidence=evidence)
 
+    def test_post_profile_overcommit_is_rejected(self) -> None:
+        evidence = self.evidence()
+        evidence["runtime_samples"]["pressure"][1]["overcommitted_minimum"] = True
+
+        with self.assertRaisesRegex(gate.GateValidationError, "overcommitted"):
+            self.validate(evidence=evidence)
+
     def test_pressure_requires_joint_source_and_cgroup_current_transitions(self) -> None:
         cases = (
             (
