@@ -447,16 +447,14 @@ fn update_handle_gauges(
     current_depth: usize,
 ) {
     if previous_depth > 0 {
-        let remove_previous = match state.pending_handle_depths.entry(previous_depth) {
+        match state.pending_handle_depths.entry(previous_depth) {
             std::collections::btree_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
                 *entry.get_mut() -= 1;
-                false
             }
-            std::collections::btree_map::Entry::Occupied(_) => true,
-            std::collections::btree_map::Entry::Vacant(_) => false,
-        };
-        if remove_previous {
-            state.pending_handle_depths.remove(&previous_depth);
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                entry.remove();
+            }
+            std::collections::btree_map::Entry::Vacant(_) => {}
         }
     }
     if current_depth > 0 {

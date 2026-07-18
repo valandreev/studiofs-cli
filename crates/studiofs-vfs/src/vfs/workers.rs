@@ -562,10 +562,10 @@ impl StudioVfs {
     }
 
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
-        let mut unique = HashSet::new();
+        let mut seen = HashSet::new();
         let unique = inodes
             .into_iter()
-            .filter(|ino| unique.insert(*ino))
+            .filter(|ino| seen.insert(*ino))
             .collect::<Vec<_>>();
         for &ino in &unique {
             self.retire_os_cache_inode(ino);
