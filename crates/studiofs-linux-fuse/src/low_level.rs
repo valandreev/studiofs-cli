@@ -454,9 +454,7 @@ impl SessionState {
         connection_config: LinuxFuseConnectionConfig,
     ) -> Self {
         let cache_policy = linux_fuse_cache_policy_from_env();
-        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
-        let requested_async_dio =
-            linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref());
+        let requested_async_dio = linux_fuse_requested_async_dio(cache_policy);
         Self::new_with_cache_settings(
             vfs,
             runtime_handle,
@@ -1153,7 +1151,29 @@ fn current_gid() -> u32 {
     unsafe { libc::getegid() }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MOUNTED_TEST_CACHE_POLICY: std::cell::Cell<Option<LinuxFuseCachePolicy>> =
+        const { std::cell::Cell::new(None) };
+    static MOUNTED_TEST_ASYNC_DIO: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn mounted_test_cache_policy() -> Option<LinuxFuseCachePolicy> {
+    MOUNTED_TEST_CACHE_POLICY.get()
+}
+
+#[cfg(test)]
+fn mounted_test_async_dio() -> Option<bool> {
+    MOUNTED_TEST_ASYNC_DIO.get()
+}
+
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
+    #[cfg(test)]
+    if let Some(policy) = mounted_test_cache_policy() {
+        return policy;
+    }
     // Internal rollback/diagnostic knob; production defaults to read-only kernel caching.
     std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY")
         .ok()
@@ -1167,6 +1187,15 @@ fn linux_fuse_async_dio_enabled_for(
 ) -> bool {
     cache_policy != LinuxFuseCachePolicy::Kernel
         && override_value.is_none_or(linux_fuse_env_flag_value)
+}
+
+fn linux_fuse_requested_async_dio(cache_policy: LinuxFuseCachePolicy) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = mounted_test_async_dio() {
+        return cache_policy != LinuxFuseCachePolicy::Kernel && enabled;
+    }
+    let override_value = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
+    linux_fuse_async_dio_enabled_for(cache_policy, override_value.as_deref())
 }
 
 fn linux_fuse_parallel_direct_writes_enabled(
@@ -3748,14 +3777,26 @@ mod tests {
         ))
     }
 
-    fn set_mounted_test_cache_policy(policy: &str) {
-        // Mounted tests are intentionally run serially by the canonical command;
-        // set the policy they exercise instead of depending on the production default.
-        unsafe { std::env::set_var("STUDIOFS_LINUX_FUSE_CACHE_POLICY", policy) };
+    struct MountedTestSettings {
+        previous_cache_policy: Option<super::LinuxFuseCachePolicy>,
+        previous_async_dio: Option<bool>,
     }
 
-    fn set_mounted_test_async_dio(enabled: bool) {
-        unsafe { std::env::set_var("STUDIOFS_FUSE_ASYNC_DIO", if enabled { "1" } else { "0" }) };
+    impl Drop for MountedTestSettings {
+        fn drop(&mut self) {
+            super::MOUNTED_TEST_CACHE_POLICY.set(self.previous_cache_policy);
+            super::MOUNTED_TEST_ASYNC_DIO.set(self.previous_async_dio);
+        }
+    }
+
+    fn mounted_test_settings(
+        cache_policy: Option<super::LinuxFuseCachePolicy>,
+        async_dio: Option<bool>,
+    ) -> MountedTestSettings {
+        MountedTestSettings {
+            previous_cache_policy: super::MOUNTED_TEST_CACHE_POLICY.replace(cache_policy),
+            previous_async_dio: super::MOUNTED_TEST_ASYNC_DIO.replace(async_dio),
+        }
     }
 
     fn run_command_bounded(
@@ -8211,21 +8252,20 @@ mod tests {
     fn mounted_same_file_parallel_direct_writes_preserve_disjoint_regions() {
         use std::os::unix::fs::FileExt;
 
-        set_mounted_test_cache_policy("direct");
-        set_mounted_test_async_dio(true);
+        let _settings =
+            mounted_test_settings(Some(super::LinuxFuseCachePolicy::Direct), Some(true));
 
         const WRITERS: usize = 8;
         const REGION_SIZE: usize = 1024 * 1024;
 
         let cache_policy = super::linux_fuse_cache_policy_from_env();
-        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
         assert_eq!(
             cache_policy,
             super::LinuxFuseCachePolicy::Direct,
             "parallel direct-write regression requires Direct cache policy"
         );
         assert!(
-            super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            super::linux_fuse_requested_async_dio(cache_policy),
             "parallel direct-write regression requires async DIO"
         );
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
@@ -8315,7 +8355,10 @@ mod tests {
     fn mounted_forced_unmount_drains_admitted_and_waiting_raw_requests() {
         use std::os::unix::fs::FileExt;
 
-        set_mounted_test_async_dio(true);
+        let _settings = mounted_test_settings(
+            Some(super::LinuxFuseCachePolicy::ReadOnlyKernel),
+            Some(true),
+        );
 
         let reply_rejections_before = super::ASYNC_WRITE_REPLY_REJECTIONS.load(Ordering::Relaxed);
         let fixture =
@@ -8609,8 +8652,10 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_read_only_kernel_cache_reuses_stable_pages() {
-        set_mounted_test_cache_policy("read-only-kernel");
-        set_mounted_test_async_dio(true);
+        let _settings = mounted_test_settings(
+            Some(super::LinuxFuseCachePolicy::ReadOnlyKernel),
+            Some(true),
+        );
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::ReadOnlyKernel,
@@ -8696,7 +8741,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_kernel_cache_coherence_matrix() {
-        set_mounted_test_cache_policy("kernel");
+        let _settings = mounted_test_settings(Some(super::LinuxFuseCachePolicy::Kernel), None);
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::Kernel,
@@ -9023,7 +9068,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_kernel_writeback_flush_and_release_are_locally_durable() {
-        set_mounted_test_cache_policy("kernel");
+        let _settings = mounted_test_settings(Some(super::LinuxFuseCachePolicy::Kernel), None);
         assert_eq!(
             super::linux_fuse_cache_policy_from_env(),
             super::LinuxFuseCachePolicy::Kernel,
@@ -9100,7 +9145,7 @@ mod tests {
     #[test]
     #[ignore = "requires PostgreSQL, S3, /dev/fuse, and fusermount3"]
     fn mounted_kernel_remote_listener_invalidation() {
-        set_mounted_test_cache_policy("kernel");
+        let _settings = mounted_test_settings(Some(super::LinuxFuseCachePolicy::Kernel), None);
         let Some(environment) = remote_test_environment() else {
             return;
         };
@@ -9418,17 +9463,16 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_cross_file_fsync_and_close_do_not_share_async_watermark() {
-        set_mounted_test_cache_policy("direct");
-        set_mounted_test_async_dio(true);
+        let _settings =
+            mounted_test_settings(Some(super::LinuxFuseCachePolicy::Direct), Some(true));
         let cache_policy = super::linux_fuse_cache_policy_from_env();
-        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
         assert_eq!(
             cache_policy,
             super::LinuxFuseCachePolicy::Direct,
             "cross-file watermark test requires Direct cache policy"
         );
         assert!(
-            super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            super::linux_fuse_requested_async_dio(cache_policy),
             "cross-file watermark test requires async DIO"
         );
         let fixture = ContractVfsFixture::new("linux-fuse-cross-file-watermark")
@@ -9541,17 +9585,16 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_direct_rollback_preserves_reopen_visibility() {
-        set_mounted_test_cache_policy("direct");
-        set_mounted_test_async_dio(false);
+        let _settings =
+            mounted_test_settings(Some(super::LinuxFuseCachePolicy::Direct), Some(false));
         let cache_policy = super::linux_fuse_cache_policy_from_env();
-        let async_dio_override = std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok();
         assert_eq!(
             cache_policy,
             super::LinuxFuseCachePolicy::Direct,
             "Direct rollback test requires Direct cache policy"
         );
         assert!(
-            !super::linux_fuse_async_dio_enabled_for(cache_policy, async_dio_override.as_deref()),
+            !super::linux_fuse_requested_async_dio(cache_policy),
             "Direct rollback test requires STUDIOFS_FUSE_ASYNC_DIO=0"
         );
         let fixture = ContractVfsFixture::new("linux-fuse-direct-rollback")
