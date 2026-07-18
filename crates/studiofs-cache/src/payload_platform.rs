@@ -400,7 +400,12 @@ fn can_read_unbuffered_range_impl(_offset: u64, len: usize, _alignment: usize) -
     len != 0
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn can_read_unbuffered_range_impl(_offset: u64, len: usize, _alignment: usize) -> bool {
+    len != 0
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn can_read_unbuffered_range_impl(_offset: u64, _len: usize, _alignment: usize) -> bool {
     false
 }
@@ -454,7 +459,37 @@ fn write_all_unbuffered_impl(
     write_all(file, aligned)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn read_unbuffered_impl(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    _scratch: &mut UnbufferedReadBuffer,
+    _alignment: usize,
+) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let read = pread(file, buf, offset)?;
+    if read == 0 {
+        return Ok(0);
+    }
+    let Ok(offset) = libc::off_t::try_from(offset) else {
+        return Ok(read);
+    };
+    let Ok(len) = libc::off_t::try_from(read) else {
+        return Ok(read);
+    };
+    // Best effort: the mounted FUSE inode is the useful page cache. Retaining
+    // the same clean bytes in backing payload files doubles memory pressure.
+    // `posix_fadvise` returns an error number directly; advisory failure must
+    // never turn a successful payload read into an I/O failure.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED);
+    }
+    Ok(read)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn read_unbuffered_impl(
     file: &File,
     buf: &mut [u8],
