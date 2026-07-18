@@ -19,6 +19,37 @@ use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
 
+struct PreparedWriterStackGuard<'a> {
+    vfs: &'a StudioVfs,
+    ino: Ino,
+    armed: bool,
+}
+
+impl<'a> PreparedWriterStackGuard<'a> {
+    fn new(vfs: &'a StudioVfs, ino: Ino) -> Self {
+        Self {
+            vfs,
+            ino,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedWriterStackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.vfs
+                .state
+                .writer_stack
+                .rollback_prepared_inode(self.ino);
+        }
+    }
+}
+
 struct BorrowedOsCacheLifecycleGuard<'a> {
     vfs: &'a StudioVfs,
     lifecycle: Option<OsCacheHandleLifecycle>,
@@ -2091,6 +2122,7 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
+        let mut prepared = PreparedWriterStackGuard::new(self, ino);
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
@@ -2099,6 +2131,7 @@ impl StudioVfs {
             .writer_stack
             .finish_prepared_inode(ino, first_object_id)
             .map_err(|err| VfsError::Other(format!("writer stack finish failed: {err}")))?;
+        prepared.disarm();
         if finished.is_empty() {
             return Ok(0);
         }
@@ -2134,6 +2167,7 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
+        let mut prepared = PreparedWriterStackGuard::new(self, ino);
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
@@ -2142,6 +2176,7 @@ impl StudioVfs {
             .writer_stack
             .finish_prepared_inode(ino, first_object_id)
             .map_err(|err| VfsError::Other(format!("writer stack idle finish failed: {err}")))?;
+        prepared.disarm();
         if finished.is_empty() {
             return Ok(0);
         }

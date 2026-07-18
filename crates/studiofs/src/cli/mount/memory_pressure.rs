@@ -54,12 +54,20 @@ impl LinuxMemoryPressureProbe {
         let Some(limit) = limit else {
             return Ok((None, None));
         };
-        let current = match fs::read_to_string(directory.join("memory.current")) {
-            Ok(contents) => Some(parse_cgroup_counter(&contents)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        let current_path = directory.join("memory.current");
+        let current = match fs::read_to_string(&current_path) {
+            Ok(contents) => parse_cgroup_counter(&contents)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read finite cgroup memory.current at {}",
+                        current_path.display()
+                    )
+                });
+            }
             Err(error) => return Err(error).context("read cgroup memory.current"),
         };
-        Ok(current.map_or((None, None), |current| (Some(limit), Some(current))))
+        Ok((Some(limit), Some(current)))
     }
 }
 
@@ -351,6 +359,23 @@ mod tests {
 
         assert_eq!(sample.cgroup_limit_bytes, None);
         assert_eq!(sample.cgroup_current_bytes, None);
+    }
+
+    #[test]
+    fn probe_rejects_finite_limit_without_current_counter() {
+        let root = probe_root();
+        let (proc_root, cgroup_root) = write_probe_files(root.path(), "0::/slice/test.scope\n");
+        fs::write(
+            cgroup_root.join("slice/test.scope/memory.max"),
+            (4 * GIB).to_string(),
+        )
+        .unwrap();
+
+        let error = LinuxMemoryPressureProbe::new(proc_root, cgroup_root)
+            .sample()
+            .expect_err("finite cgroup limit requires a current usage counter");
+
+        assert!(error.to_string().contains("memory.current"));
     }
 
     #[test]

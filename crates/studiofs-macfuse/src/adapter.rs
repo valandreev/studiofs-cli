@@ -1145,10 +1145,18 @@ impl StudioVfsAdapter {
                 .with_direct_io(pending.policy.direct_io)
                 .with_keep_cache(keep_cache);
             let added_lookup = match reservation {
-                LookupReservation::Ensure => self
-                    .shared
-                    .kernel_inode_liveness
-                    .ensure_observed(pending.ino),
+                LookupReservation::Ensure => {
+                    let added = self
+                        .shared
+                        .kernel_inode_liveness
+                        .ensure_observed(pending.ino);
+                    if added {
+                        self.shared
+                            .kernel_inode_liveness
+                            .record_open_unknown_inode();
+                    }
+                    added
+                }
                 LookupReservation::Observe => {
                     self.shared.kernel_inode_liveness.observe(pending.ino);
                     true
@@ -2460,6 +2468,48 @@ mod release_tests {
         adapter
             .release(attr.ino, opened.file_handle())
             .expect("release read-only handle");
+    }
+
+    #[test]
+    fn macfuse_open_unknown_inode_counts_only_repaired_lookup_reference() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-unknown-inode").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"unknown-open.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let first = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (first_reply, _) =
+            adapter.complete_pending_open_for_test(first, LookupReservation::Ensure);
+        assert_eq!(
+            adapter
+                .shared
+                .kernel_inode_liveness
+                .stats()
+                .open_unknown_inode,
+            1
+        );
+
+        let second = pending_open(&adapter, attr.ino, libc::O_RDONLY);
+        let (second_reply, _) =
+            adapter.complete_pending_open_for_test(second, LookupReservation::Ensure);
+        assert_eq!(
+            adapter
+                .shared
+                .kernel_inode_liveness
+                .stats()
+                .open_unknown_inode,
+            1
+        );
+
+        adapter
+            .release(attr.ino, first_reply.file_handle())
+            .expect("release first handle");
+        adapter
+            .release(attr.ino, second_reply.file_handle())
+            .expect("release second handle");
     }
 
     #[test]

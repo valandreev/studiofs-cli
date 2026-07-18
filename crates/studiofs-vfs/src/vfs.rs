@@ -6593,9 +6593,7 @@ impl StudioVfs {
                     lifecycle,
                 );
             }
-            if self.handle_table.has_active_open_overlay(open_file.ino)
-                || self.os_cache.has_active_writer(open_file.ino)
-            {
+            if self.handle_table.has_active_open_overlay(open_file.ino) {
                 self.os_cache.clear(open_file.ino);
                 return (
                     OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter),
@@ -6617,7 +6615,10 @@ impl StudioVfs {
                         );
                     }
                 };
-            (self.os_cache.observe(&attr, &spans), lifecycle)
+            (
+                self.os_cache.observe_without_active_writer(&attr, &spans),
+                lifecycle,
+            )
         });
         if should_record {
             self.os_cache.record_decision(decision);

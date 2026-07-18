@@ -242,11 +242,15 @@ impl OsCacheDecisionCounters {
 }
 
 pub(super) struct OsCacheState {
-    generations: Mutex<LruCache<Ino, OsCacheGeneration>>,
-    active_writers: Mutex<HashMap<Ino, usize>>,
+    entries: Mutex<OsCacheEntries>,
     active_foreground_handles: AtomicU64,
     decision_counters: OsCacheDecisionCounters,
     reset_baseline: Mutex<VfsOsCacheStats>,
+}
+
+struct OsCacheEntries {
+    generations: LruCache<Ino, OsCacheGeneration>,
+    active_writers: HashMap<Ino, usize>,
 }
 
 impl Default for OsCacheState {
@@ -259,20 +263,44 @@ impl OsCacheState {
     fn with_capacity(capacity: usize) -> Self {
         let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
-            generations: Mutex::new(LruCache::new(capacity)),
-            active_writers: Mutex::new(HashMap::new()),
+            entries: Mutex::new(OsCacheEntries {
+                generations: LruCache::new(capacity),
+                active_writers: HashMap::new(),
+            }),
             active_foreground_handles: AtomicU64::new(0),
             decision_counters: OsCacheDecisionCounters::default(),
             reset_baseline: Mutex::new(VfsOsCacheStats::default()),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn observe(
         &self,
         attr: &InodeAttr,
         spans: &[ResolvedSliceSpan],
     ) -> OsCacheOpenDecision {
-        let mut generations = self.generations.lock();
+        let mut entries = self.entries.lock();
+        Self::observe_generation(&mut entries.generations, attr, spans)
+    }
+
+    pub(super) fn observe_without_active_writer(
+        &self,
+        attr: &InodeAttr,
+        spans: &[ResolvedSliceSpan],
+    ) -> OsCacheOpenDecision {
+        let mut entries = self.entries.lock();
+        if entries.active_writers.contains_key(&attr.ino) {
+            entries.generations.pop(&attr.ino);
+            return OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter);
+        }
+        Self::observe_generation(&mut entries.generations, attr, spans)
+    }
+
+    fn observe_generation(
+        generations: &mut LruCache<Ino, OsCacheGeneration>,
+        attr: &InodeAttr,
+        spans: &[ResolvedSliceSpan],
+    ) -> OsCacheOpenDecision {
         let reason = match generations.get(&attr.ino) {
             Some(previous) if previous.matches_metadata(attr, spans) => {
                 return OsCacheOpenDecision::reuse();
@@ -285,11 +313,13 @@ impl OsCacheState {
     }
 
     pub(super) fn clear(&self, ino: Ino) {
-        self.generations.lock().pop(&ino);
+        self.entries.lock().generations.pop(&ino);
     }
 
     pub(super) fn begin_writer(&self, ino: Ino) {
-        *self.active_writers.lock().entry(ino).or_default() += 1;
+        let mut entries = self.entries.lock();
+        *entries.active_writers.entry(ino).or_default() += 1;
+        entries.generations.pop(&ino);
     }
 
     pub(super) fn begin_foreground_handle(&self) {
@@ -311,7 +341,7 @@ impl OsCacheState {
 
     /// Return true only when this call removes the inode's final writer.
     pub(super) fn end_writer(&self, ino: Ino) -> bool {
-        match self.active_writers.lock().entry(ino) {
+        match self.entries.lock().active_writers.entry(ino) {
             Entry::Occupied(mut writer) if *writer.get() > 1 => {
                 *writer.get_mut() -= 1;
                 false
@@ -324,17 +354,19 @@ impl OsCacheState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn has_active_writer(&self, ino: Ino) -> bool {
-        self.active_writers.lock().contains_key(&ino)
+        self.entries.lock().active_writers.contains_key(&ino)
     }
 
     pub(super) fn has_any_active_writer(&self) -> bool {
-        !self.active_writers.lock().is_empty()
+        !self.entries.lock().active_writers.is_empty()
     }
 
     pub(super) fn active_writer_count(&self) -> u64 {
-        self.active_writers
+        self.entries
             .lock()
+            .active_writers
             .values()
             .map(|count| *count as u64)
             .sum()
@@ -533,6 +565,23 @@ mod tests {
         state.begin_writer(84);
 
         assert_eq!(state.active_writer_count(), 3);
+    }
+
+    #[test]
+    fn active_writer_prevents_generation_reuse() {
+        let state = OsCacheState::with_capacity(8);
+        let attr = attr();
+        assert_eq!(
+            state.observe_without_active_writer(&attr, &spans()),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+
+        state.begin_writer(attr.ino);
+
+        assert_eq!(
+            state.observe_without_active_writer(&attr, &spans()),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
     }
 
     #[test]

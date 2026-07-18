@@ -795,6 +795,31 @@ impl MountedWriterStack {
         u32::try_from(object_count).map_err(|_| WriterStackError::ObjectReservationTooLarge)
     }
 
+    pub(super) fn rollback_prepared_inode(&self, ino: Ino) {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return;
+            };
+            Arc::clone(file)
+        };
+        let mut file = file.lock();
+        if file.ino != ino {
+            return;
+        }
+        for chunk in file.chunks.values_mut() {
+            for slice in &mut chunk.slices {
+                if slice.frozen
+                    && slice.writer.dirty_bytes() > 0
+                    && slice.pending_materialization.is_empty()
+                    && slice.materializing.is_empty()
+                {
+                    slice.frozen = false;
+                }
+            }
+        }
+    }
+
     pub(super) fn finish_prepared_inode(
         &self,
         ino: Ino,
@@ -1832,6 +1857,23 @@ mod tests {
         assert_eq!(finished[0].seq + 1, finished[1].seq);
         assert_eq!(finished[0].chunk_offset, 8);
         assert_eq!(finished[1].chunk_offset, 0);
+    }
+
+    #[test]
+    fn prepared_inode_rollback_restores_dirty_slices() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+        stack
+            .write_bytes(write_spec(1, 7, 0, 200), Bytes::from_static(b"dirty"))
+            .expect("write dirty bytes");
+        let first_count = stack.prepare_finish_inode(7).expect("prepare inode");
+        assert!(first_count > 0);
+
+        stack.rollback_prepared_inode(7);
+
+        assert_eq!(
+            stack.prepare_finish_inode(7).expect("prepare inode again"),
+            first_count
+        );
     }
 
     #[test]
