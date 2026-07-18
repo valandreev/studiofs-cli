@@ -1,17 +1,71 @@
 # Linux cache and CPU validation
 
-Date: 2026-07-15
+Date: 2026-07-18
 
 ## Decision
 
-Linux keeps the Direct cache policy and requests FUSE `ASYNC_DIO` by default.
-Set `STUDIOFS_FUSE_ASYNC_DIO=0` only as a serial rollback control. The Kernel
-cache policy remains an internal experiment and is not promoted.
+Linux now uses read-only kernel caching by default. Strict read-only handles
+participate in the FUSE page cache and reuse unchanged pages; write-capable
+handles remain Direct and keep `ASYNC_DIO`. Full FUSE writeback cache is not
+requested. `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` remains a diagnostic
+rollback control.
 
-The final runtime change makes Redb `get_attr(ino)` compare only that inode's
-current and base records. It no longer rebuilds and decodes every regular-file
-chunk graph on each lookup. No Linux `O_DIRECT`, `POSIX_FADV_DONTNEED`, new
-adapter queue, or cache layer was added.
+The mounted inode is the useful user-visible cache. Linux backing payload reads
+therefore use best-effort `POSIX_FADV_DONTNEED` after successful reads, avoiding
+a second copy of the same clean data in the local-cache file page cache.
+
+Historical note (2026-07-15): the earlier runtime change made Redb
+`get_attr(ino)` compare only that inode's current and base records. That work
+did not add Linux `O_DIRECT`, `POSIX_FADV_DONTNEED`, a new adapter queue, or a
+cache layer. The read-only FUSE cache and Linux payload drop-behind changes
+described above were added later, in `8d0f5119` and `18409dd6`.
+
+## 2026-07-18 large-file cache validation
+
+The real `test` volume was mounted through libfuse3 and exercised with one
+8,000,000,000-byte file on a host with about 7.6 GB of RAM. The file therefore
+cannot fit completely in memory. All successful runs used the release binary
+and normal cached application I/O (`direct=0`).
+
+Read-only kernel caching completed the 8 GB `studiofs-bench` write/read run
+without corruption or EOF. The read pass averaged 56.47 MB/s, reached a
+38.30 MB/s minimum, and had a 0.145 sample coefficient of variation. A
+same-binary forced-Direct control completed the write pass but reproduced the
+known premature-EOF failure during read; its visible size regressed to
+3,026,190,320 bytes. This failure is recorded as a separate metadata/coherence
+symptom and is not attributed solely to page-cache policy.
+
+Repeated `fio` reads of the same persisted 8 GB file isolated the cache-pressure
+behavior:
+
+| Variant | Average | Sample CV | Worst sampled interval | p99.9 8 MiB latency | kswapd pages scanned |
+|---|---:|---:|---:|---:|---:|
+| Kernel cache, duplicate backing cache (repeat 2) | 252.8 MB/s | 0.401 | 32.6 MiB/s | 375.4 ms | not sampled |
+| Kernel cache, duplicate backing cache (monitored repeat 3) | 241.9 MB/s | 0.367 | 81.9 MiB/s | 170.9 ms | 3,270,646 |
+| Kernel cache + backing `DONTNEED` (repeat 2) | 195.3 MB/s | 0.203 | 81.4 MiB/s | 116.9 ms | 1,461,962 |
+| Kernel cache + backing `NOREUSE` experiment (repeat 2) | 203.0 MB/s | 0.373 | 106.3 MiB/s | 263.2 ms | not sampled |
+
+`DONTNEED` cut measured reclaim scanning by 55%, reduced throughput variation by
+45%, and reduced monitored p99.9 latency by 32%. It trades about 19% average
+throughput for materially lower tail jitter. The softer Linux 7.0 `NOREUSE`
+experiment recovered only 4% average throughput and restored the large tail, so
+it was rejected.
+
+A 600 MB warmed-file check confirmed the intended fast path: consecutive reads
+took 1.27 s and 0.19 s respectively (about 3.2 GB/s on the second read). The
+mounted integration test also verified that the second unchanged read added no
+FUSE or VFS read callbacks, while a write-capable open remained Direct and
+invalidated stale cached data.
+
+Artifacts are under
+`target/perf/read-only-kernel-8d0f5119-20260718T101207Z/`, including the
+`studiofs-bench` JSON/CSV reports, `fio` JSON and bandwidth logs, runtime stats,
+and 500 ms system-pressure samples. These are diagnostic single-host results,
+not a multi-host promotion matrix.
+
+The selected drop-behind implementation is source revision
+`18409dd606e9f9c356bef1da04b58232141404ea`. Its final release binary SHA-256 is
+`0117cf1f90b21f0182d38111a2433bd0a512b934587c766b418a0335d546edb5`.
 
 ## Provenance
 
