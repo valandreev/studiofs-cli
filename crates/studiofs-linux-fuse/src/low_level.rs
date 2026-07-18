@@ -362,8 +362,11 @@ const _: fn() = assert_send_sync_static::<SessionState>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxFuseCachePolicy {
     Direct,
+    ReadOnlyKernel,
     Kernel,
 }
+
+const DEFAULT_LINUX_FUSE_CACHE_POLICY: LinuxFuseCachePolicy = LinuxFuseCachePolicy::ReadOnlyKernel;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct LinuxFuseNegotiatedGeometry {
@@ -433,6 +436,7 @@ struct LinuxFuseOpenCachePolicy {
 struct LinuxFuseOpenedFile {
     fh: u64,
     ino: u64,
+    read_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -982,6 +986,7 @@ fn record_linux_async_write_stats(
 ) {
     let profile = match metric_config.cache_policy {
         LinuxFuseCachePolicy::Direct => "direct",
+        LinuxFuseCachePolicy::ReadOnlyKernel => "read-only-kernel",
         LinuxFuseCachePolicy::Kernel => "kernel",
     };
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -1138,18 +1143,18 @@ fn current_gid() -> u32 {
 }
 
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
-    // ponytail: internal benchmark knob; promote only after studiofs-bench proves it.
+    // Internal rollback/diagnostic knob; production defaults to read-only kernel caching.
     std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY")
         .ok()
         .and_then(|value| linux_fuse_cache_policy_from_str(&value))
-        .unwrap_or(LinuxFuseCachePolicy::Direct)
+        .unwrap_or(DEFAULT_LINUX_FUSE_CACHE_POLICY)
 }
 
 fn linux_fuse_async_dio_enabled_for(
     cache_policy: LinuxFuseCachePolicy,
     override_value: Option<&str>,
 ) -> bool {
-    cache_policy == LinuxFuseCachePolicy::Direct
+    cache_policy != LinuxFuseCachePolicy::Kernel
         && override_value.is_none_or(linux_fuse_env_flag_value)
 }
 
@@ -1233,8 +1238,11 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
 
 fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
+        "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
             Some(LinuxFuseCachePolicy::Direct)
+        }
+        "" | "hybrid" | "read_only_kernel" | "read_cache" => {
+            Some(LinuxFuseCachePolicy::ReadOnlyKernel)
         }
         "kernel" | "cached" | "page_cache" | "1" | "true" | "yes" | "on" => {
             Some(LinuxFuseCachePolicy::Kernel)
@@ -2423,12 +2431,17 @@ impl SessionState {
         }
         .map_err(|error| vfs_err_to_errno(&error))?;
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        let read_only = linux_fuse_open_is_read_only(open_flags, trunc);
         let fh = self
             .vfs
             .open_created_file_with_known_attr(&attr, open_flags, trunc)
             .map_err(|error| vfs_err_to_errno(&error))?;
         Ok(LinuxFuseCreatedFile {
-            opened: LinuxFuseOpenedFile { fh, ino: attr.ino },
+            opened: LinuxFuseOpenedFile {
+                fh,
+                ino: attr.ino,
+                read_only,
+            },
             attr,
         })
     }
@@ -2542,9 +2555,10 @@ impl SessionState {
         {
             return Err(libc::EROFS);
         }
+        let read_only = linux_fuse_open_is_read_only(open_flags, trunc);
         self.vfs
             .open_file_with_known_attr(&attr, open_flags, trunc)
-            .map(|fh| LinuxFuseOpenedFile { fh, ino })
+            .map(|fh| LinuxFuseOpenedFile { fh, ino, read_only })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -2566,7 +2580,11 @@ impl SessionState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(fh, bytes);
-        Some(Ok(LinuxFuseOpenedFile { fh, ino }))
+        Some(Ok(LinuxFuseOpenedFile {
+            fh,
+            ino,
+            read_only: true,
+        }))
     }
 
     fn read_runtime_stats(
@@ -3170,17 +3188,28 @@ fn with_write_data_slice<T>(
 
 fn linux_fuse_open_cache_policy_for(
     cache_policy: LinuxFuseCachePolicy,
+    read_only: bool,
     async_dio_enabled: bool,
     field_supported: bool,
     disposition: OsCacheDisposition,
 ) -> LinuxFuseOpenCachePolicy {
+    let kernel_cache = cache_policy == LinuxFuseCachePolicy::Kernel
+        || (cache_policy == LinuxFuseCachePolicy::ReadOnlyKernel && read_only);
+    let direct_io = !kernel_cache;
     LinuxFuseOpenCachePolicy {
-        direct_io: cache_policy == LinuxFuseCachePolicy::Direct,
-        keep_cache: cache_policy == LinuxFuseCachePolicy::Kernel
-            && disposition == OsCacheDisposition::Reuse,
-        parallel_direct_writes: cache_policy == LinuxFuseCachePolicy::Direct
+        direct_io,
+        keep_cache: kernel_cache && disposition == OsCacheDisposition::Reuse,
+        parallel_direct_writes: direct_io
             && linux_fuse_parallel_direct_writes_enabled(async_dio_enabled, field_supported),
     }
+}
+
+fn linux_fuse_open_is_read_only(flags: OpenFlags, trunc: bool) -> bool {
+    !trunc
+        && flags.contains(OpenFlags::RDONLY)
+        && !flags.contains(OpenFlags::WRONLY)
+        && !flags.contains(OpenFlags::RDWR)
+        && !flags.contains(OpenFlags::APPEND)
 }
 
 fn fuse_flag(value: bool) -> c_int {
@@ -3395,12 +3424,18 @@ fn complete_file_open_reply_with(
     state.open_reply_serializer.with_inode(opened.ino, || {
         let participation = match state.cache_policy {
             LinuxFuseCachePolicy::Direct => OsCacheParticipation::Disabled,
-            LinuxFuseCachePolicy::Kernel => OsCacheParticipation::Enabled,
+            LinuxFuseCachePolicy::ReadOnlyKernel if !opened.read_only => {
+                OsCacheParticipation::Disabled
+            }
+            LinuxFuseCachePolicy::ReadOnlyKernel | LinuxFuseCachePolicy::Kernel => {
+                OsCacheParticipation::Enabled
+            }
         };
         let decision = state.vfs.prepare_os_cache_open(opened.fh, participation);
         let negotiated = state.negotiated_geometry.get();
         let policy = linux_fuse_open_cache_policy_for(
             state.cache_policy,
+            opened.read_only,
             negotiated.is_some_and(|geometry| geometry.async_dio),
             negotiated.is_some_and(|geometry| geometry.parallel_direct_writes_supported),
             decision.disposition(),
@@ -4378,13 +4413,21 @@ mod tests {
     }
 
     fn opened_file(ino: u64, fh: u64) -> super::LinuxFuseOpenedFile {
-        super::LinuxFuseOpenedFile { fh, ino }
+        super::LinuxFuseOpenedFile {
+            fh,
+            ino,
+            read_only: true,
+        }
     }
 
     fn created_file(attr: &studiofs_meta::InodeAttr, fh: u64) -> super::LinuxFuseCreatedFile {
         super::LinuxFuseCreatedFile {
             attr: attr.clone(),
-            opened: opened_file(attr.ino, fh),
+            opened: super::LinuxFuseOpenedFile {
+                fh,
+                ino: attr.ino,
+                read_only: false,
+            },
         }
     }
 
@@ -4415,7 +4458,11 @@ mod tests {
         let fh = vfs
             .open_file_with_known_attr(&attr, flags, false)
             .expect("open cache test handle");
-        opened_file(ino, fh)
+        super::LinuxFuseOpenedFile {
+            fh,
+            ino,
+            read_only: super::linux_fuse_open_is_read_only(flags, false),
+        }
     }
 
     fn accept_cache_open(
@@ -5014,6 +5061,21 @@ mod tests {
     }
 
     #[test]
+    fn read_only_kernel_is_default_and_has_internal_aliases() {
+        assert_eq!(
+            super::DEFAULT_LINUX_FUSE_CACHE_POLICY,
+            super::LinuxFuseCachePolicy::ReadOnlyKernel
+        );
+        for value in ["", "hybrid", "read_only_kernel", "read_cache"] {
+            assert_eq!(
+                super::linux_fuse_cache_policy_from_str(value),
+                Some(super::LinuxFuseCachePolicy::ReadOnlyKernel),
+                "value={value}",
+            );
+        }
+    }
+
+    #[test]
     fn conn_feature_helper_requests_writeback_cache_when_supported() {
         let writeback_cache_cap = 1_u64 << 16;
         // SAFETY: the C shim mutates and inspects a stack-local fuse_conn_info.
@@ -5040,6 +5102,12 @@ mod tests {
             (super::LinuxFuseCachePolicy::Direct, None, true),
             (super::LinuxFuseCachePolicy::Direct, Some("0"), false),
             (super::LinuxFuseCachePolicy::Direct, Some("1"), true),
+            (super::LinuxFuseCachePolicy::ReadOnlyKernel, None, true),
+            (
+                super::LinuxFuseCachePolicy::ReadOnlyKernel,
+                Some("0"),
+                false,
+            ),
             (super::LinuxFuseCachePolicy::Kernel, None, false),
             (super::LinuxFuseCachePolicy::Kernel, Some("1"), false),
         ];
@@ -5057,6 +5125,7 @@ mod tests {
     fn linux_connection_init_uses_stored_cache_settings() {
         let cases = [
             (super::LinuxFuseCachePolicy::Direct, true, (1, 0)),
+            (super::LinuxFuseCachePolicy::ReadOnlyKernel, true, (1, 0)),
             (super::LinuxFuseCachePolicy::Kernel, false, (0, 1)),
         ];
 
@@ -5732,6 +5801,7 @@ mod tests {
         for (async_dio_enabled, field_supported, expected) in cases {
             let policy = super::linux_fuse_open_cache_policy_for(
                 super::LinuxFuseCachePolicy::Direct,
+                false,
                 async_dio_enabled,
                 field_supported,
                 studiofs_vfs::OsCacheDisposition::Reuse,
@@ -6139,6 +6209,7 @@ mod tests {
             assert_eq!(
                 super::linux_fuse_open_cache_policy_for(
                     cache_policy,
+                    true,
                     async_dio,
                     field_supported,
                     disposition,
@@ -6147,6 +6218,116 @@ mod tests {
                 "cache_policy={cache_policy:?}, async_dio={async_dio}, field_supported={field_supported}, disposition={disposition:?}",
             );
         }
+    }
+
+    #[test]
+    fn read_only_kernel_policy_reuses_read_only_cache() {
+        let policy = super::linux_fuse_open_cache_policy_for(
+            super::LinuxFuseCachePolicy::ReadOnlyKernel,
+            true,
+            true,
+            true,
+            studiofs_vfs::OsCacheDisposition::Reuse,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: true,
+                parallel_direct_writes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn read_only_kernel_policy_keeps_write_capable_open_direct() {
+        let policy = super::linux_fuse_open_cache_policy_for(
+            super::LinuxFuseCachePolicy::ReadOnlyKernel,
+            false,
+            true,
+            true,
+            studiofs_vfs::OsCacheDisposition::Replace,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: true,
+            }
+        );
+    }
+
+    #[test]
+    fn linux_read_only_kernel_classifies_open_access() {
+        let cases = [
+            (OpenFlags::RDONLY, false, true),
+            (OpenFlags::WRONLY, false, false),
+            (OpenFlags::RDWR, false, false),
+            (OpenFlags::RDONLY | OpenFlags::APPEND, false, false),
+            (OpenFlags::RDONLY, true, false),
+        ];
+
+        for (flags, trunc, expected) in cases {
+            assert_eq!(
+                super::linux_fuse_open_is_read_only(flags, trunc),
+                expected,
+                "flags={flags:?}, trunc={trunc}",
+            );
+        }
+    }
+
+    #[test]
+    fn linux_read_only_kernel_second_identical_read_reuses_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-read-only-kernel-identical-read",
+            super::LinuxFuseCachePolicy::ReadOnlyKernel,
+            true,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"stable-hybrid.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let first = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (first_policy, first_decision) = accept_cache_open(&state, first);
+        release_cache_open(&fixture, first);
+
+        let second = begin_cache_open(&fixture, attr.ino, OpenFlags::RDONLY);
+        let (second_policy, second_decision) = accept_cache_open(&state, second);
+
+        assert!(!first_policy.direct_io);
+        assert_eq!(first_decision.disposition(), OsCacheDisposition::Replace);
+        assert!(!second_policy.direct_io);
+        assert!(second_policy.keep_cache);
+        assert_eq!(second_decision.disposition(), OsCacheDisposition::Reuse);
+        release_cache_open(&fixture, second);
+        assert_cache_lifecycle_idle(&fixture);
+    }
+
+    #[test]
+    fn linux_read_only_kernel_write_open_stays_direct_and_invalidates_cache() {
+        let (fixture, state) = cache_test_state(
+            "linux-read-only-kernel-direct-writer",
+            super::LinuxFuseCachePolicy::ReadOnlyKernel,
+            true,
+        );
+        let attr = fixture
+            .vfs()
+            .create(studiofs_meta::ROOT_INO, b"writer-hybrid.bin", 0, 0, 0o644)
+            .expect("create file");
+        state.inode_liveness.observe(attr.ino);
+        let writer = begin_cache_open(&fixture, attr.ino, OpenFlags::WRONLY);
+
+        let (policy, decision) = accept_cache_open(&state, writer);
+
+        assert_eq!(decision.reason(), OsCacheReason::WriteCapable);
+        assert!(policy.direct_io);
+        assert!(!policy.keep_cache);
+        release_cache_open(&fixture, writer);
+        assert_cache_lifecycle_idle(&fixture);
     }
 
     #[test]
@@ -7206,6 +7387,7 @@ mod tests {
     fn kernel_cache_policy_keeps_read_only_open_cache() {
         let policy = super::linux_fuse_open_cache_policy_for(
             super::LinuxFuseCachePolicy::Kernel,
+            true,
             false,
             true,
             studiofs_vfs::OsCacheDisposition::Reuse,
@@ -7225,6 +7407,7 @@ mod tests {
     fn kernel_cache_policy_drops_write_capable_open_cache() {
         let policy = super::linux_fuse_open_cache_policy_for(
             super::LinuxFuseCachePolicy::Kernel,
+            false,
             false,
             true,
             studiofs_vfs::OsCacheDisposition::Replace,
@@ -8391,6 +8574,91 @@ mod tests {
             })();
             result.expect("complete mounted namespace operations");
         });
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_read_only_kernel_cache_reuses_stable_pages() {
+        assert_eq!(
+            super::linux_fuse_cache_policy_from_env(),
+            super::LinuxFuseCachePolicy::ReadOnlyKernel,
+            "read-only kernel cache test requires the production default policy"
+        );
+        let fixture = ContractVfsFixture::new("linux-fuse-read-only-kernel-cache")
+            .expect("create read-only kernel cache fixture");
+        fixture
+            .start()
+            .expect("start read-only kernel cache fixture");
+        let vfs = fixture.vfs();
+        let runtime_handle = fixture.runtime().handle().clone();
+
+        run_mounted_vfs_test(
+            "read-only-kernel-cache",
+            Arc::clone(&vfs),
+            runtime_handle,
+            move |mount_point, vfs| {
+                std::fs::metadata(mount_point).expect("probe mounted root");
+                let negotiation = wait_for_snapshot(vfs, Duration::from_secs(5), |snapshot| {
+                    snapshot
+                        .fuse_connection
+                        .negotiated_writeback_cache
+                        .is_some()
+                        && snapshot.fuse_connection.negotiated_async_dio.is_some()
+                })
+                .unwrap_or_else(|error| panic!("FUSE init did not publish negotiation: {error}"));
+                assert_eq!(negotiation.fuse_connection.requested_async_dio, Some(true));
+                assert_eq!(
+                    negotiation.fuse_connection.requested_writeback_cache,
+                    Some(false)
+                );
+                assert_eq!(
+                    negotiation.fuse_connection.negotiated_writeback_cache,
+                    Some(false)
+                );
+
+                let path = mount_point.join("warm-read-only-cache.bin");
+                let payload: Vec<u8> = (0..16 * 1024 * 1024)
+                    .map(|index| u8::try_from(index % 251).expect("payload byte"))
+                    .collect();
+                let write_before = vfs.write_path_observability_snapshot();
+                std::fs::write(&path, &payload).expect("write deterministic payload");
+                let write_after = wait_for_local_mounted_idle(vfs);
+                assert!(
+                    write_after.fuse_callbacks.write.calls
+                        > write_before.fuse_callbacks.write.calls,
+                    "write-capable open must still enter the Direct FUSE write path"
+                );
+
+                let first_before = wait_for_read_quiescence(vfs);
+                let first = std::fs::read(&path).expect("first read-only read");
+                assert_eq!(first, payload);
+                let first_after = wait_for_read_quiescence(vfs);
+                assert!(
+                    first_after.fuse_callbacks.read.calls > first_before.fuse_callbacks.read.calls,
+                    "first read must populate the Linux page cache"
+                );
+
+                let second_before = wait_for_read_quiescence(vfs);
+                let second = std::fs::read(&path).expect("second read-only read");
+                assert_eq!(second, payload);
+                let second_after = wait_for_read_quiescence(vfs);
+                assert_eq!(
+                    second_after.os_cache.reuse,
+                    second_before.os_cache.reuse + 1,
+                    "stable reopen must reuse cached pages"
+                );
+                assert_eq!(
+                    second_after.fuse_callbacks.read.calls, second_before.fuse_callbacks.read.calls,
+                    "warm read must add zero FUSE read callbacks"
+                );
+                assert_eq!(
+                    second_after.vfs_read_path.calls, second_before.vfs_read_path.calls,
+                    "warm read must add zero VFS reads"
+                );
+            },
+        );
+
+        drop(fixture);
     }
 
     #[test]
