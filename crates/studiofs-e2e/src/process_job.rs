@@ -409,7 +409,7 @@ mod imp {
             signal_process_group(self.pgid, libc::SIGKILL)
         }
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_os = "macos"))]
         pub(crate) fn detach(&mut self) {
             if self.pgid > 0 {
                 unregister_group(self.pgid);
