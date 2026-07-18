@@ -94,12 +94,23 @@ struct OsCacheGeneration {
 }
 
 impl OsCacheGeneration {
-    fn from_metadata(attr: &InodeAttr, spans: Vec<ResolvedSliceSpan>) -> Self {
+    fn from_metadata(attr: &InodeAttr, spans: &[ResolvedSliceSpan]) -> Self {
         Self {
             content_epoch: attr.content_epoch,
             size: attr.size,
-            graph: spans.into_iter().map(OsCacheGraphSpan::from).collect(),
+            graph: spans.iter().map(OsCacheGraphSpan::from).collect(),
         }
+    }
+
+    fn matches_metadata(&self, attr: &InodeAttr, spans: &[ResolvedSliceSpan]) -> bool {
+        self.content_epoch == attr.content_epoch
+            && self.size == attr.size
+            && self.graph.len() == spans.len()
+            && self
+                .graph
+                .iter()
+                .zip(spans)
+                .all(|(cached, span)| cached == &OsCacheGraphSpan::from(span))
     }
 }
 
@@ -114,8 +125,8 @@ struct OsCacheGraphSpan {
     payload: Option<OsCachePayload>,
 }
 
-impl From<ResolvedSliceSpan> for OsCacheGraphSpan {
-    fn from(span: ResolvedSliceSpan) -> Self {
+impl From<&ResolvedSliceSpan> for OsCacheGraphSpan {
+    fn from(span: &ResolvedSliceSpan) -> Self {
         Self {
             chunk_id: span.chunk_id.0,
             range_start: span.range.start,
@@ -259,16 +270,17 @@ impl OsCacheState {
     pub(super) fn observe(
         &self,
         attr: &InodeAttr,
-        spans: Vec<ResolvedSliceSpan>,
+        spans: &[ResolvedSliceSpan],
     ) -> OsCacheOpenDecision {
-        let generation = OsCacheGeneration::from_metadata(attr, spans);
         let mut generations = self.generations.lock();
         let reason = match generations.get(&attr.ino) {
-            Some(previous) if previous == &generation => return OsCacheOpenDecision::reuse(),
+            Some(previous) if previous.matches_metadata(attr, spans) => {
+                return OsCacheOpenDecision::reuse();
+            }
             Some(_) => OsCacheReason::GenerationChanged,
             None => OsCacheReason::FirstObservation,
         };
-        generations.put(attr.ino, generation);
+        generations.put(attr.ino, OsCacheGeneration::from_metadata(attr, spans));
         OsCacheOpenDecision::replace(reason)
     }
 
@@ -397,14 +409,14 @@ mod tests {
         let original_attr = attr();
         let original_spans = spans();
         assert_eq!(
-            state.observe(&original_attr, original_spans),
+            state.observe(&original_attr, &original_spans),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
         let mut changed_attr = attr();
         let mut changed_spans = spans();
         mutator(&mut changed_attr, &mut changed_spans);
         assert_eq!(
-            state.observe(&changed_attr, changed_spans),
+            state.observe(&changed_attr, &changed_spans),
             OsCacheOpenDecision::replace(OsCacheReason::GenerationChanged)
         );
     }
@@ -415,10 +427,10 @@ mod tests {
         let attr = attr();
 
         assert_eq!(
-            state.observe(&attr, spans()),
+            state.observe(&attr, &spans()),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
-        assert_eq!(state.observe(&attr, spans()), OsCacheOpenDecision::reuse());
+        assert_eq!(state.observe(&attr, &spans()), OsCacheOpenDecision::reuse());
     }
 
     #[test]
@@ -469,14 +481,17 @@ mod tests {
         local.committed_content_epoch = 6;
         local.upload_state = UploadState::Updating;
         assert_eq!(
-            state.observe(&local, spans()),
+            state.observe(&local, &spans()),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
 
         local.committed_size = local.size;
         local.committed_content_epoch = local.content_epoch;
         local.upload_state = UploadState::Ready;
-        assert_eq!(state.observe(&local, spans()), OsCacheOpenDecision::reuse());
+        assert_eq!(
+            state.observe(&local, &spans()),
+            OsCacheOpenDecision::reuse()
+        );
     }
 
     #[test]
@@ -486,14 +501,14 @@ mod tests {
             let mut attr = attr();
             attr.ino = ino;
             assert_eq!(
-                state.observe(&attr, spans()),
+                state.observe(&attr, &spans()),
                 OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
             );
         }
         let mut evicted = attr();
         evicted.ino = 1;
         assert_eq!(
-            state.observe(&evicted, spans()),
+            state.observe(&evicted, &spans()),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
     }
@@ -525,14 +540,14 @@ mod tests {
         let state = OsCacheState::with_capacity(8);
         let attr = attr();
         assert_eq!(
-            state.observe(&attr, spans()),
+            state.observe(&attr, &spans()),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
 
         state.clear(attr.ino);
 
         assert_eq!(
-            state.observe(&attr, spans()),
+            state.observe(&attr, &spans()),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
     }

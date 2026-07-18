@@ -8360,7 +8360,7 @@ fn observe_os_cache_generation(vfs: &StudioVfs, attr: &InodeAttr) -> OsCacheOpen
         .sync_meta()
         .lookup_regular_file_slices(attr.ino, 0, attr.size)
         .expect("load OS-cache generation graph");
-    vfs.os_cache.observe(attr, spans)
+    vfs.os_cache.observe(attr, &spans)
 }
 
 fn os_cache_payload_test_file(
@@ -9103,7 +9103,7 @@ fn os_cache_last_writer_release_leaves_next_read_in_replace_state() {
         .lookup_regular_file_slices(attr.ino, 0, attr.size)
         .expect("observe current graph");
     assert_eq!(
-        vfs.os_cache.observe(&attr, spans),
+        vfs.os_cache.observe(&attr, &spans),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
 
@@ -9340,7 +9340,7 @@ fn full_kernel_invalidation_clears_generation_when_callback_is_suppressed_for_ac
 
     assert!(invalidator.snapshot().is_empty());
     assert_eq!(
-        vfs.os_cache.observe(&attr, Vec::new()),
+        vfs.os_cache.observe(&attr, &[]),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
     futures::executor::block_on(vfs.release_fh(writer)).expect("release active writer");
@@ -9432,7 +9432,7 @@ fn os_cache_generation_retirement_final_unlink_without_open_handles_clears_gener
         .expect("unlink final pathname");
 
     assert_eq!(
-        vfs.os_cache.observe(&attr, Vec::new()),
+        vfs.os_cache.observe(&attr, &[]),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
 }
@@ -9456,7 +9456,7 @@ fn os_cache_generation_retirement_final_unlink_with_open_handles_clears_before_l
         .expect("unlink final open pathname");
 
     assert_eq!(
-        vfs.os_cache.observe(&attr, Vec::new()),
+        vfs.os_cache.observe(&attr, &[]),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
     fixture
@@ -9556,7 +9556,7 @@ fn os_cache_generation_retirement_rename_overwrite_final_target_clears_only_targ
     .expect("rename over final target");
 
     assert_eq!(
-        vfs.os_cache.observe(&target, Vec::new()),
+        vfs.os_cache.observe(&target, &[]),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
     let moved = vfs.getattr(source.ino).expect("source inode remains live");
@@ -9646,7 +9646,7 @@ fn os_cache_generation_retirement_rename_overwrite_open_final_target_defers_clea
     .expect("rename over open final target");
 
     assert_eq!(
-        vfs.os_cache.observe(&target, target_spans),
+        vfs.os_cache.observe(&target, &target_spans),
         OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
     );
     assert!(

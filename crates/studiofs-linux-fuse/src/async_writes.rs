@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,7 @@ struct LinuxFuseAsyncWriteState {
     active_max_pending_bytes: usize,
     stats: LinuxFuseAsyncWriteStats,
     handles: HashMap<u64, HandleLedger>,
+    pending_handle_depths: BTreeMap<usize, usize>,
 }
 
 pub(crate) struct LinuxFuseAsyncWrites {
@@ -116,14 +117,15 @@ impl LinuxFuseAsyncWrites {
         }
 
         bump_generation(&mut state);
-        let sequence = {
+        let (sequence, previous_depth, current_depth) = {
             let ledger = state.handles.entry(fh).or_default();
+            let previous_depth = ledger.pending.len();
             ledger.next_sequence += 1;
             ledger.pending.insert(ledger.next_sequence);
-            ledger.next_sequence
+            (ledger.next_sequence, previous_depth, ledger.pending.len())
         };
         state.stats.active_requests += 1;
-        refresh_handle_gauges(&mut state);
+        update_handle_gauges(&mut state, previous_depth, current_depth);
 
         Ok(LinuxFuseRequestTicket {
             tracker: Arc::clone(self),
@@ -163,10 +165,11 @@ impl LinuxFuseAsyncWrites {
                 return Err(libc::EIO);
             }
 
-            let bytes_exhausted = bytes
-                > state
-                    .active_max_pending_bytes
-                    .saturating_sub(state.stats.pending_bytes);
+            let bytes_exhausted = state.stats.pending_writes != 0
+                && bytes
+                    > state
+                        .active_max_pending_bytes
+                        .saturating_sub(state.stats.pending_bytes);
             let writes_exhausted = state.stats.pending_writes >= self.limits.max_pending_writes;
             if !bytes_exhausted && !writes_exhausted {
                 if let Some(started) = wait_started {
@@ -286,7 +289,6 @@ impl LinuxFuseAsyncWrites {
         {
             bump_generation(&mut state);
             state.handles.remove(&fh);
-            refresh_handle_gauges(&mut state);
         }
     }
 
@@ -369,7 +371,8 @@ impl LinuxFuseAsyncWrites {
                     }
                 }
             };
-            if let Some(ledger) = state.handles.get_mut(&fh) {
+            let depths = if let Some(ledger) = state.handles.get_mut(&fh) {
+                let previous_depth = ledger.pending.len();
                 ledger.pending.remove(&sequence);
                 if let Some(errno) = error {
                     let replace = ledger
@@ -379,9 +382,14 @@ impl LinuxFuseAsyncWrites {
                         ledger.barrier_error = Some((sequence, errno));
                     }
                 }
-            }
+                Some((previous_depth, ledger.pending.len()))
+            } else {
+                None
+            };
             state.stats.active_requests -= 1;
-            refresh_handle_gauges(&mut state);
+            if let Some((previous_depth, current_depth)) = depths {
+                update_handle_gauges(&mut state, previous_depth, current_depth);
+            }
         }
         drop(state);
         self.changed.notify_all();
@@ -433,19 +441,39 @@ fn bump_generation(state: &mut LinuxFuseAsyncWriteState) {
     state.stats.snapshot_generation += 1;
 }
 
-fn refresh_handle_gauges(state: &mut LinuxFuseAsyncWriteState) {
-    let pending_handles = state
-        .handles
-        .values()
-        .filter(|ledger| !ledger.pending.is_empty())
-        .count();
+fn update_handle_gauges(
+    state: &mut LinuxFuseAsyncWriteState,
+    previous_depth: usize,
+    current_depth: usize,
+) {
+    if previous_depth > 0 {
+        let remove_previous = match state.pending_handle_depths.entry(previous_depth) {
+            std::collections::btree_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
+                *entry.get_mut() -= 1;
+                false
+            }
+            std::collections::btree_map::Entry::Occupied(_) => true,
+            std::collections::btree_map::Entry::Vacant(_) => false,
+        };
+        if remove_previous {
+            state.pending_handle_depths.remove(&previous_depth);
+        }
+    }
+    if current_depth > 0 {
+        *state
+            .pending_handle_depths
+            .entry(current_depth)
+            .or_default() += 1;
+    }
+    if previous_depth == 0 && current_depth > 0 {
+        state.stats.pending_handles += 1;
+    } else if previous_depth > 0 && current_depth == 0 {
+        state.stats.pending_handles -= 1;
+    }
     let max_handle_pending_writes = state
-        .handles
-        .values()
-        .map(|ledger| ledger.pending.len())
-        .max()
-        .unwrap_or(0);
-    state.stats.pending_handles = pending_handles;
+        .pending_handle_depths
+        .last_key_value()
+        .map_or(0, |(depth, _)| *depth);
     state.stats.max_handle_pending_writes = max_handle_pending_writes;
     state.stats.peak_handle_pending_writes = state
         .stats
@@ -805,6 +833,26 @@ mod tests {
         })
         .await
         .expect("active-limit shrink test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_larger_than_active_limit_is_admitted_when_queue_is_empty() {
+        timeout(TEST_TIMEOUT, async {
+            let writes = Arc::new(LinuxFuseAsyncWrites::new(16, 2));
+            writes.set_active_max_pending_bytes(4);
+
+            let writes_for_admission = Arc::clone(&writes);
+            let reservation =
+                tokio::task::spawn_blocking(move || writes_for_admission.admit(8, |_| {}))
+                    .await
+                    .expect("admission worker join")
+                    .expect("empty queue must admit one request above the active limit");
+
+            assert_eq!(writes.stats().pending_bytes, 8);
+            drop(reservation);
+        })
+        .await
+        .expect("oversized active-limit admission timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

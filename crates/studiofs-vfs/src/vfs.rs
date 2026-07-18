@@ -6617,7 +6617,7 @@ impl StudioVfs {
                         );
                     }
                 };
-            (self.os_cache.observe(&attr, spans), lifecycle)
+            (self.os_cache.observe(&attr, &spans), lifecycle)
         });
         if should_record {
             self.os_cache.record_decision(decision);
