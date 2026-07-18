@@ -8,30 +8,46 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Source used to calculate the effective memory limit and available capacity.
 pub enum MemoryPressureSource {
+    /// Host-wide memory counters supplied the effective values.
     Host,
+    /// Control-group counters supplied the effective values.
     Cgroup,
+    /// The tighter of host and finite control-group values was used.
     HostAndCgroup,
+    /// Sampling failed before any healthy observation was available.
     Fallback,
+    /// Adaptive memory-pressure control is disabled.
     Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Current memory-pressure classification used by adaptive consumers.
 pub enum MemoryPressureState {
+    /// Available memory permits normal configured operation.
     Normal,
+    /// Available memory requires reduced component limits.
     Constrained,
+    /// Adaptive pressure handling is disabled.
     Disabled,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Byte limits assigned to StudioFS memory-consuming components.
 pub struct MemoryComponentLimits {
+    /// Maximum resident bytes retained by the in-memory payload cache.
     pub memory_cache_bytes: u64,
+    /// Maximum bytes retained in dirty write buffers.
     pub dirty_bytes: u64,
+    /// Maximum bytes held while data moves between pipeline stages.
     pub transit_bytes: u64,
+    /// Maximum bytes admitted to the asynchronous write queue.
     pub async_write_bytes: u64,
 }
 
 impl MemoryComponentLimits {
+    /// Returns the saturating sum of all managed component limits.
     #[must_use]
     pub fn managed_total(self) -> u64 {
         self.memory_cache_bytes
@@ -42,29 +58,47 @@ impl MemoryComponentLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Raw host and optional control-group counters for one pressure observation.
 pub struct MemoryPressureInput {
+    /// Total physical memory visible to the host, in bytes.
     pub host_total_bytes: u64,
+    /// Host memory currently available without swapping, in bytes.
     pub host_available_bytes: u64,
+    /// Finite control-group memory limit, or `None` when unavailable.
     pub cgroup_limit_bytes: Option<u64>,
+    /// Current control-group memory usage, or `None` when unavailable.
     pub cgroup_current_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Published memory-pressure decision and its resulting component limits.
 pub struct MemoryPressureSnapshot {
+    /// Counters used to derive this snapshot.
     pub source: MemoryPressureSource,
+    /// Pressure classification after hysteresis is applied.
     pub state: MemoryPressureState,
+    /// Monotonically increasing observation generation.
     pub generation: u64,
+    /// Effective total-memory ceiling after host and cgroup limits are combined.
     pub effective_limit_bytes: u64,
+    /// Effective memory currently available to the process.
     pub available_bytes: u64,
+    /// Memory reserved for the OS and unrelated workloads.
     pub reserve_bytes: u64,
+    /// Bytes available to StudioFS-managed components after reserving headroom.
     pub envelope_bytes: u64,
+    /// Per-component limits selected for this observation.
     pub limits: MemoryComponentLimits,
+    /// Number of pressure-state transitions observed so far.
     pub transition_count: u64,
+    /// Number of failed input samples observed so far.
     pub sampling_failure_count: u64,
+    /// Whether mandatory component floors exceed the managed budget.
     pub overcommitted_minimum: bool,
 }
 
 impl MemoryPressureSnapshot {
+    /// Creates a disabled snapshot that preserves the configured limits.
     #[must_use]
     pub fn disabled(limits: MemoryComponentLimits) -> Self {
         Self {
@@ -84,6 +118,7 @@ impl MemoryPressureSnapshot {
 }
 
 #[derive(Debug, Clone)]
+/// Shares the latest pressure snapshot and notifies adaptive consumers of updates.
 pub struct MemoryPressureController {
     snapshot: Arc<RwLock<MemoryPressureSnapshot>>,
     memory_cache_limit_bytes: Arc<AtomicU64>,
@@ -104,6 +139,7 @@ impl MemoryPressureChangeListener {
 }
 
 impl MemoryPressureController {
+    /// Creates a controller containing `initial` as its current snapshot.
     #[must_use]
     pub fn new(initial: MemoryPressureSnapshot) -> Self {
         Self {
@@ -113,16 +149,19 @@ impl MemoryPressureController {
         }
     }
 
+    /// Creates a disabled controller that keeps the configured component limits.
     #[must_use]
     pub fn disabled(configured_limits: MemoryComponentLimits) -> Self {
         Self::new(MemoryPressureSnapshot::disabled(configured_limits))
     }
 
+    /// Returns a copy of the latest published snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MemoryPressureSnapshot {
         *self.snapshot.read()
     }
 
+    /// Replaces the current snapshot and wakes all change listeners.
     pub fn publish(&self, snapshot: MemoryPressureSnapshot) {
         let mut current = self.snapshot.write();
         self.memory_cache_limit_bytes
@@ -132,6 +171,7 @@ impl MemoryPressureController {
         self.changed.notify_waiters();
     }
 
+    /// Returns the shared atomic limit consumed by the memory payload cache.
     #[must_use]
     pub fn memory_cache_limit_bytes(&self) -> Arc<AtomicU64> {
         self.memory_cache_limit_bytes.clone()
@@ -147,12 +187,15 @@ impl MemoryPressureController {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Failure to sample the host or control-group memory counters.
 pub enum MemoryPressureReadError {
+    /// One or more required memory counters could not be read.
     #[error("failed to read memory pressure inputs")]
     ReadFailed,
 }
 
 #[derive(Debug)]
+/// Stateful model that converts memory observations into bounded component limits.
 pub struct MemoryPressureModel {
     configured: MemoryComponentLimits,
     block_size: u64,
@@ -162,6 +205,7 @@ pub struct MemoryPressureModel {
 }
 
 impl MemoryPressureModel {
+    /// Creates a model with configured ceilings and minimum I/O geometry.
     #[must_use]
     pub fn new(
         configured: MemoryComponentLimits,
@@ -177,6 +221,11 @@ impl MemoryPressureModel {
         }
     }
 
+    /// Processes one sample and returns the next pressure snapshot.
+    ///
+    /// Failed samples retain the last healthy limits when available. The
+    /// `admitted_managed_bytes` value keeps already-admitted work visible when
+    /// deciding whether the process remains constrained.
     pub fn observe(
         &mut self,
         input: Result<MemoryPressureInput, MemoryPressureReadError>,

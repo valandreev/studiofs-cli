@@ -14,6 +14,7 @@ pub mod fetch;
 pub mod incarnation;
 mod landing_zone;
 pub mod lock_order;
+/// Host and cgroup memory-pressure sampling, budgeting, and publication.
 pub mod memory_pressure;
 mod ordered_mutex;
 /// Quality-of-service policies and controller plumbing for write-path behavior.

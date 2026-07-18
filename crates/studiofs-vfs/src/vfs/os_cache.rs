@@ -31,15 +31,25 @@ pub enum OsCacheDisposition {
 /// Shared reason for an OS page-cache open decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OsCacheReason {
+    /// The adapter's OS-cache policy is disabled.
     PolicyDisabled,
+    /// The handle permits writes and therefore cannot reuse cached pages.
     WriteCapable,
+    /// The VFS does not recognize the supplied open handle.
     UnknownHandle,
+    /// The inode has no known local synchronization state.
     UnknownLocalState,
+    /// The inode is not a regular file.
     NotRegularFile,
+    /// Unpublished local changes may make cached pages stale.
     LocalDirtyState,
+    /// Another handle can currently write the inode.
     ActiveWriter,
+    /// No prior content generation is available for comparison.
     FirstObservation,
+    /// The inode's content generation changed since the previous observation.
     GenerationChanged,
+    /// The inode's content generation is unchanged and cached pages are reusable.
     StableGeneration,
 }
 
