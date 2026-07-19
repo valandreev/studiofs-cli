@@ -161,16 +161,6 @@ pub enum ScenarioError {
         /// Total outage operations attempted.
         total: usize,
     },
-    /// PostgreSQL outage writer recovery failed.
-    #[error("PostgreSQL outage writer recovery failed for {client}:{path}: {detail}")]
-    PostgresOutageWriterRecoveryFailed {
-        /// Client that failed recovery.
-        client: String,
-        /// Recovered file path.
-        path: String,
-        /// Recovery failure details.
-        detail: String,
-    },
     /// Writer remount failed during outage recovery.
     #[error("PostgreSQL outage writer remount failed for {client}: {detail}")]
     PostgresOutageWriterRemountFailed {
@@ -184,12 +174,6 @@ pub enum ScenarioError {
     PostgresOutagePeerConvergenceFailed {
         /// Peer convergence failure details.
         detail: String,
-    },
-    /// A peer observed outage write visibility too early.
-    #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
-    PeerObservedOutageWrite {
-        /// Observed checksum value.
-        checksum: String,
     },
     /// Insufficient clients provided for smoke scenarios.
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
@@ -232,20 +216,6 @@ pub enum ScenarioError {
         path: String,
         /// Peer convergence failure details.
         detail: String,
-    },
-    /// Crash/restart produced a corrupted advertised file checksum.
-    #[error(
-        "mounted client crash/restart corrupt advertised file for {client}:{path}: expected recovered checksum {expected_checksum}, got {actual_checksum}"
-    )]
-    CrashRestartCorruptAdvertisedFile {
-        /// Client with the corrupted advertised file.
-        client: String,
-        /// Advertised file path.
-        path: String,
-        /// Expected checksum from the writer.
-        expected_checksum: String,
-        /// Observed checksum after recovery.
-        actual_checksum: String,
     },
     /// Namespace collision scenarios require enough clients.
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]

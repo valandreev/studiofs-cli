@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn partial_write_crash_defers_payload_validation_to_final_convergence() {
+    assert!(
+        !requires_post_crash_readback(AdvancedMountedKind::CrashAfterPartialWriteAcceptance),
+        "a crash after an accepted partial write must not require that exact intermediate payload"
+    );
+}
+
+#[test]
+fn full_write_crash_defers_payload_validation_to_final_convergence() {
+    assert!(
+        !requires_post_crash_readback(AdvancedMountedKind::CrashAfterFullWriteAcceptance),
+        "a crash after an accepted full write must not require that exact intermediate payload"
+    );
+}
+
+#[test]
 fn advanced_mounted_isolation_uses_volume_specific_roots_and_payloads() {
     let context = ScenarioContext {
         run_id: "run-1".to_string(),

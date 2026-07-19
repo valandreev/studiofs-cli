@@ -1330,11 +1330,9 @@ impl<'a> ReadMetadataResolver<'a> {
                 remote_attr.committed_content_epoch,
                 false,
             );
-            self.cache_attr(&remote_attr);
-            return Ok(Some(remote_attr));
         }
-
-        Ok(Some(cached_attr))
+        self.cache_attr(&remote_attr);
+        Ok(Some(remote_attr))
     }
 
     async fn cached_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
@@ -1383,11 +1381,9 @@ impl<'a> ReadMetadataResolver<'a> {
                 remote_attr.committed_content_epoch,
                 false,
             );
-            self.cache_attr(&remote_attr);
-            return Ok(Some(remote_attr));
         }
-
-        Ok(Some(cached_attr))
+        self.cache_attr(&remote_attr);
+        Ok(Some(remote_attr))
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
@@ -3367,6 +3363,52 @@ mod tests {
                 invalidator.snapshot(),
                 Vec::<Ino>::new(),
                 "read-path cache refresh must not call WinFSP kernel invalidation while a mounted syscall is in flight"
+            );
+        });
+    }
+
+    #[test]
+    fn cached_attr_async_refreshes_drained_cached_attr_from_unpublished_meta() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "resolve-refreshes-drained-unpublished-cached-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"resolve-refreshes-drained-unpublished-cached-attr.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let mut remote_attr = meta.get_attr(ino).expect("load remote attr");
+            remote_attr.size = 0;
+            remote_attr.upload_state = MetaUploadState::Updating;
+            remote_attr.content_epoch = remote_attr.committed_content_epoch + 1;
+            meta.set_attr(&remote_attr)
+                .expect("persist unpublished remote attr");
+
+            let mut stale_cached_attr = remote_attr.clone();
+            stale_cached_attr.size = 5;
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                stale_cached_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+
+            let resolved_attr = ReadMetadataResolver::new(&vfs, ino)
+                .cached_attr_async()
+                .await
+                .expect("resolve cached attr")
+                .expect("cached attr");
+
+            assert_eq!(
+                resolved_attr.size, remote_attr.size,
+                "a drained local cache must not keep a private unpublished payload after restart"
             );
         });
     }

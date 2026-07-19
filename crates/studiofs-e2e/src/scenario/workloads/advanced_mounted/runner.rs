@@ -1004,14 +1004,21 @@ pub(in crate::scenario) fn run_write_acceptance_crash_operations(
         &path,
         &format!("write acceptance crash phase {phase}\n"),
     );
-    let expected = expected_write_acceptance_payload(kind, &payload);
+    let accepted_payload = match kind {
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => None,
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => {
+            Some(&payload[..payload.len() / 2])
+        }
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => Some(payload.as_slice()),
+        _ => unreachable!("write acceptance crash scenario expected"),
+    };
     operations.push(required_record(record_advanced_operation(
         started,
         operations.len() + 1,
         writer,
         phase,
         &path,
-        match expected.as_deref() {
+        match accepted_payload {
             Some(accepted_payload) => {
                 write_acceptance_payload(writer.mount_point.join(&path), accepted_payload)
                     .map_err(|error| error.to_string())
@@ -1039,37 +1046,24 @@ pub(in crate::scenario) fn run_write_acceptance_crash_operations(
             .remount(&writer.name)
             .map_err(|error| error.to_string()),
     ))?);
-    let recovered_path = writer.mount_point.join(&path);
-    let recovered = bounded_mounted_read(
-        recovered_path.clone(),
-        format!(
-            "write acceptance recovered read {}",
-            recovered_path.display()
-        ),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-    )
-    .map_err(scenario_error_to_io);
-    operations.push(required_record(record_advanced_operation(
-        started,
-        operations.len() + 1,
-        writer,
-        "readback",
-        &path,
-        match expected.as_deref() {
-            Some(expected) => recovered
-                .map_err(|error| error.to_string())
-                .and_then(|bytes| {
-                    if bytes == expected {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "readback mismatch for {path}: expected checksum {}, got {}",
-                            bytes_sha256(expected),
-                            bytes_sha256(&bytes)
-                        ))
-                    }
-                }),
-            None => match recovered {
+    if requires_post_crash_readback(kind) {
+        let recovered_path = writer.mount_point.join(&path);
+        let recovered = bounded_mounted_read(
+            recovered_path.clone(),
+            format!(
+                "write acceptance recovered read {}",
+                recovered_path.display()
+            ),
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+        )
+        .map_err(scenario_error_to_io);
+        operations.push(required_record(record_advanced_operation(
+            started,
+            operations.len() + 1,
+            writer,
+            "readback",
+            &path,
+            match recovered {
                 Ok(bytes) => Err(format!(
                     "readback unexpectedly found {path}: {} bytes, checksum {}",
                     bytes.len(),
@@ -1078,24 +1072,14 @@ pub(in crate::scenario) fn run_write_acceptance_crash_operations(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error.to_string()),
             },
-        },
-    ))?);
+        ))?);
+    }
     operations.sort_by_key(|operation| operation.order);
     Ok(operations)
 }
 
-pub(in crate::scenario) fn expected_write_acceptance_payload(
-    kind: AdvancedMountedKind,
-    payload: &[u8],
-) -> Option<Vec<u8>> {
-    match kind {
-        AdvancedMountedKind::CrashBeforeWriteAcceptance => None,
-        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => {
-            Some(payload[..payload.len() / 2].to_vec())
-        }
-        AdvancedMountedKind::CrashAfterFullWriteAcceptance => Some(payload.to_vec()),
-        _ => unreachable!("write acceptance crash scenario expected"),
-    }
+pub(in crate::scenario) fn requires_post_crash_readback(kind: AdvancedMountedKind) -> bool {
+    kind == AdvancedMountedKind::CrashBeforeWriteAcceptance
 }
 
 pub(in crate::scenario) fn write_acceptance_payload(

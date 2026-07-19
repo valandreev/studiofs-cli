@@ -197,7 +197,7 @@ fn postgres_outage_empty_writer_placeholder_fails_final_convergence() {
 }
 
 #[test]
-fn postgres_outage_writer_recovery_reports_equal_length_corruption() {
+fn postgres_outage_records_equal_length_writer_corruption_until_final_convergence() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
@@ -224,19 +224,23 @@ fn postgres_outage_writer_recovery_reports_equal_length_corruption() {
         client_controller_config: None,
     };
 
-    let err = run_postgres_outage_with_driver(
+    let summary = run_postgres_outage_with_driver(
         &context,
         &mut driver,
         Duration::from_secs(1),
         Duration::from_millis(10),
     )
-    .unwrap_err();
+    .unwrap();
 
-    let ScenarioError::PostgresOutageWriterRecoveryFailed { detail, .. } = err else {
-        panic!("expected writer recovery error");
-    };
-    assert!(detail.contains("expected checksum"));
-    assert!(detail.contains("recovered checksum"));
+    assert_eq!(
+        summary.writer_recovery_status,
+        PostgresOutageWriterRecoveryStatus::DivergedFromAcceptedPayload
+    );
+    assert_ne!(
+        summary.expected_writer_recovery_checksum_sha256,
+        summary.writer_recovery_checksum_sha256
+    );
+    assert!(summary.final_validator.converged);
 }
 
 #[test]

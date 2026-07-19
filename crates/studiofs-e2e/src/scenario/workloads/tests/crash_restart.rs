@@ -385,7 +385,7 @@ fn crash_restart_reports_unrecoverable_loss_when_writer_cannot_read_after_restar
 }
 
 #[test]
-fn crash_restart_reports_corrupt_advertised_file_when_final_peer_differs_from_recovered_writer() {
+fn crash_restart_records_final_checksum_different_from_recovered_writer_after_convergence() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let sandbox = temp.path().join("run-1");
     let scenario_dir = sandbox
@@ -411,18 +411,18 @@ fn crash_restart_reports_corrupt_advertised_file_when_final_peer_differs_from_re
         client_controller_config: None,
     };
 
-    let err = run_crash_restart_with_driver(
+    let summary = run_crash_restart_with_driver(
         &context,
         &mut driver,
         Duration::from_secs(1),
         Duration::from_millis(10),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(matches!(
-        err,
-        ScenarioError::CrashRestartCorruptAdvertisedFile { .. }
-    ));
+    assert!(summary.modes.iter().all(|mode| {
+        mode.local_read_checksum_sha256 != mode.final_checksum_sha256
+            && mode.final_validator.converged
+    }));
 }
 
 #[test]

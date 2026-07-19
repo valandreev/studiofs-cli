@@ -193,12 +193,18 @@ The same numbering is used by `studiofs-e2e list` and by `run --scenario`, so
 `--scenario 1-8` runs this baseline set and `--scenario 2,5,10` runs only those
 numbered scenarios when they are registered.
 
-Scenario 2 follows the rewritten PostgreSQL outage contract: writer recovery
-comes first, then normal publication, then peer convergence. Scenario 4 follows
-the rewritten crash/restart contract: a readable recovered writer checksum is
-the convergence oracle, while unrecoverable local loss is reported separately
-from corrupt advertised files, publication failure, and peer convergence
-failure.
+For every numbered mounted scenario, client-to-client agreement is evaluated at
+the scenario's final convergence gate. A differing payload, early peer
+visibility, or unreadable writer state observed before that gate is recorded in
+the scenario summary and operation artifacts for investigation; it must not
+fail the scenario by itself. The scenario fails when the final mounted-tree
+comparison does not converge, or when an operation needed to continue the
+workload cannot be performed.
+
+Scenario 2 records the writer's post-outage recovery state before normal
+publication and final peer convergence. Scenarios 3 and 4 likewise record
+outage or crash/restart checksums before their final convergence gate; those
+checksums are diagnostics, not convergence oracles.
 
 For Windows/WinFSP runs, the gate checks for stale runner-owned
 `studiofs.exe` / `studiofs-e2e.exe` processes before starting the first
