@@ -13,11 +13,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser as _;
 use serde_json::Value;
 use studiofs_e2e::baseline_gate;
-use studiofs_e2e::cli::{
-    BaselineGateArgs, CleanArgs, Cli, Commands, MacfuseJuicefsParityGateArgs, RunArgs,
-};
+use studiofs_e2e::cli::{BaselineGateArgs, CleanArgs, Cli, Commands, RunArgs};
 use studiofs_e2e::infra::InfraMode;
-use studiofs_e2e::parity_gate;
 use studiofs_e2e::runner::{
     CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
     ScenarioStatus,
@@ -98,45 +95,6 @@ fn cli_parses_local_first_baseline_gate() {
 }
 
 #[test]
-fn cli_parses_macfuse_juicefs_parity_gate() {
-    let gate = Cli::try_parse_from([
-        "studiofs-e2e",
-        "macfuse-juicefs-parity-gate",
-        "--studiofs-bin",
-        "target/debug/studiofs",
-        "--run-id-prefix",
-        "sfs495-parity",
-        "--iterations",
-        "2",
-        "--seed",
-        "495",
-        "--port-range",
-        "29800-29900",
-    ])
-    .unwrap();
-
-    match gate.command {
-        Commands::MacfuseJuicefsParityGate(MacfuseJuicefsParityGateArgs {
-            studiofs_bin,
-            run_id_prefix,
-            iterations,
-            seed,
-            platform,
-            port_range,
-            ..
-        }) => {
-            assert_eq!(studiofs_bin, PathBuf::from("target/debug/studiofs"));
-            assert_eq!(run_id_prefix, "sfs495-parity");
-            assert_eq!(iterations, 2);
-            assert_eq!(seed, 495);
-            assert_eq!(platform, PlatformSelection::MacosFuse);
-            assert_eq!(port_range.as_deref(), Some("29800-29900"));
-        }
-        other => panic!("expected macfuse-juicefs-parity-gate command, got {other:?}"),
-    }
-}
-
-#[test]
 fn list_scenario_line_omits_slug_name() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
     let line = studiofs_e2e::cli::format_scenario_list_line(0, &scenarios[0]);
@@ -179,14 +137,6 @@ fn local_first_baseline_gate_uses_scenarios_1_through_8() {
             "mounted-crash-after-full-write-acceptance",
             "collision-rename-vs-rename",
         ]
-    );
-}
-
-#[test]
-fn macfuse_juicefs_parity_gate_uses_fuse_baseline_and_performance_probe() {
-    assert_eq!(
-        parity_gate::MACFUSE_JUICEFS_PARITY_SCENARIOS,
-        ["mounted-fuse-write-baseline", "mounted-performance-probe",]
     );
 }
 
@@ -269,31 +219,6 @@ fn runner_contract_documents_mounted_level_9_promotion_gate() {
         assert!(
             normalized.contains(expected),
             "runner contract must document mounted level 9+ gate phrase: {expected}"
-        );
-    }
-}
-
-#[test]
-fn runner_contract_documents_macfuse_juicefs_parity_benchmark_gate() {
-    let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("docs/e2e-runner-contract.md");
-    let contract = fs::read_to_string(contract_path).unwrap();
-    let normalized = contract.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    for expected in [
-        "macFUSE JuiceFS Parity Benchmark Gate",
-        "SFS-495",
-        "mounted-fuse-write-baseline",
-        "mounted-performance-probe",
-        "macos-fuse",
-        "juicefs_peak_rss * 1.15",
-        "performance-probe-summary.json",
-        "performance-probe-validation.json",
-    ] {
-        assert!(
-            normalized.contains(expected),
-            "runner contract must document macFUSE JuiceFS parity gate phrase: {expected}"
         );
     }
 }
@@ -519,27 +444,6 @@ fn scenario_list_appends_symlink_attribute_after_invalidation_dropout() {
         "mounted-invalidation-dropout-fallback-convergence"
     );
     assert_eq!(names[22], "mounted-symlink-attribute-convergence");
-}
-
-#[test]
-fn scenario_list_appends_performance_probe_after_symlink_attribute() {
-    let scenarios = studiofs_e2e::scenario::available_scenarios();
-    let names = scenarios
-        .iter()
-        .map(|scenario| scenario.name)
-        .collect::<Vec<_>>();
-
-    assert_eq!(names[22], "mounted-symlink-attribute-convergence");
-    assert_eq!(names[23], "mounted-performance-probe");
-}
-
-#[test]
-fn sfs469_fuse_write_baseline_uses_reserved_98_selector() {
-    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "98"]).unwrap();
-    let Commands::Run(args) = cli.command else {
-        panic!("expected run command");
-    };
-    assert_eq!(args.scenario_names(), ["98"]);
 }
 
 #[test]

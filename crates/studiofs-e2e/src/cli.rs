@@ -8,7 +8,6 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::baseline_gate::{self, BaselineGateRequest};
 use crate::infra::InfraMode;
-use crate::parity_gate::{self, MacfuseJuicefsParityGateRequest};
 use crate::process_diagnostics;
 use crate::runner::{
     self, CleanRequest, PlatformSelection, RetentionPolicy, RunOneRequest, RunRequest,
@@ -50,8 +49,6 @@ pub enum Commands {
     ProcessDump(ProcessDumpArgs),
     /// Run the SFS-405 Local First baseline gate for mounted scenarios 1-8.
     LocalFirstBaselineGate(BaselineGateArgs),
-    /// Run the SFS-495 macFUSE JuiceFS parity benchmark gate.
-    MacfuseJuicefsParityGate(MacfuseJuicefsParityGateArgs),
     /// Remove runner-owned sandboxes from the run root.
     Clean(CleanArgs),
 }
@@ -335,46 +332,6 @@ pub struct BaselineGateArgs {
     pub timeout: Option<String>,
 }
 
-#[derive(Args, Debug)]
-/// Options for the SFS-495 macFUSE JuiceFS parity benchmark gate.
-pub struct MacfuseJuicefsParityGateArgs {
-    /// Path to the StudioFS product binary under test.
-    #[arg(long)]
-    pub studiofs_bin: PathBuf,
-
-    /// Parent directory for per-run sandboxes.
-    #[arg(long, default_value = "target/e2e-runs")]
-    pub root: PathBuf,
-
-    /// Stable run ID prefix. Multiple iterations append -01, -02, ...
-    #[arg(long, default_value = "sfs495-macfuse-juicefs-parity")]
-    pub run_id_prefix: String,
-
-    /// Number of repeated parity passes.
-    #[arg(long, default_value_t = 1)]
-    pub iterations: usize,
-
-    /// Deterministic seed recorded in every run manifest and report.
-    #[arg(long, default_value_t = 495)]
-    pub seed: u64,
-
-    /// Mount backend selection for the parity gate.
-    #[arg(long, value_enum, default_value = "macos-fuse")]
-    pub platform: PlatformSelection,
-
-    /// Sandbox retention policy.
-    #[arg(long, value_enum, default_value = "on-failure")]
-    pub retain: RetentionPolicy,
-
-    /// Optional deterministic host port pool, for example 29800-29900.
-    #[arg(long)]
-    pub port_range: Option<String>,
-
-    /// Optional whole-run timeout string forwarded to each runner pass.
-    #[arg(long)]
-    pub timeout: Option<String>,
-}
-
 impl RunArgs {
     /// Expands positional or repeated selectors into a concrete list of scenario names.
     pub fn scenario_names(&self) -> Vec<String> {
@@ -473,22 +430,6 @@ impl BaselineGateArgs {
             retention: self.retain,
             port_range: self.port_range,
             timeout: self.timeout,
-        }
-    }
-}
-
-impl From<MacfuseJuicefsParityGateArgs> for MacfuseJuicefsParityGateRequest {
-    fn from(args: MacfuseJuicefsParityGateArgs) -> Self {
-        MacfuseJuicefsParityGateRequest {
-            root: args.root,
-            run_id_prefix: args.run_id_prefix,
-            iterations: args.iterations,
-            seed: args.seed,
-            studiofs_bin: args.studiofs_bin,
-            platform: args.platform,
-            retention: args.retain,
-            port_range: args.port_range,
-            timeout: args.timeout,
         }
     }
 }
@@ -613,19 +554,6 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         }
         Commands::LocalFirstBaselineGate(args) => {
             let outcome = baseline_gate::run(args.into_request())?;
-            for run in &outcome.runs {
-                println!(
-                    "timestamp={} run_id={} status={:?} report={}",
-                    timestamp(),
-                    run.run_id,
-                    run.status,
-                    run.report_path.display()
-                );
-            }
-            Ok(outcome.exit_code())
-        }
-        Commands::MacfuseJuicefsParityGate(args) => {
-            let outcome = parity_gate::run(args.into())?;
             for run in &outcome.runs {
                 println!(
                     "timestamp={} run_id={} status={:?} report={}",

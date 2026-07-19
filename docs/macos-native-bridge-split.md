@@ -58,7 +58,7 @@ Responsibilities that stay in `studiofs-fuse`:
 - Linux cache policy, including `FOPEN_DIRECT_IO` behavior and explicit kernel
   invalidation.
 - Linux async write and async DIO experiment controls.
-- Linux mounted smoke tests and Linux performance probes.
+- Linux mounted smoke tests.
 
 Responsibilities that move into `studiofs-macfuse`:
 
@@ -71,7 +71,7 @@ Responsibilities that move into `studiofs-macfuse`:
   listings.
 - macOS mount options such as `local`, `volname`, `iosize`, and future cache
   controls.
-- macOS mounted smoke tests and repeated-read performance probes.
+- macOS mounted smoke tests.
 
 Responsibilities that remain shared:
 
@@ -123,9 +123,7 @@ Linux or Windows behavior.
    behavior at the bridge boundary.
 6. Add opt-in mounted smoke tests for mount, write, read, readdir, xattr, and
    unmount.
-7. Add the repeated-read performance probe and require macOS kernel-cache hits
-   before changing the default macOS routing.
-8. Switch CLI/backend routing on macOS only after the native bridge passes the
+7. Switch CLI/backend routing on macOS only after the native bridge passes the
    focused validation gate.
 
 ## First Implementation Issues
@@ -137,8 +135,7 @@ Linux or Windows behavior.
 5. Add native xattr, resource-fork, Finder metadata, and Unicode boundary
    tests.
 6. Add mounted macOS smoke tests.
-7. Add repeated-read kernel-cache probe and acceptance report.
-8. Switch macOS CLI/backend routing to `studiofs-macfuse` after validation.
+7. Switch macOS CLI/backend routing to `studiofs-macfuse` after validation.
 
 ## Non-goals
 

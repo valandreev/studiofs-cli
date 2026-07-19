@@ -241,48 +241,6 @@ scenario that was planned beyond the accepted baseline must be reintroduced
 through this gate with its invariant class, publication boundary, and required
 lower-layer signal named explicitly.
 
-## macFUSE JuiceFS Parity Benchmark Gate
-
-SFS-495 is the operator-started macFUSE benchmark gate for comparing StudioFS
-mounted behavior against the JuiceFS local-first memory envelope. It does not
-run in the default fast suite. The gate uses the `macos-fuse` platform with the
-existing `mounted-fuse-write-baseline` write-path baseline and the
-`mounted-performance-probe` repeated-read probe, then classifies the run from
-the generated artifacts before changing bridge or cache semantics.
-
-The parity acceptance bar is the local-first validation matrix memory ceiling:
-`mounted_memory.rss_bytes_peak <= min(2 GiB, juicefs_peak_rss * 1.15)`. A run
-that misses this bar is a benchmark failure until the artifacts prove whether
-the cause is product behavior, harness setup, environment drift, or an invalid
-comparison baseline.
-
-Required artifacts:
-
-- `artifacts/scenarios/mounted-fuse-write-baseline/performance-probe-summary.json`
-- `artifacts/scenarios/mounted-fuse-write-baseline/performance-probe-validation.json`
-- `artifacts/scenarios/mounted-performance-probe/performance-probe-summary.json`
-- `artifacts/scenarios/mounted-performance-probe/performance-probe-validation.json`
-
-The `mounted-performance-probe` summary and validation artifacts must make the
-Linux scenario 24 workload shape explicit: `workload_kind` is
-`single_file_sequential`, `payload_file_count` is `1`, and the payload is the
-single path `performance-probe/probe-data.bin` sized by
-`STUDIOFS_E2E_PERF_FILE_BYTES` with a 4 GiB default. Reopen read passes open
-and sequentially read that same file; the summary also records a warmed
-same-handle reread phase.
-
-For Linux StudioFS/JuiceFS comparisons, place the StudioFS scenario 24
-artifacts, the local JuiceFS fio result over `/home/val/mnt/jfs`, optional raw
-cache-disk fio output, and CPU samples under one report directory so
-throughput, warm-read, backlog, and CPU numbers can be compared side by side.
-
-Recommended macOS command:
-
-```text
-cargo build -p studiofs
-cargo run -p studiofs-e2e -- macfuse-juicefs-parity-gate --studiofs-bin target/debug/studiofs
-```
-
 ## Sandbox Layout
 
 Every run creates exactly one canonical sandbox:

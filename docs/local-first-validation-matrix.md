@@ -440,45 +440,6 @@ Reuse the same workload shape on both filesystems: block size, read size,
 concurrency, access pattern, warm/cold setup, cache disk, metadata disk, and
 mount options.
 
-### Linux Mounted Performance Probe Baseline
-
-For Linux scenario 24, `mounted-performance-probe` is the canonical one-file
-sequential benchmark shape. The StudioFS artifact contract must identify the
-workload as `workload_kind = single_file_sequential` and
-`payload_file_count = 1`; the payload path is
-`performance-probe/probe-data.bin`, sized by `STUDIOFS_E2E_PERF_FILE_BYTES`
-with a 4 GiB default. Each read pass reopens and sequentially reads that same
-file.
-
-Record the Linux comparison as one side-by-side report directory, for example:
-
-```text
-target/e2e-runs/<run-id>/artifacts/linux-performance-probe/
-  studiofs-scenario-24/
-    performance-probe-summary.json
-    performance-probe-validation.json
-    performance-probe-samples.ndjson
-  juicefs-local-fio/
-    fio.json
-    mount.txt
-    cpu-samples.ndjson
-  raw-cache-disk-fio/
-    fio.json
-    cpu-samples.ndjson
-  comparison.md
-```
-
-The StudioFS row comes from scenario 24. The JuiceFS row uses the local JuiceFS
-mount at `/home/val/mnt/jfs` with the same one-file sequential payload size and
-block size. Include a raw cache-disk or raw filesystem fio baseline when it is
-available on the same Linux stand.
-
-Every report row must include write throughput, repeated-read throughput,
-same-handle warm-read diagnostics, post-drain warm-read throughput when
-upload-drain waiting is enabled,
-dirty/staged/upload backlog, and CPU sampling. Treat missing JuiceFS numbers as
-an incomplete performance report rather than a pass.
-
 ### SFS-549 Linux Write-Path Evidence Gate
 
 For each Linux write-path implementation change, collect StudioFS evidence with

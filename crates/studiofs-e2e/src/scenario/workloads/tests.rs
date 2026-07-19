@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use super::*;
 use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
-use crate::scenario::{available_scenarios, resolve_scenario};
 
 fn test_isolation(root: &str) -> ScenarioIsolation {
     ScenarioIsolation {
@@ -88,7 +87,6 @@ mod chaos_barriers;
 mod crash_restart;
 mod namespace_collision;
 mod outage;
-mod registry_performance;
 
 struct RecordingSmokeDriver {
     clients: Vec<ClientSpec>,

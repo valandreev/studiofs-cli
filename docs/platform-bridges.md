@@ -272,20 +272,6 @@ accepted tail immediately instead of waiting through the full idle window. The
 bridge applies the `50/40` background queue policy, keeps macFUSE-safe
 `max_write=131072`, and
 reports the preferred I/O size through regular file attributes.
-The mounted performance probe records SFS-491 read-geometry evidence in
-`performance-probe-summary.json`: `read_observations.fuse_read_calls`,
-`read_observations.fuse_read_bytes`, and `read_observations.avg_fuse_read_bytes`
-capture observed macFUSE callback sizing, while
-`read_observations.foreground_local_payload_reads`,
-`read_observations.foreground_local_payload_read_bytes`, and
-`read_observations.avg_foreground_local_payload_read_bytes` show whether those
-callbacks caused matching local payload reads or extra local read amplification.
-When the probe waits for upload drain, the matching
-`read_observations.post_drain_fuse_read_*` and
-`read_observations.post_drain_foreground_local_payload_read_*` fields record the
-same geometry for the post-drain verification read.
-Use that report before adding any daemon-side hot read window.
-
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
 and resource-fork writes stay in xattrs rather than relying on AppleDouble
