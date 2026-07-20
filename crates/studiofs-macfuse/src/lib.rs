@@ -908,7 +908,7 @@ mod tests {
         );
         assert!(
             adapter.reusable_read_buffer_count_for_test() >= 1,
-            "reply and replaced read-window buffers should remain reusable"
+            "replied read buffers should remain reusable"
         );
         assert!(
             adapter
@@ -925,7 +925,7 @@ mod tests {
         );
         assert!(
             adapter.reusable_read_buffer_count_for_test() >= 1,
-            "reply and replaced read-window buffers should remain reusable"
+            "replied read buffers should remain reusable"
         );
         assert!(
             adapter
@@ -968,7 +968,7 @@ mod tests {
         );
         assert!(
             adapter.reusable_read_buffer_count_for_test() >= 1,
-            "reply and replaced read-window buffers should remain reusable"
+            "replied read buffers should remain reusable"
         );
         let first_capacity = adapter
             .reusable_read_buffer_capacity_for_test()
@@ -984,7 +984,7 @@ mod tests {
         );
         assert!(
             adapter.reusable_read_buffer_count_for_test() >= 1,
-            "reply and replaced read-window buffers should remain reusable"
+            "replied read buffers should remain reusable"
         );
         let second_capacity = adapter
             .reusable_read_buffer_capacity_for_test()
@@ -994,76 +994,25 @@ mod tests {
     }
 
     #[test]
-    fn queued_adjacent_reads_reuse_per_handle_window_without_second_vfs_read() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-hit")
-                .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"window.bin",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        let payload = b"0123456789abcdef";
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, payload))
-            .expect("seed payload");
-        vfs.reset_diagnostics_observability();
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
+    fn buffered_adapter_read_executes_exact_kernel_requested_range() {
+        const REQUEST_BYTES: usize = 4 * 1024;
+        const PAYLOAD_BYTES: usize = 256 * 1024;
 
-        let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
-            .expect("queue first read");
-        assert_eq!(
-            &first.wait().expect("first read should complete")[..],
-            b"01234567"
-        );
-        let after_first = vfs.write_path_observability_snapshot();
-        assert_eq!(after_first.vfs_read_path.calls, 1);
-
-        let second = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 8)
-            .expect("queue adjacent read");
-        assert_eq!(
-            &second.wait().expect("second read should complete")[..],
-            b"89abcdef"
-        );
-
-        let after_second = vfs.write_path_observability_snapshot();
-        assert_eq!(after_second.fuse_callbacks.read.calls, 2);
-        assert_eq!(
-            after_second.vfs_read_path.calls, 1,
-            "adjacent read should be served from the macFUSE per-handle window"
-        );
-    }
-
-    #[test]
-    fn queued_max_size_callbacks_reuse_ahead_window_without_second_vfs_read() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-read-window-max-callback",
+            "macfuse-buffered-read-exact-range",
         )
         .expect("create VFS fixture");
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
                 studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"max-callback-window.bin",
+                b"buffered-exact-range.bin",
                 501,
                 20,
                 0o644,
             )
             .expect("create file");
-        let callback_size = super::adapter::max_reusable_read_buffer_capacity_for_test();
-        let payload = vec![0x5A; callback_size * 2];
+        let payload = vec![0xA5; PAYLOAD_BYTES];
         fixture
             .runtime()
             .block_on(vfs.write(attr.ino, 0, &payload))
@@ -1073,39 +1022,54 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
+            .expect("open buffered reader through macFUSE adapter");
+        assert!(
+            !reader.direct_io(),
+            "ordinary macFUSE data handles must use the kernel data cache"
+        );
 
         let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, callback_size as u32)
-            .expect("queue first max-size callback");
-        assert_eq!(
-            first.wait().expect("first callback should complete"),
-            payload[..callback_size]
-        );
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, REQUEST_BYTES as u32)
+            .expect("queue buffered read")
+            .wait()
+            .expect("buffered read should complete");
+        assert_eq!(first, payload[..REQUEST_BYTES]);
 
         let second = adapter
             .queue_read_for_test(
                 attr.ino,
                 reader.file_handle(),
-                callback_size as i64,
-                callback_size as u32,
+                REQUEST_BYTES as i64,
+                REQUEST_BYTES as u32,
             )
-            .expect("queue adjacent max-size callback");
-        assert_eq!(
-            second.wait().expect("second callback should complete"),
-            payload[callback_size..]
-        );
+            .expect("queue adjacent buffered read")
+            .wait()
+            .expect("adjacent buffered read should complete");
+        assert_eq!(second, payload[REQUEST_BYTES..REQUEST_BYTES * 2]);
 
         let metrics = vfs.write_path_observability_snapshot();
         assert_eq!(metrics.fuse_callbacks.read.calls, 2);
         assert_eq!(
-            metrics.vfs_read_path.calls, 1,
-            "the second max-size callback must be served from the macFUSE ahead window"
+            metrics.fuse_callbacks.read.bytes,
+            (REQUEST_BYTES * 2) as u64
+        );
+        assert_eq!(
+            metrics.vfs_read_path.calls, 2,
+            "buffered adjacent callbacks must not reuse a daemon read window"
+        );
+        assert_eq!(
+            metrics.vfs_read_path.requested_bytes,
+            (REQUEST_BYTES * 2) as u64,
+            "buffered reads must leave speculative readahead to the kernel/UBC"
+        );
+        assert_eq!(
+            metrics.fuse_async_read.peak_pending_bytes, REQUEST_BYTES,
+            "buffered read admission must account only the kernel-requested range"
         );
     }
 
     #[test]
-    fn kernel_data_invalidation_clears_adapter_read_window() {
+    fn kernel_data_invalidation_clears_open_cache_snapshot() {
         #[derive(Default)]
         struct RecordingInvalidator {
             data: AtomicBool,
@@ -1123,37 +1087,24 @@ mod tests {
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-read-window-invalidation",
+            "macfuse-open-cache-invalidation",
         )
         .expect("create VFS fixture");
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
                 studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"window-invalidation.bin",
+                b"open-cache-invalidation.bin",
                 501,
                 20,
                 0o644,
             )
             .expect("create file");
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, b"0123456789abcdef"))
-            .expect("seed payload");
-        vfs.reset_diagnostics_observability();
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
+        let _reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
-
-        let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
-            .expect("queue first read");
-        assert_eq!(
-            &first.wait().expect("first read should complete")[..],
-            b"01234567"
-        );
 
         let inner = Arc::new(RecordingInvalidator::default());
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
@@ -1165,24 +1116,6 @@ mod tests {
             "data invalidation must force the next open to drop cached pages"
         );
 
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 8, b"ABCDEFGH"))
-            .expect("replace adjacent payload");
-
-        let second = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 8)
-            .expect("queue adjacent read after invalidation");
-        assert_eq!(
-            &second.wait().expect("second read should complete")[..],
-            b"ABCDEFGH"
-        );
-
-        let metrics = vfs.write_path_observability_snapshot();
-        assert_eq!(
-            metrics.vfs_read_path.calls, 2,
-            "invalidation must force the adjacent read back through VFS"
-        );
         assert!(inner.data.load(Ordering::Acquire));
         assert!(inner.attrs.load(Ordering::Acquire));
     }
@@ -1307,109 +1240,6 @@ mod tests {
             inner.data_calls.load(Ordering::Acquire),
             1,
             "deferred kernel invalidation must flush after active reads drain"
-        );
-    }
-
-    #[test]
-    fn queued_non_adjacent_read_falls_back_to_vfs_instead_of_reusing_window() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-random")
-                .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"random.bin",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        let payload = b"0123456789abcdef";
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, payload))
-            .expect("seed payload");
-        vfs.reset_diagnostics_observability();
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
-
-        let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
-            .expect("queue first read");
-        assert_eq!(
-            &first.wait().expect("first read should complete")[..],
-            b"01234567"
-        );
-
-        let random = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 4, 4)
-            .expect("queue non-adjacent read");
-        assert_eq!(
-            &random.wait().expect("random read should complete")[..],
-            b"4567"
-        );
-
-        let metrics = vfs.write_path_observability_snapshot();
-        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
-        assert_eq!(
-            metrics.vfs_read_path.calls, 2,
-            "non-adjacent reads should fall back to VFS instead of using sequential window"
-        );
-    }
-
-    #[test]
-    fn queued_adjacent_eof_read_returns_partial_window_bytes_without_vfs_fallback() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-eof")
-                .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"window-eof.bin",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        let payload = b"0123456789abcdef";
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, payload))
-            .expect("seed payload");
-        vfs.reset_diagnostics_observability();
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
-
-        let first = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
-            .expect("queue first read");
-        assert_eq!(
-            &first.wait().expect("first read should complete")[..],
-            b"01234567"
-        );
-
-        let eof = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 32)
-            .expect("queue EOF-spanning adjacent read");
-        assert_eq!(
-            &eof.wait().expect("EOF read should complete")[..],
-            b"89abcdef"
-        );
-
-        let metrics = vfs.write_path_observability_snapshot();
-        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
-        assert_eq!(metrics.fuse_callbacks.read.bytes, payload.len() as u64);
-        assert_eq!(
-            metrics.vfs_read_path.calls, 1,
-            "EOF-spanning adjacent read should be served from the partial macFUSE window"
         );
     }
 

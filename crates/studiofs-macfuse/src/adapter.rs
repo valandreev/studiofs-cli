@@ -47,12 +47,6 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
-// Keep the next eight maximum-size macFUSE callbacks ready for one sequential
-// handle. The callback and admission limits remain 8 MiB; this is only the
-// per-handle read-ahead window that prevents UBC from synchronously refilling
-// after every callback-sized cache run.
-const MACFUSE_READ_WINDOW_MAX_BYTES: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 8;
-const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 32;
@@ -102,7 +96,6 @@ struct AdapterSharedState {
     kernel_inode_liveness: Arc<KernelInodeLiveness>,
     read_admission: Semaphore,
     read_buffers: Arc<ReadBufferPool>,
-    read_windows: Arc<ReadWindowStore>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
 }
@@ -451,124 +444,7 @@ impl ReadBufferPool {
     }
 }
 
-#[derive(Debug, Default)]
-struct ReadWindowStore {
-    windows: DashMap<u64, ReadWindow>,
-    handles_by_inode: DashMap<u64, HashSet<u64>>,
-    // Keep invalidated inode generations for the mount lifetime: dropping them
-    // while async reads are still in flight can make an old fill look current.
-    invalidation_generations: DashMap<u64, AtomicU64>,
-}
-
-impl ReadWindowStore {
-    fn try_read(&self, file_handle: u64, ino: u64, offset: u64, out: &mut [u8]) -> Option<usize> {
-        if out.is_empty() {
-            return None;
-        }
-        let generation = self.invalidation_generation(ino);
-        let window = self.windows.get(&file_handle)?;
-        if window.ino != ino || !window.contains(offset, out.len()) {
-            return None;
-        }
-        let copied = copy_window_bytes(window.offset, window.bytes.as_ref(), offset, out);
-        if copied == 0 || self.invalidation_generation(ino) != generation {
-            return None;
-        }
-        window
-            .next_offset
-            .store(offset.saturating_add(copied as u64), Ordering::Release);
-        Some(copied)
-    }
-
-    fn remember_if_current(
-        &self,
-        file_handle: u64,
-        ino: u64,
-        offset: u64,
-        next_offset: u64,
-        bytes: PooledReadBuffer,
-        generation: u64,
-    ) -> bool {
-        if self.invalidation_generation(ino) != generation {
-            return false;
-        }
-        if bytes.is_empty() {
-            return false;
-        }
-        let mut needs_insert = true;
-        if let Some(previous) = self.windows.insert(
-            file_handle,
-            ReadWindow {
-                ino,
-                offset,
-                next_offset: AtomicU64::new(next_offset),
-                bytes,
-            },
-        ) {
-            if previous.ino != ino {
-                self.remove_inode_handle(previous.ino, file_handle);
-            } else {
-                needs_insert = false;
-            }
-        }
-        if self.invalidation_generation(ino) != generation {
-            self.invalidate_handle(file_handle);
-            return false;
-        }
-        if needs_insert {
-            self.handles_by_inode
-                .entry(ino)
-                .or_default()
-                .insert(file_handle);
-        }
-        true
-    }
-
-    fn invalidate_handle(&self, file_handle: u64) {
-        if let Some((_, window)) = self.windows.remove(&file_handle) {
-            self.remove_inode_handle(window.ino, file_handle);
-        }
-    }
-
-    fn invalidate_inode(&self, ino: u64) {
-        self.bump_inode_generation(ino);
-        let Some((_, handles)) = self.handles_by_inode.remove(&ino) else {
-            return;
-        };
-        for file_handle in handles {
-            self.windows
-                .remove_if(&file_handle, |_, window| window.ino == ino);
-        }
-    }
-
-    fn remove_inode_handle(&self, ino: u64, file_handle: u64) {
-        let Some(mut handles) = self.handles_by_inode.get_mut(&ino) else {
-            return;
-        };
-        handles.remove(&file_handle);
-        if handles.is_empty() {
-            drop(handles);
-            self.handles_by_inode
-                .remove_if(&ino, |_, handles| handles.is_empty());
-        }
-    }
-
-    fn invalidation_generation(&self, ino: u64) -> u64 {
-        self.invalidation_generations
-            .get(&ino)
-            .map_or(0, |generation| generation.load(Ordering::Acquire))
-    }
-
-    fn bump_inode_generation(&self, ino: u64) {
-        self.invalidation_generations
-            .entry(ino)
-            .or_default()
-            .fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-struct ReadWindowKernelInvalidator {
-    read_windows: Arc<ReadWindowStore>,
+struct OpenCacheKernelInvalidator {
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
@@ -591,9 +467,8 @@ impl KernelInvalidator for LiveKernelInvalidator {
     }
 }
 
-impl KernelInvalidator for ReadWindowKernelInvalidator {
+impl KernelInvalidator for OpenCacheKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.read_windows.invalidate_inode(ino);
         self.open_cache_snapshots.lock().pop(&ino);
         if self.kernel_invalidations.defer_data_if_reads_active(ino) {
             debug!(
@@ -716,37 +591,6 @@ impl DeferredKernelInvalidationFlush {
     }
 }
 
-#[derive(Debug)]
-struct ReadWindow {
-    ino: u64,
-    offset: u64,
-    next_offset: AtomicU64,
-    bytes: PooledReadBuffer,
-}
-
-impl ReadWindow {
-    fn contains(&self, offset: u64, len: usize) -> bool {
-        // Read windows are sequential readahead only; random-access reads should
-        // fall back to VFS instead of advancing this per-handle window.
-        if len == 0 || offset != self.next_offset.load(Ordering::Acquire) {
-            return false;
-        }
-        let Some(relative) = offset.checked_sub(self.offset) else {
-            return false;
-        };
-        relative < self.bytes.len() as u64
-    }
-}
-
-fn copy_window_bytes(window_offset: u64, bytes: &[u8], offset: u64, out: &mut [u8]) -> usize {
-    let relative = (offset - window_offset) as usize;
-    let available = bytes.len().saturating_sub(relative);
-    let copy_len = available.min(out.len());
-    let end = relative + copy_len;
-    out[..copy_len].copy_from_slice(&bytes[relative..end]);
-    copy_len
-}
-
 #[derive(Clone)]
 struct ReadExecutionState {
     vfs: Arc<StudioVfs>,
@@ -823,17 +667,8 @@ fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
     )
 }
 
-fn readahead_window_len(size: usize) -> usize {
-    if size == 0 {
-        return 0;
-    }
-    size.saturating_mul(8)
-        .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
-}
-
 fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    let callback_bytes = size.min(read_queue_byte_limit);
-    readahead_window_len(callback_bytes as usize).min(read_queue_byte_limit as usize) as u32
+    size.min(read_queue_byte_limit)
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -1180,7 +1015,6 @@ impl StudioVfsAdapter {
                 kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
                 read_admission: Semaphore::new(read_queue_byte_limit as usize),
                 read_buffers: Arc::new(ReadBufferPool::default()),
-                read_windows: Arc::new(ReadWindowStore::default()),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
@@ -1269,8 +1103,7 @@ impl StudioVfsAdapter {
         self.shared
             .kernel_invalidations
             .set_inner(Arc::clone(&inner));
-        Arc::new(ReadWindowKernelInvalidator {
-            read_windows: Arc::clone(&self.shared.read_windows),
+        Arc::new(OpenCacheKernelInvalidator {
             open_cache_snapshots: Arc::clone(&self.shared.open_cache_snapshots),
             kernel_invalidations: Arc::clone(&self.shared.kernel_invalidations),
             inner,
@@ -1791,39 +1624,15 @@ impl StudioVfsAdapter {
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = (size as usize).min(request.max_read_len as usize);
-        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
 
         let mut out = state
             .shared
             .read_buffers
             .clone()
-            .acquire_with_capacity(size_usize, read_len);
+            .acquire_with_capacity(size_usize, size_usize);
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        if let Some(copied) = state.shared.read_windows.try_read(
-            request.file_handle,
-            request.ino,
-            request.offset,
-            &mut out,
-        ) {
-            out.truncate(copied);
-            state
-                .vfs
-                .record_fuse_read_callback(copied, started.elapsed(), false);
-            return Ok(out);
-        }
-
-        if read_len > size_usize {
-            out.buffer.resize(read_len, 0);
-        }
-        if cancellation.is_cancelled() {
-            return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
-        }
-        let generation = state
-            .shared
-            .read_windows
-            .invalidation_generation(request.ino);
         let result = tokio::select! {
             result = state.vfs.read_into_fh(request.file_handle, request.ino, request.offset, &mut out) => result,
             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
@@ -1835,31 +1644,6 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
-                if written > size_usize {
-                    let remainder_len = written - reply_len;
-                    let mut remainder = state
-                        .shared
-                        .read_buffers
-                        .clone()
-                        .acquire_with_capacity(0, remainder_len);
-                    remainder.buffer.extend_from_slice(&out[reply_len..written]);
-                    state.shared.read_windows.remember_if_current(
-                        request.file_handle,
-                        request.ino,
-                        request.offset.saturating_add(reply_len as u64),
-                        request.offset.saturating_add(reply_len as u64),
-                        remainder,
-                        generation,
-                    );
-                    out.truncate(reply_len);
-                    out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
-                    return Ok(out);
-                } else {
-                    state
-                        .shared
-                        .read_windows
-                        .invalidate_handle(request.file_handle);
-                }
                 out.truncate(reply_len);
                 out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
                 Ok(out)
@@ -1868,10 +1652,6 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(size_usize, started.elapsed(), true);
-                state
-                    .shared
-                    .read_windows
-                    .invalidate_handle(request.file_handle);
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -2155,7 +1935,6 @@ impl StudioVfsAdapter {
         self.vfs
             .record_fuse_write_callback(data.len(), started.elapsed(), result.is_err());
         let written = result?;
-        self.shared.read_windows.invalidate_inode(ino);
         Ok(written)
     }
 
@@ -2201,7 +1980,6 @@ impl StudioVfsAdapter {
             .vfs
             .setattr_with_handle(file_handle, ino, SetattrArgs::size_only(size))
             .map_err(|error| vfs_err_to_errno(&error))?;
-        self.shared.read_windows.invalidate_inode(ino);
         Ok(attr)
     }
 
@@ -2219,7 +1997,6 @@ impl StudioVfsAdapter {
             .vfs
             .setattr_with_handle(file_handle, ino, args)
             .map_err(|error| vfs_err_to_errno(&error))?;
-        self.shared.read_windows.invalidate_inode(ino);
         Ok(attr)
     }
 
@@ -2253,7 +2030,6 @@ impl StudioVfsAdapter {
         outcome_result: Result<ReleaseFhOutcome, i32>,
     ) -> Result<(), i32> {
         self.release_foreground_read_handle(file_handle);
-        self.shared.read_windows.invalidate_handle(file_handle);
         if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
             self.clear_open_cache_snapshot(released.ino, "clean_write_release");
         }
@@ -2765,7 +2541,6 @@ mod open_cache_snapshot_tests {
         MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
         MacFuseOpenCacheSnapshotKind, ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
-    use std::sync::Arc;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
@@ -2951,48 +2726,6 @@ mod open_cache_snapshot_tests {
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
             "dirty macFUSE release must drain the last-handle barrier before returning"
-        );
-    }
-
-    #[test]
-    fn failed_release_still_invalidates_read_window_handle() {
-        let fixture = ContractVfsFixture::new("macfuse-failed-release-read-window")
-            .expect("create VFS fixture");
-        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
-        let ino = 42;
-        let file_handle = 7;
-        let generation = adapter.shared.read_windows.invalidation_generation(ino);
-        let mut window = Arc::clone(&adapter.shared.read_buffers).acquire(5);
-        window.copy_from_slice(b"stale");
-        assert!(adapter.shared.read_windows.remember_if_current(
-            file_handle,
-            ino,
-            0,
-            0,
-            window,
-            generation
-        ));
-        let mut out = [0_u8; 5];
-        assert_eq!(
-            adapter
-                .shared
-                .read_windows
-                .try_read(file_handle, ino, 0, &mut out),
-            Some(5)
-        );
-
-        let err = adapter
-            .finish_release(file_handle, None, Err(libc::EIO))
-            .expect_err("simulated release failure should propagate");
-
-        assert_eq!(err, libc::EIO);
-        assert_eq!(
-            adapter
-                .shared
-                .read_windows
-                .try_read(file_handle, ino, 0, &mut out),
-            None,
-            "release cleanup must invalidate read-window state even when VFS release fails"
         );
     }
 
@@ -4429,19 +4162,6 @@ mod tests {
     }
 
     #[test]
-    fn readahead_window_len_uses_floor_for_small_reads() {
-        assert_eq!(readahead_window_len(0), 0);
-        assert_eq!(
-            readahead_window_len(4 * 1024),
-            MACFUSE_READ_WINDOW_MIN_BYTES
-        );
-        assert_eq!(
-            readahead_window_len(MACFUSE_READ_WINDOW_MAX_BYTES),
-            MACFUSE_READ_WINDOW_MAX_BYTES
-        );
-    }
-
-    #[test]
     fn queued_read_execution_size_stays_within_reusable_pool_capacity() {
         let oversized_queue_limit = u32::MAX;
         assert_eq!(
@@ -4451,13 +4171,13 @@ mod tests {
     }
 
     #[test]
-    fn queued_read_admission_charges_readahead_allocation_bytes() {
+    fn queued_read_admission_charges_callback_bytes() {
         let callback_bytes = 128 * 1024;
-        let queue_limit = MACFUSE_READ_WINDOW_MAX_BYTES as u32;
+        let queue_limit = MACFUSE_READ_MAX_PENDING_BYTES as u32;
 
         assert_eq!(
             queued_read_admission_bytes(callback_bytes, queue_limit),
-            readahead_window_len(callback_bytes as usize) as u32
+            callback_bytes
         );
     }
 
@@ -4506,30 +4226,6 @@ mod tests {
         let _invalidator = adapter.kernel_invalidator_for_test(Arc::new(NoopKernelInvalidator));
 
         assert_eq!(adapter.hot_path_shared_state_arc_count_for_test(), 1);
-    }
-
-    #[test]
-    fn read_window_store_rejects_stale_cache_fill_after_invalidation() {
-        let store = ReadWindowStore::default();
-        let pool = Arc::new(ReadBufferPool::default());
-        let generation = store.invalidation_generation(42);
-        let mut stale = Arc::clone(&pool).acquire(5);
-        stale.copy_from_slice(b"stale");
-
-        store.invalidate_inode(42);
-
-        assert!(
-            !store.remember_if_current(7, 42, 0, 0, stale, generation),
-            "window fill must be rejected after an intervening inode invalidation"
-        );
-        let mut out = [0_u8; 5];
-        assert_eq!(store.try_read(7, 42, 0, &mut out), None);
-        assert_eq!(pool.available_count(), 1);
-        assert!(
-            pool.last_available_capacity()
-                .is_some_and(|capacity| capacity >= 5),
-            "rejected stale cache buffer should be returned to the reusable pool"
-        );
     }
 
     #[test]
