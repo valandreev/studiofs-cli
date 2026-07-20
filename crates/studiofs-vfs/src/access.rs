@@ -102,15 +102,11 @@ impl AccessPolicy {
     pub(crate) fn from_class(class: AccessClass, cfg: AccessTrackerConfig) -> Self {
         let prefetch_enabled = cfg.readahead_base_width > 0;
         let base_width = cfg.readahead_base_width;
-        let max_width = if prefetch_enabled {
-            cfg.readahead_max_width.max(base_width)
+        let (max_width, min_prefetch) = if prefetch_enabled {
+            let max_width = cfg.readahead_max_width.max(base_width);
+            (max_width, cfg.readahead_min_prefetch.max(1).min(max_width))
         } else {
-            0
-        };
-        let min_prefetch = if prefetch_enabled {
-            cfg.readahead_min_prefetch.max(1).min(max_width)
-        } else {
-            0
+            (0, 0)
         };
         match class {
             AccessClass::SequentialMediaRead => Self {

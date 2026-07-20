@@ -200,17 +200,12 @@ impl ReadAheadTracker {
 
     /// Create a tracker with dynamic width bounds.
     pub fn new_with_bounds(base_width: u32, max_width: u32, min_prefetch_on_seq: u32) -> Self {
-        let disabled = base_width == 0;
-        let base_width = if disabled { 0 } else { base_width.max(1) };
-        let width = if disabled {
-            0
+        let (base_width, width, min_prefetch_on_seq) = if base_width == 0 {
+            (0, 0, 0)
         } else {
-            max_width.max(base_width)
-        };
-        let min_prefetch_on_seq = if disabled {
-            0
-        } else {
-            min_prefetch_on_seq.max(1).min(width)
+            let base_width = base_width.max(1);
+            let width = max_width.max(base_width);
+            (base_width, width, min_prefetch_on_seq.max(1).min(width))
         };
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
