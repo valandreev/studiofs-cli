@@ -615,6 +615,7 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::{AccessClass, AccessPolicy};
     use std::sync::Arc;
     #[cfg(unix)]
     use std::{fs, os::unix::fs::symlink};
@@ -883,6 +884,30 @@ mod tests {
             missing_slash_plan.payload_write_mode,
             LocalPayloadWriteMode::default_for_mount_path(),
             "mount bootstrap should use the platform default payload write path"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_disables_prefetch_for_zero_readahead_width() {
+        let config: VfsConfigValidated = VfsConfig {
+            readahead_width: 0,
+            ..VfsConfig::default()
+        }
+        .try_into()
+        .expect("zero readahead width should validate");
+        let plan = VfsBootstrapPlan::build(
+            test_format_info("bootstrap-readahead-disabled"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            &config,
+        )
+        .expect("build bootstrap plan with readahead disabled");
+
+        assert_eq!(plan.access_tracker.readahead_base_width, 0);
+        assert_eq!(plan.readahead_max_width, 0);
+        assert!(
+            !AccessPolicy::from_class(AccessClass::SequentialMediaRead, plan.access_tracker)
+                .prefetch_enabled
         );
     }
 

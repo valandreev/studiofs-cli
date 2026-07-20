@@ -226,7 +226,7 @@ pub struct VfsConfig {
     pub read_buffer_mb: u64,
     /// Prefetch concurrency budget.
     pub prefetch_concurrency: usize,
-    /// Sequential read-ahead window.
+    /// Sequential read-ahead window; zero disables VFS prefetch.
     pub readahead_width: u32,
     /// Minimum prefetch count for sequential patterns.
     pub readahead_min_prefetch: u32,
@@ -411,7 +411,7 @@ pub struct VfsConfigRaw {
     pub read_buffer_mb: Option<u64>,
     /// Optional override for prefetch concurrency.
     pub prefetch_concurrency: Option<usize>,
-    /// Optional override for readahead width.
+    /// Optional override for readahead width; zero disables VFS prefetch.
     pub readahead_width: Option<u32>,
     /// Optional override for minimum readahead prefetch count.
     pub readahead_min_prefetch: Option<u32>,
@@ -738,7 +738,8 @@ fn normalize_vfs_config(
     cfg.prefetch_concurrency = cfg
         .prefetch_concurrency
         .max(DEFAULT_PREFETCH_CONCURRENCY_MIN);
-    cfg.readahead_width = cfg.readahead_width.max(1);
+    // Zero explicitly disables VFS readahead for platforms whose file cache
+    // already performs sequential read-ahead.
     cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
     cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
     cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);

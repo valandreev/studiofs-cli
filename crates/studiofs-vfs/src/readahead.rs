@@ -89,7 +89,7 @@ impl ReadAheadTracker {
             base_width: self.base_width,
             max_width: self.width,
             min_prefetch_on_seq: self.min_prefetch_on_seq,
-            prefetch_enabled: true,
+            prefetch_enabled: self.width > 0,
         }
     }
 
@@ -111,6 +111,10 @@ impl ReadAheadTracker {
         policy: ReadAheadPolicy,
         now_micros: u64,
     ) -> Vec<u32> {
+        if !policy.prefetch_enabled || policy.base_width == 0 || policy.max_width == 0 {
+            return Vec::new();
+        }
+
         let now_micros = now_micros.max(1);
         let base_width = policy.base_width.max(1);
         let max_width = policy.max_width.max(base_width);
@@ -162,10 +166,6 @@ impl ReadAheadTracker {
         let sequential_ready = state.sequential_ready;
         drop(state);
 
-        if !policy.prefetch_enabled {
-            return Vec::new();
-        }
-
         if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
             return Vec::new();
         }
@@ -196,9 +196,13 @@ impl ReadAheadTracker {
 
     /// Create a tracker with dynamic width bounds.
     pub fn new_with_bounds(base_width: u32, max_width: u32, min_prefetch_on_seq: u32) -> Self {
-        let base_width = base_width.max(1);
-        let width = max_width.max(base_width);
-        let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
+        let (base_width, width, min_prefetch_on_seq) = if base_width == 0 {
+            (0, 0, 0)
+        } else {
+            let base_width = base_width.max(1);
+            let width = max_width.max(base_width);
+            (base_width, width, min_prefetch_on_seq.max(1).min(width))
+        };
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
             inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
@@ -351,6 +355,15 @@ mod tests {
             blocks.is_empty(),
             "first read of a brand-new inode should not trigger prefetch"
         );
+    }
+
+    #[test]
+    fn zero_width_disables_prefetch_after_sequential_reads() {
+        let tracker = ReadAheadTracker::new_with_bounds(0, 64, 1);
+
+        assert_eq!(tracker.width, 0);
+        assert!(tracker.record_read_at_micros(1, 0, 0, 1_000_000).is_empty());
+        assert!(tracker.record_read_at_micros(1, 1, 1, 1_500_000).is_empty());
     }
 
     #[test]

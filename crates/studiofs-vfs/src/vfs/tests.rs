@@ -7418,6 +7418,14 @@ fn default_readahead_tracks_the_juicefs_sized_buffer_budget() {
 }
 
 #[test]
+fn zero_readahead_width_disables_derived_max_width() {
+    assert_eq!(
+        derive_readahead_max_width(DEFAULT_READ_BUFFER_MB, 4 * 1024 * 1024, 0),
+        0
+    );
+}
+
+#[test]
 fn upload_aimd_uses_independent_idle_reset_policy() {
     let upload_aimd = build_upload_aimd_config(&VfsConfig {
         upload_idle_reset_secs: 120,
