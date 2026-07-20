@@ -166,10 +166,6 @@ impl ReadAheadTracker {
         let sequential_ready = state.sequential_ready;
         drop(state);
 
-        if !policy.prefetch_enabled {
-            return Vec::new();
-        }
-
         if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
             return Vec::new();
         }

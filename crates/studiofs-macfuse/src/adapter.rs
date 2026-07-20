@@ -604,7 +604,6 @@ struct ReadExecutionRequest {
     file_handle: u64,
     offset: u64,
     size: u32,
-    max_read_len: u32,
 }
 
 #[derive(Debug)]
@@ -1603,7 +1602,7 @@ impl StudioVfsAdapter {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         if state.vfs.is_runtime_stats_file_ino(request.ino) {
-            let size = (request.size as usize).min(request.max_read_len as usize);
+            let size = request.size as usize;
             let mut out = state
                 .shared
                 .read_buffers
@@ -1619,7 +1618,7 @@ impl StudioVfsAdapter {
         }
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
-        let size_usize = (size as usize).min(request.max_read_len as usize);
+        let size_usize = size as usize;
 
         let mut out = state
             .shared
@@ -1724,7 +1723,6 @@ impl StudioVfsAdapter {
                     file_handle,
                     offset,
                     size,
-                    max_read_len: size,
                 },
                 started,
                 cancellation,
@@ -1807,7 +1805,6 @@ impl StudioVfsAdapter {
                         file_handle,
                         offset,
                         size,
-                        max_read_len: size,
                     },
                     started,
                     cancellation,
@@ -1877,7 +1874,6 @@ impl StudioVfsAdapter {
                             file_handle,
                             offset,
                             size,
-                            max_read_len: size,
                         },
                         started,
                         worker_cancellation,
