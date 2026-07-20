@@ -100,13 +100,22 @@ impl Default for AccessPolicy {
 
 impl AccessPolicy {
     pub(crate) fn from_class(class: AccessClass, cfg: AccessTrackerConfig) -> Self {
-        let base_width = cfg.readahead_base_width.max(1);
-        let max_width = cfg.readahead_max_width.max(base_width);
-        let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
+        let prefetch_enabled = cfg.readahead_base_width > 0;
+        let base_width = cfg.readahead_base_width;
+        let max_width = if prefetch_enabled {
+            cfg.readahead_max_width.max(base_width)
+        } else {
+            0
+        };
+        let min_prefetch = if prefetch_enabled {
+            cfg.readahead_min_prefetch.max(1).min(max_width)
+        } else {
+            0
+        };
         match class {
             AccessClass::SequentialMediaRead => Self {
                 class,
-                prefetch_enabled: true,
+                prefetch_enabled,
                 cache_promotion_on_read: false,
                 readahead_base_width: base_width,
                 readahead_max_width: max_width,
@@ -115,7 +124,7 @@ impl AccessPolicy {
             },
             AccessClass::RandomInteractiveRead => Self {
                 class,
-                prefetch_enabled: true,
+                prefetch_enabled,
                 cache_promotion_on_read: true,
                 readahead_base_width: base_width,
                 readahead_max_width: max_width,
@@ -426,6 +435,25 @@ mod tests {
         assert_eq!(third.class, AccessClass::SequentialMediaRead);
         assert!(third.policy.prefetch_enabled);
         assert!(!third.policy.cache_promotion_on_read);
+    }
+
+    #[test]
+    fn zero_readahead_width_disables_prefetch_for_read_classes() {
+        let disabled = AccessTrackerConfig {
+            readahead_base_width: 0,
+            readahead_max_width: 0,
+            ..config()
+        };
+
+        for class in [
+            AccessClass::SequentialMediaRead,
+            AccessClass::RandomInteractiveRead,
+        ] {
+            let policy = AccessPolicy::from_class(class, disabled);
+            assert!(!policy.prefetch_enabled);
+            assert_eq!(policy.readahead_base_width, 0);
+            assert_eq!(policy.readahead_max_width, 0);
+        }
     }
 
     #[test]

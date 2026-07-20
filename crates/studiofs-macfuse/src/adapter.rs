@@ -667,10 +667,6 @@ fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
     )
 }
 
-fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    size.min(read_queue_byte_limit)
-}
-
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
     NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT)
         .expect("MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT must be greater than 0")
@@ -1677,15 +1673,12 @@ impl StudioVfsAdapter {
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
-            let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-            let mut read_guard =
-                AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
+            let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
                 log_callback_error("read", MACFUSE_READ_INTERRUPTED_ERRNO);
@@ -1694,7 +1687,7 @@ impl StudioVfsAdapter {
             }
             let _permit = match acquire_read_admission(
                 &state.shared.read_admission,
-                admission_bytes,
+                size,
                 &read_guard.shared.read_diagnostics,
                 &cancellation,
             )
@@ -1731,7 +1724,7 @@ impl StudioVfsAdapter {
                     file_handle,
                     offset,
                     size,
-                    max_read_len: admission_bytes,
+                    max_read_len: size,
                 },
                 started,
                 cancellation,
@@ -1782,22 +1775,19 @@ impl StudioVfsAdapter {
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
-                let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                let mut read_guard =
-                    AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
+                let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
                 if cancellation.is_cancelled() {
                     read_guard.finish_with(AsyncReadOutcome::Canceled);
                     return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
                 let _permit = acquire_read_admission(
                     &state.shared.read_admission,
-                    admission_bytes,
+                    size,
                     &read_guard.shared.read_diagnostics,
                     &cancellation,
                 )
@@ -1817,7 +1807,7 @@ impl StudioVfsAdapter {
                         file_handle,
                         offset,
                         size,
-                        max_read_len: admission_bytes,
+                        max_read_len: size,
                     },
                     started,
                     cancellation,
@@ -1852,7 +1842,6 @@ impl StudioVfsAdapter {
         // CONTEXT: Guard and semaphore permit borrows below depend on this moved
         // state; keep `state` declared before its borrowers so drop order remains valid.
         let size = read_execution_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let worker_cancellation = cancellation.clone();
@@ -1861,16 +1850,14 @@ impl StudioVfsAdapter {
             queued: QueuedReadForTest {
                 runtime_handle: self.runtime_handle.clone(),
                 handle: self.runtime_handle.spawn(async move {
-                    let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                    let mut read_guard =
-                        AsyncReadTaskGuard::new(admission_bytes, &state.shared, &state.vfs);
+                    let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
                     if worker_cancellation.is_cancelled() {
                         read_guard.finish_with(AsyncReadOutcome::Canceled);
                         return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                     }
                     let _permit = acquire_read_admission(
                         &state.shared.read_admission,
-                        admission_bytes,
+                        size,
                         &read_guard.shared.read_diagnostics,
                         &worker_cancellation,
                     )
@@ -1890,7 +1877,7 @@ impl StudioVfsAdapter {
                             file_handle,
                             offset,
                             size,
-                            max_read_len: admission_bytes,
+                            max_read_len: size,
                         },
                         started,
                         worker_cancellation,
@@ -4167,17 +4154,6 @@ mod tests {
         assert_eq!(
             read_execution_size(u32::MAX, oversized_queue_limit),
             MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32
-        );
-    }
-
-    #[test]
-    fn queued_read_admission_charges_callback_bytes() {
-        let callback_bytes = 128 * 1024;
-        let queue_limit = MACFUSE_READ_MAX_PENDING_BYTES as u32;
-
-        assert_eq!(
-            queued_read_admission_bytes(callback_bytes, queue_limit),
-            callback_bytes
         );
     }
 

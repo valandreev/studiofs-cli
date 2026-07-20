@@ -3204,7 +3204,11 @@ fn derive_readahead_max_width(
     block_size: u32,
     readahead_base_width: u32,
 ) -> u32 {
-    derive_buffer_blocks_default(read_buffer_mb, block_size).max(readahead_base_width.max(1))
+    if readahead_base_width == 0 {
+        0
+    } else {
+        derive_buffer_blocks_default(read_buffer_mb, block_size).max(readahead_base_width)
+    }
 }
 
 fn build_fetch_aimd_config(

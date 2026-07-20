@@ -226,7 +226,7 @@ pub struct VfsConfig {
     pub read_buffer_mb: u64,
     /// Prefetch concurrency budget.
     pub prefetch_concurrency: usize,
-    /// Sequential read-ahead window.
+    /// Sequential read-ahead window; zero disables VFS prefetch.
     pub readahead_width: u32,
     /// Minimum prefetch count for sequential patterns.
     pub readahead_min_prefetch: u32,
@@ -411,7 +411,7 @@ pub struct VfsConfigRaw {
     pub read_buffer_mb: Option<u64>,
     /// Optional override for prefetch concurrency.
     pub prefetch_concurrency: Option<usize>,
-    /// Optional override for readahead width.
+    /// Optional override for readahead width; zero disables VFS prefetch.
     pub readahead_width: Option<u32>,
     /// Optional override for minimum readahead prefetch count.
     pub readahead_min_prefetch: Option<u32>,
