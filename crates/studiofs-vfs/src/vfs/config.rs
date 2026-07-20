@@ -738,7 +738,8 @@ fn normalize_vfs_config(
     cfg.prefetch_concurrency = cfg
         .prefetch_concurrency
         .max(DEFAULT_PREFETCH_CONCURRENCY_MIN);
-    cfg.readahead_width = cfg.readahead_width.max(1);
+    // Zero explicitly disables VFS readahead for platforms whose file cache
+    // already performs sequential read-ahead.
     cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
     cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
     cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);

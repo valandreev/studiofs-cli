@@ -344,6 +344,7 @@ where
     }
     runtime_tuning.apply_to_vfs_config(&mut vfs_config_raw)?;
     strip_removed_public_mount_surface(&mut vfs_config_raw);
+    apply_platform_vfs_policy(&mut vfs_config_raw);
 
     let vfs_config = vfs_config_raw
         .validate()
@@ -354,6 +355,20 @@ where
 
 fn strip_removed_public_mount_surface(config: &mut VfsConfigRaw) {
     config.upload_delay_ms = None;
+}
+
+/// macFUSE already provides sequential file-cache readahead. Running the VFS
+/// prefetcher as well issues large, competing local-cache reads during playback.
+fn apply_platform_vfs_policy(config: &mut VfsConfigRaw) {
+    #[cfg(target_os = "macos")]
+    {
+        if config.readahead_width.is_none() {
+            config.readahead_width = Some(0);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = config;
 }
 
 fn resolve_mount_launch_mode(detach: bool) -> MountLaunchMode {
@@ -2225,6 +2240,20 @@ mod tests {
             resolved.vfs_config.upload_delay_ms,
             VfsConfig::default().upload_delay_ms
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_config_disables_vfs_readahead_by_default() {
+        let resolved = build_mount_config_with(
+            VfsConfigRaw::default(),
+            None,
+            &PublicRuntimeTuningArgs::default(),
+            std::convert::identity,
+        )
+        .expect("mount config resolved");
+
+        assert_eq!(resolved.vfs_config.readahead_width, 0);
     }
 
     #[test]
