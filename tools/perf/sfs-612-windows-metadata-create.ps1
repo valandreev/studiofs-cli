@@ -106,7 +106,13 @@ function Invoke-MetadataCreateWorkload {
         $smallFilesRoot = Join-Path $workloadRoot "small-files"
         New-Item -ItemType Directory -Path $smallFilesRoot | Out-Null
         $payload = New-Object byte[] $FileSizeBytes
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill($payload)
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try {
+            $rng.GetBytes($payload)
+        }
+        finally {
+            $rng.Dispose()
+        }
         $createTimer = [System.Diagnostics.Stopwatch]::StartNew()
         for ($index = 0; $index -lt $FileCount; $index += 1) {
             [System.IO.File]::WriteAllBytes((Join-Path $smallFilesRoot ("f-{0:D8}.bin" -f $index)), $payload)
@@ -126,7 +132,12 @@ function Invoke-MetadataCreateWorkload {
     }
     finally {
         if (-not $KeepWorkloads -and (Test-Path -LiteralPath $workloadRoot -PathType Container)) {
-            Remove-WorkloadRoot -MountPath $MountPath -WorkloadRoot $workloadRoot
+            try {
+                Remove-WorkloadRoot -MountPath $MountPath -WorkloadRoot $workloadRoot
+            }
+            catch {
+                Write-Warning ("Failed to clean up workload root {0}: {1}" -f $workloadRoot, $_.Exception.Message)
+            }
         }
     }
 }
