@@ -568,7 +568,7 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
     mut host: impl WinfspShutdownHost,
     shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs)?;
+    let (shutdown_started, shutdown_result) = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
     tracing::info!(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: dropping host"
@@ -578,7 +578,7 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: host dropped"
     );
-    Ok(())
+    shutdown_result
 }
 
 #[cfg(not(test))]
@@ -589,15 +589,15 @@ fn stop_host_before_vfs_shutdown_and_process_exit<H>(
 where
     H: WinfspShutdownHost + Send + 'static,
 {
-    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs)?;
+    let (shutdown_started, shutdown_result) = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
     drop_host_before_process_exit(host, shutdown_started);
-    Ok(())
+    shutdown_result
 }
 
 fn stop_host_and_shutdown_vfs(
     host: &mut impl WinfspShutdownHost,
     shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<std::time::Instant> {
+) -> (std::time::Instant, std::io::Result<()>) {
     let shutdown_started = std::time::Instant::now();
     tracing::info!("WinFSP shutdown: stopping host before VFS shutdown");
     let stop_started = std::time::Instant::now();
@@ -615,7 +615,7 @@ fn stop_host_and_shutdown_vfs(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: VFS shutdown returned"
     );
-    shutdown_result.map(|()| shutdown_started)
+    (shutdown_started, shutdown_result)
 }
 
 #[cfg(not(test))]

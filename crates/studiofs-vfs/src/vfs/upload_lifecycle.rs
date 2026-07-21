@@ -297,14 +297,10 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
-        let deferred_namespace_drained = self
-            .wait_for_deferred_namespace_drain(background_join_timeout)
+        self.wait_for_deferred_namespace_drain(background_join_timeout)
             .await;
         self.join_background_tasks(background_join_timeout).await;
-        let deferred_namespace_error = self.deferred_namespace_shutdown_error().or_else(|| {
-            (!deferred_namespace_drained)
-                .then(|| VfsError::Other("deferred namespace metadata drain timed out".to_string()))
-        });
+        let deferred_namespace_error = self.deferred_namespace_shutdown_error();
 
         // Reset the active-access-class telemetry counters for any handles that
         // were never explicitly closed via release_fh (e.g. force-unmount).
