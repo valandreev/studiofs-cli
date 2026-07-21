@@ -97,6 +97,9 @@ The mounted runtime's `write_path_observability` JSON now also exposes the
 shared namespace-create breakdown: `namespace_create.inode_allocation`,
 `namespace_create.namespace_mutation`, completed entries, transactions per
 created entry, and `metadata_engine.begin_write`, `mutation`, and `commit`.
+For synchronous namespace creates, `namespace_mutation` measures the direct
+metadata-engine call. Deferred creates measure the same stage around the async
+runtime future, so their value also includes metadata executor queue wait.
 `payload_store_sync_data` remains the explicit local-payload `sync_data`
 measurement. redb commits are durable commit boundaries; its public API does
 not expose a separate post-commit `sync_data` call to time independently.

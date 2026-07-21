@@ -55,6 +55,8 @@ struct MetadataWriteMetrics {
 impl MetadataWriteMetrics {
     fn observe(stage: &MetadataWriteStageMetrics, elapsed: Duration) {
         let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        // Snapshot readers may observe the three relaxed counters between updates;
+        // this deliberate tearing keeps the hot write path lock-free.
         stage.calls.fetch_add(1, Ordering::Relaxed);
         stage.total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         stage.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
@@ -195,7 +197,13 @@ impl RedbWriteTransaction<'_> {
     }
 
     pub(crate) fn abort(self) -> Result<(), redb::StorageError> {
-        let Self { txn, _db, .. } = self;
+        let Self {
+            txn,
+            _db,
+            write_metrics,
+            mutation_started,
+        } = self;
+        MetadataWriteMetrics::observe(&write_metrics.mutation, mutation_started.elapsed());
         txn.abort()
     }
 }

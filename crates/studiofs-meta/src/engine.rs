@@ -24,7 +24,7 @@ pub struct MetadataWriteStageTiming {
 pub struct MetadataWriteObservability {
     /// Time spent obtaining the local metadata write transaction.
     pub begin_write: MetadataWriteStageTiming,
-    /// Time spent holding the transaction before its commit starts.
+    /// Time spent holding the transaction before its commit or abort starts.
     pub mutation: MetadataWriteStageTiming,
     /// Time spent committing the local metadata transaction.
     pub commit: MetadataWriteStageTiming,

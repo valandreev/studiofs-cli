@@ -113,9 +113,12 @@ function Invoke-MetadataCreateWorkload {
         finally {
             $rng.Dispose()
         }
+        $filePaths = for ($index = 0; $index -lt $FileCount; $index += 1) {
+            Join-Path $smallFilesRoot ("f-{0:D8}.bin" -f $index)
+        }
         $createTimer = [System.Diagnostics.Stopwatch]::StartNew()
-        for ($index = 0; $index -lt $FileCount; $index += 1) {
-            [System.IO.File]::WriteAllBytes((Join-Path $smallFilesRoot ("f-{0:D8}.bin" -f $index)), $payload)
+        foreach ($filePath in $filePaths) {
+            [System.IO.File]::WriteAllBytes($filePath, $payload)
         }
         $createTimer.Stop()
 
@@ -190,8 +193,12 @@ foreach ($target in @(
 )) {
     for ($run = 1; $run -le $Runs; $run += 1) {
         Write-Host "[$($target.filesystem)] cold run $run of $Runs"
+        $global:LASTEXITCODE = 0
         & ([scriptblock]::Create($ColdPreparationCommand))
-        if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Cold preparation failed with exit code $LASTEXITCODE" }
+        $coldSucceeded = $?
+        $coldExitCode = $global:LASTEXITCODE
+        if (-not $coldSucceeded) { throw "Cold preparation failed" }
+        if ($coldExitCode -ne 0) { throw "Cold preparation failed with exit code $coldExitCode" }
         $results.Add((Invoke-MetadataCreateWorkload -Filesystem $target.filesystem -MountPath $target.mount -Condition "cold" -Run $run -CurvineSourcePath $curvine -FileCount $SmallFileCount -FileSizeBytes $SmallFileSizeBytes))
 
         Write-Host "[$($target.filesystem)] warm run $run of $Runs"
