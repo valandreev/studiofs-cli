@@ -4,8 +4,31 @@
 //! but the design supports swapping to PostgreSQL/Redis for multi-user mode.
 
 use crate::types::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Aggregate latency for one metadata storage stage.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MetadataWriteStageTiming {
+    /// Number of observed operations.
+    pub calls: u64,
+    /// Total elapsed time in nanoseconds.
+    pub total_ns: u64,
+    /// Longest observed operation in nanoseconds.
+    pub max_ns: u64,
+}
+
+/// Shared low-cardinality timing for local metadata write transactions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MetadataWriteObservability {
+    /// Time spent obtaining the local metadata write transaction.
+    pub begin_write: MetadataWriteStageTiming,
+    /// Time spent holding the transaction before its commit starts.
+    pub mutation: MetadataWriteStageTiming,
+    /// Time spent committing the local metadata transaction.
+    pub commit: MetadataWriteStageTiming,
+}
 
 // =============================================================================
 // Errors
@@ -300,6 +323,11 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
+    /// Return shared local metadata write timing when the backend exposes it.
+    fn metadata_write_observability(&self) -> MetadataWriteObservability {
+        MetadataWriteObservability::default()
+    }
+
     /// Try to acquire the global janitor lease before contacting remote object storage.
     ///
     /// Local-only engines may allow the janitor to proceed immediately. Distributed

@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::file_session::VfsFileSessionStats;
+use studiofs_meta::MetadataWriteObservability;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Current version of the cross-platform runtime stats snapshot schema.
@@ -1354,6 +1355,23 @@ pub struct VfsWritePathCadenceStats {
     pub interval_histogram: VfsLatencyHistogramSnapshot,
 }
 
+/// Metadata transactions required to create one namespace entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsNamespaceCreateObservabilityStats {
+    /// Inode ID reservation transaction latency.
+    #[serde(default)]
+    pub inode_allocation: VfsWritePathStageLatencyStats,
+    /// Namespace mutation transaction latency.
+    #[serde(default)]
+    pub namespace_mutation: VfsWritePathStageLatencyStats,
+    /// Successfully committed file or directory entries.
+    #[serde(default)]
+    pub completed_entries: u64,
+    /// Metadata write transactions per successfully created entry.
+    #[serde(default)]
+    pub transactions_per_created_entry: f64,
+}
+
 /// Eager flush counters.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathEagerFlushStats {
@@ -1626,6 +1644,12 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Metadata commit cadence metrics.
     #[serde(default)]
     pub metadata_commit_cadence: VfsWritePathCadenceStats,
+    /// Low-level metadata-engine transaction timing.
+    #[serde(default)]
+    pub metadata_engine: MetadataWriteObservability,
+    /// Namespace create transaction breakdown.
+    #[serde(default)]
+    pub namespace_create: VfsNamespaceCreateObservabilityStats,
     /// Eager-flush metrics.
     #[serde(default)]
     pub eager_flush: VfsWritePathEagerFlushStats,

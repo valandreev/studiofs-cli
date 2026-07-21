@@ -99,6 +99,33 @@ fn handle_backed_growth_may_defer_strict_flush(
 }
 
 impl StudioVfs {
+    fn observe_metadata_commit<T>(&self, operation: impl FnOnce() -> VfsResult<T>) -> VfsResult<T> {
+        let started = Instant::now();
+        let result = operation();
+        self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
+        result
+    }
+
+    fn observe_namespace_inode_allocation<T>(
+        &self,
+        operation: impl FnOnce() -> studiofs_meta::MetaResult<T>,
+    ) -> VfsResult<T> {
+        let started = Instant::now();
+        let result = operation();
+        self.record_namespace_inode_allocation_observability(started.elapsed());
+        result.map_err(VfsError::Meta)
+    }
+
+    fn observe_namespace_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> studiofs_meta::MetaResult<T>,
+    ) -> VfsResult<T> {
+        let started = Instant::now();
+        let result = operation();
+        self.record_namespace_mutation_observability(started.elapsed());
+        result.map_err(VfsError::Meta)
+    }
+
     fn runtime_stats_entry_exists_error(parent: Ino, name: &[u8]) -> VfsError {
         VfsError::Meta(MetaError::EntryExists {
             parent,
@@ -151,9 +178,10 @@ impl StudioVfs {
                 return Ok(ino);
             }
 
-            let inos = self
-                .sync_meta()
-                .next_object_ids(DEFERRED_NAMESPACE_INODE_BATCH)?;
+            let inos = self.observe_namespace_inode_allocation(|| {
+                self.sync_meta()
+                    .next_object_ids(DEFERRED_NAMESPACE_INODE_BATCH)
+            })?;
             self.state
                 .namespace
                 .deferred
@@ -418,7 +446,8 @@ impl StudioVfs {
 
     async fn commit_deferred_namespace_op(&self, op: DeferredNamespaceOp) -> VfsResult<InodeAttr> {
         let meta = self.meta.clone();
-        match op {
+        let started = Instant::now();
+        let result = match op {
             DeferredNamespaceOp::CreateFile {
                 attr,
                 parent,
@@ -427,10 +456,16 @@ impl StudioVfs {
                 gid,
                 mode,
             } => {
-                crate::runtime::run_meta(meta, move |engine| {
+                let stage_started = Instant::now();
+                let result = crate::runtime::run_meta(meta, move |engine| {
                     engine.create_file_with_ino(attr.ino, parent, &name, uid, gid, mode)
                 })
-                .await
+                .await;
+                self.record_namespace_mutation_observability(stage_started.elapsed());
+                if result.is_ok() {
+                    self.record_namespace_create_completed();
+                }
+                result
             }
             DeferredNamespaceOp::CreateDir {
                 attr,
@@ -440,10 +475,16 @@ impl StudioVfs {
                 gid,
                 mode,
             } => {
-                crate::runtime::run_meta(meta, move |engine| {
+                let stage_started = Instant::now();
+                let result = crate::runtime::run_meta(meta, move |engine| {
                     engine.create_dir_with_ino(attr.ino, parent, &name, uid, gid, mode)
                 })
-                .await
+                .await;
+                self.record_namespace_mutation_observability(stage_started.elapsed());
+                if result.is_ok() {
+                    self.record_namespace_create_completed();
+                }
+                result
             }
             DeferredNamespaceOp::SetAttr { attr, args } => {
                 let fallback_attr = attr.clone();
@@ -457,7 +498,9 @@ impl StudioVfs {
                 })
                 .await
             }
-        }
+        };
+        self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
+        result
     }
 
     fn setattr_attr_only_deferred_local(
@@ -1775,9 +1818,14 @@ impl StudioVfs {
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
-        let attr = self
-            .sync_meta()
-            .create_file(parent, name, uid, gid, mode & 0o7777)?;
+        let attr = self.observe_metadata_commit(|| {
+            let ino = self.observe_namespace_inode_allocation(|| self.sync_meta().next_inode())?;
+            self.observe_namespace_mutation(|| {
+                self.sync_meta()
+                    .create_file_with_ino(ino, parent, name, uid, gid, mode & 0o7777)
+            })
+        })?;
+        self.record_namespace_create_completed();
         self.state.incarnation.inode_incarnations.lock().insert(
             attr.ino,
             InodeIncarnationState {
@@ -1915,9 +1963,14 @@ impl StudioVfs {
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
-        let attr = self
-            .sync_meta()
-            .create_dir(parent, name, uid, gid, mode & 0o7777)?;
+        let attr = self.observe_metadata_commit(|| {
+            let ino = self.observe_namespace_inode_allocation(|| self.sync_meta().next_inode())?;
+            self.observe_namespace_mutation(|| {
+                self.sync_meta()
+                    .create_dir_with_ino(ino, parent, name, uid, gid, mode & 0o7777)
+            })
+        })?;
+        self.record_namespace_create_completed();
         self.state
             .namespace
             .deferred
