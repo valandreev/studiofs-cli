@@ -20,7 +20,7 @@ struct TruncateMutation {
 
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
-const NAMESPACE_INODE_BATCH: u32 = 4096;
+pub(super) const NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
 const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u16 = 200;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
@@ -164,17 +164,20 @@ impl StudioVfs {
         self.setattr_with_handle(None, ino, args)
     }
 
+    /// Reserve the next inode from a shared batch, refilling it with one metadata allocation
+    /// when exhausted. The reservation lock serializes refill so concurrent callers cannot
+    /// overlap or discard durable inode ranges.
     pub(super) fn reserve_namespace_ino(&self) -> VfsResult<Ino> {
-        let mut namespace = self.state.namespace.deferred.inner.lock();
+        let mut reserved_inos = self.state.namespace.deferred.reserved_inos.lock();
         loop {
-            if let Some(ino) = namespace.reserved_inos.pop_front() {
+            if let Some(ino) = reserved_inos.pop_front() {
                 return Ok(ino);
             }
 
             let inos = self.observe_namespace_inode_allocation(|| {
                 self.sync_meta().next_object_ids(NAMESPACE_INODE_BATCH)
             })?;
-            namespace.reserved_inos.extend(inos);
+            reserved_inos.extend(inos);
         }
     }
 

@@ -1,3 +1,4 @@
+use super::namespace_ops::NAMESPACE_INODE_BATCH;
 use super::*;
 use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14557,12 +14558,12 @@ fn namespace_inode_reservation_refills_after_exhaustion() {
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-refill");
 
     let first = vfs.reserve_namespace_ino().expect("reserve first inode");
-    let mut previous = first;
-    for _ in 1..4096 {
-        let ino = vfs.reserve_namespace_ino().expect("reserve inode");
-        assert_eq!(ino, previous + 1);
-        previous = ino;
-    }
+    let (previous, contiguous) =
+        (1..NAMESPACE_INODE_BATCH).fold((first, true), |(previous, contiguous), _| {
+            let ino = vfs.reserve_namespace_ino().expect("reserve inode");
+            (ino, contiguous && ino == previous + 1)
+        });
+    assert!(contiguous, "reserved inode range should be contiguous");
     assert_eq!(namespace_inode_allocation_calls(&vfs), 1);
 
     let refilled = vfs.reserve_namespace_ino().expect("refill inode range");
@@ -14578,7 +14579,7 @@ fn namespace_inode_reservation_is_unique_under_concurrent_refill() {
         .map(|_| {
             let vfs = vfs.clone();
             thread::spawn(move || {
-                (0..1024)
+                (0..(NAMESPACE_INODE_BATCH / 4) as usize)
                     .map(|_| vfs.reserve_namespace_ino().expect("reserve inode"))
                     .collect::<Vec<_>>()
             })
@@ -14589,7 +14590,7 @@ fn namespace_inode_reservation_is_unique_under_concurrent_refill() {
         .flat_map(|thread| thread.join().expect("reservation thread"))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(inos.len(), 8192);
+    assert_eq!(inos.len(), 2 * NAMESPACE_INODE_BATCH as usize);
     assert_eq!(namespace_inode_allocation_calls(&vfs), 2);
 }
 
@@ -14609,7 +14610,7 @@ fn namespace_inode_reservation_leaves_restart_gaps() {
         .reserve_namespace_ino()
         .expect("reserve inode after restart");
 
-    assert_eq!(after_restart, first + 4096);
+    assert_eq!(after_restart, first + u64::from(NAMESPACE_INODE_BATCH));
 }
 
 #[test]
