@@ -113,7 +113,7 @@ impl StudioVfs {
         let started = Instant::now();
         let result = operation();
         self.record_namespace_inode_allocation_observability(started.elapsed());
-        result.map_err(VfsError::Meta)
+        Ok(result?)
     }
 
     fn observe_namespace_mutation<T>(
@@ -123,7 +123,7 @@ impl StudioVfs {
         let started = Instant::now();
         let result = operation();
         self.record_namespace_mutation_observability(started.elapsed());
-        result.map_err(VfsError::Meta)
+        Ok(result?)
     }
 
     fn runtime_stats_entry_exists_error(parent: Ino, name: &[u8]) -> VfsError {

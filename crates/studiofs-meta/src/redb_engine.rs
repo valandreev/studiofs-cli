@@ -38,6 +38,7 @@ pub struct RedbMetaEngine {
     write_metrics: Arc<MetadataWriteMetrics>,
 }
 
+/// Lock-free counters for one metadata write-transaction stage.
 #[derive(Default)]
 struct MetadataWriteStageMetrics {
     calls: AtomicU64,
@@ -45,6 +46,7 @@ struct MetadataWriteStageMetrics {
     max_ns: AtomicU64,
 }
 
+/// Lock-free timing counters for redb write transaction stages.
 #[derive(Default)]
 struct MetadataWriteMetrics {
     begin_write: MetadataWriteStageMetrics,
@@ -203,6 +205,8 @@ impl RedbWriteTransaction<'_> {
             write_metrics,
             mutation_started,
         } = self;
+        // Abort latency itself is intentionally excluded; mutation ends when abort starts,
+        // matching commit accounting before the durable commit call.
         MetadataWriteMetrics::observe(&write_metrics.mutation, mutation_started.elapsed());
         txn.abort()
     }
