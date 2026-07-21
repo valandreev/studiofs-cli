@@ -278,7 +278,7 @@ impl ContractVfsFixture {
                         .join()
                 });
             } else {
-                runtime.block_on(vfs.shutdown(shutdown_timeout));
+                let _ = runtime.block_on(vfs.shutdown(shutdown_timeout));
             }
         }
     }

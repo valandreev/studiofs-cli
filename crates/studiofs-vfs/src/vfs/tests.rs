@@ -6614,7 +6614,7 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
         vfs.write(created.ino, 0, b"shutdown-payload")
             .await
             .expect("write shutdown payload");
-        vfs.shutdown(std::time::Duration::ZERO).await;
+        let _ = vfs.shutdown(std::time::Duration::ZERO).await;
     });
     drop(vfs);
     drop(meta);
@@ -6678,7 +6678,7 @@ fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
             "same-mount reads should observe accepted writer-state bytes before a durability boundary"
         );
 
-        vfs.shutdown(std::time::Duration::ZERO).await;
+        let _ = vfs.shutdown(std::time::Duration::ZERO).await;
         attr.ino
     });
     drop(vfs);
@@ -11617,7 +11617,7 @@ fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
             mode: 0o644,
         },
     );
-    assert!(error.is_err());
+    assert!(matches!(error, Err(VfsError::WouldBlock)));
 
     let inner = vfs.state.namespace.deferred.inner.lock();
     assert!(inner.queue.is_empty());
@@ -11677,13 +11677,7 @@ fn deferred_namespace_admission_bounds_operation_count() {
             _rt.handle(),
         )
         .expect_err("shared admission should apply backpressure before create succeeds");
-    assert!(matches!(
-        callback_error,
-        VfsError::Meta(MetaError::AccessDenied {
-            actual: AccessLevel::ReadOnly,
-            ..
-        })
-    ));
+    assert!(matches!(callback_error, VfsError::WouldBlock));
 
     let inner = vfs.state.namespace.deferred.inner.lock();
     assert_eq!(
@@ -11699,6 +11693,29 @@ fn deferred_namespace_admission_bounds_operation_count() {
                 b"callback-overflow"
             ))
     );
+}
+
+#[test]
+fn deferred_namespace_admission_stops_after_shutdown_requested() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-shutdown-admission");
+    vfs.state
+        .shutdown
+        .shutdown_requested
+        .store(true, AtomicOrdering::Release);
+
+    let error = vfs
+        .create_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"rejected-after-shutdown-request",
+            0,
+            0,
+            0o644,
+            rt.handle(),
+        )
+        .expect_err("shutdown must stop shared deferred namespace admission");
+    assert!(matches!(error, VfsError::Other(message) if message.contains("shutdown")));
+    assert!(vfs.state.namespace.deferred.inner.lock().queue.is_empty());
 }
 
 #[test]

@@ -552,19 +552,23 @@ impl<H: WinfspShutdownHost + ?Sized> Drop for WinfspUnmountGuard<'_, H> {
 }
 
 #[cfg(test)]
-fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vfs: impl FnOnce()) {
+fn stop_host_before_vfs_shutdown(
+    host: &mut impl WinfspShutdownHost,
+    shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     host.stop_for_shutdown();
     let unmount_guard = WinfspUnmountGuard::new(host);
-    shutdown_vfs();
+    let result = shutdown_vfs();
     unmount_guard.unmount_now();
+    result
 }
 
 #[cfg(test)]
 fn stop_host_before_vfs_shutdown_and_process_exit(
     mut host: impl WinfspShutdownHost,
-    shutdown_vfs: impl FnOnce(),
-) {
-    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
+    shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs)?;
     tracing::info!(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: dropping host"
@@ -574,21 +578,26 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: host dropped"
     );
+    Ok(())
 }
 
 #[cfg(not(test))]
-fn stop_host_before_vfs_shutdown_and_process_exit<H>(mut host: H, shutdown_vfs: impl FnOnce())
+fn stop_host_before_vfs_shutdown_and_process_exit<H>(
+    mut host: H,
+    shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()>
 where
     H: WinfspShutdownHost + Send + 'static,
 {
-    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
+    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs)?;
     drop_host_before_process_exit(host, shutdown_started);
+    Ok(())
 }
 
 fn stop_host_and_shutdown_vfs(
     host: &mut impl WinfspShutdownHost,
-    shutdown_vfs: impl FnOnce(),
-) -> std::time::Instant {
+    shutdown_vfs: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<std::time::Instant> {
     let shutdown_started = std::time::Instant::now();
     tracing::info!("WinFSP shutdown: stopping host before VFS shutdown");
     let stop_started = std::time::Instant::now();
@@ -600,13 +609,13 @@ fn stop_host_and_shutdown_vfs(
     );
     let vfs_shutdown_started = std::time::Instant::now();
     tracing::info!("WinFSP shutdown: running VFS shutdown");
-    shutdown_vfs();
+    let shutdown_result = shutdown_vfs();
     tracing::info!(
         elapsed_ms = vfs_shutdown_started.elapsed().as_millis(),
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: VFS shutdown returned"
     );
-    shutdown_started
+    shutdown_result.map(|()| shutdown_started)
 }
 
 #[cfg(not(test))]
@@ -853,7 +862,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
-    // Best-effort graceful shutdown: first drain VFS background work so
+    // Graceful shutdown: first drain VFS background work so
     // metadata engines (pg/redb) can stop their threads and be closed cleanly
     // before the kernel unmounts the filesystem. Use the same env var as the
     // mount session to control upload drain timeout.
@@ -865,8 +874,10 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     // Stop WinFSP before the VFS shutdown drain so late callbacks cannot race
     // after the local metadata/cache checkpoint has been flushed.
     stop_host_before_vfs_shutdown_and_process_exit(host, || {
-        runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
-    });
+        runtime_handle
+            .block_on(vfs.shutdown(upload_drain_timeout))
+            .map_err(|error| std::io::Error::other(format!("VFS shutdown failed: {error}")))
+    })?;
 
     Ok(())
 }
@@ -1268,7 +1279,9 @@ mod tests {
 
         stop_host_before_vfs_shutdown(&mut host, || {
             events.borrow_mut().push("vfs.shutdown");
-        });
+            Ok(())
+        })
+        .expect("VFS shutdown should succeed");
 
         assert_eq!(
             events.borrow().as_slice(),
@@ -1292,7 +1305,9 @@ mod tests {
 
         stop_host_before_vfs_shutdown_and_process_exit(host, || {
             events.borrow_mut().push("vfs.shutdown");
-        });
+            Ok(())
+        })
+        .expect("VFS shutdown should succeed");
 
         assert_eq!(
             events.borrow().as_slice(),
@@ -1354,7 +1369,7 @@ mod tests {
         };
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stop_host_before_vfs_shutdown(&mut host, || {
+            let _ = stop_host_before_vfs_shutdown(&mut host, || {
                 events.borrow_mut().push("vfs.shutdown");
                 panic!("simulated VFS shutdown panic");
             });

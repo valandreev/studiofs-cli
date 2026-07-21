@@ -904,15 +904,20 @@ fn run_mount_vfs_shutdown(
 ) -> anyhow::Result<Runtime> {
     if tokio::runtime::Handle::try_current().is_ok() {
         let shutdown = std::thread::spawn(move || {
-            runtime.block_on(vfs.shutdown(upload_drain_timeout));
             runtime
+                .block_on(vfs.shutdown(upload_drain_timeout))
+                .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"))?;
+            Ok::<_, anyhow::Error>(runtime)
         });
-        return shutdown.join().map_err(|_| {
+        let shutdown = shutdown.join().map_err(|_| {
             anyhow::anyhow!("mount VFS shutdown runtime thread panicked during unmount")
-        });
+        })?;
+        return shutdown;
     }
 
-    runtime.block_on(vfs.shutdown(upload_drain_timeout));
+    runtime
+        .block_on(vfs.shutdown(upload_drain_timeout))
+        .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"))?;
     Ok(runtime)
 }
 
