@@ -709,7 +709,9 @@ where
 
     signal_named_event(&event_name);
     let join_result = handle.join();
-    rt_for_shutdown.block_on(vfs_for_shutdown.shutdown(Duration::from_secs(1)));
+    rt_for_shutdown
+        .block_on(vfs_for_shutdown.shutdown(Duration::from_secs(1)))
+        .expect("VFS shutdown should succeed");
 
     match result {
         Ok(value) => {

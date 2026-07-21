@@ -1880,8 +1880,14 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .unwrap();
     assert_eq!(reader_bytes.as_ref(), payload);
 
-    reader_vfs.shutdown(Duration::from_secs(15)).await;
-    writer_vfs.shutdown(Duration::from_secs(15)).await;
+    reader_vfs
+        .shutdown(Duration::from_secs(15))
+        .await
+        .expect("reader VFS shutdown should succeed");
+    writer_vfs
+        .shutdown(Duration::from_secs(15))
+        .await
+        .expect("writer VFS shutdown should succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2698,7 +2704,9 @@ fn test_crash_recovery_replays_pending_journal() {
             "recovered uploader should eventually upload object {object_id}"
         );
 
-        vfs.shutdown(Duration::from_secs(15)).await;
+        vfs.shutdown(Duration::from_secs(15))
+            .await
+            .expect("VFS shutdown should succeed");
     });
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
@@ -2790,7 +2798,9 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
                 "baseline object should be uploaded before overwrite crash test"
             );
 
-            vfs.shutdown(Duration::from_secs(15)).await;
+            vfs.shutdown(Duration::from_secs(15))
+                .await
+                .expect("VFS shutdown should succeed");
         });
     }
 
@@ -3237,7 +3247,8 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
 
             tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
-                .expect("shutdown should stay bounded");
+                .expect("shutdown should stay bounded")
+                .expect("VFS shutdown should succeed");
             attr.ino
         });
         rt.shutdown_background();
@@ -3358,7 +3369,8 @@ fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
 
             tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
-                .expect("shutdown should stay bounded");
+                .expect("shutdown should stay bounded")
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -3466,7 +3478,8 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
 
             tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
-                .expect("shutdown should stay bounded");
+                .expect("shutdown should stay bounded")
+                .expect("VFS shutdown should succeed");
             attr.ino
         });
         rt.shutdown_background();
@@ -3507,7 +3520,8 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
 
             tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
-                .expect("shutdown should stay bounded");
+                .expect("shutdown should stay bounded")
+                .expect("VFS shutdown should succeed");
             snapshot
         });
         rt.shutdown_background();
@@ -4345,8 +4359,14 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
         );
         assert_eq!(refreshed.committed_size, payload.len() as u64);
 
-        writer_vfs.shutdown(Duration::from_secs(15)).await;
-        remote_vfs.shutdown(Duration::from_secs(15)).await;
+        writer_vfs
+            .shutdown(Duration::from_secs(15))
+            .await
+            .expect("writer VFS shutdown should succeed");
+        remote_vfs
+            .shutdown(Duration::from_secs(15))
+            .await
+            .expect("remote VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -4441,8 +4461,14 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
             .await
             .unwrap();
 
-        writer_vfs.shutdown(Duration::from_secs(15)).await;
-        remote_vfs.shutdown(Duration::from_secs(15)).await;
+        writer_vfs
+            .shutdown(Duration::from_secs(15))
+            .await
+            .expect("writer VFS shutdown should succeed");
+        remote_vfs
+            .shutdown(Duration::from_secs(15))
+            .await
+            .expect("remote VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -4521,7 +4547,9 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
                 .await,
                 "baseline object should exist before replacement local-commit replay test"
             );
-            vfs.shutdown(Duration::from_secs(15)).await;
+            vfs.shutdown(Duration::from_secs(15))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -5054,7 +5082,9 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
             .expect("published inode must retain a committed incarnation");
         assert_eq!(committed.size, payload.len() as u64);
 
-        vfs.shutdown(Duration::from_secs(15)).await;
+        vfs.shutdown(Duration::from_secs(15))
+            .await
+            .expect("VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -5296,7 +5326,9 @@ fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen(
                 );
             }
             vfs.release_fh(fh).await.unwrap();
-            vfs.shutdown(Duration::from_secs(15)).await;
+            vfs.shutdown(Duration::from_secs(15))
+                .await
+                .expect("VFS shutdown should succeed");
             attr.ino
         });
         rt.shutdown_background();
@@ -5351,7 +5383,9 @@ fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen(
             );
         }
         vfs.release_fh(fh).await.unwrap();
-        vfs.shutdown(Duration::from_secs(15)).await;
+        vfs.shutdown(Duration::from_secs(15))
+            .await
+            .expect("VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -6677,7 +6711,9 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
                 .expect("warm published read should succeed before cache wipe");
             assert_eq!(warm_read.as_ref(), payload.as_slice());
 
-            vfs.shutdown(Duration::from_secs(15)).await;
+            vfs.shutdown(Duration::from_secs(15))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -6712,7 +6748,10 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
             .expect("cold reopened read should fetch published remote content");
         assert_eq!(cold_read.as_ref(), payload.as_slice());
 
-        reopened.shutdown(Duration::from_secs(15)).await;
+        reopened
+            .shutdown(Duration::from_secs(15))
+            .await
+            .expect("reopened VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -7171,7 +7210,9 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
 
             let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
             assert_eq!(read.as_ref(), payload.as_slice());
-            vfs.shutdown(Duration::from_secs(10)).await;
+            vfs.shutdown(Duration::from_secs(10))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -7221,7 +7262,9 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     "local-payload-runtime replay lost dirty object {object_id}"
                 );
             }
-            vfs.shutdown(Duration::from_secs(10)).await;
+            vfs.shutdown(Duration::from_secs(10))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -7323,7 +7366,9 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 .await
                 .unwrap();
             assert_eq!(read.as_ref(), replacement_payload.as_slice());
-            vfs.shutdown(Duration::from_secs(10)).await;
+            vfs.shutdown(Duration::from_secs(10))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -7420,7 +7465,9 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 .await
                 .unwrap();
             assert_eq!(final_read.as_ref(), replacement_payload.as_slice());
-            vfs.shutdown(Duration::from_secs(10)).await;
+            vfs.shutdown(Duration::from_secs(10))
+                .await
+                .expect("VFS shutdown should succeed");
         });
         rt.shutdown_background();
     }
@@ -8223,7 +8270,9 @@ fn test_write_fast_mode_no_spill_artifacts() {
             "fast-mode flush should still publish object to remote store"
         );
 
-        vfs.shutdown(Duration::from_secs(15)).await;
+        vfs.shutdown(Duration::from_secs(15))
+            .await
+            .expect("VFS shutdown should succeed");
     });
     rt.shutdown_background();
 }
@@ -8979,7 +9028,9 @@ async fn test_restart_recovers_deferred_open_unlink_cleanup() {
         "open-unlink should persist deferred delete intent before restart"
     );
 
-    vfs.shutdown(Duration::from_secs(5)).await;
+    vfs.shutdown(Duration::from_secs(5))
+        .await
+        .expect("VFS shutdown should succeed");
     drop(vfs);
 
     let reopened = make_vfs(&tmp, volume_suffix);
@@ -12902,7 +12953,8 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
 
     tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
-        .expect("shutdown should stay bounded even with offline pending uploads");
+        .expect("shutdown should stay bounded even with offline pending uploads")
+        .expect("VFS shutdown should succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -12948,7 +13000,8 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
 
     tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
-        .expect("shutdown should stay bounded even with offline pending uploads");
+        .expect("shutdown should stay bounded even with offline pending uploads")
+        .expect("VFS shutdown should succeed");
 
     let runtime_snapshot_path = cache_dir.join("runtime").join("zeroio-last-shutdown.json");
     assert!(
@@ -13109,7 +13162,8 @@ async fn ctrl_c_during_small_file_churn_does_not_hang() {
 
     tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
-        .expect("shutdown should stay bounded during small-file churn");
+        .expect("shutdown should stay bounded during small-file churn")
+        .expect("VFS shutdown should succeed");
     tokio::time::timeout(Duration::from_secs(2), churn)
         .await
         .expect("foreground churn task should observe shutdown and exit")
@@ -13153,7 +13207,8 @@ async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
 
         tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
             .await
-            .expect("shutdown after delete should stay bounded");
+            .expect("shutdown after delete should stay bounded")
+            .expect("VFS shutdown should succeed");
     }
 
     let reopened = reopen_vfs(&db_path, &cache_dir);
@@ -13210,7 +13265,8 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
 
         tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
             .await
-            .expect("shutdown after recursive delete should stay bounded");
+            .expect("shutdown after recursive delete should stay bounded")
+            .expect("VFS shutdown should succeed");
     }
 
     let reopened = reopen_vfs(&db_path, &cache_dir);
@@ -13304,7 +13360,9 @@ async fn test_shutdown_drains_dirty_buffers() {
 
     // Before shutdown — blocks may or may not be uploaded yet.
     // Call shutdown which should drain everything.
-    vfs.shutdown(Duration::from_secs(30)).await;
+    vfs.shutdown(Duration::from_secs(30))
+        .await
+        .expect("VFS shutdown should succeed");
 
     // After shutdown, all 3 payload slices should exist in metadata.
     let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
@@ -13324,8 +13382,12 @@ async fn test_double_shutdown_does_not_panic() {
     let vfs = make_vfs(&tmp, "double-shutdown");
 
     vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
-    vfs.shutdown(Duration::from_secs(5)).await;
-    vfs.shutdown(Duration::from_secs(5)).await;
+    vfs.shutdown(Duration::from_secs(5))
+        .await
+        .expect("first VFS shutdown should succeed");
+    vfs.shutdown(Duration::from_secs(5))
+        .await
+        .expect("second VFS shutdown should succeed");
     // No panic = pass.
 }
 
