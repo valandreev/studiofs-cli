@@ -4,6 +4,30 @@ const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version
 const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 
 impl RedbMetaEngine {
+    pub(crate) fn set_attr_in_txn(
+        txn: &WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<InodeAttr> {
+        let mut normalized = attr.clone();
+        if normalized.kind == FileType::RegularFile {
+            let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
+                txn,
+                REGULAR_FILE_BASE_TABLE,
+                normalized.ino,
+            )?;
+            Self::transition_upload_state_for_local_mutation(&mut normalized, has_committed_graph);
+        }
+        Self::set_inode_overlay_in_txn(txn, &normalized)?;
+        Self::sync_inode_lifecycle_in_txn(txn, normalized.ino)?;
+        Self::append_event_in_txn(
+            txn,
+            &crate::events::MetaEvent::SetAttr {
+                attr: normalized.clone(),
+            },
+        )?;
+        Ok(normalized)
+    }
+
     pub(crate) fn get_base_attr(&self, ino: Ino) -> MetaResult<Option<InodeAttr>> {
         let txn = self.begin_read_txn()?;
         let table = txn
@@ -627,29 +651,7 @@ impl MetaInodes for RedbMetaEngine {
 
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
-        {
-            let mut normalized = attr.clone();
-            if normalized.kind == FileType::RegularFile {
-                let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
-                    &txn,
-                    REGULAR_FILE_BASE_TABLE,
-                    normalized.ino,
-                )?;
-                Self::transition_upload_state_for_local_mutation(
-                    &mut normalized,
-                    has_committed_graph,
-                );
-            }
-            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
-            Self::sync_inode_lifecycle_in_txn(&txn, normalized.ino)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr {
-                    attr: normalized.clone(),
-                },
-            )?;
-        }
+        Self::set_attr_in_txn(&txn, attr)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())

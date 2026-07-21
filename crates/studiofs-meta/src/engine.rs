@@ -138,6 +138,16 @@ pub enum MetaError {
         /// Effective access currently granted to the principal.
         actual: AccessLevel,
     },
+
+    /// A namespace mutation failed at a specific position in an ordered batch.
+    #[error("namespace batch operation {index} failed: {source}")]
+    NamespaceBatchOperation {
+        /// Zero-based position of the failed operation.
+        index: usize,
+        /// Error returned while applying the operation.
+        #[source]
+        source: Box<MetaError>,
+    },
 }
 
 /// Standard result type returned by metadata APIs.
@@ -264,6 +274,48 @@ pub struct PendingCreateRecord {
     pub kind: FileType,
     /// Unix timestamp when the record was created.
     pub created_at: i64,
+}
+
+/// One of the namespace mutations supported by the deferred namespace queue.
+#[derive(Debug, Clone)]
+pub enum NamespaceMutation {
+    /// Create a regular file with a caller-reserved inode.
+    CreateFile {
+        /// Caller-reserved inode number.
+        ino: Ino,
+        /// Parent directory inode.
+        parent: Ino,
+        /// Directory entry name.
+        name: Vec<u8>,
+        /// Owner user id.
+        uid: u32,
+        /// Owner group id.
+        gid: u32,
+        /// Permission and file-type mode bits.
+        mode: u16,
+    },
+    /// Create a directory with a caller-reserved inode.
+    CreateDir {
+        /// Caller-reserved inode number.
+        ino: Ino,
+        /// Parent directory inode.
+        parent: Ino,
+        /// Directory entry name.
+        name: Vec<u8>,
+        /// Owner user id.
+        uid: u32,
+        /// Owner group id.
+        gid: u32,
+        /// Permission and file-type mode bits.
+        mode: u16,
+    },
+    /// Apply an already-resolved attribute-only update.
+    SetAttr {
+        /// Fallback attribute value when the inode is not committed yet.
+        attr: InodeAttr,
+        /// Attribute-only delta to apply to the current inode.
+        args: SetattrArgs,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -455,6 +507,12 @@ pub trait MetaNamespace: Send + Sync {
 
 /// High-level filesystem operations built on top of namespace and inode primitives.
 pub trait MetaFsOps: Send + Sync + MetaInodes {
+    /// Apply ordered namespace mutations in one local metadata transaction.
+    fn apply_namespace_mutations(
+        &self,
+        mutations: &[NamespaceMutation],
+    ) -> MetaResult<Vec<InodeAttr>>;
+
     /// Create a new file: allocate inode, set attrs, add dentry.
     fn create_file(
         &self,

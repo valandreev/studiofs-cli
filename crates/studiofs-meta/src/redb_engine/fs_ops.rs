@@ -702,6 +702,71 @@ impl<'a> NamespaceDeleteTxn<'a> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn apply_namespace_mutations(
+        &self,
+        mutations: &[NamespaceMutation],
+    ) -> MetaResult<Vec<InodeAttr>> {
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self.begin_write_txn()?;
+        let namespace_txn = NamespaceCreateTxn::new(&txn);
+        let mut results = Vec::with_capacity(mutations.len());
+        for (index, mutation) in mutations.iter().enumerate() {
+            let result = match mutation {
+                NamespaceMutation::CreateFile {
+                    ino,
+                    parent,
+                    name,
+                    uid,
+                    gid,
+                    mode,
+                } => namespace_txn.execute(&NamespaceCreateSpec::new_file(
+                    *ino, *parent, name, *uid, *gid, *mode,
+                )),
+                NamespaceMutation::CreateDir {
+                    ino,
+                    parent,
+                    name,
+                    uid,
+                    gid,
+                    mode,
+                } => namespace_txn.execute(&NamespaceCreateSpec::new_dir(
+                    *ino, *parent, name, *uid, *gid, *mode,
+                )),
+                NamespaceMutation::SetAttr { attr, args } => {
+                    let mut committed_attr =
+                        match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
+                            Ok(committed) => committed,
+                            Err(MetaError::InodeNotFound(_)) => attr.clone(),
+                            Err(error) => {
+                                return Err(MetaError::NamespaceBatchOperation {
+                                    index,
+                                    source: Box::new(error),
+                                });
+                            }
+                        };
+                    args.apply_attr_only(&mut committed_attr);
+                    committed_attr.ctime = committed_attr.ctime.max(attr.ctime);
+                    RedbMetaEngine::set_attr_in_txn(&txn, &committed_attr)
+                }
+            };
+            match result {
+                Ok(attr) => results.push(attr),
+                Err(source) => {
+                    return Err(MetaError::NamespaceBatchOperation {
+                        index,
+                        source: Box::new(source),
+                    });
+                }
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(results)
+    }
+
     pub(super) fn execute_namespace_create(
         &self,
         spec: NamespaceCreateSpec<'_>,
@@ -768,6 +833,13 @@ impl RedbMetaEngine {
 }
 
 impl MetaFsOps for RedbMetaEngine {
+    fn apply_namespace_mutations(
+        &self,
+        mutations: &[NamespaceMutation],
+    ) -> MetaResult<Vec<InodeAttr>> {
+        RedbMetaEngine::apply_namespace_mutations(self, mutations)
+    }
+
     // --- Atomic Rename ---------------------------------------------------
 
     fn rename_atomic(

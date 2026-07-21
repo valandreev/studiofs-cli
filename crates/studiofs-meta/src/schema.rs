@@ -503,6 +503,47 @@ impl SetattrArgs {
             ..Default::default()
         }
     }
+
+    /// Apply the namespace-safe subset of setattr fields.
+    pub fn apply_attr_only(&self, attr: &mut InodeAttr) -> bool {
+        let mut changed = false;
+        if let Some(mode) = self.mode {
+            attr.mode = mode & 0o7777;
+            changed = true;
+        }
+
+        if let Some(uid) = self.uid {
+            attr.uid = uid;
+            changed = true;
+        }
+
+        if let Some(gid) = self.gid {
+            attr.gid = gid;
+            changed = true;
+        }
+
+        if let Some(ns) = self.atime.resolve() {
+            attr.atime = ns;
+            changed = true;
+        }
+
+        if let Some(ns) = self.mtime.resolve() {
+            attr.mtime = ns;
+            changed = true;
+        }
+
+        if let Some(ns) = self.crtime.resolve() {
+            attr.crtime = ns;
+            changed = true;
+        }
+
+        if let Some(wa) = self.win_attrs {
+            attr.win_attrs = wa;
+            changed = true;
+        }
+
+        changed
+    }
 }
 
 // =============================================================================
