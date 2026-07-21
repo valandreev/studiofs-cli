@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use studiofs_meta::engine::{
     DeferredDeleteRecord, MetadataAuthorityStatus, MetadataInvalidationDiagnostics,
-    MetadataReplicationBacklog, PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    MetadataReplicationBacklog, MetadataWriteObservability, PendingCreateRecord, UndoLogKind,
+    UndoLogRecord,
 };
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
@@ -68,9 +69,15 @@ pub trait VfsMeta:
     + MetaAcl
     + MetaReplication
 {
+    /// Return local metadata write timing through the runtime metadata facade.
+    ///
+    /// This explicit forwarding method preserves the concrete backend override
+    /// when the VFS stores metadata as `dyn VfsMeta`.
+    fn vfs_metadata_write_observability(&self) -> MetadataWriteObservability;
 }
 
-impl<T> VfsMeta for T where
+impl<T> VfsMeta for T
+where
     T: ?Sized
         + Send
         + Sync
@@ -86,8 +93,11 @@ impl<T> VfsMeta for T where
         + MetaSymlink
         + MetaXattr
         + MetaAcl
-        + MetaReplication
+        + MetaReplication,
 {
+    fn vfs_metadata_write_observability(&self) -> MetadataWriteObservability {
+        MetaEngineCore::metadata_write_observability(self)
+    }
 }
 
 /// Read path runtime metadata facade used by VFS read-path operations.
@@ -164,6 +174,7 @@ impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
+    forward_method!(fn metadata_write_observability(&self) -> MetadataWriteObservability);
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);
     forward_method!(fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>);

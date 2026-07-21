@@ -77,14 +77,14 @@ pub use metrics::{
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
     VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats, VfsReadPathStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2195,6 +2195,15 @@ struct MetricsState {
     metadata_commit_interval_total_ns: AtomicU64,
     metadata_commit_interval_max_ns: AtomicU64,
     metadata_commit_interval_histogram: LatencyHistogram,
+    namespace_inode_allocation_calls: AtomicU64,
+    namespace_inode_allocation_total_ns: AtomicU64,
+    namespace_inode_allocation_max_ns: AtomicU64,
+    namespace_inode_allocation_histogram: LatencyHistogram,
+    namespace_mutation_calls: AtomicU64,
+    namespace_mutation_total_ns: AtomicU64,
+    namespace_mutation_max_ns: AtomicU64,
+    namespace_mutation_histogram: LatencyHistogram,
+    namespace_create_completed_entries: AtomicU64,
     eager_flush_checks: AtomicU64,
     eager_flush_triggered: AtomicU64,
     eager_flush_skipped_empty: AtomicU64,
@@ -2385,6 +2394,15 @@ impl MetricsState {
             metadata_commit_interval_total_ns: AtomicU64::new(0),
             metadata_commit_interval_max_ns: AtomicU64::new(0),
             metadata_commit_interval_histogram: LatencyHistogram::default(),
+            namespace_inode_allocation_calls: AtomicU64::new(0),
+            namespace_inode_allocation_total_ns: AtomicU64::new(0),
+            namespace_inode_allocation_max_ns: AtomicU64::new(0),
+            namespace_inode_allocation_histogram: LatencyHistogram::default(),
+            namespace_mutation_calls: AtomicU64::new(0),
+            namespace_mutation_total_ns: AtomicU64::new(0),
+            namespace_mutation_max_ns: AtomicU64::new(0),
+            namespace_mutation_histogram: LatencyHistogram::default(),
+            namespace_create_completed_entries: AtomicU64::new(0),
             eager_flush_checks: AtomicU64::new(0),
             eager_flush_triggered: AtomicU64::new(0),
             eager_flush_skipped_empty: AtomicU64::new(0),
@@ -2569,6 +2587,13 @@ impl MetricsState {
             metadata_commit_last_completed_ns,
             metadata_commit_interval_total_ns,
             metadata_commit_interval_max_ns,
+            namespace_inode_allocation_calls,
+            namespace_inode_allocation_total_ns,
+            namespace_inode_allocation_max_ns,
+            namespace_mutation_calls,
+            namespace_mutation_total_ns,
+            namespace_mutation_max_ns,
+            namespace_create_completed_entries,
             eager_flush_checks,
             eager_flush_triggered,
             eager_flush_skipped_empty,
@@ -2691,6 +2716,8 @@ impl MetricsState {
         self.payload_burst_interval_histogram.reset();
         self.metadata_commit_histogram.reset();
         self.metadata_commit_interval_histogram.reset();
+        self.namespace_inode_allocation_histogram.reset();
+        self.namespace_mutation_histogram.reset();
         self.vfs_write_create_histogram.reset();
         self.vfs_write_mkdir_histogram.reset();
         self.vfs_write_open_file_histogram.reset();
@@ -6887,6 +6914,35 @@ impl StudioVfs {
         );
     }
 
+    pub(super) fn record_namespace_inode_allocation_observability(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.namespace_inode_allocation_calls,
+            &metrics.namespace_inode_allocation_total_ns,
+            &metrics.namespace_inode_allocation_max_ns,
+            &metrics.namespace_inode_allocation_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_namespace_mutation_observability(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.namespace_mutation_calls,
+            &metrics.namespace_mutation_total_ns,
+            &metrics.namespace_mutation_max_ns,
+            &metrics.namespace_mutation_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_namespace_create_completed(&self) {
+        self.state
+            .metrics
+            .namespace_create_completed_entries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
         self.state
             .metrics
@@ -7818,6 +7874,13 @@ impl StudioVfs {
             metadata_commit_completed_calls: metadata_commit_completed_calls,
             metadata_commit_interval_total_ns: metadata_commit_interval_total_ns,
             metadata_commit_interval_max_ns: metadata_commit_interval_max_ns,
+            namespace_inode_allocation_calls: namespace_inode_allocation_calls,
+            namespace_inode_allocation_total_ns: namespace_inode_allocation_total_ns,
+            namespace_inode_allocation_max_ns: namespace_inode_allocation_max_ns,
+            namespace_mutation_calls: namespace_mutation_calls,
+            namespace_mutation_total_ns: namespace_mutation_total_ns,
+            namespace_mutation_max_ns: namespace_mutation_max_ns,
+            namespace_create_completed_entries: namespace_create_completed_entries,
             eager_flush_checks: eager_flush_checks,
             eager_flush_triggered: eager_flush_triggered,
             eager_flush_skipped_empty: eager_flush_skipped_empty,
@@ -7907,6 +7970,13 @@ impl StudioVfs {
             .metrics
             .metadata_commit_interval_histogram
             .snapshot();
+        let namespace_inode_allocation_histogram = self
+            .state
+            .metrics
+            .namespace_inode_allocation_histogram
+            .snapshot();
+        let namespace_mutation_histogram =
+            self.state.metrics.namespace_mutation_histogram.snapshot();
         let winfsp_write_callback_histogram = self
             .state
             .metrics
@@ -8739,6 +8809,30 @@ impl StudioVfs {
                 metadata_commit_interval_histogram,
                 elapsed,
             ),
+            metadata_engine: self.sync_meta().vfs_metadata_write_observability(),
+            namespace_create: VfsNamespaceCreateObservabilityStats {
+                inode_allocation: Self::build_stage_latency_stats(
+                    namespace_inode_allocation_calls,
+                    namespace_inode_allocation_total_ns,
+                    namespace_inode_allocation_max_ns,
+                    namespace_inode_allocation_histogram,
+                    elapsed,
+                ),
+                namespace_mutation: Self::build_stage_latency_stats(
+                    namespace_mutation_calls,
+                    namespace_mutation_total_ns,
+                    namespace_mutation_max_ns,
+                    namespace_mutation_histogram,
+                    elapsed,
+                ),
+                completed_entries: namespace_create_completed_entries,
+                transactions_per_created_entry: if namespace_create_completed_entries == 0 {
+                    0.0
+                } else {
+                    (namespace_inode_allocation_calls + namespace_mutation_calls) as f64
+                        / namespace_create_completed_entries as f64
+                },
+            },
             eager_flush: VfsWritePathEagerFlushStats {
                 checks: eager_flush_checks,
                 triggered: eager_flush_triggered,

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
 use studiofs_meta::engine::MetadataAuthorityStatus;
-use studiofs_meta::engine::{MetaInodes, MetaPayloadObjects};
+use studiofs_meta::engine::{MetaEngineCore, MetaInodes, MetaPayloadObjects};
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
@@ -14487,6 +14487,60 @@ fn interrupted_materializer_does_not_orphan_dirty_tail_if_last_waiter_is_cancell
         assert_eq!(readback, payload);
         vfs.release_fh(fh).await.expect("release file handle");
     });
+}
+
+#[test]
+fn namespace_create_records_one_complete_metadata_timing_sample() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "namespace-create-metadata-timing");
+    let before = vfs.write_path_observability_snapshot();
+
+    vfs.create(ROOT_INO, b"timed-create.txt", 0, 0, 0o644)
+        .expect("create file");
+
+    let after = vfs.write_path_observability_snapshot();
+    let direct_metadata_engine = meta.metadata_write_observability();
+    assert_eq!(
+        after.metadata_engine.begin_write.calls, direct_metadata_engine.begin_write.calls,
+        "the VFS snapshot must expose the active redb metadata engine metrics"
+    );
+    assert_eq!(
+        after.metadata_commit.calls,
+        before.metadata_commit.calls + 1,
+        "one namespace create should record one metadata timing sample"
+    );
+    assert_eq!(
+        after.metadata_commit_cadence.events,
+        before.metadata_commit_cadence.events + 1,
+        "a successful namespace create should record one completed metadata commit"
+    );
+    assert_eq!(
+        after.namespace_create.inode_allocation.calls,
+        before.namespace_create.inode_allocation.calls + 1,
+        "one namespace create should expose its inode allocation transaction"
+    );
+    assert_eq!(
+        after.namespace_create.namespace_mutation.calls,
+        before.namespace_create.namespace_mutation.calls + 1,
+        "one namespace create should expose its namespace mutation transaction"
+    );
+    assert_eq!(after.namespace_create.completed_entries, 1);
+    assert_eq!(after.namespace_create.transactions_per_created_entry, 2.0);
+    assert_eq!(
+        after.metadata_engine.begin_write.calls,
+        before.metadata_engine.begin_write.calls + 2,
+        "inode allocation and namespace mutation should each begin one redb write transaction"
+    );
+    assert_eq!(
+        after.metadata_engine.mutation.calls,
+        before.metadata_engine.mutation.calls + 2,
+        "each namespace-create transaction should record mutation time"
+    );
+    assert_eq!(
+        after.metadata_engine.commit.calls,
+        before.metadata_engine.commit.calls + 2,
+        "each namespace-create transaction should record commit time"
+    );
 }
 
 #[test]

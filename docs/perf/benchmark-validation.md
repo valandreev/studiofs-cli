@@ -9,6 +9,7 @@ user-provided mount point and write artifacts under `target/perf`.
 The scripts are:
 
 - Windows: `tools/perf/validate-bench-windows.ps1`
+- Windows SFS-612 metadata-create parity: `tools/perf/sfs-612-windows-metadata-create.ps1`
 - macOS: `tools/perf/validate-bench-macos.sh`
 - Linux: `tools/perf/validate-bench-linux.sh`
 
@@ -52,6 +53,71 @@ for the default `studiofs` command name. You can also pass an explicit binary
 with `-StudioFsPath` on Windows or `--studiofs` on macOS/Linux.
 On Windows, `-StudioFsPath target\release\studiofs` also resolves the matching
 `.exe` file when it exists.
+
+## SFS-612 Windows Metadata-Create Baseline
+
+SFS-612 measures the cost of creating local metadata through two mounted
+filesystems on the same Windows host: a StudioFS WinFSP mount and a JuiceFS
+reference mount. The harness copies the same Curvine source tree and then
+creates 10,000 fresh 4 KiB files. It runs three controlled cold/warm pairs per
+filesystem by default and writes raw per-run timings plus median summaries.
+
+Before running it, mount both filesystems on different drive letters backed by
+the comparable local metadata/cache storage class. Supply a command that
+prepares the cold-cache state; the script intentionally refuses to label a run
+as cold without this operator-controlled step. Record any antivirus, indexing,
+or storage exceptions in the artifact metadata.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\perf\sfs-612-windows-metadata-create.ps1 `
+  -StudioFsMountPoint Z:\ `
+  -JuiceFsMountPoint Y:\ `
+  -CurvineSource D:\src\curvine `
+  -ColdPreparationCommand '<your controlled cache preparation command>' `
+  -StudioFsMountOptions '<recorded WinFSP and StudioFS options>' `
+  -JuiceFsMountOptions '<recorded JuiceFS options>' `
+  -StorageNotes '<metadata and cache disk class>' `
+  -AntivirusAndIndexingNotes '<status or exclusions>'
+```
+
+The invocation creates
+`target/perf/sfs-612-windows-metadata-create-<timestamp>/` with:
+
+- `environment.json`: host, filesystem, mount, cache-control, storage, and
+  antivirus/indexing configuration;
+- `results.json`: every StudioFS/JuiceFS, cold/warm, raw timing sample; and
+- `summary.md`: median Curvine-copy, 4 KiB-create, and total times.
+
+This Windows-first pass does not claim Linux or macOS acceptance evidence.
+Their matching same-host StudioFS/JuiceFS comparison remains a documented
+follow-up, and their platform adapter checks must run on those operating
+systems before SFS-612 is marked cross-platform complete.
+
+The mounted runtime's `write_path_observability` JSON now also exposes the
+shared namespace-create breakdown: `namespace_create.inode_allocation`,
+`namespace_create.namespace_mutation`, completed entries, transactions per
+created entry, and `metadata_engine.begin_write`, `mutation`, and `commit`.
+For synchronous namespace creates, `namespace_mutation` measures the direct
+metadata-engine call. Deferred creates measure the same stage around the async
+runtime future, so their value also includes metadata executor queue wait.
+`payload_store_sync_data` remains the explicit local-payload `sync_data`
+measurement. redb commits are durable commit boundaries; its public API does
+not expose a separate post-commit `sync_data` call to time independently.
+
+### Accepted Windows baseline
+
+The SFS-612 Windows baseline is accepted from the operator's manual timing on
+2026-07-21 using the supplied `Z:\` StudioFS and `W:\` JuiceFS mounts with
+`E:\dev\curvine` as the source tree:
+
+| Filesystem | Observed time | Relative result |
+|---|---:|---:|
+| JuiceFS | 6 s | 1.0x reference |
+| StudioFS | 75 s (1 min 15 s) | 12.5x JuiceFS time |
+
+This is the accepted Windows reference baseline for SFS-612. It is a manual
+single observation, not a host-cache purge or a three-run cold/warm distribution;
+Linux/macOS adapter validation and measurements remain deferred.
 
 ## SFS-598 Linux JuiceFS Parity Gate
 

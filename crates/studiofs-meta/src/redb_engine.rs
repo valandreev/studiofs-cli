@@ -17,7 +17,7 @@ use std::sync::{
     Arc, Once, OnceLock, RwLock, RwLockReadGuard,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 pub(crate) mod layout;
@@ -35,6 +35,50 @@ const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Arc<RwLock<Database>>,
+    write_metrics: Arc<MetadataWriteMetrics>,
+}
+
+/// Lock-free counters for one metadata write-transaction stage.
+#[derive(Default)]
+struct MetadataWriteStageMetrics {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+/// Lock-free timing counters for redb write transaction stages.
+#[derive(Default)]
+struct MetadataWriteMetrics {
+    begin_write: MetadataWriteStageMetrics,
+    mutation: MetadataWriteStageMetrics,
+    commit: MetadataWriteStageMetrics,
+}
+
+impl MetadataWriteMetrics {
+    fn observe(stage: &MetadataWriteStageMetrics, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        // Snapshot readers may observe the three relaxed counters between updates;
+        // this deliberate tearing keeps the hot write path lock-free.
+        stage.calls.fetch_add(1, Ordering::Relaxed);
+        stage.total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        stage.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn snapshot_stage(stage: &MetadataWriteStageMetrics) -> MetadataWriteStageTiming {
+        MetadataWriteStageTiming {
+            calls: stage.calls.load(Ordering::Relaxed),
+            total_ns: stage.total_ns.load(Ordering::Relaxed),
+            max_ns: stage.max_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn snapshot(&self) -> MetadataWriteObservability {
+        MetadataWriteObservability {
+            begin_write: Self::snapshot_stage(&self.begin_write),
+            mutation: Self::snapshot_stage(&self.mutation),
+            commit: Self::snapshot_stage(&self.commit),
+        }
+    }
 }
 
 pub(crate) struct CounterWriteTransaction<'a> {
@@ -44,6 +88,8 @@ pub(crate) struct CounterWriteTransaction<'a> {
 pub(crate) struct RedbWriteTransaction<'a> {
     txn: WriteTransaction,
     _db: RwLockReadGuard<'a, Database>,
+    write_metrics: Arc<MetadataWriteMetrics>,
+    mutation_started: Instant,
 }
 
 fn redb_relaxed_durability_enabled() -> bool {
@@ -139,12 +185,29 @@ impl Deref for RedbWriteTransaction<'_> {
 
 impl RedbWriteTransaction<'_> {
     pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
-        let Self { txn, _db } = self;
-        txn.commit()
+        let Self {
+            txn,
+            _db,
+            write_metrics,
+            mutation_started,
+        } = self;
+        let commit_started = Instant::now();
+        MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
+        let result = txn.commit();
+        MetadataWriteMetrics::observe(&write_metrics.commit, commit_started.elapsed());
+        result
     }
 
     pub(crate) fn abort(self) -> Result<(), redb::StorageError> {
-        let Self { txn, _db } = self;
+        let Self {
+            txn,
+            _db,
+            write_metrics,
+            mutation_started,
+        } = self;
+        // Abort latency itself is intentionally excluded; mutation ends when abort starts,
+        // matching commit accounting before the durable commit call.
+        MetadataWriteMetrics::observe(&write_metrics.mutation, mutation_started.elapsed());
         txn.abort()
     }
 }
@@ -163,8 +226,16 @@ impl RedbMetaEngine {
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         let db = self.read_db()?;
-        let txn = begin_redb_write_txn(&db)?;
-        Ok(RedbWriteTransaction { txn, _db: db })
+        let started = Instant::now();
+        let result = begin_redb_write_txn(&db);
+        MetadataWriteMetrics::observe(&self.write_metrics.begin_write, started.elapsed());
+        let txn = result?;
+        Ok(RedbWriteTransaction {
+            txn,
+            _db: db,
+            write_metrics: Arc::clone(&self.write_metrics),
+            mutation_started: Instant::now(),
+        })
     }
 
     /// Open or create a metadata database at the given path.
@@ -216,6 +287,7 @@ impl RedbMetaEngine {
         debug!("opened metadata database at {:?}", path.as_ref());
         let engine = Self {
             db: Arc::new(RwLock::new(db)),
+            write_metrics: Arc::new(MetadataWriteMetrics::default()),
         };
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
@@ -289,6 +361,10 @@ mod txn;
 mod xattr;
 
 impl MetaEngineCore for RedbMetaEngine {
+    fn metadata_write_observability(&self) -> MetadataWriteObservability {
+        self.write_metrics.snapshot()
+    }
+
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
         Ok(true)
     }

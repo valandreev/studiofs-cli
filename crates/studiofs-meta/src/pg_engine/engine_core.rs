@@ -1,12 +1,16 @@
 //! Owns trait delegation from public metadata traits into PG engine internals.
 
 use super::PgMetaEngine;
-use crate::engine::{MetaEngineCore, MetaError, MetaResult};
+use crate::engine::{MetaEngineCore, MetaError, MetaResult, MetadataWriteObservability};
 use crate::types::*;
 use std::collections::HashSet;
 use std::time::Duration;
 
 impl MetaEngineCore for PgMetaEngine {
+    fn metadata_write_observability(&self) -> MetadataWriteObservability {
+        self.local.metadata_write_observability()
+    }
+
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
         self.try_acquire_pg_janitor_lock()
     }
