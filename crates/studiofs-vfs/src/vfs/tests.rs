@@ -11356,7 +11356,8 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
                 gid: 0,
                 mode: 0o644,
             },
-        );
+        )
+        .expect("admit permanently failing operation");
         vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
 
         vfs.wait_for_deferred_namespace_metadata(attr.ino)
@@ -11389,6 +11390,25 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
             inner.queue.is_empty(),
             "permanent failure should not block later namespace ops"
         );
+        drop(inner);
+
+        let admission_error = vfs
+            .create_with_deferred_metadata_admission(
+                ROOT_INO,
+                b"rejected-after-degraded-state.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect_err("permanent deferred persistence failure should degrade shared admission");
+        assert!(matches!(
+            admission_error,
+            VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            })
+        ));
     });
 }
 
@@ -11528,6 +11548,157 @@ fn deferred_namespace_create_under_deferred_dir_is_visible() {
             .expect("load persisted child dentry");
         assert_eq!(persisted.ino, file.ino);
     });
+}
+
+#[test]
+fn deferred_namespace_drain_commits_queued_operations_in_one_batch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-group-commit");
+    let before = vfs.write_path_observability_snapshot();
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let first = InodeAttr::new_file(9_000_011, ROOT_INO, 0, 0, 0o644);
+        let second = InodeAttr::new_file(9_000_012, ROOT_INO, 0, 0, 0o644);
+
+        for (attr, name) in [
+            (&first, b"first.txt".as_slice()),
+            (&second, b"second.txt".as_slice()),
+        ] {
+            vfs.enqueue_deferred_namespace_op(
+                Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, name)),
+                attr.clone(),
+                super::namespace::DeferredNamespaceOp::CreateFile {
+                    attr: attr.clone(),
+                    parent: ROOT_INO,
+                    name: name.to_vec(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o644,
+                },
+            )
+            .expect("admit queued operation");
+        }
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        vfs.wait_for_deferred_namespace_metadata(first.ino)
+            .await
+            .expect("first queued operation should commit");
+        vfs.wait_for_deferred_namespace_metadata(second.ino)
+            .await
+            .expect("second queued operation should commit");
+    });
+
+    let after = vfs.write_path_observability_snapshot();
+    assert_eq!(
+        after.metadata_commit.calls,
+        before.metadata_commit.calls + 1
+    );
+    assert_eq!(
+        after.metadata_engine.commit.calls,
+        before.metadata_engine.commit.calls + 1
+    );
+}
+
+#[test]
+fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");
+    let attr = InodeAttr::new_file(9_000_013, ROOT_INO, 0, 0, 0o644);
+    let name = vec![b'x'; 1024 * 1024];
+
+    let error = vfs.enqueue_deferred_namespace_op(
+        Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, &name)),
+        attr.clone(),
+        super::namespace::DeferredNamespaceOp::CreateFile {
+            attr,
+            parent: ROOT_INO,
+            name,
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        },
+    );
+    assert!(error.is_err());
+
+    let inner = vfs.state.namespace.deferred.inner.lock();
+    assert!(inner.queue.is_empty());
+    assert!(inner.entries.is_empty());
+    assert!(inner.attrs.is_empty());
+}
+
+#[test]
+fn deferred_namespace_admission_bounds_operation_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-count");
+
+    for index in 0..super::namespace_ops::DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS {
+        let ino = 10_000_000 + index as u64;
+        let name = format!("queued-{index}").into_bytes();
+        let attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, &name)),
+            attr.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr,
+                parent: ROOT_INO,
+                name,
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        )
+        .expect("admit operation within backlog limit");
+    }
+
+    let overflow_attr = InodeAttr::new_file(20_000_000, ROOT_INO, 0, 0, 0o644);
+    let overflow = vfs.enqueue_deferred_namespace_op(
+        Some(super::namespace::DeferredNamespaceKey::new(
+            ROOT_INO,
+            b"overflow",
+        )),
+        overflow_attr.clone(),
+        super::namespace::DeferredNamespaceOp::CreateFile {
+            attr: overflow_attr,
+            parent: ROOT_INO,
+            name: b"overflow".to_vec(),
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        },
+    );
+    assert!(overflow.is_err());
+
+    let callback_error = vfs
+        .create_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"callback-overflow",
+            0,
+            0,
+            0o644,
+            _rt.handle(),
+        )
+        .expect_err("shared admission should apply backpressure before create succeeds");
+    assert!(matches!(
+        callback_error,
+        VfsError::Meta(MetaError::AccessDenied {
+            actual: AccessLevel::ReadOnly,
+            ..
+        })
+    ));
+
+    let inner = vfs.state.namespace.deferred.inner.lock();
+    assert_eq!(
+        inner.backlog_operations,
+        super::namespace_ops::DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS
+    );
+    assert_eq!(inner.queue.len(), inner.backlog_operations);
+    assert!(
+        !inner
+            .entries
+            .contains_key(&super::namespace::DeferredNamespaceKey::new(
+                ROOT_INO,
+                b"callback-overflow"
+            ))
+    );
 }
 
 #[test]
