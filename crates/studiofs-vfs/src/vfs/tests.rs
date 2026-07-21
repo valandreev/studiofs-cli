@@ -6614,7 +6614,9 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
         vfs.write(created.ino, 0, b"shutdown-payload")
             .await
             .expect("write shutdown payload");
-        let _ = vfs.shutdown(std::time::Duration::ZERO).await;
+        vfs.shutdown(std::time::Duration::ZERO)
+            .await
+            .expect("VFS shutdown should succeed");
     });
     drop(vfs);
     drop(meta);
@@ -6678,7 +6680,9 @@ fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
             "same-mount reads should observe accepted writer-state bytes before a durability boundary"
         );
 
-        let _ = vfs.shutdown(std::time::Duration::ZERO).await;
+        vfs.shutdown(std::time::Duration::ZERO)
+            .await
+            .expect("VFS shutdown should succeed");
         attr.ino
     });
     drop(vfs);

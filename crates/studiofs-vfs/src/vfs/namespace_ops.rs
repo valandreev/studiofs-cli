@@ -319,33 +319,44 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
-    fn abandon_failed_deferred_namespace_op(&self, op: &DeferredNamespaceOp, error: &VfsError) {
-        let ino = op.ino();
-        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+    fn abandon_failed_deferred_namespace_batch(
+        &self,
+        ops: &[DeferredNamespaceOp],
+        error: &VfsError,
+    ) {
+        let error = error.to_string();
+        let mut affected_inodes = HashSet::new();
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
-            inner.errors.insert(ino, error.to_string());
-            match op {
-                DeferredNamespaceOp::CreateFile { parent, name, .. }
-                | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
-                    inner
-                        .entries
-                        .remove(&DeferredNamespaceKey::new(*parent, name));
+            for op in ops {
+                let ino = op.ino();
+                let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+                affected_inodes.insert(ino);
+                inner.errors.insert(ino, error.clone());
+                match op {
+                    DeferredNamespaceOp::CreateFile { parent, name, .. }
+                    | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
+                        inner
+                            .entries
+                            .remove(&DeferredNamespaceKey::new(*parent, name));
+                    }
+                    DeferredNamespaceOp::SetAttr { .. } => {}
                 }
-                DeferredNamespaceOp::SetAttr { .. } => {}
+                let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
+                if pending_count <= 1 {
+                    inner.pending_inodes.remove(&ino);
+                    inner.attrs.remove(&ino);
+                } else {
+                    inner.pending_inodes.insert(ino, pending_count - 1);
+                }
+                inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+                inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
             }
-            let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-            if pending_count <= 1 {
-                inner.pending_inodes.remove(&ino);
-                inner.attrs.remove(&ino);
-            } else {
-                inner.pending_inodes.insert(ino, pending_count - 1);
-            }
-            inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-            inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
         }
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.invalidate_attr_read_cache([ino]);
+        for ino in affected_inodes {
+            self.state.namespace.dirty_attrs.lock().remove(&ino);
+            self.invalidate_attr_read_cache([ino]);
+        }
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
@@ -385,7 +396,8 @@ impl StudioVfs {
     }
 
     pub(super) async fn wait_for_deferred_namespace_drain(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
             let drained = {
@@ -402,9 +414,9 @@ impl StudioVfs {
             if drained {
                 return true;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
-                return false;
+            tokio::select! {
+                _ = &mut sleep => return false,
+                _ = notified => {}
             }
         }
     }
@@ -480,19 +492,16 @@ impl StudioVfs {
                 continue;
             }
 
-            let deadline = Instant::now() + Duration::from_millis(10);
+            let sleep = tokio::time::sleep(Duration::from_millis(10));
+            tokio::pin!(sleep);
             while batch.len() < DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS {
                 let notified = self.state.namespace.deferred.notify.notified();
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
                 tokio::select! {
                     _ = notified => {
                         let room = DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS - batch.len();
                         batch.extend(self.pop_deferred_namespace_batch(room));
                     }
-                    _ = tokio::time::sleep(remaining) => break,
+                    _ = &mut sleep => break,
                 }
             }
 
@@ -517,12 +526,12 @@ impl StudioVfs {
                             let queued = std::mem::take(
                                 &mut self.state.namespace.deferred.inner.lock().queue,
                             );
-                            for op in batch.iter().chain(queued.iter()) {
-                                self.abandon_failed_deferred_namespace_op(op, &error);
-                            }
+                            let failed_operations = batch.len() + queued.len();
+                            batch.extend(queued);
+                            self.abandon_failed_deferred_namespace_batch(&batch, &error);
                             error!(
                                 error = %error,
-                                operations = batch.len() + queued.len(),
+                                operations = failed_operations,
                                 "deferred namespace metadata batch commit failed permanently; abandoning batch"
                             );
                             break;
