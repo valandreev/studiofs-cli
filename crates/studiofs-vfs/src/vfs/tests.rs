@@ -3,6 +3,7 @@ use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::thread;
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
 use studiofs_meta::engine::MetadataAuthorityStatus;
@@ -14541,6 +14542,90 @@ fn namespace_create_records_one_complete_metadata_timing_sample() {
         before.metadata_engine.commit.calls + 2,
         "each namespace-create transaction should record commit time"
     );
+}
+
+fn namespace_inode_allocation_calls(vfs: &StudioVfs) -> u64 {
+    vfs.write_path_observability_snapshot()
+        .namespace_create
+        .inode_allocation
+        .calls
+}
+
+#[test]
+fn namespace_inode_reservation_refills_after_exhaustion() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-refill");
+
+    let first = vfs.reserve_namespace_ino().expect("reserve first inode");
+    let mut previous = first;
+    for _ in 1..4096 {
+        let ino = vfs.reserve_namespace_ino().expect("reserve inode");
+        assert_eq!(ino, previous + 1);
+        previous = ino;
+    }
+    assert_eq!(namespace_inode_allocation_calls(&vfs), 1);
+
+    let refilled = vfs.reserve_namespace_ino().expect("refill inode range");
+    assert_eq!(refilled, previous + 1);
+    assert_eq!(namespace_inode_allocation_calls(&vfs), 2);
+}
+
+#[test]
+fn namespace_inode_reservation_is_unique_under_concurrent_refill() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-concurrent");
+    let threads = (0..8)
+        .map(|_| {
+            let vfs = vfs.clone();
+            thread::spawn(move || {
+                (0..1024)
+                    .map(|_| vfs.reserve_namespace_ino().expect("reserve inode"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let inos = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().expect("reservation thread"))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(inos.len(), 8192);
+    assert_eq!(namespace_inode_allocation_calls(&vfs), 2);
+}
+
+#[test]
+fn namespace_inode_reservation_leaves_restart_gaps() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let first = {
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-restart");
+        let first = vfs.reserve_namespace_ino().expect("reserve first inode");
+        drop(vfs);
+        drop(meta);
+        first
+    };
+
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-restart");
+    let after_restart = vfs
+        .reserve_namespace_ino()
+        .expect("reserve inode after restart");
+
+    assert_eq!(after_restart, first + 4096);
+}
+
+#[test]
+fn create_and_mkdir_share_namespace_inode_reservation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-inode-create-mkdir");
+
+    let file = vfs
+        .create(ROOT_INO, b"reserved-file", 0, 0, 0o644)
+        .expect("create file");
+    let dir = vfs
+        .mkdir(ROOT_INO, b"reserved-dir", 0, 0, 0o755)
+        .expect("create directory");
+
+    assert_eq!(dir.ino, file.ino + 1);
+    assert_eq!(namespace_inode_allocation_calls(&vfs), 1);
 }
 
 #[test]

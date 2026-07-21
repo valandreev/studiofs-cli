@@ -20,7 +20,7 @@ struct TruncateMutation {
 
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
-const DEFERRED_NAMESPACE_INODE_BATCH: u32 = 4096;
+const NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
 const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u16 = 200;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
@@ -164,31 +164,17 @@ impl StudioVfs {
         self.setattr_with_handle(None, ino, args)
     }
 
-    fn reserve_deferred_namespace_ino(&self) -> VfsResult<Ino> {
+    pub(super) fn reserve_namespace_ino(&self) -> VfsResult<Ino> {
+        let mut namespace = self.state.namespace.deferred.inner.lock();
         loop {
-            if let Some(ino) = self
-                .state
-                .namespace
-                .deferred
-                .inner
-                .lock()
-                .reserved_inos
-                .pop_front()
-            {
+            if let Some(ino) = namespace.reserved_inos.pop_front() {
                 return Ok(ino);
             }
 
             let inos = self.observe_namespace_inode_allocation(|| {
-                self.sync_meta()
-                    .next_object_ids(DEFERRED_NAMESPACE_INODE_BATCH)
+                self.sync_meta().next_object_ids(NAMESPACE_INODE_BATCH)
             })?;
-            self.state
-                .namespace
-                .deferred
-                .inner
-                .lock()
-                .reserved_inos
-                .extend(inos);
+            namespace.reserved_inos.extend(inos);
         }
     }
 
@@ -1819,7 +1805,7 @@ impl StudioVfs {
             return Ok(attr);
         }
         let attr = self.observe_metadata_commit(|| {
-            let ino = self.observe_namespace_inode_allocation(|| self.sync_meta().next_inode())?;
+            let ino = self.reserve_namespace_ino()?;
             self.observe_namespace_mutation(|| {
                 self.sync_meta()
                     .create_file_with_ino(ino, parent, name, uid, gid, mode & 0o7777)
@@ -1910,7 +1896,7 @@ impl StudioVfs {
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
 
-        let ino = self.reserve_deferred_namespace_ino()?;
+        let ino = self.reserve_namespace_ino()?;
         let attr = InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777);
         self.state.incarnation.inode_incarnations.lock().insert(
             attr.ino,
@@ -1964,7 +1950,7 @@ impl StudioVfs {
             return Ok(attr);
         }
         let attr = self.observe_metadata_commit(|| {
-            let ino = self.observe_namespace_inode_allocation(|| self.sync_meta().next_inode())?;
+            let ino = self.reserve_namespace_ino()?;
             self.observe_namespace_mutation(|| {
                 self.sync_meta()
                     .create_dir_with_ino(ino, parent, name, uid, gid, mode & 0o7777)
@@ -2006,7 +1992,7 @@ impl StudioVfs {
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
 
-        let ino = self.reserve_deferred_namespace_ino()?;
+        let ino = self.reserve_namespace_ino()?;
         let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777);
         self.state
             .namespace
