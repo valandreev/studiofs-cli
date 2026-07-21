@@ -90,12 +90,12 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) pending_inodes: HashMap<Ino, usize>,
     pub(super) errors: HashMap<Ino, String>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
-    pub(super) reserved_inos: VecDeque<Ino>,
     pub(super) locally_created_dirs: HashSet<Ino>,
 }
 
 pub(super) struct DeferredNamespaceState {
     pub(super) inner: OrderedMutex<DeferredNamespaceInner>,
+    pub(super) reserved_inos: OrderedMutex<VecDeque<Ino>>,
     pub(super) notify: tokio::sync::Notify,
     pub(super) draining: AtomicBool,
 }
@@ -104,6 +104,7 @@ impl DeferredNamespaceState {
     fn new() -> Self {
         Self {
             inner: OrderedMutex::new(DeferredNamespaceInner::default(), LockTier::Namespace),
+            reserved_inos: OrderedMutex::new(VecDeque::new(), LockTier::Namespace),
             notify: tokio::sync::Notify::new(),
             draining: AtomicBool::new(false),
         }
