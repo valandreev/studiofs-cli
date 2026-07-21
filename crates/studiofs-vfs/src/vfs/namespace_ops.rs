@@ -1,4 +1,4 @@
-use super::namespace::{DeferredNamespaceKey, DeferredNamespaceOp};
+use super::namespace::{DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp};
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
     DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
@@ -10,6 +10,7 @@ use super::{
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use studiofs_meta::engine::NamespaceMutation;
 use studiofs_meta::schema::PayloadRefState;
 
 struct TruncateMutation {
@@ -22,6 +23,10 @@ type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 pub(super) const NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
+const DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS: usize = 256;
+const DEFERRED_NAMESPACE_BATCH_LINGER_DELAY: Duration = Duration::from_millis(10);
+pub(super) const DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS: usize = 4096;
+const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
 const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u16 = 200;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -144,7 +149,16 @@ impl StudioVfs {
         }
     }
 
-    fn deferred_namespace_error(&self, ino: Ino) -> Option<String> {
+    fn return_reserved_namespace_ino(&self, ino: Ino) {
+        self.state
+            .namespace
+            .deferred
+            .reserved_inos
+            .lock()
+            .push_front(ino);
+    }
+
+    fn deferred_namespace_error(&self, ino: Ino) -> Option<Arc<str>> {
         self.state
             .namespace
             .deferred
@@ -182,14 +196,74 @@ impl StudioVfs {
             .cloned()
     }
 
+    fn deferred_namespace_op_estimated_bytes(op: &DeferredNamespaceOp) -> usize {
+        std::mem::size_of::<DeferredNamespaceOp>()
+            + match op {
+                DeferredNamespaceOp::CreateFile { name, .. }
+                | DeferredNamespaceOp::CreateDir { name, .. } => name.len(),
+                DeferredNamespaceOp::SetAttr { .. } => 0,
+            }
+    }
+
+    fn deferred_namespace_degraded_error(ino: Ino) -> VfsError {
+        VfsError::Meta(MetaError::AccessDenied {
+            ino,
+            principal: "deferred-namespace-degraded".to_string(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        })
+    }
+
+    fn deferred_namespace_admission_error(
+        &self,
+        inner: &DeferredNamespaceInner,
+        op_bytes: usize,
+        ino: Ino,
+    ) -> Option<VfsError> {
+        if self.shutdown_requested() {
+            return Some(VfsError::Other(
+                "VFS shutdown has stopped namespace admission".to_string(),
+            ));
+        }
+        if self
+            .state
+            .namespace
+            .deferred
+            .degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Some(Self::deferred_namespace_degraded_error(ino));
+        }
+        if inner.backlog_operations >= DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS
+            || op_bytes > DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES
+            || inner.backlog_bytes.saturating_add(op_bytes) > DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES
+        {
+            return Some(VfsError::WouldBlock);
+        }
+        None
+    }
+
+    fn ensure_deferred_namespace_admission(&self, op_bytes: usize, ino: Ino) -> VfsResult<()> {
+        let inner = self.state.namespace.deferred.inner.lock();
+        if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes, ino) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn enqueue_deferred_namespace_op(
         &self,
         key: Option<DeferredNamespaceKey>,
         attr: InodeAttr,
         op: DeferredNamespaceOp,
-    ) {
+    ) -> VfsResult<()> {
+        let op_bytes = Self::deferred_namespace_op_estimated_bytes(&op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
+            if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes, attr.ino)
+            {
+                return Err(error);
+            }
             if let Some(key) = key {
                 inner.entries.insert(key, attr.ino);
             }
@@ -197,6 +271,8 @@ impl StudioVfs {
             inner.errors.remove(&attr.ino);
             *inner.pending_inodes.entry(attr.ino).or_default() += 1;
             inner.queue.push_back(op);
+            inner.backlog_operations += 1;
+            inner.backlog_bytes += op_bytes;
         }
         self.state
             .namespace
@@ -204,14 +280,22 @@ impl StudioVfs {
             .lock()
             .insert(attr.ino, attr);
         self.state.namespace.deferred.notify.notify_waiters();
+        Ok(())
     }
 
-    fn pop_deferred_namespace_op(&self) -> Option<DeferredNamespaceOp> {
-        self.state.namespace.deferred.inner.lock().queue.pop_front()
+    fn pop_deferred_namespace_batch(
+        &self,
+        max_operations: usize,
+        batch: &mut Vec<DeferredNamespaceOp>,
+    ) {
+        let mut inner = self.state.namespace.deferred.inner.lock();
+        let count = inner.queue.len().min(max_operations);
+        batch.extend(inner.queue.drain(..count));
     }
 
     fn complete_deferred_namespace_op(&self, op: &DeferredNamespaceOp, committed_attr: &InodeAttr) {
         let ino = op.ino();
+        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
             match op {
@@ -231,6 +315,8 @@ impl StudioVfs {
                 inner.pending_inodes.insert(ino, pending_count - 1);
             }
             inner.errors.remove(&ino);
+            inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+            inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
         }
         self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
         self.invalidate_attr_read_cache([ino]);
@@ -238,39 +324,47 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
-    fn fail_deferred_namespace_op(&self, op: &DeferredNamespaceOp, error: &VfsError) {
-        let ino = op.ino();
+    fn abandon_failed_deferred_namespace_batch(
+        &self,
+        ops: &[DeferredNamespaceOp],
+        error: &VfsError,
+    ) {
+        let error: Arc<str> = Arc::from(error.to_string());
+        let mut affected_inodes = HashSet::new();
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
-            inner.errors.insert(ino, error.to_string());
-        }
-        self.state.namespace.deferred.notify.notify_waiters();
-    }
-
-    fn abandon_failed_deferred_namespace_op(&self, op: &DeferredNamespaceOp, error: &VfsError) {
-        let ino = op.ino();
-        {
-            let mut inner = self.state.namespace.deferred.inner.lock();
-            inner.errors.insert(ino, error.to_string());
-            match op {
-                DeferredNamespaceOp::CreateFile { parent, name, .. }
-                | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
-                    inner
-                        .entries
-                        .remove(&DeferredNamespaceKey::new(*parent, name));
+            for op in ops {
+                let ino = op.ino();
+                let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+                affected_inodes.insert(ino);
+                inner.errors.insert(ino, Arc::clone(&error));
+                match op {
+                    DeferredNamespaceOp::CreateFile { parent, name, .. }
+                    | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
+                        inner
+                            .entries
+                            .remove(&DeferredNamespaceKey::new(*parent, name));
+                    }
+                    DeferredNamespaceOp::SetAttr { .. } => {}
                 }
-                DeferredNamespaceOp::SetAttr { .. } => {}
-            }
-            let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-            if pending_count <= 1 {
-                inner.pending_inodes.remove(&ino);
-                inner.attrs.remove(&ino);
-            } else {
-                inner.pending_inodes.insert(ino, pending_count - 1);
+                let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
+                if pending_count <= 1 {
+                    inner.pending_inodes.remove(&ino);
+                    inner.attrs.remove(&ino);
+                } else {
+                    inner.pending_inodes.insert(ino, pending_count - 1);
+                }
+                inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+                inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
             }
         }
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.invalidate_attr_read_cache([ino]);
+        {
+            let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            for ino in &affected_inodes {
+                dirty_attrs.remove(ino);
+            }
+        }
+        self.invalidate_attr_read_cache(affected_inodes);
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
@@ -309,6 +403,59 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
+    pub(super) async fn wait_for_deferred_namespace_drain(&self, timeout: Duration) -> bool {
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            let drained = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                !self
+                    .state
+                    .namespace
+                    .deferred
+                    .draining
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && inner.queue.is_empty()
+                    && inner.backlog_operations == 0
+            };
+            if drained {
+                return true;
+            }
+            tokio::select! {
+                _ = &mut sleep => return false,
+                _ = notified => {}
+            }
+        }
+    }
+
+    pub(super) fn deferred_namespace_shutdown_error(&self) -> Option<VfsError> {
+        if self
+            .state
+            .namespace
+            .deferred
+            .degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Some(VfsError::Other(
+                "deferred namespace metadata persistence failed".to_string(),
+            ));
+        }
+        let inner = self.state.namespace.deferred.inner.lock();
+        let draining = self
+            .state
+            .namespace
+            .deferred
+            .draining
+            .load(std::sync::atomic::Ordering::Acquire);
+        if draining || !inner.queue.is_empty() || inner.backlog_operations != 0 {
+            return Some(VfsError::Other(
+                "deferred namespace metadata drain did not complete".to_string(),
+            ));
+        }
+        None
+    }
+
     /// Schedules the background drain for namespace metadata admitted in memory.
     pub fn schedule_deferred_namespace_metadata_drain(
         self: &Arc<Self>,
@@ -330,9 +477,11 @@ impl StudioVfs {
     }
 
     async fn drain_deferred_namespace_metadata(self: Arc<Self>) {
-        let mut failures: HashMap<Ino, u8> = HashMap::new();
+        let mut batch = Vec::with_capacity(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
         loop {
-            let Some(op) = self.pop_deferred_namespace_op() else {
+            batch.clear();
+            self.pop_deferred_namespace_batch(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS, &mut batch);
+            if batch.is_empty() {
                 self.state
                     .namespace
                     .deferred
@@ -350,56 +499,68 @@ impl StudioVfs {
                     break;
                 }
                 continue;
-            };
+            }
 
-            let result = self.commit_deferred_namespace_op(op.clone()).await;
-            match result {
-                Ok(committed_attr) => {
-                    failures.remove(&op.ino());
-                    self.complete_deferred_namespace_op(&op, &committed_attr);
-                }
-                Err(error) => {
-                    let ino = op.ino();
-                    let attempts = failures
-                        .entry(ino)
-                        .and_modify(|attempts| *attempts = attempts.saturating_add(1))
-                        .or_insert(1);
-                    if *attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
-                        self.abandon_failed_deferred_namespace_op(&op, &error);
-                        error!(
-                            ino,
-                            attempts = *attempts,
-                            error = %error,
-                            "deferred namespace metadata commit failed permanently; abandoning op"
-                        );
-                        failures.remove(&ino);
-                        continue;
+            let sleep = tokio::time::sleep(DEFERRED_NAMESPACE_BATCH_LINGER_DELAY);
+            tokio::pin!(sleep);
+            while batch.len() < DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS {
+                let notified = self.state.namespace.deferred.notify.notified();
+                tokio::select! {
+                    _ = notified => {
+                        let room = DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS - batch.len();
+                        self.pop_deferred_namespace_batch(room, &mut batch);
                     }
-                    self.fail_deferred_namespace_op(&op, &error);
-                    warn!(
-                        ino,
-                        attempts = *attempts,
-                        max_attempts = DEFERRED_NAMESPACE_MAX_RETRIES,
-                        error = %error,
-                        "deferred namespace metadata commit failed; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    self.state
-                        .namespace
-                        .deferred
-                        .inner
-                        .lock()
-                        .queue
-                        .push_front(op);
+                    _ = &mut sleep => break,
+                }
+            }
+
+            let mut attempts = 0;
+            loop {
+                let result = self.commit_deferred_namespace_batch(&batch).await;
+                match result {
+                    Ok(committed_attrs) => {
+                        for (op, committed_attr) in batch.iter().zip(committed_attrs) {
+                            self.complete_deferred_namespace_op(op, &committed_attr);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        attempts += 1;
+                        if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
+                            self.state
+                                .namespace
+                                .deferred
+                                .degraded
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            let queued = std::mem::take(
+                                &mut self.state.namespace.deferred.inner.lock().queue,
+                            );
+                            let failed_operations = batch.len() + queued.len();
+                            batch.extend(queued);
+                            self.abandon_failed_deferred_namespace_batch(&batch, &error);
+                            error!(
+                                error = %error,
+                                operations = failed_operations,
+                                "deferred namespace metadata batch commit failed permanently; abandoning batch"
+                            );
+                            break;
+                        }
+                        warn!(
+                            attempt = attempts,
+                            max_attempts = DEFERRED_NAMESPACE_MAX_RETRIES,
+                            error = %error,
+                            operations = batch.len(),
+                            "deferred namespace metadata batch commit failed; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                 }
             }
         }
     }
 
-    async fn commit_deferred_namespace_op(&self, op: DeferredNamespaceOp) -> VfsResult<InodeAttr> {
-        let meta = self.meta.clone();
-        let started = Instant::now();
-        let result = match op {
+    fn deferred_namespace_mutation(op: &DeferredNamespaceOp) -> NamespaceMutation {
+        match op {
             DeferredNamespaceOp::CreateFile {
                 attr,
                 parent,
@@ -407,18 +568,14 @@ impl StudioVfs {
                 uid,
                 gid,
                 mode,
-            } => {
-                let stage_started = Instant::now();
-                let result = crate::runtime::run_meta(meta, move |engine| {
-                    engine.create_file_with_ino(attr.ino, parent, &name, uid, gid, mode)
-                })
-                .await;
-                self.record_namespace_mutation_observability(stage_started.elapsed());
-                if result.is_ok() {
-                    self.record_namespace_create_completed();
-                }
-                result
-            }
+            } => NamespaceMutation::CreateFile {
+                ino: attr.ino,
+                parent: *parent,
+                name: name.clone(),
+                uid: *uid,
+                gid: *gid,
+                mode: *mode,
+            },
             DeferredNamespaceOp::CreateDir {
                 attr,
                 parent,
@@ -426,31 +583,57 @@ impl StudioVfs {
                 uid,
                 gid,
                 mode,
-            } => {
-                let stage_started = Instant::now();
-                let result = crate::runtime::run_meta(meta, move |engine| {
-                    engine.create_dir_with_ino(attr.ino, parent, &name, uid, gid, mode)
-                })
-                .await;
-                self.record_namespace_mutation_observability(stage_started.elapsed());
-                if result.is_ok() {
+            } => NamespaceMutation::CreateDir {
+                ino: attr.ino,
+                parent: *parent,
+                name: name.clone(),
+                uid: *uid,
+                gid: *gid,
+                mode: *mode,
+            },
+            DeferredNamespaceOp::SetAttr { attr, args } => NamespaceMutation::SetAttr {
+                attr: attr.clone(),
+                args: args.clone(),
+            },
+        }
+    }
+
+    async fn commit_deferred_namespace_batch(
+        &self,
+        ops: &[DeferredNamespaceOp],
+    ) -> VfsResult<Vec<InodeAttr>> {
+        let meta = self.meta.clone();
+        let started = Instant::now();
+        let mutations = ops
+            .iter()
+            .map(Self::deferred_namespace_mutation)
+            .collect::<Vec<_>>();
+        let stage_started = Instant::now();
+        let result = crate::runtime::run_meta(meta, move |engine| {
+            engine.apply_namespace_mutations(&mutations)
+        })
+        .await;
+        let result = match result {
+            Ok(committed_attrs) if committed_attrs.len() != ops.len() => {
+                Err(VfsError::Other(format!(
+                    "deferred namespace batch returned {} results for {} operations",
+                    committed_attrs.len(),
+                    ops.len()
+                )))
+            }
+            result => result,
+        };
+        self.record_namespace_mutation_observability(stage_started.elapsed());
+        if result.is_ok() {
+            for op in ops {
+                if matches!(
+                    op,
+                    DeferredNamespaceOp::CreateFile { .. } | DeferredNamespaceOp::CreateDir { .. }
+                ) {
                     self.record_namespace_create_completed();
                 }
-                result
             }
-            DeferredNamespaceOp::SetAttr { attr, args } => {
-                let fallback_attr = attr.clone();
-                crate::runtime::run_meta(meta, move |engine| {
-                    let mut committed_attr =
-                        engine.get_attr(fallback_attr.ino).unwrap_or(fallback_attr);
-                    args.apply_attr_only(&mut committed_attr);
-                    committed_attr.ctime = committed_attr.ctime.max(attr.ctime);
-                    engine.set_attr(&committed_attr)?;
-                    Ok(committed_attr)
-                })
-                .await
-            }
-        };
+        }
         self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
         result
     }
@@ -478,12 +661,6 @@ impl StudioVfs {
         let mut attr = self.attr_only_setattr_base_attr(ino)?;
         if args.apply_attr_only(&mut attr) {
             attr.touch_ctime();
-            self.state
-                .namespace
-                .dirty_attrs
-                .lock()
-                .insert(ino, attr.clone());
-            self.state.namespace.attr_read_cache.lock().remove(ino);
         }
 
         Ok(attr)
@@ -504,6 +681,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
+        self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>(), ino)?;
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
         self.enqueue_deferred_namespace_op(
             None,
@@ -512,7 +690,8 @@ impl StudioVfs {
                 attr: attr.clone(),
                 args,
             },
-        );
+        )?;
+        self.state.namespace.attr_read_cache.lock().remove(ino);
         self.schedule_deferred_namespace_metadata_drain(runtime);
         Ok(attr)
     }
@@ -1861,9 +2040,29 @@ impl StudioVfs {
             return Ok(attr);
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
+        self.ensure_deferred_namespace_admission(
+            std::mem::size_of::<DeferredNamespaceOp>() + name.len(),
+            parent,
+        )?;
 
         let ino = self.reserve_namespace_ino()?;
         let attr = InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777);
+        let enqueue_result = self.enqueue_deferred_namespace_op(
+            Some(DeferredNamespaceKey::new(parent, name)),
+            attr.clone(),
+            DeferredNamespaceOp::CreateFile {
+                attr: attr.clone(),
+                parent,
+                name: name.to_vec(),
+                uid,
+                gid,
+                mode: mode & 0o7777,
+            },
+        );
+        if let Err(error) = enqueue_result {
+            self.return_reserved_namespace_ino(attr.ino);
+            return Err(error);
+        }
         self.state.incarnation.inode_incarnations.lock().insert(
             attr.ino,
             InodeIncarnationState {
@@ -1874,18 +2073,6 @@ impl StudioVfs {
                     base_size: 0,
                 }),
                 upload_state: VfsUploadState::Uploading,
-            },
-        );
-        self.enqueue_deferred_namespace_op(
-            Some(DeferredNamespaceKey::new(parent, name)),
-            attr.clone(),
-            DeferredNamespaceOp::CreateFile {
-                attr: attr.clone(),
-                parent,
-                name: name.to_vec(),
-                uid,
-                gid,
-                mode: mode & 0o7777,
             },
         );
         namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
@@ -1957,17 +2144,14 @@ impl StudioVfs {
             return Ok(attr);
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
+        self.ensure_deferred_namespace_admission(
+            std::mem::size_of::<DeferredNamespaceOp>() + name.len(),
+            parent,
+        )?;
 
         let ino = self.reserve_namespace_ino()?;
         let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777);
-        self.state
-            .namespace
-            .deferred
-            .inner
-            .lock()
-            .locally_created_dirs
-            .insert(attr.ino);
-        self.enqueue_deferred_namespace_op(
+        let enqueue_result = self.enqueue_deferred_namespace_op(
             Some(DeferredNamespaceKey::new(parent, name)),
             attr.clone(),
             DeferredNamespaceOp::CreateDir {
@@ -1979,6 +2163,17 @@ impl StudioVfs {
                 mode: mode & 0o7777,
             },
         );
+        if let Err(error) = enqueue_result {
+            self.return_reserved_namespace_ino(attr.ino);
+            return Err(error);
+        }
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .locally_created_dirs
+            .insert(attr.ino);
         namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
         self.schedule_deferred_namespace_metadata_drain(runtime);
         Ok(attr)

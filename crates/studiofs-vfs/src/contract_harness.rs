@@ -278,7 +278,9 @@ impl ContractVfsFixture {
                         .join()
                 });
             } else {
-                runtime.block_on(vfs.shutdown(shutdown_timeout));
+                // This runs from Drop as well as explicit reopen; propagating or panicking
+                // here would make cleanup failures mask the original test failure.
+                let _ = runtime.block_on(vfs.shutdown(shutdown_timeout));
             }
         }
     }

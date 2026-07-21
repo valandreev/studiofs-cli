@@ -2,7 +2,9 @@ mod worker;
 
 pub(super) use worker::UploadLifecycleWorker;
 
-use super::{Ino, StudioVfs, VfsError, VfsIngressStats, VfsZeroIoShutdownSnapshot, info, warn};
+use super::{
+    Ino, StudioVfs, VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
+};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use studiofs_cache::upload_queue::PendingUpload;
@@ -264,16 +266,16 @@ impl StudioVfs {
         }
     }
 
-    /// Best-effort graceful shutdown: drain pending local state, persist the
-    /// cached-store upload journal, cancel uploader tasks, then persist upload state.
-    pub async fn shutdown(&self, upload_drain_timeout: Duration) {
+    /// Graceful shutdown: drain accepted local state, persist the cached-store
+    /// upload journal, cancel uploader tasks, then persist upload state.
+    pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
         if self
             .state
             .shutdown
             .shutdown_completed
             .load(Ordering::Acquire)
         {
-            return;
+            return Ok(());
         }
         if self
             .state
@@ -281,7 +283,7 @@ impl StudioVfs {
             .shutdown_requested
             .swap(true, Ordering::AcqRel)
         {
-            return;
+            return Ok(());
         }
         let t0 = Instant::now();
         let background_join_timeout = Duration::from_secs(2);
@@ -294,7 +296,11 @@ impl StudioVfs {
             .store(true, Ordering::Release);
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
+        self.state.namespace.deferred.notify.notify_waiters();
+        self.wait_for_deferred_namespace_drain(background_join_timeout)
+            .await;
         self.join_background_tasks(background_join_timeout).await;
+        let deferred_namespace_error = self.deferred_namespace_shutdown_error();
 
         // Reset the active-access-class telemetry counters for any handles that
         // were never explicitly closed via release_fh (e.g. force-unmount).
@@ -363,11 +369,16 @@ impl StudioVfs {
         );
         let meta = self.sync_meta();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
-        let metadata_flush_outcome = match super::run_sync_with_timeout(
-            metadata_flush_timeout,
-            move || meta.flush_metadata().map_err(VfsError::Meta),
-        ) {
-            Ok(Some(())) => "success",
+        let metadata_flush_result =
+            super::run_sync_with_timeout(metadata_flush_timeout, move || {
+                meta.flush_metadata().map_err(VfsError::Meta)
+            });
+        let metadata_flush_outcome = match metadata_flush_result {
+            Ok(Some(())) if deferred_namespace_error.is_none() => "success",
+            Ok(Some(())) => {
+                warn!("VFS shutdown: deferred namespace metadata drain failed");
+                "failed"
+            }
             Ok(None) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
@@ -425,6 +436,10 @@ impl StudioVfs {
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"
         );
+        if let Some(error) = deferred_namespace_error {
+            return Err(error);
+        }
+        Ok(())
     }
 }
 

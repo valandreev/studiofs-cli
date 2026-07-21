@@ -7019,6 +7019,16 @@ impl StudioVfs {
             return status;
         }
 
+        if self
+            .state
+            .namespace
+            .deferred
+            .degraded
+            .load(Ordering::Acquire)
+        {
+            return MetadataAuthorityStatus::read_only();
+        }
+
         self.meta.sync_view().metadata_authority_status()
     }
 
