@@ -195,6 +195,35 @@ fn namespace_mutation_batch_setattr_preserves_newer_inode_fields() {
 }
 
 #[test]
+fn namespace_mutation_batch_propagates_inode_decode_errors() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    let mut inodes = txn.open_table(INODES_TABLE).unwrap();
+    inodes.insert(41, b"not an inode".as_slice()).unwrap();
+    drop(inodes);
+    txn.commit().unwrap();
+
+    let queued_attr = InodeAttr::new_file(41, ROOT_INO, 1000, 1000, 0o600);
+    let error = engine
+        .apply_namespace_mutations(&[NamespaceMutation::SetAttr {
+            attr: queued_attr,
+            args: SetattrArgs {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        }])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MetaError::NamespaceBatchOperation {
+            index: 0,
+            source
+        } if matches!(*source, MetaError::Serialization(_))
+    ));
+}
+
+#[test]
 fn namespace_create_spec_marks_directory_parent_update() {
     let spec = NamespaceCreateSpec::new_dir(41, ROOT_INO, b"subdir", 1000, 1000, 0o755);
 

@@ -736,8 +736,17 @@ impl RedbMetaEngine {
                     *ino, *parent, name, *uid, *gid, *mode,
                 )),
                 NamespaceMutation::SetAttr { attr, args } => {
-                    let mut committed_attr = Self::get_attr_merged_in_write_txn(&txn, attr.ino)
-                        .unwrap_or_else(|_| attr.clone());
+                    let mut committed_attr =
+                        match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
+                            Ok(committed) => committed,
+                            Err(MetaError::InodeNotFound(_)) => attr.clone(),
+                            Err(error) => {
+                                return Err(MetaError::NamespaceBatchOperation {
+                                    index,
+                                    source: Box::new(error),
+                                });
+                            }
+                        };
                     args.apply_attr_only(&mut committed_attr);
                     committed_attr.ctime = committed_attr.ctime.max(attr.ctime);
                     RedbMetaEngine::set_attr_in_txn(&txn, &committed_attr)
