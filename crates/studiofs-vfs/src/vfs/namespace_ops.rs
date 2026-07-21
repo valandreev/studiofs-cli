@@ -165,7 +165,7 @@ impl StudioVfs {
             .lock()
             .errors
             .get(&ino)
-            .cloned()
+            .map(ToString::to_string)
     }
 
     fn ensure_no_deferred_namespace_error(&self, ino: Ino) -> VfsResult<()> {
@@ -282,10 +282,14 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn pop_deferred_namespace_batch(&self, max_operations: usize) -> Vec<DeferredNamespaceOp> {
+    fn pop_deferred_namespace_batch(
+        &self,
+        max_operations: usize,
+        batch: &mut Vec<DeferredNamespaceOp>,
+    ) {
         let mut inner = self.state.namespace.deferred.inner.lock();
         let count = inner.queue.len().min(max_operations);
-        inner.queue.drain(..count).collect()
+        batch.extend(inner.queue.drain(..count));
     }
 
     fn complete_deferred_namespace_op(&self, op: &DeferredNamespaceOp, committed_attr: &InodeAttr) {
@@ -324,7 +328,7 @@ impl StudioVfs {
         ops: &[DeferredNamespaceOp],
         error: &VfsError,
     ) {
-        let error = error.to_string();
+        let error: Arc<str> = Arc::from(error.to_string());
         let mut affected_inodes = HashSet::new();
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
@@ -332,7 +336,7 @@ impl StudioVfs {
                 let ino = op.ino();
                 let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
                 affected_inodes.insert(ino);
-                inner.errors.insert(ino, error.clone());
+                inner.errors.insert(ino, Arc::clone(&error));
                 match op {
                     DeferredNamespaceOp::CreateFile { parent, name, .. }
                     | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
@@ -470,8 +474,8 @@ impl StudioVfs {
 
     async fn drain_deferred_namespace_metadata(self: Arc<Self>) {
         loop {
-            let mut batch =
-                self.pop_deferred_namespace_batch(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
+            let mut batch = Vec::with_capacity(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
+            self.pop_deferred_namespace_batch(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS, &mut batch);
             if batch.is_empty() {
                 self.state
                     .namespace
@@ -499,7 +503,7 @@ impl StudioVfs {
                 tokio::select! {
                     _ = notified => {
                         let room = DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS - batch.len();
-                        batch.extend(self.pop_deferred_namespace_batch(room));
+                        self.pop_deferred_namespace_batch(room, &mut batch);
                     }
                     _ = &mut sleep => break,
                 }

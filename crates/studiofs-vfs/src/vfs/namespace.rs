@@ -88,7 +88,7 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) entries: HashMap<DeferredNamespaceKey, Ino>,
     pub(super) attrs: HashMap<Ino, InodeAttr>,
     pub(super) pending_inodes: HashMap<Ino, usize>,
-    pub(super) errors: HashMap<Ino, String>,
+    pub(super) errors: HashMap<Ino, Arc<str>>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
     pub(super) backlog_operations: usize,
     pub(super) backlog_bytes: usize,
