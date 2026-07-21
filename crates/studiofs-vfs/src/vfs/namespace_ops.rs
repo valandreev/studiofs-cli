@@ -38,46 +38,6 @@ fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
         && args.win_attrs.is_none()
 }
 
-fn apply_attr_only_setattr_args(attr: &mut InodeAttr, args: &SetattrArgs) -> bool {
-    let mut changed = false;
-    if let Some(mode) = args.mode {
-        attr.mode = mode & 0o7777;
-        changed = true;
-    }
-
-    if let Some(uid) = args.uid {
-        attr.uid = uid;
-        changed = true;
-    }
-
-    if let Some(gid) = args.gid {
-        attr.gid = gid;
-        changed = true;
-    }
-
-    if let Some(ns) = args.atime.resolve() {
-        attr.atime = ns;
-        changed = true;
-    }
-
-    if let Some(ns) = args.mtime.resolve() {
-        attr.mtime = ns;
-        changed = true;
-    }
-
-    if let Some(ns) = args.crtime.resolve() {
-        attr.crtime = ns;
-        changed = true;
-    }
-
-    if let Some(wa) = args.win_attrs {
-        attr.win_attrs = wa;
-        changed = true;
-    }
-
-    changed
-}
-
 fn handle_backed_growth_may_defer_strict_flush(
     fh: Option<u64>,
     new_size: u64,
@@ -483,7 +443,7 @@ impl StudioVfs {
                 crate::runtime::run_meta(meta, move |engine| {
                     let mut committed_attr =
                         engine.get_attr(fallback_attr.ino).unwrap_or(fallback_attr);
-                    apply_attr_only_setattr_args(&mut committed_attr, &args);
+                    args.apply_attr_only(&mut committed_attr);
                     committed_attr.ctime = committed_attr.ctime.max(attr.ctime);
                     engine.set_attr(&committed_attr)?;
                     Ok(committed_attr)
@@ -508,7 +468,7 @@ impl StudioVfs {
         }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
-            if apply_attr_only_setattr_args(attr, &args) {
+            if args.apply_attr_only(attr) {
                 attr.touch_ctime();
             }
         }) {
@@ -516,7 +476,7 @@ impl StudioVfs {
         }
 
         let mut attr = self.attr_only_setattr_base_attr(ino)?;
-        if apply_attr_only_setattr_args(&mut attr, &args) {
+        if args.apply_attr_only(&mut attr) {
             attr.touch_ctime();
             self.state
                 .namespace
@@ -626,7 +586,7 @@ impl StudioVfs {
             return Ok(updated);
         }
 
-        if apply_attr_only_setattr_args(&mut attr, &args) {
+        if args.apply_attr_only(&mut attr) {
             attr.touch_ctime();
             self.state
                 .namespace

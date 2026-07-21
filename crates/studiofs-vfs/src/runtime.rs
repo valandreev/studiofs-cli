@@ -11,8 +11,8 @@ use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
     InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
     MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
-    MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
-    SyncMetaEngineAdapter, execute_sync_meta,
+    MetaSymlink, MetaXattr, NamespaceMutation, RenameAtomicResult, ResolvedSliceSpan, SliceRange,
+    SliceRecord, SyncMetaEngineAdapter, execute_sync_meta,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -244,6 +244,12 @@ impl<M: ?Sized + MetaNamespace> MetaNamespace for RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
+    forward_method!(
+        fn apply_namespace_mutations(
+            &self,
+            mutations: &[NamespaceMutation],
+        ) -> MetaResult<Vec<InodeAttr>>
+    );
     forward_method!(
         fn create_file(
             &self,

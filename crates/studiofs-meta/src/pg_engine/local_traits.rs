@@ -2,8 +2,8 @@ use super::PgMetaEngine;
 use crate::engine::{
     DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaError, MetaFormat,
     MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
-    UndoLogKind, UndoLogRecord,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, NamespaceMutation,
+    PendingCreateRecord, UndoLogKind, UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -90,6 +90,13 @@ impl MetaNamespace for PgMetaEngine {
 }
 
 impl MetaFsOps for PgMetaEngine {
+    fn apply_namespace_mutations(
+        &self,
+        mutations: &[NamespaceMutation],
+    ) -> MetaResult<Vec<InodeAttr>> {
+        self.mutate(|local| local.apply_namespace_mutations(mutations))
+    }
+
     fn create_file(
         &self,
         parent: Ino,

@@ -13,6 +13,188 @@ fn test_create_file_and_lookup() {
 }
 
 #[test]
+fn namespace_mutation_batch_applies_mixed_operations_in_order() {
+    let engine = temp_engine();
+    let before = engine.metadata_write_observability();
+    let mut updated_file = InodeAttr::new_file(42, 41, 1000, 1000, 0o644);
+    updated_file.mode = 0o600;
+
+    let result = engine
+        .apply_namespace_mutations(&[
+            NamespaceMutation::CreateDir {
+                ino: 41,
+                parent: ROOT_INO,
+                name: b"subdir".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o755,
+            },
+            NamespaceMutation::CreateFile {
+                ino: 42,
+                parent: 41,
+                name: b"file.txt".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o644,
+            },
+            NamespaceMutation::SetAttr {
+                attr: updated_file,
+                args: SetattrArgs {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].ino, 41);
+    assert_eq!(result[0].kind, FileType::Directory);
+    assert_eq!(result[1].ino, 42);
+    assert_eq!(result[2].mode, 0o600);
+    assert_eq!(engine.lookup(41, b"file.txt").unwrap().ino, 42);
+    assert_eq!(engine.get_attr(42).unwrap().mode, 0o600);
+
+    let after = engine.metadata_write_observability();
+    assert_eq!(after.begin_write.calls - before.begin_write.calls, 1);
+    assert_eq!(after.commit.calls - before.commit.calls, 1);
+}
+
+#[test]
+fn namespace_mutation_batch_rolls_back_on_middle_conflict() {
+    let engine = temp_engine();
+
+    let error = engine
+        .apply_namespace_mutations(&[
+            NamespaceMutation::CreateFile {
+                ino: 41,
+                parent: ROOT_INO,
+                name: b"same.txt".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o644,
+            },
+            NamespaceMutation::CreateFile {
+                ino: 42,
+                parent: ROOT_INO,
+                name: b"same.txt".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o644,
+            },
+            NamespaceMutation::CreateFile {
+                ino: 43,
+                parent: ROOT_INO,
+                name: b"never-visible.txt".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o644,
+            },
+        ])
+        .unwrap_err();
+
+    match error {
+        MetaError::NamespaceBatchOperation { index, source } => {
+            assert_eq!(index, 1);
+            assert!(matches!(*source, MetaError::EntryExists { .. }));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(engine.lookup(ROOT_INO, b"same.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"never-visible.txt").is_err());
+    assert!(engine.get_attr(41).is_err());
+    assert!(engine.get_attr(42).is_err());
+    assert!(engine.get_attr(43).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap().nlink, 2);
+}
+
+#[test]
+fn namespace_mutation_batch_reports_invalid_parent_and_preserves_single_create_behavior() {
+    let engine = temp_engine();
+    let parent_file = engine
+        .create_file(ROOT_INO, b"not-a-directory", 1000, 1000, 0o644)
+        .unwrap();
+
+    let error = engine
+        .apply_namespace_mutations(&[NamespaceMutation::CreateFile {
+            ino: 42,
+            parent: parent_file.ino,
+            name: b"child.txt".to_vec(),
+            uid: 1000,
+            gid: 1000,
+            mode: 0o644,
+        }])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MetaError::NamespaceBatchOperation {
+            index: 0,
+            source
+        } if matches!(*source, MetaError::NotADirectory(ino) if ino == parent_file.ino)
+    ));
+
+    let single = temp_engine();
+    let single_attr = single
+        .create_file_with_ino(41, ROOT_INO, b"single.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let batched = temp_engine();
+    let batch_attr = batched
+        .apply_namespace_mutations(&[NamespaceMutation::CreateFile {
+            ino: 41,
+            parent: ROOT_INO,
+            name: b"single.txt".to_vec(),
+            uid: 1000,
+            gid: 1000,
+            mode: 0o644,
+        }])
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(batch_attr.ino, single_attr.ino);
+    assert_eq!(batch_attr.parent, single_attr.parent);
+    assert_eq!(batch_attr.kind, single_attr.kind);
+    assert_eq!(batch_attr.mode, single_attr.mode);
+    assert_eq!(
+        batched.lookup(ROOT_INO, b"single.txt").unwrap().ino,
+        single_attr.ino
+    );
+}
+
+#[test]
+fn namespace_mutation_batch_setattr_preserves_newer_inode_fields() {
+    let engine = temp_engine();
+    let created = engine
+        .create_file_with_ino(41, ROOT_INO, b"stale.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let mut queued_attr = created.clone();
+    queued_attr.mode = 0o600;
+    queued_attr.ctime += 10;
+
+    let mut current_attr = created;
+    current_attr.size = 99;
+    current_attr.committed_size = 99;
+    current_attr.ctime += 20;
+    engine.set_attr(&current_attr).unwrap();
+
+    let result = engine
+        .apply_namespace_mutations(&[NamespaceMutation::SetAttr {
+            attr: queued_attr,
+            args: SetattrArgs {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        }])
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(result.mode, 0o600);
+    assert_eq!(result.size, 99);
+    assert_eq!(result.committed_size, 99);
+    assert_eq!(result.ctime, current_attr.ctime);
+}
+
+#[test]
 fn namespace_create_spec_marks_directory_parent_update() {
     let spec = NamespaceCreateSpec::new_dir(41, ROOT_INO, b"subdir", 1000, 1000, 0o755);
 
