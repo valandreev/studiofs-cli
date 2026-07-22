@@ -11062,12 +11062,10 @@ fn flush_waits_for_deferred_namespace_create() {
         vfs.flush_fh(flush_fh)
             .await
             .expect("flush should wait for deferred create");
-        assert_eq!(
-            meta.lookup(1, b"deferred-create-flush-barrier.txt")
-                .expect("flushed create should be persisted")
-                .ino,
-            attr.ino
-        );
+        let looked_up = meta
+            .lookup(1, b"deferred-create-flush-barrier.txt")
+            .expect("flushed create should be persisted");
+        assert_eq!(looked_up.ino, attr.ino);
         vfs.release_fh(flush_fh).await.unwrap();
     });
 }
@@ -11091,12 +11089,10 @@ fn fsync_waits_for_deferred_namespace_create() {
         vfs.fsync(attr.ino, false)
             .await
             .expect("fsync should wait for deferred create");
-        assert_eq!(
-            meta.lookup(1, b"deferred-create-fsync-barrier.txt")
-                .expect("fsynced create should be persisted")
-                .ino,
-            attr.ino
-        );
+        let looked_up = meta
+            .lookup(1, b"deferred-create-fsync-barrier.txt")
+            .expect("fsynced create should be persisted");
+        assert_eq!(looked_up.ino, attr.ino);
     });
 }
 

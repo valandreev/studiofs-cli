@@ -1228,9 +1228,11 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
-        self.wait_for_deferred_release_inflight(open_file.ino).await;
-        self.wait_for_deferred_namespace_metadata(open_file.ino)
-            .await?;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(open_file.ino),
+            self.wait_for_deferred_namespace_metadata(open_file.ino)
+        );
+        metadata_result?;
         if !self.inode_has_local_dirty_state(open_file.ino)
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
@@ -1287,8 +1289,11 @@ impl StudioVfs {
         ino: Ino,
         datasync: bool,
     ) -> VfsResult<FsyncOutcome> {
-        self.wait_for_deferred_release_inflight(ino).await;
-        self.wait_for_deferred_namespace_metadata(ino).await?;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(ino),
+            self.wait_for_deferred_namespace_metadata(ino)
+        );
+        metadata_result?;
         let session = self
             .state
             .file_session

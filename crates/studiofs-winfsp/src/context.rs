@@ -71,6 +71,8 @@ const FILE_WRITE_ATTRIBUTES_ACCESS: FILE_ACCESS_RIGHTS = 0x0100;
 const READ_CONTROL_ACCESS: FILE_ACCESS_RIGHTS = 0x0002_0000;
 #[cfg(test)]
 const SYNCHRONIZE_ACCESS: FILE_ACCESS_RIGHTS = 0x0010_0000;
+const DEFAULT_DIR_MODE: u16 = 0o755;
+const DEFAULT_FILE_MODE: u16 = 0o644;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -1233,7 +1235,7 @@ impl StudioFsContext {
                     &plan.name,
                     0,
                     0,
-                    0o755,
+                    DEFAULT_DIR_MODE,
                     &self.rt,
                 )
                 .map_err(vfs_to_winfsp_err)?,
@@ -1243,7 +1245,7 @@ impl StudioFsContext {
                     &plan.name,
                     0,
                     0,
-                    0o644,
+                    DEFAULT_FILE_MODE,
                     &self.rt,
                 ) {
                     Ok(attr) => attr,
