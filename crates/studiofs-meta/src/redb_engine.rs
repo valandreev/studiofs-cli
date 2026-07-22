@@ -50,6 +50,10 @@ struct RelaxedDurabilityState {
     fail_next_barrier: AtomicBool,
     #[cfg(test)]
     after_barrier_commit: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    wait_count: AtomicU64,
+    #[cfg(test)]
+    last_wait_timeout_ms: AtomicU64,
 }
 
 struct RelaxedDurabilityRuntime {
@@ -263,6 +267,10 @@ fn start_relaxed_durability_runtime_with_interval(
         fail_next_barrier: AtomicBool::new(false),
         #[cfg(test)]
         after_barrier_commit: Mutex::new(None),
+        #[cfg(test)]
+        wait_count: AtomicU64::new(0),
+        #[cfg(test)]
+        last_wait_timeout_ms: AtomicU64::new(0),
     });
     let worker_state = Arc::clone(&state);
     let weak_db: Weak<RwLock<Database>> = Arc::downgrade(db);
@@ -278,10 +286,19 @@ fn start_relaxed_durability_runtime_with_interval(
                 if worker_state.stopping.load(Ordering::Acquire) {
                     break;
                 }
+                let wait_timeout = relaxed_barrier_wait_timeout(&worker_state);
+                #[cfg(test)]
+                {
+                    worker_state.last_wait_timeout_ms.store(
+                        wait_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Release,
+                    );
+                    worker_state.wait_count.fetch_add(1, Ordering::Release);
+                }
                 let (guard, _) = worker_state
                     .wake
                     .1
-                    .wait_timeout(guard, relaxed_barrier_wait_timeout(&worker_state))
+                    .wait_timeout(guard, wait_timeout)
                     .unwrap_or_else(|e| e.into_inner());
                 drop(guard);
                 if worker_state.stopping.load(Ordering::Acquire) {

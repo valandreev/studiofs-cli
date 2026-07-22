@@ -137,26 +137,53 @@ fn relaxed_worker_keeps_the_original_barrier_deadline_after_a_wakeup() {
         dir.path().join("meta.redb"),
         Duration::from_millis(500),
     );
-    let started = Instant::now();
     engine.set_counter("spurious-wakeup", 1).unwrap();
 
-    std::thread::sleep(Duration::from_millis(150));
-    engine
-        .relaxed_durability
-        .as_ref()
-        .expect("relaxed worker")
+    let runtime = engine.relaxed_durability.as_ref().expect("relaxed worker");
+    let wait_started_deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.state.wait_count.load(Ordering::Acquire) == 0
+        && Instant::now() < wait_started_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial_wait_count = runtime.state.wait_count.load(Ordering::Acquire);
+    assert!(
+        initial_wait_count > 0,
+        "relaxed worker should enter its timed wait"
+    );
+    let wake_guard = runtime
         .state
         .wake
-        .1
-        .notify_all();
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop(wake_guard);
 
-    let deadline = started + Duration::from_millis(600);
-    while engine.immediate_barriers_for_test() == 0 && Instant::now() < deadline {
+    let elapsed_ms = runtime
+        .state
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    runtime
+        .state
+        .next_barrier_ms
+        .store(elapsed_ms.saturating_add(300), Ordering::Release);
+    runtime.state.wake.1.notify_all();
+
+    let wake_deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.state.wait_count.load(Ordering::Acquire) <= initial_wait_count
+        && Instant::now() < wake_deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
 
     assert!(
-        engine.immediate_barriers_for_test() >= 1,
+        runtime.state.wait_count.load(Ordering::Acquire) > initial_wait_count,
+        "relaxed worker should recompute its wait after the wakeup"
+    );
+    assert!(
+        runtime.state.last_wait_timeout_ms.load(Ordering::Acquire) < 500,
         "a wakeup before the deadline must not restart the full interval"
     );
 }
