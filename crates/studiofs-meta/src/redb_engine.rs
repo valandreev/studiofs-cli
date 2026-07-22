@@ -187,10 +187,11 @@ fn immediate_metadata_barrier(
 
         Ok(())
     })();
-    if result.is_err() && pending_was_cleared {
-        if let Some(state) = relaxed_durability {
-            state.pending.store(true, Ordering::Release);
-        }
+    if result.is_err()
+        && pending_was_cleared
+        && let Some(state) = relaxed_durability
+    {
+        state.pending.store(true, Ordering::Release);
     }
     result?;
     if let Some(state) = relaxed_durability {
