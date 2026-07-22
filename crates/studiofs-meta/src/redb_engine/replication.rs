@@ -1368,8 +1368,16 @@ impl MetaReplication for RedbMetaEngine {
         self.flush_local_metadata()
     }
 
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        RedbMetaEngine::flush_local_metadata(self)
+    }
+
     fn sync_metadata(&self) -> MetaResult<()> {
         self.sync_local_metadata()
+    }
+
+    fn sync_local_metadata(&self) -> MetaResult<()> {
+        RedbMetaEngine::sync_local_metadata(self)
     }
 
     fn invalidation_sender_id(&self) -> Option<String> {

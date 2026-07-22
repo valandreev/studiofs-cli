@@ -371,6 +371,11 @@ impl StudioVfs {
         }
         self.join_uploader_task(background_join_timeout).await;
 
+        // Stop remote metadata workers before the local durability barrier.
+        // Their remote sync path takes the replication lock and must not hold
+        // shutdown behind a PostgreSQL command timeout.
+        self.sync_meta().prepare_for_close();
+
         // Phase 4: persist metadata + cache checkpoint.
         info!(
             elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -380,7 +385,7 @@ impl StudioVfs {
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_result =
             super::run_sync_with_timeout(metadata_flush_timeout, move || {
-                meta.sync_metadata().map_err(VfsError::Meta)
+                meta.sync_local_metadata().map_err(VfsError::Meta)
             });
         let mut metadata_barrier_error = None;
         let metadata_flush_outcome = match metadata_flush_result {
@@ -406,10 +411,6 @@ impl StudioVfs {
                 "failed"
             }
         };
-        // Stop any background metadata threads (e.g. PgMetaEngine poll) so
-        // their Arc references are released before process exit, allowing
-        // redb::Database::drop() to run cleanly.
-        self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
         let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.pending_uploads_snapshot().len();

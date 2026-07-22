@@ -929,8 +929,20 @@ pub trait MetaReplication: Send + Sync {
     /// Flush pending metadata mutations to remote store (if any).
     fn flush_metadata(&self) -> MetaResult<()>;
 
+    /// Advance the local metadata durability group-commit policy without waiting
+    /// for peer publication.
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        self.flush_metadata()
+    }
+
     /// Force metadata synchronization from remote source (if applicable).
     fn sync_metadata(&self) -> MetaResult<()>;
+
+    /// Execute the strict local metadata durability barrier without waiting for
+    /// peer publication.
+    fn sync_local_metadata(&self) -> MetaResult<()> {
+        self.sync_metadata()
+    }
 
     /// Record a VFS-local open handle that should keep its inode binding alive
     /// while remote metadata is applied.

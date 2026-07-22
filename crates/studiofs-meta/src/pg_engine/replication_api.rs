@@ -23,6 +23,10 @@ impl MetaReplication for PgMetaEngine {
         self.local.flush_local_metadata()
     }
 
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        self.local.flush_local_metadata()
+    }
+
     fn request_eager_flush(&self) {
         self.request_pending_flush();
         self.signal_poll_wakeup();
@@ -30,6 +34,10 @@ impl MetaReplication for PgMetaEngine {
 
     fn sync_metadata(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        self.local.sync_local_metadata()
+    }
+
+    fn sync_local_metadata(&self) -> MetaResult<()> {
         self.local.sync_local_metadata()
     }
 

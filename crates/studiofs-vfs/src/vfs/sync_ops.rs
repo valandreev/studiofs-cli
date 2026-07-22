@@ -59,7 +59,7 @@ impl StudioVfs {
         self.drain_deferred_namespace_metadata_for_barrier().await?;
         let meta = self.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.flush_metadata()
+            engine.flush_local_metadata()
         })
         .await
     }
@@ -67,7 +67,10 @@ impl StudioVfs {
     async fn sync_metadata_barrier(&self) -> VfsResult<()> {
         self.drain_deferred_namespace_metadata_for_barrier().await?;
         let meta = self.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.sync_metadata()).await
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.sync_local_metadata()
+        })
+        .await
     }
 
     /// Spawn a background task that replays landing-zone segments left from a previous run.
