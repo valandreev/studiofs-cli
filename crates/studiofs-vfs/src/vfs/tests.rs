@@ -11948,6 +11948,43 @@ fn shutdown_bounds_a_stalled_deferred_namespace_drain() {
 }
 
 #[test]
+fn shutdown_waits_for_an_active_empty_deferred_namespace_worker() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "shutdown-empty-deferred-worker");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.state
+            .shutdown
+            .shutdown_requested
+            .store(true, AtomicOrdering::Release);
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+
+        let waiter_vfs = Arc::clone(&vfs);
+        let waiter = tokio::spawn(async move {
+            waiter_vfs
+                .wait_for_deferred_namespace_metadata_during_shutdown(Duration::from_secs(1))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        waiter
+            .await
+            .expect("shutdown drain waiter should not panic")
+            .expect("an empty worker should settle cleanly before shutdown continues");
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

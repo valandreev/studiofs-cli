@@ -168,9 +168,7 @@ fn sync_local_metadata_propagates_barrier_failure_and_keeps_pending_state() {
     engine.set_counter("barrier-failure", 1).unwrap();
     engine.fail_next_barrier_for_test();
 
-    let error = engine
-        .sync_local_metadata()
-        .expect_err("barrier must fail");
+    let error = engine.sync_local_metadata().expect_err("barrier must fail");
 
     assert!(
         error

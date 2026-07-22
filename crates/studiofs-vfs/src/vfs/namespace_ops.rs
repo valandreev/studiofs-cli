@@ -564,15 +564,19 @@ impl StudioVfs {
         tokio::pin!(sleep);
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
-            if self
-                .state
-                .namespace
-                .deferred
-                .inner
-                .lock()
-                .settled_operations
-                >= cutoff
-            {
+            let drained = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                inner.settled_operations >= cutoff
+                    && !self
+                        .state
+                        .namespace
+                        .deferred
+                        .draining
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && inner.queue.is_empty()
+                    && inner.backlog_operations == 0
+            };
+            if drained {
                 return self.deferred_namespace_shutdown_error().map_or(Ok(()), Err);
             }
             tokio::select! {
