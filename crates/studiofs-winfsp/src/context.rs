@@ -2951,7 +2951,7 @@ mod tests {
             vfs.write_path_observability_snapshot()
                 .metadata_commit
                 .calls
-                >= before.metadata_commit.calls + 1
+                > before.metadata_commit.calls
         }));
 
         let after = vfs.write_path_observability_snapshot();
