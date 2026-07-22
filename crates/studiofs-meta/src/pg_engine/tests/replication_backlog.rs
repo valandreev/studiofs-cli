@@ -401,6 +401,39 @@ fn published_unlink_creates_remote_visible_pg_replication_backlog() {
 }
 
 #[test]
+fn regular_namespace_mutations_batch_without_pg_poll_wakeup() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    create_published_small_file(&pg, ROOT_INO, b"batched-delete.bin", 77_004);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge remote-visible setup");
+    {
+        let mut state = pg.pending_state.lock().expect("pending_state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+
+    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    *wakeup_lock.lock().expect("poll wakeup lock") = false;
+
+    pg.unlink(ROOT_INO, b"batched-delete.bin")
+        .expect("unlink published file");
+
+    assert!(
+        pg.replication_backlog().pending_ops > 0,
+        "namespace mutation must remain a remote-visible metadata backlog"
+    );
+    assert!(
+        !*wakeup_lock.lock().expect("poll wakeup lock"),
+        "ordinary namespace mutations should wait for group-commit timing or an explicit barrier"
+    );
+    assert!(
+        pg.claim_pending_batch(false).is_none(),
+        "ordinary namespace mutations must not force a PG batch before the group-commit deadline"
+    );
+}
+
+#[test]
 fn request_eager_flush_wakes_pg_poll_worker() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

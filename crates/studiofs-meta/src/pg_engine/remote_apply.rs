@@ -205,12 +205,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                 attr.upload_state == UploadState::Ready
             }
+            // Namespace and ordinary attribute changes are remote-visible, but
+            // they do not need to bypass the shared PG group-commit window. An
+            // explicit request_eager_flush() still provides the immediate
+            // publication barrier for callers that require it.
             MetaEvent::SetAttr { .. }
             | MetaEvent::RemoveAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
-            | MetaEvent::RenameEntry { .. }
-            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::RenameEntry { .. } => false,
+            MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => true,
             MetaEvent::SetSymlinkTarget { .. }
