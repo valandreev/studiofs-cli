@@ -45,13 +45,13 @@ include!("tests/fs_ops.rs");
 include!("tests/chunk_state.rs");
 
 #[test]
-fn sync_metadata_executes_immediate_barrier() {
+fn sync_local_metadata_executes_immediate_barrier() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
     engine.set_counter("barrier-test", 1).unwrap();
 
     assert!(engine.relaxed_pending_for_test());
-    engine.sync_metadata().unwrap();
+    engine.sync_local_metadata().unwrap();
     assert!(!engine.relaxed_pending_for_test());
     assert_eq!(engine.immediate_barriers_for_test(), 1);
 }
@@ -77,7 +77,7 @@ fn relaxed_durability_state_is_isolated_per_engine() {
     first.set_counter("first", 1).unwrap();
     second.set_counter("second", 1).unwrap();
 
-    first.sync_metadata().unwrap();
+    first.sync_local_metadata().unwrap();
 
     assert!(!first.relaxed_pending_for_test());
     assert!(second.relaxed_pending_for_test());
@@ -117,6 +117,20 @@ fn prepare_for_close_makes_later_relaxed_writes_immediate() {
 }
 
 #[test]
+fn sync_metadata_does_not_force_a_local_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+
+    engine.sync_metadata().unwrap();
+
+    assert_eq!(
+        engine.immediate_barriers_for_test(),
+        0,
+        "remote-style sync_metadata must not force local durability"
+    );
+}
+
+#[test]
 fn relaxed_worker_keeps_the_original_barrier_deadline_after_a_wakeup() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_with_interval_for_test(
@@ -148,13 +162,15 @@ fn relaxed_worker_keeps_the_original_barrier_deadline_after_a_wakeup() {
 }
 
 #[test]
-fn sync_metadata_propagates_barrier_failure_and_keeps_pending_state() {
+fn sync_local_metadata_propagates_barrier_failure_and_keeps_pending_state() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
     engine.set_counter("barrier-failure", 1).unwrap();
     engine.fail_next_barrier_for_test();
 
-    let error = engine.sync_metadata().expect_err("barrier must fail");
+    let error = engine
+        .sync_local_metadata()
+        .expect_err("barrier must fail");
 
     assert!(
         error
@@ -176,7 +192,7 @@ fn relaxed_barrier_preserves_write_committed_during_barrier() {
     engine.pause_after_barrier_commit_for_test(Arc::clone(&barrier));
 
     let sync_engine = Arc::clone(&engine);
-    let sync = thread::spawn(move || sync_engine.sync_metadata());
+    let sync = thread::spawn(move || sync_engine.sync_local_metadata());
     barrier.wait();
     engine.set_counter("during-barrier", 2).unwrap();
     sync.join().unwrap().unwrap();

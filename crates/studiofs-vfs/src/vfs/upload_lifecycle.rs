@@ -307,7 +307,9 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
-        let deferred_namespace_result = self.drain_deferred_namespace_metadata_for_barrier().await;
+        let deferred_namespace_result = self
+            .wait_for_deferred_namespace_metadata_during_shutdown(background_join_timeout)
+            .await;
         self.join_background_tasks(background_join_timeout).await;
         let deferred_namespace_error = deferred_namespace_result
             .err()

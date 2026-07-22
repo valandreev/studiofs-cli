@@ -1377,7 +1377,7 @@ impl MetaReplication for RedbMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        self.sync_local_metadata()
+        Ok(())
     }
 
     fn sync_local_metadata(&self) -> MetaResult<()> {

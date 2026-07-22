@@ -11921,6 +11921,33 @@ fn deferred_namespace_barrier_resumes_background_drain_after_its_cutoff() {
 }
 
 #[test]
+fn shutdown_bounds_a_stalled_deferred_namespace_drain() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "shutdown-deferred-namespace-timeout");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = InodeAttr::new_file(9_000_061, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &attr, b"stalled.txt");
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(3), async {
+            vfs.wait_for_deferred_namespace_metadata_during_shutdown(Duration::from_secs(2))
+                .await
+        })
+        .await
+        .expect("shutdown must not wait forever for a stalled namespace drain");
+        assert!(
+            shutdown.is_err(),
+            "shutdown should report the incomplete deferred namespace drain"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

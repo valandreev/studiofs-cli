@@ -547,6 +547,45 @@ impl StudioVfs {
         Ok(())
     }
 
+    pub(super) async fn wait_for_deferred_namespace_metadata_during_shutdown(
+        &self,
+        timeout: Duration,
+    ) -> VfsResult<()> {
+        let cutoff = self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admitted_operations;
+        self.resume_deferred_namespace_metadata_drain();
+
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            if self
+                .state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .settled_operations
+                >= cutoff
+            {
+                return self.deferred_namespace_shutdown_error().map_or(Ok(()), Err);
+            }
+            tokio::select! {
+                _ = &mut sleep => {
+                    return Err(VfsError::Other(
+                        "deferred namespace metadata drain timed out during shutdown".to_string(),
+                    ));
+                }
+                _ = notified => {}
+            }
+        }
+    }
+
     fn resume_deferred_namespace_metadata_drain(&self) {
         let Some(vfs) = self.state.namespace.deferred.upgrade_owner() else {
             return;
