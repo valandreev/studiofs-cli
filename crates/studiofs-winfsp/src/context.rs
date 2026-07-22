@@ -71,6 +71,8 @@ const FILE_WRITE_ATTRIBUTES_ACCESS: FILE_ACCESS_RIGHTS = 0x0100;
 const READ_CONTROL_ACCESS: FILE_ACCESS_RIGHTS = 0x0002_0000;
 #[cfg(test)]
 const SYNCHRONIZE_ACCESS: FILE_ACCESS_RIGHTS = 0x0010_0000;
+const DEFAULT_DIR_MODE: u16 = 0o755;
+const DEFAULT_FILE_MODE: u16 = 0o644;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -1228,10 +1230,24 @@ impl StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?,
             CreateCallbackKind::Directory => self
                 .vfs
-                .mkdir(plan.parent_ino, &plan.name, 0, 0, 0o755)
+                .mkdir_with_deferred_metadata_admission(
+                    plan.parent_ino,
+                    &plan.name,
+                    0,
+                    0,
+                    DEFAULT_DIR_MODE,
+                    &self.rt,
+                )
                 .map_err(vfs_to_winfsp_err)?,
             CreateCallbackKind::RegularFile => {
-                match self.vfs.create(plan.parent_ino, &plan.name, 0, 0, 0o644) {
+                match self.vfs.create_with_deferred_metadata_admission(
+                    plan.parent_ino,
+                    &plan.name,
+                    0,
+                    0,
+                    DEFAULT_FILE_MODE,
+                    &self.rt,
+                ) {
                     Ok(attr) => attr,
                     Err(VfsError::Meta(MetaError::EntryExists { .. }))
                         if open_existing_on_collision =>
@@ -2244,8 +2260,9 @@ mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
         CREATE_DISPOSITION_SHIFT, CreateCallbackKind, FILE_ACTION_MODIFIED,
-        FILE_APPEND_DATA_ACCESS, FILE_DIRECTORY_FILE_OPTION, FILE_FLAG_NO_BUFFERING_ATTRIBUTE,
-        FILE_FLAG_WRITE_THROUGH_ATTRIBUTE, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
+        FILE_APPEND_DATA_ACCESS, FILE_CREATE_DISPOSITION, FILE_DIRECTORY_FILE_OPTION,
+        FILE_FLAG_NO_BUFFERING_ATTRIBUTE, FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
+        FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
         FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
         FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
         FILE_NOTIFY_CHANGE_SIZE, FILE_OVERWRITE_IF_DISPOSITION, FILE_READ_ATTRIBUTES_ACCESS,
@@ -2892,6 +2909,77 @@ mod tests {
             async move { vfs.release_fh(handle.fh).await }
         })
         .expect("release handle");
+    }
+
+    #[test]
+    fn winfsp_regular_file_and_directory_create_complete_deferred_namespace_admission() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("deferred-create-routing");
+
+        let file_name = U16CString::from_str(r"\deferred-file.txt").expect("u16 file path");
+        let mut file_info = empty_open_file_info();
+        let file = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            FILE_CREATE_DISPOSITION << CREATE_DISPOSITION_SHIFT,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut file_info,
+        )
+        .expect("create deferred regular file");
+
+        let directory_name =
+            U16CString::from_str(r"\deferred-directory").expect("u16 directory path");
+        let mut directory_info = empty_open_file_info();
+        let directory = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            directory_name.as_ucstr(),
+            (FILE_CREATE_DISPOSITION << CREATE_DISPOSITION_SHIFT) | FILE_DIRECTORY_FILE_OPTION,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut directory_info,
+        )
+        .expect("create deferred directory");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move {
+                vfs.fsync(file.ino, false).await?;
+                vfs.fsync(directory.ino, false).await
+            }
+        })
+        .expect("wait for both deferred namespace commits");
+
+        assert_eq!(
+            vfs.meta()
+                .lookup(ROOT_INO, b"deferred-file.txt")
+                .expect("deferred file should be persisted")
+                .ino,
+            file.ino
+        );
+        assert_eq!(
+            vfs.meta()
+                .lookup(ROOT_INO, b"deferred-directory")
+                .expect("deferred directory should be persisted")
+                .ino,
+            directory.ino
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move {
+                vfs.release_fh(file.fh).await?;
+                vfs.release_fh(directory.fh).await
+            }
+        })
+        .expect("release created handles");
     }
 
     #[test]

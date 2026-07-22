@@ -926,7 +926,11 @@ impl StudioVfs {
         }
         .unwrap_or(ino);
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
-        self.wait_for_deferred_release_inflight(target_ino).await;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(target_ino),
+            self.wait_for_deferred_namespace_metadata(target_ino)
+        );
+        metadata_result?;
         let session = self
             .state
             .file_session
@@ -986,7 +990,11 @@ impl StudioVfs {
             None
         }
         .unwrap_or(ino);
-        self.wait_for_deferred_release_inflight(target_ino).await;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(target_ino),
+            self.wait_for_deferred_namespace_metadata(target_ino)
+        );
+        metadata_result?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         if self.state.writer_stack.has_dirty_writers(target_ino) {
             self.spawn_deferred_materialization_if_needed(target_ino)
@@ -1228,7 +1236,11 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
-        self.wait_for_deferred_release_inflight(open_file.ino).await;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(open_file.ino),
+            self.wait_for_deferred_namespace_metadata(open_file.ino)
+        );
+        metadata_result?;
         if !self.inode_has_local_dirty_state(open_file.ino)
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
@@ -1285,7 +1297,11 @@ impl StudioVfs {
         ino: Ino,
         datasync: bool,
     ) -> VfsResult<FsyncOutcome> {
-        self.wait_for_deferred_release_inflight(ino).await;
+        let ((), metadata_result) = tokio::join!(
+            self.wait_for_deferred_release_inflight(ino),
+            self.wait_for_deferred_namespace_metadata(ino)
+        );
+        metadata_result?;
         let session = self
             .state
             .file_session
