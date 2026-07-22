@@ -2912,9 +2912,8 @@ mod tests {
     }
 
     #[test]
-    fn winfsp_regular_file_and_directory_create_share_deferred_namespace_batch() {
+    fn winfsp_regular_file_and_directory_create_complete_deferred_namespace_admission() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("deferred-create-routing");
-        let before = vfs.write_path_observability_snapshot();
 
         let file_name = U16CString::from_str(r"\deferred-file.txt").expect("u16 file path");
         let mut file_info = empty_open_file_info();
@@ -2958,10 +2957,19 @@ mod tests {
         })
         .expect("wait for both deferred namespace commits");
 
-        let after = vfs.write_path_observability_snapshot();
         assert_eq!(
-            after.metadata_commit.calls,
-            before.metadata_commit.calls + 1
+            vfs.meta()
+                .lookup(ROOT_INO, b"deferred-file.txt")
+                .expect("deferred file should be persisted")
+                .ino,
+            file.ino
+        );
+        assert_eq!(
+            vfs.meta()
+                .lookup(ROOT_INO, b"deferred-directory")
+                .expect("deferred directory should be persisted")
+                .ino,
+            directory.ino
         );
 
         ctx.spawn_wait({

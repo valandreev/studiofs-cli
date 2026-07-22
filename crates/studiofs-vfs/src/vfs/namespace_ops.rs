@@ -260,6 +260,14 @@ impl StudioVfs {
         let op_bytes = Self::deferred_namespace_op_estimated_bytes(&op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
+            if let Some(key) = key.as_ref()
+                && inner.entries.contains_key(key)
+            {
+                return Err(VfsError::Meta(MetaError::EntryExists {
+                    parent: key.parent,
+                    name: String::from_utf8_lossy(&key.name).into_owned(),
+                }));
+            }
             if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes, attr.ino)
             {
                 return Err(error);

@@ -11071,6 +11071,36 @@ fn flush_waits_for_deferred_namespace_create() {
 }
 
 #[test]
+fn winfsp_flush_waits_for_deferred_namespace_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-winfsp-flush-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-winfsp-flush-barrier.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let fh = vfs
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+            .expect("open deferred WinFSP flush file");
+        vfs.flush_winfsp_writeback_with_outcome(attr.ino, fh)
+            .await
+            .expect("WinFSP flush should wait for deferred create");
+        let looked_up = meta
+            .lookup(1, b"deferred-create-winfsp-flush-barrier.txt")
+            .expect("WinFSP flush should persist the create");
+        assert_eq!(looked_up.ino, attr.ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn fsync_waits_for_deferred_namespace_create() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-fsync-barrier");
@@ -11683,6 +11713,53 @@ fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     assert!(inner.queue.is_empty());
     assert!(inner.entries.is_empty());
     assert!(inner.attrs.is_empty());
+}
+
+#[test]
+fn deferred_namespace_admission_rejects_duplicate_deferred_key() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-duplicate-key");
+    let first = InodeAttr::new_file(9_000_021, ROOT_INO, 0, 0, 0o644);
+    let second = InodeAttr::new_file(9_000_022, ROOT_INO, 0, 0, 0o644);
+    let key = super::namespace::DeferredNamespaceKey::new(ROOT_INO, b"duplicate.txt");
+
+    vfs.enqueue_deferred_namespace_op(
+        Some(key.clone()),
+        first.clone(),
+        super::namespace::DeferredNamespaceOp::CreateFile {
+            attr: first.clone(),
+            parent: ROOT_INO,
+            name: b"duplicate.txt".to_vec(),
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        },
+    )
+    .expect("first deferred key admission");
+
+    let error = vfs
+        .enqueue_deferred_namespace_op(
+            Some(key.clone()),
+            second.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr: second,
+                parent: ROOT_INO,
+                name: b"duplicate.txt".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        )
+        .expect_err("duplicate deferred key must be rejected atomically");
+    assert!(matches!(
+        error,
+        VfsError::Meta(MetaError::EntryExists { parent, name })
+            if parent == ROOT_INO && name == "duplicate.txt"
+    ));
+    assert_eq!(
+        vfs.state.namespace.deferred.inner.lock().entries.get(&key),
+        Some(&first.ino)
+    );
 }
 
 #[test]
