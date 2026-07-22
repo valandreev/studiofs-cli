@@ -14,9 +14,10 @@ use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{
-    Arc, Once, OnceLock, RwLock, RwLockReadGuard,
-    atomic::{AtomicU64, Ordering},
+    Arc, Condvar, Mutex, Once, RwLock, RwLockReadGuard, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -27,15 +28,55 @@ use self::layout::*;
 mod fs_ops;
 
 static RELAXED_DURABILITY_WARN: Once = Once::new();
-static RELAXED_DURABILITY_CLOCK_START: OnceLock<Instant> = OnceLock::new();
-static RELAXED_DURABILITY_NEXT_BARRIER_MS: AtomicU64 =
-    AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
 const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Arc<RwLock<Database>>,
     write_metrics: Arc<MetadataWriteMetrics>,
+    relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
+}
+
+struct RelaxedDurabilityState {
+    started: Instant,
+    interval_ms: u64,
+    next_barrier_ms: AtomicU64,
+    pending: AtomicBool,
+    force_immediate: AtomicBool,
+    stopping: AtomicBool,
+    wake: (Mutex<()>, Condvar),
+    immediate_barriers: AtomicU64,
+    #[cfg(test)]
+    fail_next_barrier: AtomicBool,
+    #[cfg(test)]
+    after_barrier_commit: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    wait_count: AtomicU64,
+    #[cfg(test)]
+    last_wait_timeout_ms: AtomicU64,
+}
+
+struct RelaxedDurabilityRuntime {
+    state: Arc<RelaxedDurabilityState>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for RelaxedDurabilityRuntime {
+    fn drop(&mut self) {
+        {
+            let _wake_guard = self
+                .state
+                .wake
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.state.stopping.store(true, Ordering::Release);
+            self.state.wake.1.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// Lock-free counters for one metadata write-transaction stage.
@@ -88,73 +129,201 @@ pub(crate) struct CounterWriteTransaction<'a> {
 pub(crate) struct RedbWriteTransaction<'a> {
     txn: WriteTransaction,
     _db: RwLockReadGuard<'a, Database>,
-    write_metrics: Arc<MetadataWriteMetrics>,
+    write_metrics: &'a MetadataWriteMetrics,
     mutation_started: Instant,
+    relaxed_durability: Option<&'a RelaxedDurabilityRuntime>,
 }
 
 fn redb_relaxed_durability_enabled() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE")
-                .ok()
-                .is_some_and(|value| {
-                    matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
+    std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
         })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
 }
 
-fn redb_relaxed_durability() -> Durability {
-    let start = RELAXED_DURABILITY_CLOCK_START.get_or_init(Instant::now);
-    let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    redb_relaxed_durability_for_elapsed_ms(&RELAXED_DURABILITY_NEXT_BARRIER_MS, elapsed_ms)
-}
-
-// Durability::Immediate makes earlier Durability::None commits persistent in redb.
-// This keeps relaxed mode fast while bounding local metadata loss to the last interval.
-fn redb_relaxed_durability_for_elapsed_ms(
-    next_barrier_ms: &AtomicU64,
-    elapsed_ms: u64,
-) -> Durability {
-    loop {
-        let next = next_barrier_ms.load(Ordering::Relaxed);
-        if elapsed_ms < next {
-            return Durability::None;
-        }
-        let new_next = elapsed_ms.saturating_add(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
-        if next_barrier_ms
-            .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Durability::Immediate;
-        }
-    }
-}
-
-fn begin_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction> {
+fn begin_redb_write_txn(
+    db: &Database,
+    relaxed_durability: Option<&RelaxedDurabilityRuntime>,
+) -> MetaResult<WriteTransaction> {
     let mut txn = db
         .begin_write()
         .map_err(|e| MetaError::Storage(e.to_string()))?;
-    if redb_relaxed_durability_enabled() {
-        RELAXED_DURABILITY_WARN.call_once(|| {
-            warn!(
-                interval_ms = REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS,
-                "STUDIOFS_REDB_RELAXED_DURABILITY_UNSAFE is enabled; most local redb commits skip durable flushes, with periodic durable barriers"
-            );
-        });
-        txn.set_durability(redb_relaxed_durability())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+    if let Some(runtime) = relaxed_durability {
+        txn.set_durability(if runtime.state.force_immediate.load(Ordering::Acquire) {
+            Durability::Immediate
+        } else {
+            Durability::None
+        })
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
     }
     Ok(txn)
+}
+
+fn immediate_metadata_barrier(
+    db: &RwLock<Database>,
+    relaxed_durability: Option<&RelaxedDurabilityState>,
+) -> MetaResult<()> {
+    let pending_was_cleared = relaxed_durability
+        .map(|state| state.pending.swap(false, Ordering::AcqRel))
+        .unwrap_or(false);
+    let result: MetaResult<()> = (|| {
+        #[cfg(test)]
+        if relaxed_durability
+            .is_some_and(|state| state.fail_next_barrier.swap(false, Ordering::AcqRel))
+        {
+            return Err(MetaError::Storage(
+                "simulated metadata barrier failure".to_string(),
+            ));
+        }
+
+        let db = db
+            .read()
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
+        let mut txn = db
+            .begin_write()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        txn.set_durability(Durability::Immediate)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+
+        #[cfg(test)]
+        if let Some(barrier) = relaxed_durability.and_then(|state| {
+            state
+                .after_barrier_commit
+                .lock()
+                .ok()
+                .and_then(|mut hook| hook.take())
+        }) {
+            barrier.wait();
+        }
+
+        Ok(())
+    })();
+    if result.is_err()
+        && pending_was_cleared
+        && let Some(state) = relaxed_durability
+    {
+        state.pending.store(true, Ordering::Release);
+    }
+    result?;
+    if let Some(state) = relaxed_durability {
+        state.immediate_barriers.fetch_add(1, Ordering::Relaxed);
+        let elapsed_ms = state
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        state.next_barrier_ms.store(
+            elapsed_ms.saturating_add(state.interval_ms),
+            Ordering::Release,
+        );
+    }
+    Ok(())
+}
+
+fn relaxed_barrier_due(state: &RelaxedDurabilityState) -> bool {
+    let elapsed_ms = state
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    elapsed_ms >= state.next_barrier_ms.load(Ordering::Acquire)
+}
+
+fn relaxed_barrier_wait_timeout(state: &RelaxedDurabilityState) -> Duration {
+    let elapsed_ms = state
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let next_barrier_ms = state.next_barrier_ms.load(Ordering::Acquire);
+    Duration::from_millis(
+        next_barrier_ms
+            .checked_sub(elapsed_ms)
+            .unwrap_or(state.interval_ms),
+    )
+}
+
+fn start_relaxed_durability_runtime_with_interval(
+    db: &Arc<RwLock<Database>>,
+    interval: Duration,
+) -> MetaResult<Arc<RelaxedDurabilityRuntime>> {
+    let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
+    let state = Arc::new(RelaxedDurabilityState {
+        started: Instant::now(),
+        interval_ms,
+        next_barrier_ms: AtomicU64::new(interval_ms),
+        pending: AtomicBool::new(false),
+        force_immediate: AtomicBool::new(false),
+        stopping: AtomicBool::new(false),
+        wake: (Mutex::new(()), Condvar::new()),
+        immediate_barriers: AtomicU64::new(0),
+        #[cfg(test)]
+        fail_next_barrier: AtomicBool::new(false),
+        #[cfg(test)]
+        after_barrier_commit: Mutex::new(None),
+        #[cfg(test)]
+        wait_count: AtomicU64::new(0),
+        #[cfg(test)]
+        last_wait_timeout_ms: AtomicU64::new(0),
+    });
+    let worker_state = Arc::clone(&state);
+    let weak_db: Weak<RwLock<Database>> = Arc::downgrade(db);
+    let worker = std::thread::Builder::new()
+        .name("studiofs-redb-durability".to_string())
+        .spawn(move || {
+            loop {
+                let guard = worker_state
+                    .wake
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if worker_state.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let wait_timeout = relaxed_barrier_wait_timeout(&worker_state);
+                #[cfg(test)]
+                {
+                    worker_state.last_wait_timeout_ms.store(
+                        wait_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Release,
+                    );
+                    worker_state.wait_count.fetch_add(1, Ordering::Release);
+                }
+                let (guard, _) = worker_state
+                    .wake
+                    .1
+                    .wait_timeout(guard, wait_timeout)
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(guard);
+                if worker_state.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                if !worker_state.pending.load(Ordering::Acquire)
+                    || !relaxed_barrier_due(&worker_state)
+                {
+                    continue;
+                }
+                let Some(db) = weak_db.upgrade() else {
+                    break;
+                };
+                if let Err(error) = immediate_metadata_barrier(&db, Some(&worker_state)) {
+                    warn!(%error, "periodic redb metadata durability barrier failed");
+                }
+            }
+        })
+        .map_err(|error| {
+            MetaError::Storage(format!("failed to spawn redb durability worker: {error}"))
+        })?;
+    Ok(Arc::new(RelaxedDurabilityRuntime {
+        state,
+        worker: Some(worker),
+    }))
 }
 
 fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
@@ -190,10 +359,17 @@ impl RedbWriteTransaction<'_> {
             _db,
             write_metrics,
             mutation_started,
+            relaxed_durability,
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
         let result = txn.commit();
+        if result.is_ok()
+            && let Some(runtime) = relaxed_durability
+            && !runtime.state.force_immediate.load(Ordering::Acquire)
+        {
+            runtime.state.pending.store(true, Ordering::Release);
+        }
         MetadataWriteMetrics::observe(&write_metrics.commit, commit_started.elapsed());
         result
     }
@@ -204,6 +380,7 @@ impl RedbWriteTransaction<'_> {
             _db,
             write_metrics,
             mutation_started,
+            relaxed_durability: _,
         } = self;
         // Abort latency itself is intentionally excluded; mutation ends when abort starts,
         // matching commit accounting before the durable commit call.
@@ -213,6 +390,12 @@ impl RedbWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn seal_relaxed_durability_for_close(&self) {
+        if let Some(runtime) = &self.relaxed_durability {
+            runtime.state.force_immediate.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn read_db(&self) -> MetaResult<RwLockReadGuard<'_, Database>> {
         self.db
             .read()
@@ -227,14 +410,15 @@ impl RedbMetaEngine {
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         let db = self.read_db()?;
         let started = Instant::now();
-        let result = begin_redb_write_txn(&db);
+        let result = begin_redb_write_txn(&db, self.relaxed_durability.as_deref());
         MetadataWriteMetrics::observe(&self.write_metrics.begin_write, started.elapsed());
         let txn = result?;
         Ok(RedbWriteTransaction {
             txn,
             _db: db,
-            write_metrics: Arc::clone(&self.write_metrics),
+            write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
+            relaxed_durability: self.relaxed_durability.as_deref(),
         })
     }
 
@@ -250,7 +434,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
         {
-            let txn = begin_redb_write_txn(&db)?;
+            let txn = begin_redb_write_txn(&db, None)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
@@ -285,9 +469,27 @@ impl RedbMetaEngine {
         }
 
         debug!("opened metadata database at {:?}", path.as_ref());
+        let db = Arc::new(RwLock::new(db));
+        let relaxed_durability = if redb_relaxed_durability_enabled() {
+            Some(start_relaxed_durability_runtime_with_interval(
+                &db,
+                Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
+            )?)
+        } else {
+            None
+        };
+        if relaxed_durability.is_some() {
+            RELAXED_DURABILITY_WARN.call_once(|| {
+                warn!(
+                    interval_ms = REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS,
+                    "relaxed redb metadata durability is enabled with bounded periodic and explicit barriers"
+                );
+            });
+        }
         let engine = Self {
-            db: Arc::new(RwLock::new(db)),
+            db,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
+            relaxed_durability,
         };
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
@@ -343,6 +545,87 @@ impl RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(out)
+    }
+
+    pub(crate) fn flush_local_metadata(&self) -> MetaResult<()> {
+        let Some(runtime) = self.relaxed_durability.as_deref() else {
+            return Ok(());
+        };
+        if runtime.state.pending.load(Ordering::Acquire) && relaxed_barrier_due(&runtime.state) {
+            immediate_metadata_barrier(&self.db, Some(&runtime.state))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_local_metadata(&self) -> MetaResult<()> {
+        immediate_metadata_barrier(
+            &self.db,
+            self.relaxed_durability
+                .as_deref()
+                .map(|runtime| runtime.state.as_ref()),
+        )
+    }
+
+    #[cfg(test)]
+    fn open_relaxed_for_test(path: impl AsRef<Path>) -> Self {
+        Self::open_relaxed_with_interval_for_test(
+            path,
+            Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
+        )
+    }
+
+    #[cfg(test)]
+    fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
+        let mut engine = Self::open(path).expect("open relaxed redb test engine");
+        if engine.relaxed_durability.is_none() {
+            engine.relaxed_durability = Some(
+                start_relaxed_durability_runtime_with_interval(&engine.db, interval)
+                    .expect("start relaxed redb test worker"),
+            );
+        }
+        engine
+    }
+
+    #[cfg(test)]
+    fn relaxed_pending_for_test(&self) -> bool {
+        self.relaxed_durability
+            .as_ref()
+            .is_some_and(|runtime| runtime.state.pending.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    fn immediate_barriers_for_test(&self) -> u64 {
+        self.relaxed_durability.as_ref().map_or(0, |runtime| {
+            runtime.state.immediate_barriers.load(Ordering::Relaxed)
+        })
+    }
+
+    #[cfg(test)]
+    fn make_relaxed_barrier_due_for_test(&self) {
+        if let Some(runtime) = &self.relaxed_durability {
+            runtime.state.next_barrier_ms.store(0, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_barrier_for_test(&self) {
+        if let Some(runtime) = &self.relaxed_durability {
+            runtime
+                .state
+                .fail_next_barrier
+                .store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_barrier_commit_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        if let Some(runtime) = &self.relaxed_durability {
+            *runtime
+                .state
+                .after_barrier_commit
+                .lock()
+                .expect("barrier hook lock") = Some(barrier);
+        }
     }
 }
 

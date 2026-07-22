@@ -1099,6 +1099,7 @@ impl MetadataRefreshDecision {
         has_pending_local_payloads: bool,
         has_dirty_writer_stack: bool,
         has_pending_uploads: bool,
+        has_pending_namespace_metadata: bool,
     ) -> Self {
         let tracks_pending_regular_content = attr.kind == FileType::RegularFile
             && (attr.upload_state != MetaUploadState::Ready
@@ -1107,6 +1108,7 @@ impl MetadataRefreshDecision {
             || has_pending_local_payloads
             || has_dirty_writer_stack
             || has_pending_uploads
+            || has_pending_namespace_metadata
         {
             return Self::UseLocal;
         }
@@ -1205,6 +1207,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
             self.vfs.inode_has_pending_uploads(self.ino),
+            self.vfs.has_deferred_namespace_metadata(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Some(dirty_attr);
@@ -1255,6 +1258,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
             self.vfs.inode_has_pending_uploads(self.ino),
+            self.vfs.has_deferred_namespace_metadata(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(dirty_attr));
@@ -1307,6 +1311,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
             self.vfs.inode_has_pending_uploads(self.ino),
+            self.vfs.has_deferred_namespace_metadata(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
@@ -1353,6 +1358,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
             self.vfs.inode_has_pending_uploads(self.ino),
+            self.vfs.has_deferred_namespace_metadata(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
@@ -2603,12 +2609,16 @@ mod tests {
         pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
 
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(&pending_attr, true, false, false),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, true, false, false, false),
             MetadataRefreshDecision::UseLocal
         );
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(&pending_attr, false, false, false),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, false, false, false, false),
             MetadataRefreshDecision::RefreshAuthoritative
+        );
+        assert_eq!(
+            MetadataRefreshDecision::for_local_attr(&pending_attr, false, false, false, true),
+            MetadataRefreshDecision::UseLocal
         );
     }
 

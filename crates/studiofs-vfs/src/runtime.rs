@@ -459,7 +459,9 @@ impl<M: ?Sized + MetaAcl> MetaAcl for RuntimeMetaHandle<M> {
 impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn check_consistency(&self) -> MetaResult<()>);
     forward_method!(fn flush_metadata(&self) -> MetaResult<()>);
+    forward_method!(fn flush_local_metadata(&self) -> MetaResult<()>);
     forward_method!(fn sync_metadata(&self) -> MetaResult<()>);
+    forward_method!(fn sync_local_metadata(&self) -> MetaResult<()>);
     forward_method!(fn note_active_open_inode(&self, ino: Ino));
     forward_method!(fn note_inactive_open_inode(&self, ino: Ino));
     forward_method!(fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()>);

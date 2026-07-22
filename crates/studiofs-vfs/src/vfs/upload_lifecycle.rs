@@ -145,27 +145,37 @@ impl StudioVfs {
             let mut handles = self.state.shutdown.background_tasks.lock();
             std::mem::take(&mut *handles)
         };
-        for mut handle in handles {
-            if !handle.is_finished() {
-                match tokio::time::timeout(timeout, &mut handle).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) if e.is_cancelled() => {}
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "background task join failed");
-                    }
-                    Err(_) => {
-                        handle.abort();
-                        let _ = handle.await;
-                        warn!(
-                            timeout_ms = timeout.as_millis() as u64,
-                            "background task did not stop in time, aborted"
-                        );
-                    }
+        Self::join_background_task_handles(handles, timeout).await;
+    }
+
+    async fn join_background_task_handles(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
+        let join_result = tokio::time::timeout(timeout, async {
+            for handle in &mut handles {
+                if let Err(e) = handle.await
+                    && !e.is_cancelled()
+                {
+                    warn!(error = %e, "background task join failed");
                 }
-            } else if let Err(e) = handle.await
-                && !e.is_cancelled()
-            {
-                warn!(error = %e, "background task join failed");
+            }
+        })
+        .await;
+        if join_result.is_err() {
+            let aborted = handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count();
+            for handle in handles {
+                if handle.is_finished() {
+                    continue;
+                }
+                handle.abort();
+                let _ = handle.await;
+            }
+            if aborted > 0 {
+                warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    aborted, "background tasks did not stop in time, aborted"
+                );
             }
         }
     }
@@ -297,10 +307,13 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
-        self.wait_for_deferred_namespace_drain(background_join_timeout)
+        let deferred_namespace_result = self
+            .wait_for_deferred_namespace_metadata_during_shutdown(background_join_timeout)
             .await;
         self.join_background_tasks(background_join_timeout).await;
-        let deferred_namespace_error = self.deferred_namespace_shutdown_error();
+        let deferred_namespace_error = deferred_namespace_result
+            .err()
+            .or_else(|| self.deferred_namespace_shutdown_error());
 
         // Reset the active-access-class telemetry counters for any handles that
         // were never explicitly closed via release_fh (e.g. force-unmount).
@@ -362,6 +375,11 @@ impl StudioVfs {
         }
         self.join_uploader_task(background_join_timeout).await;
 
+        // Stop remote metadata workers before the local durability barrier.
+        // Their remote sync path takes the replication lock and must not hold
+        // shutdown behind a PostgreSQL command timeout.
+        self.sync_meta().prepare_for_close();
+
         // Phase 4: persist metadata + cache checkpoint.
         info!(
             elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -371,8 +389,9 @@ impl StudioVfs {
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_result =
             super::run_sync_with_timeout(metadata_flush_timeout, move || {
-                meta.flush_metadata().map_err(VfsError::Meta)
+                meta.sync_local_metadata().map_err(VfsError::Meta)
             });
+        let mut metadata_barrier_error = None;
         let metadata_flush_outcome = match metadata_flush_result {
             Ok(Some(())) if deferred_namespace_error.is_none() => "success",
             Ok(Some(())) => {
@@ -384,17 +403,18 @@ impl StudioVfs {
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
                     "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
                 );
+                metadata_barrier_error = Some(VfsError::Other(format!(
+                    "metadata durability barrier timed out after {} ms",
+                    metadata_flush_timeout.as_millis()
+                )));
                 "timeout"
             }
             Err(e) => {
                 warn!("VFS shutdown: metadata flush failed: {}", e);
+                metadata_barrier_error = Some(e);
                 "failed"
             }
         };
-        // Stop any background metadata threads (e.g. PgMetaEngine poll) so
-        // their Arc references are released before process exit, allowing
-        // redb::Database::drop() to run cleanly.
-        self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
         let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.pending_uploads_snapshot().len();
@@ -439,13 +459,46 @@ impl StudioVfs {
         if let Some(error) = deferred_namespace_error {
             return Err(error);
         }
+        if let Some(error) = metadata_barrier_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_recoverable_on_restart;
+    use std::future;
+    use std::time::Duration;
+
+    use super::{StudioVfs, shutdown_recoverable_on_restart};
+
+    #[tokio::test(start_paused = true)]
+    async fn background_tasks_share_one_join_deadline() {
+        let handles = (0..3).map(|_| tokio::spawn(future::pending())).collect();
+        let timeout = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+
+        StudioVfs::join_background_task_handles(handles, timeout).await;
+
+        assert_eq!(started.elapsed(), timeout);
+    }
+
+    #[tokio::test]
+    async fn aborted_background_tasks_are_finished_before_join_returns() {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _sender = sender;
+            future::pending::<()>().await;
+        });
+
+        StudioVfs::join_background_task_handles(vec![handle], Duration::ZERO).await;
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
 
     #[test]
     fn shutdown_recoverability_requires_metadata_flush_success() {

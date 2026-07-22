@@ -1962,10 +1962,9 @@ impl StudioVfsAdapter {
         datasync: bool,
     ) -> Result<(), i32> {
         let result = if let Some(file_handle) = file_handle.filter(|handle| *handle != 0) {
-            // Handle-backed sync must preserve pending handle-local write state;
             // StudioVfs does not currently distinguish fdatasync from fsync on
-            // this path, so both use the handle flush barrier.
-            self.runtime_handle.block_on(self.vfs.flush_fh(file_handle))
+            // this path; both drain the handle and execute the strict metadata barrier.
+            self.runtime_handle.block_on(self.vfs.fsync_fh(file_handle))
         } else {
             self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
         };

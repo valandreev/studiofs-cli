@@ -6,6 +6,8 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 trait FileGraphFixture {
     fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
@@ -43,34 +45,184 @@ include!("tests/fs_ops.rs");
 include!("tests/chunk_state.rs");
 
 #[test]
-fn relaxed_durability_uses_immediate_barrier_every_five_seconds() {
-    let next_barrier_ms =
-        std::sync::atomic::AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+fn sync_local_metadata_executes_immediate_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("barrier-test", 1).unwrap();
 
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 0),
-        Durability::None
+    assert!(engine.relaxed_pending_for_test());
+    engine.sync_local_metadata().unwrap();
+    assert!(!engine.relaxed_pending_for_test());
+    assert_eq!(engine.immediate_barriers_for_test(), 1);
+}
+
+#[test]
+fn flush_metadata_only_executes_due_relaxed_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("flush-test", 1).unwrap();
+
+    engine.flush_metadata().unwrap();
+    assert_eq!(engine.immediate_barriers_for_test(), 0);
+    engine.make_relaxed_barrier_due_for_test();
+    engine.flush_metadata().unwrap();
+    assert_eq!(engine.immediate_barriers_for_test(), 1);
+}
+
+#[test]
+fn relaxed_durability_state_is_isolated_per_engine() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let first = RedbMetaEngine::open_relaxed_for_test(dir.path().join("first.redb"));
+    let second = RedbMetaEngine::open_relaxed_for_test(dir.path().join("second.redb"));
+    first.set_counter("first", 1).unwrap();
+    second.set_counter("second", 1).unwrap();
+
+    first.sync_local_metadata().unwrap();
+
+    assert!(!first.relaxed_pending_for_test());
+    assert!(second.relaxed_pending_for_test());
+    assert_eq!(first.immediate_barriers_for_test(), 1);
+    assert_eq!(second.immediate_barriers_for_test(), 0);
+}
+
+#[test]
+fn relaxed_durability_makes_idle_progress_without_another_write() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_with_interval_for_test(
+        dir.path().join("meta.redb"),
+        Duration::from_millis(20),
+    );
+    engine.set_counter("idle-progress", 1).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while engine.immediate_barriers_for_test() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(engine.immediate_barriers_for_test() >= 1);
+}
+
+#[test]
+fn prepare_for_close_makes_later_relaxed_writes_immediate() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+
+    engine.prepare_for_close();
+    engine.set_counter("after-close-preparation", 1).unwrap();
+
+    assert!(
+        !engine.relaxed_pending_for_test(),
+        "writes after close preparation must not wait for the relaxed worker"
+    );
+}
+
+#[test]
+fn sync_metadata_does_not_force_a_local_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+
+    engine.sync_metadata().unwrap();
+
+    assert_eq!(
+        engine.immediate_barriers_for_test(),
+        0,
+        "remote-style sync_metadata must not force local durability"
+    );
+}
+
+#[test]
+fn relaxed_worker_keeps_the_original_barrier_deadline_after_a_wakeup() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_with_interval_for_test(
+        dir.path().join("meta.redb"),
+        Duration::from_millis(500),
+    );
+    engine.set_counter("spurious-wakeup", 1).unwrap();
+
+    let runtime = engine.relaxed_durability.as_ref().expect("relaxed worker");
+    let wait_started_deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.state.wait_count.load(Ordering::Acquire) == 0
+        && Instant::now() < wait_started_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial_wait_count = runtime.state.wait_count.load(Ordering::Acquire);
+    assert!(
+        initial_wait_count > 0,
+        "relaxed worker should enter its timed wait"
+    );
+    let wake_guard = runtime
+        .state
+        .wake
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop(wake_guard);
+
+    let elapsed_ms = runtime
+        .state
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    runtime
+        .state
+        .next_barrier_ms
+        .store(elapsed_ms.saturating_add(300), Ordering::Release);
+    runtime.state.wake.1.notify_all();
+
+    let wake_deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.state.wait_count.load(Ordering::Acquire) <= initial_wait_count
+        && Instant::now() < wake_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        runtime.state.wait_count.load(Ordering::Acquire) > initial_wait_count,
+        "relaxed worker should recompute its wait after the wakeup"
+    );
+    assert!(
+        runtime.state.last_wait_timeout_ms.load(Ordering::Acquire) < 500,
+        "a wakeup before the deadline must not restart the full interval"
+    );
+}
+
+#[test]
+fn sync_local_metadata_propagates_barrier_failure_and_keeps_pending_state() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("barrier-failure", 1).unwrap();
+    engine.fail_next_barrier_for_test();
+
+    let error = engine.sync_local_metadata().expect_err("barrier must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated metadata barrier failure")
+    );
+    assert!(engine.relaxed_pending_for_test());
+    assert_eq!(engine.immediate_barriers_for_test(), 0);
+}
+
+#[test]
+fn relaxed_barrier_preserves_write_committed_during_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
+        dir.path().join("meta.redb"),
     ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 4_999),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
-        Durability::Immediate
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 9_999),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 10_000),
-        Durability::Immediate
-    ));
+    engine.set_counter("before-barrier", 1).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    engine.pause_after_barrier_commit_for_test(Arc::clone(&barrier));
+
+    let sync_engine = Arc::clone(&engine);
+    let sync = thread::spawn(move || sync_engine.sync_local_metadata());
+    barrier.wait();
+    engine.set_counter("during-barrier", 2).unwrap();
+    sync.join().unwrap().unwrap();
+
+    assert!(engine.relaxed_pending_for_test());
 }
 
 #[test]

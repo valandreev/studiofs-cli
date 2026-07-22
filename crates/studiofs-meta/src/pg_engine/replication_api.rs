@@ -20,7 +20,11 @@ impl MetaReplication for PgMetaEngine {
         };
         let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
-        Ok(())
+        self.local.flush_local_metadata()
+    }
+
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        self.local.flush_local_metadata()
     }
 
     fn request_eager_flush(&self) {
@@ -30,7 +34,11 @@ impl MetaReplication for PgMetaEngine {
 
     fn sync_metadata(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
-        Ok(())
+        self.local.sync_local_metadata()
+    }
+
+    fn sync_local_metadata(&self) -> MetaResult<()> {
+        self.local.sync_local_metadata()
     }
 
     fn note_active_open_inode(&self, ino: Ino) {
@@ -150,6 +158,7 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn prepare_for_close(&self) {
+        self.local.seal_relaxed_durability_for_close();
         // Signal the background poll thread to exit and wait for it.
         // This ensures the thread's `Arc<PgMetaEngine>` (from Weak::upgrade)
         // is dropped before the caller proceeds with process exit, so that

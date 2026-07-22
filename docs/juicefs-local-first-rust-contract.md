@@ -116,6 +116,17 @@ mean peer visibility.
 | `fsync` | The strict caller-requested local boundary. Durable cache mode must finish and sync the local cache/metadata state needed to recover the accepted data locally. Throughput-first Fast cache mode drains StudioFS state but does not force payload file fsync/dirsync. It does not wait for peer publication. |
 | last-handle close / release | Drains remaining dirty writer state through the local slice/cache pipeline so later opens on the same mount see coherent local state. It does not wait for peer publication. |
 
+All three boundaries use the same metadata ordering below the platform
+adapters. Create admission stops at shutdown; a flush, strict sync, or final
+release drains all previously admitted deferred namespace mutations before it
+enters the metadata engine. `flush` and final release then advance the engine's
+bounded group-commit policy and propagate any drain or persistence error.
+`fsync` and clean shutdown execute an explicit redb `Immediate` transaction
+after the drain, making every earlier `Durability::None` commit for that
+database durable before success is reported. Durability clocks, pending state,
+and the idle-progress worker belong to one metadata-engine instance, so mounts
+cannot satisfy or delay each other's barriers.
+
 Crash behavior:
 
 - A crash before a local durability boundary may lose accepted bytes that lived
@@ -127,6 +138,9 @@ Crash behavior:
   lost.
 - A crash after ordinary `flush` or close must recover whatever those operations
   explicitly made locally durable according to the platform callback contract.
+- Relaxed metadata durability is opt-in. Its periodic per-engine group commit
+  progresses while the mount is idle; explicit `fsync` and clean shutdown do
+  not wait for that deadline.
 
 ## 5. Cached Store Contract
 

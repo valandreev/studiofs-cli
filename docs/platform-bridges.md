@@ -117,7 +117,8 @@ I/O buffer behavior on Windows callbacks:
 
 WinFSP callback barrier semantics:
 - Explicit `flush(context=Some(..))` freezes/finishes dirty writer slices for
-  the handle or inode through the cached-store pipeline.
+  the handle or inode through the cached-store pipeline, drains admitted shared
+  namespace work, and enters the shared metadata flush boundary.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default so
   read-only file caching keeps WinFSP cache-manager behavior across close/reopen
@@ -129,7 +130,8 @@ WinFSP callback barrier semantics:
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer
-  state for the last handle, but it must not force synchronous PostgreSQL
+  state for the last handle and enters the shared metadata flush boundary, but
+  it must not force synchronous PostgreSQL
   replication, object upload completion, or peer publication. `fsync` remains
   the explicit caller-requested strict sync API.
 - `overwrite` and EOF-changing `set_file_size` commit the new local EOF before the callback returns; they are not backgroundable flush barriers.
@@ -194,7 +196,7 @@ Current Linux callbacks:
 | `readlink` | `readlink()` |
 | `write` | `write_fh_with_deferred_materialize()` |
 | `flush` | `flush_fh()` |
-| `fsync` | `flush_fh()` when handle-backed, otherwise `fsync()` |
+| `fsync` | `fsync_fh()` when handle-backed, otherwise `fsync()` |
 | `release` | `release_fh()` |
 | `statfs` | `statfs()` |
 | `access` | `getattr()` + POSIX mode check |
@@ -205,6 +207,12 @@ Current Linux callbacks:
 | `setxattr` | `set_xattr()` |
 | `listxattr` | `list_xattrs()` as NUL-separated names |
 | `removexattr` | `remove_xattr()`; missing attributes return `ENODATA` |
+
+Linux `flush` and final `release` map to the shared metadata flush boundary.
+Linux `fsync` maps to the shared strict metadata sync boundary after any
+handle-local payload state is drained. The adapter only translates resulting
+errors to errno; queue draining and the redb barrier remain in shared VFS and
+metadata code.
 
 Linux regular-file opens use `direct_io` by default and keep kernel writeback
 caching out of the default path. The bridge installs the shared VFS
@@ -272,6 +280,10 @@ accepted tail immediately instead of waiting through the full idle window. The
 bridge applies the `50/40` background queue policy, keeps macFUSE-safe
 `max_write=131072`, and
 reports the preferred I/O size through regular file attributes.
+macFUSE `flush` and final `release` enter the shared metadata flush boundary;
+`fsync` enters the shared strict metadata sync boundary. The adapter retains
+errno translation only and owns no durability timer, queue drain, or redb
+transaction.
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
 and resource-fork writes stay in xattrs rather than relying on AppleDouble

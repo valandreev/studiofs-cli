@@ -1,5 +1,6 @@
 use super::*;
 use crate::{LockTier, OrderedMutex};
+use std::sync::{OnceLock, Weak};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Controls how namespace paths are parsed and rendered (POSIX vs Windows separator rules).
@@ -90,6 +91,10 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) pending_inodes: HashMap<Ino, usize>,
     pub(super) errors: HashMap<Ino, Arc<str>>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
+    /// Number of deferred operations admitted since this VFS was created.
+    pub(super) admitted_operations: u64,
+    /// Number of admitted operations that have either committed or failed permanently.
+    pub(super) settled_operations: u64,
     pub(super) backlog_operations: usize,
     pub(super) backlog_bytes: usize,
     pub(super) locally_created_dirs: HashSet<Ino>,
@@ -101,6 +106,11 @@ pub(super) struct DeferredNamespaceState {
     pub(super) notify: tokio::sync::Notify,
     pub(super) draining: AtomicBool,
     pub(super) degraded: AtomicBool,
+    /// Non-owning VFS handle used only to resume the background drainer after
+    /// a synchronous barrier reaches its admission cutoff.
+    owner: OnceLock<Weak<StudioVfs>>,
+    #[cfg(test)]
+    pub(super) barrier_cutoff: AtomicU64,
 }
 
 impl DeferredNamespaceState {
@@ -111,7 +121,18 @@ impl DeferredNamespaceState {
             notify: tokio::sync::Notify::new(),
             draining: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
+            owner: OnceLock::new(),
+            #[cfg(test)]
+            barrier_cutoff: AtomicU64::new(0),
         }
+    }
+
+    pub(super) fn set_owner(&self, owner: Weak<StudioVfs>) {
+        let _ = self.owner.set(owner);
+    }
+
+    pub(super) fn upgrade_owner(&self) -> Option<Arc<StudioVfs>> {
+        self.owner.get()?.upgrade()
     }
 }
 
