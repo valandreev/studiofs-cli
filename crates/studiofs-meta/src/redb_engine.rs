@@ -226,10 +226,24 @@ fn relaxed_barrier_due(state: &RelaxedDurabilityState) -> bool {
     elapsed_ms >= state.next_barrier_ms.load(Ordering::Acquire)
 }
 
+fn relaxed_barrier_wait_timeout(state: &RelaxedDurabilityState) -> Duration {
+    let elapsed_ms = state
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let next_barrier_ms = state.next_barrier_ms.load(Ordering::Acquire);
+    Duration::from_millis(
+        next_barrier_ms
+            .checked_sub(elapsed_ms)
+            .unwrap_or(state.interval_ms),
+    )
+}
+
 fn start_relaxed_durability_runtime_with_interval(
     db: &Arc<RwLock<Database>>,
     interval: Duration,
-) -> Arc<RelaxedDurabilityRuntime> {
+) -> MetaResult<Arc<RelaxedDurabilityRuntime>> {
     let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
     let state = Arc::new(RelaxedDurabilityState {
         started: Instant::now(),
@@ -261,7 +275,7 @@ fn start_relaxed_durability_runtime_with_interval(
                 let (guard, _) = worker_state
                     .wake
                     .1
-                    .wait_timeout(guard, interval)
+                    .wait_timeout(guard, relaxed_barrier_wait_timeout(&worker_state))
                     .unwrap_or_else(|e| e.into_inner());
                 drop(guard);
                 if worker_state.stopping.load(Ordering::Acquire) {
@@ -280,11 +294,13 @@ fn start_relaxed_durability_runtime_with_interval(
                 }
             }
         })
-        .expect("failed to spawn redb durability worker");
-    Arc::new(RelaxedDurabilityRuntime {
+        .map_err(|error| {
+            MetaError::Storage(format!("failed to spawn redb durability worker: {error}"))
+        })?;
+    Ok(Arc::new(RelaxedDurabilityRuntime {
         state,
         worker: Some(worker),
-    })
+    }))
 }
 
 fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
@@ -424,12 +440,14 @@ impl RedbMetaEngine {
 
         debug!("opened metadata database at {:?}", path.as_ref());
         let db = Arc::new(RwLock::new(db));
-        let relaxed_durability = redb_relaxed_durability_enabled().then(|| {
-            start_relaxed_durability_runtime_with_interval(
+        let relaxed_durability = if redb_relaxed_durability_enabled() {
+            Some(start_relaxed_durability_runtime_with_interval(
                 &db,
                 Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
-            )
-        });
+            )?)
+        } else {
+            None
+        };
         if relaxed_durability.is_some() {
             RELAXED_DURABILITY_WARN.call_once(|| {
                 warn!(
@@ -530,9 +548,10 @@ impl RedbMetaEngine {
     fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
         let mut engine = Self::open(path).expect("open relaxed redb test engine");
         if engine.relaxed_durability.is_none() {
-            engine.relaxed_durability = Some(start_relaxed_durability_runtime_with_interval(
-                &engine.db, interval,
-            ));
+            engine.relaxed_durability = Some(
+                start_relaxed_durability_runtime_with_interval(&engine.db, interval)
+                    .expect("start relaxed redb test worker"),
+            );
         }
         engine
     }

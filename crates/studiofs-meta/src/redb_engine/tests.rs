@@ -104,6 +104,37 @@ fn relaxed_durability_makes_idle_progress_without_another_write() {
 }
 
 #[test]
+fn relaxed_worker_keeps_the_original_barrier_deadline_after_a_wakeup() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_with_interval_for_test(
+        dir.path().join("meta.redb"),
+        Duration::from_millis(500),
+    );
+    let started = Instant::now();
+    engine.set_counter("spurious-wakeup", 1).unwrap();
+
+    std::thread::sleep(Duration::from_millis(150));
+    engine
+        .relaxed_durability
+        .as_ref()
+        .expect("relaxed worker")
+        .state
+        .wake
+        .1
+        .notify_all();
+
+    let deadline = started + Duration::from_millis(600);
+    while engine.immediate_barriers_for_test() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        engine.immediate_barriers_for_test() >= 1,
+        "a wakeup before the deadline must not restart the full interval"
+    );
+}
+
+#[test]
 fn sync_metadata_propagates_barrier_failure_and_keeps_pending_state() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
