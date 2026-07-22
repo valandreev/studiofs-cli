@@ -145,27 +145,35 @@ impl StudioVfs {
             let mut handles = self.state.shutdown.background_tasks.lock();
             std::mem::take(&mut *handles)
         };
-        for mut handle in handles {
-            if !handle.is_finished() {
-                match tokio::time::timeout(timeout, &mut handle).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) if e.is_cancelled() => {}
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "background task join failed");
-                    }
-                    Err(_) => {
-                        handle.abort();
-                        let _ = handle.await;
-                        warn!(
-                            timeout_ms = timeout.as_millis() as u64,
-                            "background task did not stop in time, aborted"
-                        );
-                    }
+        Self::join_background_task_handles(handles, timeout).await;
+    }
+
+    async fn join_background_task_handles(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
+        let join_result = tokio::time::timeout(timeout, async {
+            for handle in &mut handles {
+                if let Err(e) = handle.await
+                    && !e.is_cancelled()
+                {
+                    warn!(error = %e, "background task join failed");
                 }
-            } else if let Err(e) = handle.await
-                && !e.is_cancelled()
-            {
-                warn!(error = %e, "background task join failed");
+            }
+        })
+        .await;
+        if join_result.is_err() {
+            let aborted = handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count();
+            for handle in &handles {
+                if !handle.is_finished() {
+                    handle.abort();
+                }
+            }
+            if aborted > 0 {
+                warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    aborted, "background tasks did not stop in time, aborted"
+                );
             }
         }
     }
@@ -455,7 +463,21 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_recoverable_on_restart;
+    use std::future;
+    use std::time::Duration;
+
+    use super::{StudioVfs, shutdown_recoverable_on_restart};
+
+    #[tokio::test(start_paused = true)]
+    async fn background_tasks_share_one_join_deadline() {
+        let handles = (0..3).map(|_| tokio::spawn(future::pending())).collect();
+        let timeout = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+
+        StudioVfs::join_background_task_handles(handles, timeout).await;
+
+        assert_eq!(started.elapsed(), timeout);
+    }
 
     #[test]
     fn shutdown_recoverability_requires_metadata_flush_success() {
