@@ -11041,6 +11041,58 @@ fn deferred_namespace_create_is_visible_before_background_commit() {
 }
 
 #[test]
+fn explicit_durability_waits_for_deferred_namespace_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-durability-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let flush_attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-flush-barrier.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        let flush_fh = vfs
+            .open_created_file_with_known_attr(&flush_attr, OpenFlags::RDWR, false)
+            .expect("open deferred flush file");
+        vfs.flush_fh(flush_fh)
+            .await
+            .expect("flush should wait for deferred create");
+        assert_eq!(
+            meta.lookup(1, b"deferred-create-flush-barrier.txt")
+                .expect("flushed create should be persisted")
+                .ino,
+            flush_attr.ino
+        );
+        vfs.release_fh(flush_fh).await.unwrap();
+
+        let fsync_attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-create-fsync-barrier.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .unwrap();
+        vfs.fsync(fsync_attr.ino, false)
+            .await
+            .expect("fsync should wait for deferred create");
+        assert_eq!(
+            meta.lookup(1, b"deferred-create-fsync-barrier.txt")
+                .expect("fsynced create should be persisted")
+                .ino,
+            fsync_attr.ino
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-keeps-written-dirty-attr");
@@ -11364,9 +11416,9 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
         .expect("admit permanently failing operation");
         vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
 
-        vfs.wait_for_deferred_namespace_metadata(attr.ino)
+        vfs.fsync(attr.ino, false)
             .await
-            .expect_err("failed deferred op should be reported");
+            .expect_err("fsync should report failed deferred namespace persistence");
 
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {

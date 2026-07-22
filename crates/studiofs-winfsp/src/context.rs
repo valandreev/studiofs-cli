@@ -2954,6 +2954,15 @@ mod tests {
                 > before.metadata_commit.calls
         }));
 
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move {
+                vfs.fsync(file.ino, false).await?;
+                vfs.fsync(directory.ino, false).await
+            }
+        })
+        .expect("wait for both deferred namespace commits");
+
         let after = vfs.write_path_observability_snapshot();
         assert_eq!(
             after.metadata_commit.calls,
