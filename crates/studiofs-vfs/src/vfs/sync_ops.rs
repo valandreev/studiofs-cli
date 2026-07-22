@@ -65,6 +65,11 @@ impl StudioVfs {
     }
 
     async fn sync_metadata_barrier(&self) -> VfsResult<()> {
+        #[cfg(test)]
+        self.state
+            .metrics
+            .metadata_sync_barrier_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.drain_deferred_namespace_metadata_for_barrier().await?;
         let meta = self.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1261,6 +1266,14 @@ impl StudioVfs {
     /// the single-mode Fast Local Authority contract this is a strict local-
     /// durability barrier whenever dirty unpublished state remains.
     pub async fn flush_fh_with_outcome(&self, fh: u64) -> VfsResult<ExplicitFlushOutcome> {
+        self.flush_fh_with_outcome_inner(fh, false).await
+    }
+
+    async fn flush_fh_with_outcome_inner(
+        &self,
+        fh: u64,
+        force_strict_metadata_sync: bool,
+    ) -> VfsResult<ExplicitFlushOutcome> {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
@@ -1272,7 +1285,11 @@ impl StudioVfs {
         if !self.inode_has_local_dirty_state(open_file.ino)
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
-            self.flush_metadata_barrier().await?;
+            if force_strict_metadata_sync {
+                self.sync_metadata_barrier().await?;
+            } else {
+                self.flush_metadata_barrier().await?;
+            }
             self.state.file_session.gc_if_idle(open_file.ino);
             return Ok(ExplicitFlushOutcome::default());
         }
@@ -1292,7 +1309,11 @@ impl StudioVfs {
             let outcome = match self
                 .local_sync_barrier_with_outcome(
                     open_file.ino,
-                    self.local_sync_policy_for_barrier(open_file.ino),
+                    if force_strict_metadata_sync {
+                        LocalSyncPolicy::Strict
+                    } else {
+                        self.local_sync_policy_for_barrier(open_file.ino)
+                    },
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
@@ -1322,8 +1343,8 @@ impl StudioVfs {
 
     /// Drain handle-local state, then execute the shared strict metadata barrier.
     pub async fn fsync_fh(&self, fh: u64) -> VfsResult<()> {
-        self.flush_fh(fh).await?;
-        self.sync_metadata_barrier().await
+        self.flush_fh_with_outcome_inner(fh, true).await?;
+        Ok(())
     }
 
     /// fsync implementation that reports whether file data and/or dirty attrs were persisted.

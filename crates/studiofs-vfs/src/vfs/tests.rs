@@ -11503,6 +11503,39 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
 }
 
 #[test]
+fn fsync_handle_uses_one_metadata_sync_barrier_after_dirty_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-handle-single-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"fsync-single-barrier.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            attr.ino,
+            0,
+            b"dirty",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        vfs.fsync_fh(fh).await.unwrap();
+
+        assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            1
+        );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn transient_deferred_namespace_backlog_does_not_fail_release_barrier() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-transient-backlog");

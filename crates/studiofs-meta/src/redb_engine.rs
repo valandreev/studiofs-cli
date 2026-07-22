@@ -47,6 +47,8 @@ struct RelaxedDurabilityState {
     immediate_barriers: AtomicU64,
     #[cfg(test)]
     fail_next_barrier: AtomicBool,
+    #[cfg(test)]
+    after_barrier_commit: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 struct RelaxedDurabilityRuntime {
@@ -148,25 +150,50 @@ fn immediate_metadata_barrier(
     db: &RwLock<Database>,
     relaxed_durability: Option<&RelaxedDurabilityState>,
 ) -> MetaResult<()> {
-    #[cfg(test)]
-    if relaxed_durability.is_some_and(|state| state.fail_next_barrier.swap(false, Ordering::AcqRel))
-    {
-        return Err(MetaError::Storage(
-            "simulated metadata barrier failure".to_string(),
-        ));
+    let pending_was_cleared = relaxed_durability
+        .map(|state| state.pending.swap(false, Ordering::AcqRel))
+        .unwrap_or(false);
+    let result: MetaResult<()> = (|| {
+        #[cfg(test)]
+        if relaxed_durability
+            .is_some_and(|state| state.fail_next_barrier.swap(false, Ordering::AcqRel))
+        {
+            return Err(MetaError::Storage(
+                "simulated metadata barrier failure".to_string(),
+            ));
+        }
+
+        let db = db
+            .read()
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
+        let mut txn = db
+            .begin_write()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        txn.set_durability(Durability::Immediate)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+
+        #[cfg(test)]
+        if let Some(barrier) = relaxed_durability.and_then(|state| {
+            state
+                .after_barrier_commit
+                .lock()
+                .ok()
+                .and_then(|mut hook| hook.take())
+        }) {
+            barrier.wait();
+        }
+
+        Ok(())
+    })();
+    if result.is_err() && pending_was_cleared {
+        if let Some(state) = relaxed_durability {
+            state.pending.store(true, Ordering::Release);
+        }
     }
-    let db = db
-        .read()
-        .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
-    let mut txn = db
-        .begin_write()
-        .map_err(|error| MetaError::Storage(error.to_string()))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|error| MetaError::Storage(error.to_string()))?;
-    txn.commit()
-        .map_err(|error| MetaError::Storage(error.to_string()))?;
+    result?;
     if let Some(state) = relaxed_durability {
-        state.pending.store(false, Ordering::Release);
         state.immediate_barriers.fetch_add(1, Ordering::Relaxed);
         let elapsed_ms = state
             .started
@@ -205,6 +232,8 @@ fn start_relaxed_durability_runtime_with_interval(
         immediate_barriers: AtomicU64::new(0),
         #[cfg(test)]
         fail_next_barrier: AtomicBool::new(false),
+        #[cfg(test)]
+        after_barrier_commit: Mutex::new(None),
     });
     let worker_state = Arc::clone(&state);
     let weak_db: Weak<RwLock<Database>> = Arc::downgrade(db);
@@ -519,6 +548,17 @@ impl RedbMetaEngine {
                 .state
                 .fail_next_barrier
                 .store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_barrier_commit_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        if let Some(runtime) = &self.relaxed_durability {
+            *runtime
+                .state
+                .after_barrier_commit
+                .lock()
+                .expect("barrier hook lock") = Some(barrier);
         }
     }
 }

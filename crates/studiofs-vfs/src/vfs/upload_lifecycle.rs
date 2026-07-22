@@ -164,10 +164,12 @@ impl StudioVfs {
                 .iter()
                 .filter(|handle| !handle.is_finished())
                 .count();
-            for handle in &handles {
-                if !handle.is_finished() {
-                    handle.abort();
+            for handle in handles {
+                if handle.is_finished() {
+                    continue;
                 }
+                handle.abort();
+                let _ = handle.await;
             }
             if aborted > 0 {
                 warn!(
@@ -478,6 +480,22 @@ mod tests {
         StudioVfs::join_background_task_handles(handles, timeout).await;
 
         assert_eq!(started.elapsed(), timeout);
+    }
+
+    #[tokio::test]
+    async fn aborted_background_tasks_are_finished_before_join_returns() {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _sender = sender;
+            future::pending::<()>().await;
+        });
+
+        StudioVfs::join_background_task_handles(vec![handle], Duration::ZERO).await;
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]

@@ -2152,6 +2152,8 @@ struct MetricsState {
     prefetched_object_ids: DashSet<u64>,
     prefetched_object_remaining_bytes: Mutex<LruCache<u64, u32>>,
     flush_barrier_calls: AtomicU64,
+    #[cfg(test)]
+    metadata_sync_barrier_calls: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
     local_cache_io_handoff_max_ns: AtomicU64,
@@ -2351,6 +2353,8 @@ impl MetricsState {
                     .expect("prefetched object tracking capacity is non-zero"),
             )),
             flush_barrier_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            metadata_sync_barrier_calls: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
             local_cache_io_handoff_max_ns: AtomicU64::new(0),

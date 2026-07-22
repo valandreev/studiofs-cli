@@ -6,6 +6,8 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 trait FileGraphFixture {
     fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
@@ -117,6 +119,25 @@ fn sync_metadata_propagates_barrier_failure_and_keeps_pending_state() {
     );
     assert!(engine.relaxed_pending_for_test());
     assert_eq!(engine.immediate_barriers_for_test(), 0);
+}
+
+#[test]
+fn relaxed_barrier_preserves_write_committed_during_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
+        dir.path().join("meta.redb"),
+    ));
+    engine.set_counter("before-barrier", 1).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    engine.pause_after_barrier_commit_for_test(Arc::clone(&barrier));
+
+    let sync_engine = Arc::clone(&engine);
+    let sync = thread::spawn(move || sync_engine.sync_metadata());
+    barrier.wait();
+    engine.set_counter("during-barrier", 2).unwrap();
+    sync.join().unwrap().unwrap();
+
+    assert!(engine.relaxed_pending_for_test());
 }
 
 #[test]
