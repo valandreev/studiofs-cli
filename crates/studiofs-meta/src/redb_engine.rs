@@ -51,16 +51,14 @@ struct RelaxedDurabilityState {
 
 struct RelaxedDurabilityRuntime {
     state: Arc<RelaxedDurabilityState>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl Drop for RelaxedDurabilityRuntime {
     fn drop(&mut self) {
         self.state.stopping.store(true, Ordering::Release);
         self.state.wake.1.notify_all();
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-        {
+        if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
@@ -148,15 +146,11 @@ fn begin_redb_write_txn(
 
 fn immediate_metadata_barrier(
     db: &RwLock<Database>,
-    relaxed_durability: Option<&RelaxedDurabilityRuntime>,
+    relaxed_durability: Option<&RelaxedDurabilityState>,
 ) -> MetaResult<()> {
     #[cfg(test)]
-    if relaxed_durability.is_some_and(|runtime| {
-        runtime
-            .state
-            .fail_next_barrier
-            .swap(false, Ordering::AcqRel)
-    }) {
+    if relaxed_durability.is_some_and(|state| state.fail_next_barrier.swap(false, Ordering::AcqRel))
+    {
         return Err(MetaError::Storage(
             "simulated metadata barrier failure".to_string(),
         ));
@@ -171,20 +165,16 @@ fn immediate_metadata_barrier(
         .map_err(|error| MetaError::Storage(error.to_string()))?;
     txn.commit()
         .map_err(|error| MetaError::Storage(error.to_string()))?;
-    if let Some(runtime) = relaxed_durability {
-        runtime.state.pending.store(false, Ordering::Release);
-        runtime
-            .state
-            .immediate_barriers
-            .fetch_add(1, Ordering::Relaxed);
-        let elapsed_ms = runtime
-            .state
+    if let Some(state) = relaxed_durability {
+        state.pending.store(false, Ordering::Release);
+        state.immediate_barriers.fetch_add(1, Ordering::Relaxed);
+        let elapsed_ms = state
             .started
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        runtime.state.next_barrier_ms.store(
-            elapsed_ms.saturating_add(runtime.state.interval_ms),
+        state.next_barrier_ms.store(
+            elapsed_ms.saturating_add(state.interval_ms),
             Ordering::Release,
         );
     }
@@ -198,13 +188,6 @@ fn relaxed_barrier_due(state: &RelaxedDurabilityState) -> bool {
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
     elapsed_ms >= state.next_barrier_ms.load(Ordering::Acquire)
-}
-
-fn start_relaxed_durability_runtime(db: &Arc<RwLock<Database>>) -> Arc<RelaxedDurabilityRuntime> {
-    start_relaxed_durability_runtime_with_interval(
-        db,
-        Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
-    )
 }
 
 fn start_relaxed_durability_runtime_with_interval(
@@ -246,29 +229,15 @@ fn start_relaxed_durability_runtime_with_interval(
                 let Some(db) = weak_db.upgrade() else {
                     break;
                 };
-                if let Err(error) = immediate_metadata_barrier(&db, None) {
+                if let Err(error) = immediate_metadata_barrier(&db, Some(&worker_state)) {
                     warn!(%error, "periodic redb metadata durability barrier failed");
-                } else {
-                    worker_state.pending.store(false, Ordering::Release);
-                    worker_state
-                        .immediate_barriers
-                        .fetch_add(1, Ordering::Relaxed);
-                    let elapsed_ms = worker_state
-                        .started
-                        .elapsed()
-                        .as_millis()
-                        .min(u128::from(u64::MAX)) as u64;
-                    worker_state.next_barrier_ms.store(
-                        elapsed_ms.saturating_add(worker_state.interval_ms),
-                        Ordering::Release,
-                    );
                 }
             }
         })
         .expect("failed to spawn redb durability worker");
     Arc::new(RelaxedDurabilityRuntime {
         state,
-        worker: Mutex::new(Some(worker)),
+        worker: Some(worker),
     })
 }
 
@@ -409,8 +378,12 @@ impl RedbMetaEngine {
 
         debug!("opened metadata database at {:?}", path.as_ref());
         let db = Arc::new(RwLock::new(db));
-        let relaxed_durability =
-            redb_relaxed_durability_enabled().then(|| start_relaxed_durability_runtime(&db));
+        let relaxed_durability = redb_relaxed_durability_enabled().then(|| {
+            start_relaxed_durability_runtime_with_interval(
+                &db,
+                Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
+            )
+        });
         if relaxed_durability.is_some() {
             RELAXED_DURABILITY_WARN.call_once(|| {
                 warn!(
@@ -485,13 +458,18 @@ impl RedbMetaEngine {
             return Ok(());
         };
         if runtime.state.pending.load(Ordering::Acquire) && relaxed_barrier_due(&runtime.state) {
-            immediate_metadata_barrier(&self.db, Some(runtime))?;
+            immediate_metadata_barrier(&self.db, Some(&runtime.state))?;
         }
         Ok(())
     }
 
     pub(crate) fn sync_local_metadata(&self) -> MetaResult<()> {
-        immediate_metadata_barrier(&self.db, self.relaxed_durability.as_deref())
+        immediate_metadata_barrier(
+            &self.db,
+            self.relaxed_durability
+                .as_deref()
+                .map(|runtime| runtime.state.as_ref()),
+        )
     }
 
     #[cfg(test)]
