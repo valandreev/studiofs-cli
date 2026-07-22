@@ -11503,6 +11503,31 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
 }
 
 #[test]
+fn transient_deferred_namespace_backlog_does_not_fail_release_barrier() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-transient-backlog");
+
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    assert!(
+        vfs.deferred_namespace_shutdown_error().is_none(),
+        "a concurrent deferred drain is transient during normal release"
+    );
+
+    vfs.state
+        .shutdown
+        .shutdown_requested
+        .store(true, AtomicOrdering::Release);
+    assert!(
+        vfs.deferred_namespace_shutdown_error().is_some(),
+        "an unfinished deferred drain must still fail shutdown"
+    );
+}
+
+#[test]
 fn deferred_namespace_dir_commit_clears_admitted_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-dir-clears-dirty-attr");

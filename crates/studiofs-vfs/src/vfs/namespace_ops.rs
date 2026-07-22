@@ -430,7 +430,9 @@ impl StudioVfs {
             .deferred
             .draining
             .load(std::sync::atomic::Ordering::Acquire);
-        if draining || !inner.queue.is_empty() || inner.backlog_operations != 0 {
+        if self.shutdown_requested()
+            && (draining || !inner.queue.is_empty() || inner.backlog_operations != 0)
+        {
             return Some(VfsError::Other(
                 "deferred namespace metadata drain did not complete".to_string(),
             ));
