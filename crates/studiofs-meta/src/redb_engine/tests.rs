@@ -95,12 +95,25 @@ fn relaxed_durability_makes_idle_progress_without_another_write() {
     engine.set_counter("idle-progress", 1).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
-    while engine.relaxed_pending_for_test() && Instant::now() < deadline {
+    while engine.immediate_barriers_for_test() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    assert!(!engine.relaxed_pending_for_test());
     assert!(engine.immediate_barriers_for_test() >= 1);
+}
+
+#[test]
+fn prepare_for_close_makes_later_relaxed_writes_immediate() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+
+    engine.prepare_for_close();
+    engine.set_counter("after-close-preparation", 1).unwrap();
+
+    assert!(
+        !engine.relaxed_pending_for_test(),
+        "writes after close preparation must not wait for the relaxed worker"
+    );
 }
 
 #[test]

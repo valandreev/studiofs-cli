@@ -42,6 +42,7 @@ struct RelaxedDurabilityState {
     interval_ms: u64,
     next_barrier_ms: AtomicU64,
     pending: AtomicBool,
+    force_immediate: AtomicBool,
     stopping: AtomicBool,
     wake: (Mutex<()>, Condvar),
     immediate_barriers: AtomicU64,
@@ -147,9 +148,13 @@ fn begin_redb_write_txn(
     let mut txn = db
         .begin_write()
         .map_err(|e| MetaError::Storage(e.to_string()))?;
-    if relaxed_durability.is_some() {
-        txn.set_durability(Durability::None)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+    if let Some(runtime) = relaxed_durability {
+        txn.set_durability(if runtime.state.force_immediate.load(Ordering::Acquire) {
+            Durability::Immediate
+        } else {
+            Durability::None
+        })
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
     }
     Ok(txn)
 }
@@ -250,6 +255,7 @@ fn start_relaxed_durability_runtime_with_interval(
         interval_ms,
         next_barrier_ms: AtomicU64::new(interval_ms),
         pending: AtomicBool::new(false),
+        force_immediate: AtomicBool::new(false),
         stopping: AtomicBool::new(false),
         wake: (Mutex::new(()), Condvar::new()),
         immediate_barriers: AtomicU64::new(0),
@@ -343,6 +349,7 @@ impl RedbWriteTransaction<'_> {
         let result = txn.commit();
         if result.is_ok()
             && let Some(runtime) = relaxed_durability
+            && !runtime.state.force_immediate.load(Ordering::Acquire)
         {
             runtime.state.pending.store(true, Ordering::Release);
         }
@@ -366,6 +373,12 @@ impl RedbWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn seal_relaxed_durability_for_close(&self) {
+        if let Some(runtime) = &self.relaxed_durability {
+            runtime.state.force_immediate.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn read_db(&self) -> MetaResult<RwLockReadGuard<'_, Database>> {
         self.db
             .read()

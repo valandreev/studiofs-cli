@@ -1360,6 +1360,10 @@ impl RedbMetaEngine {
 }
 
 impl MetaReplication for RedbMetaEngine {
+    fn prepare_for_close(&self) {
+        self.seal_relaxed_durability_for_close();
+    }
+
     fn check_consistency(&self) -> MetaResult<()> {
         Ok(())
     }

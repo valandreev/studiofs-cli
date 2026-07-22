@@ -279,6 +279,7 @@ impl StudioVfs {
             inner.errors.remove(&attr.ino);
             *inner.pending_inodes.entry(attr.ino).or_default() += 1;
             inner.queue.push_back(op);
+            inner.admitted_operations += 1;
             inner.backlog_operations += 1;
             inner.backlog_bytes += op_bytes;
         }
@@ -294,10 +295,22 @@ impl StudioVfs {
     fn pop_deferred_namespace_batch(
         &self,
         max_operations: usize,
+        cutoff: Option<u64>,
         batch: &mut Vec<DeferredNamespaceOp>,
     ) {
         let mut inner = self.state.namespace.deferred.inner.lock();
-        let count = inner.queue.len().min(max_operations);
+        let remaining_before_cutoff = cutoff.map(|cutoff| {
+            cutoff
+                .saturating_sub(inner.settled_operations)
+                .saturating_sub(batch.len() as u64)
+                .try_into()
+                .unwrap_or(usize::MAX)
+        });
+        let count = inner
+            .queue
+            .len()
+            .min(max_operations)
+            .min(remaining_before_cutoff.unwrap_or(usize::MAX));
         batch.extend(inner.queue.drain(..count));
     }
 
@@ -323,6 +336,7 @@ impl StudioVfs {
                 inner.pending_inodes.insert(ino, pending_count - 1);
             }
             inner.errors.remove(&ino);
+            inner.settled_operations += 1;
             inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
             inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
         }
@@ -365,6 +379,7 @@ impl StudioVfs {
                 inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
                 inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
             }
+            inner.settled_operations += ops.len() as u64;
         }
         {
             let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
@@ -456,11 +471,24 @@ impl StudioVfs {
         }
         let vfs = Arc::clone(self);
         self.track_background_task(runtime.spawn(async move {
-            vfs.drain_deferred_namespace_metadata().await;
+            vfs.drain_deferred_namespace_metadata(None).await;
         }));
     }
 
     pub(super) async fn drain_deferred_namespace_metadata_for_barrier(&self) -> VfsResult<()> {
+        let cutoff = self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admitted_operations;
+        #[cfg(test)]
+        self.state
+            .namespace
+            .deferred
+            .barrier_cutoff
+            .store(cutoff, std::sync::atomic::Ordering::Release);
         if !self
             .state
             .namespace
@@ -468,45 +496,46 @@ impl StudioVfs {
             .draining
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            self.drain_deferred_namespace_metadata().await;
+            self.drain_deferred_namespace_metadata(Some(cutoff)).await;
         } else {
             loop {
                 let notified = self.state.namespace.deferred.notify.notified();
-                let (drained, take_over) = {
+                let (settled, take_over) = {
                     let inner = self.state.namespace.deferred.inner.lock();
-                    let draining = self
-                        .state
-                        .namespace
-                        .deferred
-                        .draining
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    if !draining && !inner.queue.is_empty() {
-                        (
-                            false,
-                            self.state
-                                .namespace
-                                .deferred
-                                .draining
-                                .compare_exchange(
-                                    false,
-                                    true,
-                                    std::sync::atomic::Ordering::AcqRel,
-                                    std::sync::atomic::Ordering::Acquire,
-                                )
-                                .is_ok(),
-                        )
+                    if inner.settled_operations >= cutoff {
+                        (true, false)
                     } else {
-                        (
-                            !draining && inner.queue.is_empty() && inner.backlog_operations == 0,
-                            false,
-                        )
+                        let draining = self
+                            .state
+                            .namespace
+                            .deferred
+                            .draining
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        if !draining && !inner.queue.is_empty() {
+                            (
+                                false,
+                                self.state
+                                    .namespace
+                                    .deferred
+                                    .draining
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::AcqRel,
+                                        std::sync::atomic::Ordering::Acquire,
+                                    )
+                                    .is_ok(),
+                            )
+                        } else {
+                            (false, false)
+                        }
                     }
                 };
-                if drained {
+                if settled {
                     break;
                 }
                 if take_over {
-                    self.drain_deferred_namespace_metadata().await;
+                    self.drain_deferred_namespace_metadata(Some(cutoff)).await;
                     break;
                 }
                 notified.await;
@@ -518,11 +547,49 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn drain_deferred_namespace_metadata(&self) {
+    fn resume_deferred_namespace_metadata_drain(&self) {
+        let Some(vfs) = self.state.namespace.deferred.upgrade_owner() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        vfs.schedule_deferred_namespace_metadata_drain(&runtime);
+    }
+
+    fn finish_deferred_namespace_drain(&self, resume_background_drain: bool) {
+        self.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, std::sync::atomic::Ordering::Release);
+        if resume_background_drain && !self.state.namespace.deferred.inner.lock().queue.is_empty() {
+            self.resume_deferred_namespace_metadata_drain();
+        }
+        self.state.namespace.deferred.notify.notify_waiters();
+    }
+
+    async fn drain_deferred_namespace_metadata(&self, cutoff: Option<u64>) {
         let mut batch = Vec::with_capacity(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
         loop {
+            if cutoff.is_some_and(|cutoff| {
+                self.state
+                    .namespace
+                    .deferred
+                    .inner
+                    .lock()
+                    .settled_operations
+                    >= cutoff
+            }) {
+                self.finish_deferred_namespace_drain(true);
+                break;
+            }
             batch.clear();
-            self.pop_deferred_namespace_batch(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS, &mut batch);
+            self.pop_deferred_namespace_batch(
+                DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS,
+                cutoff,
+                &mut batch,
+            );
             if batch.is_empty() {
                 self.state
                     .namespace
@@ -550,7 +617,7 @@ impl StudioVfs {
                 tokio::select! {
                     _ = notified => {
                         let room = DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS - batch.len();
-                        self.pop_deferred_namespace_batch(room, &mut batch);
+                        self.pop_deferred_namespace_batch(room, cutoff, &mut batch);
                     }
                     _ = &mut sleep => break,
                 }

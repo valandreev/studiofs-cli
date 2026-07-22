@@ -158,6 +158,7 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn prepare_for_close(&self) {
+        self.local.seal_relaxed_durability_for_close();
         // Signal the background poll thread to exit and wait for it.
         // This ensures the thread's `Arc<PgMetaEngine>` (from Weak::upgrade)
         // is dropped before the caller proceeds with process exit, so that

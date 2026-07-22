@@ -276,6 +276,22 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+fn enqueue_deferred_namespace_create(vfs: &Arc<StudioVfs>, attr: &InodeAttr, name: &[u8]) {
+    vfs.enqueue_deferred_namespace_op(
+        Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, name)),
+        attr.clone(),
+        super::namespace::DeferredNamespaceOp::CreateFile {
+            attr: attr.clone(),
+            parent: ROOT_INO,
+            name: name.to_vec(),
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        },
+    )
+    .expect("admit deferred namespace create");
+}
+
 fn runtime_stats_test_tempdir() -> TempDir {
     studiofs_test_support::workspace_target_tempdir("runtime-stats-")
 }
@@ -11799,6 +11815,107 @@ fn deferred_namespace_barrier_takes_over_after_drain_stops_with_queued_work() {
                 .expect("load persisted entry")
                 .ino,
             attr.ino
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_barrier_ignores_admissions_after_its_cutoff() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-barrier-cutoff");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let early = InodeAttr::new_file(9_000_041, ROOT_INO, 0, 0, 0o644);
+        let late = InodeAttr::new_file(9_000_042, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &early, b"early.txt");
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+
+        let barrier_vfs = Arc::clone(&vfs);
+        let barrier = tokio::spawn(async move {
+            barrier_vfs
+                .drain_deferred_namespace_metadata_for_barrier()
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while vfs
+                .state
+                .namespace
+                .deferred
+                .barrier_cutoff
+                .load(AtomicOrdering::Acquire)
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("barrier should capture the first admission before the late admission");
+
+        enqueue_deferred_namespace_create(&vfs, &late, b"late.txt");
+        vfs.state.namespace.deferred.inner.lock().settled_operations = 1;
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_millis(100), barrier)
+            .await
+            .expect("barrier should stop once its pre-cutoff operation settles")
+            .expect("barrier task should not panic")
+            .expect("barrier should not wait for the later admission");
+    });
+}
+
+#[test]
+fn deferred_namespace_barrier_resumes_background_drain_after_its_cutoff() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-barrier-resume");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let early = InodeAttr::new_file(9_000_051, ROOT_INO, 0, 0, 0o644);
+        let late = InodeAttr::new_file(9_000_052, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &early, b"early.txt");
+
+        let barrier_vfs = Arc::clone(&vfs);
+        let barrier = tokio::spawn(async move {
+            barrier_vfs
+                .drain_deferred_namespace_metadata_for_barrier()
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while vfs
+                .state
+                .namespace
+                .deferred
+                .barrier_cutoff
+                .load(AtomicOrdering::Acquire)
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("barrier should capture the first admission before the late admission");
+
+        enqueue_deferred_namespace_create(&vfs, &late, b"late.txt");
+
+        tokio::time::timeout(Duration::from_secs(1), barrier)
+            .await
+            .expect("barrier should complete after its early operation")
+            .expect("barrier task should not panic")
+            .expect("barrier should persist its early operation");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            vfs.wait_for_deferred_namespace_metadata(late.ino).await
+        })
+        .await
+        .expect("background drain should resume for the late operation")
+        .expect("late operation should commit");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"late.txt")
+                .expect("load late persisted entry")
+                .ino,
+            late.ino
         );
     });
 }
