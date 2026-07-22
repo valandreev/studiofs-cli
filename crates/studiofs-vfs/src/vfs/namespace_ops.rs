@@ -472,18 +472,41 @@ impl StudioVfs {
         } else {
             loop {
                 let notified = self.state.namespace.deferred.notify.notified();
-                let drained = {
+                let (drained, take_over) = {
                     let inner = self.state.namespace.deferred.inner.lock();
-                    !self
+                    let draining = self
                         .state
                         .namespace
                         .deferred
                         .draining
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        && inner.queue.is_empty()
-                        && inner.backlog_operations == 0
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if !draining && !inner.queue.is_empty() {
+                        (
+                            false,
+                            self.state
+                                .namespace
+                                .deferred
+                                .draining
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire,
+                                )
+                                .is_ok(),
+                        )
+                    } else {
+                        (
+                            !draining && inner.queue.is_empty() && inner.backlog_operations == 0,
+                            false,
+                        )
+                    }
                 };
                 if drained {
+                    break;
+                }
+                if take_over {
+                    self.drain_deferred_namespace_metadata().await;
                     break;
                 }
                 notified.await;

@@ -11747,6 +11747,63 @@ fn deferred_namespace_drain_commits_queued_operations_in_one_batch() {
 }
 
 #[test]
+fn deferred_namespace_barrier_takes_over_after_drain_stops_with_queued_work() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-barrier-takeover");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = InodeAttr::new_file(9_000_031, ROOT_INO, 0, 0, 0o644);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(
+                ROOT_INO,
+                b"takeover.txt",
+            )),
+            attr.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr: attr.clone(),
+                parent: ROOT_INO,
+                name: b"takeover.txt".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        )
+        .expect("admit queued operation");
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+
+        let barrier_vfs = Arc::clone(&vfs);
+        let barrier = tokio::spawn(async move {
+            barrier_vfs
+                .drain_deferred_namespace_metadata_for_barrier()
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_millis(250), barrier)
+            .await
+            .expect("barrier should take over queued work after the prior drain stops")
+            .expect("barrier task should not panic")
+            .expect("barrier should persist queued work");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"takeover.txt")
+                .expect("load persisted entry")
+                .ino,
+            attr.ino
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

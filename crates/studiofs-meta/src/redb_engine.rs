@@ -58,8 +58,16 @@ struct RelaxedDurabilityRuntime {
 
 impl Drop for RelaxedDurabilityRuntime {
     fn drop(&mut self) {
-        self.state.stopping.store(true, Ordering::Release);
-        self.state.wake.1.notify_all();
+        {
+            let _wake_guard = self
+                .state
+                .wake
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.state.stopping.store(true, Ordering::Release);
+            self.state.wake.1.notify_all();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -116,9 +124,9 @@ pub(crate) struct CounterWriteTransaction<'a> {
 pub(crate) struct RedbWriteTransaction<'a> {
     txn: WriteTransaction,
     _db: RwLockReadGuard<'a, Database>,
-    write_metrics: Arc<MetadataWriteMetrics>,
+    write_metrics: &'a MetadataWriteMetrics,
     mutation_started: Instant,
-    relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
+    relaxed_durability: Option<&'a RelaxedDurabilityRuntime>,
 }
 
 fn redb_relaxed_durability_enabled() -> bool {
@@ -134,7 +142,7 @@ fn redb_relaxed_durability_enabled() -> bool {
 
 fn begin_redb_write_txn(
     db: &Database,
-    relaxed_durability: Option<&Arc<RelaxedDurabilityRuntime>>,
+    relaxed_durability: Option<&RelaxedDurabilityRuntime>,
 ) -> MetaResult<WriteTransaction> {
     let mut txn = db
         .begin_write()
@@ -241,13 +249,21 @@ fn start_relaxed_durability_runtime_with_interval(
     let worker = std::thread::Builder::new()
         .name("studiofs-redb-durability".to_string())
         .spawn(move || {
-            while !worker_state.stopping.load(Ordering::Acquire) {
+            loop {
                 let guard = worker_state
                     .wake
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let _ = worker_state.wake.1.wait_timeout(guard, interval);
+                if worker_state.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let (guard, _) = worker_state
+                    .wake
+                    .1
+                    .wait_timeout(guard, interval)
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(guard);
                 if worker_state.stopping.load(Ordering::Acquire) {
                     break;
                 }
@@ -348,15 +364,15 @@ impl RedbMetaEngine {
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         let db = self.read_db()?;
         let started = Instant::now();
-        let result = begin_redb_write_txn(&db, self.relaxed_durability.as_ref());
+        let result = begin_redb_write_txn(&db, self.relaxed_durability.as_deref());
         MetadataWriteMetrics::observe(&self.write_metrics.begin_write, started.elapsed());
         let txn = result?;
         Ok(RedbWriteTransaction {
             txn,
             _db: db,
-            write_metrics: Arc::clone(&self.write_metrics),
+            write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
-            relaxed_durability: self.relaxed_durability.clone(),
+            relaxed_durability: self.relaxed_durability.as_deref(),
         })
     }
 
