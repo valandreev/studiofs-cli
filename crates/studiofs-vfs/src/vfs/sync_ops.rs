@@ -55,6 +55,21 @@ pub(super) fn merge_write_dirty_attr(attr: &mut InodeAttr, base_attr: &InodeAttr
 }
 
 impl StudioVfs {
+    async fn flush_metadata_barrier(&self) -> VfsResult<()> {
+        self.drain_deferred_namespace_metadata_for_barrier().await?;
+        let meta = self.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.flush_metadata()
+        })
+        .await
+    }
+
+    async fn sync_metadata_barrier(&self) -> VfsResult<()> {
+        self.drain_deferred_namespace_metadata_for_barrier().await?;
+        let meta = self.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.sync_metadata()).await
+    }
+
     /// Spawn a background task that replays landing-zone segments left from a previous run.
     ///
     /// This is used during startup to recover data that was durably written locally but not
@@ -735,12 +750,17 @@ impl StudioVfs {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
             }),
-            LastHandleReleaseAction::Clean => Ok(ReleaseFhOutcome {
-                closed_last_handle: true,
-                flushed_local_dirty_state: false,
-            }),
+            LastHandleReleaseAction::Clean => {
+                self.flush_metadata_barrier().await?;
+                Ok(ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                })
+            }
             LastHandleReleaseAction::OrphanCleanup => {
-                self.cleanup_orphan_on_last_handle_close(ino).await
+                let outcome = self.cleanup_orphan_on_last_handle_close(ino).await?;
+                self.flush_metadata_barrier().await?;
+                Ok(outcome)
             }
             LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
@@ -866,10 +886,7 @@ impl StudioVfs {
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
         let flushed_local_dirty_state = matches!(action, LastHandleReleaseAction::LocalSync { .. });
-        if matches!(
-            action,
-            LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
-        ) {
+        if matches!(action, LastHandleReleaseAction::IgnoredEntry) {
             self.state.file_session.gc_if_idle(ino);
             return ReleaseFhOutcome {
                 closed_last_handle: true,
@@ -956,6 +973,7 @@ impl StudioVfs {
                         ino = target_ino,
                         "WinFSP writeback flush kept local dirty state for removed inode"
                     );
+                    self.flush_metadata_barrier().await?;
                     return Ok(ExplicitFlushOutcome {
                         flushed_local_dirty_state: true,
                     });
@@ -1000,6 +1018,7 @@ impl StudioVfs {
             self.spawn_deferred_materialization_if_needed(target_ino)
                 .await;
         }
+        self.flush_metadata_barrier().await?;
         Ok(ExplicitFlushOutcome {
             flushed_local_dirty_state: had_local_dirty_state,
         })
@@ -1144,6 +1163,12 @@ impl StudioVfs {
             );
         }
 
+        if local_sync_policy.requires_write_path_durability() {
+            self.sync_metadata_barrier().await?;
+        } else {
+            self.flush_metadata_barrier().await?;
+        }
+
         Ok(LocalSyncBarrierOutcome {
             had_local_dirty_state,
             flushed_file_data,
@@ -1244,6 +1269,7 @@ impl StudioVfs {
         if !self.inode_has_local_dirty_state(open_file.ino)
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
+            self.flush_metadata_barrier().await?;
             self.state.file_session.gc_if_idle(open_file.ino);
             return Ok(ExplicitFlushOutcome::default());
         }
@@ -1289,6 +1315,12 @@ impl StudioVfs {
     /// Flush data for a file handle (per-fd close in POSIX).
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
+    }
+
+    /// Drain handle-local state, then execute the shared strict metadata barrier.
+    pub async fn fsync_fh(&self, fh: u64) -> VfsResult<()> {
+        self.flush_fh(fh).await?;
+        self.sync_metadata_barrier().await
     }
 
     /// fsync implementation that reports whether file data and/or dirty attrs were persisted.

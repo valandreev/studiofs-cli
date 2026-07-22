@@ -1365,11 +1365,11 @@ impl MetaReplication for RedbMetaEngine {
     }
 
     fn flush_metadata(&self) -> MetaResult<()> {
-        Ok(())
+        self.flush_local_metadata()
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        Ok(())
+        self.sync_local_metadata()
     }
 
     fn invalidation_sender_id(&self) -> Option<String> {

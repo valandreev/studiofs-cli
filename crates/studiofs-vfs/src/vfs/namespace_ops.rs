@@ -411,32 +411,6 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
-    pub(super) async fn wait_for_deferred_namespace_drain(&self, timeout: Duration) -> bool {
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
-        loop {
-            let notified = self.state.namespace.deferred.notify.notified();
-            let drained = {
-                let inner = self.state.namespace.deferred.inner.lock();
-                !self
-                    .state
-                    .namespace
-                    .deferred
-                    .draining
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    && inner.queue.is_empty()
-                    && inner.backlog_operations == 0
-            };
-            if drained {
-                return true;
-            }
-            tokio::select! {
-                _ = &mut sleep => return false,
-                _ = notified => {}
-            }
-        }
-    }
-
     pub(super) fn deferred_namespace_shutdown_error(&self) -> Option<VfsError> {
         if self
             .state
@@ -484,7 +458,42 @@ impl StudioVfs {
         }));
     }
 
-    async fn drain_deferred_namespace_metadata(self: Arc<Self>) {
+    pub(super) async fn drain_deferred_namespace_metadata_for_barrier(&self) -> VfsResult<()> {
+        if !self
+            .state
+            .namespace
+            .deferred
+            .draining
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.drain_deferred_namespace_metadata().await;
+        } else {
+            loop {
+                let notified = self.state.namespace.deferred.notify.notified();
+                let drained = {
+                    let inner = self.state.namespace.deferred.inner.lock();
+                    !self
+                        .state
+                        .namespace
+                        .deferred
+                        .draining
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        && inner.queue.is_empty()
+                        && inner.backlog_operations == 0
+                };
+                if drained {
+                    break;
+                }
+                notified.await;
+            }
+        }
+        if let Some(error) = self.deferred_namespace_shutdown_error() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn drain_deferred_namespace_metadata(&self) {
         let mut batch = Vec::with_capacity(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
         loop {
             batch.clear();

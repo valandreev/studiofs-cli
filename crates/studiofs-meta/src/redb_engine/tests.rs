@@ -43,34 +43,80 @@ include!("tests/fs_ops.rs");
 include!("tests/chunk_state.rs");
 
 #[test]
-fn relaxed_durability_uses_immediate_barrier_every_five_seconds() {
-    let next_barrier_ms =
-        std::sync::atomic::AtomicU64::new(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS);
+fn sync_metadata_executes_immediate_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("barrier-test", 1).unwrap();
 
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 0),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 4_999),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
-        Durability::Immediate
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 5_000),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 9_999),
-        Durability::None
-    ));
-    assert!(matches!(
-        redb_relaxed_durability_for_elapsed_ms(&next_barrier_ms, 10_000),
-        Durability::Immediate
-    ));
+    assert!(engine.relaxed_pending_for_test());
+    engine.sync_metadata().unwrap();
+    assert!(!engine.relaxed_pending_for_test());
+    assert_eq!(engine.immediate_barriers_for_test(), 1);
+}
+
+#[test]
+fn flush_metadata_only_executes_due_relaxed_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("flush-test", 1).unwrap();
+
+    engine.flush_metadata().unwrap();
+    assert_eq!(engine.immediate_barriers_for_test(), 0);
+    engine.make_relaxed_barrier_due_for_test();
+    engine.flush_metadata().unwrap();
+    assert_eq!(engine.immediate_barriers_for_test(), 1);
+}
+
+#[test]
+fn relaxed_durability_state_is_isolated_per_engine() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let first = RedbMetaEngine::open_relaxed_for_test(dir.path().join("first.redb"));
+    let second = RedbMetaEngine::open_relaxed_for_test(dir.path().join("second.redb"));
+    first.set_counter("first", 1).unwrap();
+    second.set_counter("second", 1).unwrap();
+
+    first.sync_metadata().unwrap();
+
+    assert!(!first.relaxed_pending_for_test());
+    assert!(second.relaxed_pending_for_test());
+    assert_eq!(first.immediate_barriers_for_test(), 1);
+    assert_eq!(second.immediate_barriers_for_test(), 0);
+}
+
+#[test]
+fn relaxed_durability_makes_idle_progress_without_another_write() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_with_interval_for_test(
+        dir.path().join("meta.redb"),
+        Duration::from_millis(20),
+    );
+    engine.set_counter("idle-progress", 1).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while engine.relaxed_pending_for_test() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(!engine.relaxed_pending_for_test());
+    assert!(engine.immediate_barriers_for_test() >= 1);
+}
+
+#[test]
+fn sync_metadata_propagates_barrier_failure_and_keeps_pending_state() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    engine.set_counter("barrier-failure", 1).unwrap();
+    engine.fail_next_barrier_for_test();
+
+    let error = engine.sync_metadata().expect_err("barrier must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated metadata barrier failure")
+    );
+    assert!(engine.relaxed_pending_for_test());
+    assert_eq!(engine.immediate_barriers_for_test(), 0);
 }
 
 #[test]

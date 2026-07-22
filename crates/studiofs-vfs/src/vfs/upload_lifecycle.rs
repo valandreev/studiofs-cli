@@ -297,10 +297,11 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
-        self.wait_for_deferred_namespace_drain(background_join_timeout)
-            .await;
+        let deferred_namespace_result = self.drain_deferred_namespace_metadata_for_barrier().await;
         self.join_background_tasks(background_join_timeout).await;
-        let deferred_namespace_error = self.deferred_namespace_shutdown_error();
+        let deferred_namespace_error = deferred_namespace_result
+            .err()
+            .or_else(|| self.deferred_namespace_shutdown_error());
 
         // Reset the active-access-class telemetry counters for any handles that
         // were never explicitly closed via release_fh (e.g. force-unmount).
@@ -371,8 +372,9 @@ impl StudioVfs {
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_result =
             super::run_sync_with_timeout(metadata_flush_timeout, move || {
-                meta.flush_metadata().map_err(VfsError::Meta)
+                meta.sync_metadata().map_err(VfsError::Meta)
             });
+        let mut metadata_barrier_error = None;
         let metadata_flush_outcome = match metadata_flush_result {
             Ok(Some(())) if deferred_namespace_error.is_none() => "success",
             Ok(Some(())) => {
@@ -384,10 +386,15 @@ impl StudioVfs {
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
                     "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
                 );
+                metadata_barrier_error = Some(VfsError::Other(format!(
+                    "metadata durability barrier timed out after {} ms",
+                    metadata_flush_timeout.as_millis()
+                )));
                 "timeout"
             }
             Err(e) => {
                 warn!("VFS shutdown: metadata flush failed: {}", e);
+                metadata_barrier_error = Some(e);
                 "failed"
             }
         };
@@ -437,6 +444,9 @@ impl StudioVfs {
             "VFS shutdown: complete"
         );
         if let Some(error) = deferred_namespace_error {
+            return Err(error);
+        }
+        if let Some(error) = metadata_barrier_error {
             return Err(error);
         }
         Ok(())
