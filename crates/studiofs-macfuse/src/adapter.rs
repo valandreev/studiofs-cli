@@ -1139,7 +1139,14 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         self.vfs
-            .mkdir(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .mkdir_with_deferred_metadata_admission(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                mode & 0o7777,
+                &self.runtime_handle,
+            )
             .inspect(|attr| {
                 self.shared.kernel_inode_liveness.observe(attr.ino);
                 self.invalidate_readdir_cache(parent);
@@ -1179,7 +1186,14 @@ impl StudioVfsAdapter {
         }
         let attr = self
             .vfs
-            .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .create_with_deferred_metadata_admission(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                mode & 0o7777,
+                &self.runtime_handle,
+            )
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
@@ -1205,7 +1219,14 @@ impl StudioVfsAdapter {
             return Err(libc::ENOTSUP);
         }
         self.vfs
-            .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .create_with_deferred_metadata_admission(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                mode & 0o7777,
+                &self.runtime_handle,
+            )
             .inspect(|attr| {
                 self.shared.kernel_inode_liveness.observe(attr.ino);
                 self.remember_named_file_flags(attr.ino, name);

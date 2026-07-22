@@ -437,10 +437,6 @@ fn linux_fuse_async_write_enabled_from_env(
     async_write.is_none_or(linux_fuse_env_flag_value)
 }
 
-fn linux_fuse_metadata_admission_enabled() -> bool {
-    true
-}
-
 fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
     args.size.is_none()
         && (args.mode.is_some()
@@ -1447,7 +1443,7 @@ impl SessionState {
         ino: u64,
         args: SetattrArgs,
     ) -> Result<InodeAttr, i32> {
-        if linux_fuse_metadata_admission_enabled() && linux_fuse_setattr_args_are_attr_only(&args) {
+        if linux_fuse_setattr_args_are_attr_only(&args) {
             return self
                 .vfs
                 .setattr_attr_only_deferred_metadata(ino, args, &self.runtime_handle)
@@ -1474,8 +1470,9 @@ impl SessionState {
             return Err(libc::ENOTSUP);
         }
         let mode = (mode & 0o7777) as u16;
-        let attr = if linux_fuse_metadata_admission_enabled() {
-            self.vfs.create_with_deferred_metadata_admission(
+        let attr = self
+            .vfs
+            .create_with_deferred_metadata_admission(
                 parent,
                 name,
                 self.mount_uid,
@@ -1483,11 +1480,7 @@ impl SessionState {
                 mode,
                 &self.runtime_handle,
             )
-        } else {
-            self.vfs
-                .create(parent, name, self.mount_uid, self.mount_gid, mode)
-        }
-        .map_err(|error| vfs_err_to_errno(&error))?;
+            .map_err(|error| vfs_err_to_errno(&error))?;
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
         let fh = self
             .vfs
@@ -1501,19 +1494,14 @@ impl SessionState {
             return Err(libc::EROFS);
         }
         let mode = (mode & 0o7777) as u16;
-        let result = if linux_fuse_metadata_admission_enabled() {
-            self.vfs.mkdir_with_deferred_metadata_admission(
-                parent,
-                name,
-                self.mount_uid,
-                self.mount_gid,
-                mode,
-                &self.runtime_handle,
-            )
-        } else {
-            self.vfs
-                .mkdir(parent, name, self.mount_uid, self.mount_gid, mode)
-        };
+        let result = self.vfs.mkdir_with_deferred_metadata_admission(
+            parent,
+            name,
+            self.mount_uid,
+            self.mount_gid,
+            mode,
+            &self.runtime_handle,
+        );
         result.map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1526,19 +1514,14 @@ impl SessionState {
             return Err(libc::ENOTSUP);
         }
         let mode = (mode & 0o7777) as u16;
-        let result = if linux_fuse_metadata_admission_enabled() {
-            self.vfs.create_with_deferred_metadata_admission(
-                parent,
-                name,
-                self.mount_uid,
-                self.mount_gid,
-                mode,
-                &self.runtime_handle,
-            )
-        } else {
-            self.vfs
-                .create(parent, name, self.mount_uid, self.mount_gid, mode)
-        };
+        let result = self.vfs.create_with_deferred_metadata_admission(
+            parent,
+            name,
+            self.mount_uid,
+            self.mount_gid,
+            mode,
+            &self.runtime_handle,
+        );
         result.map_err(|error| vfs_err_to_errno(&error))
     }
 
