@@ -894,7 +894,10 @@ impl StudioVfs {
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
         let flushed_local_dirty_state = matches!(action, LastHandleReleaseAction::LocalSync { .. });
-        if matches!(action, LastHandleReleaseAction::IgnoredEntry) {
+        if matches!(
+            action,
+            LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
+        ) {
             self.state.file_session.gc_if_idle(ino);
             return ReleaseFhOutcome {
                 closed_last_handle: true,
