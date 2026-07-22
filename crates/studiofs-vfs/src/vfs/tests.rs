@@ -11041,12 +11041,12 @@ fn deferred_namespace_create_is_visible_before_background_commit() {
 }
 
 #[test]
-fn explicit_durability_waits_for_deferred_namespace_create() {
+fn flush_waits_for_deferred_namespace_create() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-durability-barrier");
     let _guard = rt.enter();
     rt.block_on(async {
-        let flush_attr = vfs
+        let attr = vfs
             .create_with_deferred_metadata_admission(
                 1,
                 b"deferred-create-flush-barrier.txt",
@@ -11057,7 +11057,7 @@ fn explicit_durability_waits_for_deferred_namespace_create() {
             )
             .unwrap();
         let flush_fh = vfs
-            .open_created_file_with_known_attr(&flush_attr, OpenFlags::RDWR, false)
+            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
             .expect("open deferred flush file");
         vfs.flush_fh(flush_fh)
             .await
@@ -11066,11 +11066,19 @@ fn explicit_durability_waits_for_deferred_namespace_create() {
             meta.lookup(1, b"deferred-create-flush-barrier.txt")
                 .expect("flushed create should be persisted")
                 .ino,
-            flush_attr.ino
+            attr.ino
         );
         vfs.release_fh(flush_fh).await.unwrap();
+    });
+}
 
-        let fsync_attr = vfs
+#[test]
+fn fsync_waits_for_deferred_namespace_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-fsync-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
             .create_with_deferred_metadata_admission(
                 1,
                 b"deferred-create-fsync-barrier.txt",
@@ -11080,14 +11088,14 @@ fn explicit_durability_waits_for_deferred_namespace_create() {
                 rt.handle(),
             )
             .unwrap();
-        vfs.fsync(fsync_attr.ino, false)
+        vfs.fsync(attr.ino, false)
             .await
             .expect("fsync should wait for deferred create");
         assert_eq!(
             meta.lookup(1, b"deferred-create-fsync-barrier.txt")
                 .expect("fsynced create should be persisted")
                 .ino,
-            fsync_attr.ino
+            attr.ino
         );
     });
 }

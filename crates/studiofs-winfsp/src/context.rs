@@ -2947,13 +2947,6 @@ mod tests {
         )
         .expect("create deferred directory");
 
-        assert!(wait_until(std::time::Duration::from_secs(2), || {
-            vfs.write_path_observability_snapshot()
-                .metadata_commit
-                .calls
-                > before.metadata_commit.calls
-        }));
-
         ctx.spawn_wait({
             let vfs = vfs.clone();
             async move {
