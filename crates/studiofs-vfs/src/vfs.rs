@@ -4561,6 +4561,10 @@ impl StudioVfs {
     /// and other maintenance tasks.
     pub fn start(self: &Arc<Self>) -> VfsResult<()> {
         self.ensure_can_start()?;
+        self.state
+            .namespace
+            .deferred
+            .set_owner(Arc::downgrade(self));
         let Some(channels) = self.startup.claim_channels_for_start()? else {
             return Ok(());
         };

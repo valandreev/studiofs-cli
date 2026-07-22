@@ -11870,7 +11870,7 @@ fn deferred_namespace_barrier_ignores_admissions_after_its_cutoff() {
 #[test]
 fn deferred_namespace_barrier_resumes_background_drain_after_its_cutoff() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-barrier-resume");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-barrier-resume");
     let _guard = rt.enter();
     rt.block_on(async {
         let early = InodeAttr::new_file(9_000_051, ROOT_INO, 0, 0, 0o644);

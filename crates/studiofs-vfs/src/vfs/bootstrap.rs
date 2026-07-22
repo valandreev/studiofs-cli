@@ -435,7 +435,7 @@ impl VfsBootstrap {
             retry_max_ms: config.lock_retry_max_ms,
         });
 
-        let vfs = Arc::new(StudioVfs {
+        Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
             local_payload_backend: resources.local_payload_backend,
@@ -522,9 +522,7 @@ impl VfsBootstrap {
             #[cfg(test)]
             fail_next_size_change_truncate_after_first_removed_block:
                 std::sync::atomic::AtomicBool::new(false),
-        });
-        vfs.state.namespace.deferred.set_owner(Arc::downgrade(&vfs));
-        vfs
+        })
     }
 
     fn finish(self) -> VfsResult<Arc<StudioVfs>> {
