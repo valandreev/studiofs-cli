@@ -165,14 +165,13 @@ impl OverlayCommitPort for VfsOverlayCommitter<'_> {
         } else {
             None
         };
-        let started = Instant::now();
-        let result = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.flush_regular_file_overlay_slices_with_attr(ino, &chunk_slices, attr.as_ref())
-        })
-        .await;
         self.vfs
-            .record_metadata_commit_observability(started.elapsed(), result.is_ok());
-        result
+            .commit_regular_file_overlay_batch(studiofs_meta::RegularFileOverlayMutation {
+                ino,
+                chunk_slices,
+                attr,
+            })
+            .await
     }
 }
 

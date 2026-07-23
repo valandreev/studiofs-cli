@@ -1946,10 +1946,14 @@ impl StudioVfsAdapter {
     }
 
     /// Flush file data through a VFS file handle.
-    pub(crate) fn flush(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+    pub(crate) fn flush(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
         let result = self
             .runtime_handle
-            .block_on(self.vfs.flush_fh(file_handle))
+            .block_on(
+                self.vfs
+                    .flush_volatile_writeback_with_outcome(ino, file_handle),
+            )
+            .map(|_| ())
             .map_err(|error| vfs_err_to_errno(&error));
         normalize_close_flush_result(result)
     }
@@ -2007,7 +2011,7 @@ impl StudioVfsAdapter {
     }
 
     /// Release a file handle opened through this adapter.
-    pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
+    pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
         if self
             .runtime_stats_handles
             .lock()
@@ -2017,15 +2021,9 @@ impl StudioVfsAdapter {
             return Ok(());
         }
         let released_write_handle = self.write_capable_state.release_handle(file_handle);
-        let outcome_result = if self.vfs.inode_has_local_dirty_state(ino) {
-            self.runtime_handle
-                .block_on(self.vfs.release_fh_with_outcome(file_handle))
-                .map_err(|error| vfs_err_to_errno(&error))
-        } else {
-            Ok(self
-                .vfs
-                .release_fh_with_deferred_last_handle_barrier(file_handle, &self.runtime_handle))
-        };
+        let outcome_result = Ok(self
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(file_handle, &self.runtime_handle));
         self.finish_release(file_handle, released_write_handle, outcome_result)
     }
 

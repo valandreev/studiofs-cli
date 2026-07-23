@@ -116,9 +116,9 @@ I/O buffer behavior on Windows callbacks:
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
-- Explicit `flush(context=Some(..))` freezes/finishes dirty writer slices for
-  the handle or inode through the cached-store pipeline, drains admitted shared
-  namespace work, and enters the shared metadata flush boundary.
+- Explicit `flush(context=Some(..))` admits dirty writer state to the shared
+  volatile local-dirty worker. It returns before the redb commit; the worker
+  commits metadata within one second.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default so
   read-only file caching keeps WinFSP cache-manager behavior across close/reopen
@@ -129,11 +129,10 @@ WinFSP callback barrier semantics:
   targeted stale-cache investigations.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
-- `close` is the release-path hook for WinFSP. It drains remaining local writer
-  state for the last handle and enters the shared metadata flush boundary, but
-  it must not force synchronous PostgreSQL
-  replication, object upload completion, or peer publication. `fsync` remains
-  the explicit caller-requested strict sync API.
+- `close` is the release-path hook for WinFSP. It admits remaining local writer
+  state for the last handle to the same volatile worker, without waiting for
+  redb, PostgreSQL replication, object upload completion, or peer publication.
+  `fsync` remains the explicit caller-requested strict local-redb sync API.
 - `overwrite` and EOF-changing `set_file_size` commit the new local EOF before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
@@ -208,7 +207,8 @@ Current Linux callbacks:
 | `listxattr` | `list_xattrs()` as NUL-separated names |
 | `removexattr` | `remove_xattr()`; missing attributes return `ENODATA` |
 
-Linux `flush` and final `release` map to the shared metadata flush boundary.
+Linux ordinary `flush` and final `release` admit state to the shared volatile
+metadata worker; the batch age is bounded to one second.
 Linux `fsync` maps to the shared strict metadata sync boundary after any
 handle-local payload state is drained. The adapter only translates resulting
 errors to errno; queue draining and the redb barrier remain in shared VFS and
@@ -274,14 +274,15 @@ large sequential media callbacks into smaller requests. StudioFS does not pass
 The native macOS bridge queues read replies asynchronously. Write callbacks are
 currently acknowledged after the shared VFS accepts the write, while the VFS
 materializes and uploads accepted data in the background. The shared writer
-keeps a 200 ms coalescing window for synchronous small callbacks; a strict
-flush, fsync, or last-handle release wakes that materializer and drains the
-accepted tail immediately instead of waiting through the full idle window. The
+keeps a 200 ms coalescing window for synchronous small callbacks; `fsync`
+wakes that materializer and drains the accepted tail immediately instead of
+waiting through the full idle window. Ordinary flush and last-handle release
+remain volatile. The
 bridge applies the `50/40` background queue policy, keeps macFUSE-safe
 `max_write=131072`, and
 reports the preferred I/O size through regular file attributes.
-macFUSE `flush` and final `release` enter the shared metadata flush boundary;
-`fsync` enters the shared strict metadata sync boundary. The adapter retains
+macFUSE `flush` and final `release` admit state to the shared volatile metadata
+worker; `fsync` enters the shared strict metadata sync boundary. The adapter retains
 errno translation only and owns no durability timer, queue drain, or redb
 transaction.
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /

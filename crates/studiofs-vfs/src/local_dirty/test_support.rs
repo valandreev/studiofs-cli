@@ -91,7 +91,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
+    use studiofs_meta::{
+        MetaEngineCore, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine,
+    };
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -147,6 +149,32 @@ mod tests {
         )
         .expect("create vfs");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn concurrent_overlay_commits_share_one_metadata_batch() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overlay-batch");
+        let first = vfs
+            .create(1, b"first.bin", 0, 0, 0o644)
+            .expect("create first file");
+        let second = vfs
+            .create(1, b"second.bin", 0, 0, 0o644)
+            .expect("create second file");
+
+        rt.block_on(async {
+            let committer = VfsOverlayCommitter { vfs: &vfs };
+            let (first_result, second_result) = tokio::join!(
+                committer.commit_overlay(first.ino, Vec::new(), Some(first)),
+                committer.commit_overlay(second.ino, Vec::new(), Some(second)),
+            );
+            first_result.expect("commit first overlay");
+            second_result.expect("commit second overlay");
+        });
+
+        let batch = meta.metadata_write_observability().batch;
+        assert_eq!(batch.batches, 1);
+        assert_eq!(batch.requested_ops, 2);
     }
 
     fn single_block_fixture(

@@ -4741,7 +4741,7 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
             .expect("open grow writer");
         vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend logical EOF");
-        vfs.flush_winfsp_writeback_with_outcome(ino, grow_fh)
+        vfs.flush_volatile_writeback_with_outcome(ino, grow_fh)
             .await
             .expect("flush handle-backed grow");
 
@@ -6067,7 +6067,7 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
         vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend clean handle");
         let outcome = vfs
-            .flush_winfsp_writeback_with_outcome(ino, fh)
+            .flush_volatile_writeback_with_outcome(ino, fh)
             .await
             .expect("explicit flush should persist dirty attr");
         assert!(
@@ -10937,6 +10937,61 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 }
 
 #[test]
+fn winfsp_flush_is_volatile_until_fsync() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "winfsp-volatile-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"winfsp-volatile-flush.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+
+        vfs.write(ino, 0, b"payload").await.expect("write payload");
+        assert!(vfs.inode_has_local_dirty_state(ino));
+
+        let outcome = vfs
+            .flush_volatile_writeback_with_outcome(ino, fh)
+            .await
+            .expect("volatile flush admission");
+        assert!(outcome.flushed_local_dirty_state);
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "ordinary flush must leave the accepted state for the background worker"
+        );
+
+        vfs.fsync_with_outcome(ino, false)
+            .await
+            .expect("fsync must establish the strict local barrier");
+        assert!(!vfs.inode_has_local_dirty_state(ino));
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
+fn volatile_flush_reports_a_previous_metadata_commit_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-degraded");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"volatile-flush-degraded.txt", 0, 0, 0o644)
+            .expect("create file");
+        *vfs.state.local_dirty.overlay_metadata_error.lock() =
+            Some("simulated redb outage".to_string());
+
+        let error = vfs
+            .flush_volatile_writeback_with_outcome(attr.ino, 0)
+            .await
+            .expect_err("degraded local metadata must fail an ordinary flush");
+        assert!(error.to_string().contains("simulated redb outage"));
+    });
+}
+
+#[test]
 fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-outcome-writer-stack");
@@ -11105,7 +11160,7 @@ fn winfsp_flush_waits_for_deferred_namespace_create() {
         let fh = vfs
             .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
             .expect("open deferred WinFSP flush file");
-        vfs.flush_winfsp_writeback_with_outcome(attr.ino, fh)
+        vfs.flush_volatile_writeback_with_outcome(attr.ino, fh)
             .await
             .expect("WinFSP flush should wait for deferred create");
         let looked_up = meta
@@ -14759,7 +14814,7 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
         let flushing_vfs = Arc::clone(&vfs);
         let flush = tokio::spawn(async move {
             flushing_vfs
-                .flush_winfsp_writeback_with_outcome(ino, fh)
+                .flush_volatile_writeback_with_outcome(ino, fh)
                 .await
         });
 

@@ -27,8 +27,8 @@ use self::layout::*;
 
 mod fs_ops;
 
-static RELAXED_DURABILITY_WARN: Once = Once::new();
-const REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS: u64 = 5_000;
+static VOLATILE_DURABILITY_WARN: Once = Once::new();
+const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
@@ -216,17 +216,6 @@ pub(crate) struct RedbWriteTransaction<'a> {
     write_metrics: &'a MetadataWriteMetrics,
     mutation_started: Instant,
     relaxed_durability: Option<&'a RelaxedDurabilityRuntime>,
-}
-
-fn redb_relaxed_durability_enabled() -> bool {
-    std::env::var("STUDIOFS_REDB_RELAXED_DURABILITY")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
 }
 
 fn begin_redb_write_txn(
@@ -554,22 +543,16 @@ impl RedbMetaEngine {
 
         debug!("opened metadata database at {:?}", path.as_ref());
         let db = Arc::new(RwLock::new(db));
-        let relaxed_durability = if redb_relaxed_durability_enabled() {
-            Some(start_relaxed_durability_runtime_with_interval(
-                &db,
-                Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
-            )?)
-        } else {
-            None
-        };
-        if relaxed_durability.is_some() {
-            RELAXED_DURABILITY_WARN.call_once(|| {
-                warn!(
-                    interval_ms = REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS,
-                    "relaxed redb metadata durability is enabled with bounded periodic and explicit barriers"
-                );
-            });
-        }
+        let relaxed_durability = Some(start_relaxed_durability_runtime_with_interval(
+            &db,
+            Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
+        )?);
+        VOLATILE_DURABILITY_WARN.call_once(|| {
+            warn!(
+                interval_ms = REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS,
+                "volatile redb metadata durability is enabled with bounded periodic and explicit barriers"
+            );
+        });
         let engine = Self {
             db,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
@@ -654,19 +637,17 @@ impl RedbMetaEngine {
     fn open_relaxed_for_test(path: impl AsRef<Path>) -> Self {
         Self::open_relaxed_with_interval_for_test(
             path,
-            Duration::from_millis(REDB_RELAXED_DURABILITY_BARRIER_INTERVAL_MS),
+            Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
         )
     }
 
     #[cfg(test)]
     fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
         let mut engine = Self::open(path).expect("open relaxed redb test engine");
-        if engine.relaxed_durability.is_none() {
-            engine.relaxed_durability = Some(
-                start_relaxed_durability_runtime_with_interval(&engine.db, interval)
-                    .expect("start relaxed redb test worker"),
-            );
-        }
+        engine.relaxed_durability = Some(
+            start_relaxed_durability_runtime_with_interval(&engine.db, interval)
+                .expect("start relaxed redb test worker"),
+        );
         engine
     }
 
