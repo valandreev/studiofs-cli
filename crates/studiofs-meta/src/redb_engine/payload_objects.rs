@@ -824,6 +824,10 @@ impl RedbMetaEngine {
             .filter_map(|slice| slice.payload.as_ref())
             .map(|payload| u64::from(payload.length))
             .sum();
+        let estimated = super::EstimatedBatchMetrics {
+            slices: estimated_slices,
+            payload_bytes: estimated_payload_bytes,
+        };
         for (index, mutation) in mutations.iter().enumerate() {
             let result = self
                 .apply_regular_file_overlay_mutation_in_txn(
@@ -842,7 +846,7 @@ impl RedbMetaEngine {
                     self.write_metrics.observe_batch(
                         mutations.len() as u64,
                         results.len() as u64,
-                        (estimated_slices, estimated_payload_bytes),
+                        estimated,
                         Some(index),
                         true,
                         started.elapsed(),
@@ -856,7 +860,7 @@ impl RedbMetaEngine {
             self.write_metrics.observe_batch(
                 mutations.len() as u64,
                 results.len() as u64,
-                (estimated_slices, estimated_payload_bytes),
+                estimated,
                 None,
                 true,
                 started.elapsed(),
@@ -866,7 +870,7 @@ impl RedbMetaEngine {
         self.write_metrics.observe_batch(
             mutations.len() as u64,
             results.len() as u64,
-            (estimated_slices, estimated_payload_bytes),
+            estimated,
             None,
             false,
             started.elapsed(),

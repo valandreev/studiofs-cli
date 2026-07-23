@@ -107,6 +107,12 @@ struct MetadataBatchWriteMetrics {
     total_ns: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+struct EstimatedBatchMetrics {
+    slices: u64,
+    payload_bytes: u64,
+}
+
 impl Default for MetadataBatchWriteMetrics {
     fn default() -> Self {
         Self {
@@ -127,7 +133,7 @@ impl MetadataWriteMetrics {
         &self,
         requested_ops: u64,
         actual_ops: u64,
-        estimated: (u64, u64),
+        estimated: EstimatedBatchMetrics,
         failure_index: Option<usize>,
         failed: bool,
         elapsed: Duration,
@@ -141,10 +147,10 @@ impl MetadataWriteMetrics {
             .fetch_add(actual_ops, Ordering::Relaxed);
         self.batch
             .estimated_slices
-            .fetch_add(estimated.0, Ordering::Relaxed);
+            .fetch_add(estimated.slices, Ordering::Relaxed);
         self.batch
             .estimated_payload_bytes
-            .fetch_add(estimated.1, Ordering::Relaxed);
+            .fetch_add(estimated.payload_bytes, Ordering::Relaxed);
         self.batch.total_ns.fetch_add(
             elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
