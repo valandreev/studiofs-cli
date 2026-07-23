@@ -1353,6 +1353,7 @@ struct UploadState {
     upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
     upload_completion_draining: AtomicBool,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
+    active_upload_workers: AtomicUsize,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
@@ -1593,6 +1594,7 @@ impl UploadState {
             }),
             upload_completion_draining: AtomicBool::new(false),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
+            active_upload_workers: AtomicUsize::new(0),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
@@ -6022,6 +6024,11 @@ impl StudioVfs {
             pending_upload_bytes,
             oldest_pending_upload_age_ms,
             active_uploads: self.upload_scheduler.in_flight(),
+            active_upload_workers: self
+                .state
+                .upload
+                .active_upload_workers
+                .load(Ordering::Relaxed),
             pending_retry_count,
             max_pending_retry_count,
             completed_uploads,

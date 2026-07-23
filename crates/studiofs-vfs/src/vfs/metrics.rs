@@ -1695,6 +1695,8 @@ pub struct VfsUploadStats {
     pub oldest_pending_upload_age_ms: u64,
     /// Active uploads count.
     pub active_uploads: usize,
+    /// Upload worker tasks currently processing an operation.
+    pub active_upload_workers: usize,
     /// Count of uploads waiting for retry.
     pub pending_retry_count: u64,
     /// Maximum pending-retry count observed.

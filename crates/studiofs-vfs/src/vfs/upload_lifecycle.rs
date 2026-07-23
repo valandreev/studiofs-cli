@@ -240,10 +240,12 @@ impl StudioVfs {
     pub(super) fn upload_pipeline_summary_is_active(
         pending_uploads: usize,
         active_uploads: usize,
+        active_upload_workers: usize,
         pending_metadata_ops: u32,
     ) -> bool {
         pending_uploads != 0
             || active_uploads != 0
+            || active_upload_workers != 0
             || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
     }
 

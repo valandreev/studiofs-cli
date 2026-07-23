@@ -7612,19 +7612,20 @@ fn vfs_config_raw_validate_preserves_explicit_upload_worker_count() {
 
 #[test]
 fn upload_pipeline_summary_logs_only_when_pending_work_exists() {
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0, 0));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 1, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 1)); // < 10 threshold
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 10));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 1, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 1, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0, 1)); // < 10 threshold
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 0, 10));
 }
 
 #[test]
 fn upload_pipeline_summary_is_active_checks() {
-    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0, 0));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 4, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 9));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 11));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 4, 0, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0, 9));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 0, 11));
 }
 
 #[test]

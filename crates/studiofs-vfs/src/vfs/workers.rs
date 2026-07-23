@@ -832,10 +832,16 @@ impl StudioVfs {
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
             let active_uploads = self.upload_scheduler.in_flight();
+            let active_upload_workers = self
+                .state
+                .upload
+                .active_upload_workers
+                .load(Ordering::Relaxed);
             let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;
             let is_active = Self::upload_pipeline_summary_is_active(
                 pending,
                 active_uploads,
+                active_upload_workers,
                 pending_metadata_ops,
             );
             let activity_started = is_active && !upload_pipeline_summary_was_active;
@@ -907,6 +913,7 @@ impl StudioVfs {
                             "pending_upload_bytes": pending_upload_bytes,
                             "pending_uploads_human": pending_uploads_human,
                             "active_uploads": active_uploads,
+                            "active_upload_workers": active_upload_workers,
                             "pending_metadata_ops": pending_metadata_ops,
                             "inflight_metadata_ops": metadata_backlog.inflight_ops,
                             "dirty_mem_blocks": ingress.dirty_mem_blocks,
@@ -926,6 +933,7 @@ impl StudioVfs {
                         "pending_uploads": pending,
                         "pending_upload_bytes": pending_upload_bytes,
                         "active_uploads": active_uploads,
+                        "active_upload_workers": active_upload_workers,
                         "pending_metadata_ops": pending_metadata_ops,
                         "inflight_metadata_ops": metadata_backlog.inflight_ops,
                         "local_backend_dirty_count": local_backend_dirty_count,
@@ -943,6 +951,7 @@ impl StudioVfs {
                 info!(
                     pending_uploads = %pending_uploads_human,
                     active_uploads,
+                    active_upload_workers,
                     pending_metadata_ops,
                     "upload pipeline"
                 );
