@@ -251,6 +251,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
+    let invalidation_runtime_handle = runtime_handle.clone();
     let mut callback_state = Box::new(adapter::CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle,
@@ -270,7 +271,9 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_watcher =
         spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
-    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
+    vfs.set_kernel_invalidator(
+        callback_state.kernel_invalidator(session.kernel_invalidator(invalidation_runtime_handle)),
+    );
     let result = session.run();
     vfs.clear_kernel_invalidator();
     drop(session);
@@ -501,6 +504,97 @@ mod tests {
         session.request_exit();
         drop(session);
         std::fs::remove_dir(mount_point).expect("remove macFUSE smoke mount point");
+    }
+
+    #[test]
+    fn mounted_write_and_close_return_before_timeout() {
+        if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-mounted-write-callback",
+        )
+        .expect("create VFS fixture");
+        let mount_point = std::path::PathBuf::from(format!(
+            "target/studiofs-macfuse-write-smoke-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir(&mount_point);
+        std::fs::create_dir_all(&mount_point).expect("create macFUSE write smoke mount point");
+        let unmount_signal = super::MacFuseUnmountSignal::new();
+        let request = super::MacFuseMountRequest {
+            vfs: fixture.vfs(),
+            runtime_handle: fixture.runtime().handle().clone(),
+            mount_point: mount_point.clone(),
+            volume_name: "StudioFS Write Smoke".into(),
+            read_only: false,
+            run_in_foreground: true,
+            signal_handling: super::SignalHandling::Disabled,
+            unmount_signal: Some(unmount_signal.clone()),
+        };
+        let mount = std::thread::spawn(move || super::mount_with_request(request));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let target = mount_point.join("callback-write.bin");
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "dd if=/dev/zero of=\"$1\" bs=65536 count=1 status=none",
+                "sh",
+            ])
+            .arg(&target)
+            .spawn()
+            .expect("start mounted write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = writer.try_wait().expect("poll mounted write") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                writer.kill().expect("stop hung mounted write");
+                writer.wait().expect("reap hung mounted write");
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        unmount_signal.request_unmount();
+        mount
+            .join()
+            .expect("join macFUSE mount thread")
+            .expect("unmount macFUSE write smoke");
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match std::fs::remove_file(&target) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EBUSY | libc::ENXIO))
+                        && std::time::Instant::now() < cleanup_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("remove macFUSE write smoke file: {error}"),
+            }
+        }
+        loop {
+            match std::fs::remove_dir(&mount_point) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ResourceBusy
+                        && std::time::Instant::now() < cleanup_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("remove macFUSE write smoke mount point: {error}"),
+            }
+        }
+
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "mounted macFUSE write did not complete before timeout"
+        );
     }
 
     #[test]

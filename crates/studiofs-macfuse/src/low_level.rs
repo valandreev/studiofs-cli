@@ -639,10 +639,14 @@ impl Session {
     }
 
     /// Build a VFS kernel invalidator for this mounted session.
-    pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
+    pub fn kernel_invalidator(
+        &self,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Arc<dyn KernelInvalidator> {
         Arc::new(MacFuseKernelInvalidator {
             channel: self.channel,
             state: Arc::clone(&self.invalidation_state),
+            runtime_handle,
         })
     }
 
@@ -681,9 +685,11 @@ impl SessionExitHandle {
     }
 }
 
+#[derive(Clone)]
 struct MacFuseKernelInvalidator {
     channel: NonNull<raw::FuseChan>,
     state: Arc<SessionInvalidationState>,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 #[derive(Debug)]
@@ -771,6 +777,13 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
 
 impl MacFuseKernelInvalidator {
     fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+        let invalidator = self.clone();
+        self.runtime_handle.spawn_blocking(move || {
+            invalidator.notify_inode_range(ino, offset, len);
+        });
+    }
+
+    fn notify_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
         let Some(_active) = self.state.begin_invalidation() else {
             debug!(
                 ino,
