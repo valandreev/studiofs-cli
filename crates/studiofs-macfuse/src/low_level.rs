@@ -707,6 +707,7 @@ struct InodeInvalidation {
 struct SessionInvalidationQueue {
     state: ParkingMutex<SessionInvalidationQueueState>,
     wake: Condvar,
+    worker: ParkingMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct SessionInvalidationQueueState {
@@ -733,6 +734,7 @@ impl SessionInvalidationQueue {
                 kinds: HashMap::new(),
             }),
             wake: Condvar::new(),
+            worker: ParkingMutex::new(None),
         })
     }
 
@@ -743,7 +745,7 @@ impl SessionInvalidationQueue {
         let queue = Self::new();
         let worker_queue = Arc::clone(&queue);
         let channel = SessionChannel(channel);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("studiofs-macfuse-invalidation".to_string())
             .spawn(move || {
                 while let Some(invalidation) = worker_queue.next() {
@@ -756,6 +758,7 @@ impl SessionInvalidationQueue {
                     );
                 }
             })?;
+        *queue.worker.lock() = Some(worker);
         Ok(queue)
     }
 
@@ -796,6 +799,15 @@ impl SessionInvalidationQueue {
         state.pending.clear();
         state.kinds.clear();
         self.wake.notify_all();
+    }
+
+    fn join_worker(&self) {
+        let worker = self.worker.lock().take();
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            warn!("macFUSE invalidation worker panicked during shutdown");
+        }
     }
 }
 
@@ -917,6 +929,7 @@ impl Drop for Session {
             );
             return;
         }
+        self.invalidation_queue.join_worker();
         // SAFETY: `self.channel` was attached to `self.raw`; removing it before
         // unmount avoids leaving the session with a stale channel pointer.
         unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };

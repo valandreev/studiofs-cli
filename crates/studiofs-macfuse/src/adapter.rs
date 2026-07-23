@@ -52,6 +52,7 @@ const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_SYMLINK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const MACFUSE_SYMLINK_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
@@ -1169,6 +1170,7 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let mut retry_attempts = 0;
+        let retry_deadline = Instant::now() + MACFUSE_SYMLINK_RETRY_TIMEOUT;
         let attr = loop {
             // Capture this before the metadata lookup so a commit racing the
             // symlink attempt still permits the final retry.
@@ -1183,6 +1185,7 @@ impl StudioVfsAdapter {
                     if errno == libc::ENOENT
                         && deferred_parent_pending
                         && retry_attempts < MACFUSE_SYMLINK_RETRY_ATTEMPTS
+                        && Instant::now() < retry_deadline
                     {
                         retry_attempts += 1;
                         debug!(
@@ -1198,10 +1201,9 @@ impl StudioVfsAdapter {
                 }
             }
         }?;
-        Ok(attr).inspect(|attr| {
-            self.shared.kernel_inode_liveness.observe(attr.ino);
-            self.invalidate_readdir_cache(parent);
-        })
+        self.shared.kernel_inode_liveness.observe(attr.ino);
+        self.invalidate_readdir_cache(parent);
+        Ok(attr)
     }
 
     /// Create and open a regular file.
@@ -1591,13 +1593,15 @@ impl StudioVfsAdapter {
                     let _ = Reply::new(request).entry(&entry);
                 }
                 Err(errno) => {
-                    warn!(
-                        parent,
-                        name = %String::from_utf8_lossy(&name),
-                        target = %String::from_utf8_lossy(&target),
-                        errno,
-                        "macFUSE symlink callback returned error"
-                    );
+                    if callback_error_log_level("symlink", errno).is_some() {
+                        warn!(
+                            parent,
+                            name = %String::from_utf8_lossy(&name),
+                            target = %String::from_utf8_lossy(&target),
+                            errno,
+                            "macFUSE symlink callback returned error"
+                        );
+                    }
                     let _ = Reply::new(request).error(errno);
                 }
             });
