@@ -310,10 +310,13 @@ const OVERLAY_BATCH_MAX_QUEUED_OPERATIONS: usize = 256;
 const OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 const OVERLAY_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
 
+type OverlayCompletionSender =
+    tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>;
+
 struct QueuedOverlayMutation {
     sequence: u64,
     mutation: studiofs_meta::RegularFileOverlayMutation,
-    completion: tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>,
+    completion: OverlayCompletionSender,
     write_path_started_at: Instant,
     descriptor_bytes: usize,
     admission: tokio::sync::OwnedSemaphorePermit,
@@ -326,6 +329,7 @@ struct OverlayBatchInner {
     draining: bool,
     next_sequence: u64,
     completed_sequence: u64,
+    last_admitted_sequence: Option<u64>,
     enqueued: u64,
     coalesced: u64,
     batches: u64,
@@ -457,7 +461,9 @@ impl StudioVfs {
         let cutoff = {
             let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
             inner.forced_barriers = inner.forced_barriers.saturating_add(1);
-            inner.next_sequence.saturating_sub(1)
+            inner
+                .last_admitted_sequence
+                .unwrap_or(inner.completed_sequence)
         };
         loop {
             let notified = self
@@ -468,7 +474,7 @@ impl StudioVfs {
                 .notified();
             let complete = {
                 let inner = self.state.local_dirty.overlay_batch.inner.lock();
-                inner.completed_sequence >= cutoff
+                inner.completed_sequence == cutoff
             };
             if complete {
                 return Ok(());
@@ -501,7 +507,13 @@ impl StudioVfs {
         &self,
         mutation: studiofs_meta::RegularFileOverlayMutation,
     ) -> VfsResult<Option<InodeAttr>> {
-        if self.shutdown_requested() {
+        if self.shutdown_requested()
+            && !self
+                .state
+                .shutdown
+                .shutdown_final_drain_active
+                .load(Ordering::Acquire)
+        {
             return Err(VfsError::Other(
                 "overlay metadata queue is stopping for shutdown".to_string(),
             ));
@@ -536,21 +548,40 @@ impl StudioVfs {
                 .notified();
             let admitted = {
                 let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
-                if self.shutdown_requested() {
+                if self.shutdown_requested()
+                    && !self
+                        .state
+                        .shutdown
+                        .shutdown_final_drain_active
+                        .load(Ordering::Acquire)
+                {
                     return Err(VfsError::Other(
                         "overlay metadata queue is stopping for shutdown".to_string(),
                     ));
                 }
                 self.ensure_volatile_overlay_metadata_healthy()?;
-                if inner
-                    .queued_descriptor_bytes
-                    .saturating_add(descriptor_bytes)
-                    > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
+                if inner.next_sequence == u64::MAX
+                    && inner.queue.is_empty()
+                    && !inner.draining
+                    && inner
+                        .last_admitted_sequence
+                        .is_some_and(|last| inner.completed_sequence == last)
+                {
+                    inner.next_sequence = 0;
+                    inner.completed_sequence = 0;
+                    inner.last_admitted_sequence = None;
+                }
+                if inner.next_sequence == u64::MAX
+                    || inner
+                        .queued_descriptor_bytes
+                        .saturating_add(descriptor_bytes)
+                        > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
                 {
                     None
                 } else {
                     let sequence = inner.next_sequence;
-                    inner.next_sequence = inner.next_sequence.saturating_add(1);
+                    inner.next_sequence += 1;
+                    inner.last_admitted_sequence = Some(sequence);
                     inner.enqueued = inner.enqueued.saturating_add(1);
                     inner.queued_descriptor_bytes = inner
                         .queued_descriptor_bytes
@@ -596,7 +627,7 @@ impl StudioVfs {
 
 fn clone_overlay_batch_error(error: &VfsError) -> VfsError {
     match error {
-        VfsError::Meta(error) => VfsError::Meta(MetaError::Storage(error.to_string())),
+        VfsError::Meta(error) => VfsError::Meta((*error).clone()),
         VfsError::Io(error) => VfsError::Io(std::io::Error::new(error.kind(), error.to_string())),
         VfsError::Data(error) => {
             VfsError::Data(studiofs_data::store::DataError::Storage(error.to_string()))
@@ -634,24 +665,25 @@ struct OverlayBatchDrainingGuard {
 
 impl Drop for OverlayBatchDrainingGuard {
     fn drop(&mut self) {
+        let handle = tokio::runtime::Handle::try_current().ok();
         let restart = {
             let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
             inner.draining = false;
             if inner.queue.is_empty() {
                 false
-            } else {
+            } else if handle.is_some() {
                 inner.draining = true;
                 true
+            } else {
+                false
             }
         };
-        if restart {
+        if restart && let Some(handle) = handle {
             let state = Arc::clone(&self.state);
             let meta = self.meta.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    drain_regular_file_overlay_batches(state, meta).await;
-                });
-            }
+            handle.spawn(async move {
+                drain_regular_file_overlay_batches(state, meta).await;
+            });
         }
     }
 }
@@ -666,9 +698,8 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
     loop {
         let mut mutations: Vec<studiofs_meta::RegularFileOverlayMutation> =
             Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
-        let mut completions: Vec<
-            Vec<tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>>,
-        > = Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
+        let mut completions: Vec<Vec<OverlayCompletionSender>> =
+            Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
         let mut admissions = Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
         let mut last_sequence = None;
         let mut write_path_started_at = None;
@@ -765,6 +796,11 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                         let _ = completion.send(Err(Arc::clone(&error)));
                     }
                 }
+                if let Some(sequence) = last_sequence {
+                    mark_overlay_sequence_complete(&state, sequence);
+                }
+                fail_queued_overlay_mutations(&state, &error);
+                return;
             }
             Err(error) => {
                 state
@@ -776,35 +812,57 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                         let _ = completion.send(Err(Arc::clone(&error)));
                     }
                 }
+                if let Some(sequence) = last_sequence {
+                    mark_overlay_sequence_complete(&state, sequence);
+                }
+                fail_queued_overlay_mutations(&state, &error);
+                return;
             }
         }
         if let Some(sequence) = last_sequence {
-            let mut inner = state.local_dirty.overlay_batch.inner.lock();
-            inner.completed_sequence = inner.completed_sequence.max(sequence);
-            state
-                .local_dirty
-                .overlay_batch
-                .space_available
-                .notify_waiters();
+            mark_overlay_sequence_complete(&state, sequence);
         }
     }
+}
+
+fn mark_overlay_sequence_complete(state: &Arc<VfsState>, sequence: u64) {
+    let mut inner = state.local_dirty.overlay_batch.inner.lock();
+    inner.completed_sequence = inner.completed_sequence.max(sequence);
+    state
+        .local_dirty
+        .overlay_batch
+        .space_available
+        .notify_waiters();
+}
+
+fn fail_queued_overlay_mutations(state: &Arc<VfsState>, error: &Arc<VfsError>) {
+    let mut inner = state.local_dirty.overlay_batch.inner.lock();
+    while let Some(queued) = inner.queue.pop_front() {
+        inner.queued_descriptor_bytes = inner
+            .queued_descriptor_bytes
+            .saturating_sub(queued.descriptor_bytes);
+        inner.completed_sequence = inner.completed_sequence.max(queued.sequence);
+        let _ = queued.completion.send(Err(Arc::clone(error)));
+    }
+    state
+        .local_dirty
+        .overlay_batch
+        .space_available
+        .notify_waiters();
 }
 
 fn merge_overlay_mutations(
     target: &mut studiofs_meta::RegularFileOverlayMutation,
     incoming: studiofs_meta::RegularFileOverlayMutation,
 ) {
-    for (chunk_id, slices) in incoming.chunk_slices {
-        if let Some((_, target_slices)) = target
-            .chunk_slices
-            .iter_mut()
-            .find(|(target_chunk_id, _)| *target_chunk_id == chunk_id)
-        {
-            target_slices.extend(slices);
-        } else {
-            target.chunk_slices.push((chunk_id, slices));
-        }
+    let mut by_chunk = std::collections::BTreeMap::new();
+    for (chunk_id, slices) in target.chunk_slices.drain(..) {
+        by_chunk.insert(chunk_id, slices);
     }
+    for (chunk_id, slices) in incoming.chunk_slices {
+        by_chunk.entry(chunk_id).or_default().extend(slices);
+    }
+    target.chunk_slices = by_chunk.into_iter().collect();
     if incoming.attr.is_some() {
         target.attr = incoming.attr;
     }

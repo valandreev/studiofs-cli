@@ -331,7 +331,15 @@ impl StudioVfs {
             pending_uploads = self.pending_uploads_snapshot().len(),
             "VFS shutdown: flushing pending local dirty state"
         );
+        self.state
+            .shutdown
+            .shutdown_final_drain_active
+            .store(true, Ordering::Release);
         let local_dirty_drain_error = self.flush_pending_payloads_for_shutdown().await.err();
+        self.state
+            .shutdown
+            .shutdown_final_drain_active
+            .store(false, Ordering::Release);
         info!(
             pending_uploads = self.pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,

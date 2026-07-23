@@ -497,6 +497,16 @@ impl RedbMetaEngine {
 
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
+        Self::open_with_relaxed_interval(
+            path,
+            Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
+        )
+    }
+
+    fn open_with_relaxed_interval(
+        path: impl AsRef<Path>,
+        durability_interval: Duration,
+    ) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 MetaError::Storage(format!("failed to create directory for redb: {e}"))
@@ -545,7 +555,7 @@ impl RedbMetaEngine {
         let db = Arc::new(RwLock::new(db));
         let relaxed_durability = Some(start_relaxed_durability_runtime_with_interval(
             &db,
-            Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
+            durability_interval,
         )?);
         VOLATILE_DURABILITY_WARN.call_once(|| {
             warn!(
@@ -643,12 +653,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
-        let mut engine = Self::open(path).expect("open relaxed redb test engine");
-        engine.relaxed_durability = Some(
-            start_relaxed_durability_runtime_with_interval(&engine.db, interval)
-                .expect("start relaxed redb test worker"),
-        );
-        engine
+        Self::open_with_relaxed_interval(path, interval).expect("open relaxed redb test engine")
     }
 
     #[cfg(test)]
