@@ -806,8 +806,6 @@ impl RedbMetaEngine {
         }
 
         let started = std::time::Instant::now();
-        let txn = self.begin_write_txn()?;
-        let mut results = Vec::with_capacity(mutations.len());
         let estimated = mutations.iter().fold(
             super::EstimatedBatchMetrics {
                 slices: 0,
@@ -825,6 +823,21 @@ impl RedbMetaEngine {
                 estimated
             },
         );
+        let txn = match self.begin_write_txn() {
+            Ok(txn) => txn,
+            Err(error) => {
+                self.write_metrics.observe_batch(
+                    mutations.len() as u64,
+                    0,
+                    estimated,
+                    None,
+                    true,
+                    started.elapsed(),
+                );
+                return Err(error);
+            }
+        };
+        let mut results = Vec::with_capacity(mutations.len());
         for (index, mutation) in mutations.iter().enumerate() {
             let result = self
                 .apply_regular_file_overlay_mutation_in_txn(
