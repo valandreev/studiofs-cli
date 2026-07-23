@@ -146,28 +146,6 @@ fn clone_publication_error(error: &VfsError) -> VfsError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use studiofs_meta::MetaError;
-
-    #[test]
-    fn publication_batch_preserves_metadata_error_kind() {
-        let error = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
-            ino: 7,
-            block_index: 3,
-        });
-
-        assert!(matches!(
-            clone_publication_error(&error),
-            VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
-                ino: 7,
-                block_index: 3,
-            })
-        ));
-    }
-}
-
 impl CommitCoordinator {
     #[cfg(test)]
     pub(super) async fn finalize_inode_epoch(
@@ -573,5 +551,27 @@ impl CommitCoordinator {
 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_meta::MetaError;
+
+    #[test]
+    fn publication_batch_preserves_metadata_error_kind() {
+        let error = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+            ino: 7,
+            block_index: 3,
+        });
+
+        assert!(matches!(
+            clone_publication_error(&error),
+            VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+                ino: 7,
+                block_index: 3,
+            })
+        ));
     }
 }
