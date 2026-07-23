@@ -29,6 +29,8 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+// Bound unique inodes per session; producers apply backpressure instead of
+// dropping invalidations when this finite metadata budget is exhausted.
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
