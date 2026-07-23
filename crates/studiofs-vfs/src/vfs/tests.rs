@@ -6041,7 +6041,7 @@ fn handle_backed_shrink_with_dirty_writer_forces_strict_sync() {
 }
 
 #[test]
-fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
+fn fsync_after_clean_handle_extend_queues_metadata_only_publish() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");
     let _guard = rt.enter();
@@ -6067,12 +6067,12 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
         vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend clean handle");
         let outcome = vfs
-            .flush_volatile_writeback_with_outcome(ino, fh)
+            .fsync_with_outcome(ino, false)
             .await
-            .expect("explicit flush should persist dirty attr");
+            .expect("fsync should persist dirty attr");
         assert!(
-            outcome.flushed_local_dirty_state,
-            "explicit flush should report the metadata-only dirty attr"
+            outcome.persisted_dirty_attrs,
+            "fsync should report the metadata-only dirty attr"
         );
 
         let extended_attr = meta.get_attr(ino).expect("load extended attr");
