@@ -559,7 +559,7 @@ impl RedbMetaEngine {
         )?);
         VOLATILE_DURABILITY_WARN.call_once(|| {
             warn!(
-                interval_ms = REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS,
+                interval_ms = durability_interval.as_millis() as u64,
                 "volatile redb metadata durability is enabled with bounded periodic and explicit barriers"
             );
         });

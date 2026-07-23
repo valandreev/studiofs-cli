@@ -119,6 +119,9 @@ fn prepare_for_close_makes_later_relaxed_writes_immediate() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
 
+    engine
+        .sync_local_metadata()
+        .expect("initial schema writes must be durable before close preparation");
     engine.prepare_for_close();
     engine.set_counter("after-close-preparation", 1).unwrap();
 
