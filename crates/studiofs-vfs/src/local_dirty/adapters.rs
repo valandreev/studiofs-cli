@@ -151,6 +151,7 @@ impl OverlayCommitPort for VfsOverlayCommitter<'_> {
             Vec<studiofs_meta::schema::SliceRecord>,
         )>,
         attr: Option<InodeAttr>,
+        wait_for_completion: bool,
     ) -> VfsResult<Option<InodeAttr>> {
         let attr = if let Some(attr) = attr {
             if chunk_slices.is_empty()
@@ -166,11 +167,14 @@ impl OverlayCommitPort for VfsOverlayCommitter<'_> {
             None
         };
         self.vfs
-            .commit_regular_file_overlay_batch(studiofs_meta::RegularFileOverlayMutation {
-                ino,
-                chunk_slices,
-                attr,
-            })
+            .commit_regular_file_overlay_batch(
+                studiofs_meta::RegularFileOverlayMutation {
+                    ino,
+                    chunk_slices,
+                    attr,
+                },
+                wait_for_completion,
+            )
             .await
     }
 }

@@ -1,5 +1,12 @@
 use super::*;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
 use studiofs_meta::InodeLifecycleState;
+
+use crate::runtime::{MetaExecutor, run_meta};
+use crate::{VfsError, VfsMeta, VfsResult};
 
 pub(super) struct CommitCoordinator;
 
@@ -16,11 +23,162 @@ struct FinalizeMetaSnapshot {
     object_ids: Vec<u64>,
 }
 
+const EPOCH_PUBLICATION_BATCH_MAX_OPERATIONS: usize = 64;
+
+type EpochPublicationCompletion = tokio::sync::oneshot::Sender<Result<bool, Arc<VfsError>>>;
+
+struct EpochPublicationRequest {
+    ino: studiofs_meta::Ino,
+    content_epoch: u64,
+    completion: EpochPublicationCompletion,
+}
+
+#[derive(Default)]
+pub(super) struct EpochPublicationBatcher {
+    inner: parking_lot::Mutex<EpochPublicationBatchInner>,
+}
+
+#[derive(Default)]
+struct EpochPublicationBatchInner {
+    queue: VecDeque<EpochPublicationRequest>,
+    draining: bool,
+}
+
+impl EpochPublicationBatcher {
+    async fn publish(
+        self: &Arc<Self>,
+        meta: MetaExecutor<dyn VfsMeta>,
+        ino: studiofs_meta::Ino,
+        content_epoch: u64,
+    ) -> VfsResult<bool> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let should_spawn = {
+            let mut inner = self.inner.lock();
+            inner.queue.push_back(EpochPublicationRequest {
+                ino,
+                content_epoch,
+                completion,
+            });
+            if inner.draining {
+                false
+            } else {
+                inner.draining = true;
+                true
+            }
+        };
+        if should_spawn {
+            let batcher = Arc::clone(self);
+            tokio::spawn(async move {
+                batcher.drain(meta).await;
+            });
+        }
+
+        match receiver.await {
+            Ok(Ok(published)) => Ok(published),
+            Ok(Err(error)) => Err(clone_publication_error(&error)),
+            Err(_) => Err(VfsError::Other(
+                "epoch publication batcher stopped".to_string(),
+            )),
+        }
+    }
+
+    async fn drain(self: Arc<Self>, meta: MetaExecutor<dyn VfsMeta>) {
+        loop {
+            let requests = {
+                let mut inner = self.inner.lock();
+                let take = EPOCH_PUBLICATION_BATCH_MAX_OPERATIONS.min(inner.queue.len());
+                let requests: Vec<_> = inner.queue.drain(..take).collect();
+                if requests.is_empty() {
+                    inner.draining = false;
+                    return;
+                }
+                requests
+            };
+            let keys: Vec<_> = requests
+                .iter()
+                .map(|request| (request.ino, request.content_epoch))
+                .collect();
+            let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.publish_regular_file_overlay_to_base_if_matches_batch(&keys)
+            })
+            .await;
+            match result {
+                Ok(published) if published.len() == requests.len() => {
+                    for (request, published) in requests.into_iter().zip(published) {
+                        let _ = request.completion.send(Ok(published));
+                    }
+                }
+                Ok(_) => {
+                    let error = Arc::new(VfsError::Other(
+                        "epoch publication batch returned an unexpected result count".to_string(),
+                    ));
+                    for request in requests {
+                        let _ = request.completion.send(Err(Arc::clone(&error)));
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        request_count = requests.len(),
+                        "epoch publication batch failed; retrying requests individually"
+                    );
+                    for request in requests {
+                        let ino = request.ino;
+                        let content_epoch = request.content_epoch;
+                        let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                            engine
+                                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                        })
+                        .await;
+                        let result = result.map_err(Arc::new);
+                        let _ = request.completion.send(result);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn clone_publication_error(error: &VfsError) -> VfsError {
+    match error {
+        VfsError::Meta(error) => VfsError::Meta((*error).clone()),
+        _ => VfsError::Other(error.to_string()),
+    }
+}
+
 impl CommitCoordinator {
+    #[cfg(test)]
     pub(super) async fn finalize_inode_epoch(
         vfs: &StudioVfs,
         ino: Ino,
         content_epoch: u64,
+    ) -> VfsResult<EpochFinalizeStatus> {
+        Self::finalize_inode_epoch_inner(vfs, ino, content_epoch, None, false).await
+    }
+
+    pub(super) async fn finalize_inode_epoch_with_publisher(
+        vfs: &StudioVfs,
+        ino: studiofs_meta::Ino,
+        content_epoch: u64,
+        publisher: Arc<EpochPublicationBatcher>,
+        remote_visibility_confirmed: bool,
+    ) -> VfsResult<EpochFinalizeStatus> {
+        Self::finalize_inode_epoch_inner(
+            vfs,
+            ino,
+            content_epoch,
+            Some(publisher),
+            remote_visibility_confirmed,
+        )
+        .await
+    }
+
+    async fn finalize_inode_epoch_inner(
+        vfs: &StudioVfs,
+        ino: studiofs_meta::Ino,
+        content_epoch: u64,
+        publisher: Option<Arc<EpochPublicationBatcher>>,
+        remote_visibility_confirmed: bool,
     ) -> VfsResult<EpochFinalizeStatus> {
         let _commit_qos = vfs
             .qos
@@ -104,7 +262,9 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await {
+        if !remote_visibility_confirmed
+            && let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await
+        {
             tracing::debug!(
                 ino,
                 content_epoch,
@@ -175,11 +335,16 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
         let publication_changes_visible_size = latest_attr.committed_size != latest_attr.size;
-        let published = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-        })
-        .await
-        {
+        let published = match if let Some(publisher) = publisher {
+            publisher
+                .publish(vfs.meta.clone(), ino, content_epoch)
+                .await
+        } else {
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+            })
+            .await
+        } {
             Ok(published) => published,
             Err(err) => {
                 drop(finalize_session);
@@ -386,5 +551,27 @@ impl CommitCoordinator {
 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_meta::MetaError;
+
+    #[test]
+    fn publication_batch_preserves_metadata_error_kind() {
+        let error = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+            ino: 7,
+            block_index: 3,
+        });
+
+        assert!(matches!(
+            clone_publication_error(&error),
+            VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+                ino: 7,
+                block_index: 3,
+            })
+        ));
     }
 }

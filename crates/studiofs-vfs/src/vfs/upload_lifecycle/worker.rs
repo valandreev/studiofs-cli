@@ -8,7 +8,7 @@ use opendal::Buffer;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
@@ -420,7 +420,6 @@ struct UploadProcessor<C, L, M, R, S, P> {
     shutdown: S,
     policy: P,
     block_size: u32,
-    upload_delay: Duration,
     upload_requeue_base: Duration,
     upload_requeue_max: Duration,
 }
@@ -556,26 +555,6 @@ where
             return Ok(SingleUploadOutcome::Shutdown);
         }
 
-        let mut waited_upload_delay_ms = 0u64;
-        if self.upload_delay > Duration::ZERO {
-            let age_ms = now_unix_millis().saturating_sub(op.created_unix_ms);
-            let delay_ms = self.upload_delay.as_millis() as u64;
-            if age_ms < delay_ms {
-                waited_upload_delay_ms = delay_ms - age_ms;
-                let shutdown_token = self.shutdown.shutdown_token();
-                tokio::select! {
-                    _ = shutdown_token.cancelled() => return Ok(SingleUploadOutcome::Shutdown),
-                    _ = upload_cancel_token.cancelled() => {
-                        return if self.cancel_upload_if_inode_deleted(op).await? {
-                            Ok(SingleUploadOutcome::CancelledDeleted)
-                        } else {
-                            Ok(SingleUploadOutcome::Shutdown)
-                        };
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(waited_upload_delay_ms)) => {}
-                }
-            }
-        }
         if self.shutdown.uploader_shutdown_requested() {
             return Ok(SingleUploadOutcome::Shutdown);
         }
@@ -590,10 +569,7 @@ where
         }
 
         let adaptive_penalty = Duration::from_millis(self.remote.adaptive_penalty_ms());
-        let admission_delay = self
-            .remote
-            .upload_admission_delay(adaptive_penalty)
-            .saturating_sub(Duration::from_millis(waited_upload_delay_ms));
+        let admission_delay = self.remote.upload_admission_delay(adaptive_penalty);
         if !admission_delay.is_zero() {
             let shutdown_token = self.shutdown.shutdown_token();
             tokio::select! {
@@ -2020,7 +1996,8 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
         if self.vfs.shutdown_requested() || self.vfs.inode_has_pending_uploads(ino) {
             return;
         }
-        self.vfs.queue_epoch_finalization(ino, content_epoch);
+        self.vfs
+            .queue_epoch_finalization_after_verified_upload(ino, content_epoch);
     }
 }
 
@@ -2037,6 +2014,23 @@ pub(crate) struct UploadLifecycleWorker {
     >,
 }
 
+struct ActiveUploadWorkerGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl ActiveUploadWorkerGuard<'_> {
+    fn new(counter: &AtomicUsize) -> ActiveUploadWorkerGuard<'_> {
+        counter.fetch_add(1, Ordering::Relaxed);
+        ActiveUploadWorkerGuard { counter }
+    }
+}
+
+impl Drop for ActiveUploadWorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
         let processor = UploadProcessor {
@@ -2047,7 +2041,6 @@ impl UploadLifecycleWorker {
             shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
             policy: VfsUploadPolicyPort { vfs: vfs.clone() },
             block_size: vfs.block_size,
-            upload_delay: vfs.upload_delay,
             upload_requeue_base: vfs.upload_requeue_base,
             upload_requeue_max: vfs.upload_requeue_max,
         };
@@ -2148,7 +2141,12 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => Self::enqueue_pending_upload(&mut ready, &mut delayed, op),
+                        Some(op) => Self::enqueue_pending_upload(
+                            &mut ready,
+                            &mut delayed,
+                            op,
+                            self.vfs.upload_delay,
+                        ),
                         None => inbound_closed = true,
                     }
                 }
@@ -2163,8 +2161,14 @@ impl UploadLifecycleWorker {
     fn enqueue_pending_upload(
         ready: &mut ReadyUploads,
         delayed: &mut DelayedUploads,
-        op: PendingUpload,
+        mut op: PendingUpload,
+        initial_delay: Duration,
     ) {
+        if op.not_before_unix_ms == 0 && !initial_delay.is_zero() {
+            op.not_before_unix_ms = op
+                .created_unix_ms
+                .saturating_add(initial_delay.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
         if op.not_before_unix_ms > now_unix_millis() {
             delayed
                 .entry(op.not_before_unix_ms)
@@ -2313,6 +2317,8 @@ impl UploadLifecycleWorker {
             "process_upload start"
         );
 
+        let _active_worker =
+            ActiveUploadWorkerGuard::new(&self.vfs.state.upload.active_upload_workers);
         let outcome = self.processor.process_upload(op.clone()).await;
         if outcome == UploadOutcome::Completed {
             self.vfs.state.file_session.note_background_transition(
@@ -2330,7 +2336,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use studiofs_data::DataStoreConfig;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, UploadState};
     use studiofs_meta::{MetaEngine, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
@@ -2346,6 +2352,16 @@ mod tests {
         FakeShutdown,
         FakePolicy,
     >;
+
+    #[test]
+    fn active_upload_worker_guard_decrements_on_drop() {
+        let active_workers = AtomicUsize::new(0);
+        {
+            let _guard = ActiveUploadWorkerGuard::new(&active_workers);
+            assert_eq!(active_workers.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
@@ -3296,7 +3312,6 @@ mod tests {
             shutdown: shutdown.clone(),
             policy: policy.clone(),
             block_size: 4096,
-            upload_delay: Duration::ZERO,
             upload_requeue_base: Duration::ZERO,
             upload_requeue_max: Duration::ZERO,
         };
@@ -4169,7 +4184,12 @@ mod tests {
         let mut op = make_pending_upload();
         op.not_before_unix_ms = now_unix_millis().saturating_add(20);
 
-        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, op.clone());
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            op.clone(),
+            Duration::ZERO,
+        );
         UploadLifecycleWorker::promote_ready_uploads(&mut ready, &mut delayed);
 
         assert!(ready.is_empty());
@@ -4185,6 +4205,24 @@ mod tests {
         assert!(delayed.is_empty());
     }
 
+    #[tokio::test]
+    async fn initial_upload_delay_is_queued_without_occupying_a_worker() {
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let mut op = make_pending_upload();
+        op.created_unix_ms = now_unix_millis();
+
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            op,
+            Duration::from_millis(20),
+        );
+
+        assert!(ready.is_empty());
+        assert_eq!(delayed.len(), 1);
+    }
+
     #[test]
     fn worker_queues_drop_deleted_pending_uploads_before_dispatch() {
         let mut ready = ReadyUploads::default();
@@ -4198,9 +4236,24 @@ mod tests {
         retained.ino = ready_deleted.ino + 1;
         retained.object_id = 201;
 
-        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, ready_deleted);
-        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, delayed_deleted);
-        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, retained.clone());
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            ready_deleted,
+            Duration::ZERO,
+        );
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            delayed_deleted,
+            Duration::ZERO,
+        );
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            retained.clone(),
+            Duration::ZERO,
+        );
 
         let removed = UploadLifecycleWorker::remove_deleted_uploads_from_queues(
             &mut ready,

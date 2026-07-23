@@ -165,8 +165,8 @@ mod tests {
         rt.block_on(async {
             let committer = VfsOverlayCommitter { vfs: &vfs };
             let (first_result, second_result) = tokio::join!(
-                committer.commit_overlay(first.ino, Vec::new(), Some(first.clone())),
-                committer.commit_overlay(second.ino, Vec::new(), Some(second)),
+                committer.commit_overlay(first.ino, Vec::new(), Some(first.clone()), true),
+                committer.commit_overlay(second.ino, Vec::new(), Some(second), true),
             );
             first_result.expect("commit first overlay");
             second_result.expect("commit second overlay");
@@ -175,6 +175,30 @@ mod tests {
         let batch = meta.metadata_write_observability().batch;
         assert_eq!(batch.batches, 1);
         assert_eq!(batch.requested_ops, 2);
+    }
+
+    #[test]
+    fn opportunistic_overlay_admission_returns_before_metadata_drain() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overlay-opportunistic-admission");
+        let attr = vfs
+            .create(1, b"opportunistic.bin", 0, 0, 0o644)
+            .expect("create file");
+
+        let admitted = rt.block_on(async {
+            VfsOverlayCommitter { vfs: &vfs }
+                .commit_overlay(attr.ino, Vec::new(), Some(attr.clone()), false)
+                .await
+                .expect("opportunistic overlay admission")
+        });
+        assert_eq!(admitted.as_ref().map(|value| value.ino), Some(attr.ino));
+
+        rt.block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect("wait for admitted overlay metadata");
+        assert_eq!(
+            meta.get_attr(attr.ino).expect("persisted attr").ino,
+            attr.ino
+        );
     }
 
     #[test]
@@ -200,7 +224,7 @@ mod tests {
             .mark_overlay_metadata_error("sticky overlay failure".to_string());
         let error = rt.block_on(async {
             VfsOverlayCommitter { vfs: &vfs }
-                .commit_overlay(attr.ino, Vec::new(), Some(attr))
+                .commit_overlay(attr.ino, Vec::new(), Some(attr), true)
                 .await
                 .expect_err("degraded metadata must reject new admissions")
         });
@@ -1284,8 +1308,13 @@ mod tests {
                 Vec<studiofs_meta::schema::SliceRecord>,
             )>,
             _attr: Option<InodeAttr>,
+            wait_for_completion: bool,
         ) -> VfsResult<Option<InodeAttr>> {
-            self.events.push("metadata");
+            self.events.push(if wait_for_completion {
+                "metadata:wait"
+            } else {
+                "metadata:admit"
+            });
             self.committed_payloads.lock().expect("commit lock").push(
                 _chunk_slices
                     .iter()
@@ -1449,7 +1478,7 @@ mod tests {
             events.snapshot(),
             vec![
                 "payload".to_string(),
-                "metadata".to_string(),
+                "metadata:wait".to_string(),
                 "observer".to_string(),
                 "upload".to_string(),
             ]
@@ -1502,7 +1531,7 @@ mod tests {
             events.snapshot(),
             vec![
                 "payload".to_string(),
-                "metadata".to_string(),
+                "metadata:wait".to_string(),
                 "cleanup:metadata-commit".to_string(),
             ]
         );
@@ -1595,7 +1624,7 @@ mod tests {
         assert!(outcome.persisted_blocks.is_empty());
         assert_eq!(
             events.snapshot(),
-            vec!["metadata".to_string(), "observer".to_string()]
+            vec!["metadata:admit".to_string(), "observer".to_string()]
         );
         assert!(uploads.lock().expect("uploads lock").is_empty());
         assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);
@@ -1650,7 +1679,7 @@ mod tests {
         );
         assert_eq!(
             events.snapshot(),
-            vec!["metadata".to_string(), "observer".to_string()]
+            vec!["metadata:admit".to_string(), "observer".to_string()]
         );
         assert!(uploads.lock().expect("uploads lock").is_empty());
         assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);

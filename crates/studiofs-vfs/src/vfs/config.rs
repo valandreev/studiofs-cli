@@ -989,6 +989,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vfs_config_default_defers_uploads_for_ten_seconds() {
+        assert_eq!(VfsConfig::default().upload_delay_ms, 10_000);
+    }
+
+    #[test]
     fn vfs_config_raw_validate_applies_defaults() {
         let validated = VfsConfigRaw::default()
             .validate()

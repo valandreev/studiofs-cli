@@ -821,7 +821,22 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         &self,
         ino: Ino,
         expected_epoch: u64,
-    ) -> MetaResult<bool>;
+    ) -> MetaResult<bool> {
+        Ok(self
+            .publish_regular_file_overlay_to_base_if_matches_batch(&[(ino, expected_epoch)])?
+            .into_iter()
+            .next()
+            .unwrap_or(false))
+    }
+
+    /// Promote multiple regular-file overlays in one metadata transaction.
+    ///
+    /// The result preserves input order and reports which epoch publications
+    /// passed their inode/epoch/payload-readiness guards.
+    fn publish_regular_file_overlay_to_base_if_matches_batch(
+        &self,
+        requests: &[(Ino, u64)],
+    ) -> MetaResult<Vec<bool>>;
 
     /// Best-effort background compaction for fragmented regular-file chunk
     /// graphs.

@@ -286,15 +286,13 @@ impl MetaPayloadObjects for PgMetaEngine {
         result
     }
 
-    fn publish_regular_file_overlay_to_base_if_matches(
+    fn publish_regular_file_overlay_to_base_if_matches_batch(
         &self,
-        ino: Ino,
-        expected_epoch: u64,
-    ) -> MetaResult<bool> {
-        let result = self.mutate(|local| {
-            local.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
-        });
-        if matches!(result, Ok(true)) {
+        requests: &[(Ino, u64)],
+    ) -> MetaResult<Vec<bool>> {
+        let result = self
+            .mutate(|local| local.publish_regular_file_overlay_to_base_if_matches_batch(requests));
+        if matches!(result, Ok(ref published) if published.iter().any(|value| *value)) {
             self.request_eager_flush();
         }
         result

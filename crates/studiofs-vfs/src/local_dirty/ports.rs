@@ -35,6 +35,7 @@ pub(super) trait OverlayCommitPort {
             Vec<studiofs_meta::schema::SliceRecord>,
         )>,
         attr: Option<InodeAttr>,
+        wait_for_completion: bool,
     ) -> VfsResult<Option<InodeAttr>>;
 }
 

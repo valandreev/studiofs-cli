@@ -305,7 +305,7 @@ pub(super) struct LocalSyncGroupState {
     pub(super) last_sync_at: Instant,
 }
 
-const OVERLAY_BATCH_MAX_OPERATIONS: usize = 64;
+const OVERLAY_BATCH_MAX_OPERATIONS: usize = 256;
 const OVERLAY_BATCH_MAX_QUEUED_OPERATIONS: usize = 256;
 const OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 const OVERLAY_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
@@ -525,7 +525,9 @@ impl StudioVfs {
     pub(super) async fn commit_regular_file_overlay_batch(
         &self,
         mutation: studiofs_meta::RegularFileOverlayMutation,
+        wait_for_completion: bool,
     ) -> VfsResult<Option<InodeAttr>> {
+        let admitted_attr = mutation.attr.clone();
         if self.shutdown_requested()
             && !self
                 .state
@@ -591,7 +593,7 @@ impl StudioVfs {
                         VfsError::Other("overlay mutation was already admitted".to_string())
                     })?;
                     let queued_completion = completion.take().ok_or_else(|| {
-                        VfsError::Other("overlay completion was already admitted".to_string())
+                        VfsError::Other("overlay completion was already queued".to_string())
                     })?;
                     let queued_admission = admission.take().ok_or_else(|| {
                         VfsError::Other("overlay queue admission was already consumed".to_string())
@@ -633,6 +635,9 @@ impl StudioVfs {
             });
         }
 
+        if !wait_for_completion {
+            return Ok(admitted_attr);
+        }
         receiver
             .await
             .map_err(|_| VfsError::Other("overlay batch drainer stopped".to_string()))?
@@ -768,7 +773,9 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                     coalesced_operations += 1;
                 } else {
                     mutations.push(queued.mutation);
-                    completions.push(smallvec::smallvec![queued.completion]);
+                    let mut mutation_completions = OverlayCompletionList::new();
+                    mutation_completions.push(queued.completion);
+                    completions.push(mutation_completions);
                 }
                 last_sequence = Some(queued.sequence);
                 admitted_operations += 1;
@@ -1122,10 +1129,11 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let attr_to_persist =
             self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
         let attr_to_clear = attr_to_persist.clone();
+        // These slices are submitted for upload below, so redb must commit first.
         let committed_attr = self
             .drain
             .commit_meta
-            .commit_overlay(self.ino, chunk_slices, attr_to_persist)
+            .commit_overlay(self.ino, chunk_slices, attr_to_persist, true)
             .await?;
         let skipped_stale_commit = attr_to_clear.is_some() && committed_attr.is_none();
         self.drain
