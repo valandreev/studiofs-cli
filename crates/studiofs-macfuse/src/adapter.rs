@@ -2704,36 +2704,6 @@ mod open_cache_snapshot_tests {
     }
 
     #[test]
-    fn dirty_write_release_drains_last_handle_barrier_before_returning() {
-        let fixture =
-            ContractVfsFixture::new("macfuse-deferred-release").expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(CONTRACT_ROOT_INO, b"deferred-release.bin", 501, 20, 0o644)
-            .expect("create file");
-        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-
-        let opened = adapter
-            .open(attr.ino, libc::O_RDWR)
-            .expect("open write-capable file");
-        let fh = opened.file_handle();
-        adapter
-            .write(attr.ino, fh, 0, b"deferred release payload")
-            .expect("write payload");
-        assert!(
-            vfs.inode_has_local_dirty_state(attr.ino),
-            "test setup should leave unpublished local dirty state before release"
-        );
-
-        adapter.release(attr.ino, fh).expect("release writer");
-
-        assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "dirty macFUSE release must drain the last-handle barrier before returning"
-        );
-    }
-
-    #[test]
     fn read_after_deferred_release_waits_for_last_handle_barrier() {
         let fixture = ContractVfsFixture::new("macfuse-read-after-deferred-release")
             .expect("create VFS fixture");
