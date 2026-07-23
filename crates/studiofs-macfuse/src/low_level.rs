@@ -29,6 +29,7 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
 // copied callback data out of its session lock. This registry keeps callback
@@ -764,18 +765,23 @@ impl SessionInvalidationQueue {
 
     fn enqueue(&self, ino: u64, data: bool) {
         let mut state = self.state.lock();
-        if state.closed {
-            return;
-        }
-        match state.kinds.entry(ino) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                *entry.get_mut() |= data;
+        loop {
+            if state.closed {
+                return;
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(data);
+            if let Some(kind) = state.kinds.get_mut(&ino) {
+                *kind |= data;
+                return;
+            }
+            if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
+                state.kinds.insert(ino, data);
                 state.pending.push_back(ino);
                 self.wake.notify_one();
+                return;
             }
+            // Preserve every invalidation while bounding memory: producers
+            // wait for the dedicated worker to make queue capacity available.
+            self.wake.wait(&mut state);
         }
     }
 
@@ -784,6 +790,7 @@ impl SessionInvalidationQueue {
         loop {
             if let Some(ino) = state.pending.pop_front() {
                 let data = state.kinds.remove(&ino).unwrap_or(false);
+                self.wake.notify_all();
                 return Some(InodeInvalidation { ino, data });
             }
             if state.closed {
@@ -1547,6 +1554,49 @@ mod tests {
                 data: false,
             })
         );
+    }
+
+    #[test]
+    fn session_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+        let queue = SessionInvalidationQueue::new();
+        for ino in 0..MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64 {
+            queue.enqueue(ino, false);
+        }
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.pending.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
+            assert_eq!(state.kinds.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
+        }
+
+        let producer_queue = Arc::clone(&queue);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal blocked producer start");
+            producer_queue.enqueue(MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64, false);
+            finished_tx
+                .send(())
+                .expect("signal blocked producer finish");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("start blocked producer");
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a full queue must apply producer backpressure"
+        );
+
+        assert_eq!(
+            queue.next(),
+            Some(InodeInvalidation {
+                ino: 0,
+                data: false
+            })
+        );
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer should continue after queue capacity is freed");
+        producer.join().expect("blocked producer should exit");
     }
 
     #[test]

@@ -79,6 +79,7 @@ pub(crate) struct MacFuseOpenCachePolicy {
 pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
+    reply_tasks: Arc<ReplyTaskTracker>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
@@ -1001,6 +1002,7 @@ impl StudioVfsAdapter {
         Self {
             vfs,
             runtime_handle,
+            reply_tasks: Arc::new(ReplyTaskTracker::default()),
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
@@ -1546,7 +1548,9 @@ impl StudioVfsAdapter {
         request: Request,
     ) {
         let adapter = Arc::clone(self);
+        let task = self.reply_tasks.track();
         self.runtime_handle.spawn_blocking(move || {
+            let _task = task;
             let result = adapter.rmdir(parent, &name);
             match result {
                 Ok(()) => {
@@ -1578,8 +1582,10 @@ impl StudioVfsAdapter {
         request: Request,
     ) {
         let adapter = Arc::clone(self);
-        self.runtime_handle
-            .spawn_blocking(move || match adapter.symlink(parent, &name, &target) {
+        let task = self.reply_tasks.track();
+        self.runtime_handle.spawn_blocking(move || {
+            let _task = task;
+            match adapter.symlink(parent, &name, &target) {
                 Ok(attr) => {
                     debug!(
                         parent,
@@ -1604,7 +1610,8 @@ impl StudioVfsAdapter {
                     }
                     let _ = Reply::new(request).error(errno);
                 }
-            });
+            }
+        });
     }
 
     /// Rename a namespace entry.
@@ -1774,7 +1781,9 @@ impl StudioVfsAdapter {
         let cancellation = ReadCancellationToken::default();
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
+        let task = self.reply_tasks.track();
         self.runtime_handle.spawn(async move {
+            let _task = task;
             let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
@@ -2476,6 +2485,59 @@ impl CallbackState {
         inner: Arc<dyn KernelInvalidator>,
     ) -> Arc<dyn KernelInvalidator> {
         self.adapter.kernel_invalidator(inner)
+    }
+
+    pub(crate) fn wait_for_reply_tasks(&self) {
+        self.adapter.reply_tasks.wait_for_idle();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReplyTaskTracker {
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+struct ReplyTaskGuard {
+    tracker: Arc<ReplyTaskTracker>,
+}
+
+impl ReplyTaskTracker {
+    fn track(self: &Arc<Self>) -> ReplyTaskGuard {
+        *self
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned") += 1;
+        ReplyTaskGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    fn wait_for_idle(&self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned");
+        while *active != 0 {
+            active = self
+                .idle
+                .wait(active)
+                .expect("reply task tracker lock should not be poisoned");
+        }
+    }
+}
+
+impl Drop for ReplyTaskGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .tracker
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned");
+        *active -= 1;
+        if *active == 0 {
+            self.tracker.idle.notify_all();
+        }
     }
 }
 
@@ -4171,6 +4233,28 @@ mod tests {
     use super::*;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    #[test]
+    fn reply_task_tracker_waits_until_async_reply_finishes() {
+        let tracker = Arc::new(ReplyTaskTracker::default());
+        let task = tracker.track();
+        let waiting_tracker = Arc::clone(&tracker);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting_tracker.wait_for_idle();
+            done_tx.send(()).expect("signal drained reply task");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "reply task drain must wait while a callback still owns its request"
+        );
+        drop(task);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reply task drain should finish after the callback exits");
+        waiter.join().expect("reply drain waiter should exit");
+    }
 
     #[test]
     fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {

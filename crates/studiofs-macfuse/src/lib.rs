@@ -236,7 +236,7 @@ fn spawn_signal_watcher(
 
 /// Start serving the macOS native bridge.
 ///
-/// Real macFUSE callbacks are tracked by the follow-up macOS bridge issues.
+/// Async callback replies are drained before the macFUSE session is destroyed.
 pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let MacFuseMountRequest {
         vfs,
@@ -273,6 +273,10 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
     vfs.clear_kernel_invalidator();
+    // Async namespace callbacks retain raw macFUSE requests after returning
+    // to the session loop. Drain them before Session::drop destroys the
+    // session and request backing storage.
+    callback_state.wait_for_reply_tasks();
     drop(session);
     drop(callback_state);
     result
@@ -513,6 +517,17 @@ mod tests {
             "macfuse-mounted-write-callback",
         )
         .expect("create VFS fixture");
+        let ready_name = b"macfuse-mount-ready";
+        fixture
+            .vfs()
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                ready_name,
+                501,
+                20,
+                0o644,
+            )
+            .expect("create mount readiness sentinel");
         let mount_point = std::path::PathBuf::from(format!(
             "target/studiofs-macfuse-write-smoke-{}",
             std::process::id()
@@ -531,7 +546,23 @@ mod tests {
             unmount_signal: Some(unmount_signal.clone()),
         };
         let mount = std::thread::spawn(move || super::mount_with_request(request));
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let ready_target = mount_point.join(std::str::from_utf8(ready_name).unwrap());
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if std::fs::metadata(&ready_target).is_ok() {
+                break;
+            }
+            if mount.is_finished() {
+                let result = mount.join().expect("join failed mount thread");
+                panic!("macFUSE write smoke mount exited before readiness: {result:?}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                unmount_signal.request_unmount();
+                let _ = mount.join();
+                panic!("macFUSE write smoke mount did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         let target = mount_point.join("callback-write.bin");
         let mut writer = std::process::Command::new("/bin/sh")
