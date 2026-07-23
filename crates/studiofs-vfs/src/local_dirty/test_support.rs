@@ -178,6 +178,16 @@ mod tests {
     }
 
     #[test]
+    fn first_overlay_sequence_is_above_completion_sentinel() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-sequence");
+        let inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+
+        assert_eq!(inner.completed_sequence, 0);
+        assert_eq!(inner.next_sequence, 1);
+    }
+
+    #[test]
     fn degraded_overlay_metadata_rejects_new_admissions() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-degraded-admission");

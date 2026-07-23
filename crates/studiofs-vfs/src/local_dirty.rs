@@ -425,7 +425,10 @@ impl LocalDirtyState {
             }),
             local_sync_gate: tokio::sync::Mutex::new(()),
             overlay_batch: OverlayBatchState {
-                inner: Mutex::new(OverlayBatchInner::default()),
+                inner: Mutex::new(OverlayBatchInner {
+                    next_sequence: 1,
+                    ..OverlayBatchInner::default()
+                }),
                 admission: Arc::new(tokio::sync::Semaphore::new(
                     OVERLAY_BATCH_MAX_QUEUED_OPERATIONS,
                 )),
