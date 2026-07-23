@@ -630,7 +630,7 @@ impl RedbMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<(Option<InodeAttr>, bool)> {
         if let Some(attr) = attr {
-            match Self::get_attr_merged_in_write_txn(&txn, ino) {
+            match Self::get_attr_merged_in_write_txn(txn, ino) {
                 Ok(current) if current.content_epoch > attr.content_epoch => {
                     return Ok((None, false));
                 }
@@ -642,7 +642,7 @@ impl RedbMetaEngine {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
                 let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
-                    &txn,
+                    txn,
                     REGULAR_FILE_BASE_TABLE,
                     normalized.ino,
                 )?;
@@ -757,14 +757,14 @@ impl RedbMetaEngine {
             }
 
             if let Some(attr) = normalized_attr.as_ref() {
-                Self::set_inode_overlay_in_txn(&txn, attr)?;
+                Self::set_inode_overlay_in_txn(txn, attr)?;
             }
         }
 
-        Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
+        Self::sync_inode_lifecycle_in_txn(txn, ino)?;
 
         Self::append_event_in_txn(
-            &txn,
+            txn,
             &crate::events::MetaEvent::SetRegularFileOverlaySlices {
                 ino,
                 chunk_slices: final_chunk_slices,
@@ -772,7 +772,7 @@ impl RedbMetaEngine {
         )?;
         if let Some(attr) = normalized_attr.as_ref() {
             Self::append_event_in_txn(
-                &txn,
+                txn,
                 &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
             )?;
         }
@@ -842,8 +842,7 @@ impl RedbMetaEngine {
                     self.write_metrics.observe_batch(
                         mutations.len() as u64,
                         results.len() as u64,
-                        estimated_slices,
-                        estimated_payload_bytes,
+                        (estimated_slices, estimated_payload_bytes),
                         Some(index),
                         true,
                         started.elapsed(),
@@ -857,8 +856,7 @@ impl RedbMetaEngine {
             self.write_metrics.observe_batch(
                 mutations.len() as u64,
                 results.len() as u64,
-                estimated_slices,
-                estimated_payload_bytes,
+                (estimated_slices, estimated_payload_bytes),
                 None,
                 true,
                 started.elapsed(),
@@ -868,8 +866,7 @@ impl RedbMetaEngine {
         self.write_metrics.observe_batch(
             mutations.len() as u64,
             results.len() as u64,
-            estimated_slices,
-            estimated_payload_bytes,
+            (estimated_slices, estimated_payload_bytes),
             None,
             false,
             started.elapsed(),
