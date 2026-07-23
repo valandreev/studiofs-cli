@@ -21,6 +21,14 @@ fn shutdown_recoverable_on_restart(
     dirty_after == 0 && local_payload_sync_ok && metadata_flush_outcome == "success"
 }
 
+struct ShutdownFinalDrainGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ShutdownFinalDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
@@ -335,11 +343,11 @@ impl StudioVfs {
             .shutdown
             .shutdown_final_drain_active
             .store(true, Ordering::Release);
-        let local_dirty_drain_error = self.flush_pending_payloads_for_shutdown().await.err();
-        self.state
-            .shutdown
-            .shutdown_final_drain_active
-            .store(false, Ordering::Release);
+        let local_dirty_drain_error = {
+            let _shutdown_final_drain_guard =
+                ShutdownFinalDrainGuard(&self.state.shutdown.shutdown_final_drain_active);
+            self.flush_pending_payloads_for_shutdown().await.err()
+        };
         info!(
             pending_uploads = self.pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,

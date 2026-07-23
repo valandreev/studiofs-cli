@@ -312,6 +312,7 @@ const OVERLAY_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 type OverlayCompletionSender =
     tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>;
+type OverlayCompletionList = smallvec::SmallVec<[OverlayCompletionSender; 2]>;
 
 struct QueuedOverlayMutation {
     sequence: u128,
@@ -340,14 +341,23 @@ struct OverlayBatchInner {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OverlayBatchObservability {
+    /// Number of mutations admitted to the shared volatile queue.
     pub enqueued: u64,
+    /// Number of mutations merged into an earlier mutation for the same inode.
     pub coalesced: u64,
+    /// Current number of queued mutations, excluding the in-flight batch.
     pub queue_depth: u64,
+    /// Current descriptor memory reserved by queued mutations, in bytes.
     pub queue_bytes: u64,
+    /// Age of the oldest queued mutation, in milliseconds.
     pub dirty_age_ms: u64,
+    /// Number of redb batches completed by the worker.
     pub batches: u64,
+    /// Number of mutations requested by callers.
     pub requested_operations: u64,
+    /// Number of merged mutations executed by redb.
     pub actual_operations: u64,
+    /// Number of strict barriers that waited for the volatile queue.
     pub forced_barriers: u64,
 }
 
@@ -688,19 +698,24 @@ struct OverlayBatchDrainingGuard {
 impl Drop for OverlayBatchDrainingGuard {
     fn drop(&mut self) {
         let handle = tokio::runtime::Handle::try_current().ok();
-        let restart = {
+        let fail_queued = {
             let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
             inner.draining = false;
             if inner.queue.is_empty() {
                 false
             } else if handle.is_some() {
                 inner.draining = true;
-                true
-            } else {
                 false
+            } else {
+                true
             }
         };
-        if restart && let Some(handle) = handle {
+        if fail_queued {
+            let error = Arc::new(VfsError::Other(
+                "overlay batch drainer stopped during runtime shutdown".to_string(),
+            ));
+            fail_queued_overlay_mutations(&self.state, &error);
+        } else if let Some(handle) = handle {
             let state = Arc::clone(&self.state);
             let meta = self.meta.clone();
             handle.spawn(async move {
@@ -720,7 +735,7 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
     loop {
         let mut mutations: Vec<studiofs_meta::RegularFileOverlayMutation> =
             Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
-        let mut completions: Vec<Vec<OverlayCompletionSender>> =
+        let mut completions: Vec<OverlayCompletionList> =
             Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
         let mut admissions = Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
         let mut last_sequence = None;
@@ -744,7 +759,7 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                     coalesced_operations += 1;
                 } else {
                     mutations.push(queued.mutation);
-                    completions.push(vec![queued.completion]);
+                    completions.push(smallvec::smallvec![queued.completion]);
                 }
                 last_sequence = Some(queued.sequence);
                 admitted_operations += 1;
@@ -877,14 +892,20 @@ fn merge_overlay_mutations(
     target: &mut studiofs_meta::RegularFileOverlayMutation,
     incoming: studiofs_meta::RegularFileOverlayMutation,
 ) {
-    let mut by_chunk = std::collections::BTreeMap::new();
-    for (chunk_id, slices) in target.chunk_slices.drain(..) {
-        by_chunk.insert(chunk_id, slices);
-    }
     for (chunk_id, slices) in incoming.chunk_slices {
-        by_chunk.entry(chunk_id).or_default().extend(slices);
+        if let Some((_, target_slices)) = target
+            .chunk_slices
+            .iter_mut()
+            .find(|(target_chunk_id, _)| *target_chunk_id == chunk_id)
+        {
+            target_slices.extend(slices);
+        } else {
+            target.chunk_slices.push((chunk_id, slices));
+        }
     }
-    target.chunk_slices = by_chunk.into_iter().collect();
+    target
+        .chunk_slices
+        .sort_unstable_by_key(|(chunk_id, _)| *chunk_id);
     if incoming.attr.is_some() {
         target.attr = incoming.attr;
     }
