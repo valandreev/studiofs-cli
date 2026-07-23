@@ -216,6 +216,24 @@ mod tests {
         assert!(!error.to_string().contains("second failure"));
     }
 
+    #[test]
+    fn degraded_overlay_barrier_does_not_wait_for_stopped_drainer() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-stopped-drainer");
+        {
+            let mut inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+            inner.last_admitted_sequence = Some(1);
+        }
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("stopped drainer".to_string());
+
+        let error = rt
+            .block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect_err("degraded barrier must return instead of waiting forever");
+        assert!(error.to_string().contains("stopped drainer"));
+    }
+
     fn single_block_fixture(
         ino: Ino,
         block_index: u32,

@@ -389,7 +389,7 @@ pub(super) struct LocalDirtyState {
     pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
     pub(super) overlay_batch: OverlayBatchState,
-    pub(super) overlay_metadata_error: Mutex<Option<String>>,
+    pub(super) overlay_metadata_error: Mutex<Option<Arc<str>>>,
     pub(super) overlay_metadata_degraded: AtomicBool,
 }
 
@@ -439,7 +439,7 @@ impl LocalDirtyState {
     pub(super) fn mark_overlay_metadata_error(&self, error: String) {
         let mut retained = self.overlay_metadata_error.lock();
         if retained.is_none() {
-            *retained = Some(error);
+            *retained = Some(error.into());
         }
         self.overlay_metadata_degraded
             .store(true, Ordering::Release);
@@ -489,6 +489,7 @@ impl StudioVfs {
             if complete {
                 return Ok(());
             }
+            self.ensure_volatile_overlay_metadata_healthy()?;
             notified.await;
         }
     }
@@ -575,10 +576,19 @@ impl StudioVfs {
                     None
                 } else {
                     let sequence = inner.next_sequence;
-                    inner.next_sequence = inner
-                        .next_sequence
-                        .checked_add(1)
-                        .expect("overlay batch sequence exhausted");
+                    let next_sequence = inner.next_sequence.checked_add(1).ok_or_else(|| {
+                        VfsError::Other("overlay batch sequence exhausted".to_string())
+                    })?;
+                    let queued_mutation = mutation.take().ok_or_else(|| {
+                        VfsError::Other("overlay mutation was already admitted".to_string())
+                    })?;
+                    let queued_completion = completion.take().ok_or_else(|| {
+                        VfsError::Other("overlay completion was already admitted".to_string())
+                    })?;
+                    let queued_admission = admission.take().ok_or_else(|| {
+                        VfsError::Other("overlay queue admission was already consumed".to_string())
+                    })?;
+                    inner.next_sequence = next_sequence;
                     inner.last_admitted_sequence = Some(sequence);
                     inner.enqueued = inner.enqueued.saturating_add(1);
                     inner.queued_descriptor_bytes = inner
@@ -586,13 +596,11 @@ impl StudioVfs {
                         .saturating_add(descriptor_bytes);
                     inner.queue.push_back(QueuedOverlayMutation {
                         sequence,
-                        mutation: mutation.take().expect("overlay mutation is retained"),
-                        completion: completion.take().expect("overlay completion is retained"),
+                        mutation: queued_mutation,
+                        completion: queued_completion,
                         write_path_started_at: self.write_path_started_at,
                         descriptor_bytes,
-                        admission: admission
-                            .take()
-                            .expect("overlay queue admission is retained"),
+                        admission: queued_admission,
                     });
                     Some(if inner.draining {
                         false
@@ -692,43 +700,31 @@ fn overlay_mutation_descriptor_bytes(
 
 struct OverlayBatchDrainingGuard {
     state: Arc<VfsState>,
-    meta: MetaExecutor<dyn VfsMeta>,
+    armed: bool,
+}
+
+impl OverlayBatchDrainingGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for OverlayBatchDrainingGuard {
     fn drop(&mut self) {
-        let handle = tokio::runtime::Handle::try_current().ok();
-        let fail_queued = {
-            let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
-            inner.draining = false;
-            if inner.queue.is_empty() {
-                false
-            } else if handle.is_some() {
-                inner.draining = true;
-                false
-            } else {
-                true
-            }
-        };
-        if fail_queued {
-            let error = Arc::new(VfsError::Other(
-                "overlay batch drainer stopped during runtime shutdown".to_string(),
-            ));
+        if self.armed {
+            let error = Arc::new(VfsError::Other("overlay batch drainer stopped".to_string()));
+            self.state
+                .local_dirty
+                .mark_overlay_metadata_error(error.to_string());
             fail_queued_overlay_mutations(&self.state, &error);
-        } else if let Some(handle) = handle {
-            let state = Arc::clone(&self.state);
-            let meta = self.meta.clone();
-            handle.spawn(async move {
-                drain_regular_file_overlay_batches(state, meta).await;
-            });
         }
     }
 }
 
 async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExecutor<dyn VfsMeta>) {
-    let _draining_guard = OverlayBatchDrainingGuard {
+    let mut draining_guard = OverlayBatchDrainingGuard {
         state: Arc::clone(&state),
-        meta: meta.clone(),
+        armed: true,
     };
     tokio::time::sleep(OVERLAY_BATCH_COALESCE_DELAY).await;
 
@@ -771,6 +767,7 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
             }
             if mutations.is_empty() {
                 inner.draining = false;
+                draining_guard.disarm();
                 state
                     .local_dirty
                     .overlay_batch
@@ -778,6 +775,11 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                     .notify_waiters();
                 return;
             }
+        }
+        for mutation in &mut mutations {
+            mutation
+                .chunk_slices
+                .sort_unstable_by_key(|(chunk_id, _)| *chunk_id);
         }
         if coalesced_operations > 0 {
             let mut inner = state.local_dirty.overlay_batch.inner.lock();
@@ -805,12 +807,14 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                 .actual_operations
                 .saturating_add(actual_operations as u64);
         }
-        record_overlay_batch_observability(
-            &state,
-            write_path_started_at.expect("non-empty overlay batch has a start time"),
-            started.elapsed(),
-            result.is_ok(),
-        );
+        if let Some(write_path_started_at) = write_path_started_at {
+            record_overlay_batch_observability(
+                &state,
+                write_path_started_at,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
 
         match result {
             Ok(attrs) if attrs.len() == completions.len() => {
@@ -837,6 +841,7 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                     mark_overlay_sequence_complete(&state, sequence);
                 }
                 fail_queued_overlay_mutations(&state, &error);
+                draining_guard.disarm();
                 return;
             }
             Err(error) => {
@@ -853,6 +858,7 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
                     mark_overlay_sequence_complete(&state, sequence);
                 }
                 fail_queued_overlay_mutations(&state, &error);
+                draining_guard.disarm();
                 return;
             }
         }
@@ -874,6 +880,7 @@ fn mark_overlay_sequence_complete(state: &Arc<VfsState>, sequence: u128) {
 
 fn fail_queued_overlay_mutations(state: &Arc<VfsState>, error: &Arc<VfsError>) {
     let mut inner = state.local_dirty.overlay_batch.inner.lock();
+    inner.draining = false;
     while let Some(queued) = inner.queue.pop_front() {
         inner.queued_descriptor_bytes = inner
             .queued_descriptor_bytes
@@ -903,9 +910,6 @@ fn merge_overlay_mutations(
             target.chunk_slices.push((chunk_id, slices));
         }
     }
-    target
-        .chunk_slices
-        .sort_unstable_by_key(|(chunk_id, _)| *chunk_id);
     if incoming.attr.is_some() {
         target.attr = incoming.attr;
     }
