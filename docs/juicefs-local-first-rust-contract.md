@@ -126,8 +126,9 @@ Durability clocks, pending state, and the idle-progress worker belong to one
 metadata-engine instance, so mounts cannot satisfy or delay each other's
 barriers.
 If a background redb batch fails, the VFS records a degraded local-metadata
-error. The next ordinary flush reports that error; `fsync` and shutdown still
-attempt their strict local-redb barriers and return any failure.
+error and stops new volatile metadata admissions. The next ordinary flush
+reports that error; `fsync` and shutdown drain admitted work, execute their
+strict local-redb barriers, and return the retained failure.
 
 Crash behavior:
 

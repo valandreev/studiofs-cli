@@ -386,12 +386,16 @@ impl StudioVfs {
             "VFS shutdown: persisting metadata"
         );
         let meta = self.sync_meta();
+        let overlay_barrier_error = self.wait_for_volatile_overlay_batches().await.err();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_result =
             super::run_sync_with_timeout(metadata_flush_timeout, move || {
                 meta.sync_local_metadata().map_err(VfsError::Meta)
             });
-        let mut metadata_barrier_error = local_dirty_drain_error;
+        let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
+        let mut metadata_barrier_error = local_dirty_drain_error
+            .or(overlay_barrier_error)
+            .or(overlay_health_error);
         let metadata_flush_outcome = match metadata_flush_result {
             Ok(Some(()))
                 if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() =>

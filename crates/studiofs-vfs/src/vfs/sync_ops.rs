@@ -71,13 +71,13 @@ impl StudioVfs {
             .metadata_sync_barrier_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.drain_deferred_namespace_metadata_for_barrier().await?;
+        self.wait_for_volatile_overlay_batches().await?;
         let meta = self.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.sync_local_metadata()
         })
         .await?;
-        self.clear_volatile_overlay_metadata_error();
-        Ok(())
+        self.ensure_volatile_overlay_metadata_healthy()
     }
 
     /// Spawn a background task that replays landing-zone segments left from a previous run.
@@ -965,7 +965,6 @@ impl StudioVfs {
             self.spawn_deferred_materialization_if_needed(target_ino)
                 .await;
         }
-        self.flush_metadata_barrier().await?;
         Ok(ExplicitFlushOutcome {
             flushed_local_dirty_state: had_local_dirty_state,
         })

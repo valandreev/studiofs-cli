@@ -570,6 +570,22 @@ fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
 }
 
 #[test]
+fn runtime_stats_surface_reports_overlay_batch_metrics() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
+    let snapshot = vfs.runtime_stats_snapshot();
+
+    assert!(snapshot.metadata.counters.contains_key("overlay_enqueue"));
+    assert!(snapshot.metadata.gauges.contains_key("overlay_queue_depth"));
+    assert!(
+        snapshot
+            .metadata
+            .gauges
+            .contains_key("overlay_dirty_age_ms")
+    );
+}
+
+#[test]
 fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
     let mut fixture =
         ContractVfsFixture::new("vfs-contract-harness").expect("create vfs contract fixture");
@@ -10993,7 +11009,7 @@ fn volatile_flush_reports_a_previous_metadata_commit_failure() {
 }
 
 #[test]
-fn strict_metadata_barrier_clears_previous_volatile_overlay_error() {
+fn strict_metadata_barrier_surfaces_previous_volatile_overlay_error() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-recovery");
     let _guard = rt.enter();
@@ -11005,12 +11021,11 @@ fn strict_metadata_barrier_clears_previous_volatile_overlay_error() {
             .local_dirty
             .mark_overlay_metadata_error("simulated redb outage".to_string());
 
-        vfs.fsync_with_outcome(attr.ino, false)
+        let error = vfs
+            .fsync_with_outcome(attr.ino, false)
             .await
-            .expect("strict metadata barrier should recover local metadata");
-        vfs.flush_volatile_writeback_with_outcome(attr.ino, 0)
-            .await
-            .expect("volatile flush should be admitted after strict recovery");
+            .expect_err("strict metadata barrier must surface the retained failure");
+        assert!(error.to_string().contains("simulated redb outage"));
     });
 }
 

@@ -175,21 +175,45 @@ mod tests {
         let batch = meta.metadata_write_observability().batch;
         assert_eq!(batch.batches, 1);
         assert_eq!(batch.requested_ops, 2);
+    }
+
+    #[test]
+    fn degraded_overlay_metadata_rejects_new_admissions() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-degraded-admission");
+        let attr = vfs
+            .create(1, b"degraded-admission.bin", 0, 0, 0o644)
+            .expect("create file");
 
         vfs.state
             .local_dirty
             .mark_overlay_metadata_error("sticky overlay failure".to_string());
-        rt.block_on(async {
-            let committer = VfsOverlayCommitter { vfs: &vfs };
-            committer
-                .commit_overlay(first.ino, Vec::new(), Some(first))
+        let error = rt.block_on(async {
+            VfsOverlayCommitter { vfs: &vfs }
+                .commit_overlay(attr.ino, Vec::new(), Some(attr))
                 .await
-                .expect("a later successful batch should still complete");
+                .expect_err("degraded metadata must reject new admissions")
         });
-        assert!(
-            vfs.ensure_volatile_overlay_metadata_healthy().is_err(),
-            "a successful volatile batch must not clear a previous metadata failure"
-        );
+        assert!(error.to_string().contains("sticky overlay failure"));
+    }
+
+    #[test]
+    fn overlay_metadata_retains_first_failure() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-error");
+
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("first failure".to_string());
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("second failure".to_string());
+
+        let error = vfs
+            .ensure_volatile_overlay_metadata_healthy()
+            .expect_err("metadata must remain degraded");
+        assert!(error.to_string().contains("first failure"));
+        assert!(!error.to_string().contains("second failure"));
     }
 
     fn single_block_fixture(

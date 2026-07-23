@@ -78,6 +78,7 @@ impl StudioVfs {
         let upload = self.upload_stats();
         let write_path = self.write_path_observability_snapshot();
         let cache = self.cache_state_snapshot();
+        let overlay_batch = self.overlay_batch_observability();
 
         let mut snapshot = RuntimeStatsSnapshot {
             generated_unix_ms,
@@ -498,6 +499,60 @@ impl StudioVfs {
             "ns",
             write_path.metadata_commit.calls,
             ms_sum_to_ns(write_path.metadata_commit.total_ms),
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_enqueue",
+            "count",
+            overlay_batch.enqueued,
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_coalesced",
+            "count",
+            overlay_batch.coalesced,
+        );
+        insert_gauge(
+            &mut snapshot.metadata,
+            "overlay_queue_depth",
+            "count",
+            overlay_batch.queue_depth,
+        );
+        insert_gauge(
+            &mut snapshot.metadata,
+            "overlay_queue_bytes",
+            "bytes",
+            overlay_batch.queue_bytes,
+        );
+        insert_gauge(
+            &mut snapshot.metadata,
+            "overlay_dirty_age_ms",
+            "ms",
+            overlay_batch.dirty_age_ms,
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_batches",
+            "count",
+            overlay_batch.batches,
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_requested_operations",
+            "count",
+            overlay_batch.requested_operations,
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_actual_operations",
+            "count",
+            overlay_batch.actual_operations,
+        );
+        insert_counter(
+            &mut snapshot.metadata,
+            "overlay_forced_barriers",
+            "count",
+            overlay_batch.forced_barriers,
         );
 
         snapshot
