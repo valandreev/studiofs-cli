@@ -2093,6 +2093,7 @@ impl ReadState {
 
 struct ShutdownState {
     shutdown_requested: std::sync::atomic::AtomicBool,
+    shutdown_final_drain_active: std::sync::atomic::AtomicBool,
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_completed: std::sync::atomic::AtomicBool,
     shutdown_notify: tokio::sync::Notify,
@@ -2107,6 +2108,7 @@ impl ShutdownState {
     fn new() -> Self {
         Self {
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),

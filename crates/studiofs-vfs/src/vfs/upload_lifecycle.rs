@@ -21,6 +21,14 @@ fn shutdown_recoverable_on_restart(
     dirty_after == 0 && local_payload_sync_ok && metadata_flush_outcome == "success"
 }
 
+struct ShutdownFinalDrainGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ShutdownFinalDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
@@ -331,7 +339,15 @@ impl StudioVfs {
             pending_uploads = self.pending_uploads_snapshot().len(),
             "VFS shutdown: flushing pending local dirty state"
         );
-        self.flush_pending_payloads_for_shutdown().await;
+        self.state
+            .shutdown
+            .shutdown_final_drain_active
+            .store(true, Ordering::Release);
+        let local_dirty_drain_error = {
+            let _shutdown_final_drain_guard =
+                ShutdownFinalDrainGuard(&self.state.shutdown.shutdown_final_drain_active);
+            self.flush_pending_payloads_for_shutdown().await.err()
+        };
         info!(
             pending_uploads = self.pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -386,16 +402,24 @@ impl StudioVfs {
             "VFS shutdown: persisting metadata"
         );
         let meta = self.sync_meta();
+        let overlay_barrier_error = self.wait_for_volatile_overlay_batches().await.err();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_result =
             super::run_sync_with_timeout(metadata_flush_timeout, move || {
                 meta.sync_local_metadata().map_err(VfsError::Meta)
             });
-        let mut metadata_barrier_error = None;
+        let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
+        let mut metadata_barrier_error = local_dirty_drain_error
+            .or(overlay_barrier_error)
+            .or(overlay_health_error);
         let metadata_flush_outcome = match metadata_flush_result {
-            Ok(Some(())) if deferred_namespace_error.is_none() => "success",
+            Ok(Some(()))
+                if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() =>
+            {
+                "success"
+            }
             Ok(Some(())) => {
-                warn!("VFS shutdown: deferred namespace metadata drain failed");
+                warn!("VFS shutdown: local metadata drain failed before the final barrier");
                 "failed"
             }
             Ok(None) => {
@@ -403,15 +427,17 @@ impl StudioVfs {
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
                     "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
                 );
-                metadata_barrier_error = Some(VfsError::Other(format!(
-                    "metadata durability barrier timed out after {} ms",
-                    metadata_flush_timeout.as_millis()
-                )));
+                metadata_barrier_error.get_or_insert_with(|| {
+                    VfsError::Other(format!(
+                        "metadata durability barrier timed out after {} ms",
+                        metadata_flush_timeout.as_millis()
+                    ))
+                });
                 "timeout"
             }
             Err(e) => {
                 warn!("VFS shutdown: metadata flush failed: {}", e);
-                metadata_barrier_error = Some(e);
+                metadata_barrier_error.get_or_insert(e);
                 "failed"
             }
         };

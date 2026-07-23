@@ -57,7 +57,7 @@ pub struct MetadataBatchWriteObservability {
 // =============================================================================
 // Errors
 // =============================================================================
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 /// Common metadata-layer error surface shared by all engine backends.
 pub enum MetaError {
     /// The requested inode does not exist in metadata.

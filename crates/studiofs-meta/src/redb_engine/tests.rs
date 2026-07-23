@@ -57,6 +57,18 @@ fn sync_local_metadata_executes_immediate_barrier() {
 }
 
 #[test]
+fn default_engine_uses_one_second_volatile_metadata_durability() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("meta.redb")).expect("open metadata");
+
+    let runtime = engine
+        .relaxed_durability
+        .as_ref()
+        .expect("volatile metadata worker is always enabled");
+    assert_eq!(runtime.state.interval_ms, 1_000);
+}
+
+#[test]
 fn flush_metadata_only_executes_due_relaxed_barrier() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
@@ -107,6 +119,9 @@ fn prepare_for_close_makes_later_relaxed_writes_immediate() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
 
+    engine
+        .sync_local_metadata()
+        .expect("initial schema writes must be durable before close preparation");
     engine.prepare_for_close();
     engine.set_counter("after-close-preparation", 1).unwrap();
 

@@ -363,7 +363,7 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
-            vfs.flush_winfsp_writeback_with_outcome(request.ino, request.fh)
+            vfs.flush_volatile_writeback_with_outcome(request.ino, request.fh)
                 .await
         })
     }
@@ -451,7 +451,9 @@ impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
         };
 
         let result = if request.is_dir {
-            self.context.vfs.rmdir(request.parent_ino, &request.name)
+            self.context
+                .vfs
+                .rmdir_for_cleanup(request.parent_ino, &request.name)
         } else {
             self.context.vfs.unlink(request.parent_ino, &request.name)
         };

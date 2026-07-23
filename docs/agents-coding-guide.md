@@ -124,8 +124,8 @@ Higher priority (lower tier number) must be acquired first:
 
 - `write` accepts bytes into file/chunk/slice writer state and does not wait for
   upload or PostgreSQL replication.
-- `flush` freezes and finishes the dirty slices it owns through the cached-store
-  pipeline.
+- `flush` admits the dirty state to the bounded volatile worker and does not
+  wait for a redb durability barrier.
 - `fsync` is the strict caller-requested local sync API and must not imply remote publication.
 - WinFSP `cleanup`:
   - WinFSP `FlushAndPurgeOnCleanup` is enabled by default; write-capable
@@ -138,5 +138,7 @@ Higher priority (lower tier number) must be acquired first:
   - non-delete StudioFS cleanup callback handling is observational; it should
     not be the ownership point for dirty local persistence.
 - `overwrite`, WinFSP `set_file_size`, and size-changing FUSE paths must persist new EOF/attrs before returning.
-- `release` (FUSE) and `close`/`release_fh` (WinFSP) are release-path checks; they drain remaining local writer state when required without moving remote publication to the foreground.
+- `release` (FUSE) and `close`/`release_fh` (WinFSP) admit remaining local
+  writer state without moving remote publication or redb durability to the
+  foreground; strict callers use `fsync` or shutdown.
 - Treat repeated/non-delete cleanup foreground barriers in sequential-write Windows validation (`cleanup_skipped_clean`, `cleanup_flush_fh`) as signs of avoidable callback work (SFS-192 follow-up signal).

@@ -91,7 +91,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
+    use studiofs_meta::{
+        MetaEngineCore, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine,
+    };
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -147,6 +149,137 @@ mod tests {
         )
         .expect("create vfs");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn concurrent_overlay_commits_share_one_metadata_batch() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overlay-batch");
+        let first = vfs
+            .create(1, b"first.bin", 0, 0, 0o644)
+            .expect("create first file");
+        let second = vfs
+            .create(1, b"second.bin", 0, 0, 0o644)
+            .expect("create second file");
+
+        rt.block_on(async {
+            let committer = VfsOverlayCommitter { vfs: &vfs };
+            let (first_result, second_result) = tokio::join!(
+                committer.commit_overlay(first.ino, Vec::new(), Some(first.clone())),
+                committer.commit_overlay(second.ino, Vec::new(), Some(second)),
+            );
+            first_result.expect("commit first overlay");
+            second_result.expect("commit second overlay");
+        });
+
+        let batch = meta.metadata_write_observability().batch;
+        assert_eq!(batch.batches, 1);
+        assert_eq!(batch.requested_ops, 2);
+    }
+
+    #[test]
+    fn first_overlay_sequence_is_above_completion_sentinel() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-sequence");
+        let inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+
+        assert_eq!(inner.completed_sequence, 0);
+        assert_eq!(inner.next_sequence, 1);
+    }
+
+    #[test]
+    fn degraded_overlay_metadata_rejects_new_admissions() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-degraded-admission");
+        let attr = vfs
+            .create(1, b"degraded-admission.bin", 0, 0, 0o644)
+            .expect("create file");
+
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("sticky overlay failure".to_string());
+        let error = rt.block_on(async {
+            VfsOverlayCommitter { vfs: &vfs }
+                .commit_overlay(attr.ino, Vec::new(), Some(attr))
+                .await
+                .expect_err("degraded metadata must reject new admissions")
+        });
+        assert!(error.to_string().contains("sticky overlay failure"));
+    }
+
+    #[test]
+    fn overlay_metadata_retains_first_failure() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-error");
+
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("first failure".to_string());
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("second failure".to_string());
+
+        let error = vfs
+            .ensure_volatile_overlay_metadata_healthy()
+            .expect_err("metadata must remain degraded");
+        assert!(error.to_string().contains("first failure"));
+        assert!(!error.to_string().contains("second failure"));
+    }
+
+    #[test]
+    fn degraded_overlay_barrier_does_not_wait_for_stopped_drainer() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-stopped-drainer");
+        {
+            let mut inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+            inner.last_admitted_sequence = Some(1);
+        }
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("stopped drainer".to_string());
+
+        let error = rt
+            .block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect_err("degraded barrier must return instead of waiting forever");
+        assert!(error.to_string().contains("stopped drainer"));
+    }
+
+    #[test]
+    fn degraded_overlay_barrier_reports_completed_failure() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-completed-failure");
+        {
+            let mut inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+            inner.last_admitted_sequence = Some(1);
+            inner.completed_sequence = 1;
+        }
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("completed batch failed".to_string());
+
+        let error = rt
+            .block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect_err("completed failed batch must remain visible to the barrier");
+        assert!(error.to_string().contains("completed batch failed"));
+    }
+
+    #[test]
+    fn cloned_overlay_io_errors_preserve_raw_os_error() {
+        let raw_code = 5;
+        let cloned =
+            clone_overlay_batch_error(&VfsError::Io(std::io::Error::from_raw_os_error(raw_code)));
+        let VfsError::Io(cloned) = cloned else {
+            panic!("expected cloned VFS I/O error");
+        };
+        assert_eq!(cloned.raw_os_error(), Some(raw_code));
+
+        let cloned = clone_object_error(&studiofs_data::object::ObjectError::Io(
+            std::io::Error::from_raw_os_error(raw_code),
+        ));
+        let studiofs_data::object::ObjectError::Io(cloned) = cloned else {
+            panic!("expected cloned object I/O error");
+        };
+        assert_eq!(cloned.raw_os_error(), Some(raw_code));
     }
 
     fn single_block_fixture(

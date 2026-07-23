@@ -1727,7 +1727,7 @@ impl SessionState {
                 .ok_or(libc::EBADF)?;
             return self
                 .runtime_handle
-                .block_on(self.vfs.flush_fuse_writeback_with_outcome(ino, fh))
+                .block_on(self.vfs.flush_volatile_writeback_with_outcome(ino, fh))
                 .map(|_| ())
                 .map_err(|error| vfs_err_to_errno(&error));
         }

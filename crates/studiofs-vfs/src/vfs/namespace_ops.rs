@@ -30,6 +30,7 @@ const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
 const RMDIR_INFLIGHT_RETRY_ATTEMPTS: u16 = 200;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
+const RMDIR_CLEANUP_RETRY_ATTEMPTS: u16 = 200;
 
 #[cfg(not(target_os = "macos"))]
 fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
@@ -2439,6 +2440,27 @@ impl StudioVfs {
     /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         Self::run_sync_future(self.rmdir_inner(parent, name))
+    }
+
+    /// Retry a cleanup-triggered directory removal while child callbacks catch up.
+    pub fn rmdir_for_cleanup(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        Self::run_sync_future(self.rmdir_for_cleanup_inner(parent, name))
+    }
+
+    async fn rmdir_for_cleanup_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        for attempt in 0..RMDIR_CLEANUP_RETRY_ATTEMPTS {
+            match self.rmdir_inner(parent, name).await {
+                Err(VfsError::Meta(MetaError::DirNotEmpty(_)))
+                    if attempt + 1 < RMDIR_CLEANUP_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(RMDIR_INFLIGHT_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+        Err(VfsError::Other(
+            "directory cleanup retry loop exhausted without a result".to_string(),
+        ))
     }
 
     async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {

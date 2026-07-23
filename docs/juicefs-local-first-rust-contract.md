@@ -112,20 +112,23 @@ mean peer visibility.
 
 | Operation | Contract |
 |---|---|
-| `flush` | Freeze and finish dirty slices needed for the handle/inode, commit the resulting local slice metadata, and surface local errors. It does not wait for peer publication. |
+| `flush` | Admit the latest accepted handle/inode state to the shared volatile local-dirty worker. It may return before a redb commit; the worker commits metadata within one second. It does not wait for peer publication. |
 | `fsync` | The strict caller-requested local boundary. Durable cache mode must finish and sync the local cache/metadata state needed to recover the accepted data locally. Throughput-first Fast cache mode drains StudioFS state but does not force payload file fsync/dirsync. It does not wait for peer publication. |
-| last-handle close / release | Drains remaining dirty writer state through the local slice/cache pipeline so later opens on the same mount see coherent local state. It does not wait for peer publication. |
+| last-handle close / release | Admit remaining writer state to the same volatile worker. It does not wait for a redb commit or peer publication. |
 
-All three boundaries use the same metadata ordering below the platform
-adapters. Create admission stops at shutdown; a flush, strict sync, or final
-release drains all previously admitted deferred namespace mutations before it
-enters the metadata engine. `flush` and final release then advance the engine's
-bounded group-commit policy and propagate any drain or persistence error.
-`fsync` and clean shutdown execute an explicit redb `Immediate` transaction
-after the drain, making every earlier `Durability::None` commit for that
-database durable before success is reported. Durability clocks, pending state,
-and the idle-progress worker belong to one metadata-engine instance, so mounts
-cannot satisfy or delay each other's barriers.
+Flush and final release share one bounded VFS queue: at most 256 metadata
+operations and 4 MiB of metadata descriptors. Create admission stops at
+shutdown; clean shutdown drains all previously admitted state before it enters
+the metadata engine. `fsync` and clean shutdown execute an explicit redb
+`Immediate` transaction after the drain, making every earlier
+`Durability::None` commit for that database durable before success is reported.
+Durability clocks, pending state, and the idle-progress worker belong to one
+metadata-engine instance, so mounts cannot satisfy or delay each other's
+barriers.
+If a background redb batch fails, the VFS records a degraded local-metadata
+error and stops new volatile metadata admissions. The next ordinary flush
+reports that error; `fsync` and shutdown drain admitted work, execute their
+strict local-redb barriers, and return the retained failure.
 
 Crash behavior:
 
@@ -136,11 +139,10 @@ Crash behavior:
 - A crash after `fsync` must recover the locally durable view in Durable cache
   mode. In Fast cache mode, payload bytes still only in the OS page cache may be
   lost.
-- A crash after ordinary `flush` or close must recover whatever those operations
-  explicitly made locally durable according to the platform callback contract.
-- Relaxed metadata durability is opt-in. Its periodic per-engine group commit
-  progresses while the mount is idle; explicit `fsync` and clean shutdown do
-  not wait for that deadline.
+- A crash after ordinary `flush` or close may lose accepted state that has not
+  yet crossed the one-second volatile metadata window.
+- Volatile metadata group commit is always enabled. Explicit `fsync` and clean
+  shutdown do not wait for the idle deadline: they drain and make redb durable.
 
 ## 5. Cached Store Contract
 

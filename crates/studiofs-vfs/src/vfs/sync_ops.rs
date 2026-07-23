@@ -71,11 +71,13 @@ impl StudioVfs {
             .metadata_sync_barrier_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.drain_deferred_namespace_metadata_for_barrier().await?;
+        self.wait_for_volatile_overlay_batches().await?;
         let meta = self.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.sync_local_metadata()
         })
-        .await
+        .await?;
+        self.ensure_volatile_overlay_metadata_healthy()
     }
 
     /// Spawn a background task that replays landing-zone segments left from a previous run.
@@ -936,79 +938,12 @@ impl StudioVfs {
         }
     }
 
-    /// Flush pending local state for a WinFSP writeback callback and report whether it drained
-    /// local dirty state.
+    /// Admit a platform writeback flush to the shared volatile local-dirty worker.
     ///
-    /// WinFSP passes both an inode and (sometimes) a file handle; when a handle is present we
-    /// prefer it to identify the target inode. The flush is a local durability barrier and does
-    /// not wait for remote upload completion.
-    pub async fn flush_winfsp_writeback_with_outcome(
-        self: &Arc<Self>,
-        ino: Ino,
-        fh: u64,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        let target_ino = if fh != 0 {
-            self.handle_table.get(fh).map(|open_file| open_file.ino)
-        } else {
-            None
-        }
-        .unwrap_or(ino);
-        let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
-        let ((), metadata_result) = tokio::join!(
-            self.wait_for_deferred_release_inflight(target_ino),
-            self.wait_for_deferred_namespace_metadata(target_ino)
-        );
-        metadata_result?;
-        let session = self
-            .state
-            .file_session
-            .enter_op(target_ino, FileSessionOperation::Flush)
-            .await;
-        let result: VfsResult<ExplicitFlushOutcome> = async {
-            let outcome = match self
-                .local_sync_barrier_with_outcome(
-                    target_ino,
-                    LocalSyncPolicy::Opportunistic,
-                    StickyErrorPolicy::Ignore,
-                    DirtyAttrPersistPolicy::PersistIfPresent,
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(VfsError::Meta(MetaError::InodeNotFound(_)))
-                    if had_local_dirty_state
-                        || self.inode_has_local_dirty_state(target_ino)
-                        || self.state.writer_stack.has_dirty_writers(target_ino) =>
-                {
-                    warn!(
-                        ino = target_ino,
-                        "WinFSP writeback flush kept local dirty state for removed inode"
-                    );
-                    self.flush_metadata_barrier().await?;
-                    return Ok(ExplicitFlushOutcome {
-                        flushed_local_dirty_state: true,
-                    });
-                }
-                Err(error) => return Err(error),
-            };
-            if had_local_dirty_state && !outcome.had_local_dirty_state {
-                self.state
-                    .metrics
-                    .flush_barrier_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(ExplicitFlushOutcome {
-                flushed_local_dirty_state: had_local_dirty_state || outcome.had_local_dirty_state,
-            })
-        }
-        .await;
-        drop(session);
-        self.state.file_session.gc_if_idle(target_ino);
-        result
-    }
-
-    /// Start deferred FUSE writeback materialization and report local dirty state.
-    pub async fn flush_fuse_writeback_with_outcome(
+    /// Ordinary flush returns after the VFS has accepted the latest local state;
+    /// the background worker commits metadata within its bounded age window.
+    /// `fsync` and shutdown use the strict local-redb barrier instead.
+    pub async fn flush_volatile_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
         fh: u64,
@@ -1024,12 +959,12 @@ impl StudioVfs {
             self.wait_for_deferred_namespace_metadata(target_ino)
         );
         metadata_result?;
+        self.ensure_volatile_overlay_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         if self.state.writer_stack.has_dirty_writers(target_ino) {
             self.spawn_deferred_materialization_if_needed(target_ino)
                 .await;
         }
-        self.flush_metadata_barrier().await?;
         Ok(ExplicitFlushOutcome {
             flushed_local_dirty_state: had_local_dirty_state,
         })

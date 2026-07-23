@@ -124,6 +124,31 @@ fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
     });
 }
 
+#[test]
+fn cleanup_rmdir_retries_when_child_unlink_starts_after_directory_cleanup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-cleanup-late-child");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let rmdir_vfs = vfs.clone();
+        let rmdir =
+            tokio::task::spawn_blocking(move || rmdir_vfs.rmdir_for_cleanup(ROOT_INO, b"parent"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        vfs.unlink(parent.ino, b"child.txt")
+            .expect("late child unlink should succeed");
+        rmdir
+            .await
+            .expect("cleanup rmdir task should complete")
+            .expect("cleanup rmdir should retry after the child unlink");
+    });
+}
+
 #[tokio::test]
 async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
     let shutdown = CancellationToken::new();
@@ -567,6 +592,22 @@ fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
     let mut eof = [0u8; 4];
     let read = vfs.read_runtime_stats_file(u64::MAX, &mut eof);
     assert_eq!(read, 0);
+}
+
+#[test]
+fn runtime_stats_surface_reports_overlay_batch_metrics() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
+    let snapshot = vfs.runtime_stats_snapshot();
+
+    assert!(snapshot.metadata.counters.contains_key("overlay_enqueue"));
+    assert!(snapshot.metadata.gauges.contains_key("overlay_queue_depth"));
+    assert!(
+        snapshot
+            .metadata
+            .gauges
+            .contains_key("overlay_dirty_age_ms")
+    );
 }
 
 #[test]
@@ -4741,7 +4782,7 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
             .expect("open grow writer");
         vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend logical EOF");
-        vfs.flush_winfsp_writeback_with_outcome(ino, grow_fh)
+        vfs.flush_volatile_writeback_with_outcome(ino, grow_fh)
             .await
             .expect("flush handle-backed grow");
 
@@ -6041,7 +6082,7 @@ fn handle_backed_shrink_with_dirty_writer_forces_strict_sync() {
 }
 
 #[test]
-fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
+fn fsync_after_clean_handle_extend_queues_metadata_only_publish() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");
     let _guard = rt.enter();
@@ -6067,12 +6108,12 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
         vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend clean handle");
         let outcome = vfs
-            .flush_winfsp_writeback_with_outcome(ino, fh)
+            .fsync_with_outcome(ino, false)
             .await
-            .expect("explicit flush should persist dirty attr");
+            .expect("fsync should persist dirty attr");
         assert!(
-            outcome.flushed_local_dirty_state,
-            "explicit flush should report the metadata-only dirty attr"
+            outcome.persisted_dirty_attrs,
+            "fsync should report the metadata-only dirty attr"
         );
 
         let extended_attr = meta.get_attr(ino).expect("load extended attr");
@@ -10937,6 +10978,83 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 }
 
 #[test]
+fn winfsp_flush_is_volatile_until_fsync() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "winfsp-volatile-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"winfsp-volatile-flush.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+
+        vfs.write(ino, 0, b"payload").await.expect("write payload");
+        assert!(vfs.inode_has_local_dirty_state(ino));
+
+        let outcome = vfs
+            .flush_volatile_writeback_with_outcome(ino, fh)
+            .await
+            .expect("volatile flush admission");
+        assert!(outcome.flushed_local_dirty_state);
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "ordinary flush must leave the accepted state for the background worker"
+        );
+
+        vfs.fsync_with_outcome(ino, false)
+            .await
+            .expect("fsync must establish the strict local barrier");
+        assert!(!vfs.inode_has_local_dirty_state(ino));
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
+fn volatile_flush_reports_a_previous_metadata_commit_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-degraded");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"volatile-flush-degraded.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("simulated redb outage".to_string());
+
+        let error = vfs
+            .flush_volatile_writeback_with_outcome(attr.ino, 0)
+            .await
+            .expect_err("degraded local metadata must fail an ordinary flush");
+        assert!(error.to_string().contains("simulated redb outage"));
+    });
+}
+
+#[test]
+fn strict_metadata_barrier_surfaces_previous_volatile_overlay_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-recovery");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"volatile-flush-recovery.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("simulated redb outage".to_string());
+
+        let error = vfs
+            .fsync_with_outcome(attr.ino, false)
+            .await
+            .expect_err("strict metadata barrier must surface the retained failure");
+        assert!(error.to_string().contains("simulated redb outage"));
+    });
+}
+
+#[test]
 fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-outcome-writer-stack");
@@ -11105,7 +11223,7 @@ fn winfsp_flush_waits_for_deferred_namespace_create() {
         let fh = vfs
             .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
             .expect("open deferred WinFSP flush file");
-        vfs.flush_winfsp_writeback_with_outcome(attr.ino, fh)
+        vfs.flush_volatile_writeback_with_outcome(attr.ino, fh)
             .await
             .expect("WinFSP flush should wait for deferred create");
         let looked_up = meta
@@ -14759,7 +14877,7 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
         let flushing_vfs = Arc::clone(&vfs);
         let flush = tokio::spawn(async move {
             flushing_vfs
-                .flush_winfsp_writeback_with_outcome(ino, fh)
+                .flush_volatile_writeback_with_outcome(ino, fh)
                 .await
         });
 

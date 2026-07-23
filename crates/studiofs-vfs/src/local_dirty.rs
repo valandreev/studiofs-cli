@@ -305,6 +305,68 @@ pub(super) struct LocalSyncGroupState {
     pub(super) last_sync_at: Instant,
 }
 
+const OVERLAY_BATCH_MAX_OPERATIONS: usize = 64;
+const OVERLAY_BATCH_MAX_QUEUED_OPERATIONS: usize = 256;
+const OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
+const OVERLAY_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
+
+type OverlayCompletionSender =
+    tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>;
+type OverlayCompletionList = smallvec::SmallVec<[OverlayCompletionSender; 2]>;
+
+struct QueuedOverlayMutation {
+    sequence: u128,
+    mutation: studiofs_meta::RegularFileOverlayMutation,
+    completion: OverlayCompletionSender,
+    write_path_started_at: Instant,
+    descriptor_bytes: usize,
+    admission: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct OverlayBatchInner {
+    queue: std::collections::VecDeque<QueuedOverlayMutation>,
+    queued_descriptor_bytes: usize,
+    draining: bool,
+    next_sequence: u128,
+    completed_sequence: u128,
+    last_admitted_sequence: Option<u128>,
+    enqueued: u64,
+    coalesced: u64,
+    batches: u64,
+    requested_operations: u64,
+    actual_operations: u64,
+    forced_barriers: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OverlayBatchObservability {
+    /// Number of mutations admitted to the shared volatile queue.
+    pub enqueued: u64,
+    /// Number of mutations merged into an earlier mutation for the same inode.
+    pub coalesced: u64,
+    /// Current number of queued mutations, excluding the in-flight batch.
+    pub queue_depth: u64,
+    /// Current descriptor memory reserved by queued mutations, in bytes.
+    pub queue_bytes: u64,
+    /// Age of the oldest queued mutation, in milliseconds.
+    pub dirty_age_ms: u64,
+    /// Number of redb batches completed by the worker.
+    pub batches: u64,
+    /// Number of mutations requested by callers.
+    pub requested_operations: u64,
+    /// Number of merged mutations executed by redb.
+    pub actual_operations: u64,
+    /// Number of strict barriers that waited for the volatile queue.
+    pub forced_barriers: u64,
+}
+
+pub(super) struct OverlayBatchState {
+    inner: Mutex<OverlayBatchInner>,
+    admission: Arc<tokio::sync::Semaphore>,
+    space_available: tokio::sync::Notify,
+}
+
 pub(super) struct LocalDirtyState {
     pub(super) pending_payloads:
         OrderedMutex<std::collections::HashMap<(Ino, u32), PendingPayload>>,
@@ -326,6 +388,9 @@ pub(super) struct LocalDirtyState {
     pub(super) local_sync_unsynced_bytes: AtomicU64,
     pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
+    pub(super) overlay_batch: OverlayBatchState,
+    pub(super) overlay_metadata_error: Mutex<Option<Arc<str>>>,
+    pub(super) overlay_metadata_degraded: AtomicBool,
 }
 
 impl LocalDirtyState {
@@ -359,8 +424,558 @@ impl LocalDirtyState {
                 last_sync_at: Instant::now(),
             }),
             local_sync_gate: tokio::sync::Mutex::new(()),
+            overlay_batch: OverlayBatchState {
+                inner: Mutex::new(OverlayBatchInner {
+                    next_sequence: 1,
+                    ..OverlayBatchInner::default()
+                }),
+                admission: Arc::new(tokio::sync::Semaphore::new(
+                    OVERLAY_BATCH_MAX_QUEUED_OPERATIONS,
+                )),
+                space_available: tokio::sync::Notify::new(),
+            },
+            overlay_metadata_error: Mutex::new(None),
+            overlay_metadata_degraded: AtomicBool::new(false),
         }
     }
+
+    /// Retain the first overlay commit failure and reject later volatile admissions.
+    pub(super) fn mark_overlay_metadata_error(&self, error: String) {
+        let mut retained = self.overlay_metadata_error.lock();
+        if retained.is_none() {
+            *retained = Some(error.into());
+        }
+        self.overlay_metadata_degraded
+            .store(true, Ordering::Release);
+    }
+}
+
+impl StudioVfs {
+    /// Return the sticky background overlay failure, if the worker is degraded.
+    pub(super) fn ensure_volatile_overlay_metadata_healthy(&self) -> VfsResult<()> {
+        if !self
+            .state
+            .local_dirty
+            .overlay_metadata_degraded
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let error = self.state.local_dirty.overlay_metadata_error.lock().clone();
+        if let Some(error) = error {
+            return Err(VfsError::Other(format!(
+                "local metadata commit is degraded: {error}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl StudioVfs {
+    /// Wait until every overlay mutation admitted before this call has completed successfully.
+    pub(super) async fn wait_for_volatile_overlay_batches(&self) -> VfsResult<()> {
+        let cutoff = {
+            let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
+            inner.forced_barriers = inner.forced_barriers.saturating_add(1);
+            inner
+                .last_admitted_sequence
+                .unwrap_or(inner.completed_sequence)
+        };
+        loop {
+            let notified = self
+                .state
+                .local_dirty
+                .overlay_batch
+                .space_available
+                .notified();
+            let complete = {
+                let inner = self.state.local_dirty.overlay_batch.inner.lock();
+                inner.completed_sequence >= cutoff
+            };
+            if complete {
+                return self.ensure_volatile_overlay_metadata_healthy();
+            }
+            self.ensure_volatile_overlay_metadata_healthy()?;
+            notified.await;
+        }
+    }
+
+    /// Snapshot shared overlay batching counters and queue gauges.
+    pub(crate) fn overlay_batch_observability(&self) -> OverlayBatchObservability {
+        let inner = self.state.local_dirty.overlay_batch.inner.lock();
+        let dirty_age_ms = inner
+            .queue
+            .front()
+            .map(|queued| queued.write_path_started_at.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        OverlayBatchObservability {
+            enqueued: inner.enqueued,
+            coalesced: inner.coalesced,
+            queue_depth: inner.queue.len() as u64,
+            queue_bytes: inner.queued_descriptor_bytes as u64,
+            dirty_age_ms,
+            batches: inner.batches,
+            requested_operations: inner.requested_operations,
+            actual_operations: inner.actual_operations,
+            forced_barriers: inner.forced_barriers,
+        }
+    }
+
+    /// Admit one regular-file overlay mutation to the bounded shared volatile worker.
+    pub(super) async fn commit_regular_file_overlay_batch(
+        &self,
+        mutation: studiofs_meta::RegularFileOverlayMutation,
+    ) -> VfsResult<Option<InodeAttr>> {
+        if self.shutdown_requested()
+            && !self
+                .state
+                .shutdown
+                .shutdown_final_drain_active
+                .load(Ordering::Acquire)
+        {
+            return Err(VfsError::Other(
+                "overlay metadata queue is stopping for shutdown".to_string(),
+            ));
+        }
+        self.ensure_volatile_overlay_metadata_healthy()?;
+        let descriptor_bytes = overlay_mutation_descriptor_bytes(&mutation);
+        if descriptor_bytes > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES {
+            return Err(VfsError::Other(format!(
+                "overlay metadata mutation ({descriptor_bytes} bytes) exceeds the {} byte queue limit",
+                OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
+            )));
+        }
+        let admission_semaphore = self.state.local_dirty.overlay_batch.admission.clone();
+        let mut admission = None;
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let mut mutation = Some(mutation);
+        let mut completion = Some(completion);
+        let is_drainer = loop {
+            if admission.is_none() {
+                admission = Some(admission_semaphore.clone().acquire_owned().await.map_err(
+                    |_| VfsError::Other("overlay metadata queue is closed".to_string()),
+                )?);
+            }
+            let notified = self
+                .state
+                .local_dirty
+                .overlay_batch
+                .space_available
+                .notified();
+            let admitted = {
+                let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
+                if self.shutdown_requested()
+                    && !self
+                        .state
+                        .shutdown
+                        .shutdown_final_drain_active
+                        .load(Ordering::Acquire)
+                {
+                    return Err(VfsError::Other(
+                        "overlay metadata queue is stopping for shutdown".to_string(),
+                    ));
+                }
+                self.ensure_volatile_overlay_metadata_healthy()?;
+                if inner
+                    .queued_descriptor_bytes
+                    .saturating_add(descriptor_bytes)
+                    > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
+                {
+                    None
+                } else {
+                    let sequence = inner.next_sequence;
+                    let next_sequence = inner.next_sequence.checked_add(1).ok_or_else(|| {
+                        VfsError::Other("overlay batch sequence exhausted".to_string())
+                    })?;
+                    let queued_mutation = mutation.take().ok_or_else(|| {
+                        VfsError::Other("overlay mutation was already admitted".to_string())
+                    })?;
+                    let queued_completion = completion.take().ok_or_else(|| {
+                        VfsError::Other("overlay completion was already admitted".to_string())
+                    })?;
+                    let queued_admission = admission.take().ok_or_else(|| {
+                        VfsError::Other("overlay queue admission was already consumed".to_string())
+                    })?;
+                    inner.next_sequence = next_sequence;
+                    inner.last_admitted_sequence = Some(sequence);
+                    inner.enqueued = inner.enqueued.saturating_add(1);
+                    inner.queued_descriptor_bytes = inner
+                        .queued_descriptor_bytes
+                        .saturating_add(descriptor_bytes);
+                    inner.queue.push_back(QueuedOverlayMutation {
+                        sequence,
+                        mutation: queued_mutation,
+                        completion: queued_completion,
+                        write_path_started_at: self.write_path_started_at,
+                        descriptor_bytes,
+                        admission: queued_admission,
+                    });
+                    Some(if inner.draining {
+                        false
+                    } else {
+                        inner.draining = true;
+                        true
+                    })
+                }
+            };
+            if let Some(is_drainer) = admitted {
+                break is_drainer;
+            }
+            drop(admission.take());
+            notified.await;
+        };
+
+        if is_drainer {
+            let state = Arc::clone(&self.state);
+            let meta = self.meta.clone();
+            tokio::spawn(async move {
+                drain_regular_file_overlay_batches(state, meta).await;
+            });
+        }
+
+        receiver
+            .await
+            .map_err(|_| VfsError::Other("overlay batch drainer stopped".to_string()))?
+            .map_err(|error| clone_overlay_batch_error(&error))
+    }
+}
+
+fn clone_overlay_batch_error(error: &VfsError) -> VfsError {
+    match error {
+        VfsError::Meta(error) => VfsError::Meta((*error).clone()),
+        VfsError::Io(error) => VfsError::Io(clone_io_error(error)),
+        VfsError::Data(error) => {
+            VfsError::Data(studiofs_data::store::DataError::Storage(error.to_string()))
+        }
+        VfsError::Object(error) => VfsError::Object(clone_object_error(error)),
+        VfsError::BlockNotFound(ino, block) => VfsError::BlockNotFound(*ino, *block),
+        VfsError::WouldBlock => VfsError::WouldBlock,
+        VfsError::RemoteContentPending => VfsError::RemoteContentPending,
+        VfsError::InvalidName(name) => VfsError::InvalidName(name.clone()),
+        VfsError::Other(message) => VfsError::Other(message.clone()),
+        _ => VfsError::Other(error.to_string()),
+    }
+}
+
+fn clone_object_error(
+    error: &studiofs_data::object::ObjectError,
+) -> studiofs_data::object::ObjectError {
+    use studiofs_data::object::ObjectError;
+    match error {
+        ObjectError::InvalidMagic => ObjectError::InvalidMagic,
+        ObjectError::UnsupportedVersion(version) => ObjectError::UnsupportedVersion(*version),
+        ObjectError::Io(error) => ObjectError::Io(clone_io_error(error)),
+        ObjectError::LegacyCompressionUnsupported => ObjectError::LegacyCompressionUnsupported,
+        ObjectError::ChecksumMismatch { expected, computed } => ObjectError::ChecksumMismatch {
+            expected: *expected,
+            computed: *computed,
+        },
+        ObjectError::ObjectTooLarge(size) => ObjectError::ObjectTooLarge(*size),
+        ObjectError::InvalidObjectId(value) => ObjectError::InvalidObjectId(value.clone()),
+        ObjectError::InvalidFragmentLayout(value) => {
+            ObjectError::InvalidFragmentLayout(value.clone())
+        }
+    }
+}
+
+fn clone_io_error(error: &std::io::Error) -> std::io::Error {
+    error.raw_os_error().map_or_else(
+        || std::io::Error::new(error.kind(), error.to_string()),
+        std::io::Error::from_raw_os_error,
+    )
+}
+
+fn overlay_mutation_descriptor_bytes(
+    mutation: &studiofs_meta::RegularFileOverlayMutation,
+) -> usize {
+    std::mem::size_of_val(mutation)
+        .saturating_add(
+            mutation
+                .chunk_slices
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(
+                    studiofs_meta::schema::ChunkId,
+                    Vec<studiofs_meta::schema::SliceRecord>,
+                )>()),
+        )
+        .saturating_add(
+            mutation
+                .chunk_slices
+                .iter()
+                .map(|(_, slices)| {
+                    slices
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<studiofs_meta::schema::SliceRecord>())
+                })
+                .sum::<usize>(),
+        )
+}
+
+struct OverlayBatchDrainingGuard {
+    state: Arc<VfsState>,
+    armed: bool,
+}
+
+impl OverlayBatchDrainingGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OverlayBatchDrainingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let error = Arc::new(VfsError::Other("overlay batch drainer stopped".to_string()));
+            self.state
+                .local_dirty
+                .mark_overlay_metadata_error(error.to_string());
+            fail_queued_overlay_mutations(&self.state, &error);
+        }
+    }
+}
+
+async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExecutor<dyn VfsMeta>) {
+    let mut draining_guard = OverlayBatchDrainingGuard {
+        state: Arc::clone(&state),
+        armed: true,
+    };
+    tokio::time::sleep(OVERLAY_BATCH_COALESCE_DELAY).await;
+
+    loop {
+        let mut mutations: Vec<studiofs_meta::RegularFileOverlayMutation> =
+            Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
+        let mut completions: Vec<OverlayCompletionList> =
+            Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
+        let mut admissions = Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
+        let mut last_sequence = None;
+        let mut write_path_started_at = None;
+        let mut admitted_operations = 0;
+        let mut coalesced_operations = 0;
+        {
+            let mut inner = state.local_dirty.overlay_batch.inner.lock();
+            while let Some(queued) = inner.queue.pop_front() {
+                inner.queued_descriptor_bytes = inner
+                    .queued_descriptor_bytes
+                    .saturating_sub(queued.descriptor_bytes);
+                let can_merge = mutations.last().is_some_and(|mutation| {
+                    mutation.ino == queued.mutation.ino
+                        && compatible_overlay_epochs(mutation, &queued.mutation)
+                });
+                if can_merge {
+                    let index = mutations.len() - 1;
+                    merge_overlay_mutations(&mut mutations[index], queued.mutation);
+                    completions[index].push(queued.completion);
+                    coalesced_operations += 1;
+                } else {
+                    mutations.push(queued.mutation);
+                    completions.push(smallvec::smallvec![queued.completion]);
+                }
+                last_sequence = Some(queued.sequence);
+                admitted_operations += 1;
+                write_path_started_at.get_or_insert(queued.write_path_started_at);
+                admissions.push(queued.admission);
+                if admitted_operations == OVERLAY_BATCH_MAX_OPERATIONS {
+                    break;
+                }
+            }
+            if mutations.is_empty() {
+                inner.draining = false;
+                draining_guard.disarm();
+                state
+                    .local_dirty
+                    .overlay_batch
+                    .space_available
+                    .notify_waiters();
+                return;
+            }
+        }
+        for mutation in &mut mutations {
+            mutation
+                .chunk_slices
+                .sort_unstable_by_key(|(chunk_id, _)| *chunk_id);
+        }
+        if coalesced_operations > 0 {
+            let mut inner = state.local_dirty.overlay_batch.inner.lock();
+            inner.coalesced = inner.coalesced.saturating_add(coalesced_operations as u64);
+        }
+        state
+            .local_dirty
+            .overlay_batch
+            .space_available
+            .notify_waiters();
+
+        let started = Instant::now();
+        let actual_operations = mutations.len();
+        let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.apply_regular_file_overlay_batch(&mutations)
+        })
+        .await;
+        {
+            let mut inner = state.local_dirty.overlay_batch.inner.lock();
+            inner.batches = inner.batches.saturating_add(1);
+            inner.requested_operations = inner
+                .requested_operations
+                .saturating_add(admitted_operations as u64);
+            inner.actual_operations = inner
+                .actual_operations
+                .saturating_add(actual_operations as u64);
+        }
+        if let Some(write_path_started_at) = write_path_started_at {
+            record_overlay_batch_observability(
+                &state,
+                write_path_started_at,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+
+        match result {
+            Ok(attrs) if attrs.len() == completions.len() => {
+                for (waiters, attr) in completions.into_iter().zip(attrs) {
+                    for completion in waiters {
+                        let _ = completion.send(Ok(attr.clone()));
+                    }
+                }
+            }
+            Ok(_) => {
+                let error = VfsError::Other(
+                    "overlay batch returned an unexpected result count".to_string(),
+                );
+                state
+                    .local_dirty
+                    .mark_overlay_metadata_error(error.to_string());
+                let error = Arc::new(error);
+                for waiters in completions {
+                    for completion in waiters {
+                        let _ = completion.send(Err(Arc::clone(&error)));
+                    }
+                }
+                if let Some(sequence) = last_sequence {
+                    mark_overlay_sequence_complete(&state, sequence);
+                }
+                fail_queued_overlay_mutations(&state, &error);
+                draining_guard.disarm();
+                return;
+            }
+            Err(error) => {
+                state
+                    .local_dirty
+                    .mark_overlay_metadata_error(error.to_string());
+                let error = Arc::new(error);
+                for waiters in completions {
+                    for completion in waiters {
+                        let _ = completion.send(Err(Arc::clone(&error)));
+                    }
+                }
+                if let Some(sequence) = last_sequence {
+                    mark_overlay_sequence_complete(&state, sequence);
+                }
+                fail_queued_overlay_mutations(&state, &error);
+                draining_guard.disarm();
+                return;
+            }
+        }
+        if let Some(sequence) = last_sequence {
+            mark_overlay_sequence_complete(&state, sequence);
+        }
+    }
+}
+
+fn mark_overlay_sequence_complete(state: &Arc<VfsState>, sequence: u128) {
+    let mut inner = state.local_dirty.overlay_batch.inner.lock();
+    inner.completed_sequence = inner.completed_sequence.max(sequence);
+    state
+        .local_dirty
+        .overlay_batch
+        .space_available
+        .notify_waiters();
+}
+
+fn fail_queued_overlay_mutations(state: &Arc<VfsState>, error: &Arc<VfsError>) {
+    let mut inner = state.local_dirty.overlay_batch.inner.lock();
+    inner.draining = false;
+    while let Some(queued) = inner.queue.pop_front() {
+        inner.queued_descriptor_bytes = inner
+            .queued_descriptor_bytes
+            .saturating_sub(queued.descriptor_bytes);
+        inner.completed_sequence = inner.completed_sequence.max(queued.sequence);
+        let _ = queued.completion.send(Err(Arc::clone(error)));
+    }
+    state
+        .local_dirty
+        .overlay_batch
+        .space_available
+        .notify_waiters();
+}
+
+fn merge_overlay_mutations(
+    target: &mut studiofs_meta::RegularFileOverlayMutation,
+    incoming: studiofs_meta::RegularFileOverlayMutation,
+) {
+    for (chunk_id, slices) in incoming.chunk_slices {
+        if let Some((_, target_slices)) = target
+            .chunk_slices
+            .iter_mut()
+            .find(|(target_chunk_id, _)| *target_chunk_id == chunk_id)
+        {
+            target_slices.extend(slices);
+        } else {
+            target.chunk_slices.push((chunk_id, slices));
+        }
+    }
+    if incoming.attr.is_some() {
+        target.attr = incoming.attr;
+    }
+}
+
+fn compatible_overlay_epochs(
+    left: &studiofs_meta::RegularFileOverlayMutation,
+    right: &studiofs_meta::RegularFileOverlayMutation,
+) -> bool {
+    match (left.attr.as_ref(), right.attr.as_ref()) {
+        (Some(left), Some(right)) => left.content_epoch == right.content_epoch,
+        _ => true,
+    }
+}
+
+fn record_overlay_batch_observability(
+    state: &VfsState,
+    write_path_started_at: Instant,
+    elapsed: Duration,
+    completed_commit: bool,
+) {
+    let elapsed_ns = StudioVfs::duration_ns_u64(elapsed);
+    let metrics = &state.metrics;
+    StudioVfs::observe_latency_counter(
+        &metrics.metadata_commit_calls,
+        &metrics.metadata_commit_total_ns,
+        &metrics.metadata_commit_max_ns,
+        &metrics.metadata_commit_histogram,
+        elapsed_ns,
+    );
+    if !completed_commit {
+        return;
+    }
+    metrics
+        .metadata_commit_completed_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let completed_ns = StudioVfs::duration_ns_u64(write_path_started_at.elapsed());
+    let previous_completed_ns = metrics
+        .metadata_commit_last_completed_ns
+        .swap(completed_ns, Ordering::Relaxed);
+    if previous_completed_ns == 0 || completed_ns <= previous_completed_ns {
+        return;
+    }
+    let interval_ns = completed_ns.saturating_sub(previous_completed_ns);
+    metrics
+        .metadata_commit_interval_total_ns
+        .fetch_add(interval_ns, Ordering::Relaxed);
+    metrics
+        .metadata_commit_interval_max_ns
+        .fetch_max(interval_ns, Ordering::Relaxed);
+    metrics
+        .metadata_commit_interval_histogram
+        .observe_ns(interval_ns);
 }
 
 impl<'a> LocalDirtyFlushSession<'a> {
@@ -2633,20 +3248,25 @@ impl StudioVfs {
         Ok(())
     }
 
-    pub(super) async fn flush_pending_payloads_for_shutdown(&self) {
+    pub(super) async fn flush_pending_payloads_for_shutdown(&self) -> VfsResult<()> {
         let inos = self.shutdown_dirty_inodes_by_priority();
         if inos.is_empty() {
-            return;
+            return Ok(());
         }
 
         info!(
             inode_count = inos.len(),
             "VFS shutdown: flushing dirty inodes"
         );
+        let mut first_error = None;
         for ino in inos {
             if let Err(e) = self.flush(ino).await {
                 warn!(ino, error = %e, "VFS shutdown: flush inode failed");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
