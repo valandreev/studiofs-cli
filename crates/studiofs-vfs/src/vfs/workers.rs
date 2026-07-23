@@ -207,6 +207,8 @@ impl StudioVfs {
     }
 
     pub(super) async fn background_local_dirty_flush(self: Arc<Self>) {
+        // ponytail: keep flush concurrency bounded at 32; raise only after measuring redb and payload I/O pressure.
+        const MAX_LOCAL_DIRTY_FLUSHES_IN_FLIGHT: usize = 32;
         let mut interval = tokio::time::interval(LOCAL_DIRTY_FLUSH_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -222,36 +224,51 @@ impl StudioVfs {
             if dirty_inodes.is_empty() {
                 continue;
             }
-            for ino in dirty_inodes {
+            for inode_batch in dirty_inodes.chunks(MAX_LOCAL_DIRTY_FLUSHES_IN_FLIGHT) {
+                let results =
+                    futures::future::join_all(inode_batch.iter().copied().filter_map(|ino| {
+                        if self.shutdown_requested()
+                            || !self.should_background_flush_pending_local_dirty_inode(ino)
+                        {
+                            return None;
+                        }
+                        let vfs = Arc::clone(&self);
+                        Some(async move {
+                            let session = vfs
+                                .state
+                                .file_session
+                                .enter_op(ino, FileSessionOperation::Materialize)
+                                .await;
+                            let flush_result = async {
+                                if vfs.shutdown_requested()
+                                    || !vfs.should_background_flush_pending_local_dirty_inode(ino)
+                                {
+                                    return Ok(());
+                                }
+                                vfs.flush_local_dirty_state_background(
+                                    ino,
+                                    LocalSyncPolicy::Opportunistic,
+                                )
+                                .await
+                            }
+                            .await;
+                            drop(session);
+                            vfs.state.file_session.gc_if_idle(ino);
+                            (ino, flush_result)
+                        })
+                    }))
+                    .await;
+                for (ino, flush_result) in results {
+                    if let Err(error) = flush_result {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "background local-dirty flush failed; will retry"
+                        );
+                    }
+                }
                 if self.shutdown_requested() {
                     break;
-                }
-                if !self.should_background_flush_pending_local_dirty_inode(ino) {
-                    continue;
-                }
-                let session = self
-                    .state
-                    .file_session
-                    .enter_op(ino, FileSessionOperation::Materialize)
-                    .await;
-                let flush_result = async {
-                    if self.shutdown_requested()
-                        || !self.should_background_flush_pending_local_dirty_inode(ino)
-                    {
-                        return Ok(());
-                    }
-                    self.flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
-                        .await
-                }
-                .await;
-                drop(session);
-                self.state.file_session.gc_if_idle(ino);
-                if let Err(error) = flush_result {
-                    warn!(
-                        ino,
-                        error = %error,
-                        "background local-dirty flush failed; will retry"
-                    );
                 }
             }
         }

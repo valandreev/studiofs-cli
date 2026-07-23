@@ -8,7 +8,7 @@ use opendal::Buffer;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
@@ -2014,6 +2014,23 @@ pub(crate) struct UploadLifecycleWorker {
     >,
 }
 
+struct ActiveUploadWorkerGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl ActiveUploadWorkerGuard<'_> {
+    fn new(counter: &AtomicUsize) -> ActiveUploadWorkerGuard<'_> {
+        counter.fetch_add(1, Ordering::Relaxed);
+        ActiveUploadWorkerGuard { counter }
+    }
+}
+
+impl Drop for ActiveUploadWorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
         let processor = UploadProcessor {
@@ -2300,17 +2317,9 @@ impl UploadLifecycleWorker {
             "process_upload start"
         );
 
-        self.vfs
-            .state
-            .upload
-            .active_upload_workers
-            .fetch_add(1, Ordering::Relaxed);
+        let _active_worker =
+            ActiveUploadWorkerGuard::new(&self.vfs.state.upload.active_upload_workers);
         let outcome = self.processor.process_upload(op.clone()).await;
-        self.vfs
-            .state
-            .upload
-            .active_upload_workers
-            .fetch_sub(1, Ordering::Relaxed);
         if outcome == UploadOutcome::Completed {
             self.vfs.state.file_session.note_background_transition(
                 op.ino,
@@ -2327,7 +2336,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use studiofs_data::DataStoreConfig;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, UploadState};
     use studiofs_meta::{MetaEngine, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
@@ -2343,6 +2352,16 @@ mod tests {
         FakeShutdown,
         FakePolicy,
     >;
+
+    #[test]
+    fn active_upload_worker_guard_decrements_on_drop() {
+        let active_workers = AtomicUsize::new(0);
+        {
+            let _guard = ActiveUploadWorkerGuard::new(&active_workers);
+            assert_eq!(active_workers.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
