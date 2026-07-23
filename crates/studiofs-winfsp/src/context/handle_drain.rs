@@ -451,7 +451,9 @@ impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
         };
 
         let result = if request.is_dir {
-            self.context.vfs.rmdir(request.parent_ino, &request.name)
+            self.context
+                .vfs
+                .rmdir_for_cleanup(request.parent_ino, &request.name)
         } else {
             self.context.vfs.unlink(request.parent_ino, &request.name)
         };

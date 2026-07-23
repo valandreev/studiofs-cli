@@ -124,6 +124,31 @@ fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
     });
 }
 
+#[test]
+fn cleanup_rmdir_retries_when_child_unlink_starts_after_directory_cleanup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-cleanup-late-child");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        vfs.create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let rmdir_vfs = vfs.clone();
+        let rmdir =
+            tokio::task::spawn_blocking(move || rmdir_vfs.rmdir_for_cleanup(ROOT_INO, b"parent"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        vfs.unlink(parent.ino, b"child.txt")
+            .expect("late child unlink should succeed");
+        rmdir
+            .await
+            .expect("cleanup rmdir task should complete")
+            .expect("cleanup rmdir should retry after the child unlink");
+    });
+}
+
 #[tokio::test]
 async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
     let shutdown = CancellationToken::new();
