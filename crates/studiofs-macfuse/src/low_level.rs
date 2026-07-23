@@ -4,7 +4,7 @@
 //! low-level macFUSE FFI. Public types copy callback-owned values before they
 //! can cross async boundaries and keep request/reply ownership explicit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
@@ -29,6 +29,9 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+// Bound unique inodes per session; producers apply backpressure instead of
+// dropping invalidations when this finite metadata budget is exhausted.
+const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
 // copied callback data out of its session lock. This registry keeps callback
@@ -563,6 +566,7 @@ pub struct Session {
     channel: NonNull<raw::FuseChan>,
     mount_point: CString,
     invalidation_state: Arc<SessionInvalidationState>,
+    invalidation_queue: Arc<SessionInvalidationQueue>,
 }
 
 // SAFETY: macFUSE session handles support cross-thread exit signaling, and this
@@ -610,11 +614,28 @@ impl Session {
             Some(channel) => {
                 // SAFETY: Both pointers were returned by macFUSE and are live.
                 unsafe { raw::fuse_session_add_chan(session.as_ptr(), channel.as_ptr()) };
+                let invalidation_state = Arc::new(SessionInvalidationState::new());
+                let invalidation_queue =
+                    match SessionInvalidationQueue::start(channel, Arc::clone(&invalidation_state))
+                    {
+                        Ok(queue) => queue,
+                        Err(error) => {
+                            // SAFETY: The channel was just attached to this live session and
+                            // no Session value was returned to the caller.
+                            unsafe { raw::fuse_session_remove_chan(channel.as_ptr()) };
+                            // SAFETY: `channel` is still the live channel for this mount path.
+                            unsafe { raw::fuse_unmount(mount_point.as_ptr(), channel.as_ptr()) };
+                            // SAFETY: `session` is still owned by this error path.
+                            unsafe { raw::fuse_session_destroy(session.as_ptr()) };
+                            return Err(error);
+                        }
+                    };
                 Ok(Self {
                     raw: session,
                     channel,
                     mount_point,
-                    invalidation_state: Arc::new(SessionInvalidationState::new()),
+                    invalidation_state,
+                    invalidation_queue,
                 })
             }
             None => {
@@ -641,8 +662,7 @@ impl Session {
     /// Build a VFS kernel invalidator for this mounted session.
     pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
         Arc::new(MacFuseKernelInvalidator {
-            channel: self.channel,
-            state: Arc::clone(&self.invalidation_state),
+            queue: Arc::clone(&self.invalidation_queue),
         })
     }
 
@@ -681,9 +701,127 @@ impl SessionExitHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InodeInvalidation {
+    ino: u64,
+    data: bool,
+}
+
+struct SessionInvalidationQueue {
+    state: ParkingMutex<SessionInvalidationQueueState>,
+    wake: Condvar,
+    worker: ParkingMutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct SessionInvalidationQueueState {
+    closed: bool,
+    pending: VecDeque<u64>,
+    kinds: HashMap<u64, bool>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionChannel(NonNull<raw::FuseChan>);
+
+// SAFETY: The channel is owned by the mounted macFUSE session and is only used
+// by the dedicated invalidation worker while SessionInvalidationState guards
+// the FFI call against Session::drop.
+unsafe impl Send for SessionChannel {}
+unsafe impl Sync for SessionChannel {}
+
+impl SessionInvalidationQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: ParkingMutex::new(SessionInvalidationQueueState {
+                closed: false,
+                pending: VecDeque::new(),
+                kinds: HashMap::new(),
+            }),
+            wake: Condvar::new(),
+            worker: ParkingMutex::new(None),
+        })
+    }
+
+    fn start(
+        channel: NonNull<raw::FuseChan>,
+        invalidation_state: Arc<SessionInvalidationState>,
+    ) -> io::Result<Arc<Self>> {
+        let queue = Self::new();
+        let worker_queue = Arc::clone(&queue);
+        let channel = SessionChannel(channel);
+        let worker = std::thread::Builder::new()
+            .name("studiofs-macfuse-invalidation".to_string())
+            .spawn(move || {
+                while let Some(invalidation) = worker_queue.next() {
+                    notify_inode_range(
+                        channel,
+                        &invalidation_state,
+                        invalidation.ino,
+                        if invalidation.data { 0 } else { -1 },
+                        if invalidation.data { -1 } else { 0 },
+                    );
+                }
+            })?;
+        *queue.worker.lock() = Some(worker);
+        Ok(queue)
+    }
+
+    fn enqueue(&self, ino: u64, data: bool) {
+        let mut state = self.state.lock();
+        loop {
+            if state.closed {
+                return;
+            }
+            if let Some(kind) = state.kinds.get_mut(&ino) {
+                *kind |= data;
+                return;
+            }
+            if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
+                state.kinds.insert(ino, data);
+                state.pending.push_back(ino);
+                self.wake.notify_one();
+                return;
+            }
+            // Preserve every invalidation while bounding memory: producers
+            // wait for the dedicated worker to make queue capacity available.
+            self.wake.wait(&mut state);
+        }
+    }
+
+    fn next(&self) -> Option<InodeInvalidation> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(ino) = state.pending.pop_front() {
+                let data = state.kinds.remove(&ino).unwrap_or(false);
+                self.wake.notify_all();
+                return Some(InodeInvalidation { ino, data });
+            }
+            if state.closed {
+                return None;
+            }
+            self.wake.wait(&mut state);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.pending.clear();
+        state.kinds.clear();
+        self.wake.notify_all();
+    }
+
+    fn join_worker(&self) {
+        let worker = self.worker.lock().take();
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            warn!("macFUSE invalidation worker panicked during shutdown");
+        }
+    }
+}
+
 struct MacFuseKernelInvalidator {
-    channel: NonNull<raw::FuseChan>,
-    state: Arc<SessionInvalidationState>,
+    queue: Arc<SessionInvalidationQueue>,
 }
 
 #[derive(Debug)]
@@ -749,53 +887,47 @@ impl Drop for SessionInvalidationGuard<'_> {
     }
 }
 
-// SAFETY: Invalidators may be cloned into VFS worker tasks, but every macFUSE
-// notify call must hold a counted `SessionInvalidationGuard`. `Session::drop`
-// closes the gate to new invalidations, waits for active guards only up to a
-// bounded timeout, and leaks the raw macFUSE handles instead of destroying them
-// while an FFI call may still be using the channel.
-unsafe impl Send for MacFuseKernelInvalidator {}
-// SAFETY: Concurrent invalidation calls are counted against session teardown by
-// `state`; each call otherwise goes through macFUSE's channel API.
-unsafe impl Sync for MacFuseKernelInvalidator {}
-
 impl KernelInvalidator for MacFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.inval_inode_range(ino, 0, -1);
+        self.queue.enqueue(ino, true);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        self.inval_inode_range(ino, -1, 0);
+        self.queue.enqueue(ino, false);
     }
 }
 
-impl MacFuseKernelInvalidator {
-    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
-        let Some(_active) = self.state.begin_invalidation() else {
-            debug!(
-                ino,
-                offset, len, "macFUSE inode invalidation skipped after session shutdown"
-            );
-            return;
-        };
-        // SAFETY: `channel` comes from a mounted macFUSE session. The counted
-        // invalidation guard prevents `Session::drop` from destroying the raw
-        // handles while this FFI call may still use the channel.
-        let result = unsafe {
-            raw::fuse_lowlevel_notify_inval_inode(self.channel.as_ptr(), ino, offset, len)
-        };
-        if result != 0 && result != -libc::ENOENT {
-            debug!(
-                ino,
-                offset, len, result, "macFUSE inode invalidation failed"
-            );
-        }
+fn notify_inode_range(
+    channel: SessionChannel,
+    state: &SessionInvalidationState,
+    ino: u64,
+    offset: off_t,
+    len: off_t,
+) {
+    let Some(_active) = state.begin_invalidation() else {
+        debug!(
+            ino,
+            offset, len, "macFUSE inode invalidation skipped after session shutdown"
+        );
+        return;
+    };
+    // SAFETY: `channel` comes from a mounted macFUSE session. The counted
+    // invalidation guard prevents `Session::drop` from destroying the raw
+    // handles while this FFI call may still use the channel.
+    let result =
+        unsafe { raw::fuse_lowlevel_notify_inval_inode(channel.0.as_ptr(), ino, offset, len) };
+    if result != 0 && result != -libc::ENOENT {
+        debug!(
+            ino,
+            offset, len, result, "macFUSE inode invalidation failed"
+        );
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.invalidation_state.begin_shutdown();
+        self.invalidation_queue.close();
         if !self
             .invalidation_state
             .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
@@ -806,6 +938,7 @@ impl Drop for Session {
             );
             return;
         }
+        self.invalidation_queue.join_worker();
         // SAFETY: `self.channel` was attached to `self.raw`; removing it before
         // unmount avoids leaving the session with a stale channel pointer.
         unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };
@@ -1404,5 +1537,77 @@ mod tests {
         );
 
         drop(active);
+    }
+
+    #[test]
+    fn session_invalidation_queue_coalesces_inode_requests() {
+        let queue = SessionInvalidationQueue::new();
+
+        queue.enqueue(7, false);
+        queue.enqueue(7, false);
+        queue.enqueue(8, false);
+        queue.enqueue(7, true);
+
+        assert_eq!(queue.next(), Some(InodeInvalidation { ino: 7, data: true }));
+        assert_eq!(
+            queue.next(),
+            Some(InodeInvalidation {
+                ino: 8,
+                data: false,
+            })
+        );
+    }
+
+    #[test]
+    fn session_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+        let queue = SessionInvalidationQueue::new();
+        for ino in 0..MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64 {
+            queue.enqueue(ino, false);
+        }
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.pending.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
+            assert_eq!(state.kinds.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
+        }
+
+        let producer_queue = Arc::clone(&queue);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal blocked producer start");
+            producer_queue.enqueue(MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64, false);
+            finished_tx
+                .send(())
+                .expect("signal blocked producer finish");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("start blocked producer");
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a full queue must apply producer backpressure"
+        );
+
+        assert_eq!(
+            queue.next(),
+            Some(InodeInvalidation {
+                ino: 0,
+                data: false
+            })
+        );
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer should continue after queue capacity is freed");
+        producer.join().expect("blocked producer should exit");
+    }
+
+    #[test]
+    fn session_invalidation_queue_closes_without_leaving_pending_requests() {
+        let queue = SessionInvalidationQueue::new();
+        queue.enqueue(7, true);
+
+        queue.close();
+
+        assert_eq!(queue.next(), None);
     }
 }

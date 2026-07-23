@@ -417,7 +417,10 @@ impl StudioVfs {
         Ok(())
     }
 
-    pub(super) fn has_deferred_namespace_metadata(&self, ino: Ino) -> bool {
+    /// Return whether deferred namespace metadata is currently pending for `ino`.
+    ///
+    /// This is a non-blocking snapshot and may change immediately after return.
+    pub fn has_deferred_namespace_metadata(&self, ino: Ino) -> bool {
         self.state
             .namespace
             .deferred

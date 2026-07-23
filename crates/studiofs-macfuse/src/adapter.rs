@@ -49,7 +49,11 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
-const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 32;
+const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_SYMLINK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const MACFUSE_SYMLINK_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
@@ -75,6 +79,7 @@ pub(crate) struct MacFuseOpenCachePolicy {
 pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
+    reply_tasks: Arc<ReplyTaskTracker>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
@@ -997,6 +1002,7 @@ impl StudioVfsAdapter {
         Self {
             vfs,
             runtime_handle,
+            reply_tasks: Arc::new(ReplyTaskTracker::default()),
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
@@ -1165,13 +1171,41 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .symlink(parent, name, target, self.mount_uid, self.mount_gid)
-            .inspect(|attr| {
-                self.shared.kernel_inode_liveness.observe(attr.ino);
-                self.invalidate_readdir_cache(parent);
-            })
-            .map_err(|error| vfs_err_to_errno(&error))
+        let mut retry_attempts = 0;
+        let retry_deadline = Instant::now() + MACFUSE_SYMLINK_RETRY_TIMEOUT;
+        let attr = loop {
+            // Capture this before the metadata lookup so a commit racing the
+            // symlink attempt still permits the final retry.
+            let deferred_parent_pending = self.vfs.has_deferred_namespace_metadata(parent);
+            match self
+                .vfs
+                .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+            {
+                Ok(attr) => break Ok(attr),
+                Err(error) => {
+                    let errno = vfs_err_to_errno(&error);
+                    if errno == libc::ENOENT
+                        && deferred_parent_pending
+                        && retry_attempts < MACFUSE_SYMLINK_RETRY_ATTEMPTS
+                        && Instant::now() < retry_deadline
+                    {
+                        retry_attempts += 1;
+                        debug!(
+                            parent,
+                            name = %String::from_utf8_lossy(name),
+                            retry_attempt = retry_attempts,
+                            "macFUSE symlink waiting for deferred parent metadata"
+                        );
+                        std::thread::sleep(MACFUSE_SYMLINK_RETRY_DELAY);
+                        continue;
+                    }
+                    break Err(errno);
+                }
+            }
+        }?;
+        self.shared.kernel_inode_liveness.observe(attr.ino);
+        self.invalidate_readdir_cache(parent);
+        Ok(attr)
     }
 
     /// Create and open a regular file.
@@ -1469,6 +1503,7 @@ impl StudioVfsAdapter {
         }
         let existing = self.vfs.lookup(parent, name).ok();
         let mut retry_attempts = 0;
+        let retry_deadline = Instant::now() + MACFUSE_RMDIR_RETRY_TIMEOUT;
         let result = loop {
             match self.vfs.rmdir(parent, name) {
                 Ok(()) => break Ok(()),
@@ -1476,7 +1511,8 @@ impl StudioVfsAdapter {
                     if matches!(
                         &error,
                         studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::DirNotEmpty(_))
-                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS =>
+                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS
+                        && Instant::now() < retry_deadline =>
                 {
                     retry_attempts += 1;
                     debug!(
@@ -1512,7 +1548,9 @@ impl StudioVfsAdapter {
         request: Request,
     ) {
         let adapter = Arc::clone(self);
+        let task = self.reply_tasks.track();
         self.runtime_handle.spawn_blocking(move || {
+            let _task = task;
             let result = adapter.rmdir(parent, &name);
             match result {
                 Ok(()) => {
@@ -1525,6 +1563,49 @@ impl StudioVfsAdapter {
                             name = %String::from_utf8_lossy(&name),
                             errno,
                             "macFUSE rmdir callback returned error"
+                        );
+                    }
+                    let _ = Reply::new(request).error(errno);
+                }
+            }
+        });
+    }
+
+    /// Run symlink creation away from the single macFUSE session-loop thread.
+    /// A parent directory may still be settling in deferred metadata while the
+    /// kernel delivers the child symlink callback.
+    pub(crate) fn queue_symlink_reply(
+        self: &Arc<Self>,
+        parent: u64,
+        name: Vec<u8>,
+        target: Vec<u8>,
+        request: Request,
+    ) {
+        let adapter = Arc::clone(self);
+        let task = self.reply_tasks.track();
+        self.runtime_handle.spawn_blocking(move || {
+            let _task = task;
+            match adapter.symlink(parent, &name, &target) {
+                Ok(attr) => {
+                    debug!(
+                        parent,
+                        name = %String::from_utf8_lossy(&name),
+                        target = %String::from_utf8_lossy(&target),
+                        ino = attr.ino,
+                        "macFUSE symlink callback created entry"
+                    );
+                    let stat = adapter.attr_to_stat(&attr);
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
+                Err(errno) => {
+                    if callback_error_log_level("symlink", errno).is_some() {
+                        warn!(
+                            parent,
+                            name = %String::from_utf8_lossy(&name),
+                            target = %String::from_utf8_lossy(&target),
+                            errno,
+                            "macFUSE symlink callback returned error"
                         );
                     }
                     let _ = Reply::new(request).error(errno);
@@ -1700,7 +1781,9 @@ impl StudioVfsAdapter {
         let cancellation = ReadCancellationToken::default();
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
+        let task = self.reply_tasks.track();
         self.runtime_handle.spawn(async move {
+            let _task = task;
             let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
@@ -2403,6 +2486,59 @@ impl CallbackState {
     ) -> Arc<dyn KernelInvalidator> {
         self.adapter.kernel_invalidator(inner)
     }
+
+    pub(crate) fn wait_for_reply_tasks(&self) {
+        self.adapter.reply_tasks.wait_for_idle();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReplyTaskTracker {
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+struct ReplyTaskGuard {
+    tracker: Arc<ReplyTaskTracker>,
+}
+
+impl ReplyTaskTracker {
+    fn track(self: &Arc<Self>) -> ReplyTaskGuard {
+        *self
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned") += 1;
+        ReplyTaskGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    fn wait_for_idle(&self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned");
+        while *active != 0 {
+            active = self
+                .idle
+                .wait(active)
+                .expect("reply task tracker lock should not be poisoned");
+        }
+    }
+}
+
+impl Drop for ReplyTaskGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .tracker
+            .active
+            .lock()
+            .expect("reply task tracker lock should not be poisoned");
+        *active -= 1;
+        if *active == 0 {
+            self.tracker.idle.notify_all();
+        }
+    }
 }
 
 fn callback_state<'a>(req: *mut raw::FuseReq) -> Option<&'a CallbackState> {
@@ -3004,32 +3140,12 @@ pub extern "C" fn studiofs_macfuse_symlink(
     let target = unsafe { CStr::from_ptr(target) }.to_bytes();
     // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.symlink(parent, name, target) {
-        Ok(attr) => {
-            debug!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                target = %String::from_utf8_lossy(target),
-                ino = attr.ino,
-                "macFUSE symlink callback created entry"
-            );
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
-            }
-        }
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                target = %String::from_utf8_lossy(target),
-                errno,
-                "macFUSE symlink callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    state
+        .adapter
+        .queue_symlink_reply(parent, name.to_vec(), target.to_vec(), request);
 }
 
 /// macFUSE mknod callback for regular-file creation paths that do not use create.
@@ -4117,6 +4233,28 @@ mod tests {
     use super::*;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    #[test]
+    fn reply_task_tracker_waits_until_async_reply_finishes() {
+        let tracker = Arc::new(ReplyTaskTracker::default());
+        let task = tracker.track();
+        let waiting_tracker = Arc::clone(&tracker);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting_tracker.wait_for_idle();
+            done_tx.send(()).expect("signal drained reply task");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "reply task drain must wait while a callback still owns its request"
+        );
+        drop(task);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reply task drain should finish after the callback exits");
+        waiter.join().expect("reply drain waiter should exit");
+    }
 
     #[test]
     fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
