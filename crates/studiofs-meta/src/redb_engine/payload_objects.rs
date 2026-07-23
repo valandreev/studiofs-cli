@@ -383,115 +383,27 @@ impl MetaPayloadObjects for RedbMetaEngine {
             .collect())
     }
 
-    fn publish_regular_file_overlay_to_base_if_matches(
+    fn publish_regular_file_overlay_to_base_if_matches_batch(
         &self,
-        ino: Ino,
-        expected_epoch: u64,
-    ) -> MetaResult<bool> {
-        let txn = self.begin_write_txn()?;
-
-        {
-            let inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let attr_bytes = match inodes
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(g) => g.value().to_vec(),
-                None => return Ok(false),
-            };
-            let mut attr: InodeAttr = decode(&attr_bytes)?;
-            if attr.content_epoch != expected_epoch {
-                return Ok(false);
-            }
-            let base_regular_file = txn
-                .open_table(REGULAR_FILE_BASE_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let was_remote_visible =
-                Self::regular_file_remote_visible_without_published_base(&attr)
-                    || Self::regular_file_has_published_base_from_opened_table(
-                        &base_regular_file,
-                        ino,
-                    )?;
-            drop(base_regular_file);
-
-            let Some((payload_covered_size, removed_object_ids)) =
-                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?
-            else {
-                return Ok(false);
-            };
-            let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
-                &txn,
-                REGULAR_FILE_BASE_TABLE,
-                ino,
-            )?;
-            if !removed_object_ids.is_empty() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let mut pending_del_table = txn
-                    .open_table(PENDING_DELETIONS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                for object_id in removed_object_ids {
-                    pending_del_table
-                        .insert(object_id, timestamp)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    Self::append_event_in_txn(
-                        &txn,
-                        &crate::events::MetaEvent::AddPendingDeletion {
-                            object_id,
-                            timestamp,
-                        },
-                    )?;
-                }
-            }
-            if attr.is_unpublished_empty_draft() {
-                attr.content_epoch = attr.content_epoch.saturating_add(1);
-            }
-            attr.size = attr.size.max(payload_covered_size);
-            attr.committed_size = attr.size;
-            attr.committed_content_epoch = attr.content_epoch;
-            attr.upload_state = UploadState::Ready;
-            drop(inodes);
-            Self::set_inode_overlay_in_txn(&txn, &attr)?;
-            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
-
-            let dentry_keys =
-                Self::dentry_keys_for_inode_in_write_index(&txn, DENTRIES_BY_INODE_TABLE, ino)?;
-            if !was_remote_visible {
-                for key in dentry_keys {
-                    let (parent, name) = decode_dentry_key(&key)?;
-                    Self::append_event_in_txn(
-                        &txn,
-                        &crate::events::MetaEvent::AddEntry {
-                            parent,
-                            name: name.to_vec(),
-                            entry: DirEntryValue {
-                                ino,
-                                kind: FileType::RegularFile,
-                            },
-                        },
-                    )?;
-                }
-            }
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::PublishRegularFileBaseSlices {
-                    ino,
-                    chunk_slices: published_base_chunks,
-                },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-            )?;
+        requests: &[(Ino, u64)],
+    ) -> MetaResult<Vec<bool>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
         }
-
+        let txn = self.begin_write_txn()?;
+        let mut published = Vec::with_capacity(requests.len());
+        for &(ino, expected_epoch) in requests {
+            published.push(
+                Self::publish_regular_file_overlay_to_base_if_matches_in_txn(
+                    &txn,
+                    ino,
+                    expected_epoch,
+                )?,
+            );
+        }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(true)
+        Ok(published)
     }
 
     fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize> {
@@ -622,6 +534,104 @@ impl MetaPayloadObjects for RedbMetaEngine {
 }
 
 impl RedbMetaEngine {
+    fn publish_regular_file_overlay_to_base_if_matches_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        expected_epoch: u64,
+    ) -> MetaResult<bool> {
+        let inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let attr_bytes = match inodes
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(g) => g.value().to_vec(),
+            None => return Ok(false),
+        };
+        let mut attr: InodeAttr = decode(&attr_bytes)?;
+        if attr.content_epoch != expected_epoch {
+            return Ok(false);
+        }
+        let base_regular_file = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let was_remote_visible = Self::regular_file_remote_visible_without_published_base(&attr)
+            || Self::regular_file_has_published_base_from_opened_table(&base_regular_file, ino)?;
+        drop(base_regular_file);
+
+        let Some((payload_covered_size, removed_object_ids)) =
+            Self::publish_regular_file_overlay_to_base_in_txn(txn, ino)?
+        else {
+            return Ok(false);
+        };
+        let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        if !removed_object_ids.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut pending_del_table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for object_id in removed_object_ids {
+                pending_del_table
+                    .insert(object_id, timestamp)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                Self::append_event_in_txn(
+                    txn,
+                    &crate::events::MetaEvent::AddPendingDeletion {
+                        object_id,
+                        timestamp,
+                    },
+                )?;
+            }
+        }
+        if attr.is_unpublished_empty_draft() {
+            attr.content_epoch = attr.content_epoch.saturating_add(1);
+        }
+        attr.size = attr.size.max(payload_covered_size);
+        attr.committed_size = attr.size;
+        attr.committed_content_epoch = attr.content_epoch;
+        attr.upload_state = UploadState::Ready;
+        drop(inodes);
+        Self::set_inode_overlay_in_txn(txn, &attr)?;
+        Self::sync_inode_lifecycle_in_txn(txn, ino)?;
+
+        let dentry_keys =
+            Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)?;
+        if !was_remote_visible {
+            for key in dentry_keys {
+                let (parent, name) = decode_dentry_key(&key)?;
+                Self::append_event_in_txn(
+                    txn,
+                    &crate::events::MetaEvent::AddEntry {
+                        parent,
+                        name: name.to_vec(),
+                        entry: DirEntryValue {
+                            ino,
+                            kind: FileType::RegularFile,
+                        },
+                    },
+                )?;
+            }
+        }
+        Self::append_event_in_txn(
+            txn,
+            &crate::events::MetaEvent::PublishRegularFileBaseSlices {
+                ino,
+                chunk_slices: published_base_chunks,
+            },
+        )?;
+        Self::append_event_in_txn(txn, &crate::events::MetaEvent::SetAttr { attr })?;
+
+        Ok(true)
+    }
+
     fn apply_regular_file_overlay_mutation_in_txn(
         &self,
         txn: &redb::WriteTransaction,

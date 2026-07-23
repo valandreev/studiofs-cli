@@ -396,11 +396,10 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
         ) -> MetaResult<bool>
     );
     forward_method!(
-        fn publish_regular_file_overlay_to_base_if_matches(
+        fn publish_regular_file_overlay_to_base_if_matches_batch(
             &self,
-            ino: Ino,
-            expected_epoch: u64,
-        ) -> MetaResult<bool>
+            requests: &[(Ino, u64)],
+        ) -> MetaResult<Vec<bool>>
     );
     forward_method!(
         fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize>

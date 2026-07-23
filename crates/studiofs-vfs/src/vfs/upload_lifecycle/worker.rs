@@ -2020,7 +2020,8 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
         if self.vfs.shutdown_requested() || self.vfs.inode_has_pending_uploads(ino) {
             return;
         }
-        self.vfs.queue_epoch_finalization(ino, content_epoch);
+        self.vfs
+            .queue_epoch_finalization_after_verified_upload(ino, content_epoch);
     }
 }
 

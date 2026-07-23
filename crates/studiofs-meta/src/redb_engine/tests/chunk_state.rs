@@ -888,6 +888,38 @@ fn mark_overlay_objects_uploaded_batches_matching_objects() {
 }
 
 #[test]
+fn regular_file_publication_batch_commits_two_inodes_in_one_transaction() {
+    let engine = temp_engine();
+    let first = engine
+        .create_file(ROOT_INO, b"publication-batch-first.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let second = engine
+        .create_file(ROOT_INO, b"publication-batch-second.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    for (ino, object_id) in [(first.ino, 800_001), (second.ino, 800_002)] {
+        let mut attr = engine.get_attr(ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .stage_payload_slice(attr.ino, 0, &PayloadRef::new_partial(object_id, 4096))
+            .unwrap();
+        mark_overlay_objects_uploaded(&engine, attr.ino, 1, &[object_id]);
+    }
+
+    let before = engine.metadata_write_observability();
+    let published = engine
+        .publish_regular_file_overlay_to_base_if_matches_batch(&[(first.ino, 1), (second.ino, 1)])
+        .unwrap();
+
+    assert_eq!(published, vec![true, true]);
+    let after = engine.metadata_write_observability();
+    assert_eq!(after.begin_write.calls - before.begin_write.calls, 1);
+    assert_eq!(after.commit.calls - before.commit.calls, 1);
+}
+
+#[test]
 fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
     let engine = temp_engine();
     let mut stale_attr = engine

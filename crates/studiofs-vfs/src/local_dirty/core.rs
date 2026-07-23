@@ -427,7 +427,14 @@ where
             if let Some(attr) = attr_to_persist {
                 let committed_attr = self
                     .commit_meta
-                    .commit_overlay(ino, Vec::new(), Some(attr))
+                    .commit_overlay(
+                        ino,
+                        Vec::new(),
+                        Some(attr),
+                        persist_config
+                            .local_sync_policy
+                            .requires_write_path_durability(),
+                    )
                     .await?;
                 self.observer
                     .on_metadata_committed(ino, committed_attr.as_ref());
@@ -460,9 +467,18 @@ where
                 }
             };
         let had_attr_to_persist = attr_to_persist.is_some();
+        // Upload reconciliation must not run before its overlay exists in redb.
         let committed_attr = match self
             .commit_meta
-            .commit_overlay(ino, chunk_slices, attr_to_persist)
+            .commit_overlay(
+                ino,
+                chunk_slices,
+                attr_to_persist,
+                !persisted_blocks.is_empty()
+                    || persist_config
+                        .local_sync_policy
+                        .requires_write_path_durability(),
+            )
             .await
         {
             Ok(attr) => attr,

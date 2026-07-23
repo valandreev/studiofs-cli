@@ -258,8 +258,13 @@ impl StudioVfs {
     }
 
     pub(super) async fn background_epoch_finalizer(self: Arc<Self>) {
-        loop {
-            let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
+        const MAX_FINALIZATIONS_IN_FLIGHT: usize = 32;
+        let publisher = Arc::new(commit::EpochPublicationBatcher::default());
+
+        'finalizer: loop {
+            let Some((ino, content_epoch, remote_visibility_confirmed)) =
+                self.pop_epoch_finalization()
+            else {
                 tokio::select! {
                     _ = self.state.shutdown.shutdown_notify.notified() => break,
                     _ = self.state.upload.pending_epoch_finalizations_notify.notified() => {}
@@ -267,104 +272,131 @@ impl StudioVfs {
                 continue;
             };
 
-            let Some(finalize_result) = run_epoch_finalization_until_shutdown(
-                self.state.shutdown.background_shutdown_token.clone(),
-                commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch),
-            )
-            .await
-            else {
-                break;
-            };
+            let mut work = vec![(ino, content_epoch, remote_visibility_confirmed)];
+            while work.len() < MAX_FINALIZATIONS_IN_FLIGHT {
+                let Some(next) = self.pop_epoch_finalization() else {
+                    break;
+                };
+                work.push(next);
+            }
+            let shutdown_token = self.state.shutdown.background_shutdown_token.clone();
+            let results = futures::future::join_all(work.into_iter().map(
+                |(ino, content_epoch, remote_visibility_confirmed)| {
+                    let vfs = Arc::clone(&self);
+                    let publisher = Arc::clone(&publisher);
+                    let shutdown_token = shutdown_token.clone();
+                    async move {
+                        let result = run_epoch_finalization_until_shutdown(
+                            shutdown_token,
+                            commit::CommitCoordinator::finalize_inode_epoch_with_publisher(
+                                &vfs,
+                                ino,
+                                content_epoch,
+                                publisher,
+                                remote_visibility_confirmed,
+                            ),
+                        )
+                        .await;
+                        (ino, content_epoch, result)
+                    }
+                },
+            ))
+            .await;
 
-            match finalize_result {
-                Ok(commit::EpochFinalizeStatus::Published) => {
-                    self.state.file_session.note_background_transition(
-                        ino,
-                        FileSessionOperation::Finalize,
-                        "published",
-                    );
-                }
-                Ok(commit::EpochFinalizeStatus::WaitingForUploads) => {
-                    self.state.file_session.note_background_transition(
-                        ino,
-                        FileSessionOperation::Finalize,
-                        "waiting_uploads",
-                    );
-                }
-                Ok(commit::EpochFinalizeStatus::Skipped) => {
-                    self.state.file_session.note_background_transition(
-                        ino,
-                        FileSessionOperation::Finalize,
-                        "skipped",
-                    );
-                }
-                Ok(commit::EpochFinalizeStatus::Deferred) => {
-                    self.state.file_session.note_background_transition(
-                        ino,
-                        FileSessionOperation::Finalize,
-                        "deferred",
-                    );
-                    let retry_delay = self.upload_requeue_base.max(Duration::from_millis(25));
-                    self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
-                }
-                Err(err) => {
-                    self.state
-                        .metrics
-                        .zeroio_publish_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.record_runtime_event(
-                        "zeroio",
-                        "publish_failed",
-                        "zeroio publish failed",
-                        serde_json::json!({
-                            "ino": ino,
-                            "content_epoch": content_epoch,
-                            "path": self.best_effort_path_for_inode(ino),
-                            "error": err.to_string(),
-                        }),
-                    );
-                    if Self::is_invalid_regular_file_graph_error(&err) {
-                        let attr_size =
-                            run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                                engine.get_attr(ino)
-                            })
-                            .await
-                            .ok()
-                            .map(|attr| attr.size)
-                            .unwrap_or(0);
-                        warn!(
+            for (ino, content_epoch, finalize_result) in results {
+                let Some(finalize_result) = finalize_result else {
+                    break 'finalizer;
+                };
+                match finalize_result {
+                    Ok(commit::EpochFinalizeStatus::Published) => {
+                        self.state.file_session.note_background_transition(
                             ino,
-                            content_epoch,
-                            error = %err,
-                            "epoch finalization failed due to invalid regular-file graph, quarantining inode"
+                            FileSessionOperation::Finalize,
+                            "published",
                         );
-                        self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
+                    }
+                    Ok(commit::EpochFinalizeStatus::WaitingForUploads) => {
+                        self.state.file_session.note_background_transition(
+                            ino,
+                            FileSessionOperation::Finalize,
+                            "waiting_uploads",
+                        );
+                    }
+                    Ok(commit::EpochFinalizeStatus::Skipped) => {
+                        self.state.file_session.note_background_transition(
+                            ino,
+                            FileSessionOperation::Finalize,
+                            "skipped",
+                        );
+                    }
+                    Ok(commit::EpochFinalizeStatus::Deferred) => {
+                        self.state.file_session.note_background_transition(
+                            ino,
+                            FileSessionOperation::Finalize,
+                            "deferred",
+                        );
+                        let retry_delay = self.upload_requeue_base.max(Duration::from_millis(25));
+                        self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                    }
+                    Err(err) => {
+                        self.state
+                            .metrics
+                            .zeroio_publish_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.record_runtime_event(
+                            "zeroio",
+                            "publish_failed",
+                            "zeroio publish failed",
+                            serde_json::json!({
+                                "ino": ino,
+                                "content_epoch": content_epoch,
+                                "path": self.best_effort_path_for_inode(ino),
+                                "error": err.to_string(),
+                            }),
+                        );
+                        if Self::is_invalid_regular_file_graph_error(&err) {
+                            let attr_size =
+                                run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                                    engine.get_attr(ino)
+                                })
+                                .await
+                                .ok()
+                                .map(|attr| attr.size)
+                                .unwrap_or(0);
+                            warn!(
+                                ino,
+                                content_epoch,
+                                error = %err,
+                                "epoch finalization failed due to invalid regular-file graph, quarantining inode"
+                            );
+                            self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
+                            self.state.file_session.note_background_transition(
+                                ino,
+                                FileSessionOperation::Finalize,
+                                "failed",
+                            );
+                            continue;
+                        }
+                        if self.shutdown_requested() {
+                            break 'finalizer;
+                        }
                         self.state.file_session.note_background_transition(
                             ino,
                             FileSessionOperation::Finalize,
                             "failed",
                         );
-                        continue;
+                        warn!(
+                            ino,
+                            content_epoch,
+                            error = %err,
+                            "epoch finalization failed, will retry"
+                        );
+                        self.schedule_epoch_finalization_retry(
+                            ino,
+                            content_epoch,
+                            self.upload_requeue_base,
+                        );
                     }
-                    if self.shutdown_requested() {
-                        break;
-                    }
-                    self.state.file_session.note_background_transition(
-                        ino,
-                        FileSessionOperation::Finalize,
-                        "failed",
-                    );
-                    warn!(
-                        ino,
-                        content_epoch,
-                        error = %err,
-                        "epoch finalization failed, will retry"
-                    );
-                    self.schedule_epoch_finalization_retry(
-                        ino,
-                        content_epoch,
-                        self.upload_requeue_base,
-                    );
                 }
             }
         }
