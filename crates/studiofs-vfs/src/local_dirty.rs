@@ -311,7 +311,7 @@ const OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 
 struct QueuedOverlayMutation {
     mutation: studiofs_meta::RegularFileOverlayMutation,
-    completion: tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, String>>,
+    completion: tokio::sync::oneshot::Sender<Result<Option<InodeAttr>, Arc<VfsError>>>,
     write_path_started_at: Instant,
     descriptor_bytes: usize,
     admission: tokio::sync::OwnedSemaphorePermit,
@@ -353,6 +353,7 @@ pub(super) struct LocalDirtyState {
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
     pub(super) overlay_batch: OverlayBatchState,
     pub(super) overlay_metadata_error: Mutex<Option<String>>,
+    pub(super) overlay_metadata_degraded: AtomicBool,
 }
 
 impl LocalDirtyState {
@@ -394,12 +395,33 @@ impl LocalDirtyState {
                 space_available: tokio::sync::Notify::new(),
             },
             overlay_metadata_error: Mutex::new(None),
+            overlay_metadata_degraded: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn mark_overlay_metadata_error(&self, error: String) {
+        *self.overlay_metadata_error.lock() = Some(error);
+        self.overlay_metadata_degraded
+            .store(true, Ordering::Release);
+    }
+
+    fn clear_overlay_metadata_error(&self) {
+        self.overlay_metadata_error.lock().take();
+        self.overlay_metadata_degraded
+            .store(false, Ordering::Release);
     }
 }
 
 impl StudioVfs {
     pub(super) fn ensure_volatile_overlay_metadata_healthy(&self) -> VfsResult<()> {
+        if !self
+            .state
+            .local_dirty
+            .overlay_metadata_degraded
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let error = self.state.local_dirty.overlay_metadata_error.lock().clone();
         if let Some(error) = error {
             return Err(VfsError::Other(format!(
@@ -407,6 +429,10 @@ impl StudioVfs {
             )));
         }
         Ok(())
+    }
+
+    pub(super) fn clear_volatile_overlay_metadata_error(&self) {
+        self.state.local_dirty.clear_overlay_metadata_error();
     }
 }
 
@@ -488,7 +514,9 @@ impl StudioVfs {
         receiver
             .await
             .map_err(|_| VfsError::Other("overlay batch drainer stopped".to_string()))?
-            .map_err(VfsError::Other)
+            .map_err(|error| {
+                Arc::try_unwrap(error).unwrap_or_else(|error| VfsError::Other(error.to_string()))
+            })
     }
 }
 
@@ -506,11 +534,43 @@ fn overlay_mutation_descriptor_bytes(
         )
 }
 
+struct OverlayBatchDrainingGuard {
+    state: Arc<VfsState>,
+    meta: MetaExecutor<dyn VfsMeta>,
+}
+
+impl Drop for OverlayBatchDrainingGuard {
+    fn drop(&mut self) {
+        let restart = {
+            let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
+            inner.draining = false;
+            if inner.queue.is_empty() {
+                false
+            } else {
+                inner.draining = true;
+                true
+            }
+        };
+        if restart {
+            let state = Arc::clone(&self.state);
+            let meta = self.meta.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    drain_regular_file_overlay_batches(state, meta).await;
+                });
+            }
+        }
+    }
+}
+
 async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExecutor<dyn VfsMeta>) {
+    let _draining_guard = OverlayBatchDrainingGuard {
+        state: Arc::clone(&state),
+        meta: meta.clone(),
+    };
     // Let concurrent inodes reach the shared queue before opening the redb
-    // transaction. The worker owns the queue lifecycle, so cancelling one
-    // callback cannot strand already-admitted mutations.
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    // transaction without imposing a platform-dependent timer delay.
+    tokio::task::yield_now().await;
 
     loop {
         let mut mutations = Vec::with_capacity(OVERLAY_BATCH_MAX_OPERATIONS);
@@ -556,25 +616,29 @@ async fn drain_regular_file_overlay_batches(state: Arc<VfsState>, meta: MetaExec
 
         match result {
             Ok(attrs) if attrs.len() == completions.len() => {
-                state.local_dirty.overlay_metadata_error.lock().take();
                 for (completion, attr) in completions.into_iter().zip(attrs) {
                     let _ = completion.send(Ok(attr));
                 }
             }
             Ok(_) => {
-                *state.local_dirty.overlay_metadata_error.lock() =
-                    Some("overlay batch returned an unexpected result count".to_string());
+                let error = VfsError::Other(
+                    "overlay batch returned an unexpected result count".to_string(),
+                );
+                state
+                    .local_dirty
+                    .mark_overlay_metadata_error(error.to_string());
+                let error = Arc::new(error);
                 for completion in completions {
-                    let _ = completion.send(Err(
-                        "overlay batch returned an unexpected result count".to_string(),
-                    ));
+                    let _ = completion.send(Err(Arc::clone(&error)));
                 }
             }
             Err(error) => {
-                let error = error.to_string();
-                *state.local_dirty.overlay_metadata_error.lock() = Some(error.clone());
+                state
+                    .local_dirty
+                    .mark_overlay_metadata_error(error.to_string());
+                let error = Arc::new(error);
                 for completion in completions {
-                    let _ = completion.send(Err(error.clone()));
+                    let _ = completion.send(Err(Arc::clone(&error)));
                 }
             }
         }

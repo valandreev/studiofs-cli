@@ -10980,14 +10980,37 @@ fn volatile_flush_reports_a_previous_metadata_commit_failure() {
         let attr = vfs
             .create(1, b"volatile-flush-degraded.txt", 0, 0, 0o644)
             .expect("create file");
-        *vfs.state.local_dirty.overlay_metadata_error.lock() =
-            Some("simulated redb outage".to_string());
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("simulated redb outage".to_string());
 
         let error = vfs
             .flush_volatile_writeback_with_outcome(attr.ino, 0)
             .await
             .expect_err("degraded local metadata must fail an ordinary flush");
         assert!(error.to_string().contains("simulated redb outage"));
+    });
+}
+
+#[test]
+fn strict_metadata_barrier_clears_previous_volatile_overlay_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-recovery");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"volatile-flush-recovery.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("simulated redb outage".to_string());
+
+        vfs.fsync_with_outcome(attr.ino, false)
+            .await
+            .expect("strict metadata barrier should recover local metadata");
+        vfs.flush_volatile_writeback_with_outcome(attr.ino, 0)
+            .await
+            .expect("volatile flush should be admitted after strict recovery");
     });
 }
 

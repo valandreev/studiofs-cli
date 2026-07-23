@@ -75,7 +75,9 @@ impl StudioVfs {
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.sync_local_metadata()
         })
-        .await
+        .await?;
+        self.clear_volatile_overlay_metadata_error();
+        Ok(())
     }
 
     /// Spawn a background task that replays landing-zone segments left from a previous run.

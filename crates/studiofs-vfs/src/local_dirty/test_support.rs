@@ -165,7 +165,7 @@ mod tests {
         rt.block_on(async {
             let committer = VfsOverlayCommitter { vfs: &vfs };
             let (first_result, second_result) = tokio::join!(
-                committer.commit_overlay(first.ino, Vec::new(), Some(first)),
+                committer.commit_overlay(first.ino, Vec::new(), Some(first.clone())),
                 committer.commit_overlay(second.ino, Vec::new(), Some(second)),
             );
             first_result.expect("commit first overlay");
@@ -175,6 +175,21 @@ mod tests {
         let batch = meta.metadata_write_observability().batch;
         assert_eq!(batch.batches, 1);
         assert_eq!(batch.requested_ops, 2);
+
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("sticky overlay failure".to_string());
+        rt.block_on(async {
+            let committer = VfsOverlayCommitter { vfs: &vfs };
+            committer
+                .commit_overlay(first.ino, Vec::new(), Some(first))
+                .await
+                .expect("a later successful batch should still complete");
+        });
+        assert!(
+            vfs.ensure_volatile_overlay_metadata_healthy().is_err(),
+            "a successful volatile batch must not clear a previous metadata failure"
+        );
     }
 
     fn single_block_fixture(
