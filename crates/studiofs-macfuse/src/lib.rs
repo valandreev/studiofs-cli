@@ -251,7 +251,6 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
-    let invalidation_runtime_handle = runtime_handle.clone();
     let mut callback_state = Box::new(adapter::CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle,
@@ -271,9 +270,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_watcher =
         spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
-    vfs.set_kernel_invalidator(
-        callback_state.kernel_invalidator(session.kernel_invalidator(invalidation_runtime_handle)),
-    );
+    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
     vfs.clear_kernel_invalidator();
     drop(session);

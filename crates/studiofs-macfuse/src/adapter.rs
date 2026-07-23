@@ -50,6 +50,7 @@ const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_PO
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_SYMLINK_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -1169,6 +1170,9 @@ impl StudioVfsAdapter {
         }
         let mut retry_attempts = 0;
         let attr = loop {
+            // Capture this before the metadata lookup so a commit racing the
+            // symlink attempt still permits the final retry.
+            let deferred_parent_pending = self.vfs.has_deferred_namespace_metadata(parent);
             match self
                 .vfs
                 .symlink(parent, name, target, self.mount_uid, self.mount_gid)
@@ -1177,7 +1181,7 @@ impl StudioVfsAdapter {
                 Err(error) => {
                     let errno = vfs_err_to_errno(&error);
                     if errno == libc::ENOENT
-                        && self.vfs.has_deferred_namespace_metadata(parent)
+                        && deferred_parent_pending
                         && retry_attempts < MACFUSE_SYMLINK_RETRY_ATTEMPTS
                     {
                         retry_attempts += 1;
@@ -1495,6 +1499,7 @@ impl StudioVfsAdapter {
         }
         let existing = self.vfs.lookup(parent, name).ok();
         let mut retry_attempts = 0;
+        let retry_deadline = Instant::now() + MACFUSE_RMDIR_RETRY_TIMEOUT;
         let result = loop {
             match self.vfs.rmdir(parent, name) {
                 Ok(()) => break Ok(()),
@@ -1502,7 +1507,8 @@ impl StudioVfsAdapter {
                     if matches!(
                         &error,
                         studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::DirNotEmpty(_))
-                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS =>
+                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS
+                        && Instant::now() < retry_deadline =>
                 {
                     retry_attempts += 1;
                     debug!(
