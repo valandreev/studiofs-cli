@@ -116,7 +116,12 @@ impl EpochPublicationBatcher {
                         let _ = request.completion.send(Err(Arc::clone(&error)));
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        request_count = requests.len(),
+                        "epoch publication batch failed; retrying requests individually"
+                    );
                     for request in requests {
                         let ino = request.ino;
                         let content_epoch = request.content_epoch;

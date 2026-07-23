@@ -5386,14 +5386,11 @@ impl StudioVfs {
     ) {
         let key = (ino, content_epoch);
         let inserted = {
+            let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
             let mut pending = self.state.upload.pending_epoch_finalizations.lock();
             let inserted = pending.insert(key);
             if remote_visibility_confirmed {
-                self.state
-                    .upload
-                    .verified_remote_epoch_finalizations
-                    .lock()
-                    .insert(key);
+                verified.insert(key);
             }
             inserted
         };
@@ -5412,19 +5409,17 @@ impl StudioVfs {
     }
 
     fn remove_pending_epoch_finalizations_for_inode(&self, ino: Ino) {
+        let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
         let before = pending.len();
         pending.retain(|(candidate, _)| *candidate != ino);
         let removed = before.saturating_sub(pending.len());
+        verified.retain(|(candidate, _)| *candidate != ino);
         drop(pending);
+        drop(verified);
         if removed > 0 {
             self.debug_pending_inode_state(ino, "epoch_finalization_cleared");
         }
-        self.state
-            .upload
-            .verified_remote_epoch_finalizations
-            .lock()
-            .retain(|(candidate, _)| *candidate != ino);
     }
 
     fn cancel_pending_uploads_for_inode(&self, ino: Ino) {
@@ -5488,19 +5483,12 @@ impl StudioVfs {
     }
 
     fn pop_epoch_finalization(&self) -> Option<(Ino, u64, bool)> {
-        let next = self
-            .state
-            .upload
-            .pending_epoch_finalizations
-            .lock()
-            .pop_first();
-        let verified_remote_visibility = next.is_some_and(|key| {
-            self.state
-                .upload
-                .verified_remote_epoch_finalizations
-                .lock()
-                .remove(&key)
-        });
+        let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
+        let mut pending = self.state.upload.pending_epoch_finalizations.lock();
+        let next = pending.pop_first();
+        let verified_remote_visibility = next.map(|key| verified.remove(&key)).unwrap_or(false);
+        drop(pending);
+        drop(verified);
         if let Some((ino, _)) = next {
             self.state.file_session.note_background_transition(
                 ino,

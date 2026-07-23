@@ -291,6 +291,9 @@ impl StudioVfs {
 
             let mut work = vec![(ino, content_epoch, remote_visibility_confirmed)];
             while work.len() < MAX_FINALIZATIONS_IN_FLIGHT {
+                if self.shutdown_requested() {
+                    break;
+                }
                 let Some(next) = self.pop_epoch_finalization() else {
                     break;
                 };
