@@ -622,17 +622,18 @@ impl MetaPayloadObjects for RedbMetaEngine {
 }
 
 impl RedbMetaEngine {
-    fn flush_regular_file_overlay_slices_with_attr_txn(
+    fn apply_regular_file_overlay_mutation_in_txn(
         &self,
+        txn: &redb::WriteTransaction,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<Option<InodeAttr>> {
-        let txn = self.begin_write_txn()?;
-
+    ) -> MetaResult<(Option<InodeAttr>, bool)> {
         if let Some(attr) = attr {
             match Self::get_attr_merged_in_write_txn(&txn, ino) {
-                Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),
+                Ok(current) if current.content_epoch > attr.content_epoch => {
+                    return Ok((None, false));
+                }
                 Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
                 Err(error) => return Err(error),
             }
@@ -776,13 +777,115 @@ impl RedbMetaEngine {
             )?;
         }
 
+        Ok((normalized_attr, true))
+    }
+
+    fn flush_regular_file_overlay_slices_with_attr_txn(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Option<InodeAttr>> {
+        let txn = self.begin_write_txn()?;
+        let (result, applied) =
+            self.apply_regular_file_overlay_mutation_in_txn(&txn, ino, chunk_slices, attr)?;
+        if !applied {
+            return Ok(result);
+        }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(normalized_attr)
+        Ok(result)
+    }
+
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[crate::engine::RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>> {
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let started = std::time::Instant::now();
+        let txn = self.begin_write_txn()?;
+        let mut results = Vec::with_capacity(mutations.len());
+        let estimated_slices = mutations
+            .iter()
+            .map(|mutation| {
+                mutation
+                    .chunk_slices
+                    .iter()
+                    .map(|(_, slices)| slices.len() as u64)
+                    .sum::<u64>()
+            })
+            .sum();
+        let estimated_payload_bytes = mutations
+            .iter()
+            .flat_map(|mutation| mutation.chunk_slices.iter().flat_map(|(_, slices)| slices))
+            .filter_map(|slice| slice.payload.as_ref())
+            .map(|payload| u64::from(payload.length))
+            .sum();
+        for (index, mutation) in mutations.iter().enumerate() {
+            let result = self
+                .apply_regular_file_overlay_mutation_in_txn(
+                    &txn,
+                    mutation.ino,
+                    &mutation.chunk_slices,
+                    mutation.attr.as_ref(),
+                )
+                .map_err(|source| MetaError::RegularFileOverlayBatchOperation {
+                    index,
+                    source: Box::new(source),
+                });
+            let (result, _applied) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.write_metrics.observe_batch(
+                        mutations.len() as u64,
+                        results.len() as u64,
+                        estimated_slices,
+                        estimated_payload_bytes,
+                        Some(index),
+                        true,
+                        started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            };
+            results.push(result);
+        }
+        if let Err(error) = txn.commit() {
+            self.write_metrics.observe_batch(
+                mutations.len() as u64,
+                results.len() as u64,
+                estimated_slices,
+                estimated_payload_bytes,
+                None,
+                true,
+                started.elapsed(),
+            );
+            return Err(MetaError::Storage(error.to_string()));
+        }
+        self.write_metrics.observe_batch(
+            mutations.len() as u64,
+            results.len() as u64,
+            estimated_slices,
+            estimated_payload_bytes,
+            None,
+            false,
+            started.elapsed(),
+        );
+        Ok(results)
     }
 }
 
 impl crate::engine::MetaEngine for RedbMetaEngine {
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[crate::engine::RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>> {
+        self.apply_regular_file_overlay_batch(mutations)
+    }
+
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,

@@ -30,6 +30,12 @@ pub trait VfsCommitMeta: Send + Sync {
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>>;
+
+    /// Apply ordered regular-file overlay updates in one metadata transaction.
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[studiofs_meta::RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>>;
 }
 
 impl<T> VfsCommitMeta for T
@@ -48,6 +54,13 @@ where
             chunk_slices,
             attr,
         )
+    }
+
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[studiofs_meta::RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>> {
+        <T as MetaEngine>::apply_regular_file_overlay_batch(self, mutations)
     }
 }
 
@@ -163,6 +176,12 @@ impl<M: ?Sized> RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
+    forward_method!(
+        fn apply_regular_file_overlay_batch(
+            &self,
+            mutations: &[studiofs_meta::RegularFileOverlayMutation],
+        ) -> MetaResult<Vec<Option<InodeAttr>>>
+    );
     forward_method!(
         fn flush_regular_file_overlay_slices_with_attr(
             &self,

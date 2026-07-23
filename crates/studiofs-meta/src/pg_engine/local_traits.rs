@@ -444,6 +444,13 @@ impl MetaSnapshots for PgMetaEngine {
 }
 
 impl MetaEngine for PgMetaEngine {
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[crate::engine::RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>> {
+        self.mutate(|local| local.apply_regular_file_overlay_batch(mutations))
+    }
+
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,

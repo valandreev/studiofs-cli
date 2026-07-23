@@ -4,6 +4,15 @@ fn partial_payload_ref(object_id: u64, offset: u32, length: u32) -> PayloadRef {
     payload
 }
 
+fn local_payload_slice(object_id: u64) -> SliceRecord {
+    SliceRecord::new(
+        SliceId::default(),
+        SliceOrder::default(),
+        SliceRange::new(0, 4096).expect("valid range"),
+        PayloadRef::new_partial(object_id, 4096),
+    )
+}
+
 fn resolved_byte_view(
     spans: &[ResolvedSliceSpan],
     offset: u64,
@@ -737,6 +746,105 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
 }
 
 #[test]
+fn regular_file_overlay_batch_commits_two_inodes_in_one_transaction() {
+    let engine = temp_engine();
+    let first = engine
+        .create_file(ROOT_INO, b"overlay-batch-first.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let second = engine
+        .create_file(ROOT_INO, b"overlay-batch-second.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut first_attr = first.clone();
+    first_attr.size = 4096;
+    first_attr.content_epoch = 1;
+    let before = engine.metadata_write_observability();
+
+    let results = engine
+        .apply_regular_file_overlay_batch(&[
+            crate::RegularFileOverlayMutation {
+                ino: first.ino,
+                chunk_slices: vec![(ChunkId(0), vec![local_payload_slice(200_011)])],
+                attr: Some(first_attr),
+            },
+            crate::RegularFileOverlayMutation {
+                ino: second.ino,
+                chunk_slices: vec![(ChunkId(0), vec![local_payload_slice(200_012)])],
+                attr: None,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(results[0].as_ref().map(|attr| attr.ino), Some(first.ino));
+    assert_eq!(results[1], None);
+    assert!(engine.has_local_regular_file_overlay(first.ino).unwrap());
+    assert!(engine.has_local_regular_file_overlay(second.ino).unwrap());
+    let after = engine.metadata_write_observability();
+    assert_eq!(after.begin_write.calls - before.begin_write.calls, 1);
+    assert_eq!(after.commit.calls - before.commit.calls, 1);
+    assert_eq!(after.batch.batches - before.batch.batches, 1);
+    assert_eq!(after.batch.requested_ops - before.batch.requested_ops, 2);
+    assert_eq!(after.batch.actual_ops - before.batch.actual_ops, 2);
+    assert_eq!(
+        after.batch.estimated_slices - before.batch.estimated_slices,
+        2
+    );
+    assert_eq!(
+        after.batch.estimated_payload_bytes - before.batch.estimated_payload_bytes,
+        8192
+    );
+}
+
+#[test]
+fn regular_file_overlay_batch_rolls_back_on_middle_failure() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"overlay-batch-rollback.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let overflowing = engine
+        .create_file(ROOT_INO, b"overlay-batch-overflow.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let overflow_key = encode_regular_file_chunk_key(overflowing.ino, ChunkId(0));
+    let overflow_state = RegularFileChunkState {
+        next_slice_id: SliceId(u64::MAX),
+        next_slice_order: SliceOrder(u64::MAX),
+        ..Default::default()
+    };
+    let overflow_bytes = encode(&overflow_state).expect("encode overflow state");
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+        .unwrap()
+        .insert(overflow_key.as_slice(), overflow_bytes.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+
+    let error = engine
+        .apply_regular_file_overlay_batch(&[
+            crate::RegularFileOverlayMutation {
+                ino: file.ino,
+                chunk_slices: vec![(ChunkId(0), vec![local_payload_slice(200_021)])],
+                attr: None,
+            },
+            crate::RegularFileOverlayMutation {
+                ino: overflowing.ino,
+                chunk_slices: vec![(ChunkId(0), vec![local_payload_slice(200_022)])],
+                attr: None,
+            },
+        ])
+        .expect_err("overflowing second mutation must fail the batch");
+
+    assert!(matches!(
+        error,
+        MetaError::RegularFileOverlayBatchOperation { index: 1, .. }
+    ));
+    assert!(!engine.has_local_regular_file_overlay(file.ino).unwrap());
+    assert_eq!(
+        engine.metadata_write_observability().batch.rollback_index,
+        Some(1)
+    );
+    assert_eq!(engine.metadata_write_observability().batch.failures, 1);
+}
+
+#[test]
 fn mark_overlay_objects_uploaded_batches_matching_objects() {
     let engine = temp_engine();
     let mut attr = engine
@@ -801,6 +909,7 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
         payload: Some(PayloadRef::new_partial(200_002, 4096)),
         payload_state: PayloadRefState::LocalOnly,
     }];
+    let before = engine.metadata_write_observability();
 
     let committed_attr = engine
         .flush_regular_file_overlay_slices_with_attr(
@@ -813,6 +922,8 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
         committed_attr.is_none(),
         "stale overlay commits must be skipped rather than returning a committed attr"
     );
+    let after = engine.metadata_write_observability();
+    assert_eq!(after.commit.calls, before.commit.calls);
 
     let persisted_attr = engine.get_attr(ino).unwrap();
     assert_eq!(persisted_attr.size, 0);
@@ -1499,10 +1610,7 @@ fn publish_regular_file_overlay_recovers_visible_size_from_payload_graph() {
     set_regular_file_chunk_rows(
         &engine,
         file.ino,
-        &[
-            (ChunkId(0), head_chunk),
-            (ChunkId(1), tail_chunk),
-        ],
+        &[(ChunkId(0), head_chunk), (ChunkId(1), tail_chunk)],
         &[],
     );
     mark_overlay_objects_uploaded(&engine, file.ino, 1, &[57_431_701, 57_431_702]);

@@ -429,6 +429,8 @@ regressions:
   - `path_shortcut_cache_is_bounded_and_supports_negative_entries`
   - `dentry_cache_rejects_stale_namespace_tokens_lazily`
   - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
+  - `regular_file_overlay_batch_commits_two_inodes_in_one_transaction`
+  - `regular_file_overlay_batch_rolls_back_on_middle_failure`
 
 - Metadata authority and headroom
   - `sfs315_failed_object_batch_preserves_smaller_inode_headroom`
