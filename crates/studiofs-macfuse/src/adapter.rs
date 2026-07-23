@@ -1138,7 +1138,7 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let mode = (mode & 0o7777) as u16;
+        let mode = mode & 0o7777;
         self.vfs
             .mkdir_with_deferred_metadata_admission(
                 parent,
@@ -1185,7 +1185,7 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let mode = (mode & 0o7777) as u16;
+        let mode = mode & 0o7777;
         let attr = self
             .vfs
             .create_with_deferred_metadata_admission(
@@ -1220,7 +1220,7 @@ impl StudioVfsAdapter {
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
         }
-        let mode = (mode & 0o7777) as u16;
+        let mode = mode & 0o7777;
         self.vfs
             .create_with_deferred_metadata_admission(
                 parent,
