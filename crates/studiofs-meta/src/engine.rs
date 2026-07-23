@@ -28,6 +28,30 @@ pub struct MetadataWriteObservability {
     pub mutation: MetadataWriteStageTiming,
     /// Time spent committing the local metadata transaction.
     pub commit: MetadataWriteStageTiming,
+    /// Aggregate observability for regular-file overlay batches.
+    #[serde(default)]
+    pub batch: MetadataBatchWriteObservability,
+}
+
+/// Counts and latency for regular-file overlay batches.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MetadataBatchWriteObservability {
+    /// Number of submitted batches.
+    pub batches: u64,
+    /// Number of requested operations.
+    pub requested_ops: u64,
+    /// Number of operations completed before a failure, or all operations on success.
+    pub actual_ops: u64,
+    /// Estimated slices submitted across all batches.
+    pub estimated_slices: u64,
+    /// Estimated payload bytes submitted across all batches.
+    pub estimated_payload_bytes: u64,
+    /// Number of batches that failed.
+    pub failures: u64,
+    /// Last failing zero-based operation index, if any.
+    pub rollback_index: Option<u64>,
+    /// Total batch operation latency in nanoseconds.
+    pub total_ns: u64,
 }
 
 // =============================================================================
@@ -142,6 +166,15 @@ pub enum MetaError {
     /// A namespace mutation failed at a specific position in an ordered batch.
     #[error("namespace batch operation {index} failed: {source}")]
     NamespaceBatchOperation {
+        /// Zero-based position of the failed operation.
+        index: usize,
+        /// Error returned while applying the operation.
+        #[source]
+        source: Box<MetaError>,
+    },
+    /// A regular-file overlay mutation failed at a specific position in an ordered batch.
+    #[error("regular-file overlay batch operation {index} failed: {source}")]
+    RegularFileOverlayBatchOperation {
         /// Zero-based position of the failed operation.
         index: usize,
         /// Error returned while applying the operation.
@@ -316,6 +349,17 @@ pub enum NamespaceMutation {
         /// Attribute-only delta to apply to the current inode.
         args: SetattrArgs,
     },
+}
+
+/// One regular-file overlay mutation within an ordered local batch.
+#[derive(Debug, Clone)]
+pub struct RegularFileOverlayMutation {
+    /// Inode whose local overlay is updated.
+    pub ino: Ino,
+    /// New slice records grouped by chunk.
+    pub chunk_slices: Vec<(ChunkId, Vec<SliceRecord>)>,
+    /// Optional inode attributes to persist with the slices.
+    pub attr: Option<InodeAttr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1014,6 +1058,12 @@ pub trait MetaEngine:
     + MetaSnapshots
     + MetaReplication
 {
+    /// Apply ordered regular-file overlay mutations in one local transaction.
+    fn apply_regular_file_overlay_batch(
+        &self,
+        mutations: &[RegularFileOverlayMutation],
+    ) -> MetaResult<Vec<Option<InodeAttr>>>;
+
     /// Flush local regular-file overlay slices and optionally inode attributes
     /// in one logical foreground persist step.
     ///

@@ -34,8 +34,9 @@ pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
     LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat,
     MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, MetadataWriteObservability,
-    MetadataWriteStageTiming, NamespaceMutation,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr,
+    MetadataBatchWriteObservability, MetadataWriteObservability, MetadataWriteStageTiming,
+    NamespaceMutation, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{

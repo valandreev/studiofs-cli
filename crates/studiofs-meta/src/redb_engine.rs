@@ -93,9 +93,80 @@ struct MetadataWriteMetrics {
     begin_write: MetadataWriteStageMetrics,
     mutation: MetadataWriteStageMetrics,
     commit: MetadataWriteStageMetrics,
+    batch: MetadataBatchWriteMetrics,
+}
+
+struct MetadataBatchWriteMetrics {
+    batches: AtomicU64,
+    requested_ops: AtomicU64,
+    actual_ops: AtomicU64,
+    estimated_slices: AtomicU64,
+    estimated_payload_bytes: AtomicU64,
+    failures: AtomicU64,
+    rollback_index: AtomicU64,
+    total_ns: AtomicU64,
+}
+
+const NO_ROLLBACK_INDEX: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct EstimatedBatchMetrics {
+    slices: u64,
+    payload_bytes: u64,
+}
+
+impl Default for MetadataBatchWriteMetrics {
+    fn default() -> Self {
+        Self {
+            batches: AtomicU64::new(0),
+            requested_ops: AtomicU64::new(0),
+            actual_ops: AtomicU64::new(0),
+            estimated_slices: AtomicU64::new(0),
+            estimated_payload_bytes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            rollback_index: AtomicU64::new(NO_ROLLBACK_INDEX),
+            total_ns: AtomicU64::new(0),
+        }
+    }
 }
 
 impl MetadataWriteMetrics {
+    fn observe_batch(
+        &self,
+        requested_ops: u64,
+        actual_ops: u64,
+        estimated: EstimatedBatchMetrics,
+        failure_index: Option<usize>,
+        failed: bool,
+        elapsed: Duration,
+    ) {
+        self.batch.batches.fetch_add(1, Ordering::Relaxed);
+        self.batch
+            .requested_ops
+            .fetch_add(requested_ops, Ordering::Relaxed);
+        self.batch
+            .actual_ops
+            .fetch_add(actual_ops, Ordering::Relaxed);
+        self.batch
+            .estimated_slices
+            .fetch_add(estimated.slices, Ordering::Relaxed);
+        self.batch
+            .estimated_payload_bytes
+            .fetch_add(estimated.payload_bytes, Ordering::Relaxed);
+        self.batch.total_ns.fetch_add(
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        if failed {
+            self.batch.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(index) = failure_index {
+            self.batch
+                .rollback_index
+                .store(index as u64, Ordering::Relaxed);
+        }
+    }
+
     fn observe(stage: &MetadataWriteStageMetrics, elapsed: Duration) {
         let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
         // Snapshot readers may observe the three relaxed counters between updates;
@@ -118,6 +189,19 @@ impl MetadataWriteMetrics {
             begin_write: Self::snapshot_stage(&self.begin_write),
             mutation: Self::snapshot_stage(&self.mutation),
             commit: Self::snapshot_stage(&self.commit),
+            batch: MetadataBatchWriteObservability {
+                batches: self.batch.batches.load(Ordering::Relaxed),
+                requested_ops: self.batch.requested_ops.load(Ordering::Relaxed),
+                actual_ops: self.batch.actual_ops.load(Ordering::Relaxed),
+                estimated_slices: self.batch.estimated_slices.load(Ordering::Relaxed),
+                estimated_payload_bytes: self.batch.estimated_payload_bytes.load(Ordering::Relaxed),
+                failures: self.batch.failures.load(Ordering::Relaxed),
+                rollback_index: match self.batch.rollback_index.load(Ordering::Relaxed) {
+                    NO_ROLLBACK_INDEX => None,
+                    index => Some(index),
+                },
+                total_ns: self.batch.total_ns.load(Ordering::Relaxed),
+            },
         }
     }
 }
