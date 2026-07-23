@@ -24,7 +24,6 @@ struct FinalizeMetaSnapshot {
 }
 
 const EPOCH_PUBLICATION_BATCH_MAX_OPERATIONS: usize = 64;
-const EPOCH_PUBLICATION_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
 type EpochPublicationCompletion = tokio::sync::oneshot::Sender<Result<bool, Arc<VfsError>>>;
 
@@ -76,7 +75,7 @@ impl EpochPublicationBatcher {
 
         match receiver.await {
             Ok(Ok(published)) => Ok(published),
-            Ok(Err(error)) => Err(VfsError::Other(error.to_string())),
+            Ok(Err(error)) => Err(clone_publication_error(&error)),
             Err(_) => Err(VfsError::Other(
                 "epoch publication batcher stopped".to_string(),
             )),
@@ -84,7 +83,6 @@ impl EpochPublicationBatcher {
     }
 
     async fn drain(self: Arc<Self>, meta: MetaExecutor<dyn VfsMeta>) {
-        tokio::time::sleep(EPOCH_PUBLICATION_COALESCE_DELAY).await;
         loop {
             let requests = {
                 let mut inner = self.inner.lock();
@@ -118,14 +116,50 @@ impl EpochPublicationBatcher {
                         let _ = request.completion.send(Err(Arc::clone(&error)));
                     }
                 }
-                Err(error) => {
-                    let error = Arc::new(error);
+                Err(_) => {
                     for request in requests {
-                        let _ = request.completion.send(Err(Arc::clone(&error)));
+                        let ino = request.ino;
+                        let content_epoch = request.content_epoch;
+                        let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                            engine
+                                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                        })
+                        .await;
+                        let result = result.map_err(Arc::new);
+                        let _ = request.completion.send(result);
                     }
                 }
             }
         }
+    }
+}
+
+fn clone_publication_error(error: &VfsError) -> VfsError {
+    match error {
+        VfsError::Meta(error) => VfsError::Meta((*error).clone()),
+        _ => VfsError::Other(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_meta::MetaError;
+
+    #[test]
+    fn publication_batch_preserves_metadata_error_kind() {
+        let error = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+            ino: 7,
+            block_index: 3,
+        });
+
+        assert!(matches!(
+            clone_publication_error(&error),
+            VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
+                ino: 7,
+                block_index: 3,
+            })
+        ));
     }
 }
 
