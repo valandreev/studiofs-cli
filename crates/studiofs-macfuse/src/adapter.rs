@@ -49,7 +49,9 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
-const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 32;
+const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
+const MACFUSE_SYMLINK_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
@@ -1165,13 +1167,37 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .symlink(parent, name, target, self.mount_uid, self.mount_gid)
-            .inspect(|attr| {
-                self.shared.kernel_inode_liveness.observe(attr.ino);
-                self.invalidate_readdir_cache(parent);
-            })
-            .map_err(|error| vfs_err_to_errno(&error))
+        let mut retry_attempts = 0;
+        let attr = loop {
+            match self
+                .vfs
+                .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+            {
+                Ok(attr) => break Ok(attr),
+                Err(error) => {
+                    let errno = vfs_err_to_errno(&error);
+                    if errno == libc::ENOENT
+                        && self.vfs.has_deferred_namespace_metadata(parent)
+                        && retry_attempts < MACFUSE_SYMLINK_RETRY_ATTEMPTS
+                    {
+                        retry_attempts += 1;
+                        debug!(
+                            parent,
+                            name = %String::from_utf8_lossy(name),
+                            retry_attempt = retry_attempts,
+                            "macFUSE symlink waiting for deferred parent metadata"
+                        );
+                        std::thread::sleep(MACFUSE_SYMLINK_RETRY_DELAY);
+                        continue;
+                    }
+                    break Err(errno);
+                }
+            }
+        }?;
+        Ok(attr).inspect(|attr| {
+            self.shared.kernel_inode_liveness.observe(attr.ino);
+            self.invalidate_readdir_cache(parent);
+        })
     }
 
     /// Create and open a regular file.
@@ -1531,6 +1557,44 @@ impl StudioVfsAdapter {
                 }
             }
         });
+    }
+
+    /// Run symlink creation away from the single macFUSE session-loop thread.
+    /// A parent directory may still be settling in deferred metadata while the
+    /// kernel delivers the child symlink callback.
+    pub(crate) fn queue_symlink_reply(
+        self: &Arc<Self>,
+        parent: u64,
+        name: Vec<u8>,
+        target: Vec<u8>,
+        request: Request,
+    ) {
+        let adapter = Arc::clone(self);
+        self.runtime_handle
+            .spawn_blocking(move || match adapter.symlink(parent, &name, &target) {
+                Ok(attr) => {
+                    debug!(
+                        parent,
+                        name = %String::from_utf8_lossy(&name),
+                        target = %String::from_utf8_lossy(&target),
+                        ino = attr.ino,
+                        "macFUSE symlink callback created entry"
+                    );
+                    let stat = adapter.attr_to_stat(&attr);
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
+                Err(errno) => {
+                    warn!(
+                        parent,
+                        name = %String::from_utf8_lossy(&name),
+                        target = %String::from_utf8_lossy(&target),
+                        errno,
+                        "macFUSE symlink callback returned error"
+                    );
+                    let _ = Reply::new(request).error(errno);
+                }
+            });
     }
 
     /// Rename a namespace entry.
@@ -3004,32 +3068,12 @@ pub extern "C" fn studiofs_macfuse_symlink(
     let target = unsafe { CStr::from_ptr(target) }.to_bytes();
     // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.symlink(parent, name, target) {
-        Ok(attr) => {
-            debug!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                target = %String::from_utf8_lossy(target),
-                ino = attr.ino,
-                "macFUSE symlink callback created entry"
-            );
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
-            }
-        }
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                target = %String::from_utf8_lossy(target),
-                errno,
-                "macFUSE symlink callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    state
+        .adapter
+        .queue_symlink_reply(parent, name.to_vec(), target.to_vec(), request);
 }
 
 /// macFUSE mknod callback for regular-file creation paths that do not use create.

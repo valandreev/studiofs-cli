@@ -1857,7 +1857,7 @@ mod tests {
 
         let rmdir_adapter = adapter.clone();
         let rmdir = thread::spawn(move || rmdir_adapter.rmdir(root, b"delayed-delete-parent"));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(1_000));
         adapter
             .unlink(parent.ino, b"child.txt")
             .expect("delayed child unlink should succeed");
@@ -3016,5 +3016,30 @@ mod tests {
         let target = adapter.readlink(attr.ino).expect("read symlink target");
 
         assert_eq!(target, b"target.txt");
+    }
+
+    #[test]
+    fn symlink_waits_for_deferred_parent_metadata() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-symlink-deferred-parent",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let parent = vfs
+            .mkdir_with_deferred_metadata_admission(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"parent",
+                501,
+                20,
+                0o755,
+                fixture.runtime().handle(),
+            )
+            .expect("admit deferred parent directory");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        adapter
+            .symlink(parent.ino, b"skills", b"../.agents/skills")
+            .expect("symlink should wait for its deferred parent");
     }
 }

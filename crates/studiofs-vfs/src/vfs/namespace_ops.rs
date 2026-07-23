@@ -417,7 +417,7 @@ impl StudioVfs {
         Ok(())
     }
 
-    pub(super) fn has_deferred_namespace_metadata(&self, ino: Ino) -> bool {
+    pub fn has_deferred_namespace_metadata(&self, ino: Ino) -> bool {
         self.state
             .namespace
             .deferred
