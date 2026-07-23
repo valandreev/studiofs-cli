@@ -808,26 +808,23 @@ impl RedbMetaEngine {
         let started = std::time::Instant::now();
         let txn = self.begin_write_txn()?;
         let mut results = Vec::with_capacity(mutations.len());
-        let estimated_slices = mutations
-            .iter()
-            .map(|mutation| {
-                mutation
-                    .chunk_slices
-                    .iter()
-                    .map(|(_, slices)| slices.len() as u64)
-                    .sum::<u64>()
-            })
-            .sum();
-        let estimated_payload_bytes = mutations
-            .iter()
-            .flat_map(|mutation| mutation.chunk_slices.iter().flat_map(|(_, slices)| slices))
-            .filter_map(|slice| slice.payload.as_ref())
-            .map(|payload| u64::from(payload.length))
-            .sum();
-        let estimated = super::EstimatedBatchMetrics {
-            slices: estimated_slices,
-            payload_bytes: estimated_payload_bytes,
-        };
+        let estimated = mutations.iter().fold(
+            super::EstimatedBatchMetrics {
+                slices: 0,
+                payload_bytes: 0,
+            },
+            |mut estimated, mutation| {
+                for (_, slices) in &mutation.chunk_slices {
+                    estimated.slices += slices.len() as u64;
+                    estimated.payload_bytes += slices
+                        .iter()
+                        .filter_map(|slice| slice.payload.as_ref())
+                        .map(|payload| u64::from(payload.length))
+                        .sum::<u64>();
+                }
+                estimated
+            },
+        );
         for (index, mutation) in mutations.iter().enumerate() {
             let result = self
                 .apply_regular_file_overlay_mutation_in_txn(

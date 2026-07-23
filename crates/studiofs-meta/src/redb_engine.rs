@@ -107,6 +107,8 @@ struct MetadataBatchWriteMetrics {
     total_ns: AtomicU64,
 }
 
+const NO_ROLLBACK_INDEX: u64 = u64::MAX;
+
 #[derive(Clone, Copy)]
 struct EstimatedBatchMetrics {
     slices: u64,
@@ -122,7 +124,7 @@ impl Default for MetadataBatchWriteMetrics {
             estimated_slices: AtomicU64::new(0),
             estimated_payload_bytes: AtomicU64::new(0),
             failures: AtomicU64::new(0),
-            rollback_index: AtomicU64::new(u64::MAX),
+            rollback_index: AtomicU64::new(NO_ROLLBACK_INDEX),
             total_ns: AtomicU64::new(0),
         }
     }
@@ -195,7 +197,7 @@ impl MetadataWriteMetrics {
                 estimated_payload_bytes: self.batch.estimated_payload_bytes.load(Ordering::Relaxed),
                 failures: self.batch.failures.load(Ordering::Relaxed),
                 rollback_index: match self.batch.rollback_index.load(Ordering::Relaxed) {
-                    u64::MAX => None,
+                    NO_ROLLBACK_INDEX => None,
                     index => Some(index),
                 },
                 total_ns: self.batch.total_ns.load(Ordering::Relaxed),
