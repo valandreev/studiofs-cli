@@ -436,6 +436,7 @@ impl LocalDirtyState {
         }
     }
 
+    /// Retain the first overlay commit failure and reject later volatile admissions.
     pub(super) fn mark_overlay_metadata_error(&self, error: String) {
         let mut retained = self.overlay_metadata_error.lock();
         if retained.is_none() {
@@ -447,6 +448,7 @@ impl LocalDirtyState {
 }
 
 impl StudioVfs {
+    /// Return the sticky background overlay failure, if the worker is degraded.
     pub(super) fn ensure_volatile_overlay_metadata_healthy(&self) -> VfsResult<()> {
         if !self
             .state
@@ -467,6 +469,7 @@ impl StudioVfs {
 }
 
 impl StudioVfs {
+    /// Wait until every overlay mutation admitted before this call has completed successfully.
     pub(super) async fn wait_for_volatile_overlay_batches(&self) -> VfsResult<()> {
         let cutoff = {
             let mut inner = self.state.local_dirty.overlay_batch.inner.lock();
@@ -487,13 +490,14 @@ impl StudioVfs {
                 inner.completed_sequence >= cutoff
             };
             if complete {
-                return Ok(());
+                return self.ensure_volatile_overlay_metadata_healthy();
             }
             self.ensure_volatile_overlay_metadata_healthy()?;
             notified.await;
         }
     }
 
+    /// Snapshot shared overlay batching counters and queue gauges.
     pub(crate) fn overlay_batch_observability(&self) -> OverlayBatchObservability {
         let inner = self.state.local_dirty.overlay_batch.inner.lock();
         let dirty_age_ms = inner
@@ -514,6 +518,7 @@ impl StudioVfs {
         }
     }
 
+    /// Admit one regular-file overlay mutation to the bounded shared volatile worker.
     pub(super) async fn commit_regular_file_overlay_batch(
         &self,
         mutation: studiofs_meta::RegularFileOverlayMutation,
@@ -635,7 +640,7 @@ impl StudioVfs {
 fn clone_overlay_batch_error(error: &VfsError) -> VfsError {
     match error {
         VfsError::Meta(error) => VfsError::Meta((*error).clone()),
-        VfsError::Io(error) => VfsError::Io(std::io::Error::new(error.kind(), error.to_string())),
+        VfsError::Io(error) => VfsError::Io(clone_io_error(error)),
         VfsError::Data(error) => {
             VfsError::Data(studiofs_data::store::DataError::Storage(error.to_string()))
         }
@@ -656,9 +661,7 @@ fn clone_object_error(
     match error {
         ObjectError::InvalidMagic => ObjectError::InvalidMagic,
         ObjectError::UnsupportedVersion(version) => ObjectError::UnsupportedVersion(*version),
-        ObjectError::Io(error) => {
-            ObjectError::Io(std::io::Error::new(error.kind(), error.to_string()))
-        }
+        ObjectError::Io(error) => ObjectError::Io(clone_io_error(error)),
         ObjectError::LegacyCompressionUnsupported => ObjectError::LegacyCompressionUnsupported,
         ObjectError::ChecksumMismatch { expected, computed } => ObjectError::ChecksumMismatch {
             expected: *expected,
@@ -670,6 +673,13 @@ fn clone_object_error(
             ObjectError::InvalidFragmentLayout(value.clone())
         }
     }
+}
+
+fn clone_io_error(error: &std::io::Error) -> std::io::Error {
+    error.raw_os_error().map_or_else(
+        || std::io::Error::new(error.kind(), error.to_string()),
+        std::io::Error::from_raw_os_error,
+    )
 }
 
 fn overlay_mutation_descriptor_bytes(

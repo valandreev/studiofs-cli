@@ -234,6 +234,44 @@ mod tests {
         assert!(error.to_string().contains("stopped drainer"));
     }
 
+    #[test]
+    fn degraded_overlay_barrier_reports_completed_failure() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-completed-failure");
+        {
+            let mut inner = vfs.state.local_dirty.overlay_batch.inner.lock();
+            inner.last_admitted_sequence = Some(1);
+            inner.completed_sequence = 1;
+        }
+        vfs.state
+            .local_dirty
+            .mark_overlay_metadata_error("completed batch failed".to_string());
+
+        let error = rt
+            .block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect_err("completed failed batch must remain visible to the barrier");
+        assert!(error.to_string().contains("completed batch failed"));
+    }
+
+    #[test]
+    fn cloned_overlay_io_errors_preserve_raw_os_error() {
+        let raw_code = 5;
+        let cloned =
+            clone_overlay_batch_error(&VfsError::Io(std::io::Error::from_raw_os_error(raw_code)));
+        let VfsError::Io(cloned) = cloned else {
+            panic!("expected cloned VFS I/O error");
+        };
+        assert_eq!(cloned.raw_os_error(), Some(raw_code));
+
+        let cloned = clone_object_error(&studiofs_data::object::ObjectError::Io(
+            std::io::Error::from_raw_os_error(raw_code),
+        ));
+        let studiofs_data::object::ObjectError::Io(cloned) = cloned else {
+            panic!("expected cloned object I/O error");
+        };
+        assert_eq!(cloned.raw_os_error(), Some(raw_code));
+    }
+
     fn single_block_fixture(
         ino: Ino,
         block_index: u32,
