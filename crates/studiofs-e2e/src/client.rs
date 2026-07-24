@@ -2067,12 +2067,22 @@ fn run_macos_unmount_attempt_with_timeout(
     let _stdout_guard = DeleteOnDrop(stdout_path);
     let (stderr_path, mut stderr_file) = create_macos_unmount_output_file("stderr")?;
     let _stderr_guard = DeleteOnDrop(stderr_path);
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .arg(path)
         .stdout(Stdio::from(stdout_file.try_clone()?))
-        .stderr(Stdio::from(stderr_file.try_clone()?))
-        .spawn()?;
+        .stderr(Stdio::from(stderr_file.try_clone()?));
+    ChildJob::prepare_command(&mut command)?;
+    let mut child = command.spawn()?;
+    let job = match ChildJob::assign_to_child(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -2085,6 +2095,7 @@ fn run_macos_unmount_attempt_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
+            let _ = job.force_kill();
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
@@ -2415,6 +2426,30 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cleanup timeout should bound a stuck unmount helper"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_timeout_terminates_helper_descendants() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let marker = temp.path().join("descendant-marker");
+        let error = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "nohup sh -c 'sleep 1; touch \"$1\"' sh \"$0\" >/dev/null 2>&1 & while :; do :; done",
+            ],
+            &marker,
+            Duration::from_millis(50),
+        )
+        .expect_err("blocking cleanup command should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !marker.exists(),
+            "a timed-out cleanup command must not leave descendants running"
         );
     }
 
