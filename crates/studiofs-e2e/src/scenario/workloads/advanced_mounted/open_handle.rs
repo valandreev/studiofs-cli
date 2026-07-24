@@ -114,6 +114,20 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
         started,
         7,
         &clients[2],
+        "winner_peer_visible",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            clients,
+            &[(path.as_str(), winner.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect winner",
+        ),
+    )?);
+    operations.push(required_op(
+        started,
+        8,
+        &clients[2],
         "winner_crash_restart",
         clients[2].name.as_str(),
         controller
