@@ -535,12 +535,24 @@ impl VfsBootstrap {
 impl StudioVfs {
     fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
         let recovered_after_unclean_shutdown = self.begin_zeroio_session()?;
+        let landing_recovery_inodes = if recovered_after_unclean_shutdown {
+            match self.landing_zone.recoverable_inodes() {
+                Ok(inodes) => Some(inodes),
+                Err(error) => {
+                    warn!(error = %error, "startup recovery could not inspect durable landing records");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let pending_uploads = self.cached_store.snapshot_pending_uploads();
         let attrs = self.sync_meta().list_inode_attrs()?;
         self.replay_dirty_uploads_after_unclean_shutdown(
             pending_uploads.as_slice(),
             attrs.as_slice(),
             recovered_after_unclean_shutdown,
+            landing_recovery_inodes,
         );
         Ok(())
     }

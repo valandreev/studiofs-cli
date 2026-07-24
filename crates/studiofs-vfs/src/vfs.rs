@@ -4410,7 +4410,7 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
     ) {
-        self.replay_dirty_uploads_after_unclean_shutdown(pending_uploads, attrs, false);
+        self.replay_dirty_uploads_after_unclean_shutdown(pending_uploads, attrs, false, None);
     }
 
     fn replay_dirty_uploads_after_unclean_shutdown(
@@ -4418,9 +4418,15 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
         recovered_after_unclean_shutdown: bool,
+        landing_recovery_inodes: Option<HashSet<Ino>>,
     ) {
-        StartupReplayCoordinator::new(self, pending_uploads, recovered_after_unclean_shutdown)
-            .run(attrs);
+        StartupReplayCoordinator::new(
+            self,
+            pending_uploads,
+            recovered_after_unclean_shutdown,
+            landing_recovery_inodes,
+        )
+        .run(attrs);
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {

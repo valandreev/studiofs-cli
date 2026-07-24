@@ -29,6 +29,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
     lost_unpublished_upload_inodes: HashSet<Ino>,
     live_zero_size_unpublished_inodes: HashSet<Ino>,
     recovered_after_unclean_shutdown: bool,
+    landing_recovery_inodes: Option<HashSet<Ino>>,
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
@@ -49,6 +50,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         vfs: &'a StudioVfs,
         pending_uploads: &[PendingUpload],
         recovered_after_unclean_shutdown: bool,
+        landing_recovery_inodes: Option<HashSet<Ino>>,
     ) -> Self {
         Self {
             vfs,
@@ -72,6 +74,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             lost_unpublished_upload_inodes: HashSet::new(),
             live_zero_size_unpublished_inodes: HashSet::new(),
             recovered_after_unclean_shutdown,
+            landing_recovery_inodes,
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
@@ -149,7 +152,11 @@ impl<'a> StartupReplayCoordinator<'a> {
         Self::is_lost_unpublished_regular_upload(attr)
             || (self.recovered_after_unclean_shutdown
                 && (Self::is_live_zero_size_unpublished_draft(attr)
-                    || attr.is_unpublished_empty_draft()))
+                    || attr.is_unpublished_empty_draft())
+                && !self
+                    .landing_recovery_inodes
+                    .as_ref()
+                    .is_some_and(|inodes| inodes.contains(&attr.ino)))
     }
 
     fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {
@@ -891,7 +898,7 @@ mod tests {
         let persisted = meta.get_attr(created.ino).expect("load empty draft");
         assert!(persisted.is_unpublished_empty_draft());
 
-        StartupReplayCoordinator::new(&vfs, &[], true).run(&[persisted]);
+        StartupReplayCoordinator::new(&vfs, &[], true, Some(HashSet::new())).run(&[persisted]);
 
         assert!(matches!(
             meta.lookup(1, b"unclean-empty-draft.txt"),
@@ -961,7 +968,7 @@ mod tests {
         )
         .expect("persist uploaded payload slice");
 
-        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[], false);
+        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[], false, None);
         coordinator.process_attr(&attr);
         assert_eq!(
             coordinator
