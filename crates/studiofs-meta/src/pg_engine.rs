@@ -604,7 +604,12 @@ impl PgMetaEngine {
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
         } else {
-            let _ = engine.pull_snapshot_locked(import_mode);
+            // A remount with a local event journal must replay deltas from its
+            // own accepted state: a checkpoint can omit entries that were
+            // still unpublished when it was written.
+            if engine.local.get_counter("nextEventSeq")? == 0 {
+                let _ = engine.pull_snapshot_locked(import_mode);
+            }
             if let Err(error) = engine.sync_metadata_to_current_head() {
                 warn!(
                     error = %error,
