@@ -534,9 +534,14 @@ impl VfsBootstrap {
 
 impl StudioVfs {
     fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
+        let recovered_after_unclean_shutdown = self.begin_zeroio_session()?;
         let pending_uploads = self.cached_store.snapshot_pending_uploads();
         let attrs = self.sync_meta().list_inode_attrs()?;
-        self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
+        self.replay_dirty_uploads_after_unclean_shutdown(
+            pending_uploads.as_slice(),
+            attrs.as_slice(),
+            recovered_after_unclean_shutdown,
+        );
         Ok(())
     }
 
