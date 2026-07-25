@@ -972,7 +972,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.mount_command(index)?;
-        self.executor.cleanup_stale_mount_before_remount(&command)?;
+        // force_kill already cleaned this mount on macOS; a second Disk
+        // Arbitration request can outlive the helper and detach the remount.
+        if !cfg!(target_os = "macos")
+            || self.clients[index].spec.state != ClientLifecycleState::Killed
+        {
+            self.executor.cleanup_stale_mount_before_remount(&command)?;
+        }
         self.mount_index(index)
     }
 
