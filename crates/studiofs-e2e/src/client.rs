@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::infra::ServicePort;
 use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::ChildJob;
+#[cfg(target_os = "macos")]
+use crate::process_job::{CHILD_TERMINATION_GRACE, wait_for_child_exit};
 
 /// Default client names used by the E2E mounted scenarios.
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
@@ -2095,9 +2097,16 @@ fn run_macos_unmount_attempt_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
-            let _ = job.force_kill();
-            let _ = child.kill();
-            let _ = child.wait();
+            // Give Disk Arbitration clients a chance to cancel an in-flight
+            // request before force-killing the process group. A hard kill can
+            // leave the daemon-side unmount request active after this helper
+            // returns, allowing it to detach a subsequent remount.
+            let _ = job.terminate();
+            if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                let _ = job.force_kill();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -2426,6 +2435,29 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cleanup timeout should bound a stuck unmount helper"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_timeout_gracefully_terminates_helper() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let marker = temp.path().join("graceful-termination-marker");
+        let error = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "trap 'touch \"$0\"; exit 0' TERM; while :; do :; done",
+            ],
+            &marker,
+            Duration::from_millis(50),
+        )
+        .expect_err("blocking cleanup command should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            marker.exists(),
+            "a timed-out cleanup command should receive termination before force-kill"
         );
     }
 
