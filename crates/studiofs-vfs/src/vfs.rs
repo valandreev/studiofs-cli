@@ -204,6 +204,17 @@ const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
 pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
 const ZEROIO_ACTIVE_SESSION_MARKER_FILE: &str = "zeroio-active-session";
+
+#[cfg(unix)]
+fn sync_directory_metadata(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory_metadata(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
@@ -3687,15 +3698,22 @@ impl StudioVfs {
         let recovered_after_unclean_shutdown = path.exists();
         let file = std::fs::File::create(&path).map_err(VfsError::Io)?;
         file.sync_all().map_err(VfsError::Io)?;
+        sync_directory_metadata(&self.zeroio_runtime_state_dir).map_err(VfsError::Io)?;
         Ok(recovered_after_unclean_shutdown)
     }
 
     fn finish_zeroio_session(&self) {
         let path = self.zeroio_active_session_marker_path();
-        if let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %path.display(), error = %error, "failed to clear zeroio active session marker");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Err(error) = sync_directory_metadata(&self.zeroio_runtime_state_dir) {
+                    warn!(path = %path.display(), error = %error, "failed to persist zeroio active session marker removal");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "failed to clear zeroio active session marker");
+            }
         }
     }
 

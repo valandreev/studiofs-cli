@@ -101,7 +101,11 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.seen_replay_inodes.insert(ino);
         }
         let is_live_zero_size_unpublished_draft = Self::is_live_zero_size_unpublished_draft(attr);
-        if is_live_zero_size_unpublished_draft {
+        let has_landing_recovery = self
+            .landing_recovery_inodes
+            .as_ref()
+            .is_some_and(|inodes| inodes.contains(&ino));
+        if is_live_zero_size_unpublished_draft && !has_landing_recovery {
             self.live_zero_size_unpublished_inodes.insert(ino);
         }
         if !self.needs_scan(attr) && !has_pending_uploads {
@@ -152,6 +156,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         Self::is_lost_unpublished_regular_upload(attr)
             || (self.recovered_after_unclean_shutdown
                 && Self::is_live_zero_size_unpublished_draft(attr)
+                && attr.nlink == 1
                 && self
                     .landing_recovery_inodes
                     .as_ref()
@@ -914,6 +919,39 @@ mod tests {
         assert!(
             StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
             "startup replay should still clean up unlinked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn unclean_replay_should_not_remove_hard_linked_draft_without_landing_record() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "startup-replay-hard-linked-draft-predicate");
+        let coordinator = StartupReplayCoordinator::new(&vfs, &[], true, Some(HashSet::new()));
+        let attr = zero_size_unpublished_attr(2);
+
+        assert!(
+            !coordinator.should_remove_unpublished_regular_inode(&attr),
+            "single-parent cleanup cannot safely remove a hard-linked inode"
+        );
+    }
+
+    #[test]
+    fn unclean_replay_should_not_finalize_landing_backed_draft() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "startup-replay-landing-backed-draft");
+        let attr = zero_size_unpublished_attr(1);
+        let mut coordinator =
+            StartupReplayCoordinator::new(&vfs, &[], true, Some(HashSet::from([attr.ino])));
+
+        coordinator.process_attr(&attr);
+
+        assert!(
+            !coordinator
+                .live_zero_size_unpublished_inodes
+                .contains(&attr.ino),
+            "landing recovery must materialize data before the draft becomes publishable"
         );
     }
 
