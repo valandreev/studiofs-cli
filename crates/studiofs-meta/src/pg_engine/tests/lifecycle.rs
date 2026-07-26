@@ -36,8 +36,7 @@ fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
         "local draft namespace should register as a local overlay mutation"
     );
     assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
-            .expect("startup snapshot decision"),
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
         super::StartupSnapshotImportMode::PreserveLocalState,
         "startup snapshot must preserve a local overlay after crash/restart"
     );
@@ -159,8 +158,7 @@ fn startup_snapshot_replaces_stale_local_state_without_an_overlay() {
     pg.persist_local_version(42).expect("persist local version");
 
     assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 42)
-            .expect("startup snapshot decision"),
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
         super::StartupSnapshotImportMode::ReplaceLocalState,
         "a persisted replay cursor alone must not keep stale serving state over the remote snapshot"
     );
@@ -177,8 +175,7 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
         .expect("acknowledge local events");
 
     assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
-            .expect("startup snapshot decision"),
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
         super::StartupSnapshotImportMode::ReplaceLocalState,
         "acknowledged local events must not hide the authoritative remote snapshot"
     );

@@ -96,7 +96,6 @@ impl PgMetaEngine {
 
     pub(super) fn startup_snapshot_import_mode(
         local: &RedbMetaEngine,
-        _persisted_version: i64,
     ) -> MetaResult<StartupSnapshotImportMode> {
         let has_unflushed_local_events = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?
             < local.get_counter("nextEventSeq")?;

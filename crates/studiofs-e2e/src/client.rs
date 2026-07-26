@@ -2042,7 +2042,7 @@ fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static
 }
 
 #[cfg(target_os = "macos")]
-fn create_macos_unmount_output_file(label: &str) -> io::Result<(PathBuf, fs::File)> {
+fn create_macos_unmount_output_file(label: &str) -> io::Result<fs::File> {
     let dir = PathBuf::from("target").join("studiofs-e2e-unmount-output");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{label}-{}.log", uuid::Uuid::new_v4()));
@@ -2051,7 +2051,8 @@ fn create_macos_unmount_output_file(label: &str) -> io::Result<(PathBuf, fs::Fil
         .write(true)
         .create_new(true)
         .open(&path)?;
-    Ok((path, file))
+    fs::remove_file(&path)?;
+    Ok(file)
 }
 
 #[cfg(target_os = "macos")]
@@ -2069,18 +2070,8 @@ fn run_macos_unmount_attempt_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> io::Result<std::process::Output> {
-    struct DeleteOnDrop(PathBuf);
-
-    impl Drop for DeleteOnDrop {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    let (stdout_path, mut stdout_file) = create_macos_unmount_output_file("stdout")?;
-    let _stdout_guard = DeleteOnDrop(stdout_path);
-    let (stderr_path, mut stderr_file) = create_macos_unmount_output_file("stderr")?;
-    let _stderr_guard = DeleteOnDrop(stderr_path);
+    let mut stdout_file = create_macos_unmount_output_file("stdout")?;
+    let mut stderr_file = create_macos_unmount_output_file("stderr")?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -2404,6 +2395,23 @@ mod tests {
         } else {
             assert_eq!(timeout, Duration::from_secs(15));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unmount_output_file_is_unlinked_immediately() {
+        let label = format!("unlink-on-open-{}", uuid::Uuid::new_v4());
+        let _file = create_macos_unmount_output_file(&label).expect("create output file");
+        let dir = PathBuf::from("target").join("studiofs-e2e-unmount-output");
+        let leaked = fs::read_dir(dir)
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&label));
+
+        assert!(
+            !leaked,
+            "an open unmount output file must not retain a directory entry"
+        );
     }
 
     #[cfg(target_os = "macos")]
