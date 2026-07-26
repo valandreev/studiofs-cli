@@ -31,6 +31,8 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 #[cfg(target_os = "macos")]
 const MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const MACOS_DISKUTIL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
@@ -2027,11 +2029,15 @@ pub(crate) fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()>
 }
 
 #[cfg(target_os = "macos")]
-fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static str])] {
+fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static str], Duration)] {
     &[
-        ("diskutil", &["unmount", "force"]),
-        ("umount", &["-f"]),
-        ("umount", &[]),
+        ("umount", &["-f"], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT),
+        ("umount", &[], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT),
+        (
+            "diskutil",
+            &["unmount", "force"],
+            MACOS_DISKUTIL_UNMOUNT_TIMEOUT,
+        ),
     ]
 }
 
@@ -2134,13 +2140,8 @@ fn force_unmount_stale_macos_mount(
     readiness_error: Option<io::Error>,
 ) -> io::Result<()> {
     let mut diagnostics = Vec::new();
-    for (program, args) in macos_stale_unmount_attempts() {
-        match run_macos_unmount_attempt_with_timeout(
-            program,
-            args,
-            path,
-            MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT,
-        ) {
+    for (program, args, timeout) in macos_stale_unmount_attempts() {
+        match run_macos_unmount_attempt_with_timeout(program, args, path, *timeout) {
             Ok(output) if output.status.success() => match mount_point_is_active(path) {
                 Ok(false) => return Ok(()),
                 Ok(true) => diagnostics.push(format!(
@@ -2410,16 +2411,23 @@ mod tests {
     fn macos_stale_mount_cleanup_uses_force_unmount_attempts() {
         let attempts = macos_stale_unmount_attempts();
 
+        assert_eq!(
+            attempts.first(),
+            Some(&("umount", &["-f"][..], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT)),
+            "macOS stale mount cleanup should prefer a synchronous forced unmount"
+        );
         assert!(
-            attempts
-                .iter()
-                .any(|(program, args)| *program == "diskutil" && *args == ["unmount", "force"]),
-            "macOS stale mount cleanup should try diskutil force unmount"
+            attempts.iter().any(|(program, args, timeout)| {
+                *program == "diskutil"
+                    && *args == ["unmount", "force"]
+                    && *timeout == Duration::from_secs(60)
+            }),
+            "diskutil cleanup must wait for its delegated Disk Arbitration request"
         );
         assert!(
             attempts
                 .iter()
-                .any(|(program, args)| *program == "umount" && *args == ["-f"]),
+                .any(|(program, args, _)| *program == "umount" && *args == ["-f"]),
             "macOS stale mount cleanup should fall back to forced umount"
         );
     }
