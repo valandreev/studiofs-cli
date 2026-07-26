@@ -203,6 +203,7 @@ const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
 /// Relative directory where zero-io startup/runtime snapshots are persisted.
 pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
+const ZEROIO_ACTIVE_SESSION_MARKER_FILE: &str = "zeroio-active-session";
 const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
@@ -3455,6 +3456,10 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
+    /// Inodes whose kernel invalidation was deferred while a writable handle was open.
+    deferred_kernel_invalidations: DashSet<Ino>,
+    /// Inodes whose kernel attribute invalidation was deferred while a writable handle was open.
+    deferred_kernel_inode_attrs: DashSet<Ino>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
     runtime_stats_file_time_nanos: i64,
@@ -3670,6 +3675,28 @@ impl StudioVfs {
     fn zeroio_last_shutdown_snapshot_path(&self) -> PathBuf {
         self.zeroio_runtime_state_dir
             .join(ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE)
+    }
+
+    fn zeroio_active_session_marker_path(&self) -> PathBuf {
+        self.zeroio_runtime_state_dir
+            .join(ZEROIO_ACTIVE_SESSION_MARKER_FILE)
+    }
+
+    fn begin_zeroio_session(&self) -> VfsResult<bool> {
+        let path = self.zeroio_active_session_marker_path();
+        let recovered_after_unclean_shutdown = path.exists();
+        let file = std::fs::File::create(&path).map_err(VfsError::Io)?;
+        file.sync_all().map_err(VfsError::Io)?;
+        Ok(recovered_after_unclean_shutdown)
+    }
+
+    fn finish_zeroio_session(&self) {
+        let path = self.zeroio_active_session_marker_path();
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), error = %error, "failed to clear zeroio active session marker");
+        }
     }
 
     fn load_persisted_zeroio_shutdown_snapshot(&self) -> Option<VfsZeroIoShutdownSnapshot> {
@@ -4381,12 +4408,29 @@ impl StudioVfs {
         });
     }
 
+    #[cfg(test)]
     fn replay_dirty_uploads_from_local_backend(
         &self,
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
     ) {
-        StartupReplayCoordinator::new(self, pending_uploads).run(attrs);
+        self.replay_dirty_uploads_after_unclean_shutdown(pending_uploads, attrs, false, None);
+    }
+
+    fn replay_dirty_uploads_after_unclean_shutdown(
+        &self,
+        pending_uploads: &[PendingUpload],
+        attrs: &[InodeAttr],
+        recovered_after_unclean_shutdown: bool,
+        landing_recovery_inodes: Option<HashSet<Ino>>,
+    ) {
+        StartupReplayCoordinator::new(
+            self,
+            pending_uploads,
+            recovered_after_unclean_shutdown,
+            landing_recovery_inodes,
+        )
+        .run(attrs);
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {

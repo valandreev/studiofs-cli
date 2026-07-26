@@ -101,7 +101,9 @@ impl PgMetaEngine {
         if persisted_version > 0 {
             return Ok(None);
         }
-        if Self::has_any_local_overlay_mutation(local)? {
+        let has_unflushed_local_events = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?
+            < local.get_counter("nextEventSeq")?;
+        if has_unflushed_local_events && Self::has_any_local_overlay_mutation(local)? {
             return Ok(Some(StartupSnapshotImportMode::PreserveLocalState));
         }
         Ok(Some(StartupSnapshotImportMode::ReplaceLocalState))

@@ -476,6 +476,12 @@ impl StudioVfs {
             }),
         );
         self.persist_zeroio_shutdown_snapshot(&shutdown_snapshot);
+        if deferred_namespace_error.is_none()
+            && metadata_barrier_error.is_none()
+            && local_payload_sync_ok
+        {
+            self.finish_zeroio_session();
+        }
         self.state
             .shutdown
             .shutdown_completed

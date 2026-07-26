@@ -62,10 +62,24 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
             .map_err(scenario_error_to_io)
         },
     ))?);
+    operations.push(required_op(
+        started,
+        4,
+        &clients[0],
+        "client_b_peer_visible",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            std::slice::from_ref(&clients[0]),
+            &[(path.as_str(), client_b_payload.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect client-b",
+        ),
+    )?);
     let client_d_payload = isolation.payload("write_client_d", &path, "version from client-d\n");
     operations.push(required_record(fs_op(
         started,
-        4,
+        5,
         &clients[3],
         "write",
         &path,
@@ -81,13 +95,41 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     ))?);
     operations.push(required_op(
         started,
-        5,
+        6,
+        &clients[0],
+        "client_d_peer_visible",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            std::slice::from_ref(&clients[0]),
+            &[(path.as_str(), client_d_payload.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect client-d",
+        ),
+    )?);
+    operations.push(required_op(
+        started,
+        7,
         &clients[2],
         "stale_writer_reconnect",
         clients[2].name.as_str(),
         controller
             .remount(&clients[2].name)
             .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_op(
+        started,
+        8,
+        &clients[2],
+        "reconnected_client_c_catches_up",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            std::slice::from_ref(&clients[2]),
+            &[(path.as_str(), client_d_payload.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect client-c catch-up",
+        ),
     )?);
     let winner = isolation.payload(
         "write_lww_winner",
@@ -96,7 +138,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     );
     operations.push(required_record(fs_op(
         started,
-        6,
+        9,
         &clients[2],
         "write_lww_winner",
         &path,
@@ -112,7 +154,21 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     ))?);
     operations.push(required_op(
         started,
-        7,
+        10,
+        &clients[2],
+        "winner_peer_visible",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            clients,
+            &[(path.as_str(), winner.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect winner",
+        ),
+    )?);
+    operations.push(required_op(
+        started,
+        11,
         &clients[2],
         "winner_crash_restart",
         clients[2].name.as_str(),

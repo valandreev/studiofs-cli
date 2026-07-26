@@ -601,10 +601,16 @@ impl PgMetaEngine {
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
         } else {
+            // Preserve unflushed local overlays while allowing acknowledged
+            // journals to fast-forward from the latest remote checkpoint.
             if let Some(import_mode) =
                 Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
+                && let Err(error) = engine.pull_snapshot_locked(import_mode)
             {
-                let _ = engine.pull_snapshot_locked(import_mode);
+                warn!(
+                    error = %error,
+                    "postgres metadata startup snapshot pull failed; continuing from local state"
+                );
             }
             if let Err(error) = engine.sync_metadata_to_current_head() {
                 warn!(
@@ -612,7 +618,7 @@ impl PgMetaEngine {
                     "postgres metadata startup catch-up did not reach the current remote head"
                 );
             }
-            let _ = engine.restore_pending_state_from_local_log();
+            engine.restore_pending_state_from_local_log()?;
         }
         engine.prime_local_id_ranges(client_slot)?;
         if options.background_poll {

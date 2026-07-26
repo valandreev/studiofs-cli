@@ -163,6 +163,24 @@ fn startup_snapshot_is_skipped_for_existing_local_graph() {
 }
 
 #[test]
+fn startup_snapshot_replaces_acknowledged_local_overlay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.local
+        .create_dir(ROOT_INO, b"acknowledged", 0, 0, 0o755)
+        .expect("create local directory");
+    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    pg.persist_flushed_event_seq(event_end)
+        .expect("acknowledge local events");
+
+    assert_eq!(
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
+            .expect("startup snapshot decision"),
+        Some(super::StartupSnapshotImportMode::ReplaceLocalState),
+        "acknowledged local events must not hide the authoritative remote snapshot"
+    );
+}
+
+#[test]
 fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
     let mut snapshot = RedbSnapshot::default();
     snapshot
