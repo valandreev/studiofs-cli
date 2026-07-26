@@ -3,6 +3,10 @@
 StudioFS is a Rust 2024 workspace for a cross-platform local-first virtual filesystem over S3-compatible object storage with PostgreSQL-based shared metadata.
 We are building a file system for a world where computers are constantly connecting and disconnecting, operating from different cities and countries, have varying internet connections, and cannot view the same data in perfect synchronisation. Therefore, each computer must be sufficiently autonomous. It operates locally, synchronises with the overall system, but does not depend directly on any other computer.
 
+# ExecPlans
+
+When writing complex features or significant refactors, use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
+
 ## Always-on project rules
 
 - This repository targets Rust and uses `cargo` as the primary toolchain.
@@ -13,6 +17,7 @@ We are building a file system for a world where computers are constantly connect
 - All temporary files should be in `target/` and should be cleaned up after use.
 
 ## Temporal Awareness and Efficiency
+
 - Treat elapsed time and tokens as finite engineering budgets.
 - Record the task start time and compare actual elapsed time against the estimate at meaningful checkpoints.
 - Keep progress updates short, factual, and evidence-based. A status report is never a pause or approval gate while work remains possible.
