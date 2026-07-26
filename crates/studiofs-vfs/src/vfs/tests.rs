@@ -1199,6 +1199,26 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
 }
 
 #[test]
+fn startup_replay_preserves_ready_empty_file_without_landing_record() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "startup-ready-empty-file-without-landing-record");
+
+    let created = vfs
+        .create(1, b"preserved-empty-file.bin", 0, 0, 0o644)
+        .expect("create empty file");
+    let attr = meta.get_attr(created.ino).expect("load empty file");
+    assert!(attr.is_unpublished_empty_draft());
+
+    vfs.replay_dirty_uploads_after_unclean_shutdown(&[], &[attr], true, Some(HashSet::new()));
+
+    assert!(
+        meta.lookup(1, b"preserved-empty-file.bin").is_ok(),
+        "a ready empty file is valid without a landing record"
+    );
+}
+
+#[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cleanup() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-orphan");
@@ -9377,6 +9397,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
 
         let direct_snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            1,
+            "direct write-through must durably sync local metadata"
+        );
+        assert_eq!(
             direct_snapshot.vfs_write_path.materialize_strict.calls, 1,
             "direct write-through should materialize through the strict stage"
         );
@@ -9403,6 +9431,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
         .unwrap();
 
         let deferred_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            2,
+            "deferred write-through must also durably sync local metadata"
+        );
         assert_eq!(
             deferred_snapshot.vfs_write_path.materialize_strict.calls, 2,
             "deferred write-through should also materialize through the strict stage"
@@ -10379,6 +10415,47 @@ fn kernel_invalidation_skips_unresolved_active_open_overlay() {
             "kernel invalidation must not evict an unlinked inode that still has an active writable handle"
         );
         vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn kernel_invalidation_skips_active_open_overlay_before_foreign_unlink_is_visible() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "active-open-pending-unlink-kernel-inval");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"active-open-pending-unlink-kernel-inval.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::APPEND, false)
+            .expect("open append handle");
+        assert!(
+            vfs.best_effort_path_for_inode(attr.ino).is_some(),
+            "the invalidation must race ahead of the foreign unlink becoming locally visible"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        vfs.invalidate_kernel_inodes([attr.ino]);
+
+        assert!(
+            invalidator.snapshot().is_empty(),
+            "kernel invalidation must not evict a live append handle while unlink visibility catches up"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "a skipped kernel invalidation must be replayed after the last overlay handle closes"
+        );
     });
 }
 

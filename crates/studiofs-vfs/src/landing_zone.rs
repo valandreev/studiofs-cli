@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
@@ -444,6 +444,18 @@ impl LandingZone {
                 })
             })
             .collect()
+    }
+
+    pub(super) fn recoverable_inodes(&self) -> io::Result<HashSet<u64>> {
+        self.drain_pending()?;
+        Ok(self
+            .files
+            .lock()
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?
+            .segments
+            .iter()
+            .map(|segment| segment.ino)
+            .collect())
     }
 
     pub(super) fn clear_inode(&self, ino: u64) -> io::Result<()> {

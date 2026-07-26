@@ -601,7 +601,9 @@ impl StudioVfs {
         };
         let mut unique = HashSet::new();
         for ino in inodes {
-            if unique.insert(ino) && !self.should_skip_kernel_invalidation_for_active_open(ino) {
+            if unique.insert(ino)
+                && !self.should_skip_kernel_invalidation_for_active_open(ino, true)
+            {
                 invalidator.inval_inode(ino);
             }
         }
@@ -613,15 +615,43 @@ impl StudioVfs {
         };
         let mut unique = HashSet::new();
         for ino in inodes {
-            if unique.insert(ino) && !self.should_skip_kernel_invalidation_for_active_open(ino) {
+            if unique.insert(ino)
+                && !self.should_skip_kernel_invalidation_for_active_open(ino, false)
+            {
                 invalidator.inval_inode_attrs(ino);
             }
         }
     }
 
-    fn should_skip_kernel_invalidation_for_active_open(&self, ino: Ino) -> bool {
-        self.handle_table.has_active_open_overlay(ino)
-            && self.best_effort_path_for_inode(ino).is_none()
+    fn should_skip_kernel_invalidation_for_active_open(&self, ino: Ino, full: bool) -> bool {
+        if !self.handle_table.has_active_open_overlay(ino) {
+            return false;
+        }
+        let pending = if full {
+            &self.deferred_kernel_invalidations
+        } else {
+            &self.deferred_kernel_inode_attrs
+        };
+        pending.insert(ino);
+        if self.handle_table.has_active_open_overlay(ino) {
+            true
+        } else {
+            pending.remove(&ino);
+            false
+        }
+    }
+
+    pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
+        if self.kernel_invalidator().is_none() {
+            return;
+        }
+        let full = self.deferred_kernel_invalidations.remove(&ino).is_some();
+        let attrs = self.deferred_kernel_inode_attrs.remove(&ino).is_some();
+        if full {
+            self.invalidate_kernel_inodes([ino]);
+        } else if attrs {
+            self.invalidate_kernel_inode_attrs([ino]);
+        }
     }
 
     pub(super) fn invalidate_attr_read_cache(

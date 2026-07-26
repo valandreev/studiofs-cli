@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::infra::ServicePort;
 use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::ChildJob;
+#[cfg(target_os = "macos")]
+use crate::process_job::{CHILD_TERMINATION_GRACE, wait_for_child_exit};
 
 /// Default client names used by the E2E mounted scenarios.
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
@@ -29,6 +31,8 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 #[cfg(target_os = "macos")]
 const MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const MACOS_DISKUTIL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
@@ -970,7 +974,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.mount_command(index)?;
-        self.executor.cleanup_stale_mount_before_remount(&command)?;
+        // force_kill already cleaned this mount on macOS; a second Disk
+        // Arbitration request can outlive the helper and detach the remount.
+        if !cfg!(target_os = "macos")
+            || self.clients[index].spec.state != ClientLifecycleState::Killed
+        {
+            self.executor.cleanup_stale_mount_before_remount(&command)?;
+        }
         self.mount_index(index)
     }
 
@@ -2019,16 +2029,20 @@ pub(crate) fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()>
 }
 
 #[cfg(target_os = "macos")]
-fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static str])] {
+fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static str], Duration)] {
     &[
-        ("diskutil", &["unmount", "force"]),
-        ("umount", &["-f"]),
-        ("umount", &[]),
+        ("umount", &["-f"], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT),
+        ("umount", &[], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT),
+        (
+            "diskutil",
+            &["unmount", "force"],
+            MACOS_DISKUTIL_UNMOUNT_TIMEOUT,
+        ),
     ]
 }
 
 #[cfg(target_os = "macos")]
-fn create_macos_unmount_output_file(label: &str) -> io::Result<(PathBuf, fs::File)> {
+fn create_macos_unmount_output_file(label: &str) -> io::Result<fs::File> {
     let dir = PathBuf::from("target").join("studiofs-e2e-unmount-output");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{label}-{}.log", uuid::Uuid::new_v4()));
@@ -2037,7 +2051,8 @@ fn create_macos_unmount_output_file(label: &str) -> io::Result<(PathBuf, fs::Fil
         .write(true)
         .create_new(true)
         .open(&path)?;
-    Ok((path, file))
+    fs::remove_file(&path)?;
+    Ok(file)
 }
 
 #[cfg(target_os = "macos")]
@@ -2055,24 +2070,24 @@ fn run_macos_unmount_attempt_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> io::Result<std::process::Output> {
-    struct DeleteOnDrop(PathBuf);
-
-    impl Drop for DeleteOnDrop {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    let (stdout_path, mut stdout_file) = create_macos_unmount_output_file("stdout")?;
-    let _stdout_guard = DeleteOnDrop(stdout_path);
-    let (stderr_path, mut stderr_file) = create_macos_unmount_output_file("stderr")?;
-    let _stderr_guard = DeleteOnDrop(stderr_path);
-    let mut child = Command::new(program)
+    let mut stdout_file = create_macos_unmount_output_file("stdout")?;
+    let mut stderr_file = create_macos_unmount_output_file("stderr")?;
+    let mut command = Command::new(program);
+    command
         .args(args)
         .arg(path)
         .stdout(Stdio::from(stdout_file.try_clone()?))
-        .stderr(Stdio::from(stderr_file.try_clone()?))
-        .spawn()?;
+        .stderr(Stdio::from(stderr_file.try_clone()?));
+    ChildJob::prepare_command(&mut command)?;
+    let mut child = command.spawn()?;
+    let job = match ChildJob::assign_to_child(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -2085,8 +2100,16 @@ fn run_macos_unmount_attempt_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Give Disk Arbitration clients a chance to cancel an in-flight
+            // request before force-killing the process group. A hard kill can
+            // leave the daemon-side unmount request active after this helper
+            // returns, allowing it to detach a subsequent remount.
+            let _ = job.terminate();
+            if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                let _ = job.force_kill();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -2108,13 +2131,8 @@ fn force_unmount_stale_macos_mount(
     readiness_error: Option<io::Error>,
 ) -> io::Result<()> {
     let mut diagnostics = Vec::new();
-    for (program, args) in macos_stale_unmount_attempts() {
-        match run_macos_unmount_attempt_with_timeout(
-            program,
-            args,
-            path,
-            MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT,
-        ) {
+    for (program, args, timeout) in macos_stale_unmount_attempts() {
+        match run_macos_unmount_attempt_with_timeout(program, args, path, *timeout) {
             Ok(output) if output.status.success() => match mount_point_is_active(path) {
                 Ok(false) => return Ok(()),
                 Ok(true) => diagnostics.push(format!(
@@ -2381,19 +2399,43 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_unmount_output_file_is_unlinked_immediately() {
+        let label = format!("unlink-on-open-{}", uuid::Uuid::new_v4());
+        let _file = create_macos_unmount_output_file(&label).expect("create output file");
+        let dir = PathBuf::from("target").join("studiofs-e2e-unmount-output");
+        let leaked = fs::read_dir(dir)
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&label));
+
+        assert!(
+            !leaked,
+            "an open unmount output file must not retain a directory entry"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_stale_mount_cleanup_uses_force_unmount_attempts() {
         let attempts = macos_stale_unmount_attempts();
 
+        assert_eq!(
+            attempts.first(),
+            Some(&("umount", &["-f"][..], MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT)),
+            "macOS stale mount cleanup should prefer a synchronous forced unmount"
+        );
         assert!(
-            attempts
-                .iter()
-                .any(|(program, args)| *program == "diskutil" && *args == ["unmount", "force"]),
-            "macOS stale mount cleanup should try diskutil force unmount"
+            attempts.iter().any(|(program, args, timeout)| {
+                *program == "diskutil"
+                    && *args == ["unmount", "force"]
+                    && *timeout == Duration::from_secs(60)
+            }),
+            "diskutil cleanup must wait for its delegated Disk Arbitration request"
         );
         assert!(
             attempts
                 .iter()
-                .any(|(program, args)| *program == "umount" && *args == ["-f"]),
+                .any(|(program, args, _)| *program == "umount" && *args == ["-f"]),
             "macOS stale mount cleanup should fall back to forced umount"
         );
     }
@@ -2415,6 +2457,53 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cleanup timeout should bound a stuck unmount helper"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_timeout_gracefully_terminates_helper() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let marker = temp.path().join("graceful-termination-marker");
+        let error = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "trap 'touch \"$0\"; exit 0' TERM; while :; do :; done",
+            ],
+            &marker,
+            Duration::from_millis(50),
+        )
+        .expect_err("blocking cleanup command should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            marker.exists(),
+            "a timed-out cleanup command should receive termination before force-kill"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_timeout_terminates_helper_descendants() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let marker = temp.path().join("descendant-marker");
+        let error = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "nohup sh -c 'sleep 1; touch \"$1\"' sh \"$0\" >/dev/null 2>&1 & while :; do :; done",
+            ],
+            &marker,
+            Duration::from_millis(50),
+        )
+        .expect_err("blocking cleanup command should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !marker.exists(),
+            "a timed-out cleanup command must not leave descendants running"
         );
     }
 

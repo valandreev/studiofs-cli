@@ -147,11 +147,18 @@ impl HandleTable {
     /// Returns true when an inode still has a mutating handle whose local view
     /// must survive namespace removal until the handle is released.
     pub(super) fn has_active_open_overlay(&self, ino: Ino) -> bool {
-        self.handles
-            .read()
-            .handles
-            .values()
-            .any(|open_file| open_file.ino == ino && open_file.active_open_overlay)
+        let handles = self.handles.read();
+        handles
+            .handles_by_inode
+            .get(&ino)
+            .is_some_and(|handle_ids| {
+                handle_ids.iter().any(|fh| {
+                    handles
+                        .handles
+                        .get(fh)
+                        .is_some_and(|open_file| open_file.active_open_overlay)
+                })
+            })
     }
 
     pub(super) fn clear_read_windows_for_inode(&self, ino: Ino) {

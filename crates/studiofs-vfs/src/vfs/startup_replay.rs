@@ -28,6 +28,8 @@ pub(super) struct StartupReplayCoordinator<'a> {
     stale_pending_uploads: HashMap<PendingUploadKey, PendingUpload>,
     lost_unpublished_upload_inodes: HashSet<Ino>,
     live_zero_size_unpublished_inodes: HashSet<Ino>,
+    recovered_after_unclean_shutdown: bool,
+    landing_recovery_inodes: Option<HashSet<Ino>>,
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
@@ -44,7 +46,12 @@ struct StartupGraphObject {
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
-    pub(super) fn new(vfs: &'a StudioVfs, pending_uploads: &[PendingUpload]) -> Self {
+    pub(super) fn new(
+        vfs: &'a StudioVfs,
+        pending_uploads: &[PendingUpload],
+        recovered_after_unclean_shutdown: bool,
+        landing_recovery_inodes: Option<HashSet<Ino>>,
+    ) -> Self {
         Self {
             vfs,
             pending_catalog: PendingUploadCatalog::from_ops(pending_uploads.iter().cloned()),
@@ -66,6 +73,8 @@ impl<'a> StartupReplayCoordinator<'a> {
             stale_pending_uploads: HashMap::new(),
             lost_unpublished_upload_inodes: HashSet::new(),
             live_zero_size_unpublished_inodes: HashSet::new(),
+            recovered_after_unclean_shutdown,
+            landing_recovery_inodes,
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
@@ -82,6 +91,10 @@ impl<'a> StartupReplayCoordinator<'a> {
 
     fn process_attr(&mut self, attr: &InodeAttr) {
         let ino = attr.ino;
+        if self.should_remove_unpublished_regular_inode(attr) {
+            self.lost_unpublished_upload_inodes.insert(ino);
+            return;
+        }
         let needs_finalization = StudioVfs::needs_epoch_finalization(attr);
         let has_pending_uploads = self.pending_catalog.has_inode(ino);
         if has_pending_uploads {
@@ -112,10 +125,6 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.classify_pending_uploads_for_attr(attr, graph_objects.as_slice());
         }
 
-        if graph_objects.is_empty() && Self::is_lost_unpublished_regular_upload(attr) {
-            self.lost_unpublished_upload_inodes.insert(ino);
-            return;
-        }
         if graph_objects.is_empty() && is_live_zero_size_unpublished_draft {
             return;
         }
@@ -137,6 +146,16 @@ impl<'a> StartupReplayCoordinator<'a> {
             && attr.upload_state != MetaUploadState::Ready
             && attr.committed_size == 0
             && attr.committed_content_epoch == 0
+    }
+
+    fn should_remove_unpublished_regular_inode(&self, attr: &InodeAttr) -> bool {
+        Self::is_lost_unpublished_regular_upload(attr)
+            || (self.recovered_after_unclean_shutdown
+                && Self::is_live_zero_size_unpublished_draft(attr)
+                && self
+                    .landing_recovery_inodes
+                    .as_ref()
+                    .is_some_and(|inodes| !inodes.contains(&attr.ino)))
     }
 
     fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {
@@ -376,7 +395,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                     continue;
                 }
             };
-            if !Self::is_lost_unpublished_regular_upload(&attr) {
+            if !self.should_remove_unpublished_regular_inode(&attr) {
                 continue;
             }
             let entries = match meta.readdir(attr.parent) {
@@ -930,7 +949,7 @@ mod tests {
         )
         .expect("persist uploaded payload slice");
 
-        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[]);
+        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[], false, None);
         coordinator.process_attr(&attr);
         assert_eq!(
             coordinator

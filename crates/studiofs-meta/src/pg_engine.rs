@@ -590,13 +590,10 @@ impl PgMetaEngine {
 
         // Bootstrap from the last checkpoint if present, then catch up from
         // append-only event deltas.
-        let import_mode = if repair_local_graph_recovery_pending {
-            StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog
-        } else {
-            Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
-        };
         if repair_local_graph_recovery_pending {
-            engine.pull_snapshot_locked(import_mode)?;
+            engine.pull_snapshot_locked(
+                StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
+            )?;
             engine.sync_metadata_to_current_head()?;
             engine.restore_pending_state_from_local_log()?;
             engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
@@ -604,14 +601,24 @@ impl PgMetaEngine {
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
         } else {
-            let _ = engine.pull_snapshot_locked(import_mode);
+            // Preserve unflushed local overlays while allowing acknowledged
+            // journals to fast-forward from the latest remote checkpoint.
+            if let Some(import_mode) =
+                Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
+                && let Err(error) = engine.pull_snapshot_locked(import_mode)
+            {
+                warn!(
+                    error = %error,
+                    "postgres metadata startup snapshot pull failed; continuing from local state"
+                );
+            }
             if let Err(error) = engine.sync_metadata_to_current_head() {
                 warn!(
                     error = %error,
                     "postgres metadata startup catch-up did not reach the current remote head"
                 );
             }
-            let _ = engine.restore_pending_state_from_local_log();
+            engine.restore_pending_state_from_local_log()?;
         }
         engine.prime_local_id_ranges(client_slot)?;
         if options.background_poll {

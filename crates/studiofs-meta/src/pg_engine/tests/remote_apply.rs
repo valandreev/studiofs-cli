@@ -3092,19 +3092,18 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
         client
             .execute(
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
-                &[&volume.volume_id, &add_event.kind(), &add_payload],
+                    VALUES ($1, 2, $2, $3, 'manual-foreign'), \
+                           ($1, 2, $4, $5, 'manual-foreign')",
+                &[
+                    &volume.volume_id,
+                    &add_event.kind(),
+                    &add_payload,
+                    &dentry_event.kind(),
+                    &dentry_payload,
+                ],
             )
             .await
-            .map_err(|e| MetaError::Storage(format!("insert remote attr event failed: {e}")))?;
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
-                &[&volume.volume_id, &dentry_event.kind(), &dentry_payload],
-            )
-            .await
-            .map_err(|e| MetaError::Storage(format!("insert remote dentry event failed: {e}")))?;
+            .map_err(|e| MetaError::Storage(format!("insert remote batch failed: {e}")))?;
         conn_task.abort();
         Ok(())
     })
