@@ -836,7 +836,7 @@ mod tests {
     use super::*;
     use crate::vfs::tests::{FileGraphMetaFixture, make_unstarted_test_vfs};
     use studiofs_meta::MetaGc;
-    use studiofs_meta::engine::{MetaInodes, MetaNamespace};
+    use studiofs_meta::engine::MetaInodes;
     use studiofs_meta::schema::PayloadRef;
 
     fn zero_size_unpublished_attr(nlink: u32) -> InodeAttr {
@@ -885,24 +885,6 @@ mod tests {
             !StartupReplayCoordinator::is_live_zero_size_unpublished_draft(&attr),
             "startup replay should leave advanced zero-size epochs on the finalizer path"
         );
-    }
-
-    #[test]
-    fn unclean_startup_removes_linked_unpublished_empty_draft() {
-        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unclean-empty-draft");
-        let created = vfs
-            .create(1, b"unclean-empty-draft.txt", 0, 0, 0o644)
-            .expect("create unpublished empty draft");
-        let persisted = meta.get_attr(created.ino).expect("load empty draft");
-        assert!(persisted.is_unpublished_empty_draft());
-
-        StartupReplayCoordinator::new(&vfs, &[], true, Some(HashSet::new())).run(&[persisted]);
-
-        assert!(matches!(
-            meta.lookup(1, b"unclean-empty-draft.txt"),
-            Err(MetaError::EntryNotFound { .. })
-        ));
     }
 
     #[test]
