@@ -3456,6 +3456,10 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
+    /// Inodes whose kernel invalidation was deferred while a writable handle was open.
+    deferred_kernel_invalidations: DashSet<Ino>,
+    /// Inodes whose kernel attribute invalidation was deferred while a writable handle was open.
+    deferred_kernel_inode_attrs: DashSet<Ino>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
     runtime_stats_file_time_nanos: i64,

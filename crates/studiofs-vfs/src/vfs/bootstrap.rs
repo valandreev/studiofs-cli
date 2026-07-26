@@ -509,6 +509,8 @@ impl VfsBootstrap {
             fetch_scheduler: resources.fetch_scheduler,
             distributed_flock,
             kernel_invalidator: RwLock::new(None),
+            deferred_kernel_invalidations: DashSet::new(),
+            deferred_kernel_inode_attrs: DashSet::new(),
             write_path_backend_tag: "local-payload-runtime".to_string(),
             write_path_started_at: Instant::now(),
             runtime_stats_file_time_nanos: InodeAttr::now_nanos(),

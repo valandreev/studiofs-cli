@@ -674,6 +674,7 @@ impl StudioVfs {
         if self.inode_has_local_dirty_state(ino) {
             self.invalidate_kernel_inode_attrs([ino]);
         }
+        self.flush_deferred_kernel_invalidations(ino);
         self.debug_pending_inode_state(ino, "release_last_handle");
         Some(HandleReleaseContext { open_file, ino })
     }

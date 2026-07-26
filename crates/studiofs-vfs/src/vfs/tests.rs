@@ -10435,6 +10435,11 @@ fn kernel_invalidation_skips_active_open_overlay_before_foreign_unlink_is_visibl
             "kernel invalidation must not evict a live append handle while unlink visibility catches up"
         );
         vfs.release_fh(fh).await.expect("release handle");
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "a skipped kernel invalidation must be replayed after the last overlay handle closes"
+        );
     });
 }
 
