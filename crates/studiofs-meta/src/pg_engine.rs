@@ -613,7 +613,7 @@ impl PgMetaEngine {
                     "postgres metadata startup catch-up did not reach the current remote head"
                 );
             }
-            let _ = engine.restore_pending_state_from_local_log();
+            engine.restore_pending_state_from_local_log()?;
         }
         engine.prime_local_id_ranges(client_slot)?;
         if options.background_poll {

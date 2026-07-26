@@ -129,6 +129,66 @@ fn open_with_persisted_slot_and_ranges_survives_pg_unavailable() {
 }
 
 #[test]
+fn open_fails_when_pending_local_event_log_is_corrupt() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&path).expect("open local redb");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "corrupt-local-event-log",
+            "corrupt-local-event-log-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    persist_inode_state(
+        &local,
+        InodeAllocatorState {
+            current: InodeWindow {
+                start: 4_000,
+                next: 4_002,
+                end: 4_008,
+            },
+            prefetched: InodeWindow::default(),
+        },
+    );
+
+    let event_seq = local.get_counter("nextEventSeq").expect("event start");
+    local
+        .create_file(ROOT_INO, b"pending-local-file.bin", 0, 0, 0o644)
+        .expect("create pending local file");
+    local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, event_seq)
+        .expect("persist unflushed event start");
+    let txn = local
+        .begin_write_txn()
+        .expect("begin corruption transaction");
+    {
+        let event_log = redb::TableDefinition::<u64, &[u8]>::new("event_log");
+        let mut events = txn.open_table(event_log).expect("open event log");
+        events
+            .insert(event_seq, b"invalid-event".as_slice())
+            .expect("corrupt pending event");
+    }
+    txn.commit().expect("commit corrupted event");
+    drop(local);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    );
+
+    assert!(
+        reopened.is_err(),
+        "startup must not silently discard an unreadable pending local event"
+    );
+}
+
+#[test]
 fn sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");

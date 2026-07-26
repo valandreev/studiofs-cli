@@ -151,8 +151,7 @@ impl<'a> StartupReplayCoordinator<'a> {
     fn should_remove_unpublished_regular_inode(&self, attr: &InodeAttr) -> bool {
         Self::is_lost_unpublished_regular_upload(attr)
             || (self.recovered_after_unclean_shutdown
-                && (Self::is_live_zero_size_unpublished_draft(attr)
-                    || attr.is_unpublished_empty_draft())
+                && Self::is_live_zero_size_unpublished_draft(attr)
                 && self
                     .landing_recovery_inodes
                     .as_ref()
