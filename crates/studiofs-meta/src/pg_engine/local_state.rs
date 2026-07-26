@@ -96,13 +96,17 @@ impl PgMetaEngine {
 
     pub(super) fn startup_snapshot_import_mode(
         local: &RedbMetaEngine,
-    ) -> MetaResult<StartupSnapshotImportMode> {
+        persisted_version: i64,
+    ) -> MetaResult<Option<StartupSnapshotImportMode>> {
+        if persisted_version > 0 {
+            return Ok(None);
+        }
         let has_unflushed_local_events = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?
             < local.get_counter("nextEventSeq")?;
         if has_unflushed_local_events && Self::has_any_local_overlay_mutation(local)? {
-            return Ok(StartupSnapshotImportMode::PreserveLocalState);
+            return Ok(Some(StartupSnapshotImportMode::PreserveLocalState));
         }
-        Ok(StartupSnapshotImportMode::ReplaceLocalState)
+        Ok(Some(StartupSnapshotImportMode::ReplaceLocalState))
     }
 
     pub(super) fn snapshot_replay_start_version(

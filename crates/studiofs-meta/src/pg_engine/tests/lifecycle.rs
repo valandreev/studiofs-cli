@@ -36,8 +36,9 @@ fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
         "local draft namespace should register as a local overlay mutation"
     );
     assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
-        super::StartupSnapshotImportMode::PreserveLocalState,
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
+            .expect("startup snapshot decision"),
+        Some(super::StartupSnapshotImportMode::PreserveLocalState),
         "startup snapshot must preserve a local overlay after crash/restart"
     );
 }
@@ -148,19 +149,16 @@ fn persisted_pg_version_roundtrips_in_local_counter() {
 }
 
 #[test]
-fn startup_snapshot_replaces_stale_local_state_without_an_overlay() {
+fn startup_snapshot_is_skipped_for_existing_local_graph() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    let snapshot = pg.local.export_snapshot().expect("export base snapshot");
-    pg.local
-        .import_snapshot(&snapshot)
-        .expect("seed imported base");
 
     pg.persist_local_version(42).expect("persist local version");
 
-    assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
-        super::StartupSnapshotImportMode::ReplaceLocalState,
-        "a persisted replay cursor alone must not keep stale serving state over the remote snapshot"
+    assert!(
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 42)
+            .expect("startup snapshot decision")
+            .is_none(),
+        "an existing local graph must catch up from its own cursor without importing a checkpoint"
     );
 }
 
@@ -175,8 +173,9 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
         .expect("acknowledge local events");
 
     assert_eq!(
-        PgMetaEngine::startup_snapshot_import_mode(&pg.local).expect("startup snapshot decision"),
-        super::StartupSnapshotImportMode::ReplaceLocalState,
+        PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
+            .expect("startup snapshot decision"),
+        Some(super::StartupSnapshotImportMode::ReplaceLocalState),
         "acknowledged local events must not hide the authoritative remote snapshot"
     );
 }
