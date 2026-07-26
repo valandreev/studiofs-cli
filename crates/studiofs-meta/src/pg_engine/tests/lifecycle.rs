@@ -38,7 +38,7 @@ fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
     assert_eq!(
         PgMetaEngine::startup_snapshot_import_mode(&pg.local, 0)
             .expect("startup snapshot decision"),
-        super::StartupSnapshotImportMode::PreserveLocalState,
+        Some(super::StartupSnapshotImportMode::PreserveLocalState),
         "startup snapshot must preserve a local overlay after crash/restart"
     );
 }
@@ -149,16 +149,16 @@ fn persisted_pg_version_roundtrips_in_local_counter() {
 }
 
 #[test]
-fn startup_snapshot_uses_preserving_import_for_stale_persisted_version() {
+fn startup_snapshot_is_skipped_for_existing_local_graph() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     pg.persist_local_version(42).expect("persist local version");
 
-    assert_eq!(
+    assert!(
         PgMetaEngine::startup_snapshot_import_mode(&pg.local, 42)
-            .expect("startup snapshot decision"),
-        super::StartupSnapshotImportMode::PreserveLocalState,
-        "stale clients should fast-forward from a checkpoint while preserving local state"
+            .expect("startup snapshot decision")
+            .is_none(),
+        "an existing local graph must catch up from its own cursor without importing a checkpoint"
     );
 }
 

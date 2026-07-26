@@ -87,6 +87,10 @@ impl<'a> StartupReplayCoordinator<'a> {
         if has_pending_uploads {
             self.seen_replay_inodes.insert(ino);
         }
+        let is_lost_unpublished_regular_upload = Self::is_lost_unpublished_regular_upload(attr);
+        if is_lost_unpublished_regular_upload {
+            self.lost_unpublished_upload_inodes.insert(ino);
+        }
         let is_live_zero_size_unpublished_draft = Self::is_live_zero_size_unpublished_draft(attr);
         if is_live_zero_size_unpublished_draft {
             self.live_zero_size_unpublished_inodes.insert(ino);
@@ -112,8 +116,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.classify_pending_uploads_for_attr(attr, graph_objects.as_slice());
         }
 
-        if graph_objects.is_empty() && Self::is_lost_unpublished_regular_upload(attr) {
-            self.lost_unpublished_upload_inodes.insert(ino);
+        if graph_objects.is_empty() && is_lost_unpublished_regular_upload {
             return;
         }
         if graph_objects.is_empty() && is_live_zero_size_unpublished_draft {
@@ -132,11 +135,12 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn is_lost_unpublished_regular_upload(attr: &InodeAttr) -> bool {
-        attr.nlink == 0
+        (attr.nlink == 0
             && attr.kind == FileType::RegularFile
             && attr.upload_state != MetaUploadState::Ready
             && attr.committed_size == 0
-            && attr.committed_content_epoch == 0
+            && attr.committed_content_epoch == 0)
+            || (attr.nlink <= 1 && attr.is_unpublished_empty_draft())
     }
 
     fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {

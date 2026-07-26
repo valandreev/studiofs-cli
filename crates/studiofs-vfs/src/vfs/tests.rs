@@ -1152,6 +1152,26 @@ fn startup_replay_cancels_ready_inode_stale_pending_upload() {
 }
 
 #[test]
+fn startup_replay_removes_unfinalized_empty_draft_after_crash() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-unfinalized-empty-draft");
+
+    let attr = vfs
+        .create(1, b"startup-unfinalized-empty-draft.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], std::slice::from_ref(&attr));
+
+    assert!(
+        matches!(
+            meta.lookup(1, b"startup-unfinalized-empty-draft.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "startup replay must remove a hidden empty draft that never reached its close barrier"
+    );
+}
+
+#[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-upload");
@@ -9377,6 +9397,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
 
         let direct_snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            1,
+            "direct write-through must durably sync local metadata"
+        );
+        assert_eq!(
             direct_snapshot.vfs_write_path.materialize_strict.calls, 1,
             "direct write-through should materialize through the strict stage"
         );
@@ -9403,6 +9431,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
         .unwrap();
 
         let deferred_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            2,
+            "deferred write-through must also durably sync local metadata"
+        );
         assert_eq!(
             deferred_snapshot.vfs_write_path.materialize_strict.calls, 2,
             "deferred write-through should also materialize through the strict stage"

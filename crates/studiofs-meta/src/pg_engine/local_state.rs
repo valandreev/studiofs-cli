@@ -97,11 +97,14 @@ impl PgMetaEngine {
     pub(super) fn startup_snapshot_import_mode(
         local: &RedbMetaEngine,
         persisted_version: i64,
-    ) -> MetaResult<StartupSnapshotImportMode> {
-        if persisted_version > 0 || Self::has_any_local_overlay_mutation(local)? {
-            return Ok(StartupSnapshotImportMode::PreserveLocalState);
+    ) -> MetaResult<Option<StartupSnapshotImportMode>> {
+        if persisted_version > 0 {
+            return Ok(None);
         }
-        Ok(StartupSnapshotImportMode::ReplaceLocalState)
+        if Self::has_any_local_overlay_mutation(local)? {
+            return Ok(Some(StartupSnapshotImportMode::PreserveLocalState));
+        }
+        Ok(Some(StartupSnapshotImportMode::ReplaceLocalState))
     }
 
     pub(super) fn snapshot_replay_start_version(
