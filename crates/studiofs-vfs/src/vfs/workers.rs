@@ -621,7 +621,6 @@ impl StudioVfs {
 
     fn should_skip_kernel_invalidation_for_active_open(&self, ino: Ino) -> bool {
         self.handle_table.has_active_open_overlay(ino)
-            && self.best_effort_path_for_inode(ino).is_none()
     }
 
     pub(super) fn invalidate_attr_read_cache(

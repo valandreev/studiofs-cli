@@ -10383,6 +10383,42 @@ fn kernel_invalidation_skips_unresolved_active_open_overlay() {
 }
 
 #[test]
+fn kernel_invalidation_skips_active_open_overlay_before_foreign_unlink_is_visible() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "active-open-pending-unlink-kernel-inval");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"active-open-pending-unlink-kernel-inval.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::APPEND, false)
+            .expect("open append handle");
+        assert!(
+            vfs.best_effort_path_for_inode(attr.ino).is_some(),
+            "the invalidation must race ahead of the foreign unlink becoming locally visible"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        vfs.invalidate_kernel_inodes([attr.ino]);
+
+        assert!(
+            invalidator.snapshot().is_empty(),
+            "kernel invalidation must not evict a live append handle while unlink visibility catches up"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn test_release_fh_orphan_cleanup_clears_live_extents() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");
