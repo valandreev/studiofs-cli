@@ -1521,6 +1521,7 @@ impl StudioVfs {
             }
             if local_sync_policy.requires_write_path_durability() {
                 self.flush_local_dirty_state(ino, local_sync_policy).await?;
+                self.sync_metadata_barrier().await?;
             }
             Ok(written)
         }
@@ -1745,6 +1746,11 @@ impl StudioVfs {
                     )
                     .await
                 {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
+                if let Err(e) = self.sync_metadata_barrier().await {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                     return Err(e);

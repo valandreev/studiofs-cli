@@ -9397,6 +9397,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
 
         let direct_snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            1,
+            "direct write-through must durably sync local metadata"
+        );
+        assert_eq!(
             direct_snapshot.vfs_write_path.materialize_strict.calls, 1,
             "direct write-through should materialize through the strict stage"
         );
@@ -9423,6 +9431,14 @@ fn write_through_writes_use_single_strict_materialization_stage() {
         .unwrap();
 
         let deferred_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            vfs.state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(AtomicOrdering::Acquire),
+            2,
+            "deferred write-through must also durably sync local metadata"
+        );
         assert_eq!(
             deferred_snapshot.vfs_write_path.materialize_strict.calls, 2,
             "deferred write-through should also materialize through the strict stage"
