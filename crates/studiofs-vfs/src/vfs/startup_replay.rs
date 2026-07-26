@@ -153,10 +153,10 @@ impl<'a> StartupReplayCoordinator<'a> {
             || (self.recovered_after_unclean_shutdown
                 && (Self::is_live_zero_size_unpublished_draft(attr)
                     || attr.is_unpublished_empty_draft())
-                && !self
+                && self
                     .landing_recovery_inodes
                     .as_ref()
-                    .is_some_and(|inodes| inodes.contains(&attr.ino)))
+                    .is_some_and(|inodes| !inodes.contains(&attr.ino)))
     }
 
     fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {

@@ -1199,6 +1199,36 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
 }
 
 #[test]
+fn startup_replay_preserves_empty_draft_when_landing_inspection_failed() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "startup-empty-draft-landing-inspection-failed");
+
+    let created = vfs
+        .create(1, b"preserved-empty-draft.bin", 0, 0, 0o644)
+        .expect("create empty draft");
+    let attr = meta.get_attr(created.ino).expect("load empty draft");
+    assert!(attr.is_unpublished_empty_draft());
+
+    vfs.replay_dirty_uploads_after_unclean_shutdown(&[], &[attr], true, None);
+
+    assert!(
+        meta.lookup(1, b"preserved-empty-draft.bin").is_ok(),
+        "failed landing inspection must fail closed instead of deleting an unpublished draft"
+    );
+
+    let attr = meta.get_attr(created.ino).expect("reload preserved draft");
+    vfs.replay_dirty_uploads_after_unclean_shutdown(&[], &[attr], true, Some(HashSet::new()));
+    assert!(
+        matches!(
+            meta.lookup(1, b"preserved-empty-draft.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "successful landing inspection should remove a draft with no recoverable record"
+    );
+}
+
+#[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cleanup() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-orphan");
