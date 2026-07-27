@@ -448,7 +448,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 
         let meta = self.vfs.sync_meta();
         for ino in &self.live_zero_size_unpublished_inodes {
-            let mut attr = match meta.get_attr(*ino) {
+            let attr = match meta.get_attr(*ino) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(error) => {
@@ -460,22 +460,26 @@ impl<'a> StartupReplayCoordinator<'a> {
                     continue;
                 }
             };
-            if !Self::is_live_zero_size_unpublished_draft(&attr) {
+            if !Self::is_live_zero_size_unpublished_draft(&attr)
+                && !attr.is_unpublished_empty_draft()
+            {
                 continue;
             }
-            attr.upload_state = MetaUploadState::Ready;
-            if let Err(error) = meta.set_attr(&attr) {
-                warn!(
+            match meta.publish_regular_file_overlay_to_base_if_matches(*ino, attr.content_epoch) {
+                Ok(true) => info!(
+                    ino,
+                    "startup recovery published live zero-size unpublished inode"
+                ),
+                Ok(false) => warn!(
+                    ino,
+                    "startup recovery could not publish live zero-size unpublished inode"
+                ),
+                Err(error) => warn!(
                     ino,
                     error = %error,
-                    "startup recovery failed to mark live zero-size unpublished inode ready"
-                );
-                continue;
+                    "startup recovery failed to publish live zero-size unpublished inode"
+                ),
             }
-            info!(
-                ino,
-                "startup recovery marked live zero-size unpublished inode ready"
-            );
         }
     }
 
@@ -952,6 +956,36 @@ mod tests {
                 .live_zero_size_unpublished_inodes
                 .contains(&attr.ino),
             "landing recovery must materialize data before the draft becomes publishable"
+        );
+    }
+
+    #[test]
+    fn startup_replay_should_publish_live_zero_size_draft() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-live-zero-size-draft");
+        let created = vfs
+            .create(1, b"recovered-empty.bin", 0, 0, 0o644)
+            .expect("create empty draft");
+        let mut attr = meta.get_attr(created.ino).expect("load empty draft");
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist interrupted draft");
+
+        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[], false, None);
+        coordinator.process_attr(&attr);
+        assert!(
+            coordinator
+                .live_zero_size_unpublished_inodes
+                .contains(&created.ino),
+            "startup replay must classify the interrupted empty draft for publication"
+        );
+        coordinator.finish();
+
+        let recovered = meta
+            .get_attr(created.ino)
+            .expect("load recovered empty file");
+        assert!(
+            !recovered.is_unpublished_empty_draft(),
+            "startup replay must make the recovered empty-file namespace publishable: {recovered:?}"
         );
     }
 

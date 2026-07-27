@@ -559,12 +559,18 @@ impl RedbMetaEngine {
         let was_remote_visible = Self::regular_file_remote_visible_without_published_base(&attr)
             || Self::regular_file_has_published_base_from_opened_table(&base_regular_file, ino)?;
         drop(base_regular_file);
+        let is_unpublished_empty = !was_remote_visible
+            && attr.size == 0
+            && attr.committed_size == 0
+            && attr.content_epoch == 0
+            && attr.committed_content_epoch == 0;
 
-        let Some((payload_covered_size, removed_object_ids)) =
-            Self::publish_regular_file_overlay_to_base_in_txn(txn, ino)?
-        else {
-            return Ok(false);
-        };
+        let (payload_covered_size, removed_object_ids) =
+            match Self::publish_regular_file_overlay_to_base_in_txn(txn, ino)? {
+                Some(published) => published,
+                None if is_unpublished_empty => (0, Vec::new()),
+                None => return Ok(false),
+            };
         let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
             txn,
             REGULAR_FILE_BASE_TABLE,
@@ -591,7 +597,7 @@ impl RedbMetaEngine {
                 )?;
             }
         }
-        if attr.is_unpublished_empty_draft() {
+        if is_unpublished_empty {
             attr.content_epoch = attr.content_epoch.saturating_add(1);
         }
         attr.size = attr.size.max(payload_covered_size);

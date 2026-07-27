@@ -1212,9 +1212,12 @@ fn startup_replay_preserves_ready_empty_file_without_landing_record() {
 
     vfs.replay_dirty_uploads_after_unclean_shutdown(&[], &[attr], true, Some(HashSet::new()));
 
+    let recovered = meta
+        .get_attr(created.ino)
+        .expect("load recovered empty file");
     assert!(
-        meta.lookup(1, b"preserved-empty-file.bin").is_ok(),
-        "a ready empty file is valid without a landing record"
+        recovered.is_unpublished_empty_draft(),
+        "startup replay must preserve a ready empty draft locally without publishing it: {recovered:?}"
     );
 }
 

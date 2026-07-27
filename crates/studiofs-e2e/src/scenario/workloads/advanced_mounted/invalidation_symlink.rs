@@ -289,6 +289,13 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             format!("{} symlink target v1 {}", writer.name, target_v1),
         ),
     )?);
+    wait_for_required_paths_visible_until(
+        clients,
+        &[&target_v1],
+        Instant::now() + timeout,
+        poll_interval,
+        "symlink attribute initial target",
+    )?;
 
     let link_result = run_hotspot_helper_process(
         context,
