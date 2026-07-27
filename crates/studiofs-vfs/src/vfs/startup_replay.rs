@@ -105,7 +105,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             .landing_recovery_inodes
             .as_ref()
             .is_some_and(|inodes| inodes.contains(&ino));
-        if is_live_zero_size_unpublished_draft && !has_landing_recovery {
+        if (is_live_zero_size_unpublished_draft || attr.is_unpublished_empty_draft())
+            && !has_landing_recovery
+        {
             self.live_zero_size_unpublished_inodes.insert(ino);
         }
         if !self.needs_scan(attr) && !has_pending_uploads {

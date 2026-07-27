@@ -1199,7 +1199,7 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
 }
 
 #[test]
-fn startup_replay_preserves_ready_empty_file_without_landing_record() {
+fn startup_replay_publishes_ready_empty_file_without_landing_record() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) =
         make_unstarted_test_vfs(&tmp, "startup-ready-empty-file-without-landing-record");
@@ -1212,9 +1212,12 @@ fn startup_replay_preserves_ready_empty_file_without_landing_record() {
 
     vfs.replay_dirty_uploads_after_unclean_shutdown(&[], &[attr], true, Some(HashSet::new()));
 
+    let recovered = meta
+        .get_attr(created.ino)
+        .expect("load recovered empty file");
     assert!(
-        meta.lookup(1, b"preserved-empty-file.bin").is_ok(),
-        "a ready empty file is valid without a landing record"
+        !recovered.is_unpublished_empty_draft(),
+        "startup replay must publish a ready empty file without a landing record: {recovered:?}"
     );
 }
 
