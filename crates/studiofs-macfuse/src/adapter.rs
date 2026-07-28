@@ -7,7 +7,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
 };
+use sysinfo::{MemoryRefreshKind, System};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
@@ -48,6 +49,7 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1303,21 +1305,21 @@ impl StudioVfsAdapter {
     ) -> Result<OpenReply, i32> {
         open_result
             .map(|fh| {
-                let keep_cache = if flag_policy.write_capable {
+                let policy = if flag_policy.write_capable {
                     self.record_write_capable_open(ino, fh);
                     self.vfs.record_macfuse_open_cache_decision(
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
-                    false
+                    flag_policy
                 } else if flag_policy.keep_cache {
                     self.record_foreground_read_handle(fh);
-                    self.keep_cache_for_current_generation(ino)
+                    self.read_only_open_cache_policy(ino, available_memory_bytes())
                 } else {
-                    false
+                    flag_policy
                 };
                 OpenReply::new(fh)
-                    .with_direct_io(flag_policy.direct_io)
-                    .with_keep_cache(keep_cache)
+                    .with_direct_io(policy.direct_io)
+                    .with_keep_cache(policy.keep_cache)
             })
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -1355,34 +1357,47 @@ impl StudioVfsAdapter {
         self.write_capable_state.active_count(ino) > 0
     }
 
-    fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
+    fn read_only_open_cache_policy(
+        &self,
+        ino: u64,
+        available_memory: Option<u64>,
+    ) -> MacFuseOpenCachePolicy {
         let Ok(attr) = self.vfs.getattr(ino) else {
             self.clear_open_cache_snapshot(ino, "unknown_state");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
             );
-            return false;
+            return MacFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: false,
+                write_capable: false,
+            };
+        };
+        let policy = |keep_cache| MacFuseOpenCachePolicy {
+            direct_io: available_memory.is_some_and(|available| attr.size > available),
+            keep_cache,
+            write_capable: false,
         };
         if attr.kind != FileType::RegularFile {
             self.clear_open_cache_snapshot(ino, "not_regular_file");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile,
             );
-            return false;
+            return policy(false);
         };
         if self.vfs.inode_has_local_dirty_state(ino) {
             self.clear_open_cache_snapshot(ino, "local_dirty_state");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
             );
-            return false;
+            return policy(false);
         }
         if self.has_active_write_capable_handles(ino) {
             self.clear_open_cache_snapshot(ino, "active_writer");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyActiveWriter,
             );
-            return false;
+            return policy(false);
         }
         let graph = match self.open_cache_graph_signature(ino, attr.size) {
             Ok(graph) => graph,
@@ -1396,7 +1411,7 @@ impl StudioVfsAdapter {
                 self.vfs.record_macfuse_open_cache_decision(
                     VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
                 );
-                return false;
+                return policy(false);
             }
         };
         let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
@@ -1424,7 +1439,7 @@ impl StudioVfsAdapter {
                 }
             };
             self.vfs.record_macfuse_open_cache_decision(decision);
-            return true;
+            return policy(true);
         }
 
         let content_epoch = snapshot.content_epoch;
@@ -1447,7 +1462,7 @@ impl StudioVfsAdapter {
             }
         };
         self.vfs.record_macfuse_open_cache_decision(decision);
-        false
+        policy(false)
     }
 
     fn open_cache_graph_signature(
@@ -2663,6 +2678,47 @@ pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenC
     }
 }
 
+struct AvailableMemorySnapshot {
+    system: System,
+    available: Option<u64>,
+    refreshed_at: Instant,
+}
+
+impl AvailableMemorySnapshot {
+    fn new() -> Self {
+        let mut snapshot = Self {
+            system: System::new(),
+            available: None,
+            refreshed_at: Instant::now(),
+        };
+        snapshot.refresh();
+        snapshot
+    }
+
+    fn available_memory(&mut self) -> Option<u64> {
+        if self.refreshed_at.elapsed() >= MACFUSE_AVAILABLE_MEMORY_TTL {
+            self.refresh();
+        }
+        self.available
+    }
+
+    fn refresh(&mut self) {
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let available = self.system.available_memory();
+        self.available = (available > 0).then_some(available);
+        self.refreshed_at = Instant::now();
+    }
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    static AVAILABLE_MEMORY: OnceLock<ParkingMutex<AvailableMemorySnapshot>> = OnceLock::new();
+    AVAILABLE_MEMORY
+        .get_or_init(|| ParkingMutex::new(AvailableMemorySnapshot::new()))
+        .lock()
+        .available_memory()
+}
+
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` is thread-safe, takes no pointers, and has no Rust-side
     // invariants beyond the platform libc contract.
@@ -2678,9 +2734,11 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
-        MacFuseOpenCacheSnapshotKind, ReleasedWriteCapableHandle, StudioVfsAdapter,
+        AvailableMemorySnapshot, MACFUSE_AVAILABLE_MEMORY_TTL, MacFuseOpenCacheGraphSpan,
+        MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
+        ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
+    use std::time::Instant;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
@@ -2711,6 +2769,71 @@ mod open_cache_snapshot_tests {
         assert!(
             !adapter.has_active_write_capable_handles(attr.ino),
             "a cache-disabled read-only handle must not enter the writer accounting"
+        );
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read-only handle");
+    }
+
+    #[test]
+    fn read_only_open_policy_reuses_generation_attr_for_direct_io() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-cache-direct-io").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"direct-io.bin", 501, 20, 0o644)
+            .expect("create file");
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1025))
+            .expect("set file size");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let policy = adapter.read_only_open_cache_policy(attr.ino, Some(1024));
+
+        assert!(policy.direct_io);
+    }
+
+    #[test]
+    fn expired_available_memory_snapshot_is_refreshed() {
+        let mut snapshot = AvailableMemorySnapshot {
+            system: sysinfo::System::new(),
+            available: None,
+            refreshed_at: Instant::now() - MACFUSE_AVAILABLE_MEMORY_TTL,
+        };
+
+        assert!(snapshot.available_memory().is_some());
+    }
+
+    #[test]
+    fn fresh_available_memory_snapshot_is_reused() {
+        let mut snapshot = AvailableMemorySnapshot {
+            system: sysinfo::System::new(),
+            available: None,
+            refreshed_at: Instant::now(),
+        };
+
+        assert_eq!(snapshot.available_memory(), None);
+    }
+
+    #[test]
+    fn read_only_open_avoids_a_preliminary_attr_lookup() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-cache-attr-lookups").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"attr-lookups.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let before = vfs.cache_state_snapshot().attr_read_cache;
+
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only file");
+
+        let after = vfs.cache_state_snapshot().attr_read_cache;
+        assert_eq!(
+            (after.hits + after.misses) - (before.hits + before.misses),
+            4,
+            "read-only open should resolve attrs only in VFS open and cache-generation checks"
         );
         adapter
             .release(attr.ino, opened.file_handle())

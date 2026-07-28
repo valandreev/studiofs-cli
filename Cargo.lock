@@ -4924,6 +4924,7 @@ dependencies = [
  "studiofs-bridge",
  "studiofs-meta",
  "studiofs-vfs",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
