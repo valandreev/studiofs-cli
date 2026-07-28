@@ -27,7 +27,7 @@ use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
 };
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{MemoryRefreshKind, System};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
@@ -49,6 +49,7 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1235,7 +1236,7 @@ impl StudioVfsAdapter {
         self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        let flag_policy = macfuse_open_cache_policy(flags, trunc, Some(attr.size), None);
+        let flag_policy = macfuse_open_cache_policy(flags, trunc);
         let open = self.open_with_result(
             attr.ino,
             flag_policy,
@@ -1291,7 +1292,7 @@ impl StudioVfsAdapter {
             self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
         }
-        let flag_policy = macfuse_open_cache_policy(flags, trunc, None, None);
+        let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
             .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
@@ -2668,32 +2669,54 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
 }
 
 /// Translate POSIX/macFUSE open flags into the per-handle cache-retention policy.
-pub(crate) fn macfuse_open_cache_policy(
-    flags: i32,
-    trunc: bool,
-    file_size: Option<u64>,
-    available_memory: Option<u64>,
-) -> MacFuseOpenCachePolicy {
+pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
     let write_capable = posix_open_requests_write(flags, trunc);
     MacFuseOpenCachePolicy {
-        direct_io: !write_capable
-            && file_size
-                .zip(available_memory)
-                .is_some_and(|(file_size, available_memory)| file_size > available_memory),
+        direct_io: false,
         keep_cache: !write_capable,
         write_capable,
     }
 }
 
+struct AvailableMemorySnapshot {
+    system: System,
+    available: Option<u64>,
+    refreshed_at: Instant,
+}
+
+impl AvailableMemorySnapshot {
+    fn new() -> Self {
+        let mut snapshot = Self {
+            system: System::new(),
+            available: None,
+            refreshed_at: Instant::now(),
+        };
+        snapshot.refresh();
+        snapshot
+    }
+
+    fn available_memory(&mut self) -> Option<u64> {
+        if self.refreshed_at.elapsed() >= MACFUSE_AVAILABLE_MEMORY_TTL {
+            self.refresh();
+        }
+        self.available
+    }
+
+    fn refresh(&mut self) {
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let available = self.system.available_memory();
+        self.available = (available > 0).then_some(available);
+        self.refreshed_at = Instant::now();
+    }
+}
+
 fn available_memory_bytes() -> Option<u64> {
-    static AVAILABLE_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
-    *AVAILABLE_MEMORY.get_or_init(|| {
-        let system = System::new_with_specifics(
-            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
-        );
-        let available = system.available_memory();
-        (available > 0).then_some(available)
-    })
+    static AVAILABLE_MEMORY: OnceLock<ParkingMutex<AvailableMemorySnapshot>> = OnceLock::new();
+    AVAILABLE_MEMORY
+        .get_or_init(|| ParkingMutex::new(AvailableMemorySnapshot::new()))
+        .lock()
+        .available_memory()
 }
 
 fn current_uid() -> u32 {
@@ -2711,9 +2734,11 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
-        MacFuseOpenCacheSnapshotKind, ReleasedWriteCapableHandle, StudioVfsAdapter,
+        AvailableMemorySnapshot, MACFUSE_AVAILABLE_MEMORY_TTL, MacFuseOpenCacheGraphSpan,
+        MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
+        ReleasedWriteCapableHandle, StudioVfsAdapter,
     };
+    use std::time::Instant;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
@@ -2765,6 +2790,28 @@ mod open_cache_snapshot_tests {
         let policy = adapter.read_only_open_cache_policy(attr.ino, Some(1024));
 
         assert!(policy.direct_io);
+    }
+
+    #[test]
+    fn expired_available_memory_snapshot_is_refreshed() {
+        let mut snapshot = AvailableMemorySnapshot {
+            system: sysinfo::System::new(),
+            available: None,
+            refreshed_at: Instant::now() - MACFUSE_AVAILABLE_MEMORY_TTL,
+        };
+
+        assert!(snapshot.available_memory().is_some());
+    }
+
+    #[test]
+    fn fresh_available_memory_snapshot_is_reused() {
+        let mut snapshot = AvailableMemorySnapshot {
+            system: sysinfo::System::new(),
+            available: None,
+            refreshed_at: Instant::now(),
+        };
+
+        assert_eq!(snapshot.available_memory(), None);
     }
 
     #[test]
