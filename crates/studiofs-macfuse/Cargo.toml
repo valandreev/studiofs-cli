@@ -28,5 +28,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+sysinfo.workspace = true
+
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"

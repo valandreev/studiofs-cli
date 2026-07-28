@@ -256,16 +256,21 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | buffered data cache with uncached vnode names |
+| macOS: cache policy | UBC when the file fits available memory; direct reads otherwise |
 | macOS: validated macFUSE | 5.2.0 |
 
 ### macOS cache and I/O policy
 
-macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for file
-data, while `novncache` keeps namespace lookups coherent. The mount does not
-pass `direct_io`, `nolocalcaches`, or `auto_cache`; data and attribute coherence
-instead use per-handle `keep_cache` decisions plus scoped low-level inode
-invalidations. The mount also passes
+macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for
+read-only files that fit in currently available RAM. When a file is larger than
+available RAM, its read-only handle uses `direct_io` to avoid cycling the same
+bytes through both StudioFS's local payload cache and UBC. This does not bypass
+the StudioFS cache: the VFS still reads cached payloads locally and fetches from
+object storage only on a payload-cache miss. `novncache` keeps namespace lookups
+coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
+`auto_cache` options; data and attribute coherence instead use per-handle
+`keep_cache` decisions plus scoped low-level inode invalidations. The mount also
+passes
 `iosize=4194304`, `max_read=4194304`, and `defer_permissions`; the 4 MiB
 geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass

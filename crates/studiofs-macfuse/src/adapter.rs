@@ -27,6 +27,7 @@ use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
 };
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
@@ -1234,7 +1235,7 @@ impl StudioVfsAdapter {
         self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        let flag_policy = macfuse_open_cache_policy(flags, trunc);
+        let flag_policy = macfuse_open_cache_policy(flags, trunc, Some(attr.size), None);
         let open = self.open_with_result(
             attr.ino,
             flag_policy,
@@ -1290,7 +1291,15 @@ impl StudioVfsAdapter {
             self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
         }
-        let flag_policy = macfuse_open_cache_policy(flags, trunc);
+        let (file_size, available_memory) = if posix_open_requests_write(flags, trunc) {
+            (None, None)
+        } else {
+            (
+                self.vfs.getattr(ino).ok().map(|attr| attr.size),
+                available_memory_bytes(),
+            )
+        };
+        let flag_policy = macfuse_open_cache_policy(flags, trunc, file_size, available_memory);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
             .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
@@ -2654,13 +2663,29 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
 }
 
 /// Translate POSIX/macFUSE open flags into the per-handle cache-retention policy.
-pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
+pub(crate) fn macfuse_open_cache_policy(
+    flags: i32,
+    trunc: bool,
+    file_size: Option<u64>,
+    available_memory: Option<u64>,
+) -> MacFuseOpenCachePolicy {
     let write_capable = posix_open_requests_write(flags, trunc);
     MacFuseOpenCachePolicy {
-        direct_io: false,
+        direct_io: !write_capable
+            && file_size
+                .zip(available_memory)
+                .is_some_and(|(file_size, available_memory)| file_size > available_memory),
         keep_cache: !write_capable,
         write_capable,
     }
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    );
+    let available = system.available_memory();
+    (available > 0).then_some(available)
 }
 
 fn current_uid() -> u32 {
