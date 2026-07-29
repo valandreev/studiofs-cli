@@ -108,6 +108,7 @@ impl FuseInodeLiveness {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_live(&self, ino: u64) -> bool {
         if ino == ROOT_INODE {
             return true;
@@ -163,6 +164,7 @@ impl FuseInvalidationAdmission {
         self.notified_now
     }
 
+    #[cfg(test)]
     pub(crate) const fn deferred_reply_count(self) -> usize {
         self.deferred_reply_count
     }
@@ -200,14 +202,10 @@ impl FuseLookupReservation {
     /// invalidation because content changed while the reply was in flight.
     pub(crate) fn commit(&self) -> Option<FuseLookupCommitOutcome> {
         let mut state = lock_poison_tolerant(&self.inner.state);
-        let Some(index) = state.reservations.iter().position(|reservation| {
+        let index = state.reservations.iter().position(|reservation| {
             reservation.ino == self.ino && Arc::ptr_eq(&reservation.identity, &self.identity)
-        }) else {
-            return None;
-        };
-        let Some(reply_sequence) = state.reservations[index].reply_sequence else {
-            return None;
-        };
+        })?;
+        let reply_sequence = state.reservations[index].reply_sequence?;
         let reservation = state.reservations.swap_remove(index);
         let lookup_ref_committed =
             !finish_provisional_reply(&mut state, self.ino, reply_sequence, true);
@@ -247,6 +245,7 @@ impl FuseLookupCommitOutcome {
         self.follow_up_invalidation_required
     }
 
+    #[cfg(test)]
     pub(crate) const fn lookup_ref_committed(self) -> bool {
         self.lookup_ref_committed
     }
@@ -406,6 +405,7 @@ impl FuseInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.inner.capacity
     }
@@ -676,6 +676,7 @@ impl FuseInvalidationWorker {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn push(
         &self,
         ino: u64,
@@ -714,15 +715,15 @@ impl FuseInvalidationWorker {
             return FuseInvalidationShutdownOutcome::TimedOut;
         }
         drop(completed);
-        if let Some(thread) = lock_poison_tolerant(&self.thread).take() {
-            if thread.join().is_err() {
-                self.queue
-                    .inner
-                    .metrics
-                    .worker_panics
-                    .fetch_add(1, Ordering::Relaxed);
-                return FuseInvalidationShutdownOutcome::WorkerPanicked;
-            }
+        if let Some(thread) = lock_poison_tolerant(&self.thread).take()
+            && thread.join().is_err()
+        {
+            self.queue
+                .inner
+                .metrics
+                .worker_panics
+                .fetch_add(1, Ordering::Relaxed);
+            return FuseInvalidationShutdownOutcome::WorkerPanicked;
         }
         FuseInvalidationShutdownOutcome::Drained
     }

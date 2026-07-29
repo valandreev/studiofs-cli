@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
@@ -8,6 +9,11 @@ use std::time::{Duration, Instant};
 use crate::cache_policy::{
     LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBufferPool,
     SystemMemorySampler, decide_open_cache,
+};
+use crate::invalidation::{
+    FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind, FuseInvalidationQueue,
+    FuseInvalidationShutdownOutcome, FuseInvalidationWorker, FuseLookupReservation,
+    FuseOpenHandleGuard,
 };
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
@@ -80,6 +86,7 @@ pub(crate) mod raw {
     #[link(name = "fuse3")]
     unsafe extern "C" {
         pub(crate) fn fuse_reply_err(req: *mut FuseReq, err: c_int) -> c_int;
+        pub(crate) fn fuse_reply_none(req: *mut FuseReq);
         pub(crate) fn fuse_reply_entry(req: *mut FuseReq, entry: *const FuseEntryParam) -> c_int;
         pub(crate) fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: f64) -> c_int;
         pub(crate) fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
@@ -162,6 +169,10 @@ unsafe extern "C" {
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_forget_callback(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_init_sets_bounded_background(
         userdata: *mut c_void,
         max_background: u32,
@@ -195,6 +206,9 @@ pub(crate) struct SessionState {
     available_memory: Mutex<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
     open_reply_serializer: FuseOpenReplySerializer,
+    inode_liveness: FuseInodeLiveness,
+    open_liveness: Mutex<HashMap<u64, FuseOpenHandleGuard>>,
+    invalidation_queue: FuseInvalidationQueue,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -229,6 +243,9 @@ impl SessionState {
             available_memory: Mutex::new(SystemMemorySampler::system()),
             read_buffers: SyncReadBufferPool::new(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
+            inode_liveness: FuseInodeLiveness::default(),
+            open_liveness: Mutex::new(HashMap::new()),
+            invalidation_queue: FuseInvalidationQueue::default(),
         }
     }
 }
@@ -346,6 +363,18 @@ struct LinuxFuseWriteRequest {
 struct LinuxFusePreparedOpen {
     fh: u64,
     cache: LinuxFuseOpenCachePolicy,
+}
+
+#[derive(Debug)]
+struct LinuxFuseAllocatedOpen {
+    ino: u64,
+    fh: u64,
+    flags: c_int,
+}
+
+struct LinuxFuseAllocatedCreate {
+    open: LinuxFuseAllocatedOpen,
+    lookup: FuseLookupReservation,
 }
 
 fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
@@ -573,6 +602,7 @@ pub(crate) struct Session {
     raw: NonNull<raw::FuseSession>,
     state: Option<Box<SessionState>>,
     invalidation_state: Arc<SessionInvalidationState>,
+    invalidation_worker: Option<FuseInvalidationWorker>,
     signal_handlers_installed: bool,
 }
 
@@ -606,17 +636,39 @@ impl Session {
         let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
         if mount_result == 0 {
             let invalidation_state = Arc::new(SessionInvalidationState::new());
+            let invalidation_queue = state.invalidation_queue.clone();
+            let notify_target = SessionInvalidationTarget {
+                session: raw,
+                state: Arc::clone(&invalidation_state),
+            };
+            let invalidation_worker = match FuseInvalidationWorker::spawn(
+                invalidation_queue.clone(),
+                state.inode_liveness.clone(),
+                move |ino, geometry| notify_target.notify(ino, geometry),
+            ) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    // SAFETY: the session is mounted but no callback worker
+                    // retained its pointer because thread creation failed.
+                    unsafe {
+                        raw::fuse_session_unmount(raw.as_ptr());
+                        raw::fuse_session_destroy(raw.as_ptr());
+                    }
+                    return Err(error);
+                }
+            };
+            state
+                .vfs
+                .set_kernel_invalidator(Arc::new(LinuxFuseKernelInvalidator {
+                    queue: invalidation_queue,
+                }));
             let session = Self {
                 raw,
                 state: Some(state),
                 invalidation_state,
+                invalidation_worker: Some(invalidation_worker),
                 signal_handlers_installed: false,
             };
-            if let Some(state) = &session.state {
-                state
-                    .vfs
-                    .set_kernel_invalidator(session.kernel_invalidator());
-            }
             Ok(session)
         } else {
             // SAFETY: `raw` has not been returned and must be destroyed here.
@@ -661,6 +713,7 @@ impl Session {
                 raw,
                 state: None,
                 invalidation_state: Arc::new(SessionInvalidationState::new()),
+                invalidation_worker: None,
                 signal_handlers_installed: false,
             })
         } else {
@@ -695,17 +748,13 @@ impl Session {
             Err(io::Error::from_raw_os_error(result))
         }
     }
-
-    pub(crate) fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
-        Arc::new(LinuxFuseKernelInvalidator {
-            session: self.raw,
-            state: Arc::clone(&self.invalidation_state),
-        })
-    }
 }
 
-#[derive(Debug)]
 struct LinuxFuseKernelInvalidator {
+    queue: FuseInvalidationQueue,
+}
+
+struct SessionInvalidationTarget {
     session: NonNull<raw::FuseSession>,
     state: Arc<SessionInvalidationState>,
 }
@@ -779,41 +828,64 @@ impl Drop for SessionInvalidationGuard<'_> {
     }
 }
 
-// SAFETY: invalidation calls are gated against `Session::drop`, and the raw
-// pointer is only used for libfuse notification calls while the session is live.
-unsafe impl Send for LinuxFuseKernelInvalidator {}
-// SAFETY: shared access only issues libfuse notification calls under the same gate.
-unsafe impl Sync for LinuxFuseKernelInvalidator {}
+// SAFETY: the target is moved into the sole invalidation worker. Its session
+// pointer is used only while `SessionInvalidationState` admits a notification.
+unsafe impl Send for SessionInvalidationTarget {}
 
 impl KernelInvalidator for LinuxFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.inval_inode_range(ino, 0, 0);
+        self.enqueue(ino, FuseInvalidationKind::Data);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        self.inval_inode_range(ino, -1, 0);
+        self.enqueue(ino, FuseInvalidationKind::Attributes);
     }
 }
 
 impl LinuxFuseKernelInvalidator {
-    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+    fn enqueue(&self, ino: u64, kind: FuseInvalidationKind) {
+        if self.queue.push(ino, kind).is_err() {
+            debug!(
+                ino,
+                ?kind,
+                "Linux FUSE invalidation skipped after queue shutdown"
+            );
+        }
+    }
+}
+
+impl SessionInvalidationTarget {
+    fn notify(&self, ino: u64, geometry: FuseInvalidationGeometry) -> Result<(), ()> {
         let Some(_active) = self.state.begin_invalidation() else {
             debug!(
                 ino,
-                offset, len, "Linux FUSE inode invalidation skipped after session shutdown"
+                offset = geometry.offset,
+                len = geometry.length,
+                "Linux FUSE inode invalidation skipped after session shutdown"
             );
-            return;
+            return Err(());
         };
         // SAFETY: `session` comes from a mounted libfuse3 session and the
         // invalidation guard prevents teardown from destroying it during the call.
         let result = unsafe {
-            studiofs_linux_fuse_notify_inval_inode(self.session.as_ptr(), ino, offset, len)
+            studiofs_linux_fuse_notify_inval_inode(
+                self.session.as_ptr(),
+                ino,
+                geometry.offset,
+                geometry.length,
+            )
         };
         if result != 0 && result != -libc::ENOENT {
             warn!(
                 ino,
-                offset, len, result, "Linux FUSE inode invalidation failed"
+                offset = geometry.offset,
+                len = geometry.length,
+                result,
+                "Linux FUSE inode invalidation failed"
             );
+            Err(())
+        } else {
+            Ok(())
         }
     }
 }
@@ -821,6 +893,30 @@ impl LinuxFuseKernelInvalidator {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_destroy(userdata: *mut c_void) {
     let _ = userdata;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_forget(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    nlookup: u64,
+) {
+    forget_request_with(callback_state(req), ino, nlookup, || {
+        // SAFETY: FORGET requests must receive exactly one non-error reply.
+        unsafe { raw::fuse_reply_none(req) };
+    });
+}
+
+fn forget_request_with(
+    state: Option<&SessionState>,
+    ino: u64,
+    nlookup: u64,
+    reply_none: impl FnOnce(),
+) {
+    if let Some(state) = state {
+        state.inode_liveness.forget(ino, nlookup);
+    }
+    reply_none();
 }
 
 #[unsafe(no_mangle)]
@@ -909,13 +1005,13 @@ pub extern "C" fn studiofs_linux_fuse_create(
     let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
-        Ok((attr, fh)) => {
-            let result = state.run_open_reply_transaction(
-                attr.ino,
-                || Ok(state.prepare_file_open(attr.ino, attr.size, file_info_flags(fi), fh)),
-                |prepared| reply_create(req, state, fi, &attr, prepared),
-            );
-            debug_assert!(result.is_ok(), "create preparation is infallible");
+        Ok(allocated) => {
+            let result = state.run_create_reply_transaction(allocated, |attr, prepared, lookup| {
+                reply_create(req, state, fi, attr, prepared, lookup)
+            });
+            if let Err(errno) = result {
+                reply_error(req, errno);
+            }
         }
         Err(errno) => reply_error(req, errno),
     }
@@ -1218,13 +1314,9 @@ pub extern "C" fn studiofs_linux_fuse_release(
         reply_error(req, libc::EIO);
         return;
     };
-    match file_handle(fi)
-        .ok_or(libc::EBADF)
-        .and_then(|fh| state.release(fh))
-    {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
-    }
+    let fh = file_handle(fi);
+    let result = fh.ok_or(libc::EBADF).and_then(|fh| state.release(fh));
+    finish_regular_release_with(state, fh, result, |errno| reply_error(req, errno));
 }
 
 #[unsafe(no_mangle)]
@@ -1239,7 +1331,9 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
     };
     match state.getattr_attr(ino) {
         Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino) {
-            Ok(handle) => reply_dir_open(req, fi, handle),
+            Ok(handle) => {
+                reply_dir_open(req, fi, handle);
+            }
             Err(errno) => reply_error(req, errno),
         },
         Ok(_) => reply_error(req, libc::ENOTDIR),
@@ -1279,12 +1373,12 @@ pub extern "C" fn studiofs_linux_fuse_releasedir(
     _ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
-    if let Some(handle) = dir_handle(fi) {
+    let handle = dir_handle(fi).map(|handle| {
         // SAFETY: `opendir` created this pointer with `Box::into_raw`, and
         // libfuse calls `releasedir` once for each successful directory open.
-        unsafe { drop(Box::from_raw(handle.as_ptr())) };
-    }
-    reply_error(req, 0);
+        unsafe { Box::from_raw(handle.as_ptr()) }
+    });
+    finish_dir_release_with(handle, || reply_error(req, 0));
 }
 
 #[unsafe(no_mangle)]
@@ -1502,11 +1596,21 @@ impl SessionState {
         name: &[u8],
         mode: mode_t,
         fi: *const raw::FuseFileInfo,
-    ) -> Result<(InodeAttr, u64), i32> {
+    ) -> Result<LinuxFuseAllocatedCreate, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
         require_file_info(fi)?;
+        self.create_with_flags(parent, name, mode, file_info_flags(fi))
+    }
+
+    fn create_with_flags(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        flags: c_int,
+    ) -> Result<LinuxFuseAllocatedCreate, i32> {
         let file_type = mode & libc::S_IFMT as mode_t;
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
@@ -1523,7 +1627,11 @@ impl SessionState {
                 &self.runtime_handle,
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
-        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        // Reserve the kernel lookup before opening the writer handle. Any
+        // invalidation from writer admission onward is now marked for a
+        // post-reply DATA notification.
+        let lookup = self.inode_liveness.reserve_lookup(attr.ino);
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         let fh = self
             .vfs
             .open_created_file_with_known_attr_and_read_ahead_owner(
@@ -1533,7 +1641,15 @@ impl SessionState {
                 ReadAheadOwner::Kernel,
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
-        Ok((attr, fh))
+        self.install_open_liveness(attr.ino, fh);
+        Ok(LinuxFuseAllocatedCreate {
+            open: LinuxFuseAllocatedOpen {
+                ino: attr.ino,
+                fh,
+                flags,
+            },
+            lookup,
+        })
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
@@ -1617,14 +1733,18 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFusePreparedOpen, i32> {
+    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseAllocatedOpen, i32> {
+        self.open_with_flags(ino, file_info_flags(fi))
+    }
+
+    fn open_with_flags(&self, ino: u64, flags: c_int) -> Result<LinuxFuseAllocatedOpen, i32> {
         let attr = self.getattr_attr(ino)?;
         match attr.kind {
             FileType::RegularFile => {}
             FileType::Directory => return Err(libc::EISDIR),
             FileType::Symlink => return Err(libc::EINVAL),
         }
-        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         if self.read_only
             && (trunc
                 || open_flags.contains(OpenFlags::WRONLY)
@@ -1641,7 +1761,10 @@ impl SessionState {
                 ReadAheadOwner::Kernel,
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
-        Ok(self.prepare_file_open(ino, attr.size, file_info_flags(fi), fh))
+        // Establish kernel liveness before generation preparation or any
+        // operation that can publish an invalidation for this handle.
+        self.install_open_liveness(ino, fh);
+        Ok(LinuxFuseAllocatedOpen { ino, fh, flags })
     }
 
     fn prepare_file_open(
@@ -1689,15 +1812,57 @@ impl SessionState {
         LinuxFusePreparedOpen { fh, cache }
     }
 
+    fn prepare_allocated_open(
+        &self,
+        allocated: LinuxFuseAllocatedOpen,
+    ) -> Result<LinuxFusePreparedOpen, i32> {
+        // Local metadata is cached; this refresh closes the result→reservation
+        // race without introducing remote I/O.
+        let attr = self.getattr_attr(allocated.ino)?;
+        Ok(self.prepare_file_open(allocated.ino, attr.size, allocated.flags, allocated.fh))
+    }
+
     fn run_open_reply_transaction(
         &self,
         ino: u64,
-        prepare: impl FnOnce() -> Result<LinuxFusePreparedOpen, i32>,
+        allocate: impl FnOnce() -> Result<LinuxFuseAllocatedOpen, i32>,
         reply: impl FnOnce(LinuxFusePreparedOpen) -> c_int,
     ) -> Result<c_int, i32> {
         let _reply_guard = self.open_reply_serializer.lock(ino);
-        let prepared = prepare()?;
+        let allocated = allocate()?;
+        debug_assert_eq!(allocated.ino, ino);
+        let fh = allocated.fh;
+        let prepared = match self.prepare_allocated_open(allocated) {
+            Ok(prepared) => prepared,
+            Err(errno) => {
+                self.reject_prepared_open(ino, fh);
+                return Err(errno);
+            }
+        };
         let reply_result = reply(prepared);
+        if reply_result != 0 {
+            self.reject_prepared_open(ino, prepared.fh);
+        }
+        Ok(reply_result)
+    }
+
+    fn run_create_reply_transaction(
+        &self,
+        allocated: LinuxFuseAllocatedCreate,
+        reply: impl FnOnce(&InodeAttr, LinuxFusePreparedOpen, FuseLookupReservation) -> c_int,
+    ) -> Result<c_int, i32> {
+        let ino = allocated.open.ino;
+        let _reply_guard = self.open_reply_serializer.lock(ino);
+        let attr = match self.getattr_attr(ino) {
+            Ok(attr) => attr,
+            Err(errno) => {
+                self.reject_prepared_open(ino, allocated.open.fh);
+                return Err(errno);
+            }
+        };
+        let prepared =
+            self.prepare_file_open(ino, attr.size, allocated.open.flags, allocated.open.fh);
+        let reply_result = reply(&attr, prepared, allocated.lookup);
         if reply_result != 0 {
             self.reject_prepared_open(ino, prepared.fh);
         }
@@ -1706,10 +1871,41 @@ impl SessionState {
 
     fn reject_prepared_open(&self, ino: u64, fh: u64) {
         debug!(ino, fh, "Linux FUSE rolls back rejected open reply");
+        self.remove_open_liveness(fh);
         self.vfs.abort_os_cache_open(fh);
         let _ = self
             .vfs
             .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+    }
+
+    fn install_open_liveness(&self, ino: u64, fh: u64) {
+        let guard = self.inode_liveness.open_handle(ino);
+        let replaced = self
+            .open_liveness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(fh, guard);
+        debug_assert!(replaced.is_none(), "VFS file handles must be unique");
+    }
+
+    fn remove_open_liveness(&self, fh: u64) {
+        self.open_liveness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&fh);
+    }
+
+    fn enqueue_follow_up_invalidation(&self, ino: u64) {
+        if self
+            .invalidation_queue
+            .push(ino, FuseInvalidationKind::Data)
+            .is_err()
+        {
+            debug!(
+                ino,
+                "Linux FUSE follow-up invalidation skipped after shutdown"
+            );
+        }
     }
 
     fn reply_with_pooled_read_buffer(
@@ -1911,7 +2107,11 @@ impl SessionState {
             .vfs
             .readdir_with_attrs(ino)
             .map_err(|error| vfs_err_to_errno(&error))?;
-        let raw = Box::into_raw(Box::new(DirectoryHandle { entries }));
+        let liveness = self.inode_liveness.open_handle(ino);
+        let raw = Box::into_raw(Box::new(DirectoryHandle {
+            entries,
+            _liveness: liveness,
+        }));
         NonNull::new(raw).ok_or(libc::ENOMEM)
     }
 
@@ -2038,6 +2238,7 @@ impl SessionState {
 
 struct DirectoryHandle {
     entries: Vec<DirEntryWithAttr>,
+    _liveness: FuseOpenHandleGuard,
 }
 
 fn dir_handle(fi: *const raw::FuseFileInfo) -> Option<NonNull<DirectoryHandle>> {
@@ -2277,40 +2478,110 @@ fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
     result: Result<InodeAttr, i32>,
-) {
+) -> c_int {
     match result {
-        Ok(attr) => {
-            let stat = state.attr_to_stat(&attr);
-            let entry = raw::FuseEntryParam {
-                ino: attr.ino,
-                generation: 1,
-                attr: stat,
-                attr_timeout: TTL_SECONDS,
-                entry_timeout: TTL_SECONDS,
-            };
+        Ok(attr) => match reply_entry_with(state, attr.ino, |entry| {
             // SAFETY: `entry` is initialized and valid for this synchronous reply.
-            unsafe { raw::fuse_reply_entry(req, &entry) };
+            unsafe { raw::fuse_reply_entry(req, entry) }
+        }) {
+            Ok(result) => result,
+            Err(errno) => {
+                reply_error(req, errno);
+                0
+            }
+        },
+        Err(errno) => {
+            reply_error(req, errno);
+            0
         }
-        Err(errno) => reply_error(req, errno),
     }
+}
+
+fn reply_entry_with(
+    state: &SessionState,
+    ino: u64,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> Result<c_int, i32> {
+    let reservation = state.inode_liveness.reserve_lookup(ino);
+    // Metadata reads are local/cached. Refreshing after reservation guarantees
+    // an invalidation either precedes this snapshot or marks the pending reply.
+    let attr = state.getattr_attr(ino)?;
+    Ok(reply_reserved_entry_with(state, &attr, reservation, reply))
+}
+
+fn reply_reserved_entry_with(
+    state: &SessionState,
+    attr: &InodeAttr,
+    reservation: FuseLookupReservation,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> c_int {
+    let stat = state.attr_to_stat(attr);
+    let entry = raw::FuseEntryParam {
+        ino: attr.ino,
+        generation: 1,
+        attr: stat,
+        attr_timeout: TTL_SECONDS,
+        entry_timeout: TTL_SECONDS,
+    };
+    let began = reservation.begin_reply();
+    debug_assert!(began, "fresh lookup reservation must begin exactly once");
+    let result = reply(&entry);
+    if result == 0 {
+        if reservation
+            .commit()
+            .is_some_and(|outcome| outcome.follow_up_invalidation_required())
+        {
+            state.enqueue_follow_up_invalidation(attr.ino);
+        }
+    } else {
+        reservation.rollback();
+    }
+    result
 }
 
 fn reply_dir_open(
     req: *mut raw::FuseReq,
     fi: *mut raw::FuseFileInfo,
     handle: NonNull<DirectoryHandle>,
-) {
+) -> c_int {
     if fi.is_null() {
         // SAFETY: ownership has not been handed to libfuse because `fi` is invalid.
         unsafe { drop(Box::from_raw(handle.as_ptr())) };
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
-    unsafe {
+    let result = unsafe {
         studiofs_linux_fuse_dir_file_info_init(fi, handle.as_ptr() as u64);
-        raw::fuse_reply_open(req, fi);
+        raw::fuse_reply_open(req, fi)
+    };
+    finish_dir_open_reply(handle, result)
+}
+
+fn finish_dir_open_reply(handle: NonNull<DirectoryHandle>, result: c_int) -> c_int {
+    if result != 0 {
+        // The kernel rejected the open, so ownership never left this callback.
+        unsafe { drop(Box::from_raw(handle.as_ptr())) };
+    }
+    result
+}
+
+fn finish_dir_release_with(handle: Option<Box<DirectoryHandle>>, reply: impl FnOnce()) {
+    reply();
+    // Keep the inode live until the kernel has consumed the release reply.
+    drop(handle);
+}
+
+fn finish_regular_release_with(
+    state: &SessionState,
+    fh: Option<u64>,
+    result: Result<(), c_int>,
+    reply: impl FnOnce(c_int),
+) {
+    reply(result.err().unwrap_or(0));
+    if let Some(fh) = fh {
+        state.remove_open_liveness(fh);
     }
 }
 
@@ -2343,20 +2614,27 @@ fn reply_create(
     fi: *mut raw::FuseFileInfo,
     attr: &InodeAttr,
     prepared: LinuxFusePreparedOpen,
+    lookup: FuseLookupReservation,
 ) -> c_int {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
         return -libc::EINVAL;
     }
-    let stat = state.attr_to_stat(attr);
-    let entry = raw::FuseEntryParam {
-        ino: attr.ino,
-        generation: 1,
-        attr: stat,
-        attr_timeout: TTL_SECONDS,
-        entry_timeout: TTL_SECONDS,
-    };
-    // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+    reply_create_with(state, fi, attr, prepared, lookup, |entry, fi| {
+        // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+        unsafe { raw::fuse_reply_create(req, entry, fi) }
+    })
+}
+
+fn reply_create_with(
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    attr: &InodeAttr,
+    prepared: LinuxFusePreparedOpen,
+    lookup: FuseLookupReservation,
+    reply: impl FnOnce(*const raw::FuseEntryParam, *const raw::FuseFileInfo) -> c_int,
+) -> c_int {
+    // SAFETY: libfuse owns `fi` for this callback; the C shim uses the system layout.
     unsafe {
         studiofs_linux_fuse_file_info_init(
             fi,
@@ -2365,8 +2643,8 @@ fn reply_create(
             fuse_flag(prepared.cache.keep_cache),
             fuse_flag(prepared.cache.parallel_direct_writes),
         );
-        raw::fuse_reply_create(req, &entry, fi)
     }
+    reply_reserved_entry_with(state, attr, lookup, |entry| reply(entry, fi))
 }
 
 fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
@@ -2483,42 +2761,119 @@ impl DirectoryEntryBuffer {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(state) = &self.state {
-            state.vfs.clear_kernel_invalidator();
+        let worker_outcome = shutdown_invalidation_with(
+            || {
+                if let Some(state) = &self.state {
+                    state.vfs.clear_kernel_invalidator();
+                }
+            },
+            || {
+                self.invalidation_worker
+                    .as_ref()
+                    .map(|worker| worker.shutdown(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT))
+                    .unwrap_or(FuseInvalidationShutdownOutcome::Drained)
+            },
+            || self.invalidation_state.begin_shutdown(),
+        );
+        let invalidation_metrics = self
+            .invalidation_worker
+            .as_ref()
+            .map(FuseInvalidationWorker::metrics);
+        if worker_outcome == FuseInvalidationShutdownOutcome::TimedOut {
+            warn!(
+                ?invalidation_metrics,
+                "Linux FUSE session shutdown timed out draining kernel invalidations; \
+                 unmounting and retaining worker, raw session and callback state \
+                 to avoid use-after-free"
+            );
+            self.detach_raw_session();
+            if let Some(worker) = self.invalidation_worker.take() {
+                std::mem::forget(worker);
+            }
+            if let Some(state) = self.state.take() {
+                std::mem::forget(state);
+            }
+            return;
         }
-        self.invalidation_state.begin_shutdown();
+        if worker_outcome == FuseInvalidationShutdownOutcome::WorkerPanicked {
+            warn!(
+                ?invalidation_metrics,
+                "Linux FUSE invalidation worker panicked after releasing its session pointer; \
+                 continuing safe session teardown"
+            );
+        }
+        drop(self.invalidation_worker.take());
         let safe_to_destroy = self
             .invalidation_state
             .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
         if !safe_to_destroy {
             warn!(
                 "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
-                 unmounting and leaking raw session handles to avoid use-after-free"
+                 unmounting and retaining raw session and callback state \
+                 to avoid use-after-free"
             );
-        }
-        if self.signal_handlers_installed {
-            // SAFETY: handlers were installed for this live session.
-            unsafe { raw::fuse_remove_signal_handlers(self.raw.as_ptr()) };
-        }
-        // SAFETY: libfuse tolerates unmount after regular kernel disconnects;
-        // it is needed after signal-triggered exits to avoid a stuck mount.
-        unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
-        if !safe_to_destroy {
-            // An active notification may still hold this session pointer.
+            self.detach_raw_session();
+            if let Some(state) = self.state.take() {
+                std::mem::forget(state);
+            }
             return;
         }
+        self.detach_raw_session();
         // SAFETY: `self.raw` is owned by this wrapper and destroyed once.
         unsafe { raw::fuse_session_destroy(self.raw.as_ptr()) };
     }
 }
 
+impl Session {
+    fn detach_raw_session(&mut self) {
+        let signal_handlers_installed =
+            std::mem::replace(&mut self.signal_handlers_installed, false);
+        let raw = self.raw;
+        detach_raw_session_with(
+            signal_handlers_installed,
+            || {
+                // SAFETY: handlers were installed for this retained live session.
+                unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
+            },
+            || {
+                // SAFETY: libfuse tolerates unmount after regular kernel disconnects.
+                unsafe { raw::fuse_session_unmount(raw.as_ptr()) };
+            },
+        );
+    }
+}
+
+fn shutdown_invalidation_with(
+    clear_vfs_invalidator: impl FnOnce(),
+    drain_worker: impl FnOnce() -> FuseInvalidationShutdownOutcome,
+    close_session_gate: impl FnOnce(),
+) -> FuseInvalidationShutdownOutcome {
+    clear_vfs_invalidator();
+    let outcome = drain_worker();
+    close_session_gate();
+    outcome
+}
+
+fn detach_raw_session_with(
+    signal_handlers_installed: bool,
+    remove_signal_handlers: impl FnOnce(),
+    unmount: impl FnOnce(),
+) {
+    if signal_handlers_installed {
+        remove_signal_handlers();
+    }
+    unmount();
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2746,6 +3101,18 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn low_level_ops_include_forget_callback() {
+        // SAFETY: the C shim only inspects the callback pointer in a static table.
+        let has_callback = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_forget_callback(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callback, 1);
     }
 
     #[test]
@@ -3061,7 +3428,14 @@ mod tests {
         let reply_result = state
             .run_open_reply_transaction(
                 attr.ino,
-                || Ok(state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, fh)),
+                || {
+                    state.install_open_liveness(attr.ino, fh);
+                    Ok(super::LinuxFuseAllocatedOpen {
+                        ino: attr.ino,
+                        fh,
+                        flags: libc::O_RDONLY,
+                    })
+                },
                 |prepared| {
                     assert!(
                         prepared.cache.keep_cache,
@@ -3175,6 +3549,400 @@ mod tests {
         state.begin_shutdown();
 
         assert!(state.begin_invalidation().is_none());
+    }
+
+    #[test]
+    fn invalidation_shutdown_clears_then_drains_then_closes_gate() {
+        let events = RefCell::new(Vec::new());
+
+        let outcome = super::shutdown_invalidation_with(
+            || events.borrow_mut().push("clear"),
+            || {
+                events.borrow_mut().push("drain");
+                crate::invalidation::FuseInvalidationShutdownOutcome::Drained
+            },
+            || events.borrow_mut().push("gate"),
+        );
+
+        assert_eq!(
+            outcome,
+            crate::invalidation::FuseInvalidationShutdownOutcome::Drained
+        );
+        assert_eq!(*events.borrow(), ["clear", "drain", "gate"]);
+    }
+
+    #[test]
+    fn invalidation_shutdown_timeout_closes_gate_before_retention() {
+        let events = RefCell::new(Vec::new());
+        let state = super::SessionInvalidationState::new();
+
+        let outcome = super::shutdown_invalidation_with(
+            || events.borrow_mut().push("clear"),
+            || {
+                events.borrow_mut().push("drain");
+                crate::invalidation::FuseInvalidationShutdownOutcome::TimedOut
+            },
+            || {
+                events.borrow_mut().push("gate");
+                state.begin_shutdown();
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            crate::invalidation::FuseInvalidationShutdownOutcome::TimedOut
+        );
+        assert_eq!(*events.borrow(), ["clear", "drain", "gate"]);
+        assert!(
+            state.begin_invalidation().is_none(),
+            "a retained worker must not start another raw notification"
+        );
+    }
+
+    #[test]
+    fn retained_raw_session_removes_handlers_before_unmount() {
+        let events = RefCell::new(Vec::new());
+
+        super::detach_raw_session_with(
+            true,
+            || events.borrow_mut().push("signals"),
+            || events.borrow_mut().push("unmount"),
+        );
+
+        assert_eq!(*events.borrow(), ["signals", "unmount"]);
+    }
+
+    #[test]
+    fn raw_session_without_handlers_still_unmounts() {
+        let events = RefCell::new(Vec::new());
+
+        super::detach_raw_session_with(
+            false,
+            || events.borrow_mut().push("signals"),
+            || events.borrow_mut().push("unmount"),
+        );
+
+        assert_eq!(*events.borrow(), ["unmount"]);
+    }
+
+    #[test]
+    fn forget_request_updates_liveness_and_replies_exactly_once() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-forget")
+            .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let reservation = state.inode_liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        assert!(reservation.commit().is_some());
+        let replies = AtomicUsize::new(0);
+
+        super::forget_request_with(Some(&state), 42, 1, || {
+            replies.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(replies.load(Ordering::Relaxed), 1);
+        assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn forget_request_without_userdata_still_replies_exactly_once() {
+        let replies = AtomicUsize::new(0);
+
+        super::forget_request_with(None, 42, 1, || {
+            replies.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(replies.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn entry_reply_commits_only_after_native_success() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-reply")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let accepted = fixture
+            .vfs()
+            .create(1, b"accepted", 0, 0, 0o644)
+            .expect("create accepted inode");
+        let rejected = fixture
+            .vfs()
+            .create(1, b"rejected", 0, 0, 0o644)
+            .expect("create rejected inode");
+
+        assert_eq!(super::reply_entry_with(&state, accepted.ino, |_| 0), Ok(0));
+        assert!(state.inode_liveness.is_live(accepted.ino));
+        assert_eq!(
+            super::reply_entry_with(&state, rejected.ino, |_| -libc::ENOENT),
+            Ok(-libc::ENOENT)
+        );
+        assert!(!state.inode_liveness.is_live(rejected.ino));
+    }
+
+    #[test]
+    fn entry_reply_refreshes_attr_after_creating_lookup_reservation() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-refresh")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let stale = fixture
+            .vfs()
+            .create(1, b"fresh-attr", 0, 0, 0o644)
+            .expect("create inode");
+        fixture
+            .vfs()
+            .setattr(
+                stale.ino,
+                studiofs_meta::SetattrArgs {
+                    size: Some(99),
+                    ..Default::default()
+                },
+            )
+            .expect("update size before reply reservation");
+
+        let result = super::reply_entry_with(&state, stale.ino, |entry| {
+            // SAFETY: the reply helper keeps the entry live through this closure.
+            let entry = unsafe { &*entry };
+            assert_eq!(entry.attr.st_size, 99);
+            0
+        });
+
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn entry_reply_race_enqueues_data_follow_up_after_commit() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-race")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create raced inode");
+
+        assert_eq!(
+            super::reply_entry_with(&state, attr.ino, |_| {
+                let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
+                assert_eq!(admission.deferred_reply_count(), 1);
+                0
+            }),
+            Ok(0)
+        );
+
+        assert_eq!(
+            state.invalidation_queue.pop(),
+            Some((attr.ino, crate::invalidation::FuseInvalidationKind::Data))
+        );
+    }
+
+    #[test]
+    fn open_liveness_is_installed_before_reply_and_removed_on_rejection() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-open-liveness")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"open", 0, 0, 0o644)
+            .expect("create inode");
+        let fh = fixture
+            .vfs()
+            .open_file_with_known_attr(&attr, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open VFS handle");
+
+        let result = state
+            .run_open_reply_transaction(
+                attr.ino,
+                || {
+                    state.install_open_liveness(attr.ino, fh);
+                    Ok(super::LinuxFuseAllocatedOpen {
+                        ino: attr.ino,
+                        fh,
+                        flags: libc::O_RDONLY,
+                    })
+                },
+                |_| {
+                    assert!(state.inode_liveness.is_live(attr.ino));
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare open");
+
+        assert_eq!(result, -libc::ENOENT);
+        assert!(!state.inode_liveness.is_live(attr.ino));
+        assert!(fixture.vfs().get_open_file(fh).is_none());
+    }
+
+    #[test]
+    fn allocated_open_is_live_before_cache_preparation() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-open-gap")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"open-gap", 0, 0, 0o644)
+            .expect("create inode");
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open");
+
+        let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
+        assert!(admission.notified_now());
+        assert_eq!(admission.deferred_reply_count(), 0);
+
+        let result = state
+            .run_open_reply_transaction(attr.ino, || Ok(allocated), |_| -libc::ENOENT)
+            .expect("prepare and reject open");
+        assert_eq!(result, -libc::ENOENT);
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn create_reservation_precedes_writer_open_and_defers_follow_up() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-create-gap")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let allocated = state
+            .create_with_flags(1, b"create-gap", libc::S_IFREG | 0o644, libc::O_WRONLY)
+            .expect("allocate created writer");
+        let ino = allocated.open.ino;
+        let fh = allocated.open.fh;
+
+        let admission = state.inode_liveness.admit_invalidation(ino, || {});
+        assert!(admission.notified_now(), "open guard is already installed");
+        assert_eq!(
+            admission.deferred_reply_count(),
+            1,
+            "create lookup reservation predates writer open"
+        );
+
+        let result = state
+            .run_create_reply_transaction(allocated, |attr, _prepared, lookup| {
+                super::reply_reserved_entry_with(&state, attr, lookup, |_| 0)
+            })
+            .expect("complete create reply");
+        assert_eq!(result, 0);
+        assert_eq!(
+            state.invalidation_queue.pop(),
+            Some((ino, crate::invalidation::FuseInvalidationKind::Data))
+        );
+
+        state.remove_open_liveness(fh);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(fh))
+            .expect("release created writer");
+        state.inode_liveness.forget(ino, 1);
+    }
+
+    #[test]
+    fn rejected_directory_reply_reclaims_liveness_guard() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dir-liveness")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .mkdir(1, b"dir", 0, 0, 0o755)
+            .expect("create directory");
+        let handle = state.open_dir(attr.ino).expect("open directory");
+        assert!(state.inode_liveness.is_live(attr.ino));
+
+        assert_eq!(
+            super::finish_dir_open_reply(handle, -libc::ENOENT),
+            -libc::ENOENT
+        );
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn regular_release_keeps_inode_live_through_reply_on_error() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-release-liveness")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.install_open_liveness(42, 7);
+
+        super::finish_regular_release_with(&state, Some(7), Err(libc::EIO), |errno| {
+            assert_eq!(errno, libc::EIO);
+            assert!(state.inode_liveness.is_live(42));
+        });
+
+        assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn directory_release_keeps_inode_live_through_reply() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dir-release")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .mkdir(1, b"dir", 0, 0, 0o755)
+            .expect("create directory");
+        let handle = state.open_dir(attr.ino).expect("open directory");
+        // SAFETY: this test owns the pointer returned by `open_dir`.
+        let handle = unsafe { Box::from_raw(handle.as_ptr()) };
+
+        super::finish_dir_release_with(Some(handle), || {
+            assert!(state.inode_liveness.is_live(attr.ino));
+        });
+
+        assert!(!state.inode_liveness.is_live(attr.ino));
     }
 
     #[test]

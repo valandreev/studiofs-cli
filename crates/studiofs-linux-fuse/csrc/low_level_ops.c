@@ -9,6 +9,7 @@ extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userda
 extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
 extern void studiofs_linux_fuse_destroy(void *userdata);
+extern void studiofs_linux_fuse_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, struct fuse_file_info *fi);
@@ -40,6 +41,7 @@ extern void studiofs_linux_fuse_removexattr(fuse_req_t req, fuse_ino_t ino, cons
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .init = studiofs_linux_fuse_init,
     .destroy = studiofs_linux_fuse_destroy,
+    .forget = studiofs_linux_fuse_forget,
     .lookup = studiofs_linux_fuse_lookup,
     .getattr = studiofs_linux_fuse_getattr,
     .setattr = studiofs_linux_fuse_setattr,
@@ -162,6 +164,10 @@ int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
 int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->lookup && ops->getattr && ops->setattr && ops->opendir &&
            ops->readdir && ops->releasedir && ops->statfs && ops->access;
+}
+
+int studiofs_linux_fuse_low_level_ops_has_forget_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops->forget != NULL;
 }
 
 int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
