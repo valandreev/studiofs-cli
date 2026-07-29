@@ -1963,6 +1963,7 @@ impl StudioVfs {
             Err(err) => return Err(VfsError::Meta(err)),
         };
         if attr.nlink == 0 {
+            self.retire_os_cache_inode(attr.ino);
             self.mark_inode_deleted_for_uploads(attr.ino);
         }
 
@@ -1995,6 +1996,7 @@ impl StudioVfs {
         };
 
         if attr.nlink == 0 {
+            self.retire_os_cache_inode(attr.ino);
             self.cleanup_deleted_inode_storage(
                 meta,
                 attr.ino,
@@ -2756,7 +2758,8 @@ impl StudioVfs {
                 )
                 .await;
         }
-        if let Ok(target_entry) = meta.lookup(new_parent, new_name)
+        let displaced_target_will_retire = if let Ok(target_entry) =
+            meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
             debug!(
@@ -2770,7 +2773,11 @@ impl StudioVfs {
                 "VFS rename checking displaced target lock"
             );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
-        }
+            let target_attr = meta.get_attr(target_entry.ino)?;
+            target_attr.kind == FileType::Directory || target_attr.nlink <= 1
+        } else {
+            false
+        };
         debug!(
             parent,
             name = %name_display,
@@ -2802,6 +2809,9 @@ impl StudioVfs {
         self.bump_acl_namespace_epoch();
 
         if let Some(ino) = rename_result.displaced_ino {
+            if displaced_target_will_retire {
+                self.retire_os_cache_inode(ino);
+            }
             debug!(
                 parent,
                 name = %name_display,

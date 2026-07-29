@@ -1,6 +1,8 @@
 use lru::LruCache;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use studiofs_meta::schema::{
     ChunkId, ResolvedSliceSource, ResolvedSliceSpan, SliceId, SliceOrder, SliceRange,
 };
@@ -38,6 +40,7 @@ pub enum OsCacheReason {
 }
 
 /// Generation decision returned to a platform bridge.
+#[must_use = "the platform bridge must apply or explicitly reject this cache decision"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OsCacheOpenDecision {
     disposition: OsCacheDisposition,
@@ -88,7 +91,7 @@ impl From<&ResolvedSliceSpan> for OsCacheSliceSignature {
             source: span.source,
             slice_id: span.slice_id,
             slice_order: span.slice_order,
-            payload: span.payload.clone(),
+            payload: span.payload,
         }
     }
 }
@@ -120,6 +123,45 @@ impl OsCacheGeneration {
 pub(crate) struct OsCacheState {
     generations: LruCache<Ino, OsCacheGeneration>,
     active_writers: HashMap<Ino, usize>,
+    active_foreground_handles: usize,
+    idle_notify: Arc<tokio::sync::Notify>,
+}
+
+/// Exactly-once writer participation owned by one VFS file handle.
+///
+/// Final-handle release moves this lease through the local durability barrier,
+/// so a concurrently opened reader cannot reuse stale pages while close is
+/// still materializing local state.
+pub(crate) struct OsCacheWriterLease {
+    ino: Ino,
+    state: Arc<Mutex<OsCacheState>>,
+}
+
+impl std::fmt::Debug for OsCacheWriterLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OsCacheWriterLease")
+            .field("ino", &self.ino)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OsCacheWriterLease {
+    pub(crate) fn begin(ino: Ino, state: Arc<Mutex<OsCacheState>>) -> Self {
+        state.lock().begin_writer(ino);
+        Self { ino, state }
+    }
+}
+
+impl Drop for OsCacheWriterLease {
+    fn drop(&mut self) {
+        let notify = {
+            let mut state = self.state.lock();
+            state.end_writer(self.ino);
+            state.idle_notifier()
+        };
+        notify.notify_waiters();
+    }
 }
 
 impl Default for OsCacheState {
@@ -134,6 +176,8 @@ impl OsCacheState {
         Self {
             generations: LruCache::new(capacity),
             active_writers: HashMap::new(),
+            active_foreground_handles: 0,
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -173,6 +217,35 @@ impl OsCacheState {
         *writer_count = writer_count.saturating_add(1);
     }
 
+    pub(crate) fn has_active_writer(&self, ino: Ino) -> bool {
+        self.active_writers.contains_key(&ino)
+    }
+
+    pub(crate) fn begin_foreground_handle(&mut self) {
+        self.active_foreground_handles = self.active_foreground_handles.saturating_add(1);
+    }
+
+    pub(crate) fn end_foreground_handle(&mut self) {
+        debug_assert!(
+            self.active_foreground_handles > 0,
+            "OS cache foreground handle count underflow"
+        );
+        self.active_foreground_handles = self.active_foreground_handles.saturating_sub(1);
+    }
+
+    pub(crate) fn active_foreground_handle_count(&self) -> usize {
+        self.active_foreground_handles
+    }
+
+    pub(crate) fn idle_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.idle_notify)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_generation(&self, ino: Ino) -> bool {
+        self.generations.contains(&ino)
+    }
+
     pub(crate) fn end_writer(&mut self, ino: Ino) {
         let Some(writer_count) = self.active_writers.get_mut(&ino) else {
             debug_assert!(false, "OS cache writer count underflow for inode {ino}");
@@ -187,6 +260,37 @@ impl OsCacheState {
     /// Roll back an unaccepted open decision or retire an invalid generation.
     pub(crate) fn clear_generation(&mut self, ino: Ino) {
         self.generations.pop(&ino);
+    }
+}
+
+/// Exactly-once foreground participation owned by one read-only VFS handle.
+pub(crate) struct OsCacheForegroundHandleLease {
+    state: Arc<Mutex<OsCacheState>>,
+}
+
+impl OsCacheForegroundHandleLease {
+    pub(crate) fn begin(state: Arc<Mutex<OsCacheState>>) -> Self {
+        state.lock().begin_foreground_handle();
+        Self { state }
+    }
+}
+
+impl std::fmt::Debug for OsCacheForegroundHandleLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OsCacheForegroundHandleLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OsCacheForegroundHandleLease {
+    fn drop(&mut self) {
+        let notify = {
+            let mut state = self.state.lock();
+            state.end_foreground_handle();
+            state.idle_notifier()
+        };
+        notify.notify_waiters();
     }
 }
 
@@ -314,7 +418,7 @@ mod tests {
 
         for changed in variants {
             let mut state = OsCacheState::with_capacity(8);
-            state.prepare_read(INO, OsCacheParticipation::Enabled, Some(baseline.clone()));
+            let _ = state.prepare_read(INO, OsCacheParticipation::Enabled, Some(baseline.clone()));
             assert_eq!(
                 state.prepare_read(INO, OsCacheParticipation::Enabled, Some(changed)),
                 OsCacheOpenDecision::replace(OsCacheReason::GenerationChanged)
@@ -328,7 +432,7 @@ mod tests {
         // Publication state is intentionally not accepted by the generation
         // constructor. Identical resolved content before and after publication
         // therefore produces an identical generation.
-        state.prepare_read(
+        let _ = state.prepare_read(
             INO,
             OsCacheParticipation::Enabled,
             Some(generation(4, 4096, ResolvedSliceSource::Overlay, 101)),
@@ -352,8 +456,9 @@ mod tests {
             (OsCacheParticipation::Enabled, None),
         ] {
             let mut state = OsCacheState::with_capacity(8);
-            state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
-            state.prepare_read(INO, unsafe_observation.0, unsafe_observation.1);
+            let _ =
+                state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
+            let _ = state.prepare_read(INO, unsafe_observation.0, unsafe_observation.1);
 
             assert_eq!(
                 state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()),),
@@ -366,7 +471,7 @@ mod tests {
     fn rejected_open_rollback_clears_generation() {
         let mut state = OsCacheState::with_capacity(8);
         let generation = generation(4, 4096, ResolvedSliceSource::Overlay, 101);
-        state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
+        let _ = state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
 
         state.clear_generation(INO);
 
@@ -382,7 +487,7 @@ mod tests {
         let first = span(ResolvedSliceSource::Overlay, 101);
         let mut second = span(ResolvedSliceSource::Overlay, 103);
         second.chunk_id = ChunkId(4);
-        state.prepare_read(
+        let _ = state.prepare_read(
             INO,
             OsCacheParticipation::Enabled,
             Some(OsCacheGeneration::new(
@@ -406,7 +511,7 @@ mod tests {
     fn active_writer_clears_snapshot_and_prevents_reuse() {
         let mut state = OsCacheState::with_capacity(8);
         let generation = generation(4, 4096, ResolvedSliceSource::Overlay, 101);
-        state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
+        let _ = state.prepare_read(INO, OsCacheParticipation::Enabled, Some(generation.clone()));
 
         state.begin_writer(INO);
         state.begin_writer(INO);
@@ -432,17 +537,29 @@ mod tests {
         let first = generation(1, 1, ResolvedSliceSource::Overlay, 1);
         let second = generation(2, 2, ResolvedSliceSource::Overlay, 2);
         let third = generation(3, 3, ResolvedSliceSource::Overlay, 3);
-        state.prepare_read(1, OsCacheParticipation::Enabled, Some(first.clone()));
-        state.prepare_read(2, OsCacheParticipation::Enabled, Some(second.clone()));
+        let _ = state.prepare_read(1, OsCacheParticipation::Enabled, Some(first.clone()));
+        let _ = state.prepare_read(2, OsCacheParticipation::Enabled, Some(second.clone()));
         assert_eq!(
             state.prepare_read(1, OsCacheParticipation::Enabled, Some(first)),
             OsCacheOpenDecision::reuse(OsCacheReason::StableGeneration)
         );
-        state.prepare_read(3, OsCacheParticipation::Enabled, Some(third));
+        let _ = state.prepare_read(3, OsCacheParticipation::Enabled, Some(third));
 
         assert_eq!(
             state.prepare_read(2, OsCacheParticipation::Enabled, Some(second)),
             OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
         );
+    }
+
+    #[test]
+    fn foreground_handle_lease_tracks_lifetime_exactly_once() {
+        let state = Arc::new(Mutex::new(OsCacheState::with_capacity(8)));
+        assert_eq!(state.lock().active_foreground_handle_count(), 0);
+
+        let lease = OsCacheForegroundHandleLease::begin(Arc::clone(&state));
+        assert_eq!(state.lock().active_foreground_handle_count(), 1);
+        drop(lease);
+
+        assert_eq!(state.lock().active_foreground_handle_count(), 0);
     }
 }

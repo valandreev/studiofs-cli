@@ -117,6 +117,7 @@ use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
+use os_cache::{OsCacheForegroundHandleLease, OsCacheGeneration, OsCacheState, OsCacheWriterLease};
 use overlay::ExtentRecordId;
 use prefetch::{
     PrefetchBatch, PrefetchHintRange, PrefetchHintUpdate, PrefetchReadContext, PrefetchWorkItem,
@@ -3451,6 +3452,8 @@ pub struct StudioVfs {
     landing_zone: LandingZone,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
+    /// Bounded generation snapshots and active writer participation.
+    os_cache: Arc<Mutex<OsCacheState>>,
     /// Optional distributed lease for janitor leader election.
     janitor_lease: Option<JanitorLease>,
     janitor_interval: Duration,
@@ -4743,10 +4746,7 @@ impl StudioVfs {
     ) {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
-        let foreground_active = self
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
+        let foreground_active = self.foreground_io_active();
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6448,6 +6448,24 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    fn foreground_io_active(&self) -> bool {
+        if self
+            .state
+            .read
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace)
+        {
+            return true;
+        }
+        self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
+    fn foreground_reads_active(&self) -> bool {
+        self.state
+            .read
+            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace)
+            || self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
     /// Mark a platform read-only handle as active foreground I/O.
     pub fn begin_foreground_read_handle(&self) {
         self.state.read.mark_foreground_read(now_unix_millis());
@@ -6462,12 +6480,7 @@ impl StudioVfs {
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            let now_ms = now_unix_millis();
-            if !self
-                .state
-                .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
-            {
+            if !self.foreground_reads_active() {
                 return true;
             }
 
@@ -6476,13 +6489,10 @@ impl StudioVfs {
                 return false;
             }
 
-            let notified = self.state.read.foreground_idle_notify.notified();
-            let now_ms = now_unix_millis();
-            if !self
-                .state
-                .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
-            {
+            let read_notified = self.state.read.foreground_idle_notify.notified();
+            let os_cache_notify = self.os_cache.lock().idle_notifier();
+            let os_cache_notified = os_cache_notify.notified();
+            if !self.foreground_reads_active() {
                 return true;
             }
 
@@ -6495,6 +6505,12 @@ impl StudioVfs {
                 return false;
             }
 
+            let notified = async {
+                tokio::select! {
+                    () = read_notified => {}
+                    () = os_cache_notified => {}
+                }
+            };
             let _ = tokio::time::timeout(wait_slice, notified).await;
         }
     }
@@ -8998,6 +9014,86 @@ impl StudioVfs {
     // File Handle Operations
     // =========================================================================
 
+    /// Prepare one file handle for participation in a platform OS page cache.
+    ///
+    /// The decision is idempotent for the handle. Bridges must call
+    /// [`Self::abort_os_cache_open`] when the corresponding open reply is not
+    /// accepted so the tentative generation cannot be reused. The caller must
+    /// serialize preparation through acceptance or rejection of the platform
+    /// reply for each inode. No bridge should consume this seam until it owns
+    /// that keyed reply-serialization boundary.
+    pub fn prepare_os_cache_open(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+    ) -> OsCacheOpenDecision {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+        };
+        let ino = open_file.ino;
+        open_file.prepare_os_cache_once(
+            || OsCacheForegroundHandleLease::begin(Arc::clone(&self.os_cache)),
+            |writer_registered| {
+                if participation == OsCacheParticipation::Disabled {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::Disabled);
+                }
+                if writer_registered {
+                    return OsCacheOpenDecision::replace(OsCacheReason::WriteCapable);
+                }
+                let Some(attr) = open_file.open_attr() else {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::UnknownState);
+                };
+                if attr.kind != FileType::RegularFile {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::NonRegular);
+                }
+                {
+                    let mut os_cache = self.os_cache.lock();
+                    if os_cache.has_active_writer(ino) {
+                        os_cache.clear_generation(ino);
+                        return OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter);
+                    }
+                }
+                if self.inode_has_local_dirty_state(ino) {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::LocalDirty);
+                }
+                let generation = self
+                    .sync_meta()
+                    .lookup_regular_file_slices(ino, 0, attr.size)
+                    .ok()
+                    .map(|spans| OsCacheGeneration::new(attr.content_epoch, attr.size, &spans));
+                self.os_cache
+                    .lock()
+                    .prepare_read(ino, participation, generation)
+            },
+        )
+    }
+
+    /// Roll back a prepared cache-open decision rejected by a platform bridge.
+    pub fn abort_os_cache_open(&self, fh: u64) {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return;
+        };
+        open_file.abort_os_cache_lifecycle();
+        self.os_cache.lock().clear_generation(open_file.ino);
+    }
+
+    pub(super) fn retire_os_cache_inode(&self, ino: Ino) {
+        self.os_cache.lock().clear_generation(ino);
+    }
+
+    fn register_os_cache_writer(&self, open_file: &OpenFile, write_capable: bool) {
+        if write_capable {
+            open_file.install_os_cache_writer_lease(OsCacheWriterLease::begin(
+                open_file.ino,
+                Arc::clone(&self.os_cache),
+            ));
+        }
+    }
+
     /// Open a file and allocate a file handle.
     ///
     /// Called by FUSE `open()` / WinFSP `open()`.
@@ -9057,6 +9153,7 @@ impl StudioVfs {
                 self.handle_table
                     .open(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
+            self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
             if active_open_overlay {
                 self.sync_meta().note_active_open_inode(ino);
             }
@@ -9101,6 +9198,7 @@ impl StudioVfs {
             active_open_overlay,
         );
         let fh = open_file.fh;
+        self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
         if active_open_overlay {
             self.sync_meta().note_active_open_inode(ino);
         }

@@ -9,6 +9,9 @@ use std::time::Instant;
 use studiofs_meta::types::{Ino, InodeAttr};
 use tracing::debug;
 
+use super::os_cache::{
+    OsCacheForegroundHandleLease, OsCacheOpenDecision, OsCacheReason, OsCacheWriterLease,
+};
 use crate::utils::now_unix_millis;
 
 // =============================================================================
@@ -57,6 +60,14 @@ struct ReadWindow {
 struct ReadWindowState {
     last_end: Option<u64>,
     window: Option<ReadWindow>,
+}
+
+#[derive(Debug, Default)]
+struct OsCacheHandleState {
+    prepared: Option<OsCacheOpenDecision>,
+    writer_lease: Option<OsCacheWriterLease>,
+    foreground_read_lease: Option<OsCacheForegroundHandleLease>,
+    aborted: bool,
 }
 
 /// Flags associated with an open file descriptor.
@@ -124,6 +135,7 @@ pub struct OpenFile {
     pub(super) active_open_overlay: bool,
     access_state: Arc<Mutex<HandleAccessState>>,
     read_window: Arc<Mutex<ReadWindowState>>,
+    os_cache_state: Arc<Mutex<OsCacheHandleState>>,
 }
 
 impl OpenFile {
@@ -142,7 +154,57 @@ impl OpenFile {
             active_open_overlay,
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
             read_window: Arc::new(Mutex::new(ReadWindowState::default())),
+            os_cache_state: Arc::new(Mutex::new(OsCacheHandleState::default())),
         }
+    }
+
+    pub(super) fn install_os_cache_writer_lease(&self, lease: OsCacheWriterLease) {
+        let previous = self.os_cache_state.lock().writer_lease.replace(lease);
+        debug_assert!(previous.is_none(), "OS-cache writer lease installed twice");
+    }
+
+    pub(super) fn prepare_os_cache_once(
+        &self,
+        begin_foreground_read: impl FnOnce() -> OsCacheForegroundHandleLease,
+        prepare: impl FnOnce(bool) -> OsCacheOpenDecision,
+    ) -> OsCacheOpenDecision {
+        // Deliberately retain the handle-local gate while the generation is
+        // resolved. This serializes prepare with release/abort and prevents a
+        // decision from being published after its handle was closed. Metadata
+        // resolution never acquires this handle gate, and all lifecycle paths
+        // use the same handle-then-global-cache lock order.
+        let mut state = self.os_cache_state.lock();
+        if state.aborted {
+            return OsCacheOpenDecision::replace(OsCacheReason::UnknownState);
+        }
+        if state.writer_lease.is_none() && state.foreground_read_lease.is_none() {
+            state.foreground_read_lease = Some(begin_foreground_read());
+        }
+        if let Some(decision) = state.prepared {
+            return decision;
+        }
+        let decision = prepare(state.writer_lease.is_some());
+        state.prepared = Some(decision);
+        decision
+    }
+
+    pub(super) fn take_os_cache_release_lifetimes(
+        &self,
+    ) -> (
+        Option<OsCacheWriterLease>,
+        Option<OsCacheForegroundHandleLease>,
+    ) {
+        let mut state = self.os_cache_state.lock();
+        (
+            state.writer_lease.take(),
+            state.foreground_read_lease.take(),
+        )
+    }
+
+    pub(super) fn abort_os_cache_lifecycle(&self) {
+        let mut state = self.os_cache_state.lock();
+        state.aborted = true;
+        state.prepared = None;
     }
 
     pub(super) fn open_attr(&self) -> Option<InodeAttr> {

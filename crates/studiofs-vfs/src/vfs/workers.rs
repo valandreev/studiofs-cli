@@ -596,12 +596,15 @@ impl StudioVfs {
     }
 
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
-        let Some(invalidator) = self.kernel_invalidator() else {
-            return;
-        };
         let mut unique = HashSet::new();
         for ino in inodes {
-            if unique.insert(ino)
+            if !unique.insert(ino) {
+                continue;
+            }
+            // Generation retirement is a VFS correctness boundary, not a
+            // best-effort side effect of having a mounted platform notifier.
+            self.retire_os_cache_inode(ino);
+            if let Some(invalidator) = self.kernel_invalidator()
                 && !self.should_skip_kernel_invalidation_for_active_open(ino, true)
             {
                 invalidator.inval_inode(ino);
