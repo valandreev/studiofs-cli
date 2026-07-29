@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 const ROOT_INODE: u64 = 1;
@@ -9,12 +9,20 @@ struct FuseInodeLivenessState {
     lookup_refs: HashMap<u64, u64>,
     open_refs: HashMap<u64, u64>,
     reservations: Vec<PendingLookup>,
+    provisional_forgets: HashMap<u64, Vec<ProvisionalForgetBatch>>,
+    next_reply_sequence: u64,
 }
 
 struct PendingLookup {
     ino: u64,
     identity: Arc<()>,
     invalidated_during_reply: bool,
+    reply_sequence: Option<u64>,
+}
+
+struct ProvisionalForgetBatch {
+    eligible_reply_sequences: HashSet<u64>,
+    remaining: u64,
 }
 
 #[derive(Default)]
@@ -36,6 +44,7 @@ impl FuseInodeLiveness {
                 ino,
                 identity: Arc::clone(&identity),
                 invalidated_during_reply: false,
+                reply_sequence: None,
             });
         FuseLookupReservation {
             inner: Arc::clone(&self.inner),
@@ -49,7 +58,40 @@ impl FuseInodeLiveness {
             return;
         }
         let mut state = lock_poison_tolerant(&self.inner.state);
-        subtract_ref_count(&mut state.lookup_refs, ino, nlookup);
+        let remaining = subtract_ref_count(&mut state.lookup_refs, ino, nlookup);
+        if remaining == 0 {
+            return;
+        }
+        // A multithreaded libfuse loop may dispatch FORGET after the kernel
+        // receives an entry reply but before fuse_reply_entry/create returns
+        // to the replying thread. Record aggregate debt against exactly the
+        // replies that were already in flight. A rejected reply cannot consume
+        // this debt; another eligible successful reply must do so instead.
+        let eligible_reply_sequences = state
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.ino == ino)
+            .filter_map(|reservation| reservation.reply_sequence)
+            .collect::<HashSet<_>>();
+        let already_reserved = state
+            .provisional_forgets
+            .get(&ino)
+            .map(|batches| batches.iter().map(|batch| batch.remaining).sum())
+            .unwrap_or_default();
+        let available = u64::try_from(eligible_reply_sequences.len())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(already_reserved);
+        let provisional = remaining.min(available);
+        if provisional != 0 {
+            state
+                .provisional_forgets
+                .entry(ino)
+                .or_default()
+                .push(ProvisionalForgetBatch {
+                    eligible_reply_sequences,
+                    remaining: provisional,
+                });
+        }
     }
 
     pub(crate) fn open_handle(&self, ino: u64) -> FuseOpenHandleGuard {
@@ -129,6 +171,27 @@ pub(crate) struct FuseLookupReservation {
 }
 
 impl FuseLookupReservation {
+    /// Mark the reservation immediately before calling libfuse's entry reply.
+    ///
+    /// This provisional phase lets a concurrent FORGET consume the one lookup
+    /// reference after the kernel receives the reply but before libfuse
+    /// returns success to the replying thread.
+    pub(crate) fn begin_reply(&self) -> bool {
+        let mut state = lock_poison_tolerant(&self.inner.state);
+        let Some(index) = state.reservations.iter().position(|reservation| {
+            reservation.ino == self.ino && Arc::ptr_eq(&reservation.identity, &self.identity)
+        }) else {
+            return false;
+        };
+        if state.reservations[index].reply_sequence.is_some() {
+            return false;
+        }
+        let reply_sequence = state.next_reply_sequence;
+        state.next_reply_sequence = state.next_reply_sequence.wrapping_add(1);
+        state.reservations[index].reply_sequence = Some(reply_sequence);
+        true
+    }
+
     /// Commit a successful entry reply and report whether it needs a follow-up
     /// invalidation because content changed while the reply was in flight.
     pub(crate) fn commit(&self) -> Option<FuseLookupCommitOutcome> {
@@ -138,10 +201,18 @@ impl FuseLookupReservation {
         }) else {
             return None;
         };
+        let Some(reply_sequence) = state.reservations[index].reply_sequence else {
+            return None;
+        };
         let reservation = state.reservations.swap_remove(index);
-        increment_ref_count(&mut state.lookup_refs, self.ino);
+        let lookup_ref_committed =
+            !finish_provisional_reply(&mut state, self.ino, reply_sequence, true);
+        if lookup_ref_committed {
+            increment_ref_count(&mut state.lookup_refs, self.ino);
+        }
         Some(FuseLookupCommitOutcome {
             follow_up_invalidation_required: reservation.invalidated_during_reply,
+            lookup_ref_committed,
         })
     }
 
@@ -152,7 +223,10 @@ impl FuseLookupReservation {
         }) else {
             return false;
         };
-        state.reservations.swap_remove(index);
+        let reservation = state.reservations.swap_remove(index);
+        if let Some(reply_sequence) = reservation.reply_sequence {
+            finish_provisional_reply(&mut state, self.ino, reply_sequence, false);
+        }
         true
     }
 }
@@ -161,11 +235,16 @@ impl FuseLookupReservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FuseLookupCommitOutcome {
     follow_up_invalidation_required: bool,
+    lookup_ref_committed: bool,
 }
 
 impl FuseLookupCommitOutcome {
     pub(crate) const fn follow_up_invalidation_required(self) -> bool {
         self.follow_up_invalidation_required
+    }
+
+    pub(crate) const fn lookup_ref_committed(self) -> bool {
+        self.lookup_ref_committed
     }
 }
 
@@ -204,14 +283,59 @@ fn increment_ref_count(refs: &mut HashMap<u64, u64>, ino: u64) {
     *count = count.saturating_add(1);
 }
 
-fn subtract_ref_count(refs: &mut HashMap<u64, u64>, ino: u64, count: u64) {
+fn subtract_ref_count(refs: &mut HashMap<u64, u64>, ino: u64, count: u64) -> u64 {
     let Some(current) = refs.get_mut(&ino) else {
-        return;
+        return count;
     };
-    *current = current.saturating_sub(count);
+    let consumed = (*current).min(count);
+    *current -= consumed;
     if *current == 0 {
         refs.remove(&ino);
     }
+    count - consumed
+}
+
+/// Finish one provisional reply and return whether it consumed a FORGET.
+///
+/// Forget batches are ordered by observation time. Their eligible sets are
+/// nested: a later batch contains every still-in-flight reply from an earlier
+/// batch plus any replies begun since. Keeping older debt first therefore
+/// preserves exact eligibility while allowing a rejected reply's debt to move
+/// to another successful reply from the same set.
+fn finish_provisional_reply(
+    state: &mut FuseInodeLivenessState,
+    ino: u64,
+    reply_sequence: u64,
+    successful: bool,
+) -> bool {
+    let Some(batches) = state.provisional_forgets.get_mut(&ino) else {
+        return false;
+    };
+    let consumed = if successful {
+        if let Some(batch) = batches.iter_mut().find(|batch| {
+            batch.remaining != 0 && batch.eligible_reply_sequences.contains(&reply_sequence)
+        }) {
+            batch.remaining -= 1;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let mut earlier_debt = 0_u64;
+    for batch in batches.iter_mut() {
+        batch.eligible_reply_sequences.remove(&reply_sequence);
+        let eligible = u64::try_from(batch.eligible_reply_sequences.len()).unwrap_or(u64::MAX);
+        batch.remaining = batch.remaining.min(eligible.saturating_sub(earlier_debt));
+        earlier_debt = earlier_debt.saturating_add(batch.remaining);
+    }
+    batches.retain(|batch| batch.remaining != 0);
+    if batches.is_empty() {
+        state.provisional_forgets.remove(&ino);
+    }
+    consumed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +501,7 @@ mod tests {
         assert!(!admission.notified_now());
         assert_eq!(admission.deferred_reply_count(), 1);
         assert!(!callback_called.load(Ordering::Acquire));
+        assert!(reservation.begin_reply());
         assert!(
             reservation
                 .commit()
@@ -407,6 +532,7 @@ mod tests {
         let current = liveness.reserve_lookup(42);
 
         assert!(stale.commit().is_none());
+        assert!(current.begin_reply());
         assert!(!current.commit().unwrap().follow_up_invalidation_required());
         assert!(liveness.is_live(42));
     }
@@ -416,6 +542,7 @@ mod tests {
         let liveness = FuseInodeLiveness::default();
         let old = liveness.reserve_lookup(42);
         let current = liveness.reserve_lookup(42);
+        assert!(current.begin_reply());
         assert!(!current.commit().unwrap().follow_up_invalidation_required());
 
         assert!(old.rollback());
@@ -428,8 +555,11 @@ mod tests {
     #[test]
     fn forget_saturates_at_lookup_count() {
         let liveness = FuseInodeLiveness::default();
-        assert!(liveness.reserve_lookup(42).commit().is_some());
-        assert!(liveness.reserve_lookup(42).commit().is_some());
+        for _ in 0..2 {
+            let reservation = liveness.reserve_lookup(42);
+            assert!(reservation.begin_reply());
+            assert!(reservation.commit().is_some());
+        }
 
         liveness.forget(42, 9);
 
@@ -439,7 +569,9 @@ mod tests {
     #[test]
     fn forget_zero_is_a_noop() {
         let liveness = FuseInodeLiveness::default();
-        assert!(liveness.reserve_lookup(42).commit().is_some());
+        let reservation = liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        assert!(reservation.commit().is_some());
 
         liveness.forget(42, 0);
 
@@ -472,7 +604,9 @@ mod tests {
     #[test]
     fn invalidation_callback_does_not_hold_liveness_lock() {
         let liveness = FuseInodeLiveness::default();
-        assert!(liveness.reserve_lookup(42).commit().is_some());
+        let reservation = liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        assert!(reservation.commit().is_some());
         let callback_liveness = liveness.clone();
 
         let admission = liveness.admit_invalidation(42, move || {
@@ -486,7 +620,9 @@ mod tests {
     #[test]
     fn committed_ref_notifies_now_and_pending_reply_still_needs_follow_up() {
         let liveness = FuseInodeLiveness::default();
-        assert!(liveness.reserve_lookup(42).commit().is_some());
+        let committed = liveness.reserve_lookup(42);
+        assert!(committed.begin_reply());
+        assert!(committed.commit().is_some());
         let pending = liveness.reserve_lookup(42);
         let callback_called = AtomicBool::new(false);
 
@@ -497,7 +633,187 @@ mod tests {
         assert!(admission.notified_now());
         assert_eq!(admission.deferred_reply_count(), 1);
         assert!(callback_called.load(Ordering::Acquire));
+        assert!(pending.begin_reply());
         assert!(pending.commit().unwrap().follow_up_invalidation_required());
+    }
+
+    #[test]
+    fn forget_during_reply_consumes_provisional_lookup_before_commit() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+
+        liveness.forget(42, 1);
+
+        let outcome = reservation.commit().expect("successful reply");
+        assert!(!outcome.lookup_ref_committed());
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn forget_consumes_each_same_inode_provisional_reply_at_most_once() {
+        let liveness = FuseInodeLiveness::default();
+        let first = liveness.reserve_lookup(42);
+        let second = liveness.reserve_lookup(42);
+        let third = liveness.reserve_lookup(42);
+        assert!(first.begin_reply());
+        assert!(second.begin_reply());
+        assert!(third.begin_reply());
+
+        liveness.forget(42, 2);
+
+        let outcomes = [
+            first.commit().expect("first successful reply"),
+            second.commit().expect("second successful reply"),
+            third.commit().expect("third successful reply"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.lookup_ref_committed())
+                .count(),
+            1
+        );
+        assert!(liveness.is_live(42));
+        liveness.forget(42, 1);
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn invalidated_provisional_reply_keeps_follow_up_after_concurrent_forget() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        let admission = liveness.admit_invalidation(42, || {});
+        assert_eq!(admission.deferred_reply_count(), 1);
+
+        liveness.forget(42, 1);
+
+        let outcome = reservation.commit().expect("successful reply");
+        assert!(!outcome.lookup_ref_committed());
+        assert!(outcome.follow_up_invalidation_required());
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn rejected_provisional_reply_rolls_back_without_lookup_ref() {
+        let liveness = FuseInodeLiveness::default();
+        let reservation = liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        liveness.forget(42, 1);
+
+        assert!(reservation.rollback());
+        assert!(reservation.commit().is_none());
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn rejected_reply_does_not_steal_forget_from_same_inode_successful_reply() {
+        let liveness = FuseInodeLiveness::default();
+        let rejected = liveness.reserve_lookup(42);
+        let accepted = liveness.reserve_lookup(42);
+        assert!(rejected.begin_reply());
+        assert!(accepted.begin_reply());
+
+        liveness.forget(42, 1);
+
+        assert!(rejected.rollback());
+        let outcome = accepted.commit().expect("successful reply");
+        assert!(!outcome.lookup_ref_committed());
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn future_reply_cannot_consume_forget_from_rejected_reply_cohort() {
+        let liveness = FuseInodeLiveness::default();
+        let rejected = liveness.reserve_lookup(42);
+        assert!(rejected.begin_reply());
+        liveness.forget(42, 1);
+        assert!(rejected.rollback());
+
+        let future = liveness.reserve_lookup(42);
+        assert!(future.begin_reply());
+        let outcome = future.commit().expect("future successful reply");
+
+        assert!(outcome.lookup_ref_committed());
+        assert!(liveness.is_live(42));
+    }
+
+    #[test]
+    fn future_reply_cannot_consume_debt_while_older_eligible_reply_remains() {
+        let liveness = FuseInodeLiveness::default();
+        let rejected = liveness.reserve_lookup(42);
+        let eligible = liveness.reserve_lookup(42);
+        assert!(rejected.begin_reply());
+        assert!(eligible.begin_reply());
+        liveness.forget(42, 2);
+        assert!(rejected.rollback());
+
+        let future = liveness.reserve_lookup(42);
+        assert!(future.begin_reply());
+        let future_outcome = future.commit().expect("future successful reply");
+        let eligible_outcome = eligible.commit().expect("eligible successful reply");
+
+        assert!(future_outcome.lookup_ref_committed());
+        assert!(!eligible_outcome.lookup_ref_committed());
+        assert!(liveness.is_live(42));
+        liveness.forget(42, 1);
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn forget_consumes_committed_refs_before_provisional_reply_debt() {
+        let liveness = FuseInodeLiveness::default();
+        let committed = liveness.reserve_lookup(42);
+        assert!(committed.begin_reply());
+        assert!(committed.commit().unwrap().lookup_ref_committed());
+        let first = liveness.reserve_lookup(42);
+        let second = liveness.reserve_lookup(42);
+        assert!(first.begin_reply());
+        assert!(second.begin_reply());
+
+        liveness.forget(42, 2);
+
+        let outcomes = [
+            first.commit().expect("first successful reply"),
+            second.commit().expect("second successful reply"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.lookup_ref_committed())
+                .count(),
+            1
+        );
+        assert!(liveness.is_live(42));
+        liveness.forget(42, 1);
+        assert!(!liveness.is_live(42));
+    }
+
+    #[test]
+    fn multiple_forgets_reassign_debt_across_rejected_same_inode_replies() {
+        let liveness = FuseInodeLiveness::default();
+        let first = liveness.reserve_lookup(42);
+        let second = liveness.reserve_lookup(42);
+        let third = liveness.reserve_lookup(42);
+        assert!(first.begin_reply());
+        assert!(second.begin_reply());
+        liveness.forget(42, 1);
+        assert!(third.begin_reply());
+        liveness.forget(42, 2);
+
+        assert!(first.rollback());
+        let outcomes = [
+            second.commit().expect("second successful reply"),
+            third.commit().expect("third successful reply"),
+        ];
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| !outcome.lookup_ref_committed())
+        );
+        assert!(!liveness.is_live(42));
     }
 
     #[test]
