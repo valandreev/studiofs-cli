@@ -2,12 +2,24 @@
 #include <stddef.h>
 #include <fuse_lowlevel.h>
 
+#define STUDIOFS_LINUX_FUSE_MAX_READ_SIZE (4U * 1024U * 1024U)
+
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
 extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
 extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
+extern void studiofs_linux_fuse_record_connection(void *userdata,
+                                                  uint32_t requested_max_read,
+                                                  uint32_t requested_max_readahead,
+                                                  uint32_t effective_max_read,
+                                                  uint32_t effective_max_readahead,
+                                                  uint32_t effective_max_write,
+                                                  uint32_t effective_max_background,
+                                                  uint32_t effective_congestion_threshold,
+                                                  uint64_t capable_features,
+                                                  uint64_t enabled_features);
 extern void studiofs_linux_fuse_destroy(void *userdata);
 extern void studiofs_linux_fuse_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
@@ -75,6 +87,15 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
     if (conn == NULL) {
         return;
     }
+    const uint32_t requested_max_read = conn->max_read;
+    conn->max_read = requested_max_read == 0
+                         ? STUDIOFS_LINUX_FUSE_MAX_READ_SIZE
+                         : (requested_max_read < STUDIOFS_LINUX_FUSE_MAX_READ_SIZE
+                                ? requested_max_read
+                                : STUDIOFS_LINUX_FUSE_MAX_READ_SIZE);
+    if (conn->max_readahead > STUDIOFS_LINUX_FUSE_MAX_READ_SIZE) {
+        conn->max_readahead = STUDIOFS_LINUX_FUSE_MAX_READ_SIZE;
+    }
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
     if (studiofs_linux_fuse_connection_wants_async_dio(userdata)) {
@@ -82,6 +103,18 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
     }
     if (studiofs_linux_fuse_connection_wants_writeback_cache(userdata)) {
         (void)fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+    }
+    if (userdata != NULL) {
+        studiofs_linux_fuse_record_connection(userdata,
+                                              STUDIOFS_LINUX_FUSE_MAX_READ_SIZE,
+                                              STUDIOFS_LINUX_FUSE_MAX_READ_SIZE,
+                                              conn->max_read,
+                                              conn->max_readahead,
+                                              conn->max_write,
+                                              conn->max_background,
+                                              conn->congestion_threshold,
+                                              conn->capable_ext,
+                                              conn->want_ext);
     }
 }
 
@@ -177,6 +210,20 @@ int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
     studiofs_linux_fuse_init(userdata, &conn);
     return conn.max_background == max_background &&
            conn.congestion_threshold == congestion_threshold;
+}
+
+uint32_t studiofs_linux_fuse_init_effective_max_read(uint32_t offered) {
+    struct fuse_conn_info conn = {0};
+    conn.max_read = offered;
+    studiofs_linux_fuse_init(NULL, &conn);
+    return conn.max_read;
+}
+
+uint32_t studiofs_linux_fuse_init_effective_max_readahead(uint32_t offered) {
+    struct fuse_conn_info conn = {0};
+    conn.max_readahead = offered;
+    studiofs_linux_fuse_init(NULL, &conn);
+    return conn.max_readahead;
 }
 
 int studiofs_linux_fuse_loop_config_uses_loop_config_api(void) {

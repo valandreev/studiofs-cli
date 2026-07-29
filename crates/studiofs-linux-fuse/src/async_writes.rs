@@ -78,6 +78,40 @@ struct LedgerState {
     errors: BTreeMap<u64, WriteError>,
     closed_handles: HashMap<u64, u64>,
     task_abort_handles: HashMap<u64, AbortHandle>,
+    snapshot_generation: u64,
+    peak_admitted_bytes: usize,
+    completed_writes: u64,
+    failed_writes: u64,
+    task_failed_writes: u64,
+    canceled_writes: u64,
+    shutdown_timeouts: u64,
+    admission_waits: u64,
+    admission_wait_total_nanos: u64,
+    barrier_waits: u64,
+    inode_barrier_waits: u64,
+    handle_barrier_waits: u64,
+    barrier_wait_total_nanos: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AsyncWriteMetricsSnapshot {
+    pub(crate) snapshot_generation: u64,
+    pub(crate) pending_writes: usize,
+    pub(crate) pending_bytes: usize,
+    pub(crate) pending_handles: usize,
+    pub(crate) pending_writes_per_inode: BTreeMap<u64, usize>,
+    pub(crate) peak_pending_bytes: usize,
+    pub(crate) completed_writes: u64,
+    pub(crate) failed_writes: u64,
+    pub(crate) task_failed_writes: u64,
+    pub(crate) canceled_writes: u64,
+    pub(crate) shutdown_timeouts: u64,
+    pub(crate) admission_waits: u64,
+    pub(crate) admission_wait_total_nanos: u64,
+    pub(crate) barrier_waits: u64,
+    pub(crate) inode_barrier_waits: u64,
+    pub(crate) handle_barrier_waits: u64,
+    pub(crate) barrier_wait_total_nanos: u64,
 }
 
 #[derive(Debug)]
@@ -303,7 +337,46 @@ impl AsyncWriteLedger {
         for abort_handle in &abort_handles {
             abort_handle.abort();
         }
+        if !abort_handles.is_empty() {
+            let mut state = self.lock_state();
+            state.canceled_writes = state
+                .canceled_writes
+                .saturating_add(abort_handles.len() as u64);
+        }
         abort_handles.len()
+    }
+
+    pub(crate) fn record_shutdown_timeout(&self) {
+        let mut state = self.lock_state();
+        state.shutdown_timeouts = state.shutdown_timeouts.saturating_add(1);
+    }
+
+    pub(crate) fn metrics_snapshot(&self) -> AsyncWriteMetricsSnapshot {
+        let mut state = self.lock_state();
+        state.snapshot_generation = state.snapshot_generation.saturating_add(1);
+        AsyncWriteMetricsSnapshot {
+            snapshot_generation: state.snapshot_generation,
+            pending_writes: state.pending.len(),
+            pending_bytes: state.admitted_bytes,
+            pending_handles: state.pending_by_handle.len(),
+            pending_writes_per_inode: state
+                .pending_by_inode
+                .iter()
+                .map(|(&ino, writes)| (ino, writes.len()))
+                .collect(),
+            peak_pending_bytes: state.peak_admitted_bytes,
+            completed_writes: state.completed_writes,
+            failed_writes: state.failed_writes,
+            task_failed_writes: state.task_failed_writes,
+            canceled_writes: state.canceled_writes,
+            shutdown_timeouts: state.shutdown_timeouts,
+            admission_waits: state.admission_waits,
+            admission_wait_total_nanos: state.admission_wait_total_nanos,
+            barrier_waits: state.barrier_waits,
+            inode_barrier_waits: state.inode_barrier_waits,
+            handle_barrier_waits: state.handle_barrier_waits,
+            barrier_wait_total_nanos: state.barrier_wait_total_nanos,
+        }
     }
 
     fn lock_state(&self) -> MutexGuard<'_, LedgerState> {
@@ -333,8 +406,10 @@ impl AsyncWriteLedger {
         }
 
         let mut state = self.lock_state();
+        let mut wait_started = None;
         loop {
             if state.shutting_down {
+                record_admission_wait(&mut state, wait_started);
                 return Err(AdmissionError::ShuttingDown);
             }
             if state
@@ -352,6 +427,7 @@ impl AsyncWriteLedger {
             if is_next && !self.at_capacity(&state, bytes) {
                 break;
             }
+            wait_started.get_or_insert_with(Instant::now);
             state = self
                 .changed
                 .wait(state)
@@ -366,6 +442,8 @@ impl AsyncWriteLedger {
             .admitted_writes
             .checked_add(1)
             .expect("configured write limit excludes request count overflow");
+        state.peak_admitted_bytes = state.peak_admitted_bytes.max(state.admitted_bytes);
+        record_admission_wait(&mut state, wait_started);
         if let Some(write) = state.pending.get_mut(&sequence) {
             write.reserved_bytes = Some(bytes);
         }
@@ -375,12 +453,15 @@ impl AsyncWriteLedger {
 
     fn wait_scope(&self, scope: BarrierScope, through: u64) -> BarrierOutcome {
         let mut state = self.lock_state();
+        let wait_started =
+            (scope != BarrierScope::All && scope.has_pending(&state, through)).then(Instant::now);
         while scope.has_pending(&state, through) {
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        record_barrier_wait(&mut state, scope, wait_started);
         BarrierOutcome::Complete(scope.consume_errors(&mut state, through))
     }
 
@@ -394,16 +475,21 @@ impl AsyncWriteLedger {
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
         let mut state = self.lock_state();
+        let wait_started =
+            (scope != BarrierScope::All && scope.has_pending(&state, through)).then(Instant::now);
         loop {
             if !scope.has_pending(&state, through) {
+                record_barrier_wait(&mut state, scope, wait_started);
                 let errno = scope.consume_errors(&mut state, through);
                 return BarrierOutcome::Complete(errno);
             }
 
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                record_barrier_wait(&mut state, scope, wait_started);
                 return BarrierOutcome::TimedOut;
             };
             if remaining.is_zero() {
+                record_barrier_wait(&mut state, scope, wait_started);
                 return BarrierOutcome::TimedOut;
             }
             let (next_state, wait_result) = self
@@ -412,12 +498,13 @@ impl AsyncWriteLedger {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next_state;
             if wait_result.timed_out() && scope.has_pending(&state, through) {
+                record_barrier_wait(&mut state, scope, wait_started);
                 return BarrierOutcome::TimedOut;
             }
         }
     }
 
-    fn finish(&self, sequence: u64, result: Result<(), i32>) {
+    fn finish(&self, sequence: u64, result: Result<(), i32>, task_failed: bool) {
         let mut state = self.lock_state();
         let Some(write) = state.pending.remove(&sequence) else {
             return;
@@ -434,6 +521,13 @@ impl AsyncWriteLedger {
         }
         remove_sequence(&mut state.pending_by_inode, write.ino, sequence);
         remove_sequence(&mut state.pending_by_handle, write.fh, sequence);
+        state.completed_writes = state.completed_writes.saturating_add(1);
+        if result.is_err() {
+            state.failed_writes = state.failed_writes.saturating_add(1);
+        }
+        if task_failed {
+            state.task_failed_writes = state.task_failed_writes.saturating_add(1);
+        }
         if let Err(errno) = result {
             state.errors.insert(
                 sequence,
@@ -481,7 +575,44 @@ fn remove_sequence(index: &mut HashMap<u64, BTreeSet<u64>>, key: u64, sequence: 
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn record_admission_wait(state: &mut LedgerState, wait_started: Option<Instant>) {
+    let Some(started) = wait_started else {
+        return;
+    };
+    state.admission_waits = state.admission_waits.saturating_add(1);
+    state.admission_wait_total_nanos = state
+        .admission_wait_total_nanos
+        .saturating_add(duration_nanos(started.elapsed()));
+}
+
+fn record_barrier_wait(
+    state: &mut LedgerState,
+    scope: BarrierScope,
+    wait_started: Option<Instant>,
+) {
+    let Some(started) = wait_started else {
+        return;
+    };
+    state.barrier_waits = state.barrier_waits.saturating_add(1);
+    match scope {
+        BarrierScope::Inode(_) => {
+            state.inode_barrier_waits = state.inode_barrier_waits.saturating_add(1);
+        }
+        BarrierScope::Handle(_) => {
+            state.handle_barrier_waits = state.handle_barrier_waits.saturating_add(1);
+        }
+        BarrierScope::All => return,
+    }
+    state.barrier_wait_total_nanos = state
+        .barrier_wait_total_nanos
+        .saturating_add(duration_nanos(started.elapsed()));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BarrierScope {
     Inode(u64),
     Handle(u64),
@@ -540,7 +671,7 @@ impl AsyncWriteTicket {
 
     pub(crate) fn complete(mut self, result: Result<(), i32>) {
         self.finished = true;
-        self.ledger.finish(self.sequence, result);
+        self.ledger.finish(self.sequence, result, false);
     }
 }
 
@@ -558,7 +689,7 @@ impl Drop for AsyncWriteTicket {
     fn drop(&mut self) {
         if !self.finished {
             self.finished = true;
-            self.ledger.finish(self.sequence, Err(libc::EIO));
+            self.ledger.finish(self.sequence, Err(libc::EIO), true);
         }
     }
 }
@@ -621,6 +752,33 @@ mod tests {
     }
 
     #[test]
+    fn metrics_snapshot_reports_pending_depth_failures_and_task_drop() {
+        let ledger = Arc::new(AsyncWriteLedger::with_limits(16, 4));
+        let successful = ledger.admit(10, 100, 4).expect("write should admit");
+        let failed = ledger.admit(10, 101, 6).expect("write should admit");
+        let pending = ledger.admit(20, 200, 2).expect("write should admit");
+
+        let snapshot = ledger.metrics_snapshot();
+        assert_eq!(snapshot.pending_writes, 3);
+        assert_eq!(snapshot.pending_bytes, 12);
+        assert_eq!(snapshot.pending_handles, 3);
+        assert_eq!(snapshot.pending_writes_per_inode.get(&10), Some(&2));
+        assert_eq!(snapshot.pending_writes_per_inode.get(&20), Some(&1));
+        assert_eq!(snapshot.peak_pending_bytes, 12);
+
+        successful.complete(Ok(()));
+        failed.complete(Err(libc::ENOSPC));
+        drop(pending);
+
+        let snapshot = ledger.metrics_snapshot();
+        assert_eq!(snapshot.pending_writes, 0);
+        assert_eq!(snapshot.completed_writes, 3);
+        assert_eq!(snapshot.failed_writes, 2);
+        assert_eq!(snapshot.task_failed_writes, 1);
+        assert!(snapshot.snapshot_generation > 1);
+    }
+
+    #[test]
     fn untimed_inode_barrier_waits_for_pre_watermark_write_only() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let before = ledger.admit(10, 100, 4).expect("write should admit");
@@ -648,6 +806,10 @@ mod tests {
 
         after.complete(Ok(()));
         waiter.join().expect("waiter should not panic");
+        let metrics = ledger.metrics_snapshot();
+        assert_eq!(metrics.barrier_waits, 1);
+        assert_eq!(metrics.inode_barrier_waits, 1);
+        assert_eq!(metrics.handle_barrier_waits, 0);
     }
 
     #[test]
@@ -678,6 +840,10 @@ mod tests {
 
         after.complete(Ok(()));
         waiter.join().expect("waiter should not panic");
+        let metrics = ledger.metrics_snapshot();
+        assert_eq!(metrics.barrier_waits, 1);
+        assert_eq!(metrics.inode_barrier_waits, 0);
+        assert_eq!(metrics.handle_barrier_waits, 1);
     }
 
     #[test]
@@ -1114,6 +1280,9 @@ mod tests {
             .expect("waiting admission should succeed")
             .complete(Ok(()));
         waiter.join().expect("waiter should not panic");
+        let metrics = ledger.metrics_snapshot();
+        assert_eq!(metrics.admission_waits, 1);
+        assert!(metrics.admission_wait_total_nanos > 0);
     }
 
     #[test]

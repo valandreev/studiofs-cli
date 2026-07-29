@@ -616,10 +616,20 @@ pub(crate) struct FuseInvalidationWorker {
 }
 
 impl FuseInvalidationWorker {
+    #[cfg(test)]
     pub(crate) fn spawn(
         queue: FuseInvalidationQueue,
         liveness: FuseInodeLiveness,
         notifier: impl Fn(u64, FuseInvalidationGeometry) -> Result<(), ()> + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_observer(queue, liveness, notifier, |_| {})
+    }
+
+    pub(crate) fn spawn_with_observer(
+        queue: FuseInvalidationQueue,
+        liveness: FuseInodeLiveness,
+        notifier: impl Fn(u64, FuseInvalidationGeometry) -> Result<(), ()> + Send + 'static,
+        observe_metrics: impl Fn(FuseInvalidationMetricsSnapshot) + Send + 'static,
     ) -> io::Result<Self> {
         if queue
             .inner
@@ -661,7 +671,9 @@ impl FuseInvalidationWorker {
                     } else if notify_result == Some(Err(())) {
                         metrics.notify_failures.fetch_add(1, Ordering::Relaxed);
                     }
+                    observe_metrics(metrics.snapshot());
                 }
+                observe_metrics(metrics.snapshot());
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -1197,6 +1209,36 @@ mod tests {
         let metrics = worker.metrics();
         assert_eq!(metrics.skipped_unobserved, 1);
         assert_eq!(metrics.notify_failures, 0);
+    }
+
+    #[test]
+    fn worker_observer_receives_live_metrics_after_notification() {
+        let queue = FuseInvalidationQueue::with_capacity(4);
+        let liveness = FuseInodeLiveness::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = FuseInvalidationWorker::spawn_with_observer(
+            queue.clone(),
+            liveness,
+            |_, _| Ok(()),
+            move |snapshot| {
+                let _ = sender.send(snapshot);
+            },
+        )
+        .expect("spawn worker");
+
+        queue
+            .push(1, FuseInvalidationKind::Data)
+            .expect("queue root invalidation");
+        let observed = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should publish metrics");
+        assert_eq!(observed.queue_depth, 0);
+        assert_eq!(observed.notify_latency_count, 1);
+        assert!(!observed.notification_in_flight);
+        assert_eq!(
+            worker.shutdown(Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
     }
 
     #[test]

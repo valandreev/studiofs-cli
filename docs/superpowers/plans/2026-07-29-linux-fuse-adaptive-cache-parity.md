@@ -123,17 +123,28 @@ always expose the new checksum.
   ENOSPC/EIO cannot grow memory without bound or lose watermark precision.
   Twenty-nine focused ledger tests passed; independent spec review passed and
   the review's unbounded-journal finding was fixed.
-- [ ] Add a shared generation-safe OS-cache seam to `studiofs-vfs`, driven by
+- [x] (2026-07-30) Integrated the ledger with raw Linux write callbacks:
+  opportunistic writes use RAII reply tickets, inode/fh watermarks replace the
+  mount-global barrier, native reply rejection is observed, and two-stage
+  shutdown cancellation retains the raw session on timeout. Added negotiated
+  4 MiB read geometry, accepted-reply-only open-cache counters, live
+  invalidation snapshots, and live async-write depth/wait/failure metrics.
+  With raw invalidation and liveness now wired, the runtime readiness gate was
+  flipped so unset/empty policy selects Adaptive; Direct remains the explicit
+  remount rollback.
+  Linux lib tests passed (149 passed, 3 mounted ignored) and all-target clippy
+  passed with warnings denied.
+- [x] Add a shared generation-safe OS-cache seam to `studiofs-vfs`, driven by
   failing tests before production changes.
-- [ ] Move current macFUSE cache decisions onto the shared seam without changing
+- [x] Move current macFUSE cache decisions onto the shared seam without changing
   macOS flags or the existing `macfuse_open_cache` runtime JSON.
-- [ ] Add handle-scoped readahead ownership and prove that kernel-cached handles
+- [x] Add handle-scoped readahead ownership and prove that kernel-cached handles
   do not launch duplicate VFS prefetch.
-- [ ] Add the Linux adaptive cache policy, memory snapshot, negotiated read
+- [x] Add the Linux adaptive cache policy, memory snapshot, negotiated read
   geometry, and bounded synchronous read buffer pool.
-- [ ] Add Linux lookup/open liveness, the `forget` callback, a bounded coalescing
+- [x] Add Linux lookup/open liveness, the `forget` callback, a bounded coalescing
   invalidation worker, and safe teardown.
-- [ ] Replace mount-global asynchronous-write waiting with inode and handle
+- [x] Replace mount-global asynchronous-write waiting with inode and handle
   watermarks while preserving the current local-first durability contract.
 - [ ] Add runtime statistics, documentation, mounted regressions, and benchmark
   gates.
@@ -196,6 +207,13 @@ always expose the new checksum.
   leak one lookup reference forever. Each reservation now has a provisional
   reply-in-flight phase that `forget(nlookup)` can consume before the reply
   thread finalizes it.
+
+- Observation: the implementation host has libfuse3 3.18 and `fusermount3`,
+  but no `/dev/fuse`.
+  Evidence: preflight reports `fuse-device-missing`; all three mounted tests
+  remain ignored. Mounted correctness, warm-cache byte deltas, and the
+  five-run Ubuntu/Rocky performance gates therefore remain external merge
+  gates and are not claimed by this checkout.
 
 ## Decision Log
 
