@@ -9108,16 +9108,36 @@ impl StudioVfs {
     ///
     /// Switching to [`ReadAheadOwner::Kernel`] synchronously drops the
     /// handle-local read window and retires its adaptive-prefetch stream.
+    /// Switching from kernel ownership to VFS ownership schedules the eager
+    /// first-block prefetch that was intentionally suppressed during open.
     /// The owner mutation is linearized against handle release while the
-    /// handle-table read lock is held. Returns `false` when release won that
+    /// handle-table lock is held. Returns `false` when release won that
     /// race; `true` means the handle was live at the mutation point, though a
     /// later release may of course occur immediately afterwards.
     pub fn set_read_ahead_owner(&self, fh: u64, owner: ReadAheadOwner) -> bool {
-        let Some(open_file) = self.handle_table.set_read_ahead_owner_if_live(fh, owner) else {
+        let Some((open_file, previous, owner_token)) =
+            self.handle_table.set_read_ahead_owner_if_live(fh, owner)
+        else {
             return false;
         };
         if owner == ReadAheadOwner::Kernel {
             self.clear_access_tracking_for_stream(open_file.ino, open_file.stream_id());
+        } else if previous == ReadAheadOwner::Kernel
+            && !self.is_runtime_stats_file_ino(open_file.ino)
+            && let Some(attr) = open_file.open_attr()
+            && attr.kind == studiofs_meta::types::FileType::RegularFile
+            && attr.size > 0
+            && (open_file.flags.contains(OpenFlags::RDONLY)
+                || open_file.flags.contains(OpenFlags::RDWR))
+        {
+            let Some(owner_token) = owner_token else {
+                return true;
+            };
+            let read_context = self.prefetch_read_context_from_attr(open_file.ino, &attr);
+            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+                PrefetchBatch::single(open_file.ino, 0, Some(read_context))
+                    .with_owner_token(Some(owner_token)),
+            ));
         }
         true
     }
@@ -9302,6 +9322,7 @@ impl StudioVfs {
         // Eager prefetch: when opening a regular file for reading, schedule
         // background prefetch of the first block to hide initial S3 latency.
         if read_context.attr.kind == studiofs_meta::types::FileType::RegularFile
+            && !self.is_runtime_stats_file_ino(ino)
             && read_context.attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
             && read_ahead_owner == ReadAheadOwner::Vfs

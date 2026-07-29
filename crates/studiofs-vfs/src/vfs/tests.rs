@@ -108,6 +108,105 @@ fn prepared_kernel_owner_skips_eager_open_prefetch() {
 }
 
 #[test]
+fn kernel_to_vfs_owner_transition_queues_eager_prefetch_exactly_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-ahead-owner-transition-prefetch");
+    let attr = vfs
+        .create(ROOT_INO, b"transition-prefetch.txt", 1000, 1000, 0o644)
+        .expect("create");
+    vfs.setattr(attr.ino, SetattrArgs::size_only(4096))
+        .expect("give file non-zero size");
+    let fh = vfs
+        .open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(queued_prefetch(), before + 1);
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "Vfs-to-Vfs owner assignment must not duplicate eager prefetch"
+    );
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Kernel));
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "switching back to kernel ownership must not queue VFS prefetch"
+    );
+
+    let mut lifecycle = vfs.startup.lifecycle.lock();
+    let queued = lifecycle
+        .channels
+        .as_mut()
+        .expect("unstarted VFS retains startup channels")
+        .prefetch_rx
+        .try_recv()
+        .expect("Kernel-to-VFS transition queued one batch");
+    let PrefetchWorkItem::Batch(batch) = queued else {
+        panic!("eager transition must queue a batch");
+    };
+    assert!(
+        batch.owner_token.is_some(),
+        "transition prefetch must remain scoped to the live VFS owner generation"
+    );
+}
+
+#[test]
+fn runtime_stats_owner_transition_never_queues_eager_prefetch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "runtime-stats-owner-transition-prefetch");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+    let fh = vfs
+        .open_file_with_read_ahead_owner(
+            RUNTIME_STATS_FILE_INO,
+            OpenFlags::RDONLY,
+            false,
+            ReadAheadOwner::Kernel,
+        )
+        .expect("open runtime stats with provisional owner");
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "dynamic runtime stats must bypass generic eager prefetch"
+    );
+
+    vfs.open_file(RUNTIME_STATS_FILE_INO, OpenFlags::RDONLY, false)
+        .expect("open runtime stats with VFS owner");
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "runtime stats must also bypass eager prefetch on an initial VFS owner"
+    );
+}
+
+#[test]
 fn os_cache_clean_read_first_replaces_then_reuses_after_release() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-clean-reuse");

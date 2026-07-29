@@ -5,14 +5,21 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::cache_policy::{
+    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBufferPool,
+    SystemMemorySampler, decide_open_cache,
+};
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use studiofs_bridge::fuse_open_reply::FuseOpenReplySerializer;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs,
+    StudioVfs,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -23,6 +30,10 @@ const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+// Adaptive becomes the runtime default only when Linux kernel invalidation is
+// connected to the generation tracker. The parser already exposes the final
+// public default so flipping this gate is an isolated follow-up.
+const LINUX_FUSE_ADAPTIVE_DEFAULT_READY: bool = false;
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -180,21 +191,20 @@ pub(crate) struct SessionState {
     mount_uid: u32,
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
+    cache_policy: LinuxFuseCachePolicy,
+    available_memory: Mutex<SystemMemorySampler>,
+    read_buffers: SyncReadBufferPool,
+    open_reply_serializer: FuseOpenReplySerializer,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LinuxFuseCachePolicy {
-    Direct,
-    Kernel,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinuxFuseOpenCachePolicy {
     direct_io: bool,
     keep_cache: bool,
     parallel_direct_writes: bool,
+    read_ahead_owner: ReadAheadOwner,
 }
 
 impl SessionState {
@@ -215,6 +225,10 @@ impl SessionState {
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             connection_config,
+            cache_policy: linux_fuse_cache_policy_from_env(),
+            available_memory: Mutex::new(SystemMemorySampler::system()),
+            read_buffers: SyncReadBufferPool::new(),
+            open_reply_serializer: FuseOpenReplySerializer::new(),
         }
     }
 }
@@ -328,6 +342,12 @@ struct LinuxFuseWriteRequest {
     local_sync_policy: LocalSyncPolicy,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LinuxFusePreparedOpen {
+    fh: u64,
+    cache: LinuxFuseOpenCachePolicy,
+}
+
 fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
     let parallelism = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -375,9 +395,12 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) -> c_int {
-    if linux_fuse_cache_policy_from_env() == LinuxFuseCachePolicy::Kernel {
+    let cache_policy = callback_state_from_userdata(userdata)
+        .map(|state| state.cache_policy)
+        .unwrap_or_else(linux_fuse_cache_policy_from_env);
+    if cache_policy == LinuxFuseCachePolicy::Kernel {
         1
     } else {
         0
@@ -395,11 +418,27 @@ fn current_gid() -> u32 {
 }
 
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
-    // ponytail: internal benchmark knob; promote only after studiofs-bench proves it.
-    std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY")
-        .ok()
-        .and_then(|value| linux_fuse_cache_policy_from_str(&value))
-        .unwrap_or(LinuxFuseCachePolicy::Direct)
+    let value = std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY").ok();
+    let selection = LinuxFuseCachePolicy::parse(value.as_deref());
+    if selection.warning_required {
+        warn!(
+            value = value.as_deref().unwrap_or_default(),
+            "unknown STUDIOFS_LINUX_FUSE_CACHE_POLICY; using adaptive policy"
+        );
+    }
+    linux_fuse_effective_cache_policy_for_value(value.as_deref(), LINUX_FUSE_ADAPTIVE_DEFAULT_READY)
+}
+
+fn linux_fuse_effective_cache_policy_for_value(
+    value: Option<&str>,
+    adaptive_default_ready: bool,
+) -> LinuxFuseCachePolicy {
+    let selection = LinuxFuseCachePolicy::parse(value);
+    if !adaptive_default_ready && value.is_none() {
+        LinuxFuseCachePolicy::Direct
+    } else {
+        selection.policy
+    }
 }
 
 fn linux_fuse_env_flag(name: &str) -> bool {
@@ -446,18 +485,6 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
             || !matches!(args.mtime, TimeSpec::Omit)
             || !matches!(args.crtime, TimeSpec::Omit)
             || args.win_attrs.is_some())
-}
-
-fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
-            Some(LinuxFuseCachePolicy::Direct)
-        }
-        "kernel" | "cached" | "page_cache" | "1" | "true" | "yes" | "on" => {
-            Some(LinuxFuseCachePolicy::Kernel)
-        }
-        _ => None,
-    }
 }
 
 fn argv_strings(volume_name: &str) -> Vec<String> {
@@ -882,7 +909,14 @@ pub extern "C" fn studiofs_linux_fuse_create(
     let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
-        Ok((attr, fh)) => reply_create(req, state, fi, &attr, fh),
+        Ok((attr, fh)) => {
+            let result = state.run_open_reply_transaction(
+                attr.ino,
+                || Ok(state.prepare_file_open(attr.ino, attr.size, file_info_flags(fi), fh)),
+                |prepared| reply_create(req, state, fi, &attr, prepared),
+            );
+            debug_assert!(result.is_ok(), "create preparation is infallible");
+        }
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1031,8 +1065,12 @@ pub extern "C" fn studiofs_linux_fuse_open(
         reply_error(req, libc::EINVAL);
         return;
     }
-    match state.open(ino, fi) {
-        Ok(fh) => reply_file_open(req, fi, fh),
+    match state.run_open_reply_transaction(
+        ino,
+        || state.open(ino, fi),
+        |prepared| reply_file_open(req, fi, prepared),
+    ) {
+        Ok(_) => {}
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1052,11 +1090,15 @@ pub extern "C" fn studiofs_linux_fuse_read(
     let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
+            let read = buffer.len();
             state
                 .vfs
-                .record_fuse_read_callback(buffer.len(), started.elapsed(), false);
-            // SAFETY: `buffer` is valid for this synchronous reply.
-            unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
+                .record_fuse_read_callback(read, started.elapsed(), false);
+            state.reply_with_pooled_read_buffer(buffer, |buffer| {
+                // SAFETY: `buffer` remains owned by the pool helper until this
+                // synchronous reply returns.
+                unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) }
+            });
         }
         Err(errno) => {
             state
@@ -1484,7 +1526,12 @@ impl SessionState {
         let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
         let fh = self
             .vfs
-            .open_created_file_with_known_attr(&attr, open_flags, trunc)
+            .open_created_file_with_known_attr_and_read_ahead_owner(
+                &attr,
+                open_flags,
+                trunc,
+                ReadAheadOwner::Kernel,
+            )
             .map_err(|error| vfs_err_to_errno(&error))?;
         Ok((attr, fh))
     }
@@ -1570,7 +1617,7 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
+    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFusePreparedOpen, i32> {
         let attr = self.getattr_attr(ino)?;
         match attr.kind {
             FileType::RegularFile => {}
@@ -1585,9 +1632,94 @@ impl SessionState {
         {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .open_file_with_known_attr(&attr, open_flags, trunc)
-            .map_err(|error| vfs_err_to_errno(&error))
+        let fh = self
+            .vfs
+            .open_file_with_known_attr_and_read_ahead_owner(
+                &attr,
+                open_flags,
+                trunc,
+                ReadAheadOwner::Kernel,
+            )
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        Ok(self.prepare_file_open(ino, attr.size, file_info_flags(fi), fh))
+    }
+
+    fn prepare_file_open(
+        &self,
+        ino: u64,
+        file_size: u64,
+        flags: c_int,
+        fh: u64,
+    ) -> LinuxFusePreparedOpen {
+        let participation = if self.cache_policy == LinuxFuseCachePolicy::Direct
+            || self.vfs.is_runtime_stats_file_ino(ino)
+        {
+            OsCacheParticipation::Disabled
+        } else {
+            OsCacheParticipation::Enabled
+        };
+        let generation = self.vfs.prepare_os_cache_open(fh, participation);
+        let available_memory = if self.cache_policy == LinuxFuseCachePolicy::Adaptive {
+            self.available_memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .available_memory()
+        } else {
+            None
+        };
+        let cache = if self.vfs.is_runtime_stats_file_ino(ino) {
+            LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: false,
+                read_ahead_owner: ReadAheadOwner::Vfs,
+            }
+        } else {
+            linux_fuse_open_cache_policy_for_decision(
+                flags,
+                self.cache_policy,
+                generation,
+                file_size,
+                available_memory,
+                linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+            )
+        };
+        let owner_was_set = self.vfs.set_read_ahead_owner(fh, cache.read_ahead_owner);
+        debug_assert!(owner_was_set, "newly-opened VFS handle must remain live");
+        LinuxFusePreparedOpen { fh, cache }
+    }
+
+    fn run_open_reply_transaction(
+        &self,
+        ino: u64,
+        prepare: impl FnOnce() -> Result<LinuxFusePreparedOpen, i32>,
+        reply: impl FnOnce(LinuxFusePreparedOpen) -> c_int,
+    ) -> Result<c_int, i32> {
+        let _reply_guard = self.open_reply_serializer.lock(ino);
+        let prepared = prepare()?;
+        let reply_result = reply(prepared);
+        if reply_result != 0 {
+            self.reject_prepared_open(ino, prepared.fh);
+        }
+        Ok(reply_result)
+    }
+
+    fn reject_prepared_open(&self, ino: u64, fh: u64) {
+        debug!(ino, fh, "Linux FUSE rolls back rejected open reply");
+        self.vfs.abort_os_cache_open(fh);
+        let _ = self
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+    }
+
+    fn reply_with_pooled_read_buffer(
+        &self,
+        buffer: Vec<u8>,
+        reply: impl FnOnce(&[u8]) -> c_int,
+    ) -> c_int {
+        let result = reply(&buffer);
+        self.read_buffers.put(buffer);
+        result
     }
 
     fn read(
@@ -1600,11 +1732,18 @@ impl SessionState {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size = clamp_read_size(size);
-        let mut buffer = vec![0; size];
-        let read = self
-            .runtime_handle
-            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        let mut buffer = self.read_buffers.take(size);
+        let read =
+            match self
+                .runtime_handle
+                .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    self.read_buffers.put(buffer);
+                    return Err(vfs_err_to_errno(&error));
+                }
+            };
         buffer.truncate(read as usize);
         Ok(buffer)
     }
@@ -2075,31 +2214,58 @@ fn with_write_data_slice<T>(
     }))
 }
 
-fn linux_fuse_open_cache_policy(flags: c_int) -> LinuxFuseOpenCachePolicy {
-    linux_fuse_open_cache_policy_for(flags, linux_fuse_cache_policy_from_env())
-}
-
+#[cfg(test)]
 fn linux_fuse_open_cache_policy_for(
     flags: c_int,
     cache_policy: LinuxFuseCachePolicy,
 ) -> LinuxFuseOpenCachePolicy {
-    if cache_policy == LinuxFuseCachePolicy::Direct {
-        return LinuxFuseOpenCachePolicy {
-            direct_io: true,
-            keep_cache: false,
-            parallel_direct_writes: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
-        };
-    }
-
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     let write_capable = trunc
         || open_flags.contains(OpenFlags::WRONLY)
         || open_flags.contains(OpenFlags::RDWR)
         || flags & libc::O_APPEND != 0;
+    let generation = if write_capable {
+        OpenCacheDecision {
+            disposition: studiofs_vfs::vfs::OsCacheDisposition::Replace,
+            reason: studiofs_vfs::vfs::OsCacheReason::WriteCapable,
+        }
+    } else {
+        OpenCacheDecision {
+            disposition: studiofs_vfs::vfs::OsCacheDisposition::Reuse,
+            reason: studiofs_vfs::vfs::OsCacheReason::StableGeneration,
+        }
+    };
+    linux_fuse_open_cache_policy_for_decision(flags, cache_policy, generation, 0, None, false)
+}
+
+fn linux_fuse_open_cache_policy_for_decision(
+    flags: c_int,
+    cache_policy: LinuxFuseCachePolicy,
+    generation: impl Into<OpenCacheDecision>,
+    file_size: u64,
+    available_memory: Option<u64>,
+    async_direct_io: bool,
+) -> LinuxFuseOpenCachePolicy {
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    let write_capable = trunc
+        || open_flags.contains(OpenFlags::WRONLY)
+        || open_flags.contains(OpenFlags::RDWR)
+        || flags & libc::O_APPEND != 0;
+    let decision = decide_open_cache(
+        cache_policy,
+        write_capable,
+        generation,
+        file_size,
+        available_memory,
+    );
     LinuxFuseOpenCachePolicy {
-        direct_io: false,
-        keep_cache: !write_capable,
-        parallel_direct_writes: false,
+        direct_io: decision.direct_io,
+        keep_cache: decision.keep_cache,
+        parallel_direct_writes: decision.direct_io && async_direct_io,
+        read_ahead_owner: match decision.readahead {
+            ReadAheadIntent::Vfs => ReadAheadOwner::Vfs,
+            ReadAheadIntent::Kernel => ReadAheadOwner::Kernel,
+        },
     }
 }
 
@@ -2148,23 +2314,26 @@ fn reply_dir_open(
     }
 }
 
-fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) {
+fn reply_file_open(
+    req: *mut raw::FuseReq,
+    fi: *mut raw::FuseFileInfo,
+    prepared: LinuxFusePreparedOpen,
+) -> c_int {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
         studiofs_linux_fuse_file_info_init(
             fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
+            prepared.fh,
+            fuse_flag(prepared.cache.direct_io),
+            fuse_flag(prepared.cache.keep_cache),
+            fuse_flag(prepared.cache.parallel_direct_writes),
         );
-        raw::fuse_reply_open(req, fi);
+        raw::fuse_reply_open(req, fi)
     }
 }
 
@@ -2173,11 +2342,11 @@ fn reply_create(
     state: &SessionState,
     fi: *mut raw::FuseFileInfo,
     attr: &InodeAttr,
-    fh: u64,
-) {
+    prepared: LinuxFusePreparedOpen,
+) -> c_int {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
     let stat = state.attr_to_stat(attr);
     let entry = raw::FuseEntryParam {
@@ -2189,15 +2358,14 @@ fn reply_create(
     };
     // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
     unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
         studiofs_linux_fuse_file_info_init(
             fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
+            prepared.fh,
+            fuse_flag(prepared.cache.direct_io),
+            fuse_flag(prepared.cache.keep_cache),
+            fuse_flag(prepared.cache.parallel_direct_writes),
         );
-        raw::fuse_reply_create(req, &entry, fi);
+        raw::fuse_reply_create(req, &entry, fi)
     }
 }
 
@@ -2721,6 +2889,7 @@ mod tests {
                 direct_io: false,
                 keep_cache: true,
                 parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
             }
         );
     }
@@ -2738,8 +2907,216 @@ mod tests {
                 direct_io: false,
                 keep_cache: false,
                 parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
             }
         );
+    }
+
+    #[test]
+    fn runtime_cache_policy_keeps_unset_default_direct_until_adaptive_is_ready() {
+        assert_eq!(
+            super::linux_fuse_effective_cache_policy_for_value(None, false),
+            crate::cache_policy::LinuxFuseCachePolicy::Direct
+        );
+    }
+
+    #[test]
+    fn runtime_cache_policy_honors_explicit_adaptive_before_default_switch() {
+        assert_eq!(
+            super::linux_fuse_effective_cache_policy_for_value(Some("adaptive"), false),
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn adaptive_stable_read_maps_to_kernel_readahead_and_keep_cache() {
+        let policy = super::linux_fuse_open_cache_policy_for_decision(
+            libc::O_RDONLY,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            crate::cache_policy::OpenCacheDecision {
+                disposition: studiofs_vfs::vfs::OsCacheDisposition::Reuse,
+                reason: studiofs_vfs::vfs::OsCacheReason::StableGeneration,
+            },
+            4096,
+            Some(8192),
+            false,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: true,
+                parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+            }
+        );
+    }
+
+    #[test]
+    fn adaptive_memory_bypass_maps_to_direct_vfs_readahead() {
+        let policy = super::linux_fuse_open_cache_policy_for_decision(
+            libc::O_RDONLY,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            crate::cache_policy::OpenCacheDecision {
+                disposition: studiofs_vfs::vfs::OsCacheDisposition::Replace,
+                reason: studiofs_vfs::vfs::OsCacheReason::FirstObservation,
+            },
+            8193,
+            Some(8192),
+            true,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: true,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Vfs,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_linux_decision_restores_vfs_owner_after_prepared_open() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-direct-owner")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"direct-owner.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open with provisional kernel owner");
+
+        let prepared = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, fh);
+
+        assert!(prepared.cache.direct_io);
+        assert_eq!(
+            fixture.vfs().read_ahead_owner(fh),
+            Some(studiofs_vfs::ReadAheadOwner::Vfs)
+        );
+    }
+
+    #[test]
+    fn rejected_open_transaction_aborts_generation_and_retires_handle() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-rejected-open")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let attr = fixture
+            .vfs()
+            .create(1, b"rejected-open.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let warm_fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open initial generation");
+        let warm = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, warm_fh);
+        assert!(
+            !warm.cache.keep_cache,
+            "first generation must replace pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(warm_fh))
+            .expect("release initial generation");
+
+        let fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open with provisional owner");
+
+        let reply_result = state
+            .run_open_reply_transaction(
+                attr.ino,
+                || Ok(state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, fh)),
+                |prepared| {
+                    assert!(
+                        prepared.cache.keep_cache,
+                        "rejected transaction must start from a reusable generation"
+                    );
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare transaction");
+
+        assert_eq!(reply_result, -libc::ENOENT);
+        assert!(fixture.vfs().get_open_file(fh).is_none());
+
+        let next_fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("reopen after rejected reply");
+        let next = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, next_fh);
+        assert!(
+            !next.cache.keep_cache,
+            "rejected reply must not leave a reusable generation snapshot"
+        );
+    }
+
+    #[test]
+    fn read_reply_buffer_returns_to_pool_only_after_reply_closure() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-reply-pool")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let mut buffer = state.read_buffers.take(4096);
+        buffer[0] = 0x5a;
+        let allocation = buffer.as_ptr();
+        let spare = vec![0_u8; 4096];
+        assert_ne!(spare.as_ptr(), allocation);
+        state.read_buffers.put(spare);
+
+        let reply_result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
+            assert_eq!(bytes[0], 0x5a);
+            0
+        });
+        let reused = state.read_buffers.take(4096);
+
+        assert_eq!(reply_result, 0);
+        assert_eq!(reused.as_ptr(), allocation);
     }
 
     #[test]
