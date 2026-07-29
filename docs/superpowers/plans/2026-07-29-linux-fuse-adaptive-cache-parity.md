@@ -36,6 +36,93 @@ always expose the new checksum.
 - [x] (2026-07-29 18:59Z) Ran the focused baseline: 40 Linux FUSE unit tests
   passed, 3 mounted tests were ignored as expected, and the VFS flush, fsync,
   and release durability regressions passed.
+- [x] (2026-07-29 19:10Z) Committed this living ExecPlan first as `1e7ca3bd`
+  (`docs: add Linux FUSE parity ExecPlan`).
+- [x] (2026-07-29 19:49Z) Added and independently reviewed the pure
+  generation-safe OS-cache state machine; 9 focused tests passed. Committed as
+  `3f8ab936` (`feat(vfs): add generation-safe OS cache state`).
+- [x] (2026-07-29 20:04Z) Added and independently reviewed the pure Linux
+  asynchronous-write ledger; 23 focused tests and the Linux crate check passed.
+  Committed as `5165d37a` (`feat(linux): add scoped async write ledger`).
+- [x] (2026-07-29 20:31Z) Added and independently reviewed Linux lookup/open
+  liveness plus the bounded coalescing invalidation queue; 17 focused tests and
+  the Linux crate check passed. Committed as `7c6f9da1`
+  (`feat(linux): add inode liveness and invalidation queue`).
+- [x] (2026-07-29 20:49Z) Added and independently reviewed the shared FIFO
+  per-inode open-reply serializer; 7 focused tests and bridge clippy passed.
+  Committed as `7920b3d1`
+  (`feat(bridge): serialize FUSE open replies per inode`).
+- [x] (2026-07-29 20:58Z) Wired the shared VFS cache seam, handle-scoped
+  writer/read lifetimes, abort behavior, synchronous invalidation retirement,
+  and final unlink/rename-overwrite retirement. Sixteen focused lifecycle tests,
+  ten state tests, and the VFS crate check passed; independent spec and quality
+  rereviews approved the slice. Committed as `47570dd6`
+  (`feat(vfs): wire OS cache handle lifecycle`).
+- [x] (2026-07-29 21:29Z) Added and independently reviewed the pure Linux
+  cache-policy table, adaptive-by-default parser, one-second available-memory
+  sampler, and bounded synchronous read buffer pool. Fifteen focused tests
+  passed. Committed as `d93a2dad`
+  (`feat(linux): add adaptive cache policy primitives`). The policy is not yet
+  connected to low-level opens, so the runtime default remains unchanged.
+- [x] (2026-07-29 21:48Z) Migrated macFUSE cache decisions and reply rollback
+  onto the shared VFS seam and per-inode reply serializer while preserving the
+  existing flags, memory threshold, metrics JSON, async reads, and symlink
+  behavior. Static review passed and the slice was committed as `96f24a44`
+  (`refactor(macfuse): use shared OS cache seam`). Native compilation and
+  characterization remain a required macOS CI gate because this Linux host
+  cannot compile the macOS ABI selection.
+- [x] (2026-07-29 22:12Z) Closed the multithreaded
+  accepted-reply-before-commit `forget` race with per-inode debt batches scoped
+  to the exact provisional-reply cohort. Twenty-six focused invalidation tests
+  and the Linux crate check passed; an adversarial rereview approved the
+  corrected rollback/success arithmetic. Committed as `4fd85fc7`
+  (`fix(linux): close lookup reply forget race`).
+- [x] (2026-07-29 22:31Z) Added handle-scoped VFS/kernel readahead ownership
+  with owner-generation tokens across eager hints, planned batches, launch,
+  in-flight metadata boundaries, and speculative read windows. Deterministic
+  race tests cover stale stream recreation, owner switching during an armed
+  oversized window, and rejected stale work. Focused tests and VFS clippy with
+  warnings denied passed; independent rereview approved the final slice.
+  Committed as `60aa0597`
+  (`feat(vfs): add handle-scoped readahead ownership`).
+- [x] (2026-07-29 22:53Z) Added the pure dedicated invalidation worker core:
+  one claimed consumer, liveness admission immediately before an injected
+  notifier, attr/data geometry, close-and-drain, retryable timeout, panic-aware
+  completion, and additive queue/latency/failure metrics. Thirty-two standalone
+  tests passed and an independent teardown rereview approved the slice.
+  Committed as `f448fb41`
+  (`feat(linux): add dedicated invalidation worker`).
+- [x] (2026-07-29 23:16Z) Integrated Linux cache decisions into open/create and
+  synchronous reads: session-scoped policy/memory/pool state, per-inode reply
+  transactions, shared VFS prepare/abort, rejected-reply handle retirement,
+  exact direct/kernel/adaptive flag mapping, scoped eager-prefetch restoration,
+  and runtime-stats bypass. Linux unit tests passed (117 passed, 3 mounted
+  ignored), focused VFS owner tests and VFS clippy passed, and the final
+  independent rereview approved the slice. Committed as `bd9482db`
+  (`feat(linux): integrate adaptive open cache decisions`). The unset runtime
+  default remains readiness-gated to Direct until raw invalidation integration.
+- [x] (2026-07-29 23:31Z) Added untimed inode/handle ledger barriers for normal
+  `flush`, `fsync`, and `release`, retaining timed mount-global drain only for
+  shutdown/tests. Twenty-six ledger tests passed and an independent static
+  review approved watermark, sticky-error, and shutdown semantics. Committed
+  as `d5feb514` (`feat(linux): add untimed scoped write barriers`).
+- [x] (2026-07-30 00:07Z) Wired Linux lookup/open liveness, the C/Rust
+  `forget` callback, reply reservations, producer-only invalidation, the
+  dedicated worker, and safe teardown into raw libfuse. Entry/create/open
+  sequencing now protects both the pre-reply snapshot gap and
+  accepted-reply-before-commit race. Timeout closes the notification gate,
+  removes signal handlers, unmounts, and retains worker/state/raw without
+  destroy. Linux unit tests passed (136 passed, 3 mounted ignored), isolated
+  clippy passed, and independent spec/quality rereviews approved the final
+  slice. Committed as `1002722b`
+  (`feat(linux): wire safe inode invalidation`). Adaptive default remains
+  readiness-gated pending mounted validation.
+- [x] (2026-07-30) Hardened the sequence-exact asynchronous-write ledger with
+  race-safe task cancellation and a bounded sticky-error journal. Admission
+  now reserves error capacity for every accepted request, so sustained
+  ENOSPC/EIO cannot grow memory without bound or lose watermark precision.
+  Twenty-nine focused ledger tests passed; independent spec review passed and
+  the review's unbounded-journal finding was fixed.
 - [ ] Add a shared generation-safe OS-cache seam to `studiofs-vfs`, driven by
   failing tests before production changes.
 - [ ] Move current macFUSE cache decisions onto the shared seam without changing
@@ -75,6 +162,41 @@ always expose the new checksum.
   Evidence: Cargo reported `0 passed; 792 filtered out`. The baseline was
   corrected to named contract tests and those tests passed.
 
+- Observation: Linux invalidation safety and asynchronous write shutdown share
+  the same raw-session lifetime boundary.
+  Evidence: both kernel notifications and late write replies can retain
+  libfuse request/session pointers after the main loop returns. A timeout path
+  that retains only the raw session while dropping `SessionState` would leave
+  libfuse userdata dangling.
+
+- Observation: a write callback must receive its ledger sequence before it can
+  wait for byte/request capacity.
+  Evidence: registering only after capacity admission lets a later flush or
+  release capture a watermark that omits the already-arrived callback. The
+  ledger now distinguishes registered synchronous callbacks from the bounded
+  set of admitted asynchronous executions.
+
+- Observation: capacity admission must respect request sequence order.
+  Evidence: `notify_all` without FIFO eligibility allowed a post-watermark
+  waiter to repeatedly take a freed slot before the pre-watermark waiter,
+  indirectly extending or starving the earlier barrier. The ledger now admits
+  only the lowest registered, unreserved sequence.
+
+- Observation: treating an in-progress lookup reply as immediately kernel-live
+  closes one invalidation race but opens its inverse.
+  Evidence: a notification sent before `fuse_reply_entry` can be ignored, after
+  which the reply installs stale data. Pending lookup reservations now record a
+  deferred marker; successful commit requests a follow-up data invalidation,
+  while rollback discards the marker.
+
+- Observation: committing lookup liveness only after `fuse_reply_entry` returns
+  still races with a multithreaded kernel `forget` callback.
+  Evidence: the kernel can accept the reply and dispatch `forget` before the
+  replying thread increments the committed count, causing the later commit to
+  leak one lookup reference forever. Each reservation now has a provisional
+  reply-in-flight phase that `forget(nlookup)` can consume before the reply
+  thread finalizes it.
+
 ## Decision Log
 
 - Decision: Make `Adaptive` the Linux default in the final implementation and
@@ -104,6 +226,38 @@ always expose the new checksum.
   watermarks for `release`, and a mount-global drain only during shutdown.
   Rationale: file durability must include earlier writes to the same inode, but
   unrelated files must not increase barrier latency.
+  Date/Author: 2026-07-29 / Codex.
+
+- Decision: Do not cancel an in-progress VFS write future unless a focused
+  audit first proves that the current local-first write path is cancellation
+  safe.
+  Rationale: aborting a future after local mutation starts could leave an
+  accepted write without its required completion bookkeeping. On shutdown,
+  stop admission, wait through the bounded drain windows, and retain the raw
+  session together with its boxed callback state if callbacks remain live.
+  Date/Author: 2026-07-29 / Codex.
+
+- Decision: Record Linux lookup liveness at the successful FUSE reply boundary
+  using rollback-capable reservations, and let kernel `forget` retire lookup
+  references.
+  Rationale: recording after `fuse_reply_entry` creates a visibility race,
+  while eagerly deleting liveness on namespace mutation conflicts with the
+  kernel's lookup-reference protocol.
+  Date/Author: 2026-07-29 / Codex.
+
+- Decision: Mark each lookup reservation provisional immediately before the
+  native entry/create reply and let `forget` consume provisional reservations
+  after committed references.
+  Rationale: this preserves the rule that rejected replies never become live
+  while closing the accepted-reply-before-Rust-commit race, including multiple
+  simultaneous replies for the same inode.
+  Date/Author: 2026-07-29 / Codex.
+
+- Decision: Keep the asynchronous error journal sequence-exact and consume all
+  matching errors through a completed barrier, returning the earliest errno.
+  Rationale: lossy coalescing can erase a post-watermark error when an earlier
+  barrier consumes the same aggregate. Mandatory handle release bounds the
+  lifecycle journal in normal operation.
   Date/Author: 2026-07-29 / Codex.
 
 ## Outcomes & Retrospective

@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::task::AbortHandle;
 
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_PENDING_WRITES: usize = 1024;
+const DEFAULT_MAX_RECORDED_ERRORS: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionError {
+    ErrorJournalFull,
     HandleClosed,
     RequestTooLarge,
     ShuttingDown,
@@ -19,7 +22,7 @@ impl AdmissionError {
         match self {
             Self::HandleClosed => libc::EBADF,
             Self::RequestTooLarge => libc::EINVAL,
-            Self::ShuttingDown | Self::SequenceExhausted => libc::EIO,
+            Self::ErrorJournalFull | Self::ShuttingDown | Self::SequenceExhausted => libc::EIO,
         }
     }
 }
@@ -69,17 +72,19 @@ struct LedgerState {
     pending: BTreeMap<u64, PendingWrite>,
     pending_by_inode: HashMap<u64, BTreeSet<u64>>,
     pending_by_handle: HashMap<u64, BTreeSet<u64>>,
-    // Journal growth is operationally bounded by writes between mandatory fh release barriers,
-    // which consume every lifecycle error before that identifier can be reused. Keep one entry per
-    // sequence: lossy coalescing could hide an error from a captured watermark.
+    // Keep one entry per sequence: lossy coalescing could hide an error from a
+    // captured watermark. Admission reserves bounded journal capacity for
+    // every pending request before assigning its sequence.
     errors: BTreeMap<u64, WriteError>,
     closed_handles: HashMap<u64, u64>,
+    task_abort_handles: HashMap<u64, AbortHandle>,
 }
 
 #[derive(Debug)]
 pub(crate) struct AsyncWriteLedger {
     max_pending_bytes: usize,
     max_pending_writes: usize,
+    max_recorded_errors: usize,
     state: Mutex<LedgerState>,
     changed: Condvar,
 }
@@ -92,19 +97,37 @@ impl Default for AsyncWriteLedger {
 
 impl AsyncWriteLedger {
     pub(crate) fn with_limits(max_pending_bytes: usize, max_pending_writes: usize) -> Self {
+        Self::with_limits_and_error_limit(
+            max_pending_bytes,
+            max_pending_writes,
+            DEFAULT_MAX_RECORDED_ERRORS,
+        )
+    }
+
+    fn with_limits_and_error_limit(
+        max_pending_bytes: usize,
+        max_pending_writes: usize,
+        max_recorded_errors: usize,
+    ) -> Self {
         assert!(max_pending_bytes > 0, "pending byte limit must be non-zero");
         assert!(
             max_pending_writes > 0,
             "pending write limit must be non-zero"
         );
+        assert!(
+            max_recorded_errors > 0,
+            "recorded error limit must be non-zero"
+        );
         Self {
             max_pending_bytes,
             max_pending_writes,
+            max_recorded_errors,
             state: Mutex::new(LedgerState::default()),
             changed: Condvar::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn admit(
         self: &Arc<Self>,
         ino: u64,
@@ -131,6 +154,12 @@ impl AsyncWriteLedger {
         }
         if state.closed_handles.contains_key(&fh) {
             return Err(AdmissionError::HandleClosed);
+        }
+        // Reserve space for every accepted request because each may fail.
+        // This bounds the journal without coalescing sequence identities or
+        // losing pre/post-watermark precision.
+        if state.errors.len().saturating_add(state.pending.len()) >= self.max_recorded_errors {
+            return Err(AdmissionError::ErrorJournalFull);
         }
         if state.next_sequence == u64::MAX {
             return Err(AdmissionError::SequenceExhausted);
@@ -175,6 +204,7 @@ impl AsyncWriteLedger {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_handle_watermark(&self, fh: u64) -> HandleWatermark {
         let state = self.lock_state();
         HandleWatermark {
@@ -240,6 +270,40 @@ impl AsyncWriteLedger {
         let mut state = self.lock_state();
         state.shutting_down = true;
         self.changed.notify_all();
+    }
+
+    /// Attach cancellation to an admitted task.
+    ///
+    /// The task may complete before its `AbortHandle` is registered. In that
+    /// case `finish` has already removed the sequence and the stale handle is
+    /// deliberately not retained.
+    pub(crate) fn track_task(&self, sequence: u64, abort_handle: AbortHandle) -> bool {
+        let mut state = self.lock_state();
+        if !state.pending.contains_key(&sequence) {
+            return false;
+        }
+        if state.shutting_down {
+            drop(state);
+            abort_handle.abort();
+            return true;
+        }
+        state.task_abort_handles.insert(sequence, abort_handle);
+        true
+    }
+
+    pub(crate) fn abort_pending_tasks(&self) -> usize {
+        let abort_handles = {
+            let state = self.lock_state();
+            state
+                .task_abort_handles
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for abort_handle in &abort_handles {
+            abort_handle.abort();
+        }
+        abort_handles.len()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, LedgerState> {
@@ -380,6 +444,7 @@ impl AsyncWriteLedger {
                 },
             );
         }
+        state.task_abort_handles.remove(&sequence);
         self.changed.notify_all();
     }
 
@@ -465,6 +530,10 @@ pub(crate) struct AsyncWriteTicket {
 }
 
 impl AsyncWriteTicket {
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub(crate) fn reserve_capacity(&mut self, bytes: usize) -> Result<(), AdmissionError> {
         self.ledger.reserve_capacity(self.sequence, bytes)
     }
@@ -514,6 +583,41 @@ mod tests {
             ledger.limits_for_test(),
             (DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_WRITES)
         );
+    }
+
+    #[test]
+    fn sticky_error_journal_is_bounded_without_losing_watermark_precision() {
+        let ledger = Arc::new(AsyncWriteLedger::with_limits_and_error_limit(16, 4, 2));
+        let first = ledger.admit(10, 100, 4).expect("first write should admit");
+        first.complete(Err(libc::ENOSPC));
+        let second = ledger
+            .admit(10, 100, 4)
+            .expect("second write reserves the remaining error slot");
+        let watermark = ledger.capture_inode_watermark(10);
+
+        assert_eq!(
+            ledger
+                .start_request(10, 100)
+                .expect_err("pending writes reserve journal capacity"),
+            AdmissionError::ErrorJournalFull
+        );
+        second.complete(Err(libc::EIO));
+        assert_eq!(
+            ledger
+                .start_request(10, 100)
+                .expect_err("full sticky journal must close admission"),
+            AdmissionError::ErrorJournalFull
+        );
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::ENOSPC)),
+            "the earliest exact sticky errno remains observable"
+        );
+
+        let admitted = ledger
+            .start_request(10, 100)
+            .expect("consuming the bounded journal reopens admission");
+        admitted.complete(Ok(()));
     }
 
     #[test]
@@ -930,6 +1034,65 @@ mod tests {
         assert_eq!(ledger.wait_all(SHORT_WAIT), BarrierOutcome::TimedOut);
         ticket.complete(Ok(()));
         assert_eq!(ledger.wait_all(SHORT_WAIT), BarrierOutcome::Complete(None));
+    }
+
+    #[test]
+    fn shutdown_abort_cancels_tracked_task_and_drains_ticket() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime");
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.admit(10, 100, 4).expect("write should admit");
+        let sequence = ticket.sequence();
+        let watermark = ledger.capture_inode_watermark(10);
+        let task = runtime.spawn(async move {
+            let _ticket = ticket;
+            std::future::pending::<()>().await;
+        });
+        assert!(ledger.track_task(sequence, task.abort_handle()));
+
+        ledger.shutdown();
+        assert_eq!(ledger.abort_pending_tasks(), 1);
+        let error = runtime
+            .block_on(task)
+            .expect_err("aborted task should be cancelled");
+        assert!(error.is_cancelled());
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
+        assert_eq!(ledger.abort_pending_tasks(), 0);
+    }
+
+    #[test]
+    fn task_registered_after_shutdown_is_aborted_immediately() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime");
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.admit(10, 100, 4).expect("write should admit");
+        let sequence = ticket.sequence();
+        let watermark = ledger.capture_inode_watermark(10);
+        let task = runtime.spawn(async move {
+            let _ticket = ticket;
+            std::future::pending::<()>().await;
+        });
+
+        ledger.shutdown();
+        assert_eq!(
+            ledger.abort_pending_tasks(),
+            0,
+            "the spawn→registration window has no tracked handle yet"
+        );
+        assert!(ledger.track_task(sequence, task.abort_handle()));
+        let error = runtime
+            .block_on(task)
+            .expect_err("late registration must observe shutdown and abort");
+        assert!(error.is_cancelled());
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
     }
 
     #[test]
