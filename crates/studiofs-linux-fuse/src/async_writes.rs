@@ -56,7 +56,7 @@ struct WriteError {
     errno: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct LedgerState {
     shutting_down: bool,
     next_sequence: u64,
@@ -74,22 +74,6 @@ struct LedgerState {
     // sequence: lossy coalescing could hide an error from a captured watermark.
     errors: BTreeMap<u64, WriteError>,
     closed_handles: HashMap<u64, u64>,
-}
-
-impl Default for LedgerState {
-    fn default() -> Self {
-        Self {
-            shutting_down: false,
-            next_sequence: 0,
-            admitted_bytes: 0,
-            admitted_writes: 0,
-            pending: BTreeMap::new(),
-            pending_by_inode: HashMap::new(),
-            pending_by_handle: HashMap::new(),
-            errors: BTreeMap::new(),
-            closed_handles: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -219,24 +203,26 @@ impl AsyncWriteLedger {
         true
     }
 
-    pub(crate) fn wait_inode(
-        &self,
-        watermark: InodeWatermark,
-        timeout: Duration,
-    ) -> BarrierOutcome {
-        self.wait_scope(
+    pub(crate) fn wait_inode(&self, watermark: InodeWatermark) -> BarrierOutcome {
+        self.wait_scope(BarrierScope::Inode(watermark.ino), watermark.through)
+    }
+
+    pub(crate) fn wait_handle(&self, watermark: HandleWatermark) -> BarrierOutcome {
+        self.wait_scope(BarrierScope::Handle(watermark.fh), watermark.through)
+    }
+
+    #[cfg(test)]
+    fn wait_inode_timed(&self, watermark: InodeWatermark, timeout: Duration) -> BarrierOutcome {
+        self.wait_scope_timed(
             BarrierScope::Inode(watermark.ino),
             watermark.through,
             timeout,
         )
     }
 
-    pub(crate) fn wait_handle(
-        &self,
-        watermark: HandleWatermark,
-        timeout: Duration,
-    ) -> BarrierOutcome {
-        self.wait_scope(
+    #[cfg(test)]
+    fn wait_handle_timed(&self, watermark: HandleWatermark, timeout: Duration) -> BarrierOutcome {
+        self.wait_scope_timed(
             BarrierScope::Handle(watermark.fh),
             watermark.through,
             timeout,
@@ -247,7 +233,7 @@ impl AsyncWriteLedger {
         let state = self.lock_state();
         let through = state.next_sequence;
         drop(state);
-        self.wait_scope(BarrierScope::All, through, timeout)
+        self.wait_scope_timed(BarrierScope::All, through, timeout)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -323,7 +309,23 @@ impl AsyncWriteLedger {
         Ok(())
     }
 
-    fn wait_scope(&self, scope: BarrierScope, through: u64, timeout: Duration) -> BarrierOutcome {
+    fn wait_scope(&self, scope: BarrierScope, through: u64) -> BarrierOutcome {
+        let mut state = self.lock_state();
+        while scope.has_pending(&state, through) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        BarrierOutcome::Complete(scope.consume_errors(&mut state, through))
+    }
+
+    fn wait_scope_timed(
+        &self,
+        scope: BarrierScope,
+        through: u64,
+        timeout: Duration,
+    ) -> BarrierOutcome {
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
@@ -515,6 +517,94 @@ mod tests {
     }
 
     #[test]
+    fn untimed_inode_barrier_waits_for_pre_watermark_write_only() {
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let before = ledger.admit(10, 100, 4).expect("write should admit");
+        let watermark = ledger.capture_inode_watermark(10);
+        let after = ledger.admit(10, 100, 4).expect("later write should admit");
+        let (sender, receiver) = mpsc::channel();
+        let waiting_ledger = ledger.clone();
+        let waiter = thread::spawn(move || {
+            sender
+                .send(waiting_ledger.wait_inode(watermark))
+                .expect("receiver should remain live");
+        });
+
+        assert!(
+            receiver.recv_timeout(SHORT_WAIT).is_err(),
+            "barrier must wait for a pre-watermark write"
+        );
+        before.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("barrier should complete without waiting for the later write"),
+            BarrierOutcome::Complete(None)
+        );
+
+        after.complete(Ok(()));
+        waiter.join().expect("waiter should not panic");
+    }
+
+    #[test]
+    fn untimed_handle_barrier_waits_for_pre_watermark_write_only() {
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let before = ledger.admit(10, 100, 4).expect("write should admit");
+        let watermark = ledger.capture_handle_watermark(100);
+        let after = ledger.admit(10, 100, 4).expect("later write should admit");
+        let (sender, receiver) = mpsc::channel();
+        let waiting_ledger = ledger.clone();
+        let waiter = thread::spawn(move || {
+            sender
+                .send(waiting_ledger.wait_handle(watermark))
+                .expect("receiver should remain live");
+        });
+
+        assert!(
+            receiver.recv_timeout(SHORT_WAIT).is_err(),
+            "barrier must wait for a pre-watermark write"
+        );
+        before.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("barrier should complete without waiting for the later write"),
+            BarrierOutcome::Complete(None)
+        );
+
+        after.complete(Ok(()));
+        waiter.join().expect("waiter should not panic");
+    }
+
+    #[test]
+    fn untimed_inode_barrier_drains_registered_write_after_shutdown() {
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.admit(10, 100, 4).expect("write should admit");
+        let watermark = ledger.capture_inode_watermark(10);
+        let (sender, receiver) = mpsc::channel();
+        let waiting_ledger = ledger.clone();
+        let waiter = thread::spawn(move || {
+            sender
+                .send(waiting_ledger.wait_inode(watermark))
+                .expect("receiver should remain live");
+        });
+
+        ledger.shutdown();
+        assert!(
+            receiver.recv_timeout(SHORT_WAIT).is_err(),
+            "shutdown must not abandon a registered write"
+        );
+        drop(ticket);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("dropped write should release the barrier"),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
+        waiter.join().expect("waiter should not panic");
+    }
+
+    #[test]
     fn inode_barrier_ignores_pending_writes_from_other_inodes() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let own = ledger.admit(10, 100, 4).expect("own write should admit");
@@ -523,7 +613,7 @@ mod tests {
         own.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         assert_eq!(ledger.pending_for_test(), (1, 4));
@@ -539,7 +629,7 @@ mod tests {
         own.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_handle(watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         other.complete(Ok(()));
@@ -554,12 +644,12 @@ mod tests {
         first.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::TimedOut
         );
         second.complete(Ok(()));
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -573,7 +663,7 @@ mod tests {
         before.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         after.complete(Ok(()));
@@ -588,7 +678,7 @@ mod tests {
         before.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_handle(watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         after.complete(Ok(()));
@@ -603,12 +693,12 @@ mod tests {
         second.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::TimedOut
         );
         first.complete(Ok(()));
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -622,11 +712,11 @@ mod tests {
         ticket.complete(Err(libc::ENOSPC));
 
         assert_eq!(
-            ledger.wait_inode(inode_watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(inode_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::ENOSPC))
         );
         assert_eq!(
-            ledger.wait_handle(handle_watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(handle_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -644,15 +734,15 @@ mod tests {
         other.complete(Err(libc::EROFS));
 
         assert_eq!(
-            ledger.wait_inode(own_watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(own_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::ENOSPC))
         );
         assert_eq!(
-            ledger.wait_inode(own_watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(own_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         assert_eq!(
-            ledger.wait_inode(other_watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(other_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::EROFS))
         );
     }
@@ -669,12 +759,12 @@ mod tests {
         assert_eq!(error, AdmissionError::HandleClosed);
         assert_eq!(error.errno(), libc::EBADF);
         assert_eq!(
-            ledger.wait_handle(watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(watermark, SHORT_WAIT),
             BarrierOutcome::TimedOut
         );
         ticket.complete(Ok(()));
         assert_eq!(
-            ledger.wait_handle(watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -716,7 +806,7 @@ mod tests {
         });
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::TimedOut
         );
         assert_eq!(ledger.admission_for_test(), (1, 4));
@@ -727,7 +817,7 @@ mod tests {
         reservation.expect("pre-watermark request should reserve capacity");
         blocked.complete(Ok(()));
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         waiter.join().expect("waiter should not panic");
@@ -765,7 +855,7 @@ mod tests {
         blocked.complete(Ok(()));
 
         assert_eq!(
-            ledger.wait_handle(watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
         assert!(ledger.forget_handle(100));
@@ -791,7 +881,7 @@ mod tests {
             AdmissionError::HandleClosed
         );
         assert_eq!(
-            ledger.wait_handle(old_watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(old_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::ENOSPC))
         );
         assert!(ledger.forget_handle(100));
@@ -802,7 +892,7 @@ mod tests {
         let new_watermark = ledger.capture_handle_watermark(100);
         new_lifecycle.complete(Ok(()));
         assert_eq!(
-            ledger.wait_handle(new_watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(new_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -817,11 +907,11 @@ mod tests {
 
         assert_eq!(ledger.pending_for_test(), (0, 0));
         assert_eq!(
-            ledger.wait_handle(handle_watermark, SHORT_WAIT),
+            ledger.wait_handle_timed(handle_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::EIO))
         );
         assert_eq!(
-            ledger.wait_inode(inode_watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(inode_watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
@@ -917,7 +1007,7 @@ mod tests {
         assert!(receiver.recv_timeout(SHORT_WAIT).is_err());
         before_watermark.complete(Ok(()));
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
 
@@ -955,7 +1045,7 @@ mod tests {
         assert_eq!(error.errno(), libc::EIO);
         drop(blocked);
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::EIO))
         );
         first.complete(Ok(()));
@@ -991,7 +1081,7 @@ mod tests {
 
         let watermark = ledger.capture_inode_watermark(10);
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::EINVAL))
         );
     }
@@ -1009,11 +1099,11 @@ mod tests {
         }
 
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(Some(libc::ENOSPC))
         );
         assert_eq!(
-            ledger.wait_inode(watermark, SHORT_WAIT),
+            ledger.wait_inode_timed(watermark, SHORT_WAIT),
             BarrierOutcome::Complete(None)
         );
     }
