@@ -264,6 +264,250 @@ impl StudioVfs {
                 u64::from(congestion_threshold),
             );
         }
+        for (name, value) in [
+            (
+                "linux_fuse_direct_opens",
+                write_path.linux_fuse_open_cache.direct_opens,
+            ),
+            (
+                "linux_fuse_kernel_opens",
+                write_path.linux_fuse_open_cache.kernel_opens,
+            ),
+            (
+                "linux_fuse_cache_reuse",
+                write_path.linux_fuse_open_cache.reuse,
+            ),
+            (
+                "linux_fuse_cache_replace",
+                write_path.linux_fuse_open_cache.replace,
+            ),
+            (
+                "linux_fuse_memory_bypasses",
+                write_path.linux_fuse_open_cache.memory_bypasses,
+            ),
+            (
+                "linux_fuse_cache_disabled",
+                write_path.linux_fuse_open_cache.disabled,
+            ),
+            (
+                "linux_fuse_cache_write_capable",
+                write_path.linux_fuse_open_cache.write_capable,
+            ),
+            (
+                "linux_fuse_cache_unknown_state",
+                write_path.linux_fuse_open_cache.unknown_state,
+            ),
+            (
+                "linux_fuse_cache_unknown_handle",
+                write_path.linux_fuse_open_cache.unknown_handle,
+            ),
+            (
+                "linux_fuse_cache_non_regular",
+                write_path.linux_fuse_open_cache.non_regular,
+            ),
+            (
+                "linux_fuse_cache_local_dirty",
+                write_path.linux_fuse_open_cache.local_dirty,
+            ),
+            (
+                "linux_fuse_cache_active_writer",
+                write_path.linux_fuse_open_cache.active_writer,
+            ),
+            (
+                "linux_fuse_cache_first_observation",
+                write_path.linux_fuse_open_cache.first_observation,
+            ),
+            (
+                "linux_fuse_cache_generation_changed",
+                write_path.linux_fuse_open_cache.generation_changed,
+            ),
+            (
+                "linux_fuse_cache_stable_generation",
+                write_path.linux_fuse_open_cache.stable_generation,
+            ),
+            (
+                "fuse_async_write_completed",
+                write_path.fuse_async_write.completed_writes,
+            ),
+            (
+                "fuse_async_write_failures",
+                write_path.fuse_async_write.failed_writes,
+            ),
+            (
+                "fuse_async_write_task_failures",
+                write_path.fuse_async_write.task_failed_writes,
+            ),
+            (
+                "fuse_async_write_cancellations",
+                write_path.fuse_async_write.canceled_writes,
+            ),
+            (
+                "fuse_async_write_shutdown_timeouts",
+                write_path.fuse_async_write.shutdown_timeouts,
+            ),
+            (
+                "fuse_async_write_admission_waits",
+                write_path.fuse_async_write.admission_waits,
+            ),
+            (
+                "fuse_async_write_barrier_waits",
+                write_path.fuse_async_write.barrier_waits,
+            ),
+            (
+                "fuse_async_write_inode_barrier_waits",
+                write_path.fuse_async_write.inode_barrier_waits,
+            ),
+            (
+                "fuse_async_write_handle_barrier_waits",
+                write_path.fuse_async_write.handle_barrier_waits,
+            ),
+            (
+                "fuse_invalidation_coalesced",
+                write_path.fuse_invalidation.coalesced,
+            ),
+            (
+                "fuse_invalidation_skipped_unobserved",
+                write_path.fuse_invalidation.skipped_unobserved,
+            ),
+            (
+                "fuse_invalidation_notify_failures",
+                write_path.fuse_invalidation.notify_failures,
+            ),
+            (
+                "fuse_invalidation_shutdown_timeouts",
+                write_path.fuse_invalidation.shutdown_timeouts,
+            ),
+            (
+                "fuse_invalidation_worker_panics",
+                write_path.fuse_invalidation.worker_panics,
+            ),
+        ] {
+            insert_counter(&mut snapshot.bridge, name, "count", value);
+        }
+        for (name, unit, value) in [
+            (
+                "fuse_invalidation_queue_depth",
+                "count",
+                write_path.fuse_invalidation.queue_depth as u64,
+            ),
+            (
+                "fuse_invalidation_queue_peak",
+                "count",
+                write_path.fuse_invalidation.queue_peak as u64,
+            ),
+            (
+                "fuse_invalidation_notification_in_flight",
+                "count",
+                u64::from(write_path.fuse_invalidation.notification_in_flight),
+            ),
+            (
+                "fuse_async_write_pending",
+                "count",
+                write_path.fuse_async_write.pending_writes as u64,
+            ),
+            (
+                "fuse_async_write_pending_bytes",
+                "bytes",
+                write_path.fuse_async_write.pending_bytes as u64,
+            ),
+            (
+                "fuse_async_write_pending_handles",
+                "count",
+                write_path.fuse_async_write.pending_handles as u64,
+            ),
+            (
+                "fuse_async_write_pending_inodes",
+                "count",
+                write_path.fuse_async_write.pending_writes_per_inode.len() as u64,
+            ),
+            (
+                "fuse_async_write_max_inode_depth",
+                "count",
+                write_path
+                    .fuse_async_write
+                    .pending_writes_per_inode
+                    .values()
+                    .copied()
+                    .max()
+                    .unwrap_or_default() as u64,
+            ),
+            (
+                "fuse_requested_max_read_bytes",
+                "bytes",
+                u64::from(write_path.fuse_connection.requested_max_read_bytes),
+            ),
+            (
+                "fuse_requested_max_readahead_bytes",
+                "bytes",
+                u64::from(write_path.fuse_connection.requested_max_readahead_bytes),
+            ),
+            (
+                "fuse_effective_max_read_bytes",
+                "bytes",
+                u64::from(write_path.fuse_connection.effective_max_read_bytes),
+            ),
+            (
+                "fuse_effective_max_readahead_bytes",
+                "bytes",
+                u64::from(write_path.fuse_connection.effective_max_readahead_bytes),
+            ),
+            (
+                "fuse_effective_max_write_bytes",
+                "bytes",
+                u64::from(write_path.fuse_connection.effective_max_write_bytes),
+            ),
+            (
+                "fuse_capable_features",
+                "bits",
+                write_path.fuse_connection.capable_features,
+            ),
+            (
+                "fuse_enabled_features",
+                "bits",
+                write_path.fuse_connection.enabled_features,
+            ),
+        ] {
+            insert_gauge(&mut snapshot.bridge, name, unit, value);
+        }
+        if let Some(max_background) = write_path.fuse_connection.effective_max_background {
+            insert_gauge(
+                &mut snapshot.bridge,
+                "fuse_effective_max_background",
+                "count",
+                u64::from(max_background),
+            );
+        }
+        if let Some(congestion_threshold) =
+            write_path.fuse_connection.effective_congestion_threshold
+        {
+            insert_gauge(
+                &mut snapshot.bridge,
+                "fuse_effective_congestion_threshold",
+                "count",
+                u64::from(congestion_threshold),
+            );
+        }
+        insert_latency(
+            &mut snapshot.bridge,
+            "fuse_invalidation_notify",
+            "ns",
+            write_path.fuse_invalidation.notify_latency_count,
+            write_path.fuse_invalidation.notify_latency_total_ns,
+        );
+        insert_latency(
+            &mut snapshot.bridge,
+            "fuse_async_write_admission_wait",
+            "ns",
+            write_path.fuse_async_write.admission_waits,
+            ms_sum_to_ns(write_path.fuse_async_write.admission_wait_total_ms),
+        );
+        insert_latency(
+            &mut snapshot.bridge,
+            "fuse_async_write_barrier_wait",
+            "ns",
+            write_path.fuse_async_write.barrier_waits,
+            ms_sum_to_ns(write_path.fuse_async_write.barrier_wait_total_ms),
+        );
         insert_latency(
             &mut snapshot.bridge,
             "callback",

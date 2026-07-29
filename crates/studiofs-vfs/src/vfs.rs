@@ -76,8 +76,9 @@ pub use metrics::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
-    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
-    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
+    VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane,
+    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
     VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
     VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats, VfsReadPathStats,
     VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
@@ -2848,6 +2849,9 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            linux_fuse_open_cache: Mutex::new(VfsLinuxFuseOpenCacheStats::default()),
+            fuse_invalidation_snapshot: Mutex::new(VfsFuseInvalidationSnapshot::default()),
+            fuse_connection_snapshot: Mutex::new(VfsFuseConnectionSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2907,6 +2911,9 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    linux_fuse_open_cache: Mutex<VfsLinuxFuseOpenCacheStats>,
+    fuse_invalidation_snapshot: Mutex<VfsFuseInvalidationSnapshot>,
+    fuse_connection_snapshot: Mutex<VfsFuseConnectionSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -4400,6 +4407,9 @@ impl StudioVfs {
             self.state.fuse_async_write_raw_snapshot.lock().clone();
         *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
         *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
+        *self.state.linux_fuse_open_cache.lock() = VfsLinuxFuseOpenCacheStats::default();
+        *self.state.fuse_invalidation_snapshot.lock() = VfsFuseInvalidationSnapshot::default();
+        *self.state.fuse_connection_snapshot.lock() = VfsFuseConnectionSnapshot::default();
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -7508,6 +7518,59 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    /// Record one Linux FUSE open-cache decision for mounted diagnostics.
+    pub fn record_linux_fuse_open_cache_decision(
+        &self,
+        direct_io: bool,
+        disposition: OsCacheDisposition,
+        reason: OsCacheReason,
+        memory_bypassed: bool,
+    ) {
+        let mut stats = self.state.linux_fuse_open_cache.lock();
+        stats.total = stats.total.saturating_add(1);
+        if direct_io {
+            stats.direct_opens = stats.direct_opens.saturating_add(1);
+        } else {
+            stats.kernel_opens = stats.kernel_opens.saturating_add(1);
+        }
+        match disposition {
+            OsCacheDisposition::Reuse => stats.reuse = stats.reuse.saturating_add(1),
+            OsCacheDisposition::Replace => stats.replace = stats.replace.saturating_add(1),
+        }
+        if memory_bypassed {
+            stats.memory_bypasses = stats.memory_bypasses.saturating_add(1);
+        }
+        let reason_counter = match reason {
+            OsCacheReason::Disabled => &mut stats.disabled,
+            OsCacheReason::WriteCapable => &mut stats.write_capable,
+            OsCacheReason::UnknownState => &mut stats.unknown_state,
+            OsCacheReason::UnknownHandle => &mut stats.unknown_handle,
+            OsCacheReason::NonRegular => &mut stats.non_regular,
+            OsCacheReason::LocalDirty => &mut stats.local_dirty,
+            OsCacheReason::ActiveWriter => &mut stats.active_writer,
+            OsCacheReason::FirstObservation => &mut stats.first_observation,
+            OsCacheReason::GenerationChanged => &mut stats.generation_changed,
+            OsCacheReason::StableGeneration => &mut stats.stable_generation,
+        };
+        *reason_counter = reason_counter.saturating_add(1);
+    }
+
+    /// Replace Linux FUSE invalidation diagnostics unless the update is stale.
+    pub fn record_fuse_invalidation_snapshot(&self, snapshot: VfsFuseInvalidationSnapshot) {
+        let mut current = self.state.fuse_invalidation_snapshot.lock();
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            *current = snapshot;
+        }
+    }
+
+    /// Replace negotiated Linux FUSE connection diagnostics unless the update is stale.
+    pub fn record_fuse_connection_snapshot(&self, snapshot: VfsFuseConnectionSnapshot) {
+        let mut current = self.state.fuse_connection_snapshot.lock();
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            *current = snapshot;
+        }
+    }
+
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut raw = self.state.fuse_async_write_raw_snapshot.lock();
@@ -7540,13 +7603,19 @@ impl StudioVfs {
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
             current.pending_writes = snapshot.pending_writes;
             current.pending_bytes = snapshot.pending_bytes;
+            current.pending_handles = snapshot.pending_handles;
+            current.pending_writes_per_inode = snapshot.pending_writes_per_inode;
             current.peak_pending_bytes = snapshot.peak_pending_bytes;
             current.completed_writes = snapshot.completed_writes;
             current.failed_writes = snapshot.failed_writes;
             current.task_failed_writes = snapshot.task_failed_writes;
+            current.canceled_writes = snapshot.canceled_writes;
+            current.shutdown_timeouts = snapshot.shutdown_timeouts;
             current.admission_waits = snapshot.admission_waits;
             current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
             current.barrier_waits = snapshot.barrier_waits;
+            current.inode_barrier_waits = snapshot.inode_barrier_waits;
+            current.handle_barrier_waits = snapshot.handle_barrier_waits;
             current.barrier_wait_total_ms = snapshot.barrier_wait_total_ms;
         }
     }
@@ -7576,6 +7645,12 @@ impl StudioVfs {
         snapshot.task_failed_writes = snapshot
             .task_failed_writes
             .saturating_sub(baseline.task_failed_writes);
+        snapshot.canceled_writes = snapshot
+            .canceled_writes
+            .saturating_sub(baseline.canceled_writes);
+        snapshot.shutdown_timeouts = snapshot
+            .shutdown_timeouts
+            .saturating_sub(baseline.shutdown_timeouts);
         snapshot.admission_waits = snapshot
             .admission_waits
             .saturating_sub(baseline.admission_waits);
@@ -7586,6 +7661,12 @@ impl StudioVfs {
         snapshot.barrier_waits = snapshot
             .barrier_waits
             .saturating_sub(baseline.barrier_waits);
+        snapshot.inode_barrier_waits = snapshot
+            .inode_barrier_waits
+            .saturating_sub(baseline.inode_barrier_waits);
+        snapshot.handle_barrier_waits = snapshot
+            .handle_barrier_waits
+            .saturating_sub(baseline.handle_barrier_waits);
         snapshot.barrier_wait_total_ms = Self::subtract_fuse_async_write_baseline_ms(
             snapshot.barrier_wait_total_ms,
             baseline.barrier_wait_total_ms,
@@ -8675,6 +8756,9 @@ impl StudioVfs {
                         macfuse_open_cache_local_stable_write_release_seeded,
                 }
             },
+            linux_fuse_open_cache: self.state.linux_fuse_open_cache.lock().clone(),
+            fuse_invalidation: self.state.fuse_invalidation_snapshot.lock().clone(),
+            fuse_connection: self.state.fuse_connection_snapshot.lock().clone(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {

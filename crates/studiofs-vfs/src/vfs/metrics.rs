@@ -989,6 +989,102 @@ pub struct VfsMacFuseOpenCacheStats {
     pub local_stable_write_release_seeded: u64,
 }
 
+/// Linux FUSE open-cache decisions grouped by kernel mode and safety reason.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct VfsLinuxFuseOpenCacheStats {
+    /// Total Linux FUSE opens observed by the cache policy.
+    pub total: u64,
+    /// Opens that bypassed the kernel page cache.
+    pub direct_opens: u64,
+    /// Opens that participated in the kernel page cache.
+    pub kernel_opens: u64,
+    /// Opens whose stable generation allowed retained pages to be reused.
+    pub reuse: u64,
+    /// Opens that required earlier retained pages to be replaced.
+    pub replace: u64,
+    /// Adaptive opens forced to direct I/O because the file exceeded available memory.
+    pub memory_bypasses: u64,
+    /// Decisions made while OS-cache participation was disabled.
+    pub disabled: u64,
+    /// Decisions made for write-capable handles.
+    pub write_capable: u64,
+    /// Decisions made when inode state could not be read.
+    pub unknown_state: u64,
+    /// Decisions made when the VFS handle was unknown.
+    pub unknown_handle: u64,
+    /// Decisions made for non-regular inodes.
+    pub non_regular: u64,
+    /// Decisions made while local dirty state remained.
+    pub local_dirty: u64,
+    /// Decisions made while another writer remained active.
+    pub active_writer: u64,
+    /// Decisions made for the first observed content generation.
+    pub first_observation: u64,
+    /// Decisions made after the content generation changed.
+    pub generation_changed: u64,
+    /// Decisions made for an already observed stable generation.
+    pub stable_generation: u64,
+}
+
+/// Dedicated Linux FUSE invalidation-worker diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct VfsFuseInvalidationSnapshot {
+    /// Monotonic generation used to reject stale adapter snapshots.
+    pub snapshot_generation: u64,
+    /// Current number of distinct queued inodes.
+    pub queue_depth: usize,
+    /// Peak number of distinct queued inodes.
+    pub queue_peak: usize,
+    /// Invalidation requests merged into an already queued inode.
+    pub coalesced: u64,
+    /// Notifications skipped because the kernel did not observe the inode.
+    pub skipped_unobserved: u64,
+    /// Kernel invalidation notifications that failed.
+    pub notify_failures: u64,
+    /// Completed kernel notification latency samples.
+    pub notify_latency_count: u64,
+    /// Total kernel notification latency in nanoseconds.
+    pub notify_latency_total_ns: u64,
+    /// Maximum kernel notification latency in nanoseconds.
+    pub notify_latency_max_ns: u64,
+    /// Worker shutdown attempts that exceeded their deadline.
+    pub shutdown_timeouts: u64,
+    /// Invalidator worker panics observed during teardown.
+    pub worker_panics: u64,
+    /// Whether a kernel notification is currently in progress.
+    pub notification_in_flight: bool,
+}
+
+/// Requested and negotiated Linux FUSE connection settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct VfsFuseConnectionSnapshot {
+    /// Monotonic generation used to reject stale adapter snapshots.
+    pub snapshot_generation: u64,
+    /// Selected Linux cache policy label.
+    pub cache_policy: Cow<'static, str>,
+    /// Requested maximum read size.
+    pub requested_max_read_bytes: u32,
+    /// Requested maximum kernel readahead size.
+    pub requested_max_readahead_bytes: u32,
+    /// Negotiated maximum read size.
+    pub effective_max_read_bytes: u32,
+    /// Negotiated maximum kernel readahead size.
+    pub effective_max_readahead_bytes: u32,
+    /// Negotiated maximum write size.
+    pub effective_max_write_bytes: u32,
+    /// Negotiated maximum background request count.
+    pub effective_max_background: Option<u32>,
+    /// Negotiated congestion threshold.
+    pub effective_congestion_threshold: Option<u32>,
+    /// Kernel capability bits offered during negotiation.
+    pub capable_features: u64,
+    /// Kernel capability bits enabled by the adapter.
+    pub enabled_features: u64,
+}
+
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1031,6 +1127,10 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub pending_writes: usize,
     /// Current pending async write bytes.
     pub pending_bytes: usize,
+    /// Number of file handles with pending async writes.
+    pub pending_handles: usize,
+    /// Current pending write depth keyed by inode number.
+    pub pending_writes_per_inode: BTreeMap<u64, usize>,
     /// Peak pending async write bytes.
     pub peak_pending_bytes: usize,
     /// Completed async writes.
@@ -1039,12 +1139,20 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub failed_writes: u64,
     /// Async write tasks dropped before explicit completion.
     pub task_failed_writes: u64,
+    /// Async write tasks canceled during bounded shutdown.
+    pub canceled_writes: u64,
+    /// Shutdown drains that still had callbacks after both wait windows.
+    pub shutdown_timeouts: u64,
     /// Admission waits caused by pending-write caps.
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.
     pub admission_wait_total_ms: f64,
     /// Barrier waits for flush/fsync/release callbacks.
     pub barrier_waits: u64,
+    /// Inode-scoped barrier waits for flush/fsync callbacks.
+    pub inode_barrier_waits: u64,
+    /// Handle-scoped barrier waits for release callbacks.
+    pub handle_barrier_waits: u64,
     /// Total barrier wait time in milliseconds.
     pub barrier_wait_total_ms: f64,
 }
@@ -1600,6 +1708,15 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// macFUSE open-cache decisions.
     #[serde(default)]
     pub macfuse_open_cache: VfsMacFuseOpenCacheStats,
+    /// Linux FUSE open-cache decisions.
+    #[serde(default)]
+    pub linux_fuse_open_cache: VfsLinuxFuseOpenCacheStats,
+    /// Linux FUSE invalidation-worker diagnostics.
+    #[serde(default)]
+    pub fuse_invalidation: VfsFuseInvalidationSnapshot,
+    /// Requested and negotiated Linux FUSE connection settings.
+    #[serde(default)]
+    pub fuse_connection: VfsFuseConnectionSnapshot,
     /// Async FUSE write diagnostics.
     #[serde(default)]
     pub fuse_async_write: VfsFuseAsyncWriteSnapshot,
@@ -2167,6 +2284,85 @@ mod tests {
             .expect("deserialize macFUSE open-cache stats with renamed field");
 
         assert_eq!(stats.read_only_not_regular_file, 7);
+    }
+
+    #[test]
+    fn write_path_snapshot_serializes_additive_linux_fuse_sections() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            linux_fuse_open_cache: VfsLinuxFuseOpenCacheStats {
+                total: 3,
+                direct_opens: 1,
+                kernel_opens: 2,
+                reuse: 1,
+                replace: 2,
+                memory_bypasses: 1,
+                stable_generation: 1,
+                ..Default::default()
+            },
+            fuse_invalidation: VfsFuseInvalidationSnapshot {
+                queue_depth: 2,
+                queue_peak: 7,
+                coalesced: 4,
+                notify_latency_count: 3,
+                notify_latency_total_ns: 90,
+                ..Default::default()
+            },
+            fuse_connection: VfsFuseConnectionSnapshot {
+                cache_policy: "adaptive".into(),
+                requested_max_read_bytes: 4 * 1024 * 1024,
+                effective_max_read_bytes: 1024 * 1024,
+                enabled_features: 0x10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let serialized =
+            serde_json::to_value(snapshot).expect("serialize additive Linux FUSE sections");
+
+        assert_eq!(serialized["linux_fuse_open_cache"]["direct_opens"], 1);
+        assert_eq!(serialized["linux_fuse_open_cache"]["kernel_opens"], 2);
+        assert_eq!(serialized["fuse_invalidation"]["queue_peak"], 7);
+        assert_eq!(
+            serialized["fuse_connection"]["effective_max_read_bytes"],
+            1024 * 1024
+        );
+        assert_eq!(serialized["macfuse_open_cache"]["total"], 0);
+    }
+
+    #[test]
+    fn write_path_snapshot_deserializes_legacy_json_without_linux_fuse_sections() {
+        let mut serialized = serde_json::to_value(VfsWritePathObservabilitySnapshot::default())
+            .expect("serialize baseline write-path snapshot");
+        let object = serialized
+            .as_object_mut()
+            .expect("write-path snapshot should serialize as an object");
+        object.remove("linux_fuse_open_cache");
+        object.remove("fuse_invalidation");
+        object.remove("fuse_connection");
+
+        let snapshot: VfsWritePathObservabilitySnapshot =
+            serde_json::from_value(serialized).expect("deserialize legacy write-path snapshot");
+
+        assert_eq!(snapshot.linux_fuse_open_cache.total, 0);
+        assert_eq!(snapshot.fuse_invalidation.queue_depth, 0);
+        assert!(snapshot.fuse_connection.cache_policy.is_empty());
+    }
+
+    #[test]
+    fn fuse_async_write_expansion_deserializes_legacy_snapshot_as_zeroes() {
+        let snapshot: VfsFuseAsyncWriteSnapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "pending_writes": 2
+        }))
+        .expect("deserialize legacy async-write snapshot");
+
+        assert_eq!(snapshot.pending_handles, 0);
+        assert!(snapshot.pending_writes_per_inode.is_empty());
+        assert_eq!(snapshot.canceled_writes, 0);
+        assert_eq!(snapshot.shutdown_timeouts, 0);
+        assert_eq!(snapshot.inode_barrier_waits, 0);
+        assert_eq!(snapshot.handle_barrier_waits, 0);
     }
 
     #[test]

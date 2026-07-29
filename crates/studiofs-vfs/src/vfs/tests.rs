@@ -16658,6 +16658,156 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
 }
 
 #[test]
+fn write_path_observability_records_linux_fuse_open_cache_reasons() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-open-cache-observability");
+
+    vfs.record_linux_fuse_open_cache_decision(
+        false,
+        OsCacheDisposition::Reuse,
+        OsCacheReason::StableGeneration,
+        false,
+    );
+    vfs.record_linux_fuse_open_cache_decision(
+        true,
+        OsCacheDisposition::Replace,
+        OsCacheReason::GenerationChanged,
+        true,
+    );
+
+    let stats = vfs
+        .write_path_observability_snapshot()
+        .linux_fuse_open_cache;
+    assert_eq!(stats.total, 2);
+    assert_eq!(stats.direct_opens, 1);
+    assert_eq!(stats.kernel_opens, 1);
+    assert_eq!(stats.reuse, 1);
+    assert_eq!(stats.replace, 1);
+    assert_eq!(stats.memory_bypasses, 1);
+    assert_eq!(stats.stable_generation, 1);
+    assert_eq!(stats.generation_changed, 1);
+}
+
+#[test]
+fn write_path_observability_reports_linux_fuse_worker_and_connection_snapshots() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-worker-observability");
+
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 4,
+        queue_depth: 2,
+        queue_peak: 8,
+        coalesced: 5,
+        skipped_unobserved: 3,
+        notify_failures: 1,
+        notify_latency_count: 7,
+        notify_latency_total_ns: 700,
+        notify_latency_max_ns: 250,
+        shutdown_timeouts: 1,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 2,
+        cache_policy: "adaptive".into(),
+        requested_max_read_bytes: 4 * 1024 * 1024,
+        requested_max_readahead_bytes: 4 * 1024 * 1024,
+        effective_max_read_bytes: 1024 * 1024,
+        effective_max_readahead_bytes: 512 * 1024,
+        effective_max_write_bytes: 2 * 1024 * 1024,
+        effective_max_background: Some(128),
+        effective_congestion_threshold: Some(96),
+        capable_features: 0x31,
+        enabled_features: 0x11,
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.fuse_invalidation.queue_depth, 2);
+    assert_eq!(snapshot.fuse_invalidation.queue_peak, 8);
+    assert_eq!(snapshot.fuse_invalidation.notify_latency_total_ns, 700);
+    assert_eq!(snapshot.fuse_connection.cache_policy, "adaptive");
+    assert_eq!(
+        snapshot.fuse_connection.effective_max_readahead_bytes,
+        512 * 1024
+    );
+    assert_eq!(snapshot.fuse_connection.enabled_features, 0x11);
+}
+
+#[test]
+fn linux_fuse_observability_rejects_stale_replace_snapshots() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-stale-observability");
+
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 3,
+        queue_peak: 9,
+        ..Default::default()
+    });
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 2,
+        queue_peak: 1,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 5,
+        cache_policy: "adaptive".into(),
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 4,
+        cache_policy: "direct".into(),
+        ..Default::default()
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.fuse_invalidation.queue_peak, 9);
+    assert_eq!(snapshot.fuse_connection.cache_policy, "adaptive");
+}
+
+#[test]
+fn runtime_stats_surface_reports_linux_fuse_numeric_metrics() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-linux-fuse-observability");
+
+    vfs.record_linux_fuse_open_cache_decision(
+        false,
+        OsCacheDisposition::Reuse,
+        OsCacheReason::StableGeneration,
+        false,
+    );
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        queue_depth: 2,
+        coalesced: 5,
+        notify_latency_count: 3,
+        notify_latency_total_ns: 90,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        cache_policy: "adaptive".into(),
+        effective_max_read_bytes: 1024 * 1024,
+        ..Default::default()
+    });
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    assert_eq!(snapshot.bridge.counters["linux_fuse_kernel_opens"].value, 1);
+    assert_eq!(
+        snapshot.bridge.counters["fuse_invalidation_coalesced"].value,
+        5
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_invalidation_queue_depth"].value,
+        2
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_effective_max_read_bytes"].value,
+        1024 * 1024
+    );
+    assert_eq!(
+        snapshot.bridge.latencies["fuse_invalidation_notify"].count,
+        3
+    );
+}
+
+#[test]
 fn runtime_stats_surface_reports_fuse_profile_knobs() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-fuse-profile-knobs");
