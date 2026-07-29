@@ -7,6 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Per-inode serialization for FUSE open/create cache decisions and replies.
+pub mod fuse_open_reply;
+
 #[cfg(unix)]
 /// POSIX bridge conversions shared by Unix bridge adapters.
 pub mod posix;
