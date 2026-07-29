@@ -33,6 +33,81 @@ fn os_cache_prepare_unknown_handle_is_conservative() {
 }
 
 #[test]
+fn read_ahead_owner_unknown_handle_is_conservative() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "read-ahead-owner-unknown-handle");
+
+    assert_eq!(vfs.read_ahead_owner(u64::MAX), None);
+    assert!(!vfs.set_read_ahead_owner(u64::MAX, ReadAheadOwner::Kernel));
+}
+
+#[test]
+fn read_ahead_owner_is_handle_scoped_for_same_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "read-ahead-owner-handle-scoped");
+    let attr = vfs
+        .create(ROOT_INO, b"owners.txt", 1000, 1000, 0o644)
+        .expect("create");
+
+    let kernel_fh = vfs
+        .open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    let vfs_fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("VFS-owned open");
+
+    assert_eq!(
+        vfs.read_ahead_owner(kernel_fh),
+        Some(ReadAheadOwner::Kernel)
+    );
+    assert_eq!(vfs.read_ahead_owner(vfs_fh), Some(ReadAheadOwner::Vfs));
+
+    assert!(vfs.set_read_ahead_owner(vfs_fh, ReadAheadOwner::Kernel));
+    assert_eq!(
+        vfs.read_ahead_owner(kernel_fh),
+        Some(ReadAheadOwner::Kernel)
+    );
+}
+
+#[test]
+fn prepared_kernel_owner_skips_eager_open_prefetch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-ahead-owner-eager-prefetch");
+    let attr = vfs
+        .create(ROOT_INO, b"prefetch.txt", 1000, 1000, 0o644)
+        .expect("create");
+    vfs.setattr(attr.ino, SetattrArgs::size_only(4096))
+        .expect("give file non-zero size");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+
+    vfs.open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "kernel-owned open must not schedule eager VFS prefetch"
+    );
+
+    vfs.open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("default VFS-owned open");
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "existing open API must preserve eager VFS prefetch"
+    );
+}
+
+#[test]
 fn os_cache_clean_read_first_replaces_then_reuses_after_release() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-clean-reuse");

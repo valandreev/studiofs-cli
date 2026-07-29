@@ -59,6 +59,7 @@ pub use config::{
     ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
     VfsConfigValidated,
 };
+pub use file_session::ReadAheadOwner;
 /// File session primitives returned by open operations and reported by diagnostics.
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
 /// Public handle-drain barrier types and ports.
@@ -112,7 +113,7 @@ use config::{
     PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
     WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
-use file_session::{FileSessionOperation, FileSessionState};
+use file_session::{FileSessionOperation, FileSessionState, ReadAheadToken};
 use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
@@ -9094,12 +9095,56 @@ impl StudioVfs {
         }
     }
 
+    /// Return the current speculative-read owner for an open handle.
+    ///
+    /// `None` means the handle is unknown or has already been released.
+    pub fn read_ahead_owner(&self, fh: u64) -> Option<ReadAheadOwner> {
+        self.handle_table
+            .get(fh)
+            .map(|open_file| open_file.read_ahead_owner())
+    }
+
+    /// Change the speculative-read owner for an open handle.
+    ///
+    /// Switching to [`ReadAheadOwner::Kernel`] synchronously drops the
+    /// handle-local read window and retires its adaptive-prefetch stream.
+    /// The owner mutation is linearized against handle release while the
+    /// handle-table read lock is held. Returns `false` when release won that
+    /// race; `true` means the handle was live at the mutation point, though a
+    /// later release may of course occur immediately afterwards.
+    pub fn set_read_ahead_owner(&self, fh: u64, owner: ReadAheadOwner) -> bool {
+        let Some(open_file) = self.handle_table.set_read_ahead_owner_if_live(fh, owner) else {
+            return false;
+        };
+        if owner == ReadAheadOwner::Kernel {
+            self.clear_access_tracking_for_stream(open_file.ino, open_file.stream_id());
+        }
+        true
+    }
+
+    pub(in crate::vfs) fn read_ahead_token_is_current(&self, token: ReadAheadToken) -> bool {
+        self.handle_table
+            .get(token.fh)
+            .is_some_and(|open_file| open_file.is_read_ahead_token_current(token))
+    }
+
     /// Open a file and allocate a file handle.
     ///
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        self.open_file_resolved(ino, flags, trunc, None, true)
+        self.open_file_with_read_ahead_owner(ino, flags, trunc, ReadAheadOwner::Vfs)
+    }
+
+    /// Open a file with the readahead owner installed before eager scheduling.
+    pub fn open_file_with_read_ahead_owner(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(ino, flags, trunc, None, true, read_ahead_owner)
     }
 
     /// Open a file when the caller already has a fresh inode attr from create.
@@ -9109,7 +9154,25 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
     ) -> VfsResult<u64> {
-        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), true)
+        self.open_file_with_known_attr_and_read_ahead_owner(attr, flags, trunc, ReadAheadOwner::Vfs)
+    }
+
+    /// Open a known inode with the readahead owner installed before eager scheduling.
+    pub fn open_file_with_known_attr_and_read_ahead_owner(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(
+            attr.ino,
+            flags,
+            trunc,
+            Some(attr.clone()),
+            true,
+            read_ahead_owner,
+        )
     }
 
     /// Open a file that was just created by this mount operation.
@@ -9124,7 +9187,31 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
     ) -> VfsResult<u64> {
-        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), false)
+        self.open_created_file_with_known_attr_and_read_ahead_owner(
+            attr,
+            flags,
+            trunc,
+            ReadAheadOwner::Vfs,
+        )
+    }
+
+    /// Open a newly-created inode with its readahead owner installed before
+    /// eager scheduling.
+    pub fn open_created_file_with_known_attr_and_read_ahead_owner(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(
+            attr.ino,
+            flags,
+            trunc,
+            Some(attr.clone()),
+            false,
+            read_ahead_owner,
+        )
     }
 
     fn open_file_resolved(
@@ -9134,6 +9221,7 @@ impl StudioVfs {
         trunc: bool,
         known_attr: Option<InodeAttr>,
         check_authority: bool,
+        read_ahead_owner: ReadAheadOwner,
     ) -> VfsResult<u64> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::OpenFile);
         let required_access = if Self::write_access_requested(flags, trunc) {
@@ -9153,6 +9241,7 @@ impl StudioVfs {
                 self.handle_table
                     .open(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
+            open_file.set_read_ahead_owner(read_ahead_owner);
             self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
             if active_open_overlay {
                 self.sync_meta().note_active_open_inode(ino);
@@ -9198,6 +9287,7 @@ impl StudioVfs {
             active_open_overlay,
         );
         let fh = open_file.fh;
+        open_file.set_read_ahead_owner(read_ahead_owner);
         self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
         if active_open_overlay {
             self.sync_meta().note_active_open_inode(ino);
@@ -9214,14 +9304,13 @@ impl StudioVfs {
         if read_context.attr.kind == studiofs_meta::types::FileType::RegularFile
             && read_context.attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
+            && read_ahead_owner == ReadAheadOwner::Vfs
         {
-            let _ = self
-                .prefetch_tx
-                .send(PrefetchWorkItem::Batch(PrefetchBatch::single(
-                    ino,
-                    0,
-                    Some(read_context.prefetch_context()),
-                )));
+            let owner_token = open_file.vfs_read_ahead_token();
+            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+                PrefetchBatch::single(ino, 0, Some(read_context.prefetch_context()))
+                    .with_owner_token(owner_token),
+            ));
         }
 
         Ok(fh)

@@ -1,3 +1,4 @@
+use super::file_session::ReadAheadToken;
 use super::overlay::PendingOverlayBlockSource;
 use super::writer_stack::WriterStackReadClaim;
 use super::{
@@ -1805,11 +1806,16 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
         prepared: &PreparedForegroundRead,
+        speculative_read: Option<(ReadAheadToken, usize)>,
     ) -> VfsResult<usize> {
         debug_assert!(prepared.read_len > 0);
+        let planned_read_len = prepared.read_len.min(buffer.len());
         let blocks_needed =
-            self.calculate_blocks_needed(offset, prepared.read_len, prepared.context.attr.size);
+            self.calculate_blocks_needed(offset, planned_read_len, prepared.context.attr.size);
         let open_file = fh.and_then(|handle| self.handle_table.get(handle));
+        let owner_token = open_file
+            .as_ref()
+            .and_then(|open_file| open_file.vfs_read_ahead_token());
         let access = self.state.read.observe_read_access(
             open_file.as_ref(),
             ino,
@@ -1843,12 +1849,28 @@ impl StudioVfs {
             self.upload_fg_read_latency_window,
             access.policy,
         );
-        self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
+        self.enqueue_prefetch_hint(
+            ino,
+            access.stream_id,
+            access.policy,
+            &blocks_needed,
+            owner_token,
+        );
+        // This is the launch linearization point for speculative read-window
+        // I/O. A Kernel switch before this check shrinks the DataReader to the
+        // original caller request; I/O already launched after a successful
+        // check is allowed to finish.
+        let read_len = match speculative_read {
+            Some((token, fallback_len)) if !self.read_ahead_token_is_current(token) => {
+                planned_read_len.min(fallback_len)
+            }
+            _ => planned_read_len,
+        };
         let data_reader = DataReader::new(
             self,
             ino,
             offset,
-            prepared.read_len as u64,
+            read_len as u64,
             prepared.context.pending_content_epoch,
             Some(prepared.resolved_slices.as_ref()),
         );
@@ -1879,13 +1901,18 @@ impl StudioVfs {
             ino,
             mut block_indices,
             read_context,
+            owner_token,
         } = batch;
-        if self.shutdown_requested() {
+        if self.shutdown_requested()
+            || owner_token.is_some_and(|token| !self.read_ahead_token_is_current(token))
+        {
             self.finish_prefetch_blocks(ino, &block_indices);
             return;
         }
 
         let result = async {
+            let owner_is_current =
+                || owner_token.is_none_or(|token| self.read_ahead_token_is_current(token));
             block_indices
                 .retain(|object_idx| self.readahead.is_prefetch_relevant(ino, *object_idx));
             if block_indices.is_empty() {
@@ -1898,6 +1925,9 @@ impl StudioVfs {
             else {
                 return Ok(());
             };
+            if !owner_is_current() {
+                return Ok(());
+            }
             if queued_context.size == 0 {
                 return Ok(());
             }
@@ -1923,6 +1953,9 @@ impl StudioVfs {
                 let (attr, resolved_slices) = self
                     .resolve_read_metadata_async(ino, block_start, queued_block_len)
                     .await?;
+                if !owner_is_current() {
+                    return Ok(());
+                }
                 let context = ReadRequestContext::from_attr(self, ino, attr);
                 if context.placeholder_visible(self, ino) {
                     return Ok(());
@@ -1943,6 +1976,9 @@ impl StudioVfs {
                     context.pending_content_epoch,
                     Some(resolved_slices.as_ref()),
                 );
+                if !owner_is_current() {
+                    return Ok(());
+                }
                 data_reader.prefetch_only().await?;
             }
             Ok::<(), VfsError>(())
