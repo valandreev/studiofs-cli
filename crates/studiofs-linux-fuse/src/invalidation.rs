@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const ROOT_INODE: u64 = 1;
 const DEFAULT_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
@@ -368,6 +372,8 @@ struct FuseInvalidationQueueInner {
     capacity: usize,
     state: Mutex<FuseInvalidationQueueState>,
     changed: Condvar,
+    metrics: Arc<FuseInvalidationMetricsInner>,
+    worker_claimed: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -394,6 +400,8 @@ impl FuseInvalidationQueue {
                     waiting_producers: 0,
                 }),
                 changed: Condvar::new(),
+                metrics: Arc::new(FuseInvalidationMetricsInner::default()),
+                worker_claimed: AtomicBool::new(false),
             }),
         }
     }
@@ -414,11 +422,22 @@ impl FuseInvalidationQueue {
             }
             if let Some(current) = state.pending.get_mut(&ino) {
                 *current = current.coalesce(kind);
+                self.inner.metrics.coalesced.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             if state.pending.len() < self.inner.capacity {
                 state.order.push_back(ino);
                 state.pending.insert(ino, kind);
+                let depth = self
+                    .inner
+                    .metrics
+                    .queue_depth
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                self.inner
+                    .metrics
+                    .queue_peak
+                    .fetch_max(depth, Ordering::Relaxed);
                 self.inner.changed.notify_all();
                 return Ok(());
             }
@@ -436,6 +455,10 @@ impl FuseInvalidationQueue {
                 let Some(kind) = state.pending.remove(&ino) else {
                     continue;
                 };
+                self.inner
+                    .metrics
+                    .queue_depth
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.inner.changed.notify_all();
                 return Some((ino, kind));
             }
@@ -458,6 +481,250 @@ impl FuseInvalidationQueue {
         while state.waiting_producers == 0 {
             state = wait_poison_tolerant(&self.inner.changed, state);
         }
+    }
+}
+
+/// Geometry passed to the platform-specific inode notification function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FuseInvalidationGeometry {
+    pub(crate) offset: i64,
+    pub(crate) length: i64,
+}
+
+impl FuseInvalidationGeometry {
+    /// Invalidate inode attributes without evicting cached data pages.
+    pub(crate) const ATTRIBUTES: Self = Self {
+        offset: -1,
+        length: 0,
+    };
+
+    /// Invalidate the complete cached data range and inode attributes.
+    pub(crate) const DATA: Self = Self {
+        offset: 0,
+        length: 0,
+    };
+
+    fn for_kind(kind: FuseInvalidationKind) -> Self {
+        match kind {
+            FuseInvalidationKind::Attributes => Self::ATTRIBUTES,
+            FuseInvalidationKind::Data => Self::DATA,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FuseInvalidationMetricsInner {
+    queue_depth: AtomicUsize,
+    queue_peak: AtomicUsize,
+    coalesced: AtomicU64,
+    skipped_unobserved: AtomicU64,
+    notify_failures: AtomicU64,
+    notify_latency_count: AtomicU64,
+    notify_latency_total_nanos: AtomicU64,
+    notify_latency_max_nanos: AtomicU64,
+    shutdown_timeouts: AtomicU64,
+    worker_panics: AtomicU64,
+    notification_in_flight: AtomicBool,
+}
+
+/// Point-in-time invalidation worker counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FuseInvalidationMetricsSnapshot {
+    pub(crate) queue_depth: usize,
+    pub(crate) queue_peak: usize,
+    pub(crate) coalesced: u64,
+    pub(crate) skipped_unobserved: u64,
+    pub(crate) notify_failures: u64,
+    pub(crate) notify_latency_count: u64,
+    pub(crate) notify_latency_total_nanos: u64,
+    pub(crate) notify_latency_max_nanos: u64,
+    pub(crate) shutdown_timeouts: u64,
+    pub(crate) worker_panics: u64,
+    pub(crate) notification_in_flight: bool,
+}
+
+impl FuseInvalidationMetricsInner {
+    fn snapshot(&self) -> FuseInvalidationMetricsSnapshot {
+        FuseInvalidationMetricsSnapshot {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_peak: self.queue_peak.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
+            skipped_unobserved: self.skipped_unobserved.load(Ordering::Relaxed),
+            notify_failures: self.notify_failures.load(Ordering::Relaxed),
+            notify_latency_count: self.notify_latency_count.load(Ordering::Relaxed),
+            notify_latency_total_nanos: self.notify_latency_total_nanos.load(Ordering::Relaxed),
+            notify_latency_max_nanos: self.notify_latency_max_nanos.load(Ordering::Relaxed),
+            shutdown_timeouts: self.shutdown_timeouts.load(Ordering::Relaxed),
+            worker_panics: self.worker_panics.load(Ordering::Relaxed),
+            notification_in_flight: self.notification_in_flight.load(Ordering::Acquire),
+        }
+    }
+
+    fn record_notify_latency(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.notify_latency_count.fetch_add(1, Ordering::Relaxed);
+        self.notify_latency_total_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.notify_latency_max_nanos
+            .fetch_max(nanos, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct FuseInvalidationCompletion {
+    completed: Mutex<bool>,
+    changed: Condvar,
+}
+
+struct FuseInvalidationCompletionGuard {
+    completion: Arc<FuseInvalidationCompletion>,
+}
+
+impl Drop for FuseInvalidationCompletionGuard {
+    fn drop(&mut self) {
+        *lock_poison_tolerant(&self.completion.completed) = true;
+        self.completion.changed.notify_all();
+    }
+}
+
+struct FuseInvalidationInFlightGuard<'a> {
+    in_flight: &'a AtomicBool,
+}
+
+impl Drop for FuseInvalidationInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// Result of closing and joining the invalidation worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FuseInvalidationShutdownOutcome {
+    Drained,
+    TimedOut,
+    WorkerPanicked,
+}
+
+/// Owns the sole consumer of a bounded invalidation queue.
+///
+/// The notifier closure is the platform seam: this core never owns or
+/// dereferences a raw libfuse session pointer.
+pub(crate) struct FuseInvalidationWorker {
+    queue: FuseInvalidationQueue,
+    completion: Arc<FuseInvalidationCompletion>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl FuseInvalidationWorker {
+    pub(crate) fn spawn(
+        queue: FuseInvalidationQueue,
+        liveness: FuseInodeLiveness,
+        notifier: impl Fn(u64, FuseInvalidationGeometry) -> Result<(), ()> + Send + 'static,
+    ) -> io::Result<Self> {
+        if queue
+            .inner
+            .worker_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "invalidation queue already has a worker",
+            ));
+        }
+        let completion = Arc::new(FuseInvalidationCompletion::default());
+        let worker_queue = queue.clone();
+        let worker_completion = Arc::clone(&completion);
+        let metrics = Arc::clone(&queue.inner.metrics);
+        let thread = match thread::Builder::new()
+            .name("studiofs-fuse-invalidation".to_owned())
+            .spawn(move || {
+                let _completion = FuseInvalidationCompletionGuard {
+                    completion: worker_completion,
+                };
+                while let Some((ino, kind)) = worker_queue.pop() {
+                    let geometry = FuseInvalidationGeometry::for_kind(kind);
+                    let mut notify_result = None;
+                    let admission = liveness.admit_invalidation(ino, || {
+                        metrics
+                            .notification_in_flight
+                            .store(true, Ordering::Release);
+                        let _in_flight = FuseInvalidationInFlightGuard {
+                            in_flight: &metrics.notification_in_flight,
+                        };
+                        let started = Instant::now();
+                        notify_result = Some(notifier(ino, geometry));
+                        metrics.record_notify_latency(started.elapsed());
+                    });
+                    if !admission.notified_now() {
+                        metrics.skipped_unobserved.fetch_add(1, Ordering::Relaxed);
+                    } else if notify_result == Some(Err(())) {
+                        metrics.notify_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                queue.inner.worker_claimed.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            queue,
+            completion,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    pub(crate) fn push(
+        &self,
+        ino: u64,
+        kind: FuseInvalidationKind,
+    ) -> Result<(), FuseInvalidationQueueClosed> {
+        self.queue.push(ino, kind)
+    }
+
+    pub(crate) fn metrics(&self) -> FuseInvalidationMetricsSnapshot {
+        self.queue.inner.metrics.snapshot()
+    }
+
+    /// Close admission, drain accepted entries and wait up to `timeout`.
+    ///
+    /// A timeout deliberately leaves the join handle owned by this object so
+    /// callers can retry after arranging for an in-flight notifier to finish.
+    pub(crate) fn shutdown(&self, timeout: Duration) -> FuseInvalidationShutdownOutcome {
+        self.queue.close();
+        let completed = lock_poison_tolerant(&self.completion.completed);
+        let completed = if *completed {
+            completed
+        } else {
+            let (completed, _) = self
+                .completion
+                .changed
+                .wait_timeout_while(completed, timeout, |completed| !*completed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            completed
+        };
+        if !*completed {
+            self.queue
+                .inner
+                .metrics
+                .shutdown_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            return FuseInvalidationShutdownOutcome::TimedOut;
+        }
+        drop(completed);
+        if let Some(thread) = lock_poison_tolerant(&self.thread).take() {
+            if thread.join().is_err() {
+                self.queue
+                    .inner
+                    .metrics
+                    .worker_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                return FuseInvalidationShutdownOutcome::WorkerPanicked;
+            }
+        }
+        FuseInvalidationShutdownOutcome::Drained
     }
 }
 
@@ -885,5 +1152,208 @@ mod tests {
         let queue = FuseInvalidationQueue::default();
 
         assert_eq!(queue.capacity(), 8192);
+    }
+
+    #[test]
+    fn worker_notifies_only_live_inodes_with_kind_specific_geometry() {
+        let liveness = FuseInodeLiveness::default();
+        let lookup = liveness.reserve_lookup(42);
+        assert!(lookup.begin_reply());
+        assert!(lookup.commit().is_some());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&notifications);
+        let worker = FuseInvalidationWorker::spawn(
+            FuseInvalidationQueue::with_capacity(4),
+            liveness,
+            move |ino, geometry| {
+                lock_poison_tolerant(&observed).push((ino, geometry));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        worker
+            .push(41, FuseInvalidationKind::Data)
+            .expect("worker accepts unobserved inode");
+        worker
+            .push(42, FuseInvalidationKind::Attributes)
+            .expect("worker accepts live inode");
+        worker
+            .push(ROOT_INODE, FuseInvalidationKind::Data)
+            .expect("worker accepts root");
+
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        assert_eq!(
+            *lock_poison_tolerant(&notifications),
+            vec![
+                (42, FuseInvalidationGeometry::ATTRIBUTES),
+                (ROOT_INODE, FuseInvalidationGeometry::DATA),
+            ]
+        );
+        let metrics = worker.metrics();
+        assert_eq!(metrics.skipped_unobserved, 1);
+        assert_eq!(metrics.notify_failures, 0);
+    }
+
+    #[test]
+    fn worker_coalesces_and_drains_accepted_items_after_close() {
+        let liveness = FuseInodeLiveness::default();
+        let open = liveness.open_handle(42);
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&notifications);
+        let queue = FuseInvalidationQueue::with_capacity(2);
+        queue.push(42, FuseInvalidationKind::Attributes).unwrap();
+        queue.push(42, FuseInvalidationKind::Data).unwrap();
+        let worker = FuseInvalidationWorker::spawn(queue, liveness, move |ino, geometry| {
+            lock_poison_tolerant(&observed).push((ino, geometry));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        drop(open);
+
+        assert_eq!(
+            *lock_poison_tolerant(&notifications),
+            vec![(42, FuseInvalidationGeometry::DATA)]
+        );
+        let metrics = worker.metrics();
+        assert_eq!(metrics.coalesced, 1);
+        assert_eq!(metrics.queue_depth, 0);
+        assert_eq!(metrics.queue_peak, 1);
+        assert_eq!(
+            worker.push(7, FuseInvalidationKind::Data),
+            Err(FuseInvalidationQueueClosed)
+        );
+    }
+
+    #[test]
+    fn worker_notifier_runs_outside_liveness_lock_and_records_failures() {
+        let liveness = FuseInodeLiveness::default();
+        let lookup = liveness.reserve_lookup(42);
+        assert!(lookup.begin_reply());
+        assert!(lookup.commit().is_some());
+        let callback_liveness = liveness.clone();
+        let worker = FuseInvalidationWorker::spawn(
+            FuseInvalidationQueue::with_capacity(1),
+            liveness,
+            move |ino, _geometry| {
+                callback_liveness.forget(ino, 1);
+                Err(())
+            },
+        )
+        .unwrap();
+
+        worker.push(42, FuseInvalidationKind::Data).unwrap();
+
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        assert_eq!(worker.metrics().notify_failures, 1);
+    }
+
+    #[test]
+    fn shutdown_timeout_is_reported_without_blocking_join() {
+        let liveness = FuseInodeLiveness::default();
+        let open = liveness.open_handle(42);
+        let notifier_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let notifier_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::clone(&notifier_started);
+        let gate = Arc::clone(&notifier_gate);
+        let worker = FuseInvalidationWorker::spawn(
+            FuseInvalidationQueue::with_capacity(1),
+            liveness,
+            move |_ino, _geometry| {
+                let (started_lock, started_changed) = &*started;
+                *lock_poison_tolerant(started_lock) = true;
+                started_changed.notify_all();
+                let (gate_lock, gate_changed) = &*gate;
+                let mut released = lock_poison_tolerant(gate_lock);
+                while !*released {
+                    released = wait_poison_tolerant(gate_changed, released);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        worker.push(42, FuseInvalidationKind::Data).unwrap();
+        let (started_lock, started_changed) = &*notifier_started;
+        let mut did_start = lock_poison_tolerant(started_lock);
+        while !*did_start {
+            did_start = wait_poison_tolerant(started_changed, did_start);
+        }
+        drop(did_start);
+
+        assert_eq!(
+            worker.shutdown(std::time::Duration::ZERO),
+            FuseInvalidationShutdownOutcome::TimedOut
+        );
+        assert_eq!(worker.metrics().shutdown_timeouts, 1);
+        assert!(worker.metrics().notification_in_flight);
+
+        let (gate_lock, gate_changed) = &*notifier_gate;
+        *lock_poison_tolerant(gate_lock) = true;
+        gate_changed.notify_all();
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        assert!(!worker.metrics().notification_in_flight);
+        drop(open);
+    }
+
+    #[test]
+    fn notifier_panic_completes_worker_and_is_reported_by_join() {
+        let liveness = FuseInodeLiveness::default();
+        let open = liveness.open_handle(42);
+        let worker = FuseInvalidationWorker::spawn(
+            FuseInvalidationQueue::with_capacity(1),
+            liveness,
+            |_ino, _geometry| -> Result<(), ()> {
+                panic!("injected notifier panic");
+            },
+        )
+        .unwrap();
+        worker.push(42, FuseInvalidationKind::Data).unwrap();
+
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::WorkerPanicked
+        );
+        let metrics = worker.metrics();
+        assert_eq!(metrics.worker_panics, 1);
+        assert_eq!(metrics.shutdown_timeouts, 0);
+        assert!(!metrics.notification_in_flight);
+        drop(open);
+    }
+
+    #[test]
+    fn queue_structurally_rejects_a_second_worker() {
+        let queue = FuseInvalidationQueue::with_capacity(1);
+        let worker =
+            FuseInvalidationWorker::spawn(queue.clone(), FuseInodeLiveness::default(), |_, _| {
+                Ok(())
+            })
+            .unwrap();
+
+        let error =
+            match FuseInvalidationWorker::spawn(queue, FuseInodeLiveness::default(), |_, _| Ok(()))
+            {
+                Ok(_) => panic!("second worker must be rejected"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            worker.shutdown(std::time::Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
     }
 }
