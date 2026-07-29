@@ -12,6 +12,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
+mod async_writes;
 mod low_level;
 
 /// Linux libfuse3 connection-level queue bounds.
