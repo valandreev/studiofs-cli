@@ -144,19 +144,18 @@ Local loopback examples remain available as development/test examples.
 | PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
 | Local-first VFS fast checks (no S3) | See [Local-first VFS fast checks](#local-first-vfs-fast-checks-no-s3). |
-| Buffered-first infra suite (S3 required) | `cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --ignored --nocapture --test-threads=1` |
 | CLI surface enforcement | `cargo test -p studiofs -- --nocapture` |
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | Linux libfuse3 mount | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
-| macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
+| macFUSE read/cache report fields | `cargo test -p studiofs-macfuse repeated_read_report_records_callback_distribution_and_cache_interpretation -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ### Local-first VFS fast checks (no S3)
 
-The old `sfs121_` filter only matched comments and helper names, not test
-function names. Run these exact non-ignored local-first VFS checks instead:
+The old issue-specific prefix filter matched comments and helper names, not
+test function names. Run these exact non-ignored local-first VFS checks instead:
 
 ```bash
 cargo test -p studiofs-vfs --test vfs_test upload_backlog_progresses_via_persisted_local_payload_reads -- --exact --nocapture
@@ -175,9 +174,12 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 
-The full-lifecycle tests (`*_write_read_unmount_smoke`) exercise file I/O
-through the real OS filesystem layer, not just session creation. Linux has no
-mounted bridge until the next implementation lands.
+The full-lifecycle tests exercise file I/O through the real OS filesystem
+layer, not just session creation. Linux provides
+`mounted_smoke_mounts_and_unmounts_cleanly`,
+`mounted_regular_file_io_is_visible_across_reopen`, and
+`mounted_namespace_mutations_are_visible_through_readdir`; they are ignored by
+default because they require `/dev/fuse`, libfuse3, and `fusermount3`.
 
 The WinFSP suite also contains post-upload/finalization cases. Those require a
 reachable S3 backend and return early when the resolved test endpoint is not
@@ -406,7 +408,7 @@ regressions:
   - `sfs314_partial_publish_preserves_base_tail_and_committed_size`
   - `sfs314_metadata_only_apply_keeps_attrs_and_file_graph_consistent`
   - `test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows`
-  - `test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size`
+  - `test_publish_regular_file_overlay_to_base_commits_sparse_tail_logical_size`
   - `background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart` *(requires S3 env)*
   - `sfs312_flush_materializes_local_slice_boundary_without_remote_visibility`
   - `sfs312_fsync_persists_local_state_without_remote_visibility`

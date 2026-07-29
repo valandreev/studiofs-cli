@@ -41,16 +41,16 @@ reads for recently written data without an upstream data store.
 
 ## Execution Model Per OS
 
-### Linux — `ubuntu-latest` (GitHub-hosted)
+### Linux — Ubuntu 24.04 / Rocky 9.4
 
 | Aspect | Detail |
 |--------|--------|
-| **Runner** | `ubuntu-latest` |
-| **Driver** | `/dev/fuse` (present on GitHub-hosted Ubuntu runners) |
-| **Mount mode** | StudioFS raw `/dev/fuse`, no `libfuse3` link |
-| **Mount options** | raw macFUSE-like profile (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
-| **Feasibility** | **Disabled** — SFS-600 removed the legacy raw FUSE bridge |
-| **Gating** | Manual dispatch only |
+| **Runner** | RWX Ubuntu 24.04; Rocky 9.4 release host |
+| **Driver** | `/dev/fuse` plus `fusermount3` |
+| **Mount mode** | `studiofs-linux-fuse` libfuse3 low-level session |
+| **Mount options** | `fsname`, `subtype=studiofs`, `auto_unmount`; no `allow_other` |
+| **Feasibility** | Enabled when the runner exposes `/dev/fuse` |
+| **Gating** | Manual/operator dispatch; Ubuntu first, Rocky 9.4 required |
 
 ### macOS — `macos-latest` (GitHub-hosted)
 
@@ -123,7 +123,7 @@ is killed cleanly. The job-level timeout is 15 minutes.
 
 | Platform | Hosted runner | Self-hosted runner |
 |----------|---------------|--------------------|
-| **Linux** | Full smoke coverage expected | Not required unless hosted runners regress |
+| **Linux** | Operator-run when `/dev/fuse` is exposed | Required for Rocky 9.4 release evidence |
 | **macOS** | Best-effort (`continue-on-error`) | Required for reliable mount validation |
 | **Windows** | Full smoke coverage expected | Fallback if hosted driver loading regresses |
 
@@ -144,10 +144,11 @@ If self-hosted runners are provisioned:
 
 ### Linux smoke tests
 
-- **Session control**: uses the raw `/dev/fuse` session loop in a background
-  thread.
-- **Unmount**: the main thread calls OS FUSE tooling after the smoke read.
-- **Cleanup**: the raw mount guard detaches the mount during session teardown.
+- **Session control**: uses the libfuse3 low-level multithreaded loop in a
+  background thread.
+- **Unmount**: the main thread calls `fusermount3` after the smoke read.
+- **Cleanup**: the mount guard detaches the mount and drains invalidation and
+  async-write workers before session destruction.
 
 ### WinFSP smoke tests (`crates/studiofs-winfsp/tests/mount_sanity.rs`)
 

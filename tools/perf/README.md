@@ -51,9 +51,11 @@ The generated `report.json` contains `write_path_gate` with
 `dirty_backlog`, and `top_wait_counter_deltas`. `fio is not required for the
 StudioFS side`.
 
-For SFS-598 Linux rollout evidence, use `linux-juicefs-parity-gate.sh` against
-already-mounted local, new StudioFS, old StudioFS, and JuiceFS paths. It writes
-the side-by-side gate artifacts and rollout `decision.md` under `target/perf`.
+For Linux adaptive-cache rollout evidence, use
+`linux-juicefs-parity-gate.sh` against already-mounted local,
+current-main/direct, feature/direct, feature/adaptive, and JuiceFS paths. It
+defaults to five repetitions, computes median/p95/p99 wall time, applies the
+release thresholds, and writes all artifacts under `target/perf`.
 
 ## Scope
 
@@ -150,7 +152,7 @@ These artifact paths are preserved under `signals.profile_artifacts`.
 When comparing a candidate change against a baseline:
 
 1. Keep the same machine, mount mode, target path, and script defaults unless the change requires otherwise.
-2. Compare at least three runs before deciding that a regression or improvement is real.
+2. Compare five runs for Linux cache-policy and platform release decisions.
 3. Prefer medians across runs over a single best run.
 4. Treat lower `throughput_cv`, fewer low-throughput windows, and fewer stalls as the primary success criteria for write smoothing.
 5. Treat higher read throughput and lower P95/P99 latency as the primary success criteria for read improvements.

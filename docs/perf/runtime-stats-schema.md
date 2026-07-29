@@ -39,6 +39,20 @@ Each section contains:
 | `gauges` | point-in-time values such as queue depth or resident bytes |
 | `latencies` | histograms with `count`, `sum`, unit, and bucket counts |
 
+The VFS write-path observability JSON also carries additive Linux bridge
+objects. They are optional/defaultable so older snapshots and readers remain
+valid:
+
+| Object | Required diagnostics |
+| --- | --- |
+| `linux_fuse_open_cache` | selected policy; direct/kernel opens; keep/drop and generation replace/reuse counts; memory bypass; per-`OsCacheReason` counts |
+| `fuse_async_write` | pending requests/bytes/handles/inodes; peak and per-inode depth; admission and scoped barrier waits; failures, drops, cancellations, and shutdown timeouts |
+| `fuse_invalidation` | current/peak queue depth; coalescing; unobserved skips; notification failures and latency; shutdown timeout |
+| `fuse_connection` | requested and negotiated `max_read`, `max_readahead`, `max_write`, background/congestion limits, and enabled capability flags |
+
+`macfuse_open_cache` remains unchanged for compatibility. New producers must
+add fields rather than rename or repurpose existing macOS or Linux keys.
+
 Latency histograms must expose `count` and `sum` so readers can compute interval
 average latency by subtracting two snapshots. Bucket upper bounds are always
 stored as inclusive nanoseconds in `le_ns`; the histogram `unit` identifies the
@@ -78,7 +92,7 @@ Recommended gauges:
 | Section | Gauges |
 | --- | --- |
 | `system` | `uptime_ms`, `rss_bytes`, `worker_threads` |
-| `bridge` | `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache` |
+| `bridge` | `fuse_max_read_bytes`, `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache`, `linux_fuse_cache_policy` |
 | `cache` | `resident_bytes`, `dirty_bytes`, `evictable_bytes`, `prefetch_queue_depth` |
 | `upload_queue` | `pending_depth`, `pending_bytes`, `active_uploads`, `oldest_pending_age_ms` |
 | `metadata` | `pending_ops`, `inflight_ops`, `overlay_queue_depth`, `overlay_queue_bytes`, `overlay_dirty_age_ms` |

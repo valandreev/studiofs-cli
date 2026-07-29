@@ -725,7 +725,8 @@ Required checks:
   `docker compose up --detach --wait` with a project-scoped name and records the
   copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
-  - Linux mounted runs are disabled after SFS-600 until a new Linux bridge exists.
+  - Linux requires `/dev/fuse`, `fusermount3`, and a system libfuse3 runtime;
+    the runner fails preflight explicitly when the device is not exposed.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured
     WinFSP registry setting such as `MountUseMountmgrFromFSD=1`.

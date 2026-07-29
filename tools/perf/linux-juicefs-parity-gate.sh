@@ -8,7 +8,7 @@ bench_bin="$repo_root/target/bench/studiofs-bench"
 juicefs_repo="/home/val/dev/juicefs"
 source_repo="$repo_root"
 output_root="$repo_root/target/perf"
-runs=3
+runs=5
 workload_bytes=$((1024 * 1024 * 1024))
 small_workload_bytes=$((256 * 1024 * 1024))
 dry_run=false
@@ -17,22 +17,27 @@ dcc_smoke_command=""
 local_target=""
 studiofs_new_target=""
 studiofs_old_target=""
+studiofs_adaptive_target=""
 juicefs_target=""
 
 usage() {
   cat <<USAGE
-Usage: linux-juicefs-parity-gate.sh --local-target <path> --studiofs-new-target <path> --studiofs-old-target <path> --juicefs-target <path> [options]
+Usage: linux-juicefs-parity-gate.sh --local-target <path> --studiofs-new-target <path> --studiofs-old-target <path> --studiofs-adaptive-target <path> --juicefs-target <path> [options]
 
 Runs the SFS-598 Linux parity gate against already-mounted targets and writes
 artifacts under target/perf by default.
 
 Options:
   --bench <path>                 studiofs-bench binary. Defaults to target/bench/studiofs-bench.
-  --runs <n>                     Repeated runs per target/workload. Defaults to 3.
+  --runs <n>                     Repeated runs per target/workload. Defaults to 5.
   --workload-bytes <n>           Large sequential workload size. Defaults to 1 GiB.
   --small-workload-bytes <n>     Small-file workload size. Defaults to 256 MiB.
   --source-repo <path>           Repository copied by the repo-copy workload. Defaults to this repo.
   --juicefs-repo <path>          Local JuiceFS checkout used as behavior reference. Defaults to /home/val/dev/juicefs.
+  --studiofs-old-target <path>   Mounted current-main/direct target.
+  --studiofs-new-target <path>   Mounted feature/direct target.
+  --studiofs-adaptive-target <path>
+                                 Mounted feature/adaptive target.
   --dcc-smoke-command <command>  Optional command run with TARGET_PATH set for DCC-like compatibility smoke.
   --output-root <path>           Artifact root. Defaults to target/perf.
   --dry-run                      Write the artifact skeleton without running heavy I/O.
@@ -86,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --local-target) require_value "$1" "${2:-}"; local_target="$2"; shift 2 ;;
     --studiofs-new-target) require_value "$1" "${2:-}"; studiofs_new_target="$2"; shift 2 ;;
     --studiofs-old-target) require_value "$1" "${2:-}"; studiofs_old_target="$2"; shift 2 ;;
+    --studiofs-adaptive-target) require_value "$1" "${2:-}"; studiofs_adaptive_target="$2"; shift 2 ;;
     --juicefs-target) require_value "$1" "${2:-}"; juicefs_target="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -98,7 +104,7 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 2
 fi
 
-for required in local_target studiofs_new_target studiofs_old_target juicefs_target; do
+for required in local_target studiofs_new_target studiofs_old_target studiofs_adaptive_target juicefs_target; do
   if [[ -z "${!required}" ]]; then
     echo "Error: --${required//_/-} is required" >&2
     usage >&2
@@ -118,6 +124,7 @@ output_root="$(realpath -m "$output_root")"
 local_target="$(realpath -m "$local_target")"
 studiofs_new_target="$(realpath -m "$studiofs_new_target")"
 studiofs_old_target="$(realpath -m "$studiofs_old_target")"
+studiofs_adaptive_target="$(realpath -m "$studiofs_adaptive_target")"
 juicefs_target="$(realpath -m "$juicefs_target")"
 
 mkdir -p "$output_root"
@@ -144,19 +151,22 @@ cat > "$artifact_dir/environment.json" <<JSON
   "dry_run": $dry_run,
   "targets": {
     "local": "$(json_escape "$local_target")",
-    "studiofs_new": "$(json_escape "$studiofs_new_target")",
-    "studiofs_old": "$(json_escape "$studiofs_old_target")",
+    "studiofs_feature_direct": "$(json_escape "$studiofs_new_target")",
+    "studiofs_main_direct": "$(json_escape "$studiofs_old_target")",
+    "studiofs_feature_adaptive": "$(json_escape "$studiofs_adaptive_target")",
     "juicefs": "$(json_escape "$juicefs_target")"
   }
 }
 JSON
 
-declare -a target_names=("local" "studiofs_new" "studiofs_old" "juicefs")
-declare -a target_paths=("$local_target" "$studiofs_new_target" "$studiofs_old_target" "$juicefs_target")
+declare -a target_names=("local" "studiofs_feature_direct" "studiofs_main_direct" "studiofs_feature_adaptive" "juicefs")
+declare -a target_paths=("$local_target" "$studiofs_new_target" "$studiofs_old_target" "$studiofs_adaptive_target" "$juicefs_target")
 declare -a workload_names=(
   "large-sequential-read-write"
   "repeated-warm-read"
-  "many-small-files"
+  "small-files-4kib"
+  "small-files-16kib"
+  "small-files-64kib"
   "metadata-heavy-scan"
   "source-repo-copy"
   "truncate-rewrite"
@@ -219,8 +229,59 @@ for _ in range(2):
 print(json.dumps({'workload': 'repeated-warm-read', 'reads': reads}, sort_keys=True))
 PY"
       ;;
-    many-small-files)
-      command_text="$(printf '%q ' "$bench_bin" --scripted --target "$target_path" --workload-bytes "$small_workload_bytes" --mode read-write --layout hundred-files-plus-minus-five --cache enabled --save-report)"
+    small-files-4kib|small-files-16kib|small-files-64kib)
+      local small_kib
+      small_kib="${workload#small-files-}"
+      small_kib="${small_kib%kib}"
+      command_text="python3 - $(printf '%q' "$target_path") $small_kib $run <<'PY'
+import concurrent.futures
+import json
+import pathlib
+import shutil
+import sys
+import time
+
+target = pathlib.Path(sys.argv[1])
+size = int(sys.argv[2]) * 1024
+run = int(sys.argv[3])
+root = target / f'studiofs-linux-cache-small-{size}-{run}'
+shutil.rmtree(root, ignore_errors=True)
+root.mkdir()
+payload = bytes([size % 251]) * size
+
+def write_one(i):
+    (root / f'f-{i:05d}.bin').write_bytes(payload)
+
+def read_stat_one(i):
+    path = root / f'f-{i:05d}.bin'
+    data = path.read_bytes()
+    if len(data) != size:
+        raise RuntimeError(f'short read: {path}')
+    path.stat()
+
+started = time.monotonic()
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(write_one, range(10_000)))
+write_ms = (time.monotonic() - started) * 1000
+
+started = time.monotonic()
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(read_stat_one, range(10_000)))
+read_stat_ms = (time.monotonic() - started) * 1000
+
+started = time.monotonic()
+shutil.rmtree(root)
+cleanup_ms = (time.monotonic() - started) * 1000
+print(json.dumps({
+    'workload': 'small-files',
+    'file_count': 10_000,
+    'threads': 8,
+    'file_size': size,
+    'write_ms': round(write_ms, 3),
+    'read_stat_ms': round(read_stat_ms, 3),
+    'cleanup_ms': round(cleanup_ms, 3),
+}, sort_keys=True))
+PY"
       ;;
     metadata-heavy-scan)
       command_text="python3 - $(printf '%q' "$target_path") <<'PY'
@@ -289,6 +350,18 @@ PY"
   fi
   end_ns="$(date +%s%N)"
   wall_ms="$(((end_ns - start_ns) / 1000000))"
+  if [[ "$workload" == "repeated-warm-read" ]]; then
+    wall_ms="$(python3 - "$run_dir/stdout.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+payload = json.loads(lines[-1])
+print(round(float(payload["reads"][-1]["wall_ms"])))
+PY
+)"
+  fi
   local warning_count error_count unsupported_ioctl_count
   warning_count="$( (grep -Eih 'warn|warning' "$run_dir/stdout.txt" "$run_dir/stderr.txt" 2>/dev/null || true) | wc -l | tr -d ' ')"
   error_count="$( (grep -Eih 'error|failed|panic' "$run_dir/stdout.txt" "$run_dir/stderr.txt" 2>/dev/null || true) | wc -l | tr -d ' ')"
@@ -314,8 +387,8 @@ summary_path="$artifact_dir/summary.md"
 {
   echo "# SFS-598 Linux JuiceFS Parity Gate"
   echo
-  echo "| Workload | local | StudioFS new | StudioFS old | JuiceFS |"
-  echo "|---|---:|---:|---:|---:|"
+  echo "| Workload | local | feature/direct | current-main/direct | feature/adaptive | JuiceFS |"
+  echo "|---|---:|---:|---:|---:|---:|"
   for workload in "${workload_names[@]}"; do
     printf '| `%s` ' "$workload"
     for target_name in "${target_names[@]}"; do
@@ -325,16 +398,128 @@ summary_path="$artifact_dir/summary.md"
     echo "|"
   done
   echo
-  echo "Each cell is the number of captured run artifacts. Inspect per-run metrics.json, stdout.txt, stderr.txt, optional time.txt, and studiofs-bench reports."
-  echo "Decision must consider throughput, wall time, CPU from time.txt when present, warning/error counts, unsupported ioctl count, and StudioFS report/runtime counters."
+  echo "Each cell is the number of captured run artifacts. See statistics.md and gate.json for median/p95/p99 and threshold results."
 } > "$summary_path"
+
+python3 - "$artifact_dir" "${target_names[*]}" "${workload_names[*]}" "$dry_run" <<'PY'
+import json
+import math
+import pathlib
+import statistics
+import sys
+
+root = pathlib.Path(sys.argv[1])
+targets = sys.argv[2].split()
+workloads = sys.argv[3].split()
+dry_run = sys.argv[4] == "true"
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+stats = {}
+for target in targets:
+    stats[target] = {}
+    for workload in workloads:
+        values = []
+        for path in sorted((root / target / workload).glob("run-*/metrics.json")):
+            metric = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(metric.get("status"), int) and metric["status"] == 0:
+                values.append(float(metric["wall_ms"]))
+        if values:
+            stats[target][workload] = {
+                "runs": len(values),
+                "median_ms": statistics.median(values),
+                "p95_ms": percentile(values, 0.95),
+                "p99_ms": percentile(values, 0.99),
+            }
+
+comparisons = []
+passed = not dry_run
+if not dry_run:
+    for workload in workloads:
+        baseline = stats["studiofs_main_direct"].get(workload)
+        direct = stats["studiofs_feature_direct"].get(workload)
+        adaptive = stats["studiofs_feature_adaptive"].get(workload)
+        if not baseline or not direct or not adaptive:
+            comparisons.append({
+                "workload": workload,
+                "passed": False,
+                "reason": "missing successful runs",
+            })
+            passed = False
+            continue
+
+        checks = {
+            "direct_median_vs_main": direct["median_ms"] <= baseline["median_ms"] * 1.05,
+            "direct_p95_vs_main": direct["p95_ms"] <= baseline["p95_ms"] * 1.10,
+            "direct_p99_vs_main": direct["p99_ms"] <= baseline["p99_ms"] * 1.10,
+            "adaptive_median_vs_direct": adaptive["median_ms"] <= direct["median_ms"] * 1.05,
+            "adaptive_p95_vs_direct": adaptive["p95_ms"] <= direct["p95_ms"] * 1.05,
+            "adaptive_p99_vs_direct": adaptive["p99_ms"] <= direct["p99_ms"] * 1.05,
+        }
+        workload_passed = all(checks.values())
+        passed = passed and workload_passed
+        comparisons.append({
+            "workload": workload,
+            "passed": workload_passed,
+            "checks": checks,
+        })
+
+    warm_direct = stats["studiofs_feature_direct"].get("repeated-warm-read")
+    warm_adaptive = stats["studiofs_feature_adaptive"].get("repeated-warm-read")
+    warm_improved = bool(
+        warm_direct
+        and warm_adaptive
+        and warm_adaptive["median_ms"] <= warm_direct["median_ms"] * 0.95
+    )
+    passed = passed and warm_improved
+else:
+    warm_improved = False
+
+gate = {
+    "status": "dry-run" if dry_run else ("passed" if passed else "failed"),
+    "thresholds": {
+        "feature_direct_median_regression_max_percent": 5,
+        "feature_direct_p95_p99_regression_max_percent": 10,
+        "adaptive_regression_max_percent": 5,
+        "required_warm_read_improvement_percent": 5,
+    },
+    "warm_read_improved": warm_improved,
+    "comparisons": comparisons,
+}
+(root / "statistics.json").write_text(
+    json.dumps(stats, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+(root / "gate.json").write_text(
+    json.dumps(gate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+
+lines = [
+    "# Linux cache-policy statistics",
+    "",
+    "| Workload | Target | Median ms | p95 ms | p99 ms |",
+    "|---|---|---:|---:|---:|",
+]
+for workload in workloads:
+    for target in targets:
+        item = stats[target].get(workload)
+        if item:
+            lines.append(
+                f"| `{workload}` | `{target}` | "
+                f"{item['median_ms']:.3f} | {item['p95_ms']:.3f} | "
+                f"{item['p99_ms']:.3f} |"
+            )
+lines.extend(["", f"Gate status: **{gate['status']}**.", ""])
+(root / "statistics.md").write_text("\n".join(lines), encoding="utf-8")
+PY
 
 cat > "$artifact_dir/decision.md" <<'MD'
 # SFS-598 Rollout Decision
 
 Choose one after reviewing the side-by-side artifacts:
 
-- [ ] Default the new Linux backend.
+- [ ] Default adaptive Linux cache policy.
 - [ ] Keep the new Linux backend opt-in and iterate.
 - [ ] Stop this path and pivot to the separate Curvine-style investigation.
 
@@ -342,7 +527,13 @@ Notes:
 
 - Source repository copy must complete without unsupported-ioctl log spam or severe throughput collapse.
 - Warm reads must use safe cache behavior and approach local OS-cache/JuiceFS repeated-read behavior.
+- `gate.json` must pass, and runtime stats must separately prove that the
+  second clean warm pass adds zero VFS read bytes.
 - Do not count microbenchmarks alone as success.
 MD
 
 echo "$artifact_dir"
+if [[ "$dry_run" == false ]] && ! grep -q '"status": "passed"' "$artifact_dir/gate.json"; then
+  echo "Linux cache-policy performance thresholds failed; see $artifact_dir/gate.json" >&2
+  exit 1
+fi

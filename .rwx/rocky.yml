@@ -27,6 +27,8 @@ tasks:
         git \
         gtk3-devel \
         libappindicator-gtk3-devel \
+        fuse3 \
+        fuse3-devel \
         libxdo-devel \
         make \
         openssl-devel \

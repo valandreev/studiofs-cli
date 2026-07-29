@@ -113,6 +113,20 @@ Required correctness evidence:
 - kernel invalidation;
 - graceful unmount and VFS shutdown.
 
+Adaptive-cache evidence must additionally prove:
+
+- the second clean reopen/read uses the kernel page cache without increasing
+  VFS read bytes;
+- overwrite and remote invalidation change the mounted checksum, including for
+  a reader that was already open;
+- dirty/active-writer and larger-than-available-memory files use direct I/O;
+- truncate, append, sparse write, rename-overwrite, unlink, hardlink, and xattr
+  operations cannot reuse a stale generation;
+- signal/unmount with pending writes and invalidations has no hung request,
+  leaked callback, or notification use-after-free;
+- duplicate `flush`, `fsync`, `fdatasync`, and final `release` preserve the
+  local-first durability contract.
+
 Start with the current Linux mounted smoke surface on each target distro:
 
 ```bash
@@ -139,8 +153,21 @@ mounted `studiofs devbench` small-file recipe above as the current evidence
 surface and archive command, stdout, environment, summary, and JSON report under
 `target/perf`.
 
-`fuser` is only a baseline/comparison path. Raw `/dev/fuse` remains only a
-fallback if mounted evidence proves libfuse3 transport overhead is the blocker.
+Run five identical repetitions of current-main/direct, feature/direct,
+feature/adaptive, and (when available) JuiceFS on the same host and storage.
+Include 4/16/64 KiB small files (10,000 files, eight threads), cold/warm
+sequential and random reads, repeated reopen reads, a file larger than
+available memory, and concurrent writes where an inode barrier runs while
+another inode remains busy. Compare median, p95, and p99.
+
+Merge requires zero stale checksums, hangs, leaked callbacks, or durability
+failures. Feature/direct may regress current-main/direct by at most 5% at the
+median and 10% at p95/p99. Adaptive may regress direct by at most 5% in any
+mandatory workload and must improve at least one warm/reopen-read workload by
+5% or more. The second warm pass must add zero VFS read bytes.
+
+`direct` is the tested operational rollback and requires a remount. Raw
+`/dev/fuse` is no longer a separate runtime profile.
 
 ## SFS-356 Encrypted remote object regression gate
 

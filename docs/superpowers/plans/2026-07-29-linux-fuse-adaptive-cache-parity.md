@@ -146,8 +146,9 @@ always expose the new checksum.
   invalidation worker, and safe teardown.
 - [x] Replace mount-global asynchronous-write waiting with inode and handle
   watermarks while preserving the current local-first durability contract.
-- [ ] Add runtime statistics, documentation, mounted regressions, and benchmark
-  gates.
+- [x] Add runtime statistics, documentation, mounted/E2E regression
+  definitions, and five-run benchmark gates. The mounted executions remain an
+  external merge gate because this host has no `/dev/fuse`.
 - [ ] Complete focused verification, review the diff for specification and code
   quality, run the justified broader checks, and commit all related changes.
 
@@ -274,16 +275,29 @@ always expose the new checksum.
 - Decision: Keep the asynchronous error journal sequence-exact and consume all
   matching errors through a completed barrier, returning the earliest errno.
   Rationale: lossy coalescing can erase a post-watermark error when an earlier
-  barrier consumes the same aggregate. Mandatory handle release bounds the
-  lifecycle journal in normal operation.
+  barrier consumes the same aggregate. Admission reserves one of 8192 bounded
+  journal slots for every accepted request and fails closed with EIO when the
+  journal is full, preserving exact watermarks without unbounded growth.
   Date/Author: 2026-07-29 / Codex.
 
 ## Outcomes & Retrospective
 
-No production behavior has changed yet. The initial repository state is clean
-and the focused baseline is recorded. Update this section after every major
-milestone with delivered behavior, remaining gaps, measured results, and any
-change to the intended scope.
+Linux now defaults to the generation-safe Adaptive cache policy, delegates
+readahead to the kernel only for page-cached handles, coalesces invalidations
+for live inodes, and scopes async-write durability barriers to the relevant
+inode or handle. Direct remains an explicit remount rollback. The shared macOS
+cache seam and legacy `macfuse_open_cache` JSON remain intact.
+
+Focused Linux tests, VFS observability tests, documentation-name consistency,
+perf dry-run validation, and warnings-denied clippy pass. The validation
+infrastructure now runs five current-main/direct, feature/direct,
+feature/adaptive, local, and JuiceFS samples and emits median/p95/p99 threshold
+decisions under `target/perf`.
+
+This checkout is not yet merge-certified: `/dev/fuse` is absent, so mounted
+checks, warm-pass VFS-byte proof, Ubuntu 24.04/Rocky 9.4 performance data, and
+signal/unmount stress could not execute. Native macFUSE characterization also
+requires macOS CI. Those are release evidence gaps, not silently waived gates.
 
 ## Context and Orientation
 

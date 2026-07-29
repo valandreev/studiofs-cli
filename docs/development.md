@@ -6,7 +6,7 @@
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
 - Cache: RAM + disk + runtime upload queue
-- Bridges: WinFSP (Windows), macFUSE (macOS). Linux mount is intentionally not implemented after the SFS-600 raw FUSE removal.
+- Bridges: WinFSP (Windows), macFUSE (macOS), libfuse3 low-level FUSE (Linux).
 
 ## Project Structure
 
@@ -19,6 +19,7 @@ studiofs-cli/
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
   │   ├── studiofs-macfuse/   # macOS native bridge stub
+  │   ├── studiofs-linux-fuse/# Linux libfuse3 low-level bridge
   │   ├── studiofs-winfsp/    # Windows bridge
   │   └── studiofs-e2e/       # real mounted E2E runner
   └── docs/
@@ -85,18 +86,16 @@ not currently provide, and those workflows are also manual-only.
 | Job | Runner | Purpose |
 |-----|--------|---------|
 | **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
-| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests and local-first VFS fast checks; no mounted Linux backend |
-| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; no mounted Linux backend |
+| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS checks, and operator-run mounted libfuse3 E2E |
+| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
 macOS and Windows jobs include named steps for backend-specific crates so
 regressions in `studiofs-macfuse` or `studiofs-winfsp` are immediately
 attributable in the CI job log rather than buried inside the broad workspace
-run. Linux has no mounted backend until the next bridge is built.
-
-Linux `studiofs mount` fails with a clear "not implemented" error. There is no
-legacy raw FUSE fallback.
+run. Linux links the system libfuse3 development package and exercises
+`studiofs-linux-fuse` in the workspace tests.
 
 The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
 RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows
@@ -108,7 +107,8 @@ RWX workflow definitions live in `.rwx/`:
 
 - `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
 - `.rwx/rocky.yml` — Rocky Linux tests.
-- `.rwx/e2e.yml` — disabled Linux mounted E2E targets kept as placeholders until a new Linux bridge exists.
+- `.rwx/e2e.yml` — operator-run Linux mounted E2E targets; the runner must
+  expose `/dev/fuse` and install libfuse3 plus `fusermount3`.
 
 When diagnosing RWX failures locally, keep the RWX CLI binary under
 `.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
@@ -129,9 +129,8 @@ Downloaded logs belong under `.rwx/downloads/`; that directory has its own
 the matching RWX CLI release binary from the official RWX GitHub release before
 running `rwx logs`.
 
-The hosted Linux real mounted E2E targets currently exit early because SFS-600
-removed the legacy raw FUSE bridge. Re-enable them only when a new Linux bridge
-exists.
+The hosted Linux real mounted E2E targets fail preflight when `/dev/fuse` is
+unavailable. That is an infrastructure failure, not a test skip.
 
 ## Tests
 
