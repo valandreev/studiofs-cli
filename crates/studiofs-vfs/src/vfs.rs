@@ -40,6 +40,7 @@ mod metrics;
 mod misc_ops;
 mod namespace;
 mod namespace_ops;
+mod os_cache;
 mod overlay;
 mod prefetch;
 mod read_context;
@@ -91,6 +92,7 @@ pub use metrics::{
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
+pub use os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason};
 pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
