@@ -13,6 +13,7 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 mod async_writes;
+mod cache_policy;
 mod invalidation;
 mod low_level;
 
