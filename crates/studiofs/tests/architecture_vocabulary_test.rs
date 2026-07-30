@@ -657,6 +657,7 @@ fn validation_docs_drop_durable_mode_callback_wording() {
 #[test]
 fn e2e_runner_contract_covers_required_sfs341_surfaces() {
     let doc = read_workspace_file("docs/e2e-runner-contract.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
         "# Real E2E Runner Contract",
         "## Runner Boundaries And CLI",
@@ -680,7 +681,8 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
         "cleanup",
         "## Preflight Gates",
         "Docker",
-        "Linux mounted runs are disabled after SFS-600",
+        "Linux mounted runs require `/dev/fuse`",
+        "missing mount prerequisites fail preflight explicitly",
         "WinFSP",
         "macFUSE",
         "floating RustFS tag",
@@ -698,7 +700,7 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
     let missing: Vec<_> = required_terms
         .iter()
         .copied()
-        .filter(|term| !doc.contains(term))
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 
     assert!(
@@ -958,10 +960,9 @@ fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
         "large sequential write",
         "upload/backpressure observability",
         "Unity/Unreal-style project tree workloads",
-        "fuser",
-        "is only a baseline/comparison path",
+        "`direct` is the tested operational rollback",
         "/dev/fuse",
-        "remains only a fallback",
+        "no longer a separate runtime profile",
         "validate-bench-linux.sh",
         "studiofs devbench",
         "target/perf",

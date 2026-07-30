@@ -149,8 +149,13 @@ always expose the new checksum.
 - [x] Add runtime statistics, documentation, mounted/E2E regression
   definitions, and five-run benchmark gates. The mounted executions remain an
   external merge gate because this host has no `/dev/fuse`.
-- [ ] Complete focused verification, review the diff for specification and code
-  quality, run the justified broader checks, and commit all related changes.
+- [x] (2026-07-30) Completed the locally available final verification and
+  review. On a fresh target directory, Linux FUSE passed 150 tests with 3
+  mounted tests ignored, VFS passed 836 tests, both crates passed all-target
+  clippy with warnings denied, and the architecture vocabulary suite passed
+  45 tests. Documentation-name checks, shell syntax, and the performance-gate
+  dry run also passed. Mounted Linux, native macOS, and distro performance
+  evidence remain explicit external merge gates.
 
 ## Surprises & Discoveries
 
@@ -288,11 +293,13 @@ for live inodes, and scopes async-write durability barriers to the relevant
 inode or handle. Direct remains an explicit remount rollback. The shared macOS
 cache seam and legacy `macfuse_open_cache` JSON remain intact.
 
-Focused Linux tests, VFS observability tests, documentation-name consistency,
-perf dry-run validation, and warnings-denied clippy pass. The validation
-infrastructure now runs five current-main/direct, feature/direct,
-feature/adaptive, local, and JuiceFS samples and emits median/p95/p99 threshold
-decisions under `target/perf`.
+On a fresh target directory, the Linux FUSE library passed 150 tests with 3
+mounted tests ignored, the VFS library passed 836 tests, and both crates passed
+all-target clippy with warnings denied. The architecture vocabulary suite
+passed 45 tests. Documentation-name consistency, shell syntax, and performance
+gate dry-run validation also pass. The validation infrastructure now runs five
+current-main/direct, feature/direct, feature/adaptive, local, and JuiceFS
+samples and emits median/p95/p99 threshold decisions under `target/perf`.
 
 This checkout is not yet merge-certified: `/dev/fuse` is absent, so mounted
 checks, warm-pass VFS-byte proof, Ubuntu 24.04/Rocky 9.4 performance data, and

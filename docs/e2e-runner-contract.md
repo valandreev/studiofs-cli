@@ -360,9 +360,10 @@ mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 Crash-style remounts do not run `studiofs umount` for the killed client. Linux
-mounted runs are disabled after SFS-600 until a new Linux bridge exists. Other
-platforms keep the existing remount path unless a platform-specific stale-mount
-cleanup is added.
+mounted runs require `/dev/fuse`, `fusermount3`, and the system libfuse3
+runtime; missing mount prerequisites fail preflight explicitly. Other platforms
+keep the existing remount path unless a platform-specific stale-mount cleanup
+is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
 three peer remote volumes, one from each client, then discovers each peer-owned
