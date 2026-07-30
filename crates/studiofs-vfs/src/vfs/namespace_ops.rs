@@ -2020,6 +2020,10 @@ impl StudioVfs {
     /// In ignored-path mode, this records a synthetic ignored entry so namespace
     /// behavior remains consistent while avoiding metadata mutations.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
+        Self::run_sync_future(self.link_inner(ino, new_parent, new_name))
+    }
+
+    async fn link_inner(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
@@ -2051,12 +2055,37 @@ impl StudioVfs {
             namespace_mutations.record_ignored_insertion(new_parent, std::iter::empty());
             return Ok(ignored);
         }
-        let attr = self.sync_meta().link(ino, new_parent, new_name)?;
-        namespace_mutations.record_insertion(new_parent, new_name, ino, [ino]);
-        self.bump_acl_namespace_epoch();
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.sync_meta().request_eager_flush();
-        Ok(attr)
+        let session = self
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
+        let result = (|| {
+            // `sync_meta().link` only knows the committed metadata snapshot.
+            // Serialize the merge with writes, release, and other links, then
+            // preserve the effective local-first size/epoch fields.
+            let mut visible_attr = self.getattr(ino)?;
+            let attr = self.sync_meta().link(ino, new_parent, new_name)?;
+            namespace_mutations.record_insertion(new_parent, new_name, ino, [ino]);
+            self.bump_acl_namespace_epoch();
+            visible_attr.nlink = attr.nlink;
+            visible_attr.ctime = attr.ctime;
+            if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+                dirty_attr.nlink = attr.nlink;
+                dirty_attr.ctime = attr.ctime;
+            }
+            self.state.namespace.attr_read_cache.lock().put(
+                ino,
+                visible_attr.clone(),
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+            self.sync_meta().request_eager_flush();
+            Ok(visible_attr)
+        })();
+        drop(session);
+        self.state.file_session.gc_if_idle(ino);
+        result
     }
 
     /// Create a regular file under `parent`.

@@ -17,8 +17,9 @@ use crate::cache_policy::{
 };
 use crate::invalidation::{
     FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
-    FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationShutdownOutcome,
-    FuseInvalidationWorker, FuseLookupReservation, FuseOpenHandleGuard,
+    FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
+    FuseInvalidationShutdownOutcome, FuseInvalidationWorker, FuseLookupReservation,
+    FuseOpenHandleGuard,
 };
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
@@ -39,6 +40,7 @@ const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const NAMESPACE_ATTR_INVALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
 const ASYNC_WRITE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // Raw invalidation, lookup/open liveness, and generation retirement are wired,
 // so unset Linux mounts can safely use the requested adaptive default.
@@ -644,8 +646,6 @@ fn argv_strings_for_cache_policy(
         "auto_unmount".to_owned(),
         "-o".to_owned(),
         format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
-        "-o".to_owned(),
-        format!("max_readahead={LINUX_FUSE_MAX_READ_SIZE}"),
     ]
 }
 
@@ -817,12 +817,13 @@ impl Session {
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
-        // SAFETY: the C shim returns a static empty ops table; userdata is null
-        // because no callbacks are installed in this lifecycle-only smoke.
+        // SAFETY: the C shim returns a static ops table. Userdata is null for
+        // this lifecycle-only smoke; init supports null userdata and every
+        // request callback rejects a missing SessionState before dereferencing.
         let raw = NonNull::new(unsafe {
             studiofs_linux_fuse_session_new(
                 args.as_mut_ptr(),
-                studiofs_linux_fuse_empty_low_level_ops(),
+                studiofs_linux_fuse_low_level_ops(),
                 studiofs_linux_fuse_low_level_ops_size(),
                 std::ptr::null_mut(),
             )
@@ -1265,9 +1266,19 @@ pub extern "C" fn studiofs_linux_fuse_link(
         reply_error(req, libc::EIO);
         return;
     };
+    let lookup = state.inode_liveness.reserve_lookup(ino);
     let result = with_name_bytes(newname, |newname| state.link(ino, newparent, newname))
         .unwrap_or(Err(libc::EINVAL));
-    reply_entry_result(req, state, result);
+    match result {
+        Ok((attr, cache_safe)) => {
+            let attr_timeout = if cache_safe { TTL_SECONDS } else { 0.0 };
+            reply_reserved_entry_with_timeout(state, &attr, lookup, attr_timeout, |entry| {
+                // SAFETY: `entry` is initialized and valid for this synchronous reply.
+                unsafe { raw::fuse_reply_entry(req, entry) }
+            });
+        }
+        Err(errno) => reply_error(req, errno),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1849,13 +1860,50 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<InodeAttr, i32> {
+    fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<(InodeAttr, bool), i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
+        let watermark = self.async_writes.capture_inode_watermark(ino);
+        self.async_writes.wait_inode_completion(watermark);
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        let attr = self
+            .vfs
             .link(ino, newparent, newname)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        let cache_safe = match self
+            .invalidation_queue
+            .push_with_receipt(ino, FuseInvalidationKind::Attributes)
+        {
+            Ok(receipt) => match receipt.wait_timeout(NAMESPACE_ATTR_INVALIDATION_TIMEOUT) {
+                Some(
+                    FuseInvalidationReceiptOutcome::Notified
+                    | FuseInvalidationReceiptOutcome::SkippedUnobserved,
+                ) => true,
+                Some(FuseInvalidationReceiptOutcome::NotifyFailed) => {
+                    warn!(
+                        ino,
+                        "hardlink attribute invalidation failed; replying with zero attr TTL"
+                    );
+                    false
+                }
+                None => {
+                    warn!(
+                        ino,
+                        "timed out waiting for hardlink attribute invalidation; replying with zero attr TTL"
+                    );
+                    false
+                }
+            },
+            Err(_) => {
+                warn!(
+                    ino,
+                    "hardlink invalidation queue is closed; replying with zero attr TTL"
+                );
+                false
+            }
+        };
+        Ok((attr, cache_safe))
     }
 
     fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseAllocatedOpen, i32> {
@@ -2710,12 +2758,22 @@ fn reply_reserved_entry_with(
     reservation: FuseLookupReservation,
     reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
 ) -> c_int {
+    reply_reserved_entry_with_timeout(state, attr, reservation, TTL_SECONDS, reply)
+}
+
+fn reply_reserved_entry_with_timeout(
+    state: &SessionState,
+    attr: &InodeAttr,
+    reservation: FuseLookupReservation,
+    attr_timeout: f64,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> c_int {
     let stat = state.attr_to_stat(attr);
     let entry = raw::FuseEntryParam {
         ino: attr.ino,
         generation: 1,
         attr: stat,
-        attr_timeout: TTL_SECONDS,
+        attr_timeout,
         entry_timeout: TTL_SECONDS,
     };
     let began = reservation.begin_reply();
@@ -3351,15 +3409,33 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            args.iter()
-                .filter(|arg| arg.as_str() == "max_readahead=4194304")
-                .count(),
-            1
-        );
+        assert!(!args.iter().any(|arg| arg.contains("max_readahead")));
         assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
+    }
+
+    #[test]
+    fn generated_argv_is_accepted_by_low_level_session_parser() {
+        let mut args =
+            super::OwnedFuseArgs::new(super::argv_strings("demo")).expect("build FUSE arguments");
+        // SAFETY: the C shim returns a static empty ops table and this test
+        // destroys the resulting session before the stack-owned arguments drop.
+        let session = unsafe {
+            super::studiofs_linux_fuse_session_new(
+                args.as_mut_ptr(),
+                super::studiofs_linux_fuse_empty_low_level_ops(),
+                super::studiofs_linux_fuse_low_level_ops_size(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(
+            !session.is_null(),
+            "generated mount options must be accepted by the low-level libfuse parser"
+        );
+        // SAFETY: the non-null session is uniquely owned by this test.
+        unsafe { super::raw::fuse_session_destroy(session) };
     }
 
     #[test]
@@ -4709,6 +4785,35 @@ mod tests {
     }
 
     #[test]
+    fn committed_hardlink_succeeds_with_conservative_cache_when_queue_is_closed() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-link-closed-queue")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let source = fixture
+            .vfs()
+            .create(1, b"source.txt", 0, 0, 0o644)
+            .expect("create source");
+        state.invalidation_queue.close();
+
+        let (linked, cache_safe) = state
+            .link(source.ino, 1, b"alias.txt")
+            .expect("committed link must still report success");
+
+        assert_eq!(linked.ino, source.ino);
+        assert!(!cache_safe);
+        assert_eq!(
+            fixture.vfs().lookup(1, b"alias.txt").expect("alias").ino,
+            source.ino
+        );
+    }
+
+    #[test]
     fn mknod_reports_special_files_as_unsupported() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mknod-special")
@@ -4959,6 +5064,7 @@ mod tests {
             std::fs::write(&file, b"namespace")?;
             std::fs::rename(&file, &renamed)?;
             std::fs::hard_link(&renamed, &hardlink)?;
+            assert_eq!(std::fs::metadata(&hardlink)?.len(), 9);
             assert_eq!(std::fs::read_to_string(&hardlink)?, "namespace");
             assert!(std::fs::metadata(&renamed)?.nlink() >= 2);
             std::os::unix::fs::symlink("renamed.txt", &symlink)?;

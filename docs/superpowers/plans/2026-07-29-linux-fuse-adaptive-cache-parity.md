@@ -177,6 +177,20 @@ always expose the new checksum.
   original bin-test compile failure was reproduced before the fix; its focused
   test then passed, and all-target check and clippy passed for both `studiofs`
   and `studiofs-e2e`.
+- [x] (2026-07-30) Repaired the mounted Linux validation failures exposed once
+  `/dev/fuse` became available. Removed the unsupported low-level
+  `max_readahead` mount argument while retaining negotiated init-time capping,
+  made the lifecycle smoke use the real init callback so `max_read` agrees,
+  and closed the hardlink visibility race across async writes, volatile local
+  attrs, entry replies, and kernel invalidation. Independent review then
+  hardened receipts to report notification failure, kept committed hardlinks
+  successful with a conservative zero-TTL reply on notification failure or
+  shutdown, and serialized same-inode links with writes/releases. Linux passed
+  158 unit tests plus all 3 mounted tests; the formerly flaky namespace test
+  passed 10 consecutive mounted runs. VFS passed all 838 tests, including new
+  link-vs-release and concurrent-link regressions. Both affected crates passed
+  all-target clippy with warnings denied, and the independent correctness
+  re-review reported no remaining actionable issue.
 
 ## Surprises & Discoveries
 
@@ -242,6 +256,32 @@ always expose the new checksum.
   five-run Ubuntu/Rocky performance gates therefore remain external merge
   gates and are not claimed by this checkout.
 
+- Observation: a later execution environment exposed `/dev/fuse`, and
+  libfuse's low-level option parser rejected `-o max_readahead=4194304`.
+  Evidence: all three mounted tests failed before session creation with
+  `unknown option(s)`, while a parser-level regression test became green after
+  removing that argv option. The existing init callback still caps the
+  kernel-offered `conn->max_readahead` at 4 MiB and records the negotiated
+  value.
+
+- Observation: a lifecycle-only session using an empty ops table cannot
+  request `max_read` consistently with the real mounted path.
+  Evidence: after the parser fix the smoke reported that `init()` and
+  `fuse_session_new()` requested different maximum read sizes. Using the real
+  ops table with null userdata invokes the null-safe init callback and makes
+  the negotiation identical to production.
+
+- Observation: an accepted async write can complete after a following
+  namespace callback is dispatched, and `MetaEngine::link` returns committed
+  attrs rather than the newer local-first effective attrs.
+  Evidence: the mounted hardlink test intermittently observed size zero;
+  instrumentation showed `StudioVfs::getattr` reporting 9 bytes immediately
+  before `link`, while the metadata link result reported zero. Linux link now
+  waits only for its inode's pre-watermark writes without consuming sticky
+  errors, VFS link preserves the effective local attr while applying the new
+  `nlink`/`ctime`, and the FUSE reply waits for the coalesced invalidation
+  notification before publishing that snapshot.
+
 - Observation: compiling the current C shim against the official libfuse
   3.10.5 headers fails before linking.
   Evidence: `cc -fsyntax-only` reports missing `capable_ext`, `want_ext`,
@@ -300,6 +340,13 @@ always expose the new checksum.
   Rationale: file durability must include earlier writes to the same inode, but
   unrelated files must not increase barrier latency.
   Date/Author: 2026-07-29 / Codex.
+
+- Decision: Treat hardlink as an ordering consumer, not a durability barrier.
+  Rationale: it must observe writes already accepted for the source inode, but
+  it must not consume the sticky errno reserved for `flush`, `fsync`, or
+  `release`. A non-consuming inode completion wait preserves both namespace
+  visibility and the existing durability contract.
+  Date/Author: 2026-07-30 / Codex.
 
 - Decision: Do not cancel an in-progress VFS write future unless a focused
   audit first proves that the current local-first write path is cancellation
@@ -685,3 +732,12 @@ fix and its warning-free VFS validation.
 
 Revision note (2026-07-30): recorded the additive observability fixture compile
 fix and the broader CLI/E2E validation that exposed the original gap.
+
+Revision note (2026-07-30): recorded the mounted libfuse option/geometry fixes
+and the async-write-to-hardlink ordering, effective-attr, and completed
+invalidation solution, together with repeated mounted evidence.
+
+Revision note (2026-07-30): incorporated independent review of the mounted fix:
+notification receipts now carry outcomes, post-commit invalidation problems
+select zero-TTL success rather than false syscall failure, and file-session
+serialization prevents concurrent hardlinks from regressing visible attrs.

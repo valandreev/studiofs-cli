@@ -363,8 +363,61 @@ pub(crate) struct FuseInvalidationQueueClosed;
 struct FuseInvalidationQueueState {
     closed: bool,
     order: VecDeque<u64>,
-    pending: HashMap<u64, FuseInvalidationKind>,
+    pending: HashMap<u64, PendingInvalidation>,
     waiting_producers: usize,
+}
+
+struct PendingInvalidation {
+    kind: FuseInvalidationKind,
+    completion: Arc<FuseInvalidationReceiptInner>,
+}
+
+struct FuseInvalidationReceiptInner {
+    outcome: Mutex<Option<FuseInvalidationReceiptOutcome>>,
+    changed: Condvar,
+}
+
+impl FuseInvalidationReceiptInner {
+    fn complete(&self, outcome: FuseInvalidationReceiptOutcome) {
+        *lock_poison_tolerant(&self.outcome) = Some(outcome);
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FuseInvalidationReceiptOutcome {
+    Notified,
+    SkippedUnobserved,
+    NotifyFailed,
+}
+
+#[derive(Clone)]
+pub(crate) struct FuseInvalidationReceipt {
+    inner: Arc<FuseInvalidationReceiptInner>,
+}
+
+impl FuseInvalidationReceipt {
+    pub(crate) fn wait_timeout(&self, timeout: Duration) -> Option<FuseInvalidationReceiptOutcome> {
+        let outcome = lock_poison_tolerant(&self.inner.outcome);
+        if outcome.is_some() {
+            return *outcome;
+        }
+        let (outcome, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(outcome, timeout, |outcome| outcome.is_none())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *outcome
+    }
+}
+
+impl Default for FuseInvalidationReceiptInner {
+    fn default() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
 }
 
 struct FuseInvalidationQueueInner {
@@ -415,19 +468,36 @@ impl FuseInvalidationQueue {
         ino: u64,
         kind: FuseInvalidationKind,
     ) -> Result<(), FuseInvalidationQueueClosed> {
+        self.push_with_receipt(ino, kind).map(|_| ())
+    }
+
+    pub(crate) fn push_with_receipt(
+        &self,
+        ino: u64,
+        kind: FuseInvalidationKind,
+    ) -> Result<FuseInvalidationReceipt, FuseInvalidationQueueClosed> {
         let mut state = lock_poison_tolerant(&self.inner.state);
         loop {
             if state.closed {
                 return Err(FuseInvalidationQueueClosed);
             }
             if let Some(current) = state.pending.get_mut(&ino) {
-                *current = current.coalesce(kind);
+                current.kind = current.kind.coalesce(kind);
                 self.inner.metrics.coalesced.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                return Ok(FuseInvalidationReceipt {
+                    inner: Arc::clone(&current.completion),
+                });
             }
             if state.pending.len() < self.inner.capacity {
+                let completion = Arc::new(FuseInvalidationReceiptInner::default());
                 state.order.push_back(ino);
-                state.pending.insert(ino, kind);
+                state.pending.insert(
+                    ino,
+                    PendingInvalidation {
+                        kind,
+                        completion: Arc::clone(&completion),
+                    },
+                );
                 let depth = self
                     .inner
                     .metrics
@@ -439,7 +509,7 @@ impl FuseInvalidationQueue {
                     .queue_peak
                     .fetch_max(depth, Ordering::Relaxed);
                 self.inner.changed.notify_all();
-                return Ok(());
+                return Ok(FuseInvalidationReceipt { inner: completion });
             }
             state.waiting_producers = state.waiting_producers.saturating_add(1);
             self.inner.changed.notify_all();
@@ -448,11 +518,21 @@ impl FuseInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn pop(&self) -> Option<(u64, FuseInvalidationKind)> {
+        self.pop_pending().map(|(ino, pending)| {
+            pending
+                .completion
+                .complete(FuseInvalidationReceiptOutcome::SkippedUnobserved);
+            (ino, pending.kind)
+        })
+    }
+
+    fn pop_pending(&self) -> Option<(u64, PendingInvalidation)> {
         let mut state = lock_poison_tolerant(&self.inner.state);
         loop {
             if let Some(ino) = state.order.pop_front() {
-                let Some(kind) = state.pending.remove(&ino) else {
+                let Some(pending) = state.pending.remove(&ino) else {
                     continue;
                 };
                 self.inner
@@ -460,7 +540,7 @@ impl FuseInvalidationQueue {
                     .queue_depth
                     .fetch_sub(1, Ordering::Relaxed);
                 self.inner.changed.notify_all();
-                return Some((ino, kind));
+                return Some((ino, pending));
             }
             if state.closed {
                 return None;
@@ -652,8 +732,8 @@ impl FuseInvalidationWorker {
                 let _completion = FuseInvalidationCompletionGuard {
                     completion: worker_completion,
                 };
-                while let Some((ino, kind)) = worker_queue.pop() {
-                    let geometry = FuseInvalidationGeometry::for_kind(kind);
+                while let Some((ino, pending)) = worker_queue.pop_pending() {
+                    let geometry = FuseInvalidationGeometry::for_kind(pending.kind);
                     let mut notify_result = None;
                     let admission = liveness.admit_invalidation(ino, || {
                         metrics
@@ -671,6 +751,16 @@ impl FuseInvalidationWorker {
                     } else if notify_result == Some(Err(())) {
                         metrics.notify_failures.fetch_add(1, Ordering::Relaxed);
                     }
+                    let receipt_outcome = if admission.notified_now() {
+                        if notify_result == Some(Ok(())) {
+                            FuseInvalidationReceiptOutcome::Notified
+                        } else {
+                            FuseInvalidationReceiptOutcome::NotifyFailed
+                        }
+                    } else {
+                        FuseInvalidationReceiptOutcome::SkippedUnobserved
+                    };
+                    pending.completion.complete(receipt_outcome);
                     observe_metrics(metrics.snapshot());
                 }
                 observe_metrics(metrics.snapshot());
@@ -1242,6 +1332,53 @@ mod tests {
     }
 
     #[test]
+    fn receipt_completes_only_after_worker_notification_returns() {
+        let liveness = FuseInodeLiveness::default();
+        let open = liveness.open_handle(42);
+        let notifier_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let notifier_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::clone(&notifier_started);
+        let gate = Arc::clone(&notifier_gate);
+        let queue = FuseInvalidationQueue::with_capacity(1);
+        let worker =
+            FuseInvalidationWorker::spawn(queue.clone(), liveness, move |_ino, _geometry| {
+                let (started_lock, started_changed) = &*started;
+                *lock_poison_tolerant(started_lock) = true;
+                started_changed.notify_all();
+                let (gate_lock, gate_changed) = &*gate;
+                let mut released = lock_poison_tolerant(gate_lock);
+                while !*released {
+                    released = wait_poison_tolerant(gate_changed, released);
+                }
+                Ok(())
+            })
+            .expect("spawn worker");
+        let receipt = queue
+            .push_with_receipt(42, FuseInvalidationKind::Attributes)
+            .expect("queue invalidation");
+        let (started_lock, started_changed) = &*notifier_started;
+        let mut did_start = lock_poison_tolerant(started_lock);
+        while !*did_start {
+            did_start = wait_poison_tolerant(started_changed, did_start);
+        }
+        drop(did_start);
+
+        assert_eq!(receipt.wait_timeout(Duration::ZERO), None);
+        let (gate_lock, gate_changed) = &*notifier_gate;
+        *lock_poison_tolerant(gate_lock) = true;
+        gate_changed.notify_all();
+        assert_eq!(
+            receipt.wait_timeout(Duration::from_secs(1)),
+            Some(FuseInvalidationReceiptOutcome::Notified)
+        );
+        assert_eq!(
+            worker.shutdown(Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        drop(open);
+    }
+
+    #[test]
     fn worker_coalesces_and_drains_accepted_items_after_close() {
         let liveness = FuseInodeLiveness::default();
         let open = liveness.open_handle(42);
@@ -1300,6 +1437,29 @@ mod tests {
             FuseInvalidationShutdownOutcome::Drained
         );
         assert_eq!(worker.metrics().notify_failures, 1);
+    }
+
+    #[test]
+    fn receipt_reports_kernel_notification_failure() {
+        let liveness = FuseInodeLiveness::default();
+        let open = liveness.open_handle(42);
+        let queue = FuseInvalidationQueue::with_capacity(1);
+        let worker =
+            FuseInvalidationWorker::spawn(queue.clone(), liveness, |_ino, _geometry| Err(()))
+                .expect("spawn worker");
+        let receipt = queue
+            .push_with_receipt(42, FuseInvalidationKind::Attributes)
+            .expect("queue invalidation");
+
+        assert_eq!(
+            receipt.wait_timeout(Duration::from_secs(1)),
+            Some(FuseInvalidationReceiptOutcome::NotifyFailed)
+        );
+        assert_eq!(
+            worker.shutdown(Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        drop(open);
     }
 
     #[test]

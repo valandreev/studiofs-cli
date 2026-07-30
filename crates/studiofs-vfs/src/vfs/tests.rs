@@ -600,6 +600,107 @@ fn os_cache_unlink_preserves_generation_when_hardlink_survives() {
 }
 
 #[test]
+fn hardlink_preserves_volatile_local_size_and_updates_link_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "hardlink-unflushed-local-size");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"original.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::WRONLY, false)
+            .expect("writer");
+        vfs.write_fh(writer, attr.ino, 0, b"namespace")
+            .await
+            .expect("write");
+        vfs.flush_volatile_writeback_with_outcome(attr.ino, writer)
+            .await
+            .expect("volatile flush");
+        let gate = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(release.closed_last_handle);
+        let visible_attr = vfs.getattr(attr.ino).expect("visible local attr");
+        assert_eq!(visible_attr.size, b"namespace".len() as u64);
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+
+        vfs.rename(ROOT_INO, b"original.txt", ROOT_INO, b"renamed.txt")
+            .expect("rename");
+        vfs.state.namespace.attr_read_cache.lock().put(
+            attr.ino,
+            visible_attr,
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("visible local attr").size,
+            b"namespace".len() as u64
+        );
+
+        let linking_vfs = Arc::clone(&vfs);
+        let link =
+            tokio::task::spawn_blocking(move || linking_vfs.link(attr.ino, ROOT_INO, b"alias.txt"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !link.is_finished(),
+            "hardlink must serialize with the in-flight release mutation"
+        );
+        drop(gate);
+        let linked = link
+            .await
+            .expect("hardlink task")
+            .expect("hardlink mutation");
+        assert_eq!(linked.size, b"namespace".len() as u64);
+        assert_eq!(linked.nlink, 2);
+
+        vfs.wait_for_deferred_release_inflight(attr.ino).await;
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("settled linked attr").size,
+            b"namespace".len() as u64
+        );
+    });
+}
+
+#[test]
+fn concurrent_hardlinks_do_not_regress_visible_link_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "concurrent-hardlink-count");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let first_vfs = Arc::clone(&vfs);
+        let first_start = Arc::clone(&start);
+        let first = std::thread::spawn(move || {
+            first_start.wait();
+            first_vfs.link(attr.ino, ROOT_INO, b"first.txt")
+        });
+        let second_vfs = Arc::clone(&vfs);
+        let second_start = Arc::clone(&start);
+        let second = std::thread::spawn(move || {
+            second_start.wait();
+            second_vfs.link(attr.ino, ROOT_INO, b"second.txt")
+        });
+        start.wait();
+
+        let first = first.join().expect("first link task").expect("first link");
+        let second = second
+            .join()
+            .expect("second link task")
+            .expect("second link");
+        let mut observed_counts = [first.nlink, second.nlink];
+        observed_counts.sort_unstable();
+        assert_eq!(observed_counts, [2, 3]);
+        assert_eq!(vfs.getattr(attr.ino).expect("final attr").nlink, 3);
+    });
+}
+
+#[test]
 fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-rename-overwrite");

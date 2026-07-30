@@ -275,6 +275,21 @@ impl AsyncWriteLedger {
         self.wait_scope(BarrierScope::Inode(watermark.ino), watermark.through)
     }
 
+    /// Wait for writes admitted before `watermark` without consuming sticky errors.
+    ///
+    /// Namespace operations use this to observe prior write effects while
+    /// leaving error delivery to the next flush, fsync, or release barrier.
+    pub(crate) fn wait_inode_completion(&self, watermark: InodeWatermark) {
+        let mut state = self.lock_state();
+        let scope = BarrierScope::Inode(watermark.ino);
+        while scope.has_pending(&state, watermark.through) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
     pub(crate) fn wait_handle(&self, watermark: HandleWatermark) -> BarrierOutcome {
         self.wait_scope(BarrierScope::Handle(watermark.fh), watermark.through)
     }
@@ -833,6 +848,21 @@ mod tests {
         assert_eq!(metrics.barrier_waits, 1);
         assert_eq!(metrics.inode_barrier_waits, 1);
         assert_eq!(metrics.handle_barrier_waits, 0);
+    }
+
+    #[test]
+    fn inode_completion_wait_preserves_sticky_error_for_barrier() {
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.start_request(10, 100).unwrap();
+        let watermark = ledger.capture_inode_watermark(10);
+
+        ticket.complete(Err(libc::ENOSPC));
+        ledger.wait_inode_completion(watermark);
+
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::ENOSPC))
+        );
     }
 
     #[test]
