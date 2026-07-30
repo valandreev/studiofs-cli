@@ -8753,7 +8753,7 @@ async fn test_object_key_format() {
     let object_id: u64 = 0x1234;
 
     let key = format_object_key(data_prefix, object_id);
-    assert_eq!(key, "disk-a/objects/0000/0000000000001234");
+    assert_eq!(key, "disk-a/objects/1234/0000000000001234");
 }
 
 // =============================================================================

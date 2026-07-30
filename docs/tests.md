@@ -439,6 +439,9 @@ regressions:
   - `sfs315_large_object_batch_replaces_undersized_prefetched_window`
   - `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`
 
+- Payload-object identifier layout
+  - `composite_object_keys_use_low_bits_for_shards_and_preserve_ids`
+
 Run a single focused regression:
 
 Each command below is copy-paste ready and includes the full crate and test
