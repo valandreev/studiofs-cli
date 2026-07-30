@@ -6451,12 +6451,13 @@ impl StudioVfs {
         self.max_dirty_bytes.store(value, Ordering::Release);
     }
 
-    /// Number of foreground reads currently in-flight.
+    /// Number of foreground reads and OS-cache read handles currently in flight.
     pub fn foreground_reads_inflight(&self) -> usize {
         self.state
             .read
             .foreground_reads_inflight
             .load(Ordering::Relaxed)
+            .saturating_add(self.os_cache.lock().active_foreground_handle_count())
     }
 
     fn foreground_io_active(&self) -> bool {

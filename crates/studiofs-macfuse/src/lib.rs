@@ -2260,7 +2260,7 @@ mod tests {
             .expect("release read-only handle");
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);
-        assert_eq!(cache_decisions.read_only_local_dirty_state, 1);
+        assert_eq!(cache_decisions.read_only_active_writer, 1);
 
         adapter
             .release(attr.ino, second_writer.file_handle())
