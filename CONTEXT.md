@@ -19,3 +19,15 @@ _Avoid_: Compatibility floor, required platform
 **Mount UX**:
 The user-facing mount experience: `studiofs mount <disk-name> <mount-point>` plus only storage-location controls for local cache, cache size, and S3 endpoint override.
 _Avoid_: Tuning surface, performance profile CLI
+
+**Allocator namespace**:
+A non-reusable, volume-scoped identity minted by PostgreSQL for exactly one local allocator; namespace `0` is reserved for system IDs.
+_Avoid_: Client slot, ID range
+
+**Local allocator**:
+Durable local state that owns one allocator namespace and advances its counter without PostgreSQL foreground round trips.
+_Avoid_: PostgreSQL range reservation
+
+**Logical chunk**:
+A file range identified by `(inode, chunk_index)`; it has no separately allocated global identity.
+_Avoid_: Chunk UUID, chunk object ID
