@@ -54,6 +54,9 @@ For a PostgreSQL-backed StudioFS volume, StudioFS will allocate inode IDs and im
 - Decision: Add a batched inode allocation method and route namespace creation through it.
   Rationale: A directory or file inode must consume the inode namespace and its headroom, while payload blocks must consume the payload namespace. The existing VFS batch currently uses the payload method only because both classes shared one stream.
   Date/Author: 2026-07-30 / Codex.
+- Decision: A PostgreSQL restore that can rewind `next_allocator_namespace` creates a new logical volume rather than reusing the old volume identity.
+  Rationale: The registry counter is the sole non-reuse witness. A physical/WAL restore that preserves its high-water mark is safe; a point-in-time or logical restore that can move it backwards cannot safely coexist with prior local allocator roots.
+  Date/Author: 2026-07-30 / Codex.
 
 ## Context and Orientation
 
@@ -97,6 +100,8 @@ Counter exhaustion is terminal for that allocator: return a typed allocation-ove
 At a new PostgreSQL-backed local root, namespace bootstrap must first run one PostgreSQL transaction that reads and locks the per-volume legacy `next_inode` counter. If `next_inode` exists, the volume is legacy: do not create or increment `next_allocator_namespace`, do not mint namespaces, log `id_allocator_legacy_migration_required`, and leave both metadata-authority headroom flags false. This is a read-only compatibility guard, not a migration. Only after confirming that `next_inode` is absent may the transaction create or lock `next_allocator_namespace`, mint two namespaces, and commit. One redb transaction then stores the paired state before either allocator issues an ID. If PostgreSQL fails before the paired state commits, discard any minted namespace and retry later; it remains permanently unused. The product UX guarantees a local metadata root belongs to exactly one computer-volume pair. A parallel clone must create new local state and therefore gets new namespaces.
 
 If either durable allocator record is untrustworthy, do not use either old namespace or counter. During `PgMetaEngine::open_with_options`, first apply the legacy guard above; only a volume without `next_inode` may mint two fresh namespaces and replace both records atomically. If PostgreSQL is unavailable, open the known local metadata view for reads but set both `MetadataAuthorityStatus` headroom flags to false. Existing readable files remain readable; all new write-capable opens, writes, and namespace mutations fail through the existing `MetaError::AccessDenied { actual: ReadOnly }` path. A mounted process remains read-only: it performs no background allocator retry. After PostgreSQL returns, close and reopen the metadata engine; that next `open_with_options` call retries recovery and restores writable authority only after the paired durable record commits.
+
+The PostgreSQL registry counter is monotonic metadata, not reconstructible cache. A physical or WAL restore is permitted only when it preserves the counter high-water mark. Before a point-in-time or logical restore that can rewind `next_allocator_namespace`, the operator must assign the restored data a new volume identity and provision new local roots; prior roots must not reconnect to it. This is an operational safety rule, not an automatic recovery path.
 
 The operator-visible surface is deliberately small and typed at the metadata boundary. There is no existing structured metadata diagnostics/status output that can carry an allocator reason, so emit one `tracing` event named `id_allocator_recovery_required` for each failed bootstrap or recovery attempt, `id_allocator_legacy_migration_required` when the bootstrap guard finds `next_inode`, and `id_allocator_counter_exhausted` when either allocator reaches terminal exhaustion. Include volume ID, affected allocator state (`new`, `untrustworthy`, `legacy_migration_required`, or `counter_exhausted`), and the PostgreSQL error when one exists. `MetadataAuthorityStatus.inode_id_headroom` and `.object_id_headroom` remain the only status fields and expose availability, not the reason. Do not add bridge-specific errno mappings or a new diagnostics service: the shared VFS read-only response is the contract.
 
@@ -184,6 +189,7 @@ Write each test before its production change. Place allocator unit tests beside 
 - a direct redb engine still allocates with its existing `NEXT_INODE` behavior;
 - local-counter exhaustion and namespace exhaustion fail without wrapping or reusing a value;
 - an unavailable allocator makes VFS reject mutations while a previously committed read still succeeds.
+- a database restore either preserves `next_allocator_namespace` high-water or uses a new volume identity and new local roots.
 
 Run the commands in Concrete Steps. The PostgreSQL-backed two-root namespace test must prove that namespace minting, not range reservation, is the sole PostgreSQL ID operation. The recovery test must prove both the immutable read-only mounted state and successful recovery after reopen.
 
@@ -206,6 +212,6 @@ Keep `MetaInodes::next_inode() -> MetaResult<Ino>` and `MetaPayloadObjects::next
 
 ## Outcomes & Retrospective
 
-As of 2026-07-30, no allocator implementation has started. The plan now separates stable replication client identity from ID allocation, blocks legacy PostgreSQL volumes instead of risking namespace collisions, routes namespace-create batches through the inode allocator, scopes the namespace protocol to PostgreSQL-backed volumes, defines the exclusive high-water endpoint, and makes recovery explicitly remount-based. Implementation remains to be completed and must update this section with the observed test output, unavailable platform checks, and any deviation from the stated recovery behavior.
+As of 2026-07-30, no allocator implementation has started. The plan now separates stable replication client identity from ID allocation, blocks legacy PostgreSQL volumes instead of risking namespace collisions, routes namespace-create batches through the inode allocator, scopes the namespace protocol to PostgreSQL-backed volumes, defines the exclusive high-water endpoint, makes recovery explicitly remount-based, and treats counter-rewinding database restores as a new-volume operation. Implementation remains to be completed and must update this section with the observed test output, unavailable platform checks, and any deviation from the stated recovery behavior.
 
 Revision note (2026-07-30): created from SFS-623 after graph and local-first-contract validation. Revised after review to retain replication client slots, preserve direct-redb allocation, guard legacy PostgreSQL volumes, route namespace batches to the inode allocator, make high-water bounds and remount recovery explicit, resolve diagnostics, and add mandatory ExecPlan milestones, steps, artifacts, and platform proof commands; no implementation has started.
