@@ -167,6 +167,11 @@ always expose the new checksum.
   reporting proves barrier-tail and individual small-file phase regressions
   fail the gate; real local smoke runs exercised a 128 MiB working set with a
   64 MiB memory sample and 64 barriers with concurrent unrelated writes.
+- [x] (2026-07-30) Documented all 14 variants in the new public VFS OS-cache
+  decision enums after the workspace `missing_docs` lint exposed the gap.
+  `cargo check -p studiofs-vfs --lib` completed without warnings, all 26
+  focused OS-cache tests passed, and VFS all-target clippy passed with warnings
+  denied.
 
 ## Surprises & Discoveries
 
@@ -669,3 +674,6 @@ Revision note (2026-07-30): completed the post-review fixes, recorded their
 fresh verification evidence, and strengthened the performance gate with true
 over-RAM I/O, concurrent-barrier progress checks, separately gated `fsync`
 tail latency, and fixture-backed report assertions.
+
+Revision note (2026-07-30): recorded the public OS-cache enum documentation
+fix and its warning-free VFS validation.

@@ -13,29 +13,43 @@ pub(crate) const OS_CACHE_GENERATION_CAPACITY: usize = 8192;
 /// Whether an open handle may participate in the operating-system page cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsCacheParticipation {
+    /// Bypass the operating-system page cache for this handle.
     Disabled,
+    /// Allow this handle to use the operating-system page cache.
     Enabled,
 }
 
 /// Whether the kernel may retain and reuse pages from an earlier open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsCacheDisposition {
+    /// Retain and reuse pages cached for the same stable content generation.
     Reuse,
+    /// Discard previously cached pages before serving this open.
     Replace,
 }
 
 /// Stable reason attached to an OS-cache open decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsCacheReason {
+    /// Page-cache participation was explicitly disabled for this handle.
     Disabled,
+    /// The handle can modify file contents.
     WriteCapable,
+    /// The VFS could not determine a safe cache state for the inode.
     UnknownState,
+    /// The VFS could not resolve the supplied file handle.
     UnknownHandle,
+    /// The inode is not a regular file.
     NonRegular,
+    /// The inode has locally dirty content that is not safe to cache.
     LocalDirty,
+    /// Another open handle can currently modify the inode.
     ActiveWriter,
+    /// This is the first observed content generation for the inode.
     FirstObservation,
+    /// The observed content generation differs from the retained generation.
     GenerationChanged,
+    /// The observed content generation matches the retained generation.
     StableGeneration,
 }
 
