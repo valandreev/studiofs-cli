@@ -17,6 +17,7 @@ libc.workspace = true
 studiofs-bridge.workspace = true
 studiofs-meta.workspace = true
 studiofs-vfs.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

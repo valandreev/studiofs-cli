@@ -1,3 +1,4 @@
+use super::file_session::ReadAheadToken;
 use super::{
     AccessPolicy, Ino, JoinSet, MetaError, Ordering, ReadRequestContext, ReadStreamKey, Semaphore,
     StudioVfs, VecDeque,
@@ -15,6 +16,7 @@ pub(super) enum PrefetchWorkItem {
         first_block: u32,
         last_block: u32,
         policy: AccessPolicy,
+        owner_token: Option<ReadAheadToken>,
     },
     Batch(PrefetchBatch),
 }
@@ -86,6 +88,7 @@ struct PrefetchBatchBuilder<'a> {
     first_block: u32,
     last_block: u32,
     policy: AccessPolicy,
+    owner_token: Option<ReadAheadToken>,
 }
 
 impl<'a> PrefetchBatchBuilder<'a> {
@@ -96,6 +99,7 @@ impl<'a> PrefetchBatchBuilder<'a> {
         first_block: u32,
         last_block: u32,
         policy: AccessPolicy,
+        owner_token: Option<ReadAheadToken>,
     ) -> Self {
         Self {
             vfs,
@@ -104,6 +108,7 @@ impl<'a> PrefetchBatchBuilder<'a> {
             first_block,
             last_block,
             policy,
+            owner_token,
         }
     }
 
@@ -131,11 +136,10 @@ impl<'a> PrefetchBatchBuilder<'a> {
         );
         let mut planned = Vec::new();
         if !primary_blocks.is_empty() {
-            planned.push(PrefetchBatch::new(
-                self.ino,
-                primary_blocks,
-                Some(read_context),
-            ));
+            planned.push(
+                PrefetchBatch::new(self.ino, primary_blocks, Some(read_context))
+                    .with_owner_token(self.owner_token),
+            );
         }
         self.append_sibling_batches(&mut planned, siblings);
         planned
@@ -206,7 +210,9 @@ impl<'a> PrefetchBatchBuilder<'a> {
 
     fn append_sibling_batches(&self, planned: &mut Vec<PrefetchBatch>, siblings: Vec<Ino>) {
         for sibling_ino in siblings.into_iter().take(self.vfs.dir_prefetch_max_batch) {
-            planned.push(PrefetchBatch::single(sibling_ino, 0, None));
+            planned.push(
+                PrefetchBatch::single(sibling_ino, 0, None).with_owner_token(self.owner_token),
+            );
         }
     }
 }
@@ -216,6 +222,7 @@ pub(super) struct PrefetchBatch {
     pub(super) ino: Ino,
     pub(super) block_indices: Vec<u32>,
     pub(super) read_context: Option<PrefetchReadContext>,
+    pub(super) owner_token: Option<ReadAheadToken>,
 }
 
 impl PrefetchBatch {
@@ -228,6 +235,7 @@ impl PrefetchBatch {
             ino,
             block_indices: vec![object_idx],
             read_context,
+            owner_token: None,
         }
     }
 
@@ -248,7 +256,13 @@ impl PrefetchBatch {
             ino,
             block_indices,
             read_context,
+            owner_token: None,
         }
+    }
+
+    pub(super) fn with_owner_token(mut self, owner_token: Option<ReadAheadToken>) -> Self {
+        self.owner_token = owner_token;
+        self
     }
 }
 
@@ -313,11 +327,20 @@ impl PrefetchWorker {
                 ino,
                 block_indices,
                 read_context,
+                owner_token,
             } = batch;
             for object_idx in &block_indices {
                 self.pending_set.remove(&(ino, *object_idx));
             }
             self.update_queue_depth_metric();
+            if owner_token.is_some_and(|token| !self.vfs.read_ahead_token_is_current(token)) {
+                self.vfs
+                    .state
+                    .metrics
+                    .readahead_dropped_blocks
+                    .fetch_add(block_indices.len() as u64, Ordering::Relaxed);
+                continue;
+            }
 
             let mut started_blocks = Vec::with_capacity(block_indices.len());
             for object_idx in block_indices {
@@ -339,7 +362,10 @@ impl PrefetchWorker {
             self.inflight.spawn(async move {
                 let _permit = permit;
                 let _ = vfs
-                    .read_prefetch_batch(PrefetchBatch::new(ino, started_blocks, read_context))
+                    .read_prefetch_batch(
+                        PrefetchBatch::new(ino, started_blocks, read_context)
+                            .with_owner_token(owner_token),
+                    )
                     .await;
             });
         }
@@ -357,13 +383,21 @@ impl PrefetchWorker {
                 first_block,
                 last_block,
                 policy,
-            } => self.vfs.plan_prefetch_batches_from_hint(
-                ino,
-                stream_id,
-                first_block,
-                last_block,
-                policy,
-            ),
+                owner_token,
+            } => {
+                if owner_token.is_some_and(|token| !self.vfs.read_ahead_token_is_current(token)) {
+                    Vec::new()
+                } else {
+                    self.vfs.plan_prefetch_batches_from_hint_with_owner(
+                        ino,
+                        stream_id,
+                        first_block,
+                        last_block,
+                        policy,
+                        owner_token,
+                    )
+                }
+            }
             PrefetchWorkItem::Batch(batch) => vec![batch],
         };
 
@@ -452,6 +486,7 @@ impl StudioVfs {
         stream_id: u64,
         policy: AccessPolicy,
         blocks_needed: &[(u32, usize, usize)],
+        owner_token: Option<ReadAheadToken>,
     ) {
         if self.shutdown_requested() || blocks_needed.is_empty() {
             return;
@@ -498,19 +533,35 @@ impl StudioVfs {
             first_block: range.first_block,
             last_block: range.last_block,
             policy,
+            owner_token,
         });
     }
 
-    pub(super) fn plan_prefetch_batches_from_hint(
+    pub(super) fn plan_prefetch_batches_from_hint_with_owner(
         &self,
         ino: Ino,
         stream_id: u64,
         first_block: u32,
         last_block: u32,
         policy: AccessPolicy,
+        owner_token: Option<ReadAheadToken>,
     ) -> Vec<PrefetchBatch> {
-        PrefetchBatchBuilder::new(self, ino, stream_id, first_block, last_block, policy)
-            .plan_batches()
+        let planned = PrefetchBatchBuilder::new(
+            self,
+            ino,
+            stream_id,
+            first_block,
+            last_block,
+            policy,
+            owner_token,
+        )
+        .plan_batches();
+        if owner_token.is_some_and(|token| !self.read_ahead_token_is_current(token)) {
+            self.clear_access_tracking_for_stream(ino, stream_id);
+            Vec::new()
+        } else {
+            planned
+        }
     }
 }
 
@@ -590,7 +641,7 @@ mod tests {
         let stream_id = 77;
         let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
 
-        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(2, 0, 1), (3, 0, 1)]);
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(2, 0, 1), (3, 0, 1)], None);
         assert_eq!(
             vfs.state
                 .read
@@ -600,7 +651,7 @@ mod tests {
             Some(&(2, 3))
         );
 
-        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(4, 0, 1)]);
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(4, 0, 1)], None);
         assert_eq!(
             vfs.state
                 .read
@@ -610,7 +661,7 @@ mod tests {
             Some(&(2, 4))
         );
 
-        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(3, 0, 1)]);
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(3, 0, 1)], None);
         assert_eq!(
             vfs.state
                 .read
@@ -618,6 +669,85 @@ mod tests {
                 .lock()
                 .get(&(ino, stream_id)),
             Some(&(2, 4))
+        );
+    }
+
+    #[test]
+    fn stale_handle_hint_cannot_recreate_readahead_stream_after_kernel_switch() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-stale-owner-hint");
+        let attr = vfs
+            .create(ROOT_INO, b"stale-hint.bin", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let open_file = vfs.get_open_file(fh).expect("tracked handle");
+        let owner_token = open_file
+            .vfs_read_ahead_token()
+            .expect("VFS-owned handle token");
+        let stream_id = open_file.stream_id();
+        let key = ReadStreamKey {
+            ino: attr.ino,
+            stream_id,
+        };
+        assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Kernel));
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
+        worker.enqueue_work_item(PrefetchWorkItem::ReadHint {
+            ino: attr.ino,
+            stream_id,
+            first_block: 0,
+            last_block: 0,
+            policy: AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker),
+            owner_token: Some(owner_token),
+        });
+
+        assert!(worker.pending_queue.is_empty());
+        assert!(
+            !vfs.readahead.debug_has_stream(key),
+            "stale queued hint must be rejected before access state is recreated"
+        );
+    }
+
+    #[test]
+    fn kernel_switch_during_hint_planning_clears_recreated_stream() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-owner-switch-planning");
+        let attr = vfs
+            .create(ROOT_INO, b"planning-race.bin", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let open_file = vfs.get_open_file(fh).expect("tracked handle");
+        let owner_token = open_file
+            .vfs_read_ahead_token()
+            .expect("VFS-owned handle token");
+        let stream_id = open_file.stream_id();
+        let key = ReadStreamKey {
+            ino: attr.ino,
+            stream_id,
+        };
+        assert!(vfs.read_ahead_token_is_current(owner_token));
+
+        // Models the switch after enqueue admission but immediately before
+        // the planner records/recreates adaptive stream state.
+        assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Kernel));
+        let planned = vfs.plan_prefetch_batches_from_hint_with_owner(
+            attr.ino,
+            stream_id,
+            0,
+            0,
+            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker),
+            Some(owner_token),
+        );
+
+        assert!(planned.is_empty());
+        assert!(
+            !vfs.readahead.debug_has_stream(key),
+            "post-planning validation must clear stream state recreated after the owner switch"
         );
     }
 
@@ -640,7 +770,8 @@ mod tests {
             .insert((ino, stream_id), (0, 2));
         assert!(vfs.readahead.debug_has_stream(key));
 
-        let planned = vfs.plan_prefetch_batches_from_hint(ino, stream_id, 0, 2, policy);
+        let planned =
+            vfs.plan_prefetch_batches_from_hint_with_owner(ino, stream_id, 0, 2, policy, None);
 
         assert!(planned.is_empty());
         assert!(
@@ -671,7 +802,14 @@ mod tests {
         let _ = vfs
             .readahead
             .record_read_for_stream(key, 0, 0, policy.readahead_policy());
-        let planned = vfs.plan_prefetch_batches_from_hint(created.ino, stream_id, 1, 1, policy);
+        let planned = vfs.plan_prefetch_batches_from_hint_with_owner(
+            created.ino,
+            stream_id,
+            1,
+            1,
+            policy,
+            None,
+        );
 
         assert_eq!(
             planned.len(),
@@ -702,7 +840,8 @@ mod tests {
 
         let stream_id = 456;
         let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
-        let planned = vfs.plan_prefetch_batches_from_hint(first.ino, stream_id, 0, 0, policy);
+        let planned = vfs
+            .plan_prefetch_batches_from_hint_with_owner(first.ino, stream_id, 0, 0, policy, None);
 
         assert_eq!(planned.len(), 1);
         assert_eq!(

@@ -236,18 +236,32 @@ For comparisons, compare medians before drawing conclusions:
 These scripts do not run full test suites. They are benchmark evidence capture
 tools for mounted StudioFS volumes.
 
-## Linux Raw FUSE Profile Gate
+## Linux Adaptive FUSE Cache Gate
 
-Linux has one raw `/dev/fuse` runtime profile. Capture its evidence under
-`target/perf/linux-raw-fuse/` and compare runs with the same machine, mount
-point, cache disk, metadata disk, object store, PostgreSQL service, and workload
-shape:
+Linux uses the libfuse3 low-level bridge with `adaptive`, `direct`, and
+`kernel` cache policies. Capture evidence under `target/perf/` and compare
+current-main/direct, feature/direct, feature/adaptive, and optional JuiceFS
+mounts with the same machine, cache disk, metadata disk, object store,
+PostgreSQL service, and workload shape:
 
 ```sh
 bash ./tools/perf/validate-bench-linux.sh --mount-point /mnt/studio/myvolume --profile write-path-gate --big-file-size 8GB --block-size 4MB --threads 1
 ```
 
+For the cross-mount gate use five runs:
+
+```sh
+bash ./tools/perf/linux-juicefs-parity-gate.sh \
+  --local-target /mnt/local \
+  --studiofs-old-target /mnt/studio-main-direct \
+  --studiofs-new-target /mnt/studio-feature-direct \
+  --studiofs-adaptive-target /mnt/studio-feature-adaptive \
+  --juicefs-target /mnt/juicefs \
+  --runs 5
+```
+
 Also run `studiofs bench <mountpoint> --report <path>` for fixed public mounted
-evidence. The raw profile must keep median sequential write throughput,
-repeated warm read throughput, p95/p99 callback latency, fsync/flush latency,
-and RSS within the documented release thresholds.
+evidence. The generated gate summary reports median, p95, and p99 wall time and
+applies the 5% median/adaptive and 10% direct-tail thresholds. A release record
+must include runtime-stat deltas proving the second clean warm pass added zero
+VFS read bytes.

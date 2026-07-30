@@ -1,14 +1,36 @@
 #include <errno.h> /* IWYU pragma: keep */
 #include <stddef.h>
+#include <stdint.h>
 #include <fuse_lowlevel.h>
+
+#define STUDIOFS_LINUX_FUSE_MAX_READ_SIZE (4U * 1024U * 1024U)
 
 static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn);
+static int studiofs_linux_fuse_set_feature_flag_compat(struct fuse_conn_info *conn,
+                                                       uint64_t flag);
+static int studiofs_linux_fuse_get_feature_flag_compat(struct fuse_conn_info *conn,
+                                                       uint64_t flag);
+static uint64_t studiofs_linux_fuse_capable_features(const struct fuse_conn_info *conn);
+static uint64_t studiofs_linux_fuse_enabled_features(const struct fuse_conn_info *conn);
+static void studiofs_linux_fuse_set_capable_features(struct fuse_conn_info *conn,
+                                                     uint64_t features);
 extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
 extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
+extern void studiofs_linux_fuse_record_connection(void *userdata,
+                                                  uint32_t requested_max_read,
+                                                  uint32_t requested_max_readahead,
+                                                  uint32_t effective_max_read,
+                                                  uint32_t effective_max_readahead,
+                                                  uint32_t effective_max_write,
+                                                  uint32_t effective_max_background,
+                                                  uint32_t effective_congestion_threshold,
+                                                  uint64_t capable_features,
+                                                  uint64_t enabled_features);
 extern void studiofs_linux_fuse_destroy(void *userdata);
+extern void studiofs_linux_fuse_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 extern void studiofs_linux_fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_linux_fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, struct fuse_file_info *fi);
@@ -40,6 +62,7 @@ extern void studiofs_linux_fuse_removexattr(fuse_req_t req, fuse_ino_t ino, cons
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .init = studiofs_linux_fuse_init,
     .destroy = studiofs_linux_fuse_destroy,
+    .forget = studiofs_linux_fuse_forget,
     .lookup = studiofs_linux_fuse_lookup,
     .getattr = studiofs_linux_fuse_getattr,
     .setattr = studiofs_linux_fuse_setattr,
@@ -69,17 +92,85 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .removexattr = studiofs_linux_fuse_removexattr,
 };
 
+static int studiofs_linux_fuse_set_feature_flag_compat(struct fuse_conn_info *conn,
+                                                       uint64_t flag) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
+    return fuse_set_feature_flag(conn, flag);
+#else
+    if (flag > UINT32_MAX || (conn->capable & (uint32_t)flag) == 0) {
+        return 0;
+    }
+    conn->want |= (uint32_t)flag;
+    return 1;
+#endif
+}
+
+static int studiofs_linux_fuse_get_feature_flag_compat(struct fuse_conn_info *conn,
+                                                       uint64_t flag) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
+    return fuse_get_feature_flag(conn, flag);
+#else
+    return flag <= UINT32_MAX && (conn->want & (uint32_t)flag) != 0;
+#endif
+}
+
+static uint64_t studiofs_linux_fuse_capable_features(const struct fuse_conn_info *conn) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
+    return conn->capable_ext;
+#else
+    return conn->capable;
+#endif
+}
+
+static uint64_t studiofs_linux_fuse_enabled_features(const struct fuse_conn_info *conn) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
+    return conn->want_ext;
+#else
+    return conn->want;
+#endif
+}
+
+static void studiofs_linux_fuse_set_capable_features(struct fuse_conn_info *conn,
+                                                     uint64_t features) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
+    conn->capable_ext = features;
+#else
+    conn->capable = (uint32_t)features;
+#endif
+}
+
 static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn) {
     if (conn == NULL) {
         return;
     }
+    const uint32_t requested_max_read = conn->max_read;
+    conn->max_read = requested_max_read == 0
+                         ? STUDIOFS_LINUX_FUSE_MAX_READ_SIZE
+                         : (requested_max_read < STUDIOFS_LINUX_FUSE_MAX_READ_SIZE
+                                ? requested_max_read
+                                : STUDIOFS_LINUX_FUSE_MAX_READ_SIZE);
+    if (conn->max_readahead > STUDIOFS_LINUX_FUSE_MAX_READ_SIZE) {
+        conn->max_readahead = STUDIOFS_LINUX_FUSE_MAX_READ_SIZE;
+    }
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
     if (studiofs_linux_fuse_connection_wants_async_dio(userdata)) {
-        (void)fuse_set_feature_flag(conn, FUSE_CAP_ASYNC_DIO);
+        (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_ASYNC_DIO);
     }
     if (studiofs_linux_fuse_connection_wants_writeback_cache(userdata)) {
-        (void)fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+        (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_WRITEBACK_CACHE);
+    }
+    if (userdata != NULL) {
+        studiofs_linux_fuse_record_connection(userdata,
+                                              STUDIOFS_LINUX_FUSE_MAX_READ_SIZE,
+                                              STUDIOFS_LINUX_FUSE_MAX_READ_SIZE,
+                                              conn->max_read,
+                                              conn->max_readahead,
+                                              conn->max_write,
+                                              conn->max_background,
+                                              conn->congestion_threshold,
+                                              studiofs_linux_fuse_capable_features(conn),
+                                              studiofs_linux_fuse_enabled_features(conn));
     }
 }
 
@@ -148,7 +239,11 @@ void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info,
     info->fh = fh;
     info->direct_io = direct_io != 0;
     info->keep_cache = keep_cache != 0;
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 15)
     info->parallel_direct_writes = parallel_direct_writes != 0;
+#else
+    (void)parallel_direct_writes;
+#endif
 }
 
 uint64_t studiofs_linux_fuse_file_info_fh(const struct fuse_file_info *info) {
@@ -164,6 +259,10 @@ int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_l
            ops->readdir && ops->releasedir && ops->statfs && ops->access;
 }
 
+int studiofs_linux_fuse_low_level_ops_has_forget_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops->forget != NULL;
+}
+
 int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
                                                     uint32_t max_background,
                                                     uint32_t congestion_threshold) {
@@ -173,22 +272,36 @@ int studiofs_linux_fuse_init_sets_bounded_background(void *userdata,
            conn.congestion_threshold == congestion_threshold;
 }
 
+uint32_t studiofs_linux_fuse_init_effective_max_read(uint32_t offered) {
+    struct fuse_conn_info conn = {0};
+    conn.max_read = offered;
+    studiofs_linux_fuse_init(NULL, &conn);
+    return conn.max_read;
+}
+
+uint32_t studiofs_linux_fuse_init_effective_max_readahead(uint32_t offered) {
+    struct fuse_conn_info conn = {0};
+    conn.max_readahead = offered;
+    studiofs_linux_fuse_init(NULL, &conn);
+    return conn.max_readahead;
+}
+
 int studiofs_linux_fuse_loop_config_uses_loop_config_api(void) {
     return FUSE_USE_VERSION >= 32;
 }
 
 int studiofs_linux_fuse_conn_wants_writeback_cache_after_set(uint64_t capable_ext) {
     struct fuse_conn_info conn = {0};
-    conn.capable_ext = capable_ext;
-    return fuse_set_feature_flag(&conn, FUSE_CAP_WRITEBACK_CACHE) &&
-           fuse_get_feature_flag(&conn, FUSE_CAP_WRITEBACK_CACHE);
+    studiofs_linux_fuse_set_capable_features(&conn, capable_ext);
+    return studiofs_linux_fuse_set_feature_flag_compat(&conn, FUSE_CAP_WRITEBACK_CACHE) &&
+           studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_WRITEBACK_CACHE);
 }
 
 int studiofs_linux_fuse_conn_wants_async_dio_after_set(uint64_t capable_ext) {
     struct fuse_conn_info conn = {0};
-    conn.capable_ext = capable_ext;
-    return fuse_set_feature_flag(&conn, FUSE_CAP_ASYNC_DIO) &&
-           fuse_get_feature_flag(&conn, FUSE_CAP_ASYNC_DIO);
+    studiofs_linux_fuse_set_capable_features(&conn, capable_ext);
+    return studiofs_linux_fuse_set_feature_flag_compat(&conn, FUSE_CAP_ASYNC_DIO) &&
+           studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_ASYNC_DIO);
 }
 
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {
@@ -208,8 +321,7 @@ int studiofs_linux_fuse_low_level_ops_has_posix_compat_callbacks(const struct fu
 int studiofs_linux_fuse_file_info_direct_io_after_init(void) {
     struct fuse_file_info info = {0};
     studiofs_linux_fuse_file_info_init(&info, 7, 1, 0, 0);
-    return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0 &&
-           info.parallel_direct_writes == 0;
+    return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0;
 }
 
 int studiofs_linux_fuse_file_info_flags_after_init(int direct_io,
@@ -217,6 +329,9 @@ int studiofs_linux_fuse_file_info_flags_after_init(int direct_io,
                                                    int parallel_direct_writes) {
     struct fuse_file_info info = {0};
     studiofs_linux_fuse_file_info_init(&info, 7, direct_io, keep_cache, parallel_direct_writes);
-    return (info.direct_io ? 1 : 0) | (info.keep_cache ? 2 : 0) |
-           (info.parallel_direct_writes ? 4 : 0);
+    int flags = (info.direct_io ? 1 : 0) | (info.keep_cache ? 2 : 0);
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 15)
+    flags |= info.parallel_direct_writes ? 4 : 0;
+#endif
+    return flags;
 }

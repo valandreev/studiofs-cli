@@ -182,7 +182,7 @@ Current Linux callbacks:
 | `lookup` | `lookup()` |
 | `getattr` | `getattr()` |
 | `setattr` | `setattr_with_handle()` |
-| `create` | `create()` + `open_created_file_with_known_attr()` |
+| `create` | deferred namespace admission + `open_created_file_with_known_attr()` |
 | `mkdir` | `mkdir()` |
 | `mknod` | `create()` for regular files; special files return `ENOTSUP` |
 | `symlink` | `symlink()` |
@@ -194,9 +194,10 @@ Current Linux callbacks:
 | `read` | `read_into_fh()` |
 | `readlink` | `readlink()` |
 | `write` | `write_fh_with_deferred_materialize()` |
-| `flush` | `flush_fh()` |
+| `flush` | async-write inode watermark + `flush_volatile_writeback_with_outcome()` |
 | `fsync` | `fsync_fh()` when handle-backed, otherwise `fsync()` |
-| `release` | `release_fh()` |
+| `release` | close handle admission, wait its write watermark, then `release_fh_with_deferred_last_handle_barrier()` |
+| `forget` | decrement successful entry/create lookup references |
 | `statfs` | `statfs()` |
 | `access` | `getattr()` + POSIX mode check |
 | `opendir` | `getattr()` directory check |
@@ -208,22 +209,31 @@ Current Linux callbacks:
 | `removexattr` | `remove_xattr()`; missing attributes return `ENODATA` |
 
 Linux ordinary `flush` and final `release` admit state to the shared volatile
-metadata worker; the batch age is bounded to one second.
+metadata worker; the batch age is bounded to one second. An async-write ledger
+uses sequence-number watermarks, so a barrier waits for earlier writes to its
+own inode or handle, never unrelated inodes or later writes.
 Linux `fsync` maps to the shared strict metadata sync boundary after any
 handle-local payload state is drained. The adapter only translates resulting
 errors to errno; queue draining and the redb barrier remain in shared VFS and
 metadata code.
 
-Linux regular-file opens use `direct_io` by default and keep kernel writeback
-caching out of the default path. The bridge installs the shared VFS
-`KernelInvalidator` through libfuse3 low-level inode notifications, so
-StudioFS attr/data invalidation signals still reach the kernel even when
-regular files use direct I/O. Callback dispatch runs through libfuse3's
-multithreaded low-level loop while the connection init callback caps the kernel
-background queue (`max_background=16`, `congestion_threshold=12`) so heavy
-callback workloads apply backpressure instead of growing unbounded request
-memory. The Linux bridge request can override those queue bounds before
-mounting. StudioFS uses the libfuse3 `fuse_loop_config` multithreaded loop API:
+Linux regular-file opens use the adaptive cache policy by default. Clean
+read-only handles use the kernel page cache when they fit available memory;
+write-capable, dirty, actively written, unknown, and larger-than-memory files
+use direct I/O. A stable content generation enables `keep_cache`; a first or
+changed generation replaces cached pages. Set
+`STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
+rollback.
+
+The bridge installs a bounded, coalescing invalidation worker through libfuse3
+low-level inode notifications. Successful entry/create replies and `forget`
+maintain lookup liveness, while open handles independently keep an inode live.
+Callback dispatch runs through libfuse3's multithreaded low-level loop while
+the connection init callback caps the kernel background queue
+(`max_background=128`, `congestion_threshold=96`) so heavy callback workloads
+apply backpressure instead of growing unbounded request memory. The Linux
+bridge request can override those queue bounds before mounting. StudioFS uses
+the libfuse3 `fuse_loop_config` multithreaded loop API:
 libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and an
 adaptive worker-pool limit based on available CPU parallelism, capped by the
 configured `max_background` queue. Older supported 3.x headers use the public
@@ -246,6 +256,8 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Linux `fsname` | volume name |
 | Linux `subtype` | `"studiofs"` |
 | Linux `auto_unmount` | Yes |
+| Linux cache policy | `adaptive`; `direct` rollback; explicit `kernel` mode |
+| Linux requested `max_read` / `max_readahead` | up to 4 MiB; negotiated values are recorded |
 | macOS `fsname` | `"studiofs"` |
 | macOS `auto_unmount` | Yes |
 | `allow_other` | macOS: yes |

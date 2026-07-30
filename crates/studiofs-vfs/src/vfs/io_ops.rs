@@ -4,6 +4,10 @@ use super::{
     block_index_from_offset, debug, error, format_object_fragment_keys, offset_within_block, warn,
 };
 
+fn direct_foreground_read_len(prepared_read_len: usize, caller_buffer_len: usize) -> usize {
+    prepared_read_len.min(caller_buffer_len)
+}
+
 impl StudioVfs {
     /// Read file data at the given offset.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
@@ -48,7 +52,7 @@ impl StudioVfs {
         }
         let mut buf = vec![0u8; prepared.read_len];
         let written = self
-            .execute_prepared_foreground_read(None, ino, offset, &mut buf, &prepared)
+            .execute_prepared_foreground_read(None, ino, offset, &mut buf, &prepared, None)
             .await?;
         buf.truncate(written as usize);
         Ok(Bytes::from(buf))
@@ -147,9 +151,10 @@ impl StudioVfs {
         {
             return Ok(read);
         }
-        let requested_len = if open_file.as_ref().is_some_and(|open_file| {
-            open_file.should_fill_read_window(offset, buffer.len(), FOREGROUND_READ_WINDOW_BYTES)
-        }) {
+        let read_window_token = open_file.as_ref().and_then(|open_file| {
+            open_file.arm_read_window_prefetch(offset, buffer.len(), FOREGROUND_READ_WINDOW_BYTES)
+        });
+        let requested_len = if read_window_token.is_some() {
             FOREGROUND_READ_WINDOW_BYTES
         } else {
             buffer.len()
@@ -193,19 +198,34 @@ impl StudioVfs {
             }
             return Ok(0);
         }
-        let written = if prepared.read_len <= buffer.len() {
+        let read_window_is_current = read_window_token.is_some_and(|token| {
+            open_file
+                .as_ref()
+                .is_some_and(|open_file| open_file.is_read_ahead_token_current(token))
+        });
+        let written = if prepared.read_len <= buffer.len() || !read_window_is_current {
+            let direct_len = direct_foreground_read_len(prepared.read_len, buffer.len());
             self.execute_prepared_foreground_read(
                 fh,
                 ino,
                 offset,
-                &mut buffer[..prepared.read_len],
+                &mut buffer[..direct_len],
                 &prepared,
+                None,
             )
             .await?
         } else {
             let mut window = vec![0u8; prepared.read_len];
+            let token = read_window_token.expect("current speculative read has an owner token");
             let written = self
-                .execute_prepared_foreground_read(fh, ino, offset, &mut window, &prepared)
+                .execute_prepared_foreground_read(
+                    fh,
+                    ino,
+                    offset,
+                    &mut window,
+                    &prepared,
+                    Some((token, buffer.len())),
+                )
                 .await?;
             window.truncate(written);
             let read = buffer.len().min(window.len());
@@ -453,5 +473,31 @@ impl StudioVfs {
     /// Drops all detail and only reports success/failure of the flush attempt.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         self.flush_with_outcome(ino).await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{OpenFile, OpenFlags, ReadAheadOwner};
+    use super::direct_foreground_read_len;
+
+    #[test]
+    fn kernel_switch_after_oversized_window_prepare_uses_caller_buffer() {
+        let open_file = OpenFile::new(7, 42, OpenFlags::RDONLY, None, false);
+        open_file.record_read_progress(0, 128);
+        let armed = open_file
+            .arm_read_window_prefetch(128, 128, 4096)
+            .expect("sequential VFS-owned read arms the speculative window");
+        let prepared_read_len = 4096;
+        let mut caller_buffer = [0_u8; 128];
+
+        open_file.set_read_ahead_owner(ReadAheadOwner::Kernel);
+        assert!(!open_file.is_read_ahead_token_current(armed));
+
+        let direct_len = direct_foreground_read_len(prepared_read_len, caller_buffer.len());
+        caller_buffer[..direct_len].fill(1);
+
+        assert_eq!(direct_len, caller_buffer.len());
+        assert!(caller_buffer.iter().all(|byte| *byte == 1));
     }
 }

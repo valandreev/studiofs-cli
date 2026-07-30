@@ -2,6 +2,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
 
 use proc_macro2::LineColumn;
@@ -657,6 +658,7 @@ fn validation_docs_drop_durable_mode_callback_wording() {
 #[test]
 fn e2e_runner_contract_covers_required_sfs341_surfaces() {
     let doc = read_workspace_file("docs/e2e-runner-contract.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
         "# Real E2E Runner Contract",
         "## Runner Boundaries And CLI",
@@ -680,7 +682,8 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
         "cleanup",
         "## Preflight Gates",
         "Docker",
-        "Linux mounted runs are disabled after SFS-600",
+        "Linux mounted runs require `/dev/fuse`",
+        "missing mount prerequisites fail preflight explicitly",
         "WinFSP",
         "macFUSE",
         "floating RustFS tag",
@@ -698,7 +701,7 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
     let missing: Vec<_> = required_terms
         .iter()
         .copied()
-        .filter(|term| !doc.contains(term))
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 
     assert!(
@@ -958,10 +961,9 @@ fn local_first_validation_matrix_covers_sfs610_linux_release_gate() {
         "large sequential write",
         "upload/backpressure observability",
         "Unity/Unreal-style project tree workloads",
-        "fuser",
-        "is only a baseline/comparison path",
+        "`direct` is the tested operational rollback",
         "/dev/fuse",
-        "remains only a fallback",
+        "no longer a separate runtime profile",
         "validate-bench-linux.sh",
         "studiofs devbench",
         "target/perf",
@@ -1079,6 +1081,142 @@ fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
         missing.is_empty(),
         "SFS-402 baseline audit is missing required surfaces:\n{}",
         missing.join("\n")
+    );
+}
+
+#[test]
+fn linux_adaptive_perf_gate_covers_mandatory_workloads_and_phase_checks() {
+    let script = read_workspace_file("tools/perf/linux-juicefs-parity-gate.sh");
+    let required_terms = [
+        "cold-sequential-read",
+        "repeated-warm-read",
+        "random-read",
+        "larger-than-memory-read",
+        "inode-barrier-isolation",
+        "small-files-4kib",
+        "small-files-16kib",
+        "small-files-64kib",
+        "write_ms",
+        "read_stat_ms",
+        "cleanup_ms",
+        "phase_checks",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !script.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "Linux adaptive performance gate is missing mandatory coverage:\n{}",
+        missing.join("\n")
+    );
+
+    let fixture =
+        studiofs_test_support::workspace_target_tempdir("linux-cache-gate-report-fixture-");
+    let targets = [
+        "local",
+        "studiofs_feature_direct",
+        "studiofs_main_direct",
+        "studiofs_feature_adaptive",
+        "juicefs",
+    ];
+    let workloads = [
+        "repeated-warm-read",
+        "inode-barrier-isolation",
+        "small-files-4kib",
+    ];
+    for target in targets {
+        for workload in workloads {
+            let run_dir = fixture.path().join(target).join(workload).join("run-001");
+            fs::create_dir_all(&run_dir).expect("create performance gate fixture directory");
+
+            let (wall_ms, fsync_p95_ms) = match (target, workload) {
+                ("studiofs_feature_adaptive", "repeated-warm-read") => (90.0, None),
+                ("studiofs_feature_direct", "inode-barrier-isolation") => (100.0, Some(20.0)),
+                (_, "inode-barrier-isolation") => (100.0, Some(10.0)),
+                _ => (100.0, None),
+            };
+            fs::write(
+                run_dir.join("metrics.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "status": 0,
+                    "wall_ms": wall_ms,
+                    "fsync_p95_ms": fsync_p95_ms,
+                }))
+                .expect("serialize performance gate metrics"),
+            )
+            .expect("write performance gate metrics");
+
+            let read_stat_ms =
+                if target == "studiofs_feature_adaptive" && workload == "small-files-4kib" {
+                    200.0
+                } else {
+                    100.0
+                };
+            fs::write(
+                run_dir.join("stdout.txt"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "write_ms": 100.0,
+                        "read_stat_ms": read_stat_ms,
+                        "cleanup_ms": 100.0,
+                    })
+                ),
+            )
+            .expect("write performance gate stdout fixture");
+        }
+    }
+
+    let script_path = repo_root().join("tools/perf/linux-juicefs-parity-gate.sh");
+    let output = Command::new("bash")
+        .arg(script_path)
+        .args([
+            "--local-target",
+            "/tmp",
+            "--studiofs-new-target",
+            "/tmp",
+            "--studiofs-old-target",
+            "/tmp",
+            "--studiofs-adaptive-target",
+            "/tmp",
+            "--juicefs-target",
+            "/tmp",
+        ])
+        .env("STUDIOFS_PERF_REPORT_ONLY_DIR", fixture.path())
+        .env("STUDIOFS_PERF_REPORT_WORKLOADS", workloads.join(" "))
+        .output()
+        .expect("run fixture-backed performance report");
+    assert!(
+        !output.status.success(),
+        "fixture contains barrier-tail and small-file phase regressions"
+    );
+
+    let gate: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.path().join("gate.json")).expect("read fixture gate"),
+    )
+    .expect("parse fixture gate");
+    let comparisons = gate["comparisons"]
+        .as_array()
+        .expect("gate comparisons should be an array");
+    let barrier = comparisons
+        .iter()
+        .find(|item| item["workload"] == "inode-barrier-isolation")
+        .expect("barrier comparison");
+    assert_eq!(
+        barrier["checks"]["fsync_p95_direct_median_vs_main"], false,
+        "barrier fsync p95 regression must fail the gate"
+    );
+    let small_files = comparisons
+        .iter()
+        .find(|item| item["workload"] == "small-files-4kib")
+        .expect("small-file comparison");
+    assert_eq!(
+        small_files["phase_checks"]["read_stat_ms"]["adaptive_median_vs_direct"], false,
+        "a small-file phase regression must fail the gate"
     );
 }
 

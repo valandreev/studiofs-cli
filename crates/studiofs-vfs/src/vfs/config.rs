@@ -36,6 +36,7 @@ use crate::vfs::{
     FOREGROUND_READ_SPEEDOMETER_SHARDS, MIN_UPLOAD_WORKER_COUNT,
 };
 
+use super::os_cache::{OsCacheForegroundHandleLease, OsCacheWriterLease};
 use super::{OpenFile, VfsError, VfsResult};
 
 /// Maximum runtime dirty budget for large cache classes.
@@ -151,6 +152,10 @@ pub(super) struct HandleReleaseContext {
     pub(super) open_file: OpenFile,
     /// Inode associated with the handle.
     pub(super) ino: Ino,
+    /// Writer participation retained through the final local barrier.
+    pub(super) os_cache_writer_lease: Option<OsCacheWriterLease>,
+    /// Foreground read participation retained through the final local barrier.
+    pub(super) os_cache_foreground_read_lease: Option<OsCacheForegroundHandleLease>,
 }
 
 /// Target inode and open-handle count for unlink handling.

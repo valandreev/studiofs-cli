@@ -656,6 +656,8 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
+        let (os_cache_writer_lease, os_cache_foreground_read_lease) =
+            open_file.take_os_cache_release_lifetimes();
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
         if open_file.active_open_overlay {
@@ -669,6 +671,8 @@ impl StudioVfs {
         self.clear_access_tracking_for_stream(ino, stream_id);
         self.debug_pending_inode_state(ino, "release_handle_closed");
         if remaining > 0 {
+            drop(os_cache_writer_lease);
+            drop(os_cache_foreground_read_lease);
             return None;
         }
         if self.inode_has_local_dirty_state(ino) {
@@ -676,7 +680,12 @@ impl StudioVfs {
         }
         self.flush_deferred_kernel_invalidations(ino);
         self.debug_pending_inode_state(ino, "release_last_handle");
-        Some(HandleReleaseContext { open_file, ino })
+        Some(HandleReleaseContext {
+            open_file,
+            ino,
+            os_cache_writer_lease,
+            os_cache_foreground_read_lease,
+        })
     }
 
     async fn cleanup_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
@@ -851,7 +860,9 @@ impl StudioVfs {
     ) -> VfsResult<ReleaseFhOutcome> {
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
-        self.execute_last_handle_release_action(ino, action).await
+        let result = self.execute_last_handle_release_action(ino, action).await;
+        drop(context);
+        result
     }
 
     /// Release a handle and report whether this close owned the actual
@@ -907,9 +918,16 @@ impl StudioVfs {
                 flushed_local_dirty_state: false,
             };
         }
+        let HandleReleaseContext {
+            os_cache_writer_lease,
+            os_cache_foreground_read_lease,
+            ..
+        } = context;
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
+            let _os_cache_writer_lease = os_cache_writer_lease;
+            let _os_cache_foreground_read_lease = os_cache_foreground_read_lease;
             tokio::task::yield_now().await;
             let session = vfs
                 .state

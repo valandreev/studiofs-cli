@@ -4906,6 +4906,7 @@ dependencies = [
  "studiofs-bridge",
  "studiofs-meta",
  "studiofs-vfs",
+ "sysinfo",
  "tokio",
  "tracing",
 ]

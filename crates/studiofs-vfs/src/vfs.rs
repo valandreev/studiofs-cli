@@ -40,6 +40,7 @@ mod metrics;
 mod misc_ops;
 mod namespace;
 mod namespace_ops;
+mod os_cache;
 mod overlay;
 mod prefetch;
 mod read_context;
@@ -58,6 +59,7 @@ pub use config::{
     ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
     VfsConfigValidated,
 };
+pub use file_session::ReadAheadOwner;
 /// File session primitives returned by open operations and reported by diagnostics.
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
 /// Public handle-drain barrier types and ports.
@@ -74,8 +76,9 @@ pub use metrics::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
-    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseIoStats,
-    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
+    VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane,
+    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
     VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
     VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats, VfsReadPathStats,
     VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
@@ -91,6 +94,7 @@ pub use metrics::{
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
+pub use os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason};
 pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
@@ -110,11 +114,12 @@ use config::{
     PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
     WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
-use file_session::{FileSessionOperation, FileSessionState};
+use file_session::{FileSessionOperation, FileSessionState, ReadAheadToken};
 use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
+use os_cache::{OsCacheForegroundHandleLease, OsCacheGeneration, OsCacheState, OsCacheWriterLease};
 use overlay::ExtentRecordId;
 use prefetch::{
     PrefetchBatch, PrefetchHintRange, PrefetchHintUpdate, PrefetchReadContext, PrefetchWorkItem,
@@ -2844,6 +2849,9 @@ impl VfsState {
             fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
+            linux_fuse_open_cache: Mutex::new(VfsLinuxFuseOpenCacheStats::default()),
+            fuse_invalidation_snapshot: Mutex::new(VfsFuseInvalidationSnapshot::default()),
+            fuse_connection_snapshot: Mutex::new(VfsFuseConnectionSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: DeferredInodeGate::default(),
@@ -2903,6 +2911,9 @@ struct VfsState {
     fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
+    linux_fuse_open_cache: Mutex<VfsLinuxFuseOpenCacheStats>,
+    fuse_invalidation_snapshot: Mutex<VfsFuseInvalidationSnapshot>,
+    fuse_connection_snapshot: Mutex<VfsFuseConnectionSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -3449,6 +3460,8 @@ pub struct StudioVfs {
     landing_zone: LandingZone,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
+    /// Bounded generation snapshots and active writer participation.
+    os_cache: Arc<Mutex<OsCacheState>>,
     /// Optional distributed lease for janitor leader election.
     janitor_lease: Option<JanitorLease>,
     janitor_interval: Duration,
@@ -4394,6 +4407,9 @@ impl StudioVfs {
             self.state.fuse_async_write_raw_snapshot.lock().clone();
         *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
         *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
+        *self.state.linux_fuse_open_cache.lock() = VfsLinuxFuseOpenCacheStats::default();
+        *self.state.fuse_invalidation_snapshot.lock() = VfsFuseInvalidationSnapshot::default();
+        *self.state.fuse_connection_snapshot.lock() = VfsFuseConnectionSnapshot::default();
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -4741,10 +4757,7 @@ impl StudioVfs {
     ) {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
-        let foreground_active = self
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace);
+        let foreground_active = self.foreground_io_active();
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -6446,6 +6459,24 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    fn foreground_io_active(&self) -> bool {
+        if self
+            .state
+            .read
+            .foreground_io_active(now_unix_millis(), self.upload_user_idle_grace)
+        {
+            return true;
+        }
+        self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
+    fn foreground_reads_active(&self) -> bool {
+        self.state
+            .read
+            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace)
+            || self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
     /// Mark a platform read-only handle as active foreground I/O.
     pub fn begin_foreground_read_handle(&self) {
         self.state.read.mark_foreground_read(now_unix_millis());
@@ -6460,12 +6491,7 @@ impl StudioVfs {
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            let now_ms = now_unix_millis();
-            if !self
-                .state
-                .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
-            {
+            if !self.foreground_reads_active() {
                 return true;
             }
 
@@ -6474,13 +6500,10 @@ impl StudioVfs {
                 return false;
             }
 
-            let notified = self.state.read.foreground_idle_notify.notified();
-            let now_ms = now_unix_millis();
-            if !self
-                .state
-                .read
-                .foreground_read_active(now_ms, self.upload_user_idle_grace)
-            {
+            let read_notified = self.state.read.foreground_idle_notify.notified();
+            let os_cache_notify = self.os_cache.lock().idle_notifier();
+            let os_cache_notified = os_cache_notify.notified();
+            if !self.foreground_reads_active() {
                 return true;
             }
 
@@ -6493,6 +6516,12 @@ impl StudioVfs {
                 return false;
             }
 
+            let notified = async {
+                tokio::select! {
+                    () = read_notified => {}
+                    () = os_cache_notified => {}
+                }
+            };
             let _ = tokio::time::timeout(wait_slice, notified).await;
         }
     }
@@ -7489,6 +7518,59 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    /// Record one Linux FUSE open-cache decision for mounted diagnostics.
+    pub fn record_linux_fuse_open_cache_decision(
+        &self,
+        direct_io: bool,
+        disposition: OsCacheDisposition,
+        reason: OsCacheReason,
+        memory_bypassed: bool,
+    ) {
+        let mut stats = self.state.linux_fuse_open_cache.lock();
+        stats.total = stats.total.saturating_add(1);
+        if direct_io {
+            stats.direct_opens = stats.direct_opens.saturating_add(1);
+        } else {
+            stats.kernel_opens = stats.kernel_opens.saturating_add(1);
+        }
+        match disposition {
+            OsCacheDisposition::Reuse => stats.reuse = stats.reuse.saturating_add(1),
+            OsCacheDisposition::Replace => stats.replace = stats.replace.saturating_add(1),
+        }
+        if memory_bypassed {
+            stats.memory_bypasses = stats.memory_bypasses.saturating_add(1);
+        }
+        let reason_counter = match reason {
+            OsCacheReason::Disabled => &mut stats.disabled,
+            OsCacheReason::WriteCapable => &mut stats.write_capable,
+            OsCacheReason::UnknownState => &mut stats.unknown_state,
+            OsCacheReason::UnknownHandle => &mut stats.unknown_handle,
+            OsCacheReason::NonRegular => &mut stats.non_regular,
+            OsCacheReason::LocalDirty => &mut stats.local_dirty,
+            OsCacheReason::ActiveWriter => &mut stats.active_writer,
+            OsCacheReason::FirstObservation => &mut stats.first_observation,
+            OsCacheReason::GenerationChanged => &mut stats.generation_changed,
+            OsCacheReason::StableGeneration => &mut stats.stable_generation,
+        };
+        *reason_counter = reason_counter.saturating_add(1);
+    }
+
+    /// Replace Linux FUSE invalidation diagnostics unless the update is stale.
+    pub fn record_fuse_invalidation_snapshot(&self, snapshot: VfsFuseInvalidationSnapshot) {
+        let mut current = self.state.fuse_invalidation_snapshot.lock();
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            *current = snapshot;
+        }
+    }
+
+    /// Replace negotiated Linux FUSE connection diagnostics unless the update is stale.
+    pub fn record_fuse_connection_snapshot(&self, snapshot: VfsFuseConnectionSnapshot) {
+        let mut current = self.state.fuse_connection_snapshot.lock();
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            *current = snapshot;
+        }
+    }
+
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut raw = self.state.fuse_async_write_raw_snapshot.lock();
@@ -7521,13 +7603,19 @@ impl StudioVfs {
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
             current.pending_writes = snapshot.pending_writes;
             current.pending_bytes = snapshot.pending_bytes;
+            current.pending_handles = snapshot.pending_handles;
+            current.pending_writes_per_inode = snapshot.pending_writes_per_inode;
             current.peak_pending_bytes = snapshot.peak_pending_bytes;
             current.completed_writes = snapshot.completed_writes;
             current.failed_writes = snapshot.failed_writes;
             current.task_failed_writes = snapshot.task_failed_writes;
+            current.canceled_writes = snapshot.canceled_writes;
+            current.shutdown_timeouts = snapshot.shutdown_timeouts;
             current.admission_waits = snapshot.admission_waits;
             current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
             current.barrier_waits = snapshot.barrier_waits;
+            current.inode_barrier_waits = snapshot.inode_barrier_waits;
+            current.handle_barrier_waits = snapshot.handle_barrier_waits;
             current.barrier_wait_total_ms = snapshot.barrier_wait_total_ms;
         }
     }
@@ -7557,6 +7645,12 @@ impl StudioVfs {
         snapshot.task_failed_writes = snapshot
             .task_failed_writes
             .saturating_sub(baseline.task_failed_writes);
+        snapshot.canceled_writes = snapshot
+            .canceled_writes
+            .saturating_sub(baseline.canceled_writes);
+        snapshot.shutdown_timeouts = snapshot
+            .shutdown_timeouts
+            .saturating_sub(baseline.shutdown_timeouts);
         snapshot.admission_waits = snapshot
             .admission_waits
             .saturating_sub(baseline.admission_waits);
@@ -7567,6 +7661,12 @@ impl StudioVfs {
         snapshot.barrier_waits = snapshot
             .barrier_waits
             .saturating_sub(baseline.barrier_waits);
+        snapshot.inode_barrier_waits = snapshot
+            .inode_barrier_waits
+            .saturating_sub(baseline.inode_barrier_waits);
+        snapshot.handle_barrier_waits = snapshot
+            .handle_barrier_waits
+            .saturating_sub(baseline.handle_barrier_waits);
         snapshot.barrier_wait_total_ms = Self::subtract_fuse_async_write_baseline_ms(
             snapshot.barrier_wait_total_ms,
             baseline.barrier_wait_total_ms,
@@ -8656,6 +8756,9 @@ impl StudioVfs {
                         macfuse_open_cache_local_stable_write_release_seeded,
                 }
             },
+            linux_fuse_open_cache: self.state.linux_fuse_open_cache.lock().clone(),
+            fuse_invalidation: self.state.fuse_invalidation_snapshot.lock().clone(),
+            fuse_connection: self.state.fuse_connection_snapshot.lock().clone(),
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {
@@ -8996,12 +9099,186 @@ impl StudioVfs {
     // File Handle Operations
     // =========================================================================
 
+    /// Prepare one file handle for participation in a platform OS page cache.
+    ///
+    /// The decision is idempotent for the handle. Bridges must call
+    /// [`Self::abort_os_cache_open`] when the corresponding open reply is not
+    /// accepted so the tentative generation cannot be reused. The caller must
+    /// serialize preparation through acceptance or rejection of the platform
+    /// reply for each inode. No bridge should consume this seam until it owns
+    /// that keyed reply-serialization boundary.
+    pub fn prepare_os_cache_open(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+    ) -> OsCacheOpenDecision {
+        self.prepare_os_cache_open_inner(fh, participation, None)
+    }
+
+    /// Prepare an OS-cache decision from the attribute snapshot used for the platform reply.
+    ///
+    /// Read-only bridge paths should use this variant after refreshing local
+    /// attributes so cache identity, reply attributes, and memory policy all
+    /// describe the same metadata view.
+    pub fn prepare_os_cache_open_with_attr(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+        refreshed_attr: &InodeAttr,
+    ) -> OsCacheOpenDecision {
+        self.prepare_os_cache_open_inner(fh, participation, Some(refreshed_attr))
+    }
+
+    fn prepare_os_cache_open_inner(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+        refreshed_attr: Option<&InodeAttr>,
+    ) -> OsCacheOpenDecision {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
+        };
+        let ino = open_file.ino;
+        open_file.prepare_os_cache_once(
+            || OsCacheForegroundHandleLease::begin(Arc::clone(&self.os_cache)),
+            |writer_registered| {
+                if participation == OsCacheParticipation::Disabled {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::Disabled);
+                }
+                if writer_registered {
+                    return OsCacheOpenDecision::replace(OsCacheReason::WriteCapable);
+                }
+                let handle_attr;
+                let attr = if let Some(attr) = refreshed_attr {
+                    attr
+                } else {
+                    handle_attr = open_file.open_attr();
+                    let Some(attr) = handle_attr.as_ref() else {
+                        self.os_cache.lock().clear_generation(ino);
+                        return OsCacheOpenDecision::replace(OsCacheReason::UnknownState);
+                    };
+                    attr
+                };
+                if attr.kind != FileType::RegularFile {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::NonRegular);
+                }
+                {
+                    let mut os_cache = self.os_cache.lock();
+                    if os_cache.has_active_writer(ino) {
+                        os_cache.clear_generation(ino);
+                        return OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter);
+                    }
+                }
+                if self.inode_has_local_dirty_state(ino) {
+                    self.os_cache.lock().clear_generation(ino);
+                    return OsCacheOpenDecision::replace(OsCacheReason::LocalDirty);
+                }
+                let generation = self
+                    .sync_meta()
+                    .lookup_regular_file_slices(ino, 0, attr.size)
+                    .ok()
+                    .map(|spans| OsCacheGeneration::new(attr.content_epoch, attr.size, &spans));
+                self.os_cache
+                    .lock()
+                    .prepare_read(ino, participation, generation)
+            },
+        )
+    }
+
+    /// Roll back a prepared cache-open decision rejected by a platform bridge.
+    pub fn abort_os_cache_open(&self, fh: u64) {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return;
+        };
+        open_file.abort_os_cache_lifecycle();
+        self.os_cache.lock().clear_generation(open_file.ino);
+    }
+
+    pub(super) fn retire_os_cache_inode(&self, ino: Ino) {
+        self.os_cache.lock().clear_generation(ino);
+    }
+
+    fn register_os_cache_writer(&self, open_file: &OpenFile, write_capable: bool) {
+        if write_capable {
+            open_file.install_os_cache_writer_lease(OsCacheWriterLease::begin(
+                open_file.ino,
+                Arc::clone(&self.os_cache),
+            ));
+        }
+    }
+
+    /// Return the current speculative-read owner for an open handle.
+    ///
+    /// `None` means the handle is unknown or has already been released.
+    pub fn read_ahead_owner(&self, fh: u64) -> Option<ReadAheadOwner> {
+        self.handle_table
+            .get(fh)
+            .map(|open_file| open_file.read_ahead_owner())
+    }
+
+    /// Change the speculative-read owner for an open handle.
+    ///
+    /// Switching to [`ReadAheadOwner::Kernel`] synchronously drops the
+    /// handle-local read window and retires its adaptive-prefetch stream.
+    /// Switching from kernel ownership to VFS ownership schedules the eager
+    /// first-block prefetch that was intentionally suppressed during open.
+    /// The owner mutation is linearized against handle release while the
+    /// handle-table lock is held. Returns `false` when release won that
+    /// race; `true` means the handle was live at the mutation point, though a
+    /// later release may of course occur immediately afterwards.
+    pub fn set_read_ahead_owner(&self, fh: u64, owner: ReadAheadOwner) -> bool {
+        let Some((open_file, previous, owner_token)) =
+            self.handle_table.set_read_ahead_owner_if_live(fh, owner)
+        else {
+            return false;
+        };
+        if owner == ReadAheadOwner::Kernel {
+            self.clear_access_tracking_for_stream(open_file.ino, open_file.stream_id());
+        } else if previous == ReadAheadOwner::Kernel
+            && !self.is_runtime_stats_file_ino(open_file.ino)
+            && let Some(attr) = open_file.open_attr()
+            && attr.kind == studiofs_meta::types::FileType::RegularFile
+            && attr.size > 0
+            && (open_file.flags.contains(OpenFlags::RDONLY)
+                || open_file.flags.contains(OpenFlags::RDWR))
+        {
+            let Some(owner_token) = owner_token else {
+                return true;
+            };
+            let read_context = self.prefetch_read_context_from_attr(open_file.ino, &attr);
+            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+                PrefetchBatch::single(open_file.ino, 0, Some(read_context))
+                    .with_owner_token(Some(owner_token)),
+            ));
+        }
+        true
+    }
+
+    pub(in crate::vfs) fn read_ahead_token_is_current(&self, token: ReadAheadToken) -> bool {
+        self.handle_table
+            .get(token.fh)
+            .is_some_and(|open_file| open_file.is_read_ahead_token_current(token))
+    }
+
     /// Open a file and allocate a file handle.
     ///
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        self.open_file_resolved(ino, flags, trunc, None, true)
+        self.open_file_with_read_ahead_owner(ino, flags, trunc, ReadAheadOwner::Vfs)
+    }
+
+    /// Open a file with the readahead owner installed before eager scheduling.
+    pub fn open_file_with_read_ahead_owner(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(ino, flags, trunc, None, true, read_ahead_owner)
     }
 
     /// Open a file when the caller already has a fresh inode attr from create.
@@ -9011,7 +9288,25 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
     ) -> VfsResult<u64> {
-        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), true)
+        self.open_file_with_known_attr_and_read_ahead_owner(attr, flags, trunc, ReadAheadOwner::Vfs)
+    }
+
+    /// Open a known inode with the readahead owner installed before eager scheduling.
+    pub fn open_file_with_known_attr_and_read_ahead_owner(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(
+            attr.ino,
+            flags,
+            trunc,
+            Some(attr.clone()),
+            true,
+            read_ahead_owner,
+        )
     }
 
     /// Open a file that was just created by this mount operation.
@@ -9026,7 +9321,31 @@ impl StudioVfs {
         flags: OpenFlags,
         trunc: bool,
     ) -> VfsResult<u64> {
-        self.open_file_resolved(attr.ino, flags, trunc, Some(attr.clone()), false)
+        self.open_created_file_with_known_attr_and_read_ahead_owner(
+            attr,
+            flags,
+            trunc,
+            ReadAheadOwner::Vfs,
+        )
+    }
+
+    /// Open a newly-created inode with its readahead owner installed before
+    /// eager scheduling.
+    pub fn open_created_file_with_known_attr_and_read_ahead_owner(
+        &self,
+        attr: &InodeAttr,
+        flags: OpenFlags,
+        trunc: bool,
+        read_ahead_owner: ReadAheadOwner,
+    ) -> VfsResult<u64> {
+        self.open_file_resolved(
+            attr.ino,
+            flags,
+            trunc,
+            Some(attr.clone()),
+            false,
+            read_ahead_owner,
+        )
     }
 
     fn open_file_resolved(
@@ -9036,6 +9355,7 @@ impl StudioVfs {
         trunc: bool,
         known_attr: Option<InodeAttr>,
         check_authority: bool,
+        read_ahead_owner: ReadAheadOwner,
     ) -> VfsResult<u64> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::OpenFile);
         let required_access = if Self::write_access_requested(flags, trunc) {
@@ -9055,6 +9375,8 @@ impl StudioVfs {
                 self.handle_table
                     .open(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
+            open_file.set_read_ahead_owner(read_ahead_owner);
+            self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
             if active_open_overlay {
                 self.sync_meta().note_active_open_inode(ino);
             }
@@ -9099,6 +9421,8 @@ impl StudioVfs {
             active_open_overlay,
         );
         let fh = open_file.fh;
+        open_file.set_read_ahead_owner(read_ahead_owner);
+        self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
         if active_open_overlay {
             self.sync_meta().note_active_open_inode(ino);
         }
@@ -9112,16 +9436,16 @@ impl StudioVfs {
         // Eager prefetch: when opening a regular file for reading, schedule
         // background prefetch of the first block to hide initial S3 latency.
         if read_context.attr.kind == studiofs_meta::types::FileType::RegularFile
+            && !self.is_runtime_stats_file_ino(ino)
             && read_context.attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
+            && read_ahead_owner == ReadAheadOwner::Vfs
         {
-            let _ = self
-                .prefetch_tx
-                .send(PrefetchWorkItem::Batch(PrefetchBatch::single(
-                    ino,
-                    0,
-                    Some(read_context.prefetch_context()),
-                )));
+            let owner_token = open_file.vfs_read_ahead_token();
+            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+                PrefetchBatch::single(ino, 0, Some(read_context.prefetch_context()))
+                    .with_owner_token(owner_token),
+            ));
         }
 
         Ok(fh)

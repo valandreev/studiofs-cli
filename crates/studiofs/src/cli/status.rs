@@ -1057,6 +1057,7 @@ mod tests {
             eager_flush: Default::default(),
             tuning: Default::default(),
             allocator: None,
+            ..Default::default()
         };
         std::fs::write(&metrics_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 

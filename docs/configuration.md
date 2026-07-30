@@ -175,8 +175,27 @@ Notes:
 - Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - AIMD fetch/upload windows reset to their initial window after an idle gap by default. Advanced tuning can set `fetch_idle_reset_secs` and `upload_idle_reset_secs` independently; `0` disables idle reset for that traffic class.
-- On Windows and macOS, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
-- Linux mount is not implemented after SFS-600; the legacy raw `/dev/fuse` bridge and `STUDIOFS_FUSE_ASYNC_*` toggles are removed.
+- On Windows, macOS, and Linux, StudioFS uses the standard Local-First runtime
+  path for every mount. Foreground `flush()` / `close()` confirm local
+  acceptance while upload and file-version publication continue
+  asynchronously. Linux `create` uses deferred metadata admission; ordinary
+  `flush` and final `release` use the volatile/deferred local durability paths,
+  while `fsync`/`fdatasync` remain strict local barriers without remote
+  publication.
+- Linux mounts use the libfuse3 low-level bridge. Current
+  `STUDIOFS_FUSE_ASYNC_WRITE`, `STUDIOFS_FUSE_ASYNC_WRITE_DISABLED`, and
+  `STUDIOFS_FUSE_ASYNC_DIO` compatibility toggles remain supported; removed
+  raw-transport queue/profile tuning is not restored.
+- `STUDIOFS_LINUX_FUSE_CACHE_POLICY=adaptive` is the Linux default. Clean,
+  read-only files participate in the kernel page cache when their size does
+  not exceed sampled available memory; write-capable, dirty, actively written,
+  unknown, or larger-than-memory files use direct I/O. Set `direct` (or a
+  retained direct-mode alias) and remount for the operational rollback.
+  `kernel` enables kernel caching/writeback capability explicitly. Unset,
+  empty, `adaptive`, `auto`, and unknown values select adaptive; unknown values
+  also emit a warning. Retained direct aliases are `direct_io`, `dio`, `0`,
+  `false`, `no`, and `off`; retained kernel aliases are `cached`,
+  `page_cache`, `1`, `true`, `yes`, and `on`.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

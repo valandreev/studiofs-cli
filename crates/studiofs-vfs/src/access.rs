@@ -156,6 +156,14 @@ impl AccessPolicy {
             prefetch_enabled: self.prefetch_enabled,
         }
     }
+
+    pub(crate) fn without_prefetch(mut self) -> Self {
+        self.prefetch_enabled = false;
+        self.readahead_base_width = 0;
+        self.readahead_max_width = 0;
+        self.readahead_min_prefetch = 0;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

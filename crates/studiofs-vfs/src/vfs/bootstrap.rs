@@ -496,6 +496,7 @@ impl VfsBootstrap {
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             landing_zone: resources.landing_zone,
             handle_table: HandleTable::new(),
+            os_cache: Arc::new(Mutex::new(OsCacheState::default())),
             janitor_lease: None,
             janitor_interval: plan.janitor_interval,
             janitor_skip_newer_than: plan.janitor_skip_newer_than,

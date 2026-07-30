@@ -1,18 +1,37 @@
 use super::*;
+use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::async_writes::{
+    AsyncWriteLedger, AsyncWriteMetricsSnapshot, AsyncWriteTicket, BarrierOutcome,
+    DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_WRITES,
+};
+use crate::cache_policy::{
+    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBufferPool,
+    SystemMemorySampler, decide_open_cache,
+};
+use crate::invalidation::{
+    FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
+    FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
+    FuseInvalidationShutdownOutcome, FuseInvalidationWorker, FuseLookupReservation,
+    FuseOpenHandleGuard,
+};
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use studiofs_bridge::fuse_open_reply::FuseOpenReplySerializer;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs,
+    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs,
+    StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -20,9 +39,12 @@ use tracing::{debug, warn};
 const TTL_SECONDS: f64 = 1.0;
 const LINUX_FUSE_BLOCK_SIZE: u32 = 4096;
 const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
-const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
-const LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES: usize = 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const NAMESPACE_ATTR_INVALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
+const ASYNC_WRITE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Raw invalidation, lookup/open liveness, and generation retirement are wired,
+// so unset Linux mounts can safely use the requested adaptive default.
+const LINUX_FUSE_ADAPTIVE_DEFAULT_READY: bool = true;
 const FUSE_SET_ATTR_MODE: c_int = 1 << 0;
 const FUSE_SET_ATTR_UID: c_int = 1 << 1;
 const FUSE_SET_ATTR_GID: c_int = 1 << 2;
@@ -69,6 +91,7 @@ pub(crate) mod raw {
     #[link(name = "fuse3")]
     unsafe extern "C" {
         pub(crate) fn fuse_reply_err(req: *mut FuseReq, err: c_int) -> c_int;
+        pub(crate) fn fuse_reply_none(req: *mut FuseReq);
         pub(crate) fn fuse_reply_entry(req: *mut FuseReq, entry: *const FuseEntryParam) -> c_int;
         pub(crate) fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: f64) -> c_int;
         pub(crate) fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
@@ -151,11 +174,19 @@ unsafe extern "C" {
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_low_level_ops_has_forget_callback(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_init_sets_bounded_background(
         userdata: *mut c_void,
         max_background: u32,
         congestion_threshold: u32,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_init_effective_max_read(offered: u32) -> u32;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_init_effective_max_readahead(offered: u32) -> u32;
     #[cfg(test)]
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
     #[cfg(test)]
@@ -175,26 +206,29 @@ unsafe extern "C" {
 pub(crate) struct SessionState {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
-    async_writes: Arc<LinuxFuseAsyncWrites>,
+    async_writes: Arc<AsyncWriteLedger>,
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
+    cache_policy: LinuxFuseCachePolicy,
+    available_memory: Mutex<SystemMemorySampler>,
+    read_buffers: SyncReadBufferPool,
+    open_reply_serializer: FuseOpenReplySerializer,
+    inode_liveness: FuseInodeLiveness,
+    open_liveness: Mutex<HashMap<u64, FuseOpenHandleGuard>>,
+    invalidation_queue: FuseInvalidationQueue,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LinuxFuseCachePolicy {
-    Direct,
-    Kernel,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinuxFuseOpenCachePolicy {
     direct_io: bool,
     keep_cache: bool,
     parallel_direct_writes: bool,
+    read_ahead_owner: ReadAheadOwner,
+    memory_bypassed: bool,
 }
 
 impl SessionState {
@@ -207,14 +241,21 @@ impl SessionState {
         Self {
             vfs,
             runtime_handle,
-            async_writes: Arc::new(LinuxFuseAsyncWrites::new(
-                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_BYTES,
-                LINUX_FUSE_ASYNC_WRITE_MAX_PENDING_WRITES,
+            async_writes: Arc::new(AsyncWriteLedger::with_limits(
+                DEFAULT_MAX_PENDING_BYTES,
+                DEFAULT_MAX_PENDING_WRITES,
             )),
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             connection_config,
+            cache_policy: linux_fuse_cache_policy_from_env(),
+            available_memory: Mutex::new(SystemMemorySampler::system()),
+            read_buffers: SyncReadBufferPool::new(),
+            open_reply_serializer: FuseOpenReplySerializer::new(),
+            inode_liveness: FuseInodeLiveness::default(),
+            open_liveness: Mutex::new(HashMap::new()),
+            invalidation_queue: FuseInvalidationQueue::default(),
         }
     }
 }
@@ -229,96 +270,158 @@ struct FuseReqPtr(*mut raw::FuseReq);
 unsafe impl Send for FuseReqPtr {}
 
 impl FuseReqPtr {
-    fn reply_write(self, written: size_t) {
+    fn reply_write(&mut self, written: size_t) -> c_int {
         // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
-        unsafe { raw::fuse_reply_write(self.0, written) };
+        unsafe { raw::fuse_reply_write(self.0, written) }
     }
 
-    fn reply_error(self, errno: c_int) {
-        reply_error(self.0, errno);
+    fn reply_error(&mut self, errno: c_int) -> c_int {
+        // SAFETY: ownership of the single FUSE reply was transferred with this pointer.
+        unsafe { raw::fuse_reply_err(self.0, errno) }
     }
 }
 
-#[derive(Debug)]
-struct LinuxFuseAsyncWrites {
-    limits: LinuxFuseAsyncWriteLimits,
-    state: Mutex<LinuxFuseAsyncWriteState>,
-    // Block libfuse worker threads here so write backpressure reaches the kernel.
-    idle: Condvar,
+trait FuseWriteReply: Send {
+    fn reply_write(&mut self, written: size_t) -> c_int;
+    fn reply_error(&mut self, errno: c_int) -> c_int;
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LinuxFuseAsyncWriteLimits {
-    max_pending_bytes: usize,
-    max_pending_writes: usize,
+impl FuseWriteReply for FuseReqPtr {
+    fn reply_write(&mut self, written: size_t) -> c_int {
+        Self::reply_write(self, written)
+    }
+
+    fn reply_error(&mut self, errno: c_int) -> c_int {
+        Self::reply_error(self, errno)
+    }
 }
 
-#[derive(Default, Debug)]
-struct LinuxFuseAsyncWriteState {
-    pending_bytes: usize,
-    pending_writes: usize,
+struct FuseWriteTaskGuard<R: FuseWriteReply> {
+    reply: Option<R>,
+    ticket: Option<AsyncWriteTicket>,
+    metrics: Option<FuseWriteCallbackMetrics>,
 }
 
-struct LinuxFuseAsyncWriteReservation {
-    writes: Arc<LinuxFuseAsyncWrites>,
-    bytes: usize,
+struct FuseWriteCallbackMetrics {
+    vfs: Arc<StudioVfs>,
+    requested_bytes: usize,
+    started: Instant,
 }
 
-impl LinuxFuseAsyncWrites {
-    fn new(max_pending_bytes: usize, max_pending_writes: usize) -> Self {
-        Self {
-            limits: LinuxFuseAsyncWriteLimits {
-                max_pending_bytes,
-                max_pending_writes,
-            },
-            state: Mutex::new(LinuxFuseAsyncWriteState::default()),
-            idle: Condvar::new(),
-        }
-    }
+#[derive(Clone, Copy)]
+struct FuseWriteCallbackContext {
+    req: *mut raw::FuseReq,
+    started: Instant,
+}
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> LinuxFuseAsyncWriteReservation {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        while self.should_wait(&state, bytes) {
-            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
-        }
-        state.pending_writes += 1;
-        state.pending_bytes = state.pending_bytes.saturating_add(bytes);
-        LinuxFuseAsyncWriteReservation {
-            writes: self.clone(),
-            bytes,
-        }
-    }
-
-    fn should_wait(&self, state: &LinuxFuseAsyncWriteState, bytes: usize) -> bool {
-        state.pending_writes >= self.limits.max_pending_writes
-            || (state.pending_bytes > 0
-                && state.pending_bytes.saturating_add(bytes) > self.limits.max_pending_bytes)
-    }
-
-    fn wait_idle(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        while state.pending_writes > 0 {
-            state = self.idle.wait(state).unwrap_or_else(|err| err.into_inner());
-        }
-    }
-
+impl<R: FuseWriteReply> FuseWriteTaskGuard<R> {
     #[cfg(test)]
-    fn snapshot(&self) -> (usize, usize) {
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        (state.pending_writes, state.pending_bytes)
+    fn new(reply: R, ticket: AsyncWriteTicket) -> Self {
+        Self {
+            reply: Some(reply),
+            ticket: Some(ticket),
+            metrics: None,
+        }
     }
 
-    fn finish(&self, bytes: usize) {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        state.pending_writes = state.pending_writes.saturating_sub(1);
-        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
-        self.idle.notify_all();
+    fn with_metrics(
+        reply: R,
+        ticket: AsyncWriteTicket,
+        vfs: Arc<StudioVfs>,
+        requested_bytes: usize,
+        started: Instant,
+    ) -> Self {
+        Self {
+            reply: Some(reply),
+            ticket: Some(ticket),
+            metrics: Some(FuseWriteCallbackMetrics {
+                vfs,
+                requested_bytes,
+                started,
+            }),
+        }
+    }
+
+    fn complete(mut self, result: Result<u32, i32>) -> c_int {
+        let mut reply = self
+            .reply
+            .take()
+            .expect("write task reply must be owned until completion");
+        let ticket = self
+            .ticket
+            .take()
+            .expect("write task ticket must be owned until completion");
+        let reply_result = match result {
+            Ok(written) => reply.reply_write(written as size_t),
+            Err(errno) => reply.reply_error(errno),
+        };
+        if reply_result != 0 {
+            debug!(
+                result = reply_result,
+                "Linux FUSE async write reply was rejected"
+            );
+        }
+        if let Some(metrics) = self.metrics.take() {
+            metrics.vfs.record_fuse_write_callback(
+                metrics.requested_bytes,
+                metrics.started.elapsed(),
+                result.is_err(),
+            );
+        }
+        ticket.complete(result.map(|_| ()));
+        reply_result
     }
 }
 
-impl Drop for LinuxFuseAsyncWriteReservation {
+impl<R: FuseWriteReply> Drop for FuseWriteTaskGuard<R> {
     fn drop(&mut self) {
-        self.writes.finish(self.bytes);
+        let Some(mut reply) = self.reply.take() else {
+            return;
+        };
+        let reply_result = reply.reply_error(libc::EIO);
+        if reply_result != 0 {
+            debug!(
+                result = reply_result,
+                "Linux FUSE cancelled async write EIO reply was rejected"
+            );
+        }
+        if let Some(metrics) = self.metrics.take() {
+            metrics.vfs.record_fuse_write_callback(
+                metrics.requested_bytes,
+                metrics.started.elapsed(),
+                true,
+            );
+        }
+        if let Some(ticket) = self.ticket.take() {
+            ticket.complete(Err(libc::EIO));
+        }
+    }
+}
+
+fn finish_async_barrier_with<T>(
+    outcome: BarrierOutcome,
+    vfs_barrier: impl FnOnce() -> Result<T, i32>,
+) -> Result<T, i32> {
+    let async_errno = match outcome {
+        BarrierOutcome::Complete(errno) => errno,
+        BarrierOutcome::TimedOut => Some(libc::EIO),
+    };
+    let vfs_result = vfs_barrier();
+    async_errno.map_or(vfs_result, Err)
+}
+
+struct ForgetClosedHandle<'a> {
+    ledger: &'a AsyncWriteLedger,
+    fh: u64,
+}
+
+impl Drop for ForgetClosedHandle<'_> {
+    fn drop(&mut self) {
+        let forgotten = self.ledger.forget_handle(self.fh);
+        debug_assert!(
+            forgotten,
+            "closed handle barrier must consume all pending writes and errors"
+        );
     }
 }
 
@@ -326,6 +429,26 @@ struct LinuxFuseWriteRequest {
     fh: u64,
     offset: u64,
     local_sync_policy: LocalSyncPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxFusePreparedOpen {
+    fh: u64,
+    cache: LinuxFuseOpenCachePolicy,
+    disposition: studiofs_vfs::vfs::OsCacheDisposition,
+    reason: studiofs_vfs::vfs::OsCacheReason,
+}
+
+#[derive(Debug)]
+struct LinuxFuseAllocatedOpen {
+    ino: u64,
+    fh: u64,
+    flags: c_int,
+}
+
+struct LinuxFuseAllocatedCreate {
+    open: LinuxFuseAllocatedOpen,
+    lookup: FuseLookupReservation,
 }
 
 fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
@@ -375,13 +498,54 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) -> c_int {
-    if linux_fuse_cache_policy_from_env() == LinuxFuseCachePolicy::Kernel {
+    let cache_policy = callback_state_from_userdata(userdata)
+        .map(|state| state.cache_policy)
+        .unwrap_or_else(linux_fuse_cache_policy_from_env);
+    if cache_policy == LinuxFuseCachePolicy::Kernel {
         1
     } else {
         0
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_record_connection(
+    userdata: *mut c_void,
+    requested_max_read: u32,
+    requested_max_readahead: u32,
+    effective_max_read: u32,
+    effective_max_readahead: u32,
+    effective_max_write: u32,
+    effective_max_background: u32,
+    effective_congestion_threshold: u32,
+    capable_features: u64,
+    enabled_features: u64,
+) {
+    let Some(state) = callback_state_from_userdata(userdata) else {
+        return;
+    };
+    let cache_policy = match state.cache_policy {
+        LinuxFuseCachePolicy::Direct => "direct",
+        LinuxFuseCachePolicy::Adaptive => "adaptive",
+        LinuxFuseCachePolicy::Kernel => "kernel",
+    };
+    state
+        .vfs
+        .record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+            snapshot_generation: 1,
+            cache_policy: cache_policy.into(),
+            requested_max_read_bytes: requested_max_read,
+            requested_max_readahead_bytes: requested_max_readahead,
+            effective_max_read_bytes: effective_max_read,
+            effective_max_readahead_bytes: effective_max_readahead,
+            effective_max_write_bytes: effective_max_write,
+            effective_max_background: Some(effective_max_background),
+            effective_congestion_threshold: Some(effective_congestion_threshold),
+            capable_features,
+            enabled_features,
+        });
 }
 
 fn current_uid() -> u32 {
@@ -395,11 +559,27 @@ fn current_gid() -> u32 {
 }
 
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
-    // ponytail: internal benchmark knob; promote only after studiofs-bench proves it.
-    std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY")
-        .ok()
-        .and_then(|value| linux_fuse_cache_policy_from_str(&value))
-        .unwrap_or(LinuxFuseCachePolicy::Direct)
+    let value = std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY").ok();
+    let selection = LinuxFuseCachePolicy::parse(value.as_deref());
+    if selection.warning_required {
+        warn!(
+            value = value.as_deref().unwrap_or_default(),
+            "unknown STUDIOFS_LINUX_FUSE_CACHE_POLICY; using adaptive policy"
+        );
+    }
+    linux_fuse_effective_cache_policy_for_value(value.as_deref(), LINUX_FUSE_ADAPTIVE_DEFAULT_READY)
+}
+
+fn linux_fuse_effective_cache_policy_for_value(
+    value: Option<&str>,
+    adaptive_default_ready: bool,
+) -> LinuxFuseCachePolicy {
+    let selection = LinuxFuseCachePolicy::parse(value);
+    if !adaptive_default_ready && value.is_none() {
+        LinuxFuseCachePolicy::Direct
+    } else {
+        selection.policy
+    }
 }
 
 fn linux_fuse_env_flag(name: &str) -> bool {
@@ -448,18 +628,6 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
             || args.win_attrs.is_some())
 }
 
-fn linux_fuse_cache_policy_from_str(value: &str) -> Option<LinuxFuseCachePolicy> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "direct" | "direct_io" | "dio" | "0" | "false" | "no" | "off" => {
-            Some(LinuxFuseCachePolicy::Direct)
-        }
-        "kernel" | "cached" | "page_cache" | "1" | "true" | "yes" | "on" => {
-            Some(LinuxFuseCachePolicy::Kernel)
-        }
-        _ => None,
-    }
-}
-
 fn argv_strings(volume_name: &str) -> Vec<String> {
     argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env())
 }
@@ -476,6 +644,8 @@ fn argv_strings_for_cache_policy(
         "subtype=studiofs".to_owned(),
         "-o".to_owned(),
         "auto_unmount".to_owned(),
+        "-o".to_owned(),
+        format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
     ]
 }
 
@@ -546,6 +716,8 @@ pub(crate) struct Session {
     raw: NonNull<raw::FuseSession>,
     state: Option<Box<SessionState>>,
     invalidation_state: Arc<SessionInvalidationState>,
+    invalidation_worker: Option<FuseInvalidationWorker>,
+    invalidation_metrics_generation: Arc<AtomicU64>,
     signal_handlers_installed: bool,
 }
 
@@ -579,17 +751,46 @@ impl Session {
         let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
         if mount_result == 0 {
             let invalidation_state = Arc::new(SessionInvalidationState::new());
+            let invalidation_queue = state.invalidation_queue.clone();
+            let notify_target = SessionInvalidationTarget {
+                session: raw,
+                state: Arc::clone(&invalidation_state),
+            };
+            let invalidation_metrics_generation = Arc::new(AtomicU64::new(0));
+            let metrics_vfs = Arc::clone(&state.vfs);
+            let worker_metrics_generation = Arc::clone(&invalidation_metrics_generation);
+            let invalidation_worker = match FuseInvalidationWorker::spawn_with_observer(
+                invalidation_queue.clone(),
+                state.inode_liveness.clone(),
+                move |ino, geometry| notify_target.notify(ino, geometry),
+                move |metrics| {
+                    record_invalidation_metrics(&metrics_vfs, &worker_metrics_generation, metrics);
+                },
+            ) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    // SAFETY: the session is mounted but no callback worker
+                    // retained its pointer because thread creation failed.
+                    unsafe {
+                        raw::fuse_session_unmount(raw.as_ptr());
+                        raw::fuse_session_destroy(raw.as_ptr());
+                    }
+                    return Err(error);
+                }
+            };
+            state
+                .vfs
+                .set_kernel_invalidator(Arc::new(LinuxFuseKernelInvalidator {
+                    queue: invalidation_queue,
+                }));
             let session = Self {
                 raw,
                 state: Some(state),
                 invalidation_state,
+                invalidation_worker: Some(invalidation_worker),
+                invalidation_metrics_generation,
                 signal_handlers_installed: false,
             };
-            if let Some(state) = &session.state {
-                state
-                    .vfs
-                    .set_kernel_invalidator(session.kernel_invalidator());
-            }
             Ok(session)
         } else {
             // SAFETY: `raw` has not been returned and must be destroyed here.
@@ -616,12 +817,13 @@ impl Session {
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
-        // SAFETY: the C shim returns a static empty ops table; userdata is null
-        // because no callbacks are installed in this lifecycle-only smoke.
+        // SAFETY: the C shim returns a static ops table. Userdata is null for
+        // this lifecycle-only smoke; init supports null userdata and every
+        // request callback rejects a missing SessionState before dereferencing.
         let raw = NonNull::new(unsafe {
             studiofs_linux_fuse_session_new(
                 args.as_mut_ptr(),
-                studiofs_linux_fuse_empty_low_level_ops(),
+                studiofs_linux_fuse_low_level_ops(),
                 studiofs_linux_fuse_low_level_ops_size(),
                 std::ptr::null_mut(),
             )
@@ -634,6 +836,8 @@ impl Session {
                 raw,
                 state: None,
                 invalidation_state: Arc::new(SessionInvalidationState::new()),
+                invalidation_worker: None,
+                invalidation_metrics_generation: Arc::new(AtomicU64::new(0)),
                 signal_handlers_installed: false,
             })
         } else {
@@ -668,17 +872,13 @@ impl Session {
             Err(io::Error::from_raw_os_error(result))
         }
     }
-
-    pub(crate) fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
-        Arc::new(LinuxFuseKernelInvalidator {
-            session: self.raw,
-            state: Arc::clone(&self.invalidation_state),
-        })
-    }
 }
 
-#[derive(Debug)]
 struct LinuxFuseKernelInvalidator {
+    queue: FuseInvalidationQueue,
+}
+
+struct SessionInvalidationTarget {
     session: NonNull<raw::FuseSession>,
     state: Arc<SessionInvalidationState>,
 }
@@ -752,41 +952,64 @@ impl Drop for SessionInvalidationGuard<'_> {
     }
 }
 
-// SAFETY: invalidation calls are gated against `Session::drop`, and the raw
-// pointer is only used for libfuse notification calls while the session is live.
-unsafe impl Send for LinuxFuseKernelInvalidator {}
-// SAFETY: shared access only issues libfuse notification calls under the same gate.
-unsafe impl Sync for LinuxFuseKernelInvalidator {}
+// SAFETY: the target is moved into the sole invalidation worker. Its session
+// pointer is used only while `SessionInvalidationState` admits a notification.
+unsafe impl Send for SessionInvalidationTarget {}
 
 impl KernelInvalidator for LinuxFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        self.inval_inode_range(ino, 0, 0);
+        self.enqueue(ino, FuseInvalidationKind::Data);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        self.inval_inode_range(ino, -1, 0);
+        self.enqueue(ino, FuseInvalidationKind::Attributes);
     }
 }
 
 impl LinuxFuseKernelInvalidator {
-    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+    fn enqueue(&self, ino: u64, kind: FuseInvalidationKind) {
+        if self.queue.push(ino, kind).is_err() {
+            debug!(
+                ino,
+                ?kind,
+                "Linux FUSE invalidation skipped after queue shutdown"
+            );
+        }
+    }
+}
+
+impl SessionInvalidationTarget {
+    fn notify(&self, ino: u64, geometry: FuseInvalidationGeometry) -> Result<(), ()> {
         let Some(_active) = self.state.begin_invalidation() else {
             debug!(
                 ino,
-                offset, len, "Linux FUSE inode invalidation skipped after session shutdown"
+                offset = geometry.offset,
+                len = geometry.length,
+                "Linux FUSE inode invalidation skipped after session shutdown"
             );
-            return;
+            return Err(());
         };
         // SAFETY: `session` comes from a mounted libfuse3 session and the
         // invalidation guard prevents teardown from destroying it during the call.
         let result = unsafe {
-            studiofs_linux_fuse_notify_inval_inode(self.session.as_ptr(), ino, offset, len)
+            studiofs_linux_fuse_notify_inval_inode(
+                self.session.as_ptr(),
+                ino,
+                geometry.offset,
+                geometry.length,
+            )
         };
         if result != 0 && result != -libc::ENOENT {
             warn!(
                 ino,
-                offset, len, result, "Linux FUSE inode invalidation failed"
+                offset = geometry.offset,
+                len = geometry.length,
+                result,
+                "Linux FUSE inode invalidation failed"
             );
+            Err(())
+        } else {
+            Ok(())
         }
     }
 }
@@ -794,6 +1017,30 @@ impl LinuxFuseKernelInvalidator {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_destroy(userdata: *mut c_void) {
     let _ = userdata;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_forget(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    nlookup: u64,
+) {
+    forget_request_with(callback_state(req), ino, nlookup, || {
+        // SAFETY: FORGET requests must receive exactly one non-error reply.
+        unsafe { raw::fuse_reply_none(req) };
+    });
+}
+
+fn forget_request_with(
+    state: Option<&SessionState>,
+    ino: u64,
+    nlookup: u64,
+    reply_none: impl FnOnce(),
+) {
+    if let Some(state) = state {
+        state.inode_liveness.forget(ino, nlookup);
+    }
+    reply_none();
 }
 
 #[unsafe(no_mangle)]
@@ -882,7 +1129,14 @@ pub extern "C" fn studiofs_linux_fuse_create(
     let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
-        Ok((attr, fh)) => reply_create(req, state, fi, &attr, fh),
+        Ok(allocated) => {
+            let result = state.run_create_reply_transaction(allocated, |attr, prepared, lookup| {
+                reply_create(req, state, fi, attr, prepared, lookup)
+            });
+            if let Err(errno) = result {
+                reply_error(req, errno);
+            }
+        }
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1012,9 +1266,19 @@ pub extern "C" fn studiofs_linux_fuse_link(
         reply_error(req, libc::EIO);
         return;
     };
+    let lookup = state.inode_liveness.reserve_lookup(ino);
     let result = with_name_bytes(newname, |newname| state.link(ino, newparent, newname))
         .unwrap_or(Err(libc::EINVAL));
-    reply_entry_result(req, state, result);
+    match result {
+        Ok((attr, cache_safe)) => {
+            let attr_timeout = if cache_safe { TTL_SECONDS } else { 0.0 };
+            reply_reserved_entry_with_timeout(state, &attr, lookup, attr_timeout, |entry| {
+                // SAFETY: `entry` is initialized and valid for this synchronous reply.
+                unsafe { raw::fuse_reply_entry(req, entry) }
+            });
+        }
+        Err(errno) => reply_error(req, errno),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1031,8 +1295,12 @@ pub extern "C" fn studiofs_linux_fuse_open(
         reply_error(req, libc::EINVAL);
         return;
     }
-    match state.open(ino, fi) {
-        Ok(fh) => reply_file_open(req, fi, fh),
+    match state.run_open_reply_transaction(
+        ino,
+        || state.open(ino, fi),
+        |prepared| reply_file_open(req, fi, prepared),
+    ) {
+        Ok(_) => {}
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1052,11 +1320,15 @@ pub extern "C" fn studiofs_linux_fuse_read(
     let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
+            let read = buffer.len();
             state
                 .vfs
-                .record_fuse_read_callback(buffer.len(), started.elapsed(), false);
-            // SAFETY: `buffer` is valid for this synchronous reply.
-            unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) };
+                .record_fuse_read_callback(read, started.elapsed(), false);
+            state.reply_with_pooled_read_buffer(buffer, |buffer| {
+                // SAFETY: `buffer` remains owned by the pool helper until this
+                // synchronous reply returns.
+                unsafe { raw::fuse_reply_buf(req, buffer.as_ptr().cast::<c_char>(), buffer.len()) }
+            });
         }
         Err(errno) => {
             state
@@ -1097,13 +1369,15 @@ pub extern "C" fn studiofs_linux_fuse_write(
         return;
     };
     let started = Instant::now();
-    match state.queue_async_write(req, ino, buf, size, off, fi) {
-        Ok(true) => {
-            state
-                .vfs
-                .record_fuse_write_callback(size, started.elapsed(), false);
-            return;
-        }
+    match state.queue_async_write(
+        FuseWriteCallbackContext { req, started },
+        ino,
+        buf,
+        size,
+        off,
+        fi,
+    ) {
+        Ok(true) => return,
         Ok(false) => {}
         Err(errno) => {
             state
@@ -1176,13 +1450,9 @@ pub extern "C" fn studiofs_linux_fuse_release(
         reply_error(req, libc::EIO);
         return;
     };
-    match file_handle(fi)
-        .ok_or(libc::EBADF)
-        .and_then(|fh| state.release(fh))
-    {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
-    }
+    let fh = file_handle(fi);
+    let result = fh.ok_or(libc::EBADF).and_then(|fh| state.release(fh));
+    finish_regular_release_with(state, fh, result, |errno| reply_error(req, errno));
 }
 
 #[unsafe(no_mangle)]
@@ -1197,7 +1467,9 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
     };
     match state.getattr_attr(ino) {
         Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino) {
-            Ok(handle) => reply_dir_open(req, fi, handle),
+            Ok(handle) => {
+                reply_dir_open(req, fi, handle);
+            }
             Err(errno) => reply_error(req, errno),
         },
         Ok(_) => reply_error(req, libc::ENOTDIR),
@@ -1237,12 +1509,12 @@ pub extern "C" fn studiofs_linux_fuse_releasedir(
     _ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
-    if let Some(handle) = dir_handle(fi) {
+    let handle = dir_handle(fi).map(|handle| {
         // SAFETY: `opendir` created this pointer with `Box::into_raw`, and
         // libfuse calls `releasedir` once for each successful directory open.
-        unsafe { drop(Box::from_raw(handle.as_ptr())) };
-    }
-    reply_error(req, 0);
+        unsafe { Box::from_raw(handle.as_ptr()) }
+    });
+    finish_dir_release_with(handle, || reply_error(req, 0));
 }
 
 #[unsafe(no_mangle)]
@@ -1460,11 +1732,21 @@ impl SessionState {
         name: &[u8],
         mode: mode_t,
         fi: *const raw::FuseFileInfo,
-    ) -> Result<(InodeAttr, u64), i32> {
+    ) -> Result<LinuxFuseAllocatedCreate, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
         require_file_info(fi)?;
+        self.create_with_flags(parent, name, mode, file_info_flags(fi))
+    }
+
+    fn create_with_flags(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        flags: c_int,
+    ) -> Result<LinuxFuseAllocatedCreate, i32> {
         let file_type = mode & libc::S_IFMT as mode_t;
         if file_type != 0 && file_type != libc::S_IFREG as mode_t {
             return Err(libc::ENOTSUP);
@@ -1481,12 +1763,29 @@ impl SessionState {
                 &self.runtime_handle,
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
-        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        // Reserve the kernel lookup before opening the writer handle. Any
+        // invalidation from writer admission onward is now marked for a
+        // post-reply DATA notification.
+        let lookup = self.inode_liveness.reserve_lookup(attr.ino);
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         let fh = self
             .vfs
-            .open_created_file_with_known_attr(&attr, open_flags, trunc)
+            .open_created_file_with_known_attr_and_read_ahead_owner(
+                &attr,
+                open_flags,
+                trunc,
+                ReadAheadOwner::Kernel,
+            )
             .map_err(|error| vfs_err_to_errno(&error))?;
-        Ok((attr, fh))
+        self.install_open_liveness(attr.ino, fh);
+        Ok(LinuxFuseAllocatedCreate {
+            open: LinuxFuseAllocatedOpen {
+                ino: attr.ino,
+                fh,
+                flags,
+            },
+            lookup,
+        })
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
@@ -1561,23 +1860,64 @@ impl SessionState {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<InodeAttr, i32> {
+    fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<(InodeAttr, bool), i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
+        let watermark = self.async_writes.capture_inode_watermark(ino);
+        self.async_writes.wait_inode_completion(watermark);
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        let attr = self
+            .vfs
             .link(ino, newparent, newname)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        let cache_safe = match self
+            .invalidation_queue
+            .push_with_receipt(ino, FuseInvalidationKind::Attributes)
+        {
+            Ok(receipt) => match receipt.wait_timeout(NAMESPACE_ATTR_INVALIDATION_TIMEOUT) {
+                Some(
+                    FuseInvalidationReceiptOutcome::Notified
+                    | FuseInvalidationReceiptOutcome::SkippedUnobserved,
+                ) => true,
+                Some(FuseInvalidationReceiptOutcome::NotifyFailed) => {
+                    warn!(
+                        ino,
+                        "hardlink attribute invalidation failed; replying with zero attr TTL"
+                    );
+                    false
+                }
+                None => {
+                    warn!(
+                        ino,
+                        "timed out waiting for hardlink attribute invalidation; replying with zero attr TTL"
+                    );
+                    false
+                }
+            },
+            Err(_) => {
+                warn!(
+                    ino,
+                    "hardlink invalidation queue is closed; replying with zero attr TTL"
+                );
+                false
+            }
+        };
+        Ok((attr, cache_safe))
     }
 
-    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<u64, i32> {
+    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseAllocatedOpen, i32> {
+        self.open_with_flags(ino, file_info_flags(fi))
+    }
+
+    fn open_with_flags(&self, ino: u64, flags: c_int) -> Result<LinuxFuseAllocatedOpen, i32> {
         let attr = self.getattr_attr(ino)?;
         match attr.kind {
             FileType::RegularFile => {}
             FileType::Directory => return Err(libc::EISDIR),
             FileType::Symlink => return Err(libc::EINVAL),
         }
-        let (open_flags, trunc) = posix_flags_to_open_flags(file_info_flags(fi));
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         if self.read_only
             && (trunc
                 || open_flags.contains(OpenFlags::WRONLY)
@@ -1585,9 +1925,185 @@ impl SessionState {
         {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .open_file_with_known_attr(&attr, open_flags, trunc)
-            .map_err(|error| vfs_err_to_errno(&error))
+        let fh = self
+            .vfs
+            .open_file_with_known_attr_and_read_ahead_owner(
+                &attr,
+                open_flags,
+                trunc,
+                ReadAheadOwner::Kernel,
+            )
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        // Establish kernel liveness before generation preparation or any
+        // operation that can publish an invalidation for this handle.
+        self.install_open_liveness(ino, fh);
+        Ok(LinuxFuseAllocatedOpen { ino, fh, flags })
+    }
+
+    fn prepare_file_open(&self, attr: &InodeAttr, flags: c_int, fh: u64) -> LinuxFusePreparedOpen {
+        let ino = attr.ino;
+        let participation = if self.cache_policy == LinuxFuseCachePolicy::Direct
+            || self.vfs.is_runtime_stats_file_ino(ino)
+        {
+            OsCacheParticipation::Disabled
+        } else {
+            OsCacheParticipation::Enabled
+        };
+        let generation = self
+            .vfs
+            .prepare_os_cache_open_with_attr(fh, participation, attr);
+        let available_memory = if self.cache_policy == LinuxFuseCachePolicy::Adaptive {
+            self.available_memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .available_memory()
+        } else {
+            None
+        };
+        let cache = if self.vfs.is_runtime_stats_file_ino(ino) {
+            LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: false,
+                read_ahead_owner: ReadAheadOwner::Vfs,
+                memory_bypassed: false,
+            }
+        } else {
+            linux_fuse_open_cache_policy_for_decision(
+                flags,
+                self.cache_policy,
+                generation,
+                attr.size,
+                available_memory,
+                linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+            )
+        };
+        let owner_was_set = self.vfs.set_read_ahead_owner(fh, cache.read_ahead_owner);
+        debug_assert!(owner_was_set, "newly-opened VFS handle must remain live");
+        LinuxFusePreparedOpen {
+            fh,
+            cache,
+            disposition: generation.disposition(),
+            reason: generation.reason(),
+        }
+    }
+
+    fn prepare_allocated_open(
+        &self,
+        allocated: LinuxFuseAllocatedOpen,
+    ) -> Result<LinuxFusePreparedOpen, i32> {
+        // Local metadata is cached; this refresh closes the result→reservation
+        // race without introducing remote I/O.
+        let attr = self.getattr_attr(allocated.ino)?;
+        Ok(self.prepare_file_open(&attr, allocated.flags, allocated.fh))
+    }
+
+    fn run_open_reply_transaction(
+        &self,
+        ino: u64,
+        allocate: impl FnOnce() -> Result<LinuxFuseAllocatedOpen, i32>,
+        reply: impl FnOnce(LinuxFusePreparedOpen) -> c_int,
+    ) -> Result<c_int, i32> {
+        let _reply_guard = self.open_reply_serializer.lock(ino);
+        let allocated = allocate()?;
+        debug_assert_eq!(allocated.ino, ino);
+        let fh = allocated.fh;
+        let prepared = match self.prepare_allocated_open(allocated) {
+            Ok(prepared) => prepared,
+            Err(errno) => {
+                self.reject_prepared_open(ino, fh);
+                return Err(errno);
+            }
+        };
+        let reply_result = reply(prepared);
+        if reply_result != 0 {
+            self.reject_prepared_open(ino, prepared.fh);
+        } else {
+            self.record_accepted_open_cache(prepared);
+        }
+        Ok(reply_result)
+    }
+
+    fn run_create_reply_transaction(
+        &self,
+        allocated: LinuxFuseAllocatedCreate,
+        reply: impl FnOnce(&InodeAttr, LinuxFusePreparedOpen, FuseLookupReservation) -> c_int,
+    ) -> Result<c_int, i32> {
+        let ino = allocated.open.ino;
+        let _reply_guard = self.open_reply_serializer.lock(ino);
+        let attr = match self.getattr_attr(ino) {
+            Ok(attr) => attr,
+            Err(errno) => {
+                self.reject_prepared_open(ino, allocated.open.fh);
+                return Err(errno);
+            }
+        };
+        let prepared = self.prepare_file_open(&attr, allocated.open.flags, allocated.open.fh);
+        let reply_result = reply(&attr, prepared, allocated.lookup);
+        if reply_result != 0 {
+            self.reject_prepared_open(ino, prepared.fh);
+        } else {
+            self.record_accepted_open_cache(prepared);
+        }
+        Ok(reply_result)
+    }
+
+    fn record_accepted_open_cache(&self, prepared: LinuxFusePreparedOpen) {
+        self.vfs.record_linux_fuse_open_cache_decision(
+            prepared.cache.direct_io,
+            prepared.disposition,
+            prepared.reason,
+            prepared.cache.memory_bypassed,
+        );
+    }
+
+    fn reject_prepared_open(&self, ino: u64, fh: u64) {
+        debug!(ino, fh, "Linux FUSE rolls back rejected open reply");
+        self.remove_open_liveness(fh);
+        self.vfs.abort_os_cache_open(fh);
+        let _ = self
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+    }
+
+    fn install_open_liveness(&self, ino: u64, fh: u64) {
+        let guard = self.inode_liveness.open_handle(ino);
+        let replaced = self
+            .open_liveness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(fh, guard);
+        debug_assert!(replaced.is_none(), "VFS file handles must be unique");
+    }
+
+    fn remove_open_liveness(&self, fh: u64) {
+        self.open_liveness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&fh);
+    }
+
+    fn enqueue_follow_up_invalidation(&self, ino: u64) {
+        if self
+            .invalidation_queue
+            .push(ino, FuseInvalidationKind::Data)
+            .is_err()
+        {
+            debug!(
+                ino,
+                "Linux FUSE follow-up invalidation skipped after shutdown"
+            );
+        }
+    }
+
+    fn reply_with_pooled_read_buffer(
+        &self,
+        buffer: Vec<u8>,
+        reply: impl FnOnce(&[u8]) -> c_int,
+    ) -> c_int {
+        let result = reply(&buffer);
+        self.read_buffers.put(buffer);
+        result
     }
 
     fn read(
@@ -1600,11 +2116,18 @@ impl SessionState {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size = clamp_read_size(size);
-        let mut buffer = vec![0; size];
-        let read = self
-            .runtime_handle
-            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        let mut buffer = self.read_buffers.take(size);
+        let read =
+            match self
+                .runtime_handle
+                .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    self.read_buffers.put(buffer);
+                    return Err(vfs_err_to_errno(&error));
+                }
+            };
         buffer.truncate(read as usize);
         Ok(buffer)
     }
@@ -1639,7 +2162,7 @@ impl SessionState {
 
     fn queue_async_write(
         &self,
-        req: *mut raw::FuseReq,
+        callback: FuseWriteCallbackContext,
         ino: u64,
         buf: *const c_char,
         size: usize,
@@ -1654,16 +2177,42 @@ impl SessionState {
             return Ok(false);
         }
 
-        let data = with_write_data_slice(buf, size, |data| {
-            let reservation = self.async_writes.reserve(data.len());
-            (reservation, Bytes::copy_from_slice(data))
-        })?;
-        let (reservation, data) = data;
+        // Register before capacity admission so a concurrently captured
+        // inode/handle watermark cannot miss this callback.
+        let mut ticket = self
+            .async_writes
+            .start_request(ino, request.fh)
+            .map_err(|error| error.errno())?;
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        if let Err(error) = ticket.reserve_capacity(size) {
+            let errno = error.errno();
+            ticket.complete(Err(errno));
+            record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+            return Err(errno);
+        }
+        // The request buffer remains owned by libfuse while this callback is
+        // blocked on admission. Copy only after bounded capacity is reserved.
+        let data = with_write_data_slice(buf, size, Bytes::copy_from_slice)?;
         let fh = request.fh;
         let write_offset = request.offset;
         let vfs = self.vfs.clone();
-        let req = FuseReqPtr(req);
-        self.runtime_handle.spawn(async move {
+        let metrics_vfs = Arc::clone(&self.vfs);
+        let metrics_ledger = Arc::clone(&self.async_writes);
+        let cache_policy = self.cache_policy;
+        let sequence = ticket.sequence();
+        let task_guard = FuseWriteTaskGuard::with_metrics(
+            FuseReqPtr(callback.req),
+            ticket,
+            Arc::clone(&self.vfs),
+            size,
+            callback.started,
+        );
+        let write_ledger = Arc::clone(&self.async_writes);
+        let task = self.runtime_handle.spawn(async move {
+            if !write_ledger.mark_task_non_cancellable(sequence) {
+                record_async_write_metrics(&metrics_vfs, &metrics_ledger, cache_policy);
+                return;
+            }
             let result = vfs
                 .write_fh_owned_with_deferred_materialize(
                     fh,
@@ -1672,17 +2221,21 @@ impl SessionState {
                     data,
                     LocalSyncPolicy::Opportunistic,
                 )
-                .await;
-            drop(reservation);
-            match result {
-                Ok(written) => {
-                    req.reply_write(written as size_t);
-                }
-                Err(error) => {
-                    req.reply_error(vfs_err_to_errno(&error));
-                }
+                .await
+                .map_err(|error| vfs_err_to_errno(&error));
+            let reply_result = task_guard.complete(result);
+            if reply_result != 0 {
+                debug!(
+                    ino,
+                    fh,
+                    result = reply_result,
+                    "Linux FUSE async write reply was rejected"
+                );
             }
+            record_async_write_metrics(&metrics_vfs, &metrics_ledger, cache_policy);
         });
+        self.async_writes.track_task(sequence, task.abort_handle());
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
         Ok(true)
     }
 
@@ -1718,46 +2271,66 @@ impl SessionState {
     }
 
     fn flush(&self, fh: u64) -> Result<(), i32> {
-        self.async_writes.wait_idle();
-        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
-            let ino = self
-                .vfs
-                .get_open_file(fh)
-                .map(|open_file| open_file.ino)
-                .ok_or(libc::EBADF)?;
-            return self
-                .runtime_handle
-                .block_on(self.vfs.flush_volatile_writeback_with_outcome(ino, fh))
-                .map(|_| ())
-                .map_err(|error| vfs_err_to_errno(&error));
-        }
-        self.runtime_handle
-            .block_on(self.vfs.flush_fh(fh))
-            .map_err(|error| vfs_err_to_errno(&error))
+        let ino = self
+            .vfs
+            .get_open_file(fh)
+            .map(|open_file| open_file.ino)
+            .ok_or(libc::EBADF)?;
+        let watermark = self.async_writes.capture_inode_watermark(ino);
+        let outcome = self.async_writes.wait_inode(watermark);
+        let result = finish_async_barrier_with(outcome, || {
+            if self.local_sync_policy_for_handle(fh).is_opportunistic() {
+                return self
+                    .runtime_handle
+                    .block_on(self.vfs.flush_volatile_writeback_with_outcome(ino, fh))
+                    .map(|_| ())
+                    .map_err(|error| vfs_err_to_errno(&error));
+            }
+            self.runtime_handle
+                .block_on(self.vfs.flush_fh(fh))
+                .map_err(|error| vfs_err_to_errno(&error))
+        });
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        result
     }
 
     fn fsync(&self, file_handle: Option<u64>, ino: u64, datasync: bool) -> Result<(), i32> {
-        self.async_writes.wait_idle();
-        let result = if let Some(fh) = file_handle {
-            // StudioVfs does not currently distinguish fdatasync from fsync on
-            // this path; both drain the handle and execute the strict metadata barrier.
-            self.runtime_handle.block_on(self.vfs.fsync_fh(fh))
-        } else {
-            self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
-        };
-        result.map_err(|error| vfs_err_to_errno(&error))
+        let watermark = self.async_writes.capture_inode_watermark(ino);
+        let outcome = self.async_writes.wait_inode(watermark);
+        let result = finish_async_barrier_with(outcome, || {
+            let result = if let Some(fh) = file_handle {
+                // StudioVfs does not currently distinguish fdatasync from fsync on
+                // this path; both drain the handle and execute the strict metadata barrier.
+                self.runtime_handle.block_on(self.vfs.fsync_fh(fh))
+            } else {
+                self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
+            };
+            result.map_err(|error| vfs_err_to_errno(&error))
+        });
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        result
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
-        self.async_writes.wait_idle();
-        if self.local_sync_policy_for_handle(fh).is_opportunistic() {
-            self.vfs
-                .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
-            return Ok(());
-        }
-        self.runtime_handle
-            .block_on(self.vfs.release_fh(fh))
-            .map_err(|error| vfs_err_to_errno(&error))
+        let local_sync_policy = self.local_sync_policy_for_handle(fh);
+        let watermark = self.async_writes.close_handle(fh);
+        let _forget = ForgetClosedHandle {
+            ledger: &self.async_writes,
+            fh,
+        };
+        let outcome = self.async_writes.wait_handle(watermark);
+        let result = finish_async_barrier_with(outcome, || {
+            if local_sync_policy.is_opportunistic() {
+                self.vfs
+                    .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+                return Ok(());
+            }
+            self.runtime_handle
+                .block_on(self.vfs.release_fh(fh))
+                .map_err(|error| vfs_err_to_errno(&error))
+        });
+        record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
+        result
     }
 
     fn vfs_file_handle(&self, fi: *const raw::FuseFileInfo) -> Option<u64> {
@@ -1772,7 +2345,11 @@ impl SessionState {
             .vfs
             .readdir_with_attrs(ino)
             .map_err(|error| vfs_err_to_errno(&error))?;
-        let raw = Box::into_raw(Box::new(DirectoryHandle { entries }));
+        let liveness = self.inode_liveness.open_handle(ino);
+        let raw = Box::into_raw(Box::new(DirectoryHandle {
+            entries,
+            _liveness: liveness,
+        }));
         NonNull::new(raw).ok_or(libc::ENOMEM)
     }
 
@@ -1899,6 +2476,7 @@ impl SessionState {
 
 struct DirectoryHandle {
     entries: Vec<DirEntryWithAttr>,
+    _liveness: FuseOpenHandleGuard,
 }
 
 fn dir_handle(fi: *const raw::FuseFileInfo) -> Option<NonNull<DirectoryHandle>> {
@@ -2075,31 +2653,59 @@ fn with_write_data_slice<T>(
     }))
 }
 
-fn linux_fuse_open_cache_policy(flags: c_int) -> LinuxFuseOpenCachePolicy {
-    linux_fuse_open_cache_policy_for(flags, linux_fuse_cache_policy_from_env())
-}
-
+#[cfg(test)]
 fn linux_fuse_open_cache_policy_for(
     flags: c_int,
     cache_policy: LinuxFuseCachePolicy,
 ) -> LinuxFuseOpenCachePolicy {
-    if cache_policy == LinuxFuseCachePolicy::Direct {
-        return LinuxFuseOpenCachePolicy {
-            direct_io: true,
-            keep_cache: false,
-            parallel_direct_writes: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
-        };
-    }
-
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
     let write_capable = trunc
         || open_flags.contains(OpenFlags::WRONLY)
         || open_flags.contains(OpenFlags::RDWR)
         || flags & libc::O_APPEND != 0;
+    let generation = if write_capable {
+        OpenCacheDecision {
+            disposition: studiofs_vfs::vfs::OsCacheDisposition::Replace,
+            reason: studiofs_vfs::vfs::OsCacheReason::WriteCapable,
+        }
+    } else {
+        OpenCacheDecision {
+            disposition: studiofs_vfs::vfs::OsCacheDisposition::Reuse,
+            reason: studiofs_vfs::vfs::OsCacheReason::StableGeneration,
+        }
+    };
+    linux_fuse_open_cache_policy_for_decision(flags, cache_policy, generation, 0, None, false)
+}
+
+fn linux_fuse_open_cache_policy_for_decision(
+    flags: c_int,
+    cache_policy: LinuxFuseCachePolicy,
+    generation: impl Into<OpenCacheDecision>,
+    file_size: u64,
+    available_memory: Option<u64>,
+    async_direct_io: bool,
+) -> LinuxFuseOpenCachePolicy {
+    let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+    let write_capable = trunc
+        || open_flags.contains(OpenFlags::WRONLY)
+        || open_flags.contains(OpenFlags::RDWR)
+        || flags & libc::O_APPEND != 0;
+    let decision = decide_open_cache(
+        cache_policy,
+        write_capable,
+        generation,
+        file_size,
+        available_memory,
+    );
     LinuxFuseOpenCachePolicy {
-        direct_io: false,
-        keep_cache: !write_capable,
-        parallel_direct_writes: false,
+        direct_io: decision.direct_io,
+        keep_cache: decision.keep_cache,
+        parallel_direct_writes: decision.direct_io && async_direct_io,
+        read_ahead_owner: match decision.readahead {
+            ReadAheadIntent::Vfs => ReadAheadOwner::Vfs,
+            ReadAheadIntent::Kernel => ReadAheadOwner::Kernel,
+        },
+        memory_bypassed: decision.memory_bypassed,
     }
 }
 
@@ -2111,60 +2717,143 @@ fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
     result: Result<InodeAttr, i32>,
-) {
+) -> c_int {
     match result {
-        Ok(attr) => {
-            let stat = state.attr_to_stat(&attr);
-            let entry = raw::FuseEntryParam {
-                ino: attr.ino,
-                generation: 1,
-                attr: stat,
-                attr_timeout: TTL_SECONDS,
-                entry_timeout: TTL_SECONDS,
-            };
+        Ok(attr) => match reply_entry_with(state, attr.ino, |entry| {
             // SAFETY: `entry` is initialized and valid for this synchronous reply.
-            unsafe { raw::fuse_reply_entry(req, &entry) };
+            unsafe { raw::fuse_reply_entry(req, entry) }
+        }) {
+            Ok(result) => result,
+            Err(errno) => {
+                reply_error(req, errno);
+                0
+            }
+        },
+        Err(errno) => {
+            reply_error(req, errno);
+            0
         }
-        Err(errno) => reply_error(req, errno),
     }
+}
+
+fn reply_entry_with(
+    state: &SessionState,
+    ino: u64,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> Result<c_int, i32> {
+    let reservation = state.inode_liveness.reserve_lookup(ino);
+    // Metadata reads are local/cached. Refreshing after reservation guarantees
+    // an invalidation either precedes this snapshot or marks the pending reply.
+    let attr = state.getattr_attr(ino)?;
+    Ok(reply_reserved_entry_with(state, &attr, reservation, reply))
+}
+
+fn reply_reserved_entry_with(
+    state: &SessionState,
+    attr: &InodeAttr,
+    reservation: FuseLookupReservation,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> c_int {
+    reply_reserved_entry_with_timeout(state, attr, reservation, TTL_SECONDS, reply)
+}
+
+fn reply_reserved_entry_with_timeout(
+    state: &SessionState,
+    attr: &InodeAttr,
+    reservation: FuseLookupReservation,
+    attr_timeout: f64,
+    reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
+) -> c_int {
+    let stat = state.attr_to_stat(attr);
+    let entry = raw::FuseEntryParam {
+        ino: attr.ino,
+        generation: 1,
+        attr: stat,
+        attr_timeout,
+        entry_timeout: TTL_SECONDS,
+    };
+    let began = reservation.begin_reply();
+    debug_assert!(began, "fresh lookup reservation must begin exactly once");
+    let result = reply(&entry);
+    if result == 0 {
+        if reservation
+            .commit()
+            .is_some_and(|outcome| outcome.follow_up_invalidation_required())
+        {
+            state.enqueue_follow_up_invalidation(attr.ino);
+        }
+    } else {
+        reservation.rollback();
+    }
+    result
 }
 
 fn reply_dir_open(
     req: *mut raw::FuseReq,
     fi: *mut raw::FuseFileInfo,
     handle: NonNull<DirectoryHandle>,
-) {
+) -> c_int {
     if fi.is_null() {
         // SAFETY: ownership has not been handed to libfuse because `fi` is invalid.
         unsafe { drop(Box::from_raw(handle.as_ptr())) };
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
-    unsafe {
+    let result = unsafe {
         studiofs_linux_fuse_dir_file_info_init(fi, handle.as_ptr() as u64);
-        raw::fuse_reply_open(req, fi);
+        raw::fuse_reply_open(req, fi)
+    };
+    finish_dir_open_reply(handle, result)
+}
+
+fn finish_dir_open_reply(handle: NonNull<DirectoryHandle>, result: c_int) -> c_int {
+    if result != 0 {
+        // The kernel rejected the open, so ownership never left this callback.
+        unsafe { drop(Box::from_raw(handle.as_ptr())) };
+    }
+    result
+}
+
+fn finish_dir_release_with(handle: Option<Box<DirectoryHandle>>, reply: impl FnOnce()) {
+    reply();
+    // Keep the inode live until the kernel has consumed the release reply.
+    drop(handle);
+}
+
+fn finish_regular_release_with(
+    state: &SessionState,
+    fh: Option<u64>,
+    result: Result<(), c_int>,
+    reply: impl FnOnce(c_int),
+) {
+    reply(result.err().unwrap_or(0));
+    if let Some(fh) = fh {
+        state.remove_open_liveness(fh);
     }
 }
 
-fn reply_file_open(req: *mut raw::FuseReq, fi: *mut raw::FuseFileInfo, fh: u64) {
+fn reply_file_open(
+    req: *mut raw::FuseReq,
+    fi: *mut raw::FuseFileInfo,
+    prepared: LinuxFusePreparedOpen,
+) -> c_int {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
     // SAFETY: libfuse owns `fi` for this callback; the C shim writes fields
     // using the exact system header layout.
     unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
         studiofs_linux_fuse_file_info_init(
             fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
+            prepared.fh,
+            fuse_flag(prepared.cache.direct_io),
+            fuse_flag(prepared.cache.keep_cache),
+            fuse_flag(prepared.cache.parallel_direct_writes),
         );
-        raw::fuse_reply_open(req, fi);
+        raw::fuse_reply_open(req, fi)
     }
 }
 
@@ -2173,32 +2862,38 @@ fn reply_create(
     state: &SessionState,
     fi: *mut raw::FuseFileInfo,
     attr: &InodeAttr,
-    fh: u64,
-) {
+    prepared: LinuxFusePreparedOpen,
+    lookup: FuseLookupReservation,
+) -> c_int {
     if fi.is_null() {
         reply_error(req, libc::EINVAL);
-        return;
+        return -libc::EINVAL;
     }
-    let stat = state.attr_to_stat(attr);
-    let entry = raw::FuseEntryParam {
-        ino: attr.ino,
-        generation: 1,
-        attr: stat,
-        attr_timeout: TTL_SECONDS,
-        entry_timeout: TTL_SECONDS,
-    };
-    // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+    reply_create_with(state, fi, attr, prepared, lookup, |entry, fi| {
+        // SAFETY: `entry` and `fi` are initialized and valid for this synchronous reply.
+        unsafe { raw::fuse_reply_create(req, entry, fi) }
+    })
+}
+
+fn reply_create_with(
+    state: &SessionState,
+    fi: *mut raw::FuseFileInfo,
+    attr: &InodeAttr,
+    prepared: LinuxFusePreparedOpen,
+    lookup: FuseLookupReservation,
+    reply: impl FnOnce(*const raw::FuseEntryParam, *const raw::FuseFileInfo) -> c_int,
+) -> c_int {
+    // SAFETY: libfuse owns `fi` for this callback; the C shim uses the system layout.
     unsafe {
-        let policy = linux_fuse_open_cache_policy(file_info_flags(fi));
         studiofs_linux_fuse_file_info_init(
             fi,
-            fh,
-            fuse_flag(policy.direct_io),
-            fuse_flag(policy.keep_cache),
-            fuse_flag(policy.parallel_direct_writes),
+            prepared.fh,
+            fuse_flag(prepared.cache.direct_io),
+            fuse_flag(prepared.cache.keep_cache),
+            fuse_flag(prepared.cache.parallel_direct_writes),
         );
-        raw::fuse_reply_create(req, &entry, fi);
     }
+    reply_reserved_entry_with(state, attr, lookup, |entry| reply(entry, fi))
 }
 
 fn reply_error(req: *mut raw::FuseReq, errno: c_int) {
@@ -2315,28 +3010,79 @@ impl DirectoryEntryBuffer {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(state) = &self.state {
-            state.vfs.clear_kernel_invalidator();
+        let writes_drained = self.state.as_ref().is_none_or(|state| {
+            let drained = shutdown_async_writes(&state.async_writes);
+            if !drained {
+                state.async_writes.record_shutdown_timeout();
+            }
+            record_async_write_metrics(&state.vfs, &state.async_writes, state.cache_policy);
+            drained
+        });
+        let worker_outcome = shutdown_invalidation_with(
+            || {
+                if let Some(state) = &self.state {
+                    state.vfs.clear_kernel_invalidator();
+                }
+            },
+            || {
+                self.invalidation_worker
+                    .as_ref()
+                    .map(|worker| worker.shutdown(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT))
+                    .unwrap_or(FuseInvalidationShutdownOutcome::Drained)
+            },
+            || self.invalidation_state.begin_shutdown(),
+        );
+        let invalidation_metrics = self
+            .invalidation_worker
+            .as_ref()
+            .map(FuseInvalidationWorker::metrics);
+        if let (Some(state), Some(metrics)) = (&self.state, invalidation_metrics) {
+            record_invalidation_metrics(&state.vfs, &self.invalidation_metrics_generation, metrics);
         }
-        self.invalidation_state.begin_shutdown();
-        let safe_to_destroy = self
-            .invalidation_state
-            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
-        if !safe_to_destroy {
+        if !writes_drained {
             warn!(
-                "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
-                 unmounting and leaking raw session handles to avoid use-after-free"
+                "Linux FUSE session shutdown timed out cancelling async writes; \
+                 retaining raw session and callback state to avoid dangling request pointers"
             );
         }
-        if self.signal_handlers_installed {
-            // SAFETY: handlers were installed for this live session.
-            unsafe { raw::fuse_remove_signal_handlers(self.raw.as_ptr()) };
+        let worker_timed_out = worker_outcome == FuseInvalidationShutdownOutcome::TimedOut;
+        if worker_timed_out {
+            warn!(
+                ?invalidation_metrics,
+                "Linux FUSE session shutdown timed out draining kernel invalidations; \
+                 unmounting and retaining worker, raw session and callback state \
+                 to avoid use-after-free"
+            );
         }
-        // SAFETY: libfuse tolerates unmount after regular kernel disconnects;
-        // it is needed after signal-triggered exits to avoid a stuck mount.
-        unsafe { raw::fuse_session_unmount(self.raw.as_ptr()) };
-        if !safe_to_destroy {
-            // An active notification may still hold this session pointer.
+        if worker_outcome == FuseInvalidationShutdownOutcome::WorkerPanicked {
+            warn!(
+                ?invalidation_metrics,
+                "Linux FUSE invalidation worker panicked after releasing its session pointer; \
+                 continuing safe session teardown"
+            );
+        }
+        if !worker_timed_out {
+            drop(self.invalidation_worker.take());
+        }
+        let invalidations_idle = !worker_timed_out
+            && self
+                .invalidation_state
+                .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT);
+        if !invalidations_idle && !worker_timed_out {
+            warn!(
+                "Linux FUSE session shutdown timed out waiting for active kernel invalidation; \
+                 unmounting and retaining raw session and callback state \
+                 to avoid use-after-free"
+            );
+        }
+        self.detach_raw_session();
+        if !writes_drained || !invalidations_idle {
+            if let Some(worker) = self.invalidation_worker.take() {
+                std::mem::forget(worker);
+            }
+            if let Some(state) = self.state.take() {
+                std::mem::forget(state);
+            }
             return;
         }
         // SAFETY: `self.raw` is owned by this wrapper and destroyed once.
@@ -2344,18 +3090,190 @@ impl Drop for Session {
     }
 }
 
+impl Session {
+    fn detach_raw_session(&mut self) {
+        let signal_handlers_installed =
+            std::mem::replace(&mut self.signal_handlers_installed, false);
+        let raw = self.raw;
+        detach_raw_session_with(
+            signal_handlers_installed,
+            || {
+                // SAFETY: handlers were installed for this retained live session.
+                unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
+            },
+            || {
+                // SAFETY: libfuse tolerates unmount after regular kernel disconnects.
+                unsafe { raw::fuse_session_unmount(raw.as_ptr()) };
+            },
+        );
+    }
+}
+
+fn shutdown_async_writes(ledger: &AsyncWriteLedger) -> bool {
+    shutdown_async_writes_with_timeout(ledger, ASYNC_WRITE_SHUTDOWN_TIMEOUT)
+}
+
+fn shutdown_async_writes_with_timeout(ledger: &AsyncWriteLedger, timeout: Duration) -> bool {
+    ledger.shutdown();
+    if matches!(ledger.wait_all(timeout), BarrierOutcome::Complete(_)) {
+        return true;
+    }
+
+    // Only tasks that have not entered the VFS mutation future remain
+    // cancellable. Their guard converts cancellation into exactly one EIO
+    // reply and a sticky ledger error; post-transition writes keep draining.
+    ledger.abort_pending_tasks();
+    matches!(ledger.wait_all(timeout), BarrierOutcome::Complete(_))
+}
+
+fn record_invalidation_metrics(
+    vfs: &StudioVfs,
+    generation: &AtomicU64,
+    metrics: FuseInvalidationMetricsSnapshot,
+) {
+    let snapshot_generation = generation.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation,
+        queue_depth: metrics.queue_depth,
+        queue_peak: metrics.queue_peak,
+        coalesced: metrics.coalesced,
+        skipped_unobserved: metrics.skipped_unobserved,
+        notify_failures: metrics.notify_failures,
+        notify_latency_count: metrics.notify_latency_count,
+        notify_latency_total_ns: metrics.notify_latency_total_nanos,
+        notify_latency_max_ns: metrics.notify_latency_max_nanos,
+        shutdown_timeouts: metrics.shutdown_timeouts,
+        worker_panics: metrics.worker_panics,
+        notification_in_flight: metrics.notification_in_flight,
+    });
+}
+
+fn record_async_write_metrics(
+    vfs: &StudioVfs,
+    ledger: &AsyncWriteLedger,
+    cache_policy: LinuxFuseCachePolicy,
+) {
+    let snapshot =
+        async_write_metrics_snapshot(ledger, cache_policy, linux_fuse_async_write_enabled());
+    vfs.record_fuse_async_write_snapshot(snapshot);
+}
+
+fn async_write_metrics_snapshot(
+    ledger: &AsyncWriteLedger,
+    cache_policy: LinuxFuseCachePolicy,
+    enabled: bool,
+) -> VfsFuseAsyncWriteSnapshot {
+    let AsyncWriteMetricsSnapshot {
+        snapshot_generation,
+        pending_writes,
+        pending_bytes,
+        pending_handles,
+        pending_writes_per_inode,
+        peak_pending_bytes,
+        completed_writes,
+        failed_writes,
+        task_failed_writes,
+        canceled_writes,
+        shutdown_timeouts,
+        admission_waits,
+        admission_wait_total_nanos,
+        barrier_waits,
+        inode_barrier_waits,
+        handle_barrier_waits,
+        barrier_wait_total_nanos,
+    } = ledger.metrics_snapshot();
+    let profile = match cache_policy {
+        LinuxFuseCachePolicy::Direct => "direct",
+        LinuxFuseCachePolicy::Adaptive => "adaptive",
+        LinuxFuseCachePolicy::Kernel => "kernel",
+    };
+    VfsFuseAsyncWriteSnapshot {
+        snapshot_generation,
+        enabled,
+        linux_fuse_profile: profile.into(),
+        kernel_writeback_cache: Some(cache_policy == LinuxFuseCachePolicy::Kernel),
+        max_pending_bytes: enabled.then_some(DEFAULT_MAX_PENDING_BYTES),
+        max_pending_writes: enabled.then_some(DEFAULT_MAX_PENDING_WRITES),
+        pending_writes,
+        pending_bytes,
+        pending_handles,
+        pending_writes_per_inode,
+        peak_pending_bytes,
+        completed_writes,
+        failed_writes,
+        task_failed_writes,
+        canceled_writes,
+        shutdown_timeouts,
+        admission_waits,
+        admission_wait_total_ms: admission_wait_total_nanos as f64 / 1_000_000.0,
+        barrier_waits,
+        inode_barrier_waits,
+        handle_barrier_waits,
+        barrier_wait_total_ms: barrier_wait_total_nanos as f64 / 1_000_000.0,
+        ..VfsFuseAsyncWriteSnapshot::default()
+    }
+}
+
+fn shutdown_invalidation_with(
+    clear_vfs_invalidator: impl FnOnce(),
+    drain_worker: impl FnOnce() -> FuseInvalidationShutdownOutcome,
+    close_session_gate: impl FnOnce(),
+) -> FuseInvalidationShutdownOutcome {
+    clear_vfs_invalidator();
+    let outcome = drain_worker();
+    close_session_gate();
+    outcome
+}
+
+fn detach_raw_session_with(
+    signal_handlers_installed: bool,
+    remove_signal_handlers: impl FnOnce(),
+    unmount: impl FnOnce(),
+) {
+    if signal_handlers_installed {
+        remove_signal_handlers();
+    }
+    unmount();
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    use studiofs_meta::MetaInodes;
 
     struct UnmountGuard(Option<std::path::PathBuf>);
+
+    struct FakeWriteReply {
+        replies: Arc<Mutex<Vec<Result<u32, i32>>>>,
+        result: libc::c_int,
+    }
+
+    impl super::FuseWriteReply for FakeWriteReply {
+        fn reply_write(&mut self, written: libc::size_t) -> libc::c_int {
+            self.replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(Ok(written as u32));
+            self.result
+        }
+
+        fn reply_error(&mut self, errno: libc::c_int) -> libc::c_int {
+            self.replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(Err(errno));
+            self.result
+        }
+    }
 
     impl UnmountGuard {
         fn new(path: std::path::PathBuf) -> Self {
@@ -2492,9 +3410,39 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "max_read=4194304")
+                .count(),
+            1
+        );
+        assert!(!args.iter().any(|arg| arg.contains("max_readahead")));
         assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
+    }
+
+    #[test]
+    fn generated_argv_is_accepted_by_low_level_session_parser() {
+        let mut args =
+            super::OwnedFuseArgs::new(super::argv_strings("demo")).expect("build FUSE arguments");
+        // SAFETY: the C shim returns a static empty ops table and this test
+        // destroys the resulting session before the stack-owned arguments drop.
+        let session = unsafe {
+            super::studiofs_linux_fuse_session_new(
+                args.as_mut_ptr(),
+                super::studiofs_linux_fuse_empty_low_level_ops(),
+                super::studiofs_linux_fuse_low_level_ops_size(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(
+            !session.is_null(),
+            "generated mount options must be accepted by the low-level libfuse parser"
+        );
+        // SAFETY: the non-null session is uniquely owned by this test.
+        unsafe { super::raw::fuse_session_destroy(session) };
     }
 
     #[test]
@@ -2527,14 +3475,280 @@ mod tests {
     }
 
     #[test]
-    fn async_write_reservation_releases_pending_bytes_on_drop() {
-        let writes = Arc::new(super::LinuxFuseAsyncWrites::new(16, 4));
+    fn connection_read_geometry_preserves_smaller_offer_and_caps_larger_offer() {
+        const KIB_128: u32 = 128 * 1024;
+        const MIB_8: u32 = 8 * 1024 * 1024;
+        const LIMIT: u32 = 4 * 1024 * 1024;
 
-        let reservation = writes.reserve(8);
-        assert_eq!(writes.snapshot(), (1, 8));
+        // SAFETY: both C helpers initialize a stack-local fuse_conn_info.
+        unsafe {
+            assert_eq!(
+                super::studiofs_linux_fuse_init_effective_max_read(KIB_128),
+                KIB_128
+            );
+            assert_eq!(
+                super::studiofs_linux_fuse_init_effective_max_read(MIB_8),
+                LIMIT
+            );
+            assert_eq!(
+                super::studiofs_linux_fuse_init_effective_max_readahead(KIB_128),
+                KIB_128
+            );
+            assert_eq!(
+                super::studiofs_linux_fuse_init_effective_max_readahead(MIB_8),
+                LIMIT
+            );
+        }
+    }
 
-        drop(reservation);
-        assert_eq!(writes.snapshot(), (0, 0));
+    #[test]
+    fn connection_read_geometry_handles_zero_offer_without_userdata() {
+        const LIMIT: u32 = 4 * 1024 * 1024;
+
+        // SAFETY: the helpers intentionally exercise init with null userdata.
+        unsafe {
+            assert_eq!(super::studiofs_linux_fuse_init_effective_max_read(0), LIMIT);
+            assert_eq!(
+                super::studiofs_linux_fuse_init_effective_max_readahead(0),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn negotiated_connection_geometry_is_recorded_in_vfs_stats() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-geometry-stats")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+
+        // SAFETY: userdata points to `state` for the duration of the call.
+        unsafe {
+            super::studiofs_linux_fuse_record_connection(
+                (&mut state as *mut super::SessionState).cast(),
+                4 * 1024 * 1024,
+                4 * 1024 * 1024,
+                128 * 1024,
+                256 * 1024,
+                1024 * 1024,
+                128,
+                96,
+                0x55,
+                0x11,
+            );
+        }
+
+        let snapshot = fixture.vfs().write_path_observability_snapshot();
+        assert_eq!(snapshot.fuse_connection.cache_policy, "adaptive");
+        assert_eq!(
+            snapshot.fuse_connection.effective_max_read_bytes,
+            128 * 1024
+        );
+        assert_eq!(
+            snapshot.fuse_connection.effective_max_readahead_bytes,
+            256 * 1024
+        );
+        assert_eq!(snapshot.fuse_connection.effective_max_background, Some(128));
+        assert_eq!(
+            snapshot.fuse_connection.effective_congestion_threshold,
+            Some(96)
+        );
+        assert_eq!(snapshot.fuse_connection.capable_features, 0x55);
+        assert_eq!(snapshot.fuse_connection.enabled_features, 0x11);
+    }
+
+    #[test]
+    fn async_write_ledger_metrics_are_published_to_vfs_stats() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-write-stats")
+                .expect("create VFS fixture");
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+
+        super::record_async_write_metrics(
+            &fixture.vfs(),
+            &ledger,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+        );
+        let pending = fixture.vfs().write_path_observability_snapshot();
+        assert_eq!(pending.fuse_async_write.pending_writes, 1);
+        assert_eq!(pending.fuse_async_write.pending_handles, 1);
+        assert_eq!(
+            pending.fuse_async_write.pending_writes_per_inode.get(&10),
+            Some(&1)
+        );
+
+        ticket.complete(Err(libc::ENOSPC));
+        super::record_async_write_metrics(
+            &fixture.vfs(),
+            &ledger,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+        );
+        let completed = fixture.vfs().write_path_observability_snapshot();
+        assert_eq!(completed.fuse_async_write.pending_writes, 0);
+        assert_eq!(completed.fuse_async_write.completed_writes, 1);
+        assert_eq!(completed.fuse_async_write.failed_writes, 1);
+    }
+
+    #[test]
+    fn disabled_async_write_metrics_report_the_effective_setting() {
+        let ledger = crate::async_writes::AsyncWriteLedger::with_limits(16, 4);
+
+        let snapshot = super::async_write_metrics_snapshot(
+            &ledger,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            false,
+        );
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.max_pending_bytes, None);
+        assert_eq!(snapshot.max_pending_writes, None);
+    }
+
+    #[test]
+    fn dropped_async_write_task_replies_once_and_records_sticky_eio() {
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        let watermark = ledger.capture_inode_watermark(10);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let guard = super::FuseWriteTaskGuard::new(
+            FakeWriteReply {
+                replies: Arc::clone(&replies),
+                result: 0,
+            },
+            ticket,
+        );
+
+        drop(guard);
+
+        assert_eq!(
+            *replies.lock().unwrap_or_else(|error| error.into_inner()),
+            [Err(libc::EIO)]
+        );
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            crate::async_writes::BarrierOutcome::Complete(Some(libc::EIO))
+        );
+    }
+
+    #[test]
+    fn completed_async_write_captures_native_reply_result_without_sticky_error() {
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        let watermark = ledger.capture_inode_watermark(10);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let guard = super::FuseWriteTaskGuard::new(
+            FakeWriteReply {
+                replies: Arc::clone(&replies),
+                result: -libc::ENOENT,
+            },
+            ticket,
+        );
+
+        assert_eq!(guard.complete(Ok(8)), -libc::ENOENT);
+        assert_eq!(
+            *replies.lock().unwrap_or_else(|error| error.into_inner()),
+            [Ok(8)]
+        );
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            crate::async_writes::BarrierOutcome::Complete(None)
+        );
+    }
+
+    #[test]
+    fn async_write_callback_metrics_are_recorded_only_when_reply_completes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-async-write-callback-stats",
+        )
+        .expect("create VFS fixture");
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        let guard = super::FuseWriteTaskGuard::with_metrics(
+            FakeWriteReply {
+                replies: Arc::new(Mutex::new(Vec::new())),
+                result: 0,
+            },
+            ticket,
+            fixture.vfs(),
+            8,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            fixture
+                .vfs()
+                .write_path_observability_snapshot()
+                .fuse_callbacks
+                .write
+                .calls,
+            0,
+            "enqueue must not count as callback completion"
+        );
+        guard.complete(Err(libc::ENOSPC));
+        let stats = fixture.vfs().write_path_observability_snapshot();
+        assert_eq!(stats.fuse_callbacks.write.calls, 1);
+        assert_eq!(stats.fuse_callbacks.write.bytes, 8);
+        assert_eq!(stats.fuse_callbacks.write.errors, 1);
+    }
+
+    #[test]
+    fn async_error_has_precedence_but_vfs_barrier_still_runs() {
+        let vfs_calls = AtomicUsize::new(0);
+
+        let result = super::finish_async_barrier_with(
+            crate::async_writes::BarrierOutcome::Complete(Some(libc::ENOSPC)),
+            || {
+                vfs_calls.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(libc::EROFS)
+            },
+        );
+
+        assert_eq!(result, Err(libc::ENOSPC));
+        assert_eq!(vfs_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn async_write_shutdown_aborts_opportunistic_task_and_drains_reply_guard() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("create test runtime");
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        let sequence = ticket.sequence();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let guard = super::FuseWriteTaskGuard::new(
+            FakeWriteReply {
+                replies: Arc::clone(&replies),
+                result: 0,
+            },
+            ticket,
+        );
+        let task = runtime.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        assert!(ledger.track_task(sequence, task.abort_handle()));
+
+        assert!(super::shutdown_async_writes_with_timeout(
+            &ledger,
+            Duration::from_millis(100)
+        ));
+        let error = runtime
+            .block_on(task)
+            .expect_err("shutdown should abort pending write task");
+        assert!(error.is_cancelled());
+        assert_eq!(
+            *replies.lock().unwrap_or_else(|error| error.into_inner()),
+            [Err(libc::EIO)]
+        );
     }
 
     #[test]
@@ -2578,6 +3792,18 @@ mod tests {
         };
 
         assert_eq!(has_callbacks, 1);
+    }
+
+    #[test]
+    fn low_level_ops_include_forget_callback() {
+        // SAFETY: the C shim only inspects the callback pointer in a static table.
+        let has_callback = unsafe {
+            super::studiofs_linux_fuse_low_level_ops_has_forget_callback(
+                super::studiofs_linux_fuse_low_level_ops(),
+            )
+        };
+
+        assert_eq!(has_callback, 1);
     }
 
     #[test]
@@ -2721,6 +3947,8 @@ mod tests {
                 direct_io: false,
                 keep_cache: true,
                 parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+                memory_bypassed: false,
             }
         );
     }
@@ -2738,8 +3966,337 @@ mod tests {
                 direct_io: false,
                 keep_cache: false,
                 parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+                memory_bypassed: false,
             }
         );
+    }
+
+    #[test]
+    fn runtime_cache_policy_keeps_unset_default_direct_until_adaptive_is_ready() {
+        assert_eq!(
+            super::linux_fuse_effective_cache_policy_for_value(None, false),
+            crate::cache_policy::LinuxFuseCachePolicy::Direct
+        );
+    }
+
+    #[test]
+    fn runtime_cache_policy_honors_explicit_adaptive_before_default_switch() {
+        assert_eq!(
+            super::linux_fuse_effective_cache_policy_for_value(Some("adaptive"), false),
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn runtime_cache_policy_uses_adaptive_after_readiness_gate() {
+        assert_eq!(
+            super::linux_fuse_effective_cache_policy_for_value(None, true),
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn adaptive_stable_read_maps_to_kernel_readahead_and_keep_cache() {
+        let policy = super::linux_fuse_open_cache_policy_for_decision(
+            libc::O_RDONLY,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            crate::cache_policy::OpenCacheDecision {
+                disposition: studiofs_vfs::vfs::OsCacheDisposition::Reuse,
+                reason: studiofs_vfs::vfs::OsCacheReason::StableGeneration,
+            },
+            4096,
+            Some(8192),
+            false,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: true,
+                parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+                memory_bypassed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn adaptive_memory_bypass_maps_to_direct_vfs_readahead() {
+        let policy = super::linux_fuse_open_cache_policy_for_decision(
+            libc::O_RDONLY,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            crate::cache_policy::OpenCacheDecision {
+                disposition: studiofs_vfs::vfs::OsCacheDisposition::Replace,
+                reason: studiofs_vfs::vfs::OsCacheReason::FirstObservation,
+            },
+            8193,
+            Some(8192),
+            true,
+        );
+
+        assert_eq!(
+            policy,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                parallel_direct_writes: true,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Vfs,
+                memory_bypassed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_linux_decision_restores_vfs_owner_after_prepared_open() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-direct-owner")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"direct-owner.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open with provisional kernel owner");
+
+        let prepared = state.prepare_file_open(&attr, libc::O_RDONLY, fh);
+
+        assert!(prepared.cache.direct_io);
+        assert_eq!(
+            fixture.vfs().read_ahead_owner(fh),
+            Some(studiofs_vfs::ReadAheadOwner::Vfs)
+        );
+    }
+
+    #[test]
+    fn rejected_open_transaction_aborts_generation_and_retires_handle() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-rejected-open")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let attr = fixture
+            .vfs()
+            .create(1, b"rejected-open.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let warm_fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open initial generation");
+        let warm = state.prepare_file_open(&attr, libc::O_RDONLY, warm_fh);
+        assert!(
+            !warm.cache.keep_cache,
+            "first generation must replace pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(warm_fh))
+            .expect("release initial generation");
+
+        let fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("open with provisional owner");
+
+        let reply_result = state
+            .run_open_reply_transaction(
+                attr.ino,
+                || {
+                    state.install_open_liveness(attr.ino, fh);
+                    Ok(super::LinuxFuseAllocatedOpen {
+                        ino: attr.ino,
+                        fh,
+                        flags: libc::O_RDONLY,
+                    })
+                },
+                |prepared| {
+                    assert!(
+                        prepared.cache.keep_cache,
+                        "rejected transaction must start from a reusable generation"
+                    );
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare transaction");
+
+        assert_eq!(reply_result, -libc::ENOENT);
+        assert!(fixture.vfs().get_open_file(fh).is_none());
+        assert_eq!(
+            fixture
+                .vfs()
+                .write_path_observability_snapshot()
+                .linux_fuse_open_cache
+                .total,
+            0,
+            "a rejected native FUSE reply must not count as an open"
+        );
+
+        let next_fh = fixture
+            .vfs()
+            .open_file_with_read_ahead_owner(
+                attr.ino,
+                studiofs_vfs::OpenFlags::RDONLY,
+                false,
+                studiofs_vfs::ReadAheadOwner::Kernel,
+            )
+            .expect("reopen after rejected reply");
+        let next = state.prepare_file_open(&attr, libc::O_RDONLY, next_fh);
+        assert!(
+            !next.cache.keep_cache,
+            "rejected reply must not leave a reusable generation snapshot"
+        );
+    }
+
+    #[test]
+    fn accepted_open_transaction_records_cache_decision_once() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-accepted-open")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"accepted-open.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let result = state
+            .run_open_reply_transaction(
+                attr.ino,
+                || state.open_with_flags(attr.ino, libc::O_RDONLY),
+                |_| 0,
+            )
+            .expect("accepted reply transaction");
+
+        assert_eq!(result, 0);
+        let cache = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .linux_fuse_open_cache;
+        assert_eq!(cache.total, 1);
+        assert_eq!(cache.direct_opens, 1);
+        assert_eq!(cache.disabled, 1);
+    }
+
+    #[test]
+    fn open_reply_cache_generation_uses_refreshed_attributes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-refreshed-open-generation",
+        )
+        .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let attr = fixture
+            .vfs()
+            .create(1, b"refreshed-open-generation.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let warm_fh = fixture
+            .vfs()
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open initial generation");
+        let warm = state.prepare_file_open(&attr, libc::O_RDONLY, warm_fh);
+        assert!(!warm.cache.keep_cache, "first observation replaces pages");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(warm_fh))
+            .expect("release initial generation");
+
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open from old attributes");
+        let mut refreshed = fixture.meta().get_attr(attr.ino).expect("refresh attr");
+        refreshed.size = 4096;
+        refreshed.committed_size = 4096;
+        refreshed.content_epoch = refreshed.content_epoch.saturating_add(1);
+        refreshed.committed_content_epoch = refreshed.content_epoch;
+        fixture
+            .meta()
+            .set_attr(&refreshed)
+            .expect("publish refreshed attributes");
+        thread::sleep(Duration::from_millis(1_100));
+
+        state
+            .run_open_reply_transaction(
+                attr.ino,
+                || Ok(allocated),
+                |prepared| {
+                    assert_eq!(
+                        (prepared.cache.keep_cache, prepared.reason),
+                        (false, studiofs_vfs::vfs::OsCacheReason::GenerationChanged),
+                        "the generation must match the refreshed attributes used for the reply"
+                    );
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare refreshed open reply");
+    }
+
+    #[test]
+    fn read_reply_buffer_returns_to_pool_only_after_reply_closure() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-reply-pool")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let mut buffer = state.read_buffers.take(4096);
+        buffer[0] = 0x5a;
+        let allocation = buffer.as_ptr();
+        let spare = vec![0_u8; 4096];
+        assert_ne!(spare.as_ptr(), allocation);
+        state.read_buffers.put(spare);
+
+        let reply_result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
+            assert_eq!(bytes[0], 0x5a);
+            0
+        });
+        let reused = state.read_buffers.take(4096);
+
+        assert_eq!(reply_result, 0);
+        assert_eq!(reused.as_ptr(), allocation);
     }
 
     #[test]
@@ -2798,6 +4355,400 @@ mod tests {
         state.begin_shutdown();
 
         assert!(state.begin_invalidation().is_none());
+    }
+
+    #[test]
+    fn invalidation_shutdown_clears_then_drains_then_closes_gate() {
+        let events = RefCell::new(Vec::new());
+
+        let outcome = super::shutdown_invalidation_with(
+            || events.borrow_mut().push("clear"),
+            || {
+                events.borrow_mut().push("drain");
+                crate::invalidation::FuseInvalidationShutdownOutcome::Drained
+            },
+            || events.borrow_mut().push("gate"),
+        );
+
+        assert_eq!(
+            outcome,
+            crate::invalidation::FuseInvalidationShutdownOutcome::Drained
+        );
+        assert_eq!(*events.borrow(), ["clear", "drain", "gate"]);
+    }
+
+    #[test]
+    fn invalidation_shutdown_timeout_closes_gate_before_retention() {
+        let events = RefCell::new(Vec::new());
+        let state = super::SessionInvalidationState::new();
+
+        let outcome = super::shutdown_invalidation_with(
+            || events.borrow_mut().push("clear"),
+            || {
+                events.borrow_mut().push("drain");
+                crate::invalidation::FuseInvalidationShutdownOutcome::TimedOut
+            },
+            || {
+                events.borrow_mut().push("gate");
+                state.begin_shutdown();
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            crate::invalidation::FuseInvalidationShutdownOutcome::TimedOut
+        );
+        assert_eq!(*events.borrow(), ["clear", "drain", "gate"]);
+        assert!(
+            state.begin_invalidation().is_none(),
+            "a retained worker must not start another raw notification"
+        );
+    }
+
+    #[test]
+    fn retained_raw_session_removes_handlers_before_unmount() {
+        let events = RefCell::new(Vec::new());
+
+        super::detach_raw_session_with(
+            true,
+            || events.borrow_mut().push("signals"),
+            || events.borrow_mut().push("unmount"),
+        );
+
+        assert_eq!(*events.borrow(), ["signals", "unmount"]);
+    }
+
+    #[test]
+    fn raw_session_without_handlers_still_unmounts() {
+        let events = RefCell::new(Vec::new());
+
+        super::detach_raw_session_with(
+            false,
+            || events.borrow_mut().push("signals"),
+            || events.borrow_mut().push("unmount"),
+        );
+
+        assert_eq!(*events.borrow(), ["unmount"]);
+    }
+
+    #[test]
+    fn forget_request_updates_liveness_and_replies_exactly_once() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-forget")
+            .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let reservation = state.inode_liveness.reserve_lookup(42);
+        assert!(reservation.begin_reply());
+        assert!(reservation.commit().is_some());
+        let replies = AtomicUsize::new(0);
+
+        super::forget_request_with(Some(&state), 42, 1, || {
+            replies.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(replies.load(Ordering::Relaxed), 1);
+        assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn forget_request_without_userdata_still_replies_exactly_once() {
+        let replies = AtomicUsize::new(0);
+
+        super::forget_request_with(None, 42, 1, || {
+            replies.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(replies.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn entry_reply_commits_only_after_native_success() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-reply")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let accepted = fixture
+            .vfs()
+            .create(1, b"accepted", 0, 0, 0o644)
+            .expect("create accepted inode");
+        let rejected = fixture
+            .vfs()
+            .create(1, b"rejected", 0, 0, 0o644)
+            .expect("create rejected inode");
+
+        assert_eq!(super::reply_entry_with(&state, accepted.ino, |_| 0), Ok(0));
+        assert!(state.inode_liveness.is_live(accepted.ino));
+        assert_eq!(
+            super::reply_entry_with(&state, rejected.ino, |_| -libc::ENOENT),
+            Ok(-libc::ENOENT)
+        );
+        assert!(!state.inode_liveness.is_live(rejected.ino));
+    }
+
+    #[test]
+    fn entry_reply_refreshes_attr_after_creating_lookup_reservation() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-refresh")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let stale = fixture
+            .vfs()
+            .create(1, b"fresh-attr", 0, 0, 0o644)
+            .expect("create inode");
+        fixture
+            .vfs()
+            .setattr(
+                stale.ino,
+                studiofs_meta::SetattrArgs {
+                    size: Some(99),
+                    ..Default::default()
+                },
+            )
+            .expect("update size before reply reservation");
+
+        let result = super::reply_entry_with(&state, stale.ino, |entry| {
+            // SAFETY: the reply helper keeps the entry live through this closure.
+            let entry = unsafe { &*entry };
+            assert_eq!(entry.attr.st_size, 99);
+            0
+        });
+
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn entry_reply_race_enqueues_data_follow_up_after_commit() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-entry-race")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create raced inode");
+
+        assert_eq!(
+            super::reply_entry_with(&state, attr.ino, |_| {
+                let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
+                assert_eq!(admission.deferred_reply_count(), 1);
+                0
+            }),
+            Ok(0)
+        );
+
+        assert_eq!(
+            state.invalidation_queue.pop(),
+            Some((attr.ino, crate::invalidation::FuseInvalidationKind::Data))
+        );
+    }
+
+    #[test]
+    fn open_liveness_is_installed_before_reply_and_removed_on_rejection() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-open-liveness")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"open", 0, 0, 0o644)
+            .expect("create inode");
+        let fh = fixture
+            .vfs()
+            .open_file_with_known_attr(&attr, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open VFS handle");
+
+        let result = state
+            .run_open_reply_transaction(
+                attr.ino,
+                || {
+                    state.install_open_liveness(attr.ino, fh);
+                    Ok(super::LinuxFuseAllocatedOpen {
+                        ino: attr.ino,
+                        fh,
+                        flags: libc::O_RDONLY,
+                    })
+                },
+                |_| {
+                    assert!(state.inode_liveness.is_live(attr.ino));
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare open");
+
+        assert_eq!(result, -libc::ENOENT);
+        assert!(!state.inode_liveness.is_live(attr.ino));
+        assert!(fixture.vfs().get_open_file(fh).is_none());
+    }
+
+    #[test]
+    fn allocated_open_is_live_before_cache_preparation() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-open-gap")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"open-gap", 0, 0, 0o644)
+            .expect("create inode");
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open");
+
+        let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
+        assert!(admission.notified_now());
+        assert_eq!(admission.deferred_reply_count(), 0);
+
+        let result = state
+            .run_open_reply_transaction(attr.ino, || Ok(allocated), |_| -libc::ENOENT)
+            .expect("prepare and reject open");
+        assert_eq!(result, -libc::ENOENT);
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn create_reservation_precedes_writer_open_and_defers_follow_up() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-create-gap")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let allocated = state
+            .create_with_flags(1, b"create-gap", libc::S_IFREG | 0o644, libc::O_WRONLY)
+            .expect("allocate created writer");
+        let ino = allocated.open.ino;
+        let fh = allocated.open.fh;
+
+        let admission = state.inode_liveness.admit_invalidation(ino, || {});
+        assert!(admission.notified_now(), "open guard is already installed");
+        assert_eq!(
+            admission.deferred_reply_count(),
+            1,
+            "create lookup reservation predates writer open"
+        );
+
+        let result = state
+            .run_create_reply_transaction(allocated, |attr, _prepared, lookup| {
+                super::reply_reserved_entry_with(&state, attr, lookup, |_| 0)
+            })
+            .expect("complete create reply");
+        assert_eq!(result, 0);
+        assert_eq!(
+            state.invalidation_queue.pop(),
+            Some((ino, crate::invalidation::FuseInvalidationKind::Data))
+        );
+
+        state.remove_open_liveness(fh);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(fh))
+            .expect("release created writer");
+        state.inode_liveness.forget(ino, 1);
+    }
+
+    #[test]
+    fn rejected_directory_reply_reclaims_liveness_guard() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dir-liveness")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .mkdir(1, b"dir", 0, 0, 0o755)
+            .expect("create directory");
+        let handle = state.open_dir(attr.ino).expect("open directory");
+        assert!(state.inode_liveness.is_live(attr.ino));
+
+        assert_eq!(
+            super::finish_dir_open_reply(handle, -libc::ENOENT),
+            -libc::ENOENT
+        );
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn regular_release_keeps_inode_live_through_reply_on_error() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-release-liveness")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.install_open_liveness(42, 7);
+
+        super::finish_regular_release_with(&state, Some(7), Err(libc::EIO), |errno| {
+            assert_eq!(errno, libc::EIO);
+            assert!(state.inode_liveness.is_live(42));
+        });
+
+        assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn directory_release_keeps_inode_live_through_reply() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dir-release")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .mkdir(1, b"dir", 0, 0, 0o755)
+            .expect("create directory");
+        let handle = state.open_dir(attr.ino).expect("open directory");
+        // SAFETY: this test owns the pointer returned by `open_dir`.
+        let handle = unsafe { Box::from_raw(handle.as_ptr()) };
+
+        super::finish_dir_release_with(Some(handle), || {
+            assert!(state.inode_liveness.is_live(attr.ino));
+        });
+
+        assert!(!state.inode_liveness.is_live(attr.ino));
     }
 
     #[test]
@@ -2912,6 +4863,35 @@ mod tests {
             Err(libc::EROFS)
         );
         assert_eq!(state.remove_xattr(1, b"user.key"), Err(libc::EROFS));
+    }
+
+    #[test]
+    fn committed_hardlink_succeeds_with_conservative_cache_when_queue_is_closed() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-link-closed-queue")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let source = fixture
+            .vfs()
+            .create(1, b"source.txt", 0, 0, 0o644)
+            .expect("create source");
+        state.invalidation_queue.close();
+
+        let (linked, cache_safe) = state
+            .link(source.ino, 1, b"alias.txt")
+            .expect("committed link must still report success");
+
+        assert_eq!(linked.ino, source.ino);
+        assert!(!cache_safe);
+        assert_eq!(
+            fixture.vfs().lookup(1, b"alias.txt").expect("alias").ino,
+            source.ino
+        );
     }
 
     #[test]
@@ -3165,6 +5145,7 @@ mod tests {
             std::fs::write(&file, b"namespace")?;
             std::fs::rename(&file, &renamed)?;
             std::fs::hard_link(&renamed, &hardlink)?;
+            assert_eq!(std::fs::metadata(&hardlink)?.len(), 9);
             assert_eq!(std::fs::read_to_string(&hardlink)?, "namespace");
             assert!(std::fs::metadata(&renamed)?.nlink() >= 2);
             std::os::unix::fs::symlink("renamed.txt", &symlink)?;

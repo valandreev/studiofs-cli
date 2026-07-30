@@ -21,6 +21,959 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn os_cache_prepare_unknown_handle_is_conservative() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-unknown-handle");
+
+    assert_eq!(
+        vfs.prepare_os_cache_open(u64::MAX, OsCacheParticipation::Enabled),
+        OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle)
+    );
+}
+
+#[test]
+fn read_ahead_owner_unknown_handle_is_conservative() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "read-ahead-owner-unknown-handle");
+
+    assert_eq!(vfs.read_ahead_owner(u64::MAX), None);
+    assert!(!vfs.set_read_ahead_owner(u64::MAX, ReadAheadOwner::Kernel));
+}
+
+#[test]
+fn read_ahead_owner_is_handle_scoped_for_same_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "read-ahead-owner-handle-scoped");
+    let attr = vfs
+        .create(ROOT_INO, b"owners.txt", 1000, 1000, 0o644)
+        .expect("create");
+
+    let kernel_fh = vfs
+        .open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    let vfs_fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("VFS-owned open");
+
+    assert_eq!(
+        vfs.read_ahead_owner(kernel_fh),
+        Some(ReadAheadOwner::Kernel)
+    );
+    assert_eq!(vfs.read_ahead_owner(vfs_fh), Some(ReadAheadOwner::Vfs));
+
+    assert!(vfs.set_read_ahead_owner(vfs_fh, ReadAheadOwner::Kernel));
+    assert_eq!(
+        vfs.read_ahead_owner(kernel_fh),
+        Some(ReadAheadOwner::Kernel)
+    );
+}
+
+#[test]
+fn prepared_kernel_owner_skips_eager_open_prefetch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-ahead-owner-eager-prefetch");
+    let attr = vfs
+        .create(ROOT_INO, b"prefetch.txt", 1000, 1000, 0o644)
+        .expect("create");
+    vfs.setattr(attr.ino, SetattrArgs::size_only(4096))
+        .expect("give file non-zero size");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+
+    vfs.open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "kernel-owned open must not schedule eager VFS prefetch"
+    );
+
+    vfs.open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("default VFS-owned open");
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "existing open API must preserve eager VFS prefetch"
+    );
+}
+
+#[test]
+fn kernel_to_vfs_owner_transition_queues_eager_prefetch_exactly_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-ahead-owner-transition-prefetch");
+    let attr = vfs
+        .create(ROOT_INO, b"transition-prefetch.txt", 1000, 1000, 0o644)
+        .expect("create");
+    vfs.setattr(attr.ino, SetattrArgs::size_only(4096))
+        .expect("give file non-zero size");
+    let fh = vfs
+        .open_file_with_read_ahead_owner(attr.ino, OpenFlags::RDONLY, false, ReadAheadOwner::Kernel)
+        .expect("kernel-owned open");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(queued_prefetch(), before + 1);
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "Vfs-to-Vfs owner assignment must not duplicate eager prefetch"
+    );
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Kernel));
+    assert_eq!(
+        queued_prefetch(),
+        before + 1,
+        "switching back to kernel ownership must not queue VFS prefetch"
+    );
+
+    let mut lifecycle = vfs.startup.lifecycle.lock();
+    let queued = lifecycle
+        .channels
+        .as_mut()
+        .expect("unstarted VFS retains startup channels")
+        .prefetch_rx
+        .try_recv()
+        .expect("Kernel-to-VFS transition queued one batch");
+    let PrefetchWorkItem::Batch(batch) = queued else {
+        panic!("eager transition must queue a batch");
+    };
+    assert!(
+        batch.owner_token.is_some(),
+        "transition prefetch must remain scoped to the live VFS owner generation"
+    );
+}
+
+#[test]
+fn runtime_stats_owner_transition_never_queues_eager_prefetch() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "runtime-stats-owner-transition-prefetch");
+    let queued_prefetch = || {
+        vfs.startup
+            .lifecycle
+            .lock()
+            .channels
+            .as_ref()
+            .expect("unstarted VFS retains startup channels")
+            .prefetch_rx
+            .len()
+    };
+    let before = queued_prefetch();
+    let fh = vfs
+        .open_file_with_read_ahead_owner(
+            RUNTIME_STATS_FILE_INO,
+            OpenFlags::RDONLY,
+            false,
+            ReadAheadOwner::Kernel,
+        )
+        .expect("open runtime stats with provisional owner");
+
+    assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Vfs));
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "dynamic runtime stats must bypass generic eager prefetch"
+    );
+
+    vfs.open_file(RUNTIME_STATS_FILE_INO, OpenFlags::RDONLY, false)
+        .expect("open runtime stats with VFS owner");
+    assert_eq!(
+        queued_prefetch(),
+        before,
+        "runtime stats must also bypass eager prefetch on an initial VFS owner"
+    );
+}
+
+#[test]
+fn os_cache_clean_read_first_replaces_then_reuses_after_release() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-clean-reuse");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"cache.txt", 1000, 1000, 0o644)
+            .expect("create");
+
+        let first_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("first open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(first_fh, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+        assert_eq!(
+            vfs.prepare_os_cache_open(first_fh, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation),
+            "preparation must be idempotent for one handle"
+        );
+        vfs.release_fh(first_fh).await.expect("first release");
+
+        let second_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("second open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(second_fh, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::reuse(OsCacheReason::StableGeneration)
+        );
+        vfs.release_fh(second_fh).await.expect("second release");
+    });
+}
+
+#[test]
+fn os_cache_writer_blocks_reads_until_every_writer_is_released() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-writer-lifecycle");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"writer.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let seed_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("seed open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(seed_fh, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+        vfs.release_fh(seed_fh).await.expect("seed release");
+
+        let writer_a = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer A");
+        let writer_b = vfs
+            .open_file(attr.ino, OpenFlags::WRONLY, false)
+            .expect("writer B");
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader");
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+        vfs.release_fh(reader).await.expect("reader release");
+        vfs.release_fh(writer_a).await.expect("writer A release");
+
+        let still_blocked = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("still-blocked reader");
+        assert_eq!(
+            vfs.prepare_os_cache_open(still_blocked, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+        vfs.release_fh(still_blocked)
+            .await
+            .expect("still-blocked reader release");
+        vfs.release_fh(writer_b).await.expect("writer B release");
+
+        let clean_reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("clean reader");
+        assert_eq!(
+            vfs.prepare_os_cache_open(clean_reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+        vfs.release_fh(clean_reader)
+            .await
+            .expect("clean reader release");
+    });
+}
+
+#[test]
+fn os_cache_abort_rolls_back_generation_and_writer_lifecycle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-abort");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"abort.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let rejected = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("rejected read open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(rejected, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+        vfs.abort_os_cache_open(rejected);
+        vfs.release_fh(rejected)
+            .await
+            .expect("rejected read release");
+
+        let retry = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("retry read open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(retry, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::FirstObservation)
+        );
+        vfs.release_fh(retry).await.expect("retry read release");
+
+        let rejected_writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("rejected writer open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(rejected_writer, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::WriteCapable)
+        );
+        vfs.abort_os_cache_open(rejected_writer);
+
+        let blocked_reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader while rejected writer awaits release");
+        assert_eq!(
+            vfs.prepare_os_cache_open(blocked_reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+        vfs.release_fh(blocked_reader)
+            .await
+            .expect("blocked reader release");
+        vfs.release_fh(rejected_writer)
+            .await
+            .expect("rejected writer release");
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader after rejected writer");
+        assert_ne!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled)
+                .reason(),
+            OsCacheReason::ActiveWriter
+        );
+        vfs.release_fh(reader).await.expect("reader release");
+    });
+}
+
+#[test]
+fn os_cache_last_writer_remains_active_through_release_barrier() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-release-barrier");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"barrier.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        let gate = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let releasing_vfs = Arc::clone(&vfs);
+        let release = tokio::spawn(async move { releasing_vfs.release_fh(writer).await });
+
+        for _ in 0..1_000 {
+            if vfs.get_open_file(writer).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            vfs.get_open_file(writer).is_none(),
+            "release must close admission before waiting on the inode barrier"
+        );
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader during release barrier");
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+
+        drop(gate);
+        release
+            .await
+            .expect("release task")
+            .expect("writer release");
+        vfs.release_fh(reader).await.expect("reader release");
+    });
+}
+
+#[test]
+fn os_cache_reports_write_non_regular_dirty_and_unknown_reasons() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-reasons");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"reasons.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        assert_eq!(
+            vfs.prepare_os_cache_open(writer, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::WriteCapable)
+        );
+        vfs.abort_os_cache_open(writer);
+        vfs.release_fh(writer).await.expect("writer release");
+
+        let dirty_reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("dirty reader");
+        let mut dirty_attr = vfs.getattr(attr.ino).expect("load attr for dirty state");
+        dirty_attr.mtime = InodeAttr::now_nanos();
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, dirty_attr);
+        assert_eq!(
+            vfs.prepare_os_cache_open(dirty_reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::LocalDirty)
+        );
+        vfs.release_fh(dirty_reader)
+            .await
+            .expect("dirty reader release");
+
+        let unknown = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("unknown-state reader");
+        *vfs.get_open_file(unknown)
+            .expect("open handle")
+            .open_attr
+            .write() = None;
+        assert_eq!(
+            vfs.prepare_os_cache_open(unknown, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::UnknownState)
+        );
+        vfs.release_fh(unknown).await.expect("unknown release");
+
+        let directory = vfs
+            .mkdir(ROOT_INO, b"directory", 1000, 1000, 0o755)
+            .expect("mkdir");
+        let directory_fh = vfs
+            .open_file(directory.ino, OpenFlags::RDONLY, false)
+            .expect("open directory");
+        assert_eq!(
+            vfs.prepare_os_cache_open(directory_fh, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::NonRegular)
+        );
+        vfs.release_fh(directory_fh)
+            .await
+            .expect("directory release");
+    });
+}
+
+#[test]
+fn os_cache_writer_never_enrolls_as_foreground_read_handle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-writer-foreground");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"foreground-writer.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        let foreground_read_handles = vfs.os_cache.lock().active_foreground_handle_count();
+        assert!(
+            !vfs.foreground_io_active(),
+            "legacy adapters that do not call the seam must retain prior QoS behavior"
+        );
+        assert!(
+            vfs.wait_for_foreground_reads_idle(Duration::from_millis(10))
+                .await,
+            "an unprepared writer is not a foreground read"
+        );
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader");
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter),
+            "unprepared writer must still block cache reuse"
+        );
+        vfs.release_fh(reader).await.expect("reader release");
+        assert!(
+            !vfs.foreground_io_active(),
+            "the prepared reader lifetime ended at release"
+        );
+
+        assert_eq!(
+            vfs.prepare_os_cache_open(writer, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::WriteCapable)
+        );
+        assert_eq!(
+            vfs.os_cache.lock().active_foreground_handle_count(),
+            foreground_read_handles,
+            "prepared writers must not inflate the read-handle count"
+        );
+        assert!(
+            vfs.wait_for_foreground_reads_idle(Duration::from_millis(10))
+                .await,
+            "a prepared writer is still not a foreground read"
+        );
+        vfs.write_fh(writer, attr.ino, 0, b"writer activity")
+            .await
+            .expect("writer activity");
+        assert!(
+            vfs.foreground_io_active(),
+            "ordinary writer activity must retain the existing upload/QoS signal"
+        );
+        assert!(
+            vfs.wait_for_foreground_reads_idle(Duration::from_millis(10))
+                .await,
+            "writer activity must not delay the read-only idle barrier"
+        );
+        vfs.release_fh(writer).await.expect("writer release");
+        assert!(!vfs.foreground_io_active());
+    });
+}
+
+#[test]
+fn os_cache_final_unlink_retires_generation_with_and_without_open_handle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-final-unlink");
+    rt.block_on(async move {
+        for (name, keep_open) in [
+            (b"closed.txt".as_slice(), false),
+            (b"open.txt".as_slice(), true),
+        ] {
+            let attr = vfs
+                .create(ROOT_INO, name, 1000, 1000, 0o644)
+                .expect("create");
+            let seed = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("seed open");
+            let _ = vfs.prepare_os_cache_open(seed, OsCacheParticipation::Enabled);
+            vfs.release_fh(seed).await.expect("seed release");
+            assert!(vfs.os_cache.lock().has_generation(attr.ino));
+
+            let surviving_handle = keep_open.then(|| {
+                vfs.open_file(attr.ino, OpenFlags::RDONLY, false)
+                    .expect("surviving open handle")
+            });
+            vfs.unlink(ROOT_INO, name).expect("final unlink");
+            assert!(
+                !vfs.os_cache.lock().has_generation(attr.ino),
+                "final unlink must synchronously retire the generation"
+            );
+            if let Some(fh) = surviving_handle {
+                vfs.release_fh(fh).await.expect("surviving release");
+            }
+        }
+    });
+}
+
+#[test]
+fn os_cache_unlink_preserves_generation_when_hardlink_survives() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-hardlink-unlink");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"original.txt", 1000, 1000, 0o644)
+            .expect("create");
+        vfs.link(attr.ino, ROOT_INO, b"alias.txt")
+            .expect("hardlink");
+        let seed = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("seed open");
+        let _ = vfs.prepare_os_cache_open(seed, OsCacheParticipation::Enabled);
+        vfs.release_fh(seed).await.expect("seed release");
+
+        vfs.unlink(ROOT_INO, b"original.txt")
+            .expect("unlink one hardlink");
+
+        assert!(vfs.os_cache.lock().has_generation(attr.ino));
+    });
+}
+
+#[test]
+fn hardlink_preserves_volatile_local_size_and_updates_link_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "hardlink-unflushed-local-size");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"original.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::WRONLY, false)
+            .expect("writer");
+        vfs.write_fh(writer, attr.ino, 0, b"namespace")
+            .await
+            .expect("write");
+        vfs.flush_volatile_writeback_with_outcome(attr.ino, writer)
+            .await
+            .expect("volatile flush");
+        let gate = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(release.closed_last_handle);
+        let visible_attr = vfs.getattr(attr.ino).expect("visible local attr");
+        assert_eq!(visible_attr.size, b"namespace".len() as u64);
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+
+        vfs.rename(ROOT_INO, b"original.txt", ROOT_INO, b"renamed.txt")
+            .expect("rename");
+        vfs.state.namespace.attr_read_cache.lock().put(
+            attr.ino,
+            visible_attr,
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("visible local attr").size,
+            b"namespace".len() as u64
+        );
+
+        let linking_vfs = Arc::clone(&vfs);
+        let link =
+            tokio::task::spawn_blocking(move || linking_vfs.link(attr.ino, ROOT_INO, b"alias.txt"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !link.is_finished(),
+            "hardlink must serialize with the in-flight release mutation"
+        );
+        drop(gate);
+        let linked = link
+            .await
+            .expect("hardlink task")
+            .expect("hardlink mutation");
+        assert_eq!(linked.size, b"namespace".len() as u64);
+        assert_eq!(linked.nlink, 2);
+
+        vfs.wait_for_deferred_release_inflight(attr.ino).await;
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("settled linked attr").size,
+            b"namespace".len() as u64
+        );
+    });
+}
+
+#[test]
+fn concurrent_hardlinks_do_not_regress_visible_link_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "concurrent-hardlink-count");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let first_vfs = Arc::clone(&vfs);
+        let first_start = Arc::clone(&start);
+        let first = std::thread::spawn(move || {
+            first_start.wait();
+            first_vfs.link(attr.ino, ROOT_INO, b"first.txt")
+        });
+        let second_vfs = Arc::clone(&vfs);
+        let second_start = Arc::clone(&start);
+        let second = std::thread::spawn(move || {
+            second_start.wait();
+            second_vfs.link(attr.ino, ROOT_INO, b"second.txt")
+        });
+        start.wait();
+
+        let first = first.join().expect("first link task").expect("first link");
+        let second = second
+            .join()
+            .expect("second link task")
+            .expect("second link");
+        let mut observed_counts = [first.nlink, second.nlink];
+        observed_counts.sort_unstable();
+        assert_eq!(observed_counts, [2, 3]);
+        assert_eq!(vfs.getattr(attr.ino).expect("final attr").nlink, 3);
+    });
+}
+
+#[test]
+fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-rename-overwrite");
+    rt.block_on(async move {
+        let retired = vfs
+            .create(ROOT_INO, b"retired-target.txt", 1000, 1000, 0o644)
+            .expect("retired target");
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("source");
+        let seed = vfs
+            .open_file(retired.ino, OpenFlags::RDONLY, false)
+            .expect("seed retired");
+        let _ = vfs.prepare_os_cache_open(seed, OsCacheParticipation::Enabled);
+        vfs.release_fh(seed).await.expect("seed release");
+
+        vfs.rename(ROOT_INO, b"source.txt", ROOT_INO, b"retired-target.txt")
+            .expect("rename overwrite");
+        assert!(!vfs.os_cache.lock().has_generation(retired.ino));
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"retired-target.txt")
+                .expect("moved source")
+                .ino,
+            source.ino
+        );
+
+        let open_retired = vfs
+            .create(ROOT_INO, b"open-retired-target.txt", 1000, 1000, 0o644)
+            .expect("open retired target");
+        vfs.create(ROOT_INO, b"open-source.txt", 1000, 1000, 0o644)
+            .expect("open target source");
+        let open_target_fh = vfs
+            .open_file(open_retired.ino, OpenFlags::RDONLY, false)
+            .expect("open displaced target");
+        let _ = vfs.prepare_os_cache_open(open_target_fh, OsCacheParticipation::Enabled);
+        vfs.rename(
+            ROOT_INO,
+            b"open-source.txt",
+            ROOT_INO,
+            b"open-retired-target.txt",
+        )
+        .expect("rename over open final target");
+        assert!(
+            !vfs.os_cache.lock().has_generation(open_retired.ino),
+            "a final displaced name retires generation even while a handle keeps the inode live"
+        );
+        let _ = vfs.release_fh(open_target_fh).await;
+
+        let surviving = vfs
+            .create(ROOT_INO, b"surviving-target.txt", 1000, 1000, 0o644)
+            .expect("surviving target");
+        vfs.link(surviving.ino, ROOT_INO, b"surviving-alias.txt")
+            .expect("target hardlink");
+        vfs.create(ROOT_INO, b"second-source.txt", 1000, 1000, 0o644)
+            .expect("second source");
+        let seed = vfs
+            .open_file(surviving.ino, OpenFlags::RDONLY, false)
+            .expect("seed surviving");
+        let _ = vfs.prepare_os_cache_open(seed, OsCacheParticipation::Enabled);
+        vfs.release_fh(seed).await.expect("seed release");
+
+        vfs.rename(
+            ROOT_INO,
+            b"second-source.txt",
+            ROOT_INO,
+            b"surviving-target.txt",
+        )
+        .expect("rename over one hardlink");
+        assert!(
+            vfs.os_cache.lock().has_generation(surviving.ino),
+            "displaced name must not retire an inode still reachable by another hardlink"
+        );
+    });
+}
+
+#[test]
+fn os_cache_release_wakes_foreground_idle_waiter_promptly() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-idle-notify");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"idle.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open");
+        let _ = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+        let waiting_vfs = Arc::clone(&vfs);
+        let waiter = tokio::spawn(async move {
+            waiting_vfs
+                .wait_for_foreground_reads_idle(Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a prepared read handle must keep the read-idle barrier waiting"
+        );
+
+        vfs.release_fh(fh).await.expect("release");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("OS-cache release should notify promptly")
+                .expect("waiter task"),
+        );
+    });
+}
+
+#[test]
+fn os_cache_unprepared_truncating_handle_blocks_reader_reuse() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-trunc-writer");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"truncate.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let truncating = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, true)
+            .expect("truncating open");
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader");
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+        vfs.release_fh(reader).await.expect("reader release");
+        vfs.release_fh(truncating)
+            .await
+            .expect("truncating release");
+    });
+}
+
+#[test]
+fn os_cache_disabled_read_tracks_foreground_lifetime_until_release() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-disabled-lifetime");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"disabled.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let baseline = vfs.os_cache.lock().active_foreground_handle_count();
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open");
+        assert_eq!(
+            vfs.prepare_os_cache_open(fh, OsCacheParticipation::Disabled),
+            OsCacheOpenDecision::replace(OsCacheReason::Disabled)
+        );
+        assert_eq!(
+            vfs.os_cache.lock().active_foreground_handle_count(),
+            baseline + 1
+        );
+        vfs.release_fh(fh).await.expect("release");
+        assert_eq!(
+            vfs.os_cache.lock().active_foreground_handle_count(),
+            baseline
+        );
+    });
+}
+
+#[test]
+fn os_cache_deferred_release_retains_writer_until_background_barrier_finishes() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-deferred-release");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"deferred.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        vfs.write_fh(writer, attr.ino, 0, b"dirty")
+            .await
+            .expect("write");
+        let gate = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(outcome.closed_last_handle);
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader during deferred barrier");
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter)
+        );
+        drop(gate);
+        vfs.wait_for_deferred_release_inflight(attr.ino).await;
+        vfs.release_fh(reader).await.expect("reader release");
+    });
+}
+
+#[test]
+fn os_cache_cancelled_release_drops_writer_lifecycle_exactly_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-cancelled-release");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"cancelled.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        let gate = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let releasing_vfs = Arc::clone(&vfs);
+        let release = tokio::spawn(async move { releasing_vfs.release_fh(writer).await });
+        for _ in 0..1_000 {
+            if vfs.get_open_file(writer).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        release.abort();
+        let _ = release.await;
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader after cancellation");
+        assert_ne!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled)
+                .reason(),
+            OsCacheReason::ActiveWriter
+        );
+        drop(gate);
+        vfs.release_fh(reader).await.expect("reader release");
+    });
+}
+
+#[test]
+fn os_cache_release_error_still_drops_writer_lifecycle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-release-error");
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"error.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        vfs.write_fh(writer, attr.ino, 0, b"dirty")
+            .await
+            .expect("write");
+        vfs.mark_upload_sticky_error(
+            attr.ino,
+            &VfsError::Other("simulated release failure".into()),
+        );
+        vfs.release_fh(writer)
+            .await
+            .expect_err("sticky error must fail release");
+
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("reader after release error");
+        assert_ne!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled)
+                .reason(),
+            OsCacheReason::ActiveWriter
+        );
+        vfs.clear_upload_sticky_error(attr.ino);
+        vfs.release_fh(reader).await.expect("reader release");
+    });
+}
+
 #[tokio::test]
 async fn fetch_warmup_shutdown_cancels_in_flight_probe() {
     let shutdown = CancellationToken::new();
@@ -15802,6 +16755,156 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(
         snapshot.fuse_async_write.kernel_writeback_cache,
         Some(false)
+    );
+}
+
+#[test]
+fn write_path_observability_records_linux_fuse_open_cache_reasons() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-open-cache-observability");
+
+    vfs.record_linux_fuse_open_cache_decision(
+        false,
+        OsCacheDisposition::Reuse,
+        OsCacheReason::StableGeneration,
+        false,
+    );
+    vfs.record_linux_fuse_open_cache_decision(
+        true,
+        OsCacheDisposition::Replace,
+        OsCacheReason::GenerationChanged,
+        true,
+    );
+
+    let stats = vfs
+        .write_path_observability_snapshot()
+        .linux_fuse_open_cache;
+    assert_eq!(stats.total, 2);
+    assert_eq!(stats.direct_opens, 1);
+    assert_eq!(stats.kernel_opens, 1);
+    assert_eq!(stats.reuse, 1);
+    assert_eq!(stats.replace, 1);
+    assert_eq!(stats.memory_bypasses, 1);
+    assert_eq!(stats.stable_generation, 1);
+    assert_eq!(stats.generation_changed, 1);
+}
+
+#[test]
+fn write_path_observability_reports_linux_fuse_worker_and_connection_snapshots() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-worker-observability");
+
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 4,
+        queue_depth: 2,
+        queue_peak: 8,
+        coalesced: 5,
+        skipped_unobserved: 3,
+        notify_failures: 1,
+        notify_latency_count: 7,
+        notify_latency_total_ns: 700,
+        notify_latency_max_ns: 250,
+        shutdown_timeouts: 1,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 2,
+        cache_policy: "adaptive".into(),
+        requested_max_read_bytes: 4 * 1024 * 1024,
+        requested_max_readahead_bytes: 4 * 1024 * 1024,
+        effective_max_read_bytes: 1024 * 1024,
+        effective_max_readahead_bytes: 512 * 1024,
+        effective_max_write_bytes: 2 * 1024 * 1024,
+        effective_max_background: Some(128),
+        effective_congestion_threshold: Some(96),
+        capable_features: 0x31,
+        enabled_features: 0x11,
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.fuse_invalidation.queue_depth, 2);
+    assert_eq!(snapshot.fuse_invalidation.queue_peak, 8);
+    assert_eq!(snapshot.fuse_invalidation.notify_latency_total_ns, 700);
+    assert_eq!(snapshot.fuse_connection.cache_policy, "adaptive");
+    assert_eq!(
+        snapshot.fuse_connection.effective_max_readahead_bytes,
+        512 * 1024
+    );
+    assert_eq!(snapshot.fuse_connection.enabled_features, 0x11);
+}
+
+#[test]
+fn linux_fuse_observability_rejects_stale_replace_snapshots() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-fuse-stale-observability");
+
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 3,
+        queue_peak: 9,
+        ..Default::default()
+    });
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        snapshot_generation: 2,
+        queue_peak: 1,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 5,
+        cache_policy: "adaptive".into(),
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        snapshot_generation: 4,
+        cache_policy: "direct".into(),
+        ..Default::default()
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.fuse_invalidation.queue_peak, 9);
+    assert_eq!(snapshot.fuse_connection.cache_policy, "adaptive");
+}
+
+#[test]
+fn runtime_stats_surface_reports_linux_fuse_numeric_metrics() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-linux-fuse-observability");
+
+    vfs.record_linux_fuse_open_cache_decision(
+        false,
+        OsCacheDisposition::Reuse,
+        OsCacheReason::StableGeneration,
+        false,
+    );
+    vfs.record_fuse_invalidation_snapshot(VfsFuseInvalidationSnapshot {
+        queue_depth: 2,
+        coalesced: 5,
+        notify_latency_count: 3,
+        notify_latency_total_ns: 90,
+        ..Default::default()
+    });
+    vfs.record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
+        cache_policy: "adaptive".into(),
+        effective_max_read_bytes: 1024 * 1024,
+        ..Default::default()
+    });
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    assert_eq!(snapshot.bridge.counters["linux_fuse_kernel_opens"].value, 1);
+    assert_eq!(
+        snapshot.bridge.counters["fuse_invalidation_coalesced"].value,
+        5
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_invalidation_queue_depth"].value,
+        2
+    );
+    assert_eq!(
+        snapshot.bridge.gauges["fuse_effective_max_read_bytes"].value,
+        1024 * 1024
+    );
+    assert_eq!(
+        snapshot.bridge.latencies["fuse_invalidation_notify"].count,
+        3
     );
 }
 

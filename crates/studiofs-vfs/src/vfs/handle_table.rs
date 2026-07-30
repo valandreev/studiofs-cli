@@ -7,7 +7,7 @@ use std::sync::{
 };
 use studiofs_meta::types::{Ino, InodeAttr};
 
-use super::{OpenFile, OpenFlags};
+use super::{OpenFile, OpenFlags, ReadAheadOwner, ReadAheadToken};
 
 #[derive(Debug, Default)]
 struct HandleCounts {
@@ -74,6 +74,25 @@ impl HandleTable {
     /// Look up an open file handle.
     pub(super) fn get(&self, fh: u64) -> Option<OpenFile> {
         self.handles.read().handles.get(&fh).cloned()
+    }
+
+    /// Mutate ownership only while `fh` is live in the table.
+    ///
+    /// The exclusive table lock is the linearization point: concurrent release
+    /// or owner changes either win before this returns `Some` or observe the
+    /// completed owner mutation and captured token afterwards.
+    pub(super) fn set_read_ahead_owner_if_live(
+        &self,
+        fh: u64,
+        owner: ReadAheadOwner,
+    ) -> Option<(OpenFile, ReadAheadOwner, Option<ReadAheadToken>)> {
+        // An exclusive table lock keeps concurrent owner changes and release
+        // from interleaving between the mutation and owner-token capture.
+        let handles = self.handles.write();
+        let open_file = handles.handles.get(&fh)?;
+        let previous = open_file.set_read_ahead_owner(owner);
+        let owner_token = open_file.vfs_read_ahead_token();
+        Some((open_file.clone(), previous, owner_token))
     }
 
     /// Refresh the attribute snapshot carried by an already-open handle.

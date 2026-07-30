@@ -40,6 +40,7 @@ studiofs (CLI)
   ├── studiofs-data       S3 object I/O + object format
   ├── studiofs-cache      local cache backend + upload runtime
   ├── studiofs-vfs        filesystem core
+  ├── studiofs-linux-fuse Linux libfuse3 low-level bridge
   ├── studiofs-macfuse    macOS native bridge
   ├── studiofs-winfsp     Windows bridge
   └── studiofs-e2e        real mounted E2E runner
@@ -105,6 +106,13 @@ Reads resolve data in this order:
 Metadata lookups are served from local `redb`; PostgreSQL is not part of the
 foreground read path.
 
+On Linux, adaptive page-cache participation is decided per file handle. Clean
+read-only handles let the kernel own readahead; direct or memory-bypassed
+handles retain VFS prefetch. A generation identity built from content epoch,
+logical size, and the ordered resolved-slice graph prevents `keep_cache` from
+reusing stale content. Writer opens and inode invalidation synchronously retire
+that generation before any kernel invalidation is queued.
+
 ## Cache and Upload Runtime
 
 - `studiofs-cache` provides the single cached-store pipeline for writer pages,
@@ -136,3 +144,6 @@ foreground read path.
 - Per-file writer and per-inode session coordination keep
   write/flush/fsync/release boundaries ordered without forcing synchronous
   remote publication into the foreground path.
+- Linux asynchronous writes use sequence-number watermarks: `flush` and
+  `fsync` wait only for earlier writes to the same inode, and `release` closes
+  admission for its file handle and waits only for that handle's predecessors.

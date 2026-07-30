@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::mem::{self, MaybeUninit};
+#[cfg(test)]
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::{c_char, c_ulong};
@@ -14,15 +15,19 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, mapref::entry::Entry as DashMapEntry};
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+#[cfg(test)]
 use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
+use studiofs_bridge::fuse_open_reply::{FuseOpenReplyGuard, FuseOpenReplySerializer};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::engine::XATTR_CREATE_FLAG;
-use studiofs_meta::schema::{ROOT_INO, ResolvedSliceSource};
+use studiofs_meta::schema::ROOT_INO;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
-use studiofs_vfs::vfs::ReleaseFhOutcome;
+use studiofs_vfs::vfs::{
+    OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason,
+};
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
@@ -60,9 +65,6 @@ const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
 const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
-const WRITE_CAPABLE_STATE_SHARDS: usize = 32;
-#[cfg(not(test))]
-const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
 #[cfg(test)]
 const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8;
 
@@ -89,8 +91,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     shared: Arc<AdapterSharedState>,
-    write_capable_state: WriteCapableState,
-    foreground_read_handles: ParkingMutex<HashSet<u64>>,
+    open_reply_serializer: FuseOpenReplySerializer,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
@@ -99,6 +100,9 @@ pub(crate) struct StudioVfsAdapter {
 
 #[derive(Debug)]
 struct AdapterSharedState {
+    // Characterization-only mirror for existing macOS tests. Production cache
+    // correctness lives exclusively in StudioVfs's generation-safe seam.
+    #[cfg(test)]
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_inode_liveness: Arc<KernelInodeLiveness>,
     read_admission: Semaphore,
@@ -227,95 +231,7 @@ impl KernelInodeLiveness {
     }
 }
 
-#[derive(Debug)]
-struct WriteCapableState {
-    handles: Box<[ParkingMutex<HashMap<u64, u64>>]>,
-    handle_counts: Box<[ParkingMutex<HashMap<u64, usize>>]>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReleasedWriteCapableHandle {
-    ino: u64,
-    last_for_inode: bool,
-}
-
-impl Default for WriteCapableState {
-    fn default() -> Self {
-        Self {
-            handles: new_write_capable_shards(),
-            handle_counts: new_write_capable_shards(),
-        }
-    }
-}
-
-impl WriteCapableState {
-    fn record_open(&self, ino: u64, file_handle: u64) {
-        self.increment_count(ino);
-        let previous_ino = {
-            let mut handles = self.handle_shard(file_handle).lock();
-            handles.insert(file_handle, ino)
-        };
-        if let Some(previous_ino) = previous_ino {
-            self.decrement_count(previous_ino);
-        }
-    }
-
-    fn release_handle(&self, file_handle: u64) -> Option<ReleasedWriteCapableHandle> {
-        let write_ino = {
-            let mut handles = self.handle_shard(file_handle).lock();
-            handles.remove(&file_handle)?
-        };
-        let last_for_inode = self.decrement_count(write_ino);
-        Some(ReleasedWriteCapableHandle {
-            ino: write_ino,
-            last_for_inode,
-        })
-    }
-
-    fn active_count(&self, ino: u64) -> usize {
-        self.count_shard(ino).lock().get(&ino).copied().unwrap_or(0)
-    }
-
-    fn increment_count(&self, ino: u64) {
-        *self.count_shard(ino).lock().entry(ino).or_default() += 1;
-    }
-
-    fn decrement_count(&self, ino: u64) -> bool {
-        match self.count_shard(ino).lock().entry(ino) {
-            HashMapEntry::Occupied(mut entry) => {
-                let count = entry.get_mut();
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    entry.remove();
-                    true
-                } else {
-                    false
-                }
-            }
-            HashMapEntry::Vacant(_) => true,
-        }
-    }
-
-    fn handle_shard(&self, file_handle: u64) -> &ParkingMutex<HashMap<u64, u64>> {
-        &self.handles[write_capable_shard_index(file_handle)]
-    }
-
-    fn count_shard(&self, ino: u64) -> &ParkingMutex<HashMap<u64, usize>> {
-        &self.handle_counts[write_capable_shard_index(ino)]
-    }
-}
-
-fn new_write_capable_shards<T>() -> Box<[ParkingMutex<HashMap<u64, T>>]> {
-    (0..WRITE_CAPABLE_STATE_SHARDS)
-        .map(|_| ParkingMutex::new(HashMap::new()))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
-fn write_capable_shard_index(key: u64) -> usize {
-    key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize % WRITE_CAPABLE_STATE_SHARDS
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
@@ -324,6 +240,7 @@ struct MacFuseOpenCacheSnapshot {
     graph: Vec<MacFuseOpenCacheGraphSpan>,
 }
 
+#[cfg(test)]
 impl PartialEq for MacFuseOpenCacheSnapshot {
     fn eq(&self, other: &Self) -> bool {
         // `kind` is intentionally omitted: publication-only transitions must
@@ -334,8 +251,10 @@ impl PartialEq for MacFuseOpenCacheSnapshot {
     }
 }
 
+#[cfg(test)]
 impl Eq for MacFuseOpenCacheSnapshot {}
 
+#[cfg(test)]
 impl MacFuseOpenCacheSnapshot {
     fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
         debug_assert_eq!(attr.kind, FileType::RegularFile);
@@ -349,6 +268,7 @@ impl MacFuseOpenCacheSnapshot {
 }
 
 /// Publication state of the generation represented by an open-cache snapshot.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MacFuseOpenCacheSnapshotKind {
     /// The generation is fully committed and visible through remote metadata.
@@ -357,6 +277,7 @@ enum MacFuseOpenCacheSnapshotKind {
     LocalStableUnpublished,
 }
 
+#[cfg(test)]
 impl MacFuseOpenCacheSnapshotKind {
     fn from_attr(attr: &InodeAttr) -> Self {
         if attr.upload_state == UploadState::Ready
@@ -370,6 +291,7 @@ impl MacFuseOpenCacheSnapshotKind {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MacFuseOpenCacheGraphSpan {
     chunk_id: u64,
@@ -381,22 +303,13 @@ struct MacFuseOpenCacheGraphSpan {
     payload: Option<MacFuseOpenCachePayload>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MacFuseOpenCachePayload {
     object_id: u64,
     offset: u32,
     length: u32,
     flags: u8,
-}
-
-fn open_cache_source_tag(source: ResolvedSliceSource) -> u8 {
-    match source {
-        ResolvedSliceSource::Overlay => 1,
-        ResolvedSliceSource::Base => 2,
-        ResolvedSliceSource::OverlayTombstone => 3,
-        ResolvedSliceSource::BaseTombstone => 4,
-        ResolvedSliceSource::Hole => 5,
-    }
 }
 
 #[derive(Debug, Default)]
@@ -452,6 +365,7 @@ impl ReadBufferPool {
 }
 
 struct OpenCacheKernelInvalidator {
+    #[cfg(test)]
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     kernel_invalidations: Arc<KernelInvalidationGate>,
     inner: Arc<dyn KernelInvalidator>,
@@ -476,6 +390,7 @@ impl KernelInvalidator for LiveKernelInvalidator {
 
 impl KernelInvalidator for OpenCacheKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
+        #[cfg(test)]
         self.open_cache_snapshots.lock().pop(&ino);
         if self.kernel_invalidations.defer_data_if_reads_active(ino) {
             debug!(
@@ -673,6 +588,7 @@ fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
     )
 }
 
+#[cfg(test)]
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
     NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT)
         .expect("MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT must be greater than 0")
@@ -1012,6 +928,7 @@ impl StudioVfsAdapter {
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
             shared: Arc::new(AdapterSharedState {
+                #[cfg(test)]
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                     open_cache_snapshot_capacity(),
                 ))),
@@ -1021,8 +938,7 @@ impl StudioVfsAdapter {
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
             }),
-            write_capable_state: WriteCapableState::default(),
-            foreground_read_handles: ParkingMutex::new(HashSet::new()),
+            open_reply_serializer: FuseOpenReplySerializer::new(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
             next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
@@ -1107,6 +1023,7 @@ impl StudioVfsAdapter {
             .kernel_invalidations
             .set_inner(Arc::clone(&inner));
         Arc::new(OpenCacheKernelInvalidator {
+            #[cfg(test)]
             open_cache_snapshots: Arc::clone(&self.shared.open_cache_snapshots),
             kernel_invalidations: Arc::clone(&self.shared.kernel_invalidations),
             inner,
@@ -1211,6 +1128,7 @@ impl StudioVfsAdapter {
     }
 
     /// Create and open a regular file.
+    #[cfg(test)]
     pub(crate) fn create(
         &self,
         parent: u64,
@@ -1218,10 +1136,28 @@ impl StudioVfsAdapter {
         mode: mode_t,
         flags: i32,
     ) -> Result<(InodeAttr, OpenReply), i32> {
+        let attr = self.create_attr(parent, name, mode)?;
+        let open = self.open_created_attr(&attr, flags)?;
+        Ok((attr, open))
+    }
+
+    fn create_for_reply(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        flags: i32,
+    ) -> Result<(InodeAttr, OpenReply, FuseOpenReplyGuard), i32> {
+        let attr = self.create_attr(parent, name, mode)?;
+        let guard = self.open_reply_serializer.lock(attr.ino);
+        let open = self.open_created_attr(&attr, flags)?;
+        Ok((attr, open, guard))
+    }
+
+    fn create_attr(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let mode = mode & 0o7777;
         let attr = self
             .vfs
             .create_with_deferred_metadata_admission(
@@ -1229,22 +1165,26 @@ impl StudioVfsAdapter {
                 name,
                 self.mount_uid,
                 self.mount_gid,
-                mode,
+                mode & 0o7777,
                 &self.runtime_handle,
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
+        Ok(attr)
+    }
+
+    fn open_created_attr(&self, attr: &InodeAttr, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         let flag_policy = macfuse_open_cache_policy(flags, trunc);
         let open = self.open_with_result(
             attr.ino,
             flag_policy,
             self.vfs
-                .open_created_file_with_known_attr(&attr, open_flags, trunc),
+                .open_created_file_with_known_attr(attr, open_flags, trunc),
         )?;
         self.shared.kernel_inode_liveness.observe(attr.ino);
-        Ok((attr, open))
+        Ok(open)
     }
 
     /// Create a regular file through the macFUSE mknod callback.
@@ -1297,197 +1237,125 @@ impl StudioVfsAdapter {
             .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
 
+    fn is_runtime_stats_file_ino(&self, ino: u64) -> bool {
+        self.vfs.is_runtime_stats_file_ino(ino)
+    }
+
+    fn lock_open_reply(&self, ino: u64) -> FuseOpenReplyGuard {
+        self.open_reply_serializer.lock(ino)
+    }
+
+    fn reject_prepared_open(&self, ino: u64, fh: u64) {
+        debug!(ino, fh, "macFUSE rolls back rejected open reply");
+        self.vfs.abort_os_cache_open(fh);
+        #[cfg(test)]
+        self.shared.open_cache_snapshots.lock().pop(&ino);
+        let _ = self
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.runtime_handle);
+    }
+
     fn open_with_result(
         &self,
         ino: u64,
         flag_policy: MacFuseOpenCachePolicy,
         open_result: VfsResult<u64>,
     ) -> Result<OpenReply, i32> {
-        open_result
-            .map(|fh| {
-                let policy = if flag_policy.write_capable {
-                    self.record_write_capable_open(ino, fh);
-                    self.vfs.record_macfuse_open_cache_decision(
-                        VfsMacFuseOpenCacheDecision::WriteCapable,
-                    );
-                    flag_policy
-                } else if flag_policy.keep_cache {
-                    self.record_foreground_read_handle(fh);
-                    self.read_only_open_cache_policy(ino, available_memory_bytes())
-                } else {
-                    flag_policy
-                };
-                OpenReply::new(fh)
-                    .with_direct_io(policy.direct_io)
-                    .with_keep_cache(policy.keep_cache)
-            })
-            .map_err(|error| vfs_err_to_errno(&error))
-    }
-
-    fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
-        self.shared.open_cache_snapshots.lock().pop(&ino);
-        debug!(ino, reason, "macFUSE open invalidates kernel cache");
-    }
-
-    fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
-        {
-            self.write_capable_state.record_open(ino, file_handle);
+        let fh = open_result.map_err(|error| vfs_err_to_errno(&error))?;
+        let policy = if flag_policy.write_capable {
+            let decision = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+            debug_assert_eq!(decision.reason(), OsCacheReason::WriteCapable);
+            self.vfs
+                .record_macfuse_open_cache_decision(VfsMacFuseOpenCacheDecision::WriteCapable);
+            #[cfg(test)]
             self.shared.open_cache_snapshots.lock().pop(&ino);
-        }
-        debug!(
-            ino,
-            reason = "write_capable",
-            "macFUSE open invalidates kernel cache"
-        );
-    }
-
-    fn record_foreground_read_handle(&self, file_handle: u64) {
-        if self.foreground_read_handles.lock().insert(file_handle) {
-            self.vfs.begin_foreground_read_handle();
-        }
-    }
-
-    fn release_foreground_read_handle(&self, file_handle: u64) {
-        if self.foreground_read_handles.lock().remove(&file_handle) {
-            self.vfs.end_foreground_read_handle();
-        }
-    }
-
-    fn has_active_write_capable_handles(&self, ino: u64) -> bool {
-        self.write_capable_state.active_count(ino) > 0
+            flag_policy
+        } else if flag_policy.keep_cache {
+            self.read_only_open_cache_policy(ino, fh, available_memory_bytes())
+        } else {
+            let _ = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
+            flag_policy
+        };
+        Ok(OpenReply::new(fh)
+            .with_direct_io(policy.direct_io)
+            .with_keep_cache(policy.keep_cache))
     }
 
     fn read_only_open_cache_policy(
         &self,
         ino: u64,
+        fh: u64,
         available_memory: Option<u64>,
     ) -> MacFuseOpenCachePolicy {
-        let Ok(attr) = self.vfs.getattr(ino) else {
-            self.clear_open_cache_snapshot(ino, "unknown_state");
+        let attr = self.vfs.getattr(ino).ok();
+        let participation = if attr.is_some() {
+            OsCacheParticipation::Enabled
+        } else {
+            OsCacheParticipation::Disabled
+        };
+        let decision = if let Some(attr) = attr.as_ref() {
+            self.vfs
+                .prepare_os_cache_open_with_attr(fh, participation, attr)
+        } else {
+            self.vfs.prepare_os_cache_open(fh, participation)
+        };
+        let Some(attr) = attr else {
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
             );
+            #[cfg(test)]
+            self.shared.open_cache_snapshots.lock().pop(&ino);
             return MacFuseOpenCachePolicy {
                 direct_io: false,
                 keep_cache: false,
                 write_capable: false,
             };
         };
-        let policy = |keep_cache| MacFuseOpenCachePolicy {
+        let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
+        let policy = MacFuseOpenCachePolicy {
             direct_io: available_memory.is_some_and(|available| attr.size > available),
             keep_cache,
             write_capable: false,
         };
-        if attr.kind != FileType::RegularFile {
-            self.clear_open_cache_snapshot(ino, "not_regular_file");
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile,
-            );
-            return policy(false);
-        };
-        if self.vfs.inode_has_local_dirty_state(ino) {
-            self.clear_open_cache_snapshot(ino, "local_dirty_state");
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
-            );
-            return policy(false);
-        }
-        if self.has_active_write_capable_handles(ino) {
-            self.clear_open_cache_snapshot(ino, "active_writer");
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyActiveWriter,
-            );
-            return policy(false);
-        }
-        let graph = match self.open_cache_graph_signature(ino, attr.size) {
-            Ok(graph) => graph,
-            Err(error) => {
-                debug!(
-                    ino,
-                    ?error,
-                    "macFUSE open cache could not read file graph signature"
-                );
-                self.clear_open_cache_snapshot(ino, "unknown_state");
-                self.vfs.record_macfuse_open_cache_decision(
-                    VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
-                );
-                return policy(false);
-            }
-        };
-        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
-        let kind = snapshot.kind;
-
-        let mut snapshots = self.shared.open_cache_snapshots.lock();
-        if snapshots
-            .get(&ino)
-            .is_some_and(|previous| *previous == snapshot)
-        {
-            debug!(
-                ino,
-                keep_cache = true,
-                content_epoch = snapshot.content_epoch,
-                size = snapshot.size,
-                reason = "read_only_safe",
-                "macFUSE open cache decision"
-            );
-            let decision = match kind {
-                MacFuseOpenCacheSnapshotKind::RemoteReady => {
-                    VfsMacFuseOpenCacheDecision::ReadOnlyKeep
-                }
-                MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
-                    VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableKeep
-                }
-            };
-            self.vfs.record_macfuse_open_cache_decision(decision);
-            return policy(true);
-        }
-
-        let content_epoch = snapshot.content_epoch;
-        let size = snapshot.size;
-        snapshots.put(ino, snapshot);
+        let metric = macfuse_cache_metric(&attr, decision);
+        self.vfs.record_macfuse_open_cache_decision(metric);
+        #[cfg(test)]
+        self.track_open_cache_observation_for_test(ino, &attr, decision);
         debug!(
             ino,
-            keep_cache = false,
-            content_epoch,
-            size,
-            reason = "generation_changed",
+            keep_cache,
+            content_epoch = attr.content_epoch,
+            size = attr.size,
+            reason = ?decision.reason(),
             "macFUSE open cache decision"
         );
-        let decision = match kind {
-            MacFuseOpenCacheSnapshotKind::RemoteReady => {
-                VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged
-            }
-            MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
-                VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableGenerationChanged
-            }
-        };
-        self.vfs.record_macfuse_open_cache_decision(decision);
-        policy(false)
+        policy
     }
 
-    fn open_cache_graph_signature(
+    #[cfg(test)]
+    fn track_open_cache_observation_for_test(
         &self,
         ino: u64,
-        size: u64,
-    ) -> Result<Vec<MacFuseOpenCacheGraphSpan>, studiofs_meta::MetaError> {
-        let spans = self.vfs.meta().lookup_regular_file_slices(ino, 0, size)?;
-        Ok(spans
-            .into_iter()
-            .map(|span| MacFuseOpenCacheGraphSpan {
-                chunk_id: span.chunk_id.0,
-                range_start: span.range.start,
-                range_end: span.range.end,
-                source: open_cache_source_tag(span.source),
-                slice_id: span.slice_id.map(|slice_id| slice_id.0),
-                slice_order: span.slice_order.map(|slice_order| slice_order.0),
-                payload: span.payload.map(|payload| MacFuseOpenCachePayload {
-                    object_id: payload.object_id,
-                    offset: payload.offset,
-                    length: payload.length,
-                    flags: payload.flags.bits(),
-                }),
-            })
-            .collect())
+        attr: &InodeAttr,
+        decision: OsCacheOpenDecision,
+    ) {
+        match decision.reason() {
+            OsCacheReason::FirstObservation
+            | OsCacheReason::GenerationChanged
+            | OsCacheReason::StableGeneration => {
+                self.shared
+                    .open_cache_snapshots
+                    .lock()
+                    .put(ino, MacFuseOpenCacheSnapshot::from_attr(attr, Vec::new()));
+            }
+            _ => {
+                self.shared.open_cache_snapshots.lock().pop(&ino);
+            }
+        }
     }
 
     /// Remove a file entry.
@@ -1501,7 +1369,8 @@ impl StudioVfsAdapter {
                 if let Some(attr) = unlinked_attr
                     && attr.nlink == 0
                 {
-                    self.clear_open_cache_snapshot(attr.ino, "unlink");
+                    #[cfg(test)]
+                    self.shared.open_cache_snapshots.lock().pop(&attr.ino);
                     self.clear_file_flags(attr.ino);
                     self.shared.kernel_inode_liveness.close(attr.ino);
                 }
@@ -2118,24 +1987,9 @@ impl StudioVfsAdapter {
         {
             return Ok(());
         }
-        let released_write_handle = self.write_capable_state.release_handle(file_handle);
-        let outcome_result = Ok(self
+        let _outcome = self
             .vfs
-            .release_fh_with_deferred_last_handle_barrier(file_handle, &self.runtime_handle));
-        self.finish_release(file_handle, released_write_handle, outcome_result)
-    }
-
-    fn finish_release(
-        &self,
-        file_handle: u64,
-        released_write_handle: Option<ReleasedWriteCapableHandle>,
-        outcome_result: Result<ReleaseFhOutcome, i32>,
-    ) -> Result<(), i32> {
-        self.release_foreground_read_handle(file_handle);
-        if let Some(released) = released_write_handle.filter(|released| released.last_for_inode) {
-            self.clear_open_cache_snapshot(released.ino, "clean_write_release");
-        }
-        outcome_result?;
+            .release_fh_with_deferred_last_handle_barrier(file_handle, &self.runtime_handle);
         Ok(())
     }
 
@@ -2678,6 +2532,34 @@ pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenC
     }
 }
 
+fn macfuse_cache_metric(
+    attr: &InodeAttr,
+    decision: OsCacheOpenDecision,
+) -> VfsMacFuseOpenCacheDecision {
+    let remote_ready = attr.upload_state == UploadState::Ready
+        && attr.content_epoch == attr.committed_content_epoch
+        && attr.size == attr.committed_size;
+    match decision.reason() {
+        OsCacheReason::StableGeneration if remote_ready => {
+            VfsMacFuseOpenCacheDecision::ReadOnlyKeep
+        }
+        OsCacheReason::StableGeneration => VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableKeep,
+        OsCacheReason::FirstObservation | OsCacheReason::GenerationChanged if remote_ready => {
+            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged
+        }
+        OsCacheReason::FirstObservation | OsCacheReason::GenerationChanged => {
+            VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableGenerationChanged
+        }
+        OsCacheReason::NonRegular => VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile,
+        OsCacheReason::LocalDirty => VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
+        OsCacheReason::ActiveWriter => VfsMacFuseOpenCacheDecision::ReadOnlyActiveWriter,
+        OsCacheReason::WriteCapable => VfsMacFuseOpenCacheDecision::WriteCapable,
+        OsCacheReason::Disabled | OsCacheReason::UnknownState | OsCacheReason::UnknownHandle => {
+            VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState
+        }
+    }
+}
+
 struct AvailableMemorySnapshot {
     system: System,
     available: Option<u64>,
@@ -2736,12 +2618,12 @@ mod open_cache_snapshot_tests {
     use super::{
         AvailableMemorySnapshot, MACFUSE_AVAILABLE_MEMORY_TTL, MacFuseOpenCacheGraphSpan,
         MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        ReleasedWriteCapableHandle, StudioVfsAdapter,
+        StudioVfsAdapter,
     };
     use std::time::Instant;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
-    use studiofs_vfs::vfs::{OpenFlags, ReleaseFhOutcome};
+    use studiofs_vfs::vfs::OpenFlags;
 
     #[test]
     fn open_without_cache_must_not_imply_write_capable_handle() {
@@ -2766,9 +2648,12 @@ mod open_cache_snapshot_tests {
             .expect("open with explicit cache policy");
 
         assert!(!opened.keep_cache());
-        assert!(
-            !adapter.has_active_write_capable_handles(attr.ino),
-            "a cache-disabled read-only handle must not enter the writer accounting"
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .macfuse_open_cache
+                .read_only_active_writer,
+            0,
+            "a cache-disabled read-only handle must not enter writer accounting"
         );
         adapter
             .release(attr.ino, opened.file_handle())
@@ -2785,11 +2670,16 @@ mod open_cache_snapshot_tests {
             .expect("create file");
         vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1025))
             .expect("set file size");
-        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
-
-        let policy = adapter.read_only_open_cache_policy(attr.ino, Some(1024));
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open read-only file");
+        let policy = adapter.read_only_open_cache_policy(attr.ino, fh, Some(1024));
 
         assert!(policy.direct_io);
+        adapter
+            .release(attr.ino, fh)
+            .expect("release read-only file");
     }
 
     #[test]
@@ -2902,6 +2792,104 @@ mod open_cache_snapshot_tests {
     }
 
     #[test]
+    fn rejected_open_reply_aborts_cache_generation_before_retry() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-rejected-reply")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                CONTRACT_ROOT_INO,
+                b"rejected-open-reply.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let rejected = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("prepare first read-only open");
+        assert!(!rejected.keep_cache());
+        adapter.reject_prepared_open(attr.ino, rejected.file_handle());
+
+        let retry = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("retry read-only open");
+        assert!(
+            !retry.keep_cache(),
+            "a rejected reply must not seed keep_cache for the next open"
+        );
+        adapter
+            .release(attr.ino, retry.file_handle())
+            .expect("release retry handle");
+    }
+
+    #[test]
+    fn rejected_create_reply_aborts_cache_generation_before_retry() {
+        let fixture = ContractVfsFixture::new("macfuse-create-cache-rejected-reply")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+
+        let (attr, rejected, reply_guard) = adapter
+            .create_for_reply(
+                CONTRACT_ROOT_INO,
+                b"rejected-create-reply.bin",
+                0o644,
+                libc::O_RDONLY,
+            )
+            .expect("prepare create reply");
+        assert!(!rejected.keep_cache());
+        adapter.reject_prepared_open(attr.ino, rejected.file_handle());
+        drop(reply_guard);
+
+        let retry = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("retry read-only open after rejected create");
+        assert!(
+            !retry.keep_cache(),
+            "a rejected create reply must not seed keep_cache for the next open"
+        );
+        adapter
+            .release(attr.ino, retry.file_handle())
+            .expect("release retry handle");
+    }
+
+    #[test]
+    fn runtime_stats_open_stays_direct_and_preserves_macfuse_cache_json() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-runtime-stats-cache-schema").expect("create fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let ino = studiofs_vfs::RUNTIME_STATS_FILE_INO;
+        let before = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .macfuse_open_cache
+            .total;
+
+        let open = adapter
+            .open(ino, libc::O_RDONLY)
+            .expect("open runtime stats");
+        assert!(open.direct_io());
+        assert!(!open.keep_cache());
+        let after = fixture
+            .vfs()
+            .write_path_observability_snapshot()
+            .macfuse_open_cache
+            .total;
+        assert_eq!(after, before, "runtime stats must bypass cache preparation");
+        let json = serde_json::to_value(fixture.vfs().write_path_observability_snapshot())
+            .expect("write-path runtime stats should serialize");
+        assert!(
+            json.get("macfuse_open_cache").is_some(),
+            "the existing macfuse_open_cache JSON section must remain present"
+        );
+        adapter
+            .release(ino, open.file_handle())
+            .expect("release runtime stats");
+    }
+
+    #[test]
     fn close_flush_ignores_namespace_enoent() {
         assert_eq!(
             super::normalize_close_flush_result(Err(libc::ENOENT)),
@@ -2932,34 +2920,30 @@ mod open_cache_snapshot_tests {
             )
             .expect("create file");
         let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
-        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, Vec::new());
-        let file_handle = 7;
-
+        let seed = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("seed cache observation");
         adapter
-            .shared
-            .open_cache_snapshots
-            .lock()
-            .put(attr.ino, snapshot);
-        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
-
+            .release(attr.ino, seed.file_handle())
+            .expect("release seed");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open retained reader");
+        assert!(reader.keep_cache());
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open write-capable handle");
         adapter
-            .finish_release(
-                file_handle,
-                Some(ReleasedWriteCapableHandle {
-                    ino: attr.ino,
-                    last_for_inode: true,
-                }),
-                Ok(ReleaseFhOutcome {
-                    closed_last_handle: false,
-                    flushed_local_dirty_state: false,
-                }),
-            )
-            .expect("release should succeed");
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer while reader remains open");
 
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
             "last writer close must invalidate open-cache snapshots even while readers remain open"
         );
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release retained reader");
     }
 
     #[test]
@@ -3339,8 +3323,8 @@ pub extern "C" fn studiofs_macfuse_create(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     // SAFETY: macFUSE passes initialized file info for create callbacks.
     let flags = unsafe { (*fi).flags };
-    match state.adapter.create(parent, name, mode, flags) {
-        Ok((attr, open)) => {
+    match state.adapter.create_for_reply(parent, name, mode, flags) {
+        Ok((attr, open, _reply_guard)) => {
             debug!(
                 parent,
                 name = %String::from_utf8_lossy(name),
@@ -3353,7 +3337,21 @@ pub extern "C" fn studiofs_macfuse_create(
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).create(&entry, open);
+                if let Err(error) = Reply::new(request).create(&entry, open) {
+                    warn!(
+                        ino = attr.ino,
+                        file_handle = open.file_handle(),
+                        ?error,
+                        "macFUSE create reply was rejected"
+                    );
+                    state
+                        .adapter
+                        .reject_prepared_open(attr.ino, open.file_handle());
+                }
+            } else {
+                state
+                    .adapter
+                    .reject_prepared_open(attr.ino, open.file_handle());
             }
         }
         Err(errno) => {
@@ -3480,10 +3478,44 @@ pub extern "C" fn studiofs_macfuse_open(
     }
     // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for open.
     let flags = unsafe { (*fi).flags };
+    let _reply_guard =
+        (!state.adapter.is_runtime_stats_file_ino(ino)).then(|| state.adapter.lock_open_reply(ino));
     match state.adapter.open(ino, flags) {
         Ok(open) => {
             if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).open(open);
+                if let Err(error) = Reply::new(request).open(open) {
+                    warn!(
+                        ino,
+                        file_handle = open.file_handle(),
+                        ?error,
+                        "macFUSE open reply was rejected"
+                    );
+                    if state.adapter.is_runtime_stats_file_ino(ino) {
+                        if let Err(errno) = state.adapter.release(ino, open.file_handle()) {
+                            warn!(
+                                ino,
+                                file_handle = open.file_handle(),
+                                errno,
+                                "macFUSE failed to close runtime stats after rejected open reply"
+                            );
+                        }
+                    } else {
+                        state.adapter.reject_prepared_open(ino, open.file_handle());
+                    }
+                }
+            } else {
+                if state.adapter.is_runtime_stats_file_ino(ino) {
+                    if let Err(errno) = state.adapter.release(ino, open.file_handle()) {
+                        warn!(
+                            ino,
+                            file_handle = open.file_handle(),
+                            errno,
+                            "macFUSE failed to close runtime stats without an open request"
+                        );
+                    }
+                } else {
+                    state.adapter.reject_prepared_open(ino, open.file_handle());
+                }
             }
         }
         Err(errno) => {
@@ -4562,34 +4594,6 @@ mod tests {
             unrelated_updates_completed,
             "kernel IPC for one inode must not retain a DashMap shard guard and block unrelated inode updates"
         );
-    }
-
-    #[test]
-    fn write_capable_state_allows_concurrent_per_inode_access_without_external_lock() {
-        let state = Arc::new(WriteCapableState::default());
-
-        std::thread::scope(|scope| {
-            for shard_index in 0..8 {
-                let state = Arc::clone(&state);
-                scope.spawn(move || {
-                    let ino = 10_000 + shard_index;
-                    let file_handle = 20_000 + shard_index;
-                    state.record_open(ino, file_handle);
-                    assert_eq!(state.active_count(ino), 1);
-                    let released = state
-                        .release_handle(file_handle)
-                        .expect("recorded handle should release");
-                    assert_eq!(
-                        released,
-                        ReleasedWriteCapableHandle {
-                            ino,
-                            last_for_inode: true,
-                        }
-                    );
-                    assert_eq!(state.active_count(ino), 0);
-                });
-            }
-        });
     }
 
     #[test]

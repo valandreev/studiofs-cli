@@ -28,7 +28,9 @@ tasks:
       sudo apt-get install -y \
         ca-certificates \
         curl \
+        fuse3 \
         jq \
+        libfuse3-dev \
         libgtk-3-dev \
         libxdo-dev \
         pkg-config \
@@ -72,6 +74,12 @@ tasks:
 
       docker version
       docker compose version
+      test -c /dev/fuse || {
+        echo "preflight failed: RWX runner does not expose /dev/fuse" >&2
+        exit 1
+      }
+      command -v fusermount3
+      pkg-config --modversion fuse3
 
       cargo run -p studiofs-e2e -- list
       cargo test -p studiofs-e2e --test runner_contract -- --nocapture
@@ -87,9 +95,6 @@ tasks:
     docker: true
     run: |
       set -euo pipefail
-      echo "Linux mounted E2E is disabled: SFS-600 removed the legacy raw FUSE bridge."
-      exit 2
-
       case "${RWX_RUN_ID:-}" in
         ""|*[!A-Za-z0-9_-]*)
           echo "e2e smoke failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
@@ -170,9 +175,6 @@ tasks:
     timeout: 30m
     run: |
       set -euo pipefail
-      echo "Linux mounted E2E is disabled: SFS-600 removed the legacy raw FUSE bridge."
-      exit 2
-
       case "${RWX_RUN_ID:-}" in
         ""|*[!A-Za-z0-9_-]*)
           echo "e2e full failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
