@@ -1,7 +1,9 @@
-#![expect(
+#![allow(
     dead_code,
     reason = "SFS-632 wires this staged private state into PostgreSQL-backed local roots."
 )]
+
+use std::ops::Range;
 
 const STATE_VERSION: u8 = 1;
 const RECORD_ENCODED_LEN: usize = 11;
@@ -12,12 +14,19 @@ pub(crate) const MAX_COUNTER: u64 = COUNTER_LIMIT - 1;
 pub(crate) const MAX_NAMESPACE: u32 = 0x00ff_ffff;
 const LOCAL_ID_BATCH_SIZE: u64 = 4_096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AllocatorStateError {
+    #[error("invalid allocator namespace")]
     InvalidNamespace,
+    #[error("duplicate allocator namespaces")]
+    DuplicateNamespace,
+    #[error("invalid allocator reserved-through counter")]
     InvalidReservedThrough,
+    #[error("invalid allocator counter")]
     InvalidCounter,
+    #[error("invalid allocator state encoding")]
     InvalidEncoding,
+    #[error("allocator counter exhausted")]
     CounterExhausted,
 }
 
@@ -56,12 +65,11 @@ impl AllocatorRecord {
         self,
         requested_count: u64,
     ) -> Result<(Self, Range<u64>), AllocatorStateError> {
-        let count = requested_count.max(LOCAL_ID_BATCH_SIZE);
-        let end = self
-            .reserved_through
-            .checked_add(count)
-            .filter(|&end| end <= COUNTER_LIMIT)
-            .ok_or(AllocatorStateError::CounterExhausted)?;
+        let available = COUNTER_LIMIT - self.reserved_through;
+        if available == 0 || requested_count > available {
+            return Err(AllocatorStateError::CounterExhausted);
+        }
+        let end = self.reserved_through + requested_count.max(LOCAL_ID_BATCH_SIZE).min(available);
         let next = Self::new(self.namespace, end)?;
         Ok((next, self.reserved_through..end))
     }
@@ -102,8 +110,14 @@ pub(crate) struct AllocatorStateV1 {
 }
 
 impl AllocatorStateV1 {
-    pub(crate) const fn new(inode: AllocatorRecord, payload: AllocatorRecord) -> Self {
-        Self { inode, payload }
+    pub(crate) fn new(
+        inode: AllocatorRecord,
+        payload: AllocatorRecord,
+    ) -> Result<Self, AllocatorStateError> {
+        if inode.namespace() == payload.namespace() {
+            return Err(AllocatorStateError::DuplicateNamespace);
+        }
+        Ok(Self { inode, payload })
     }
 
     pub(crate) fn encode(self) -> [u8; ENCODED_LEN] {
@@ -120,10 +134,10 @@ impl AllocatorStateV1 {
         if bytes.len() != ENCODED_LEN || bytes.first() != Some(&STATE_VERSION) {
             return Err(AllocatorStateError::InvalidEncoding);
         }
-        Ok(Self::new(
+        Self::new(
             AllocatorRecord::decode(&bytes[1..1 + RECORD_ENCODED_LEN])?,
             AllocatorRecord::decode(&bytes[1 + RECORD_ENCODED_LEN..])?,
-        ))
+        )
     }
 }
 
@@ -148,6 +162,14 @@ mod tests {
         assert_eq!(
             AllocatorRecord::new(0, 0),
             Err(AllocatorStateError::InvalidNamespace)
+        );
+    }
+
+    #[test]
+    fn sfs623_allocator_state_errors_have_display_messages() {
+        assert_eq!(
+            AllocatorStateError::CounterExhausted.to_string(),
+            "allocator counter exhausted"
         );
     }
 
@@ -189,6 +211,22 @@ mod tests {
     }
 
     #[test]
+    fn sfs623_allocator_state_rejects_duplicate_namespaces() {
+        let state = AllocatorStateV1::new(
+            AllocatorRecord::new(1, 0).expect("inode record"),
+            AllocatorRecord::new(2, 0).expect("payload record"),
+        )
+        .expect("allocator state");
+        let mut encoded = state.encode();
+        encoded[1 + RECORD_ENCODED_LEN..1 + RECORD_ENCODED_LEN + 3].copy_from_slice(&[0, 0, 1]);
+
+        assert_eq!(
+            AllocatorStateV1::decode(&encoded),
+            Err(AllocatorStateError::DuplicateNamespace)
+        );
+    }
+
+    #[test]
     fn sfs623_allocator_state_accepts_final_exclusive_endpoint_but_cannot_reserve_past_it() {
         let record = AllocatorRecord::new(1, COUNTER_LIMIT - LOCAL_ID_BATCH_SIZE).expect("record");
 
@@ -206,13 +244,27 @@ mod tests {
     }
 
     #[test]
+    fn sfs623_allocator_state_reserves_a_final_partial_batch() {
+        let record = AllocatorRecord::new(1, COUNTER_LIMIT - 1).expect("record");
+
+        assert_eq!(
+            record.reserve(1),
+            Ok((
+                AllocatorRecord::new(1, COUNTER_LIMIT).expect("advanced record"),
+                (COUNTER_LIMIT - 1)..COUNTER_LIMIT,
+            ))
+        );
+    }
+
+    #[test]
     fn sfs623_allocator_state_restarts_after_the_reserved_tail() {
         let state = AllocatorStateV1::new(
             AllocatorRecord::new(1, 0).expect("inode record"),
             AllocatorRecord::new(2, 0).expect("payload record"),
-        );
+        )
+        .expect("allocator state");
         let (inode, first) = state.inode.reserve(1).expect("first reservation");
-        let persisted = AllocatorStateV1::new(inode, state.payload);
+        let persisted = AllocatorStateV1::new(inode, state.payload).expect("persisted state");
         let restarted = AllocatorStateV1::decode(&persisted.encode())
             .expect("decode persisted state")
             .inode;
@@ -223,11 +275,53 @@ mod tests {
     }
 
     #[test]
+    fn sfs623_allocator_state_replaces_persisted_pair_atomically() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = dir.path().join("meta.redb");
+        let first = AllocatorStateV1::new(
+            AllocatorRecord::new(1, 4_096).expect("inode record"),
+            AllocatorRecord::new(2, 8_192).expect("payload record"),
+        )
+        .expect("first state");
+        let engine = crate::redb_engine::RedbMetaEngine::open(&path).expect("open metadata");
+
+        assert_eq!(
+            engine.read_allocator_state().expect("read empty state"),
+            None
+        );
+        engine
+            .replace_allocator_state(first)
+            .expect("persist first state");
+        drop(engine);
+
+        let engine = crate::redb_engine::RedbMetaEngine::open(&path).expect("reopen metadata");
+        assert_eq!(
+            engine.read_allocator_state().expect("read first state"),
+            Some(first)
+        );
+
+        let second = AllocatorStateV1::new(
+            AllocatorRecord::new(1, 12_288).expect("inode record"),
+            AllocatorRecord::new(2, 16_384).expect("payload record"),
+        )
+        .expect("second state");
+        engine
+            .replace_allocator_state(second)
+            .expect("replace allocator state");
+
+        assert_eq!(
+            engine.read_allocator_state().expect("read second state"),
+            Some(second)
+        );
+    }
+
+    #[test]
     fn sfs623_allocator_state_rejects_partial_or_unknown_versioned_pair() {
         let state = AllocatorStateV1::new(
             AllocatorRecord::new(1, 0).expect("inode record"),
             AllocatorRecord::new(2, 0).expect("payload record"),
-        );
+        )
+        .expect("allocator state");
         let mut encoded = state.encode();
         encoded[0] = 2;
 
@@ -241,4 +335,3 @@ mod tests {
         );
     }
 }
-use std::ops::Range;

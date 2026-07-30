@@ -8,6 +8,10 @@ pub(super) const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition:
 /// Counters: counter_name -> u64 (as bytes)
 pub(super) const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 
+/// Paired local allocator state, intentionally excluded from exported snapshots.
+pub(super) const LOCAL_ALLOCATOR_STATE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("local_allocator_state");
+
 /// Inodes: ino (u64) -> InodeAttr (postcard)
 pub(super) const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
 

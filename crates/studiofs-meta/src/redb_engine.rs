@@ -520,6 +520,7 @@ impl RedbMetaEngine {
             let txn = begin_redb_write_txn(&db, None)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
+            let _ = txn.open_table(LOCAL_ALLOCATOR_STATE_TABLE);
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(BASE_INODES_TABLE);
             let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
@@ -700,6 +701,7 @@ impl RedbMetaEngine {
 }
 
 mod acl;
+mod allocator_state;
 mod chunk_state;
 mod format;
 mod gc;
