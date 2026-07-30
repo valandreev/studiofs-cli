@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub(crate) mod allocator_state;
+
 /// Async adapters for invoking synchronous metadata capabilities from Tokio.
 pub mod async_engine;
 /// Fast Contract/Core fixtures and invariant checks for local tests.
