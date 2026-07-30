@@ -102,7 +102,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$(uname -s)" != "Linux" ]]; then
+if [[ -z "$report_only_dir" && "$(uname -s)" != "Linux" ]]; then
   echo "Error: SFS-598 parity gate is Linux-only." >&2
   exit 2
 fi
@@ -120,20 +120,20 @@ if [[ "$dry_run" == false && -z "$report_only_dir" && ! -x "$bench_bin" ]]; then
   exit 1
 fi
 
-bench_bin="$(realpath -m "$bench_bin")"
-source_repo="$(realpath -m "$source_repo")"
-juicefs_repo="$(realpath -m "$juicefs_repo")"
-output_root="$(realpath -m "$output_root")"
-local_target="$(realpath -m "$local_target")"
-studiofs_new_target="$(realpath -m "$studiofs_new_target")"
-studiofs_old_target="$(realpath -m "$studiofs_old_target")"
-studiofs_adaptive_target="$(realpath -m "$studiofs_adaptive_target")"
-juicefs_target="$(realpath -m "$juicefs_target")"
-
 over_ram_total_memory_bytes=0
 over_ram_available_memory_bytes=0
 over_ram_workload_bytes=0
 if [[ -z "$report_only_dir" ]]; then
+  bench_bin="$(realpath -m "$bench_bin")"
+  source_repo="$(realpath -m "$source_repo")"
+  juicefs_repo="$(realpath -m "$juicefs_repo")"
+  output_root="$(realpath -m "$output_root")"
+  local_target="$(realpath -m "$local_target")"
+  studiofs_new_target="$(realpath -m "$studiofs_new_target")"
+  studiofs_old_target="$(realpath -m "$studiofs_old_target")"
+  studiofs_adaptive_target="$(realpath -m "$studiofs_adaptive_target")"
+  juicefs_target="$(realpath -m "$juicefs_target")"
+
   if ! read -r over_ram_total_kib over_ram_available_kib < <(
     awk '
       $1 == "MemTotal:" { total = $2 }
@@ -159,11 +159,11 @@ if [[ -z "$report_only_dir" ]]; then
 fi
 
 if [[ -n "$report_only_dir" ]]; then
-  artifact_dir="$(realpath -m "$report_only_dir")"
-  if [[ ! -d "$artifact_dir" ]]; then
-    echo "Error: STUDIOFS_PERF_REPORT_ONLY_DIR is not a directory: $artifact_dir" >&2
+  if [[ ! -d "$report_only_dir" ]]; then
+    echo "Error: STUDIOFS_PERF_REPORT_ONLY_DIR is not a directory: $report_only_dir" >&2
     exit 2
   fi
+  artifact_dir="$(cd "$report_only_dir" && pwd -P)"
 else
   mkdir -p "$output_root"
   timestamp="$(date -u +%Y%m%d-%H%M%S)"
