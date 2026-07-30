@@ -9112,6 +9112,29 @@ impl StudioVfs {
         fh: u64,
         participation: OsCacheParticipation,
     ) -> OsCacheOpenDecision {
+        self.prepare_os_cache_open_inner(fh, participation, None)
+    }
+
+    /// Prepare an OS-cache decision from the attribute snapshot used for the platform reply.
+    ///
+    /// Read-only bridge paths should use this variant after refreshing local
+    /// attributes so cache identity, reply attributes, and memory policy all
+    /// describe the same metadata view.
+    pub fn prepare_os_cache_open_with_attr(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+        refreshed_attr: &InodeAttr,
+    ) -> OsCacheOpenDecision {
+        self.prepare_os_cache_open_inner(fh, participation, Some(refreshed_attr))
+    }
+
+    fn prepare_os_cache_open_inner(
+        &self,
+        fh: u64,
+        participation: OsCacheParticipation,
+        refreshed_attr: Option<&InodeAttr>,
+    ) -> OsCacheOpenDecision {
         let Some(open_file) = self.handle_table.get(fh) else {
             return OsCacheOpenDecision::replace(OsCacheReason::UnknownHandle);
         };
@@ -9126,9 +9149,16 @@ impl StudioVfs {
                 if writer_registered {
                     return OsCacheOpenDecision::replace(OsCacheReason::WriteCapable);
                 }
-                let Some(attr) = open_file.open_attr() else {
-                    self.os_cache.lock().clear_generation(ino);
-                    return OsCacheOpenDecision::replace(OsCacheReason::UnknownState);
+                let handle_attr;
+                let attr = if let Some(attr) = refreshed_attr {
+                    attr
+                } else {
+                    handle_attr = open_file.open_attr();
+                    let Some(attr) = handle_attr.as_ref() else {
+                        self.os_cache.lock().clear_generation(ino);
+                        return OsCacheOpenDecision::replace(OsCacheReason::UnknownState);
+                    };
+                    attr
                 };
                 if attr.kind != FileType::RegularFile {
                     self.os_cache.lock().clear_generation(ino);

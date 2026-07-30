@@ -191,6 +191,16 @@ always expose the new checksum.
   link-vs-release and concurrent-link regressions. Both affected crates passed
   all-target clippy with warnings denied, and the independent correctness
   re-review reported no remaining actionable issue.
+- [x] (2026-07-30 15:37Z) Addressed three follow-up review findings. Cache
+  preparation now consumes the refreshed attributes used by the Linux/macOS
+  reply, the over-RAM performance workload samples memory once and reuses one
+  byte count for the complete comparison matrix, and async-write observability
+  reports the effective rollback setting with no capacity limits when
+  disabled. The three regressions were reproduced before their fixes. Linux
+  passed 160 unit tests plus all 3 mounted tests, 26 focused VFS OS-cache tests
+  passed, the performance-gate Python suite passed all 3 tests, macFUSE
+  compiled, and all-target clippy passed with warnings denied for the three
+  affected Rust crates.
 
 ## Surprises & Discoveries
 
@@ -741,3 +751,8 @@ Revision note (2026-07-30): incorporated independent review of the mounted fix:
 notification receipts now carry outcomes, post-commit invalidation problems
 select zero-TTL success rather than false syscall failure, and file-session
 serialization prevents concurrent hardlinks from regressing visible attrs.
+
+Revision note (2026-07-30): recorded the follow-up fixes for refreshed
+open-reply cache identity, fixed-size over-RAM comparisons, and effective
+async-write rollback observability, together with focused, lint, and mounted
+verification evidence.

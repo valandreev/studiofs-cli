@@ -15,6 +15,7 @@ dry_run=false
 dcc_smoke_command=""
 report_only_dir="${STUDIOFS_PERF_REPORT_ONLY_DIR:-}"
 report_workloads="${STUDIOFS_PERF_REPORT_WORKLOADS:-}"
+meminfo_path="${STUDIOFS_PERF_MEMINFO_PATH:-/proc/meminfo}"
 
 local_target=""
 studiofs_new_target=""
@@ -129,6 +130,34 @@ studiofs_old_target="$(realpath -m "$studiofs_old_target")"
 studiofs_adaptive_target="$(realpath -m "$studiofs_adaptive_target")"
 juicefs_target="$(realpath -m "$juicefs_target")"
 
+over_ram_total_memory_bytes=0
+over_ram_available_memory_bytes=0
+over_ram_workload_bytes=0
+if [[ -z "$report_only_dir" ]]; then
+  if ! read -r over_ram_total_kib over_ram_available_kib < <(
+    awk '
+      $1 == "MemTotal:" { total = $2 }
+      $1 == "MemAvailable:" { available = $2 }
+      END {
+        if (!total || !available) {
+          exit 1
+        }
+        print total, available
+      }
+    ' "$meminfo_path"
+  ); then
+    echo "Error: MemAvailable and MemTotal are required in $meminfo_path" >&2
+    exit 1
+  fi
+  over_ram_total_memory_bytes=$((over_ram_total_kib * 1024))
+  over_ram_available_memory_bytes=$((over_ram_available_kib * 1024))
+  over_ram_growth_bytes=$((over_ram_available_memory_bytes / 20))
+  if ((over_ram_growth_bytes < 64 * 1024 * 1024)); then
+    over_ram_growth_bytes=$((64 * 1024 * 1024))
+  fi
+  over_ram_workload_bytes=$((over_ram_available_memory_bytes + over_ram_growth_bytes))
+fi
+
 if [[ -n "$report_only_dir" ]]; then
   artifact_dir="$(realpath -m "$report_only_dir")"
   if [[ ! -d "$artifact_dir" ]]; then
@@ -157,6 +186,9 @@ else
   "runs": $runs,
   "large_workload_bytes": $workload_bytes,
   "small_workload_bytes": $small_workload_bytes,
+  "over_ram_total_memory_bytes": $over_ram_total_memory_bytes,
+  "over_ram_available_memory_bytes": $over_ram_available_memory_bytes,
+  "over_ram_workload_bytes": $over_ram_workload_bytes,
   "dry_run": $dry_run,
   "targets": {
     "local": "$(json_escape "$local_target")",
@@ -314,19 +346,11 @@ print(json.dumps({
 PY"
       ;;
     larger-than-memory-read)
-      command_text="python3 - $(printf '%q' "$target_path") <<'PY'
+      command_text="python3 - $(printf '%q' "$target_path") $over_ram_workload_bytes $over_ram_available_memory_bytes <<'PY'
 import json, os, pathlib, sys, time
 root = pathlib.Path(sys.argv[1])
-memory = {}
-meminfo_path = pathlib.Path(os.environ.get('STUDIOFS_PERF_MEMINFO_PATH', '/proc/meminfo'))
-for line in meminfo_path.read_text().splitlines():
-    key, _, rest = line.partition(':')
-    if key in {'MemAvailable', 'MemTotal'}:
-        memory[key] = int(rest.split()[0]) * 1024
-if memory.keys() != {'MemAvailable', 'MemTotal'}:
-    raise RuntimeError('MemAvailable and MemTotal are required for the over-RAM workload')
-available = memory['MemAvailable']
-logical_size = available + max(64 * 1024 * 1024, available // 20)
+logical_size = int(sys.argv[2])
+available = int(sys.argv[3])
 path = root / 'sfs-598-over-ram.bin'
 chunk = b'o' * (8 * 1024 * 1024)
 with path.open('wb', buffering=0) as f:

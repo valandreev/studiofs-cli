@@ -1940,13 +1940,8 @@ impl SessionState {
         Ok(LinuxFuseAllocatedOpen { ino, fh, flags })
     }
 
-    fn prepare_file_open(
-        &self,
-        ino: u64,
-        file_size: u64,
-        flags: c_int,
-        fh: u64,
-    ) -> LinuxFusePreparedOpen {
+    fn prepare_file_open(&self, attr: &InodeAttr, flags: c_int, fh: u64) -> LinuxFusePreparedOpen {
+        let ino = attr.ino;
         let participation = if self.cache_policy == LinuxFuseCachePolicy::Direct
             || self.vfs.is_runtime_stats_file_ino(ino)
         {
@@ -1954,7 +1949,9 @@ impl SessionState {
         } else {
             OsCacheParticipation::Enabled
         };
-        let generation = self.vfs.prepare_os_cache_open(fh, participation);
+        let generation = self
+            .vfs
+            .prepare_os_cache_open_with_attr(fh, participation, attr);
         let available_memory = if self.cache_policy == LinuxFuseCachePolicy::Adaptive {
             self.available_memory
                 .lock()
@@ -1976,7 +1973,7 @@ impl SessionState {
                 flags,
                 self.cache_policy,
                 generation,
-                file_size,
+                attr.size,
                 available_memory,
                 linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
             )
@@ -1998,7 +1995,7 @@ impl SessionState {
         // Local metadata is cached; this refresh closes the result→reservation
         // race without introducing remote I/O.
         let attr = self.getattr_attr(allocated.ino)?;
-        Ok(self.prepare_file_open(allocated.ino, attr.size, allocated.flags, allocated.fh))
+        Ok(self.prepare_file_open(&attr, allocated.flags, allocated.fh))
     }
 
     fn run_open_reply_transaction(
@@ -2041,8 +2038,7 @@ impl SessionState {
                 return Err(errno);
             }
         };
-        let prepared =
-            self.prepare_file_open(ino, attr.size, allocated.open.flags, allocated.open.fh);
+        let prepared = self.prepare_file_open(&attr, allocated.open.flags, allocated.open.fh);
         let reply_result = reply(&attr, prepared, allocated.lookup);
         if reply_result != 0 {
             self.reject_prepared_open(ino, prepared.fh);
@@ -3157,6 +3153,16 @@ fn record_async_write_metrics(
     ledger: &AsyncWriteLedger,
     cache_policy: LinuxFuseCachePolicy,
 ) {
+    let snapshot =
+        async_write_metrics_snapshot(ledger, cache_policy, linux_fuse_async_write_enabled());
+    vfs.record_fuse_async_write_snapshot(snapshot);
+}
+
+fn async_write_metrics_snapshot(
+    ledger: &AsyncWriteLedger,
+    cache_policy: LinuxFuseCachePolicy,
+    enabled: bool,
+) -> VfsFuseAsyncWriteSnapshot {
     let AsyncWriteMetricsSnapshot {
         snapshot_generation,
         pending_writes,
@@ -3181,13 +3187,13 @@ fn record_async_write_metrics(
         LinuxFuseCachePolicy::Adaptive => "adaptive",
         LinuxFuseCachePolicy::Kernel => "kernel",
     };
-    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+    VfsFuseAsyncWriteSnapshot {
         snapshot_generation,
-        enabled: true,
+        enabled,
         linux_fuse_profile: profile.into(),
         kernel_writeback_cache: Some(cache_policy == LinuxFuseCachePolicy::Kernel),
-        max_pending_bytes: Some(DEFAULT_MAX_PENDING_BYTES),
-        max_pending_writes: Some(DEFAULT_MAX_PENDING_WRITES),
+        max_pending_bytes: enabled.then_some(DEFAULT_MAX_PENDING_BYTES),
+        max_pending_writes: enabled.then_some(DEFAULT_MAX_PENDING_WRITES),
         pending_writes,
         pending_bytes,
         pending_handles,
@@ -3205,7 +3211,7 @@ fn record_async_write_metrics(
         handle_barrier_waits,
         barrier_wait_total_ms: barrier_wait_total_nanos as f64 / 1_000_000.0,
         ..VfsFuseAsyncWriteSnapshot::default()
-    });
+    }
 }
 
 fn shutdown_invalidation_with(
@@ -3242,6 +3248,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use studiofs_meta::MetaInodes;
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 
@@ -3587,6 +3594,21 @@ mod tests {
         assert_eq!(completed.fuse_async_write.pending_writes, 0);
         assert_eq!(completed.fuse_async_write.completed_writes, 1);
         assert_eq!(completed.fuse_async_write.failed_writes, 1);
+    }
+
+    #[test]
+    fn disabled_async_write_metrics_report_the_effective_setting() {
+        let ledger = crate::async_writes::AsyncWriteLedger::with_limits(16, 4);
+
+        let snapshot = super::async_write_metrics_snapshot(
+            &ledger,
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            false,
+        );
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.max_pending_bytes, None);
+        assert_eq!(snapshot.max_pending_writes, None);
     }
 
     #[test]
@@ -4052,7 +4074,7 @@ mod tests {
             )
             .expect("open with provisional kernel owner");
 
-        let prepared = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, fh);
+        let prepared = state.prepare_file_open(&attr, libc::O_RDONLY, fh);
 
         assert!(prepared.cache.direct_io);
         assert_eq!(
@@ -4086,7 +4108,7 @@ mod tests {
                 studiofs_vfs::ReadAheadOwner::Kernel,
             )
             .expect("open initial generation");
-        let warm = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, warm_fh);
+        let warm = state.prepare_file_open(&attr, libc::O_RDONLY, warm_fh);
         assert!(
             !warm.cache.keep_cache,
             "first generation must replace pages"
@@ -4148,7 +4170,7 @@ mod tests {
                 studiofs_vfs::ReadAheadOwner::Kernel,
             )
             .expect("reopen after rejected reply");
-        let next = state.prepare_file_open(attr.ino, attr.size, libc::O_RDONLY, next_fh);
+        let next = state.prepare_file_open(&attr, libc::O_RDONLY, next_fh);
         assert!(
             !next.cache.keep_cache,
             "rejected reply must not leave a reusable generation snapshot"
@@ -4188,6 +4210,65 @@ mod tests {
         assert_eq!(cache.total, 1);
         assert_eq!(cache.direct_opens, 1);
         assert_eq!(cache.disabled, 1);
+    }
+
+    #[test]
+    fn open_reply_cache_generation_uses_refreshed_attributes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-refreshed-open-generation",
+        )
+        .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let attr = fixture
+            .vfs()
+            .create(1, b"refreshed-open-generation.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let warm_fh = fixture
+            .vfs()
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open initial generation");
+        let warm = state.prepare_file_open(&attr, libc::O_RDONLY, warm_fh);
+        assert!(!warm.cache.keep_cache, "first observation replaces pages");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(warm_fh))
+            .expect("release initial generation");
+
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open from old attributes");
+        let mut refreshed = fixture.meta().get_attr(attr.ino).expect("refresh attr");
+        refreshed.size = 4096;
+        refreshed.committed_size = 4096;
+        refreshed.content_epoch = refreshed.content_epoch.saturating_add(1);
+        refreshed.committed_content_epoch = refreshed.content_epoch;
+        fixture
+            .meta()
+            .set_attr(&refreshed)
+            .expect("publish refreshed attributes");
+        thread::sleep(Duration::from_millis(1_100));
+
+        state
+            .run_open_reply_transaction(
+                attr.ino,
+                || Ok(allocated),
+                |prepared| {
+                    assert_eq!(
+                        (prepared.cache.keep_cache, prepared.reason),
+                        (false, studiofs_vfs::vfs::OsCacheReason::GenerationChanged),
+                        "the generation must match the refreshed attributes used for the reply"
+                    );
+                    -libc::ENOENT
+                },
+            )
+            .expect("prepare refreshed open reply");
     }
 
     #[test]

@@ -1297,7 +1297,12 @@ impl StudioVfsAdapter {
         } else {
             OsCacheParticipation::Disabled
         };
-        let decision = self.vfs.prepare_os_cache_open(fh, participation);
+        let decision = if let Some(attr) = attr.as_ref() {
+            self.vfs
+                .prepare_os_cache_open_with_attr(fh, participation, attr)
+        } else {
+            self.vfs.prepare_os_cache_open(fh, participation)
+        };
         let Some(attr) = attr else {
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
