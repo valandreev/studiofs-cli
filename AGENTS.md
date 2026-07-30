@@ -16,6 +16,20 @@ When writing complex features or significant refactors, use an ExecPlan (as desc
 - Prefer focused validation for local work; run broad full-suite commands only when requested.
 - All temporary files should be in `target/` and should be cleaned up after use.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs for this repo live in Linear and are managed through the configured Linear plug-in. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.
+
 ## Temporal Awareness and Efficiency
 
 - Treat elapsed time and tokens as finite engineering budgets.
