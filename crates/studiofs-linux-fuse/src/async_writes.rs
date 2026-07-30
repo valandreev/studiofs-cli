@@ -50,6 +50,8 @@ struct PendingWrite {
     ino: u64,
     fh: u64,
     reserved_bytes: Option<usize>,
+    cancellable: bool,
+    cancellation_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +212,8 @@ impl AsyncWriteLedger {
                 ino,
                 fh,
                 reserved_bytes: None,
+                cancellable: true,
+                cancellation_requested: false,
             },
         );
         state
@@ -313,37 +317,56 @@ impl AsyncWriteLedger {
     /// deliberately not retained.
     pub(crate) fn track_task(&self, sequence: u64, abort_handle: AbortHandle) -> bool {
         let mut state = self.lock_state();
-        if !state.pending.contains_key(&sequence) {
+        let Some(write) = state.pending.get(&sequence) else {
             return false;
-        }
-        if state.shutting_down {
+        };
+        if write.cancellation_requested {
             drop(state);
             abort_handle.abort();
+            return true;
+        }
+        if !write.cancellable {
             return true;
         }
         state.task_abort_handles.insert(sequence, abort_handle);
         true
     }
 
-    pub(crate) fn abort_pending_tasks(&self) -> usize {
-        let abort_handles = {
-            let state = self.lock_state();
-            state
-                .task_abort_handles
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
+    /// Atomically leave the shutdown-cancellable phase before entering the VFS write future.
+    pub(crate) fn mark_task_non_cancellable(&self, sequence: u64) -> bool {
+        let mut state = self.lock_state();
+        let Some(write) = state.pending.get_mut(&sequence) else {
+            return false;
         };
-        for abort_handle in &abort_handles {
-            abort_handle.abort();
+        if write.cancellation_requested {
+            return false;
         }
-        if !abort_handles.is_empty() {
-            let mut state = self.lock_state();
-            state.canceled_writes = state
-                .canceled_writes
-                .saturating_add(abort_handles.len() as u64);
+        write.cancellable = false;
+        state.task_abort_handles.remove(&sequence);
+        true
+    }
+
+    pub(crate) fn abort_pending_tasks(&self) -> usize {
+        let mut state = self.lock_state();
+        let cancellable = state
+            .pending
+            .iter()
+            .filter_map(|(&sequence, write)| {
+                (write.cancellable && !write.cancellation_requested).then_some(sequence)
+            })
+            .collect::<Vec<_>>();
+        for sequence in &cancellable {
+            if let Some(write) = state.pending.get_mut(sequence) {
+                write.cancellation_requested = true;
+            }
+            if let Some(abort_handle) = state.task_abort_handles.get(sequence) {
+                abort_handle.abort();
+            }
         }
-        abort_handles.len()
+        state.canceled_writes = state
+            .canceled_writes
+            .saturating_add(cancellable.len() as u64);
+        cancellable.len()
     }
 
     pub(crate) fn record_shutdown_timeout(&self) {
@@ -1231,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn task_registered_after_shutdown_is_aborted_immediately() {
+    fn task_registered_during_first_shutdown_drain_waits_for_explicit_cancellation() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("create test runtime");
@@ -1245,20 +1268,79 @@ mod tests {
         });
 
         ledger.shutdown();
-        assert_eq!(
-            ledger.abort_pending_tasks(),
-            0,
-            "the spawn→registration window has no tracked handle yet"
-        );
         assert!(ledger.track_task(sequence, task.abort_handle()));
+        runtime.block_on(tokio::task::yield_now());
+        assert!(
+            !task.is_finished(),
+            "shutdown alone must preserve the first drain window"
+        );
+        assert_eq!(ledger.abort_pending_tasks(), 1);
         let error = runtime
             .block_on(task)
-            .expect_err("late registration must observe shutdown and abort");
+            .expect_err("explicit cancellation must abort the queued task");
         assert!(error.is_cancelled());
         assert_eq!(
             ledger.wait_inode(watermark),
             BarrierOutcome::Complete(Some(libc::EIO))
         );
+    }
+
+    #[test]
+    fn explicit_cancellation_before_task_registration_aborts_on_registration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime");
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.admit(10, 100, 4).expect("write should admit");
+        let sequence = ticket.sequence();
+        let watermark = ledger.capture_inode_watermark(10);
+        let task = runtime.spawn(async move {
+            let _ticket = ticket;
+            std::future::pending::<()>().await;
+        });
+
+        ledger.shutdown();
+        assert_eq!(ledger.abort_pending_tasks(), 1);
+        assert!(ledger.track_task(sequence, task.abort_handle()));
+        let error = runtime
+            .block_on(task)
+            .expect_err("late registration must apply requested cancellation");
+        assert!(error.is_cancelled());
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
+    }
+
+    #[test]
+    fn task_is_not_aborted_after_entering_non_cancellable_write_phase() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create test runtime");
+        let ledger = Arc::new(AsyncWriteLedger::default());
+        let ticket = ledger.admit(10, 100, 4).expect("write should admit");
+        let sequence = ticket.sequence();
+        let task = runtime.spawn(std::future::pending::<()>());
+        assert!(ledger.track_task(sequence, task.abort_handle()));
+        assert!(
+            ledger.mark_task_non_cancellable(sequence),
+            "pending task should enter the VFS mutation phase"
+        );
+
+        ledger.shutdown();
+        assert_eq!(ledger.abort_pending_tasks(), 0);
+        runtime.block_on(tokio::task::yield_now());
+        assert!(
+            !task.is_finished(),
+            "post-transition task must survive shutdown cancellation"
+        );
+
+        task.abort();
+        let error = runtime
+            .block_on(task)
+            .expect_err("test cleanup should abort the detached pending future");
+        assert!(error.is_cancelled());
+        ticket.complete(Ok(()));
     }
 
     #[test]

@@ -297,13 +297,46 @@ impl FuseWriteReply for FuseReqPtr {
 struct FuseWriteTaskGuard<R: FuseWriteReply> {
     reply: Option<R>,
     ticket: Option<AsyncWriteTicket>,
+    metrics: Option<FuseWriteCallbackMetrics>,
+}
+
+struct FuseWriteCallbackMetrics {
+    vfs: Arc<StudioVfs>,
+    requested_bytes: usize,
+    started: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct FuseWriteCallbackContext {
+    req: *mut raw::FuseReq,
+    started: Instant,
 }
 
 impl<R: FuseWriteReply> FuseWriteTaskGuard<R> {
+    #[cfg(test)]
     fn new(reply: R, ticket: AsyncWriteTicket) -> Self {
         Self {
             reply: Some(reply),
             ticket: Some(ticket),
+            metrics: None,
+        }
+    }
+
+    fn with_metrics(
+        reply: R,
+        ticket: AsyncWriteTicket,
+        vfs: Arc<StudioVfs>,
+        requested_bytes: usize,
+        started: Instant,
+    ) -> Self {
+        Self {
+            reply: Some(reply),
+            ticket: Some(ticket),
+            metrics: Some(FuseWriteCallbackMetrics {
+                vfs,
+                requested_bytes,
+                started,
+            }),
         }
     }
 
@@ -326,6 +359,13 @@ impl<R: FuseWriteReply> FuseWriteTaskGuard<R> {
                 "Linux FUSE async write reply was rejected"
             );
         }
+        if let Some(metrics) = self.metrics.take() {
+            metrics.vfs.record_fuse_write_callback(
+                metrics.requested_bytes,
+                metrics.started.elapsed(),
+                result.is_err(),
+            );
+        }
         ticket.complete(result.map(|_| ()));
         reply_result
     }
@@ -341,6 +381,13 @@ impl<R: FuseWriteReply> Drop for FuseWriteTaskGuard<R> {
             debug!(
                 result = reply_result,
                 "Linux FUSE cancelled async write EIO reply was rejected"
+            );
+        }
+        if let Some(metrics) = self.metrics.take() {
+            metrics.vfs.record_fuse_write_callback(
+                metrics.requested_bytes,
+                metrics.started.elapsed(),
+                true,
             );
         }
         if let Some(ticket) = self.ticket.take() {
@@ -1311,13 +1358,15 @@ pub extern "C" fn studiofs_linux_fuse_write(
         return;
     };
     let started = Instant::now();
-    match state.queue_async_write(req, ino, buf, size, off, fi) {
-        Ok(true) => {
-            state
-                .vfs
-                .record_fuse_write_callback(size, started.elapsed(), false);
-            return;
-        }
+    match state.queue_async_write(
+        FuseWriteCallbackContext { req, started },
+        ino,
+        buf,
+        size,
+        off,
+        fi,
+    ) {
+        Ok(true) => return,
         Ok(false) => {}
         Err(errno) => {
             state
@@ -2069,7 +2118,7 @@ impl SessionState {
 
     fn queue_async_write(
         &self,
-        req: *mut raw::FuseReq,
+        callback: FuseWriteCallbackContext,
         ino: u64,
         buf: *const c_char,
         size: usize,
@@ -2107,8 +2156,19 @@ impl SessionState {
         let metrics_ledger = Arc::clone(&self.async_writes);
         let cache_policy = self.cache_policy;
         let sequence = ticket.sequence();
-        let task_guard = FuseWriteTaskGuard::new(FuseReqPtr(req), ticket);
+        let task_guard = FuseWriteTaskGuard::with_metrics(
+            FuseReqPtr(callback.req),
+            ticket,
+            Arc::clone(&self.vfs),
+            size,
+            callback.started,
+        );
+        let write_ledger = Arc::clone(&self.async_writes);
         let task = self.runtime_handle.spawn(async move {
+            if !write_ledger.mark_task_non_cancellable(sequence) {
+                record_async_write_metrics(&metrics_vfs, &metrics_ledger, cache_policy);
+                return;
+            }
             let result = vfs
                 .write_fh_owned_with_deferred_materialize(
                     fh,
@@ -3005,9 +3065,9 @@ fn shutdown_async_writes_with_timeout(ledger: &AsyncWriteLedger, timeout: Durati
         return true;
     }
 
-    // Only opportunistic writes enter this ledger. Their owned payload and
-    // VFS future are cancellation-safe; the task guard converts cancellation
-    // into exactly one EIO reply and a sticky ledger error.
+    // Only tasks that have not entered the VFS mutation future remain
+    // cancellable. Their guard converts cancellation into exactly one EIO
+    // reply and a sticky ledger error; post-transition writes keep draining.
     ledger.abort_pending_tasks();
     matches!(ledger.wait_all(timeout), BarrierOutcome::Complete(_))
 }
@@ -3123,7 +3183,7 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 
@@ -3502,6 +3562,42 @@ mod tests {
             ledger.wait_inode(watermark),
             crate::async_writes::BarrierOutcome::Complete(None)
         );
+    }
+
+    #[test]
+    fn async_write_callback_metrics_are_recorded_only_when_reply_completes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-async-write-callback-stats",
+        )
+        .expect("create VFS fixture");
+        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        let guard = super::FuseWriteTaskGuard::with_metrics(
+            FakeWriteReply {
+                replies: Arc::new(Mutex::new(Vec::new())),
+                result: 0,
+            },
+            ticket,
+            fixture.vfs(),
+            8,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            fixture
+                .vfs()
+                .write_path_observability_snapshot()
+                .fuse_callbacks
+                .write
+                .calls,
+            0,
+            "enqueue must not count as callback completion"
+        );
+        guard.complete(Err(libc::ENOSPC));
+        let stats = fixture.vfs().write_path_observability_snapshot();
+        assert_eq!(stats.fuse_callbacks.write.calls, 1);
+        assert_eq!(stats.fuse_callbacks.write.bytes, 8);
+        assert_eq!(stats.fuse_callbacks.write.errors, 1);
     }
 
     #[test]

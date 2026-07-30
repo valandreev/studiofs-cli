@@ -13,6 +13,8 @@ workload_bytes=$((1024 * 1024 * 1024))
 small_workload_bytes=$((256 * 1024 * 1024))
 dry_run=false
 dcc_smoke_command=""
+report_only_dir="${STUDIOFS_PERF_REPORT_ONLY_DIR:-}"
+report_workloads="${STUDIOFS_PERF_REPORT_WORKLOADS:-}"
 
 local_target=""
 studiofs_new_target=""
@@ -112,7 +114,7 @@ for required in local_target studiofs_new_target studiofs_old_target studiofs_ad
   fi
 done
 
-if [[ "$dry_run" == false && ! -x "$bench_bin" ]]; then
+if [[ "$dry_run" == false && -z "$report_only_dir" && ! -x "$bench_bin" ]]; then
   echo "Error: studiofs-bench is not executable: $bench_bin" >&2
   exit 1
 fi
@@ -127,17 +129,24 @@ studiofs_old_target="$(realpath -m "$studiofs_old_target")"
 studiofs_adaptive_target="$(realpath -m "$studiofs_adaptive_target")"
 juicefs_target="$(realpath -m "$juicefs_target")"
 
-mkdir -p "$output_root"
-timestamp="$(date -u +%Y%m%d-%H%M%S)"
-artifact_dir="$output_root/sfs-598-linux-juicefs-parity-$timestamp"
-suffix=2
-while ! mkdir "$artifact_dir" 2>/dev/null; do
-  artifact_dir="$output_root/sfs-598-linux-juicefs-parity-$timestamp-$suffix"
-  suffix=$((suffix + 1))
-done
+if [[ -n "$report_only_dir" ]]; then
+  artifact_dir="$(realpath -m "$report_only_dir")"
+  if [[ ! -d "$artifact_dir" ]]; then
+    echo "Error: STUDIOFS_PERF_REPORT_ONLY_DIR is not a directory: $artifact_dir" >&2
+    exit 2
+  fi
+else
+  mkdir -p "$output_root"
+  timestamp="$(date -u +%Y%m%d-%H%M%S)"
+  artifact_dir="$output_root/sfs-598-linux-juicefs-parity-$timestamp"
+  suffix=2
+  while ! mkdir "$artifact_dir" 2>/dev/null; do
+    artifact_dir="$output_root/sfs-598-linux-juicefs-parity-$timestamp-$suffix"
+    suffix=$((suffix + 1))
+  done
 
-git_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
-cat > "$artifact_dir/environment.json" <<JSON
+  git_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
+  cat > "$artifact_dir/environment.json" <<JSON
 {
   "issue": "SFS-598",
   "created_utc": "$timestamp",
@@ -158,12 +167,17 @@ cat > "$artifact_dir/environment.json" <<JSON
   }
 }
 JSON
+fi
 
 declare -a target_names=("local" "studiofs_feature_direct" "studiofs_main_direct" "studiofs_feature_adaptive" "juicefs")
 declare -a target_paths=("$local_target" "$studiofs_new_target" "$studiofs_old_target" "$studiofs_adaptive_target" "$juicefs_target")
 declare -a workload_names=(
   "large-sequential-read-write"
+  "cold-sequential-read"
   "repeated-warm-read"
+  "random-read"
+  "larger-than-memory-read"
+  "inode-barrier-isolation"
   "small-files-4kib"
   "small-files-16kib"
   "small-files-64kib"
@@ -174,6 +188,9 @@ declare -a workload_names=(
 )
 if [[ -n "$dcc_smoke_command" ]]; then
   workload_names+=("dcc-smoke")
+fi
+if [[ -n "$report_workloads" ]]; then
+  read -r -a workload_names <<< "$report_workloads"
 fi
 
 record_dry_run() {
@@ -199,6 +216,37 @@ run_workload() {
   case "$workload" in
     large-sequential-read-write)
       command_text="$(printf '%q ' "$bench_bin" --scripted --target "$target_path" --workload-bytes "$workload_bytes" --mode read-write --layout single-file --cache enabled --save-report)"
+      ;;
+    cold-sequential-read)
+      command_text="python3 - $(printf '%q' "$target_path") $workload_bytes <<'PY'
+import json, os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+size = int(sys.argv[2])
+path = root / 'sfs-598-cold-sequential.bin'
+chunk = b'c' * (8 * 1024 * 1024)
+with path.open('wb', buffering=0) as f:
+    remaining = size
+    while remaining:
+        part = chunk[:min(len(chunk), remaining)]
+        f.write(part)
+        remaining -= len(part)
+    os.fsync(f.fileno())
+    if hasattr(os, 'posix_fadvise'):
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+started = time.monotonic()
+total = 0
+with path.open('rb', buffering=0) as f:
+    while True:
+        data = f.read(len(chunk))
+        if not data:
+            break
+        total += len(data)
+print(json.dumps({
+    'workload': 'cold-sequential-read',
+    'bytes': total,
+    'wall_ms': round((time.monotonic() - started) * 1000, 3),
+}, sort_keys=True))
+PY"
       ;;
     repeated-warm-read)
       command_text="python3 - $(printf '%q' "$target_path") $workload_bytes <<'PY'
@@ -227,6 +275,158 @@ for _ in range(2):
             total += len(data)
     reads.append({'bytes': total, 'wall_ms': round((time.monotonic() - start) * 1000, 3)})
 print(json.dumps({'workload': 'repeated-warm-read', 'reads': reads}, sort_keys=True))
+PY"
+      ;;
+    random-read)
+      command_text="python3 - $(printf '%q' "$target_path") $small_workload_bytes <<'PY'
+import json, os, pathlib, random, sys, time
+root = pathlib.Path(sys.argv[1])
+size = int(sys.argv[2])
+path = root / 'sfs-598-random-read.bin'
+chunk = b'r' * (8 * 1024 * 1024)
+with path.open('wb', buffering=0) as f:
+    remaining = size
+    while remaining:
+        part = chunk[:min(len(chunk), remaining)]
+        f.write(part)
+        remaining -= len(part)
+    os.fsync(f.fileno())
+    if hasattr(os, 'posix_fadvise'):
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+block = 4096
+blocks = max(1, size // block)
+sample_count = min(16_384, blocks)
+rng = random.Random(0x5F598)
+offsets = [rng.randrange(blocks) * block for _ in range(sample_count)]
+started = time.monotonic()
+checksum = 0
+with path.open('rb', buffering=0) as f:
+    for offset in offsets:
+        f.seek(offset)
+        data = f.read(block)
+        checksum ^= data[0] if data else 0
+print(json.dumps({
+    'workload': 'random-read',
+    'reads': sample_count,
+    'checksum': checksum,
+    'wall_ms': round((time.monotonic() - started) * 1000, 3),
+}, sort_keys=True))
+PY"
+      ;;
+    larger-than-memory-read)
+      command_text="python3 - $(printf '%q' "$target_path") <<'PY'
+import json, os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+memory = {}
+meminfo_path = pathlib.Path(os.environ.get('STUDIOFS_PERF_MEMINFO_PATH', '/proc/meminfo'))
+for line in meminfo_path.read_text().splitlines():
+    key, _, rest = line.partition(':')
+    if key in {'MemAvailable', 'MemTotal'}:
+        memory[key] = int(rest.split()[0]) * 1024
+if memory.keys() != {'MemAvailable', 'MemTotal'}:
+    raise RuntimeError('MemAvailable and MemTotal are required for the over-RAM workload')
+available = memory['MemAvailable']
+logical_size = available + max(64 * 1024 * 1024, available // 20)
+path = root / 'sfs-598-over-ram.bin'
+chunk = b'o' * (8 * 1024 * 1024)
+with path.open('wb', buffering=0) as f:
+    remaining = logical_size
+    while remaining:
+        part = chunk[:min(len(chunk), remaining)]
+        f.write(part)
+        remaining -= len(part)
+    os.fsync(f.fileno())
+    if hasattr(os, 'posix_fadvise'):
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+started = time.monotonic()
+total = 0
+checksum = 0
+with path.open('rb', buffering=0) as f:
+    while True:
+        data = f.read(len(chunk))
+        if not data:
+            break
+        total += len(data)
+        checksum ^= data[0]
+if total != logical_size:
+    raise RuntimeError(f'over-RAM read was short: {total} != {logical_size}')
+print(json.dumps({
+    'workload': 'larger-than-memory-read',
+    'bytes': total,
+    'checksum': checksum,
+    'available_memory_bytes': available,
+    'wall_ms': round((time.monotonic() - started) * 1000, 3),
+}, sort_keys=True))
+PY"
+      ;;
+    inode-barrier-isolation)
+      command_text="python3 - $(printf '%q' "$target_path") <<'PY'
+import json, os, pathlib, threading, sys, time
+root = pathlib.Path(sys.argv[1])
+busy_path = root / 'sfs-598-busy-inode.bin'
+barrier_path = root / 'sfs-598-barrier-inode.bin'
+busy_path.write_bytes(b'\0' * (16 * 1024 * 1024))
+barrier_path.write_bytes(b'\0' * (64 * 4096))
+stop = threading.Event()
+busy_started = threading.Event()
+busy_writes = 0
+worker_errors = []
+
+def write_busy_inode():
+    global busy_writes
+    fd = None
+    try:
+        fd = os.open(busy_path, os.O_RDWR)
+        payload = b'b' * 4096
+        busy_started.set()
+        while not stop.is_set():
+            os.pwrite(fd, payload, (busy_writes % 4096) * 4096)
+            busy_writes += 1
+    except BaseException as error:
+        worker_errors.append(error)
+    finally:
+        busy_started.set()
+        if fd is not None:
+            os.close(fd)
+
+worker = threading.Thread(target=write_busy_inode)
+worker.start()
+if not busy_started.wait(timeout=5):
+    stop.set()
+    worker.join()
+    raise RuntimeError('busy-inode writer did not start')
+if worker_errors:
+    worker.join()
+    raise RuntimeError('busy-inode writer failed before barriers') from worker_errors[0]
+busy_writes_before = busy_writes
+try:
+    latencies = []
+    started = time.monotonic()
+    with barrier_path.open('r+b', buffering=0) as f:
+        for index in range(64):
+            f.seek(index * 4096)
+            f.write(bytes([index]) * 4096)
+            fsync_started = time.monotonic()
+            os.fsync(f.fileno())
+            latencies.append((time.monotonic() - fsync_started) * 1000)
+    wall_ms = (time.monotonic() - started) * 1000
+    busy_writes_after = busy_writes
+finally:
+    stop.set()
+    worker.join()
+if worker_errors:
+    raise RuntimeError('busy-inode writer failed during barriers') from worker_errors[0]
+if busy_writes_after <= busy_writes_before:
+    raise RuntimeError('busy-inode writer made no progress during barriers')
+ordered = sorted(latencies)
+p95 = ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)]
+print(json.dumps({
+    'workload': 'inode-barrier-isolation',
+    'barriers': len(latencies),
+    'busy_writes': busy_writes,
+    'fsync_p95_ms': round(p95, 3),
+    'wall_ms': round(wall_ms, 3),
+}, sort_keys=True))
 PY"
       ;;
     small-files-4kib|small-files-16kib|small-files-64kib)
@@ -350,8 +550,10 @@ PY"
   fi
   end_ns="$(date +%s%N)"
   wall_ms="$(((end_ns - start_ns) / 1000000))"
-  if [[ "$workload" == "repeated-warm-read" ]]; then
-    wall_ms="$(python3 - "$run_dir/stdout.txt" <<'PY'
+  if [[ "$status" == 0 ]]; then
+    case "$workload" in
+      repeated-warm-read)
+        wall_ms="$(python3 - "$run_dir/stdout.txt" <<'PY'
 import json
 import pathlib
 import sys
@@ -361,13 +563,40 @@ payload = json.loads(lines[-1])
 print(round(float(payload["reads"][-1]["wall_ms"])))
 PY
 )"
+        ;;
+      cold-sequential-read|random-read|larger-than-memory-read|inode-barrier-isolation)
+        wall_ms="$(python3 - "$run_dir/stdout.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+payload = json.loads(lines[-1])
+print(round(float(payload["wall_ms"])))
+PY
+)"
+        ;;
+    esac
   fi
-  local warning_count error_count unsupported_ioctl_count
+  local warning_count error_count unsupported_ioctl_count fsync_p95_ms
+  fsync_p95_ms="null"
+  if [[ "$status" == 0 && "$workload" == "inode-barrier-isolation" ]]; then
+    fsync_p95_ms="$(python3 - "$run_dir/stdout.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+payload = json.loads(lines[-1])
+print(float(payload["fsync_p95_ms"]))
+PY
+)"
+  fi
   warning_count="$( (grep -Eih 'warn|warning' "$run_dir/stdout.txt" "$run_dir/stderr.txt" 2>/dev/null || true) | wc -l | tr -d ' ')"
   error_count="$( (grep -Eih 'error|failed|panic' "$run_dir/stdout.txt" "$run_dir/stderr.txt" 2>/dev/null || true) | wc -l | tr -d ' ')"
   unsupported_ioctl_count="$( (grep -Eih 'unsupported.*ioctl|ioctl.*unsupported' "$run_dir/stdout.txt" "$run_dir/stderr.txt" 2>/dev/null || true) | wc -l | tr -d ' ')"
   cat > "$run_dir/metrics.json" <<JSON
-{"status":$status,"wall_ms":$wall_ms,"warning_count":$warning_count,"error_count":$error_count,"unsupported_ioctl_count":$unsupported_ioctl_count}
+{"status":$status,"wall_ms":$wall_ms,"fsync_p95_ms":$fsync_p95_ms,"warning_count":$warning_count,"error_count":$error_count,"unsupported_ioctl_count":$unsupported_ioctl_count}
 JSON
   if [[ "$status" != 0 ]]; then
     echo "Workload failed: $target_name/$workload run $run. See $run_dir" >&2
@@ -375,13 +604,15 @@ JSON
   fi
 }
 
-for i in "${!target_names[@]}"; do
-  for workload in "${workload_names[@]}"; do
-    for ((run=1; run<=runs; run++)); do
-      run_workload "${target_names[$i]}" "${target_paths[$i]}" "$workload" "$run"
+if [[ -z "$report_only_dir" ]]; then
+  for i in "${!target_names[@]}"; do
+    for workload in "${workload_names[@]}"; do
+      for ((run=1; run<=runs; run++)); do
+        run_workload "${target_names[$i]}" "${target_paths[$i]}" "$workload" "$run"
+      done
     done
   done
-done
+fi
 
 summary_path="$artifact_dir/summary.md"
 {
@@ -417,22 +648,55 @@ def percentile(values, fraction):
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
+def summarize(values):
+    return {
+        "runs": len(values),
+        "median_ms": statistics.median(values),
+        "p95_ms": percentile(values, 0.95),
+        "p99_ms": percentile(values, 0.99),
+    }
+
+small_file_phases = ("write_ms", "read_stat_ms", "cleanup_ms")
 stats = {}
 for target in targets:
     stats[target] = {}
     for workload in workloads:
         values = []
+        barrier_fsync_p95_values = []
+        phase_values = {phase: [] for phase in small_file_phases}
         for path in sorted((root / target / workload).glob("run-*/metrics.json")):
             metric = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(metric.get("status"), int) and metric["status"] == 0:
                 values.append(float(metric["wall_ms"]))
+                if workload == "inode-barrier-isolation":
+                    barrier_fsync_p95_values.append(float(metric["fsync_p95_ms"]))
+                if workload.startswith("small-files-"):
+                    stdout_lines = (path.parent / "stdout.txt").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    payload = json.loads(stdout_lines[-1])
+                    for phase in small_file_phases:
+                        phase_values[phase].append(float(payload[phase]))
         if values:
-            stats[target][workload] = {
-                "runs": len(values),
-                "median_ms": statistics.median(values),
-                "p95_ms": percentile(values, 0.95),
-                "p99_ms": percentile(values, 0.99),
-            }
+            item = summarize(values)
+            if workload == "inode-barrier-isolation":
+                item["barrier_fsync_p95_ms"] = summarize(barrier_fsync_p95_values)
+            if workload.startswith("small-files-"):
+                item["phases"] = {
+                    phase: summarize(samples)
+                    for phase, samples in phase_values.items()
+                }
+            stats[target][workload] = item
+
+def regression_checks(baseline, direct, adaptive):
+    return {
+        "direct_median_vs_main": direct["median_ms"] <= baseline["median_ms"] * 1.05,
+        "direct_p95_vs_main": direct["p95_ms"] <= baseline["p95_ms"] * 1.10,
+        "direct_p99_vs_main": direct["p99_ms"] <= baseline["p99_ms"] * 1.10,
+        "adaptive_median_vs_direct": adaptive["median_ms"] <= direct["median_ms"] * 1.05,
+        "adaptive_p95_vs_direct": adaptive["p95_ms"] <= direct["p95_ms"] * 1.05,
+        "adaptive_p99_vs_direct": adaptive["p99_ms"] <= direct["p99_ms"] * 1.05,
+    }
 
 comparisons = []
 passed = not dry_run
@@ -450,20 +714,36 @@ if not dry_run:
             passed = False
             continue
 
-        checks = {
-            "direct_median_vs_main": direct["median_ms"] <= baseline["median_ms"] * 1.05,
-            "direct_p95_vs_main": direct["p95_ms"] <= baseline["p95_ms"] * 1.10,
-            "direct_p99_vs_main": direct["p99_ms"] <= baseline["p99_ms"] * 1.10,
-            "adaptive_median_vs_direct": adaptive["median_ms"] <= direct["median_ms"] * 1.05,
-            "adaptive_p95_vs_direct": adaptive["p95_ms"] <= direct["p95_ms"] * 1.05,
-            "adaptive_p99_vs_direct": adaptive["p99_ms"] <= direct["p99_ms"] * 1.05,
-        }
+        checks = regression_checks(baseline, direct, adaptive)
+        phase_checks = {}
+        if workload.startswith("small-files-"):
+            for phase in small_file_phases:
+                phase_checks[phase] = regression_checks(
+                    baseline["phases"][phase],
+                    direct["phases"][phase],
+                    adaptive["phases"][phase],
+                )
+                checks.update({
+                    f"{phase}_{name}": result
+                    for name, result in phase_checks[phase].items()
+                })
+        if workload == "inode-barrier-isolation":
+            barrier_checks = regression_checks(
+                baseline["barrier_fsync_p95_ms"],
+                direct["barrier_fsync_p95_ms"],
+                adaptive["barrier_fsync_p95_ms"],
+            )
+            checks.update({
+                f"fsync_p95_{name}": result
+                for name, result in barrier_checks.items()
+            })
         workload_passed = all(checks.values())
         passed = passed and workload_passed
         comparisons.append({
             "workload": workload,
             "passed": workload_passed,
             "checks": checks,
+            "phase_checks": phase_checks,
         })
 
     warm_direct = stats["studiofs_feature_direct"].get("repeated-warm-read")
@@ -510,6 +790,21 @@ for workload in workloads:
                 f"{item['median_ms']:.3f} | {item['p95_ms']:.3f} | "
                 f"{item['p99_ms']:.3f} |"
             )
+            for phase, phase_item in item.get("phases", {}).items():
+                lines.append(
+                    f"| `{workload}:{phase}` | `{target}` | "
+                    f"{phase_item['median_ms']:.3f} | "
+                    f"{phase_item['p95_ms']:.3f} | "
+                    f"{phase_item['p99_ms']:.3f} |"
+                )
+            barrier_item = item.get("barrier_fsync_p95_ms")
+            if barrier_item:
+                lines.append(
+                    f"| `{workload}:fsync_p95_ms` | `{target}` | "
+                    f"{barrier_item['median_ms']:.3f} | "
+                    f"{barrier_item['p95_ms']:.3f} | "
+                    f"{barrier_item['p99_ms']:.3f} |"
+                )
 lines.extend(["", f"Gate status: **{gate['status']}**.", ""])
 (root / "statistics.md").write_text("\n".join(lines), encoding="utf-8")
 PY

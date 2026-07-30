@@ -156,6 +156,17 @@ always expose the new checksum.
   45 tests. Documentation-name checks, shell syntax, and the performance-gate
   dry run also passed. Mounted Linux, native macOS, and distro performance
   evidence remain explicit external merge gates.
+- [x] (2026-07-30 11:04Z) Addressed the post-review blockers discovered against
+  `397d4660`: make shutdown cancellation stop at the pre-mutation boundary,
+  record asynchronous write callback results at reply completion, compile the
+  C shim with libfuse 3.10.x headers, and make the performance gate exercise
+  every mandatory workload and small-file phase. The final Linux library run
+  passed 153 tests with 3 mounted tests ignored; all-target clippy passed with
+  warnings denied. The C shim passed syntax-only compilation against official
+  libfuse 3.10.5 and 3.14.0 headers plus the host 3.18 headers. Fixture-backed
+  reporting proves barrier-tail and individual small-file phase regressions
+  fail the gate; real local smoke runs exercised a 128 MiB working set with a
+  64 MiB memory sample and 64 barriers with concurrent unrelated writes.
 
 ## Surprises & Discoveries
 
@@ -221,6 +232,34 @@ always expose the new checksum.
   five-run Ubuntu/Rocky performance gates therefore remain external merge
   gates and are not claimed by this checkout.
 
+- Observation: compiling the current C shim against the official libfuse
+  3.10.5 headers fails before linking.
+  Evidence: `cc -fsyntax-only` reports missing `capable_ext`, `want_ext`,
+  `fuse_set_feature_flag`, `fuse_get_feature_flag`, and
+  `parallel_direct_writes`. The compatibility boundary must follow the
+  installed header's `FUSE_VERSION`, not only the requested API version.
+
+- Observation: Tokio task abortion is not a safe cancellation mechanism once
+  an opportunistic VFS write has entered its mutation future.
+  Evidence: `write_fh_owned_with_deferred_materialize` can publish bytes into
+  `MountedWriterStack` before awaiting deferred materialization scheduling.
+  Dropping the outer task there sends EIO although the bytes remain locally
+  visible.
+
+- Observation: `parallel_direct_writes` is not present throughout the libfuse
+  3.14 line even though one ABI-incompatible 3.14 patch exposed it.
+  Evidence: official 3.14.0 headers reject member access, while guarding it at
+  `FUSE_VERSION >= 3.15` compiles against official 3.10.5 and 3.14.0 headers
+  and the host 3.18 headers.
+
+- Observation: naming a sparse head/tail probe “larger-than-memory” does not
+  exercise an over-RAM working set, and aggregate wall time hides barrier tail
+  latency.
+  Evidence: the final workload materializes and sequentially reads more than
+  `MemAvailable`, verifies the full byte count, separately reports and gates
+  per-run `fsync_p95_ms`, and rejects a barrier run unless the unrelated inode
+  advances while the target barriers execute.
+
 ## Decision Log
 
 - Decision: Make `Adaptive` the Linux default in the final implementation and
@@ -261,6 +300,15 @@ always expose the new checksum.
   session together with its boxed callback state if callbacks remain live.
   Date/Author: 2026-07-29 / Codex.
 
+- Decision: Preserve the required two-stage shutdown cancellation, but make
+  each task atomically leave the cancellable set immediately before entering
+  the VFS write future.
+  Rationale: this still cancels queued tasks after the first drain timeout,
+  while a task that may mutate `MountedWriterStack` must finish normally. If
+  the second drain also times out, the existing raw-session retention remains
+  the safety boundary.
+  Date/Author: 2026-07-30 / Codex.
+
 - Decision: Record Linux lookup liveness at the successful FUSE reply boundary
   using rollback-capable reservations, and let kernel `forget` retire lookup
   references.
@@ -293,13 +341,20 @@ for live inodes, and scopes async-write durability barriers to the relevant
 inode or handle. Direct remains an explicit remount rollback. The shared macOS
 cache seam and legacy `macfuse_open_cache` JSON remain intact.
 
-On a fresh target directory, the Linux FUSE library passed 150 tests with 3
+On a fresh target directory, the Linux FUSE library passed 153 tests with 3
 mounted tests ignored, the VFS library passed 836 tests, and both crates passed
 all-target clippy with warnings denied. The architecture vocabulary suite
 passed 45 tests. Documentation-name consistency, shell syntax, and performance
 gate dry-run validation also pass. The validation infrastructure now runs five
 current-main/direct, feature/direct, feature/adaptive, local, and JuiceFS
 samples and emits median/p95/p99 threshold decisions under `target/perf`.
+
+The post-review hardening makes shutdown cancellation linearizable at the VFS
+mutation boundary, defers callback metrics until the native reply result is
+known, supports older libfuse headers, and turns the performance matrix into
+executable coverage. A fixture-backed report regression test proves that both
+barrier `fsync` tail latency and every small-file phase participate in the
+merge decision.
 
 This checkout is not yet merge-certified: `/dev/fuse` is absent, so mounted
 checks, warm-pass VFS-byte proof, Ubuntu 24.04/Rocky 9.4 performance data, and
@@ -551,8 +606,10 @@ tree. The direct cache policy is the runtime rollback:
 If a platform reply fails after the VFS handle was opened, abort its cache
 observation and close that handle before returning. If invalidation shutdown
 times out, leak the raw session rather than destroy memory still reachable from
-kernel IPC. If asynchronous-write shutdown times out, cancellation and request
-guards must produce bounded `EIO` completion before session destruction.
+kernel IPC. If asynchronous-write shutdown times out, cancel only tasks that
+have not entered the VFS mutation future. Request guards produce bounded `EIO`
+completion for those canceled tasks; already-mutating tasks must drain, or the
+session and callback state remain retained rather than being destroyed.
 
 ## Artifacts and Notes
 
@@ -603,3 +660,12 @@ Revision note (2026-07-29): created the initial self-contained ExecPlan after
 the focused clean baseline. It incorporates the approved Linux parity design,
 current-main discoveries, implementation order, TDD requirements, and recovery
 rules.
+
+Revision note (2026-07-30): recorded the five post-review findings and resolved
+the apparent shutdown contradiction by limiting cancellation to tasks that
+have not entered the VFS mutation future.
+
+Revision note (2026-07-30): completed the post-review fixes, recorded their
+fresh verification evidence, and strengthened the performance gate with true
+over-RAM I/O, concurrent-barrier progress checks, separately gated `fsync`
+tail latency, and fixture-backed report assertions.
