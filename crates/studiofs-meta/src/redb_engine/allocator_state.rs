@@ -37,6 +37,30 @@ impl RedbMetaEngine {
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
         }
         txn.commit()
-            .map_err(|error| MetaError::Storage(error.to_string()))
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        self.sync_local_metadata()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator_state::AllocatorRecord;
+
+    #[test]
+    fn sfs623_allocator_state_replace_forces_immediate_durability() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+        let state = AllocatorStateV1::new(
+            AllocatorRecord::new(1, 4_096).expect("inode record"),
+            AllocatorRecord::new(2, 8_192).expect("payload record"),
+        )
+        .expect("allocator state");
+
+        engine
+            .replace_allocator_state(state)
+            .expect("persist allocator state");
+
+        assert_eq!(engine.immediate_barriers_for_test(), 1);
     }
 }
