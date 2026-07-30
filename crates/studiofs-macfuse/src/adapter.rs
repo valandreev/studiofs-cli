@@ -2689,8 +2689,11 @@ mod open_cache_snapshot_tests {
             available: None,
             refreshed_at: Instant::now() - MACFUSE_AVAILABLE_MEMORY_TTL,
         };
+        let before_refresh = snapshot.refreshed_at;
 
-        assert!(snapshot.available_memory().is_some());
+        let _ = snapshot.available_memory();
+
+        assert!(snapshot.refreshed_at > before_refresh);
     }
 
     #[test]
