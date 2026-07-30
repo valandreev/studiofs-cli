@@ -413,7 +413,7 @@ pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
 ///
 /// Where:
 /// - `data_prefix`: volume data root, e.g. `mydisk/objects/`
-/// - `prefix`: First 4 hex chars of object_id for S3 partition distribution
+/// - `prefix`: Low 16 bits of object_id for S3 partition distribution
 /// - `object_id`: 16-char hex sequential object ID
 ///
 /// # Arguments
@@ -423,14 +423,11 @@ pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
 /// # Returns
 /// S3 key path string
 pub fn format_object_key(data_prefix: &str, object_id: u64) -> String {
-    let normalized_prefix = if data_prefix.ends_with('/') {
-        data_prefix.to_string()
-    } else {
-        format!("{}/", data_prefix)
-    };
-    let hex_id = format!("{:016x}", object_id);
-    let prefix = &hex_id[..4];
-    format!("{}{}/{}", normalized_prefix, prefix, hex_id)
+    let separator = if data_prefix.ends_with('/') { "" } else { "/" };
+    format!(
+        "{data_prefix}{separator}{:04x}/{object_id:016x}",
+        object_id & 0xffff
+    )
 }
 
 /// Format one cloud fragment key for an object.
@@ -642,12 +639,26 @@ mod tests {
         let object_id: u64 = 0x1234;
 
         let key = format_object_key(data_prefix, object_id);
-        assert_eq!(key, "disk-a/objects/0000/0000000000001234");
+        assert_eq!(key, "disk-a/objects/1234/0000000000001234");
+    }
+
+    #[test]
+    fn composite_object_keys_use_low_bits_for_shards_and_preserve_ids() {
+        let first = (0x12_3456_u64 << 39) | 0xffff;
+        let second = first + 1;
+
+        let first_key = format_object_key("disk-a/objects", first);
+        let second_key = format_object_key("disk-a/objects", second);
+
+        assert_eq!(first_key, "disk-a/objects/ffff/091a2b000000ffff");
+        assert_eq!(second_key, "disk-a/objects/0000/091a2b0000010000");
+        assert_eq!(parse_object_id_from_key(&first_key).unwrap(), first);
+        assert_eq!(parse_object_id_from_key(&second_key).unwrap(), second);
     }
 
     #[test]
     fn test_object_key_parsing() {
-        let key = "disk-a/objects/0000/0000000000001234";
+        let key = "disk-a/objects/1234/0000000000001234";
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);
@@ -659,12 +670,12 @@ mod tests {
         let object_id: u64 = 0x1234;
 
         let key = format_object_fragment_key(data_prefix, object_id, 0);
-        assert_eq!(key, "disk-a/objects/0000/0000000000001234/0");
+        assert_eq!(key, "disk-a/objects/1234/0000000000001234/0");
     }
 
     #[test]
     fn test_fragment_key_parsing() {
-        let key = "disk-a/objects/0000/0000000000001234/0";
+        let key = "disk-a/objects/1234/0000000000001234/0";
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);
