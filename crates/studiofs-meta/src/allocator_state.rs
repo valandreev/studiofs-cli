@@ -84,9 +84,11 @@ impl AllocatorRecord {
         Ok(())
     }
 
-    fn encode_into(self, output: &mut [u8]) {
-        output[..3].copy_from_slice(&self.namespace.to_be_bytes()[1..]);
-        output[3..].copy_from_slice(&self.reserved_through.to_be_bytes());
+    fn encode(self) -> [u8; RECORD_ENCODED_LEN] {
+        let mut bytes = [0; RECORD_ENCODED_LEN];
+        bytes[..3].copy_from_slice(&self.namespace.to_be_bytes()[1..]);
+        bytes[3..].copy_from_slice(&self.reserved_through.to_be_bytes());
+        bytes
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, AllocatorStateError> {
@@ -123,10 +125,8 @@ impl AllocatorStateV1 {
     pub(crate) fn encode(self) -> [u8; ENCODED_LEN] {
         let mut bytes = [0; ENCODED_LEN];
         bytes[0] = STATE_VERSION;
-        self.inode
-            .encode_into(&mut bytes[1..1 + RECORD_ENCODED_LEN]);
-        self.payload
-            .encode_into(&mut bytes[1 + RECORD_ENCODED_LEN..]);
+        bytes[1..1 + RECORD_ENCODED_LEN].copy_from_slice(&self.inode.encode());
+        bytes[1 + RECORD_ENCODED_LEN..].copy_from_slice(&self.payload.encode());
         bytes
     }
 
@@ -155,6 +155,13 @@ mod tests {
             highest.id_at(MAX_COUNTER).expect("highest id"),
             i64::MAX as u64
         );
+    }
+
+    #[test]
+    fn sfs623_allocator_state_record_encoding_is_fixed_size() {
+        let record = AllocatorRecord::new(0x12_3456, 0x0000_0004_0506_0708).expect("record");
+
+        assert_eq!(record.encode(), [0x12, 0x34, 0x56, 0, 0, 0, 4, 5, 6, 7, 8]);
     }
 
     #[test]
