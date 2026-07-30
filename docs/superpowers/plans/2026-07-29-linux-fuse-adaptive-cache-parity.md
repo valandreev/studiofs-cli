@@ -172,6 +172,11 @@ always expose the new checksum.
   `cargo check -p studiofs-vfs --lib` completed without warnings, all 26
   focused OS-cache tests passed, and VFS all-target clippy passed with warnings
   denied.
+- [x] (2026-07-30) Made the CLI status snapshot fixture resilient to additive
+  observability sections by filling unspecified fields from `Default`. The
+  original bin-test compile failure was reproduced before the fix; its focused
+  test then passed, and all-target check and clippy passed for both `studiofs`
+  and `studiofs-e2e`.
 
 ## Surprises & Discoveries
 
@@ -677,3 +682,6 @@ tail latency, and fixture-backed report assertions.
 
 Revision note (2026-07-30): recorded the public OS-cache enum documentation
 fix and its warning-free VFS validation.
+
+Revision note (2026-07-30): recorded the additive observability fixture compile
+fix and the broader CLI/E2E validation that exposed the original gap.
