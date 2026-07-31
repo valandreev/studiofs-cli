@@ -120,7 +120,7 @@ impl PgMetaEngine {
                             .map_err(|error| MetaError::Storage(format!("postgres legacy allocator guard failed: {}", Self::format_pg_error(error))))?;
                         if legacy.is_some() {
                             return Err(MetaError::Storage(
-                                "legacy next_inode counter requires allocator migration".to_string(),
+                                "legacy next_inode counter requires allocator migration before writes can be enabled; see docs/plans/sfs-623-collision-free-local-id-allocation.md".to_string(),
                             ));
                         }
                         tx.execute(
@@ -158,14 +158,14 @@ impl PgMetaEngine {
     }
 
     pub(super) fn bootstrap_allocator_state(&self) {
-        let state = match self.local.read_allocator_state() {
+        let loaded_state_result = match self.local.read_allocator_state() {
             Ok(Some(state)) => Ok(state),
             Ok(None) | Err(_) => self.mint_allocator_state().and_then(|state| {
                 self.local.replace_allocator_state(state)?;
                 Ok(state)
             }),
         };
-        match state {
+        match loaded_state_result {
             Ok(state) => {
                 if let Ok(mut runtime) = self.allocator_runtime.lock() {
                     runtime.state = Some(state);
@@ -253,6 +253,11 @@ impl PgMetaEngine {
         count: u64,
         inode: bool,
     ) -> MetaResult<Option<u64>> {
+        if count != 1 {
+            return Err(MetaError::Storage(
+                "allocator single-ID path requires count = 1".to_string(),
+            ));
+        }
         Self::take_from_batch(runtime, count, inode, |record, range| {
             let Some(counter) = range.into_iter().next() else {
                 return Err(MetaError::Storage(
@@ -404,5 +409,27 @@ mod tests {
 
         assert_eq!(result, state.inode.id_at(0).expect("first inode ID"));
         assert_eq!(runtime.inode_batch.start, 1);
+    }
+
+    #[test]
+    fn single_id_take_rejects_multiple_count_without_consuming_batch() {
+        let state = AllocatorStateV1::new(
+            AllocatorRecord::new(5, 0).expect("inode namespace"),
+            AllocatorRecord::new(6, 0).expect("payload namespace"),
+        )
+        .expect("allocator state");
+        let mut runtime = AllocatorRuntime {
+            state: Some(state),
+            inode_batch: 0..2,
+            payload_batch: 0..0,
+        };
+
+        let result = PgMetaEngine::take_id_from_batch(&mut runtime, 2, true);
+
+        assert!(
+            result.is_err(),
+            "single-ID path must reject multi-ID requests"
+        );
+        assert_eq!(runtime.inode_batch.start, 0);
     }
 }
