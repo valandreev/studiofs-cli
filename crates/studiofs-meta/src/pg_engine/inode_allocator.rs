@@ -1,4 +1,4 @@
-//! Owns PostgreSQL-backed client-slot and local-ID namespace allocation.
+//! Owns PG-backed inode and client-slot allocation, including local payload namespaces.
 
 use super::{
     LOCAL_PG_CLIENT_SLOT_COUNTER, PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER, PG_NEXT_CLIENT_SLOT_COUNTER,
