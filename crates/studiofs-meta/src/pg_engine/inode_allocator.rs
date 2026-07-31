@@ -4,7 +4,7 @@ use super::{
     LOCAL_PG_CLIENT_SLOT_COUNTER, PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER, PG_NEXT_CLIENT_SLOT_COUNTER,
     PG_NEXT_INODE_COUNTER, PgMetaEngine,
 };
-use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, MAX_NAMESPACE};
+use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT, MAX_NAMESPACE};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::RedbMetaEngine;
 use std::ops::Range;
@@ -167,15 +167,17 @@ impl PgMetaEngine {
         };
         match loaded_state_result {
             Ok(state) => {
+                let inode_id_headroom = state.inode.reserved_through() < COUNTER_LIMIT;
+                let object_id_headroom = state.payload.reserved_through() < COUNTER_LIMIT;
                 if let Ok(mut runtime) = self.allocator_runtime.lock() {
                     runtime.state = Some(state);
                     runtime.inode_batch = 0..0;
                     runtime.payload_batch = 0..0;
                 }
                 self.inode_id_headroom_available
-                    .store(true, Ordering::Release);
+                    .store(inode_id_headroom, Ordering::Release);
                 self.object_id_headroom_available
-                    .store(true, Ordering::Release);
+                    .store(object_id_headroom, Ordering::Release);
             }
             Err(error) => {
                 self.inode_id_headroom_available

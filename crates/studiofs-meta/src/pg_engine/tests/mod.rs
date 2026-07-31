@@ -1,6 +1,6 @@
 use super::*;
-use crate::allocator_state::{AllocatorRecord, AllocatorStateV1};
-use crate::pg_dsn::resolve_studiofs_pg_dsns;
+use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT};
+use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use uuid::Uuid;
@@ -43,8 +43,8 @@ fn pg_dsn() -> Option<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())?;
     Some(
-        resolve_studiofs_pg_dsns(&raw)
-            .expect("failed to resolve STUDIOFS_TEST_PG_DSN")
+        run_async(async { ensure_studiofs_database(&raw).await })
+            .expect("failed to provision STUDIOFS_TEST_PG_DSN database")
             .metadata_dsn,
     )
 }

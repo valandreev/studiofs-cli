@@ -152,6 +152,25 @@ fn allocator_refill_does_not_hold_runtime_lock_during_local_persistence() {
 }
 
 #[test]
+fn allocator_bootstrap_marks_exhausted_persisted_record_read_only() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, COUNTER_LIMIT).expect("exhausted inode namespace"),
+        AllocatorRecord::new(2, 0).expect("available payload namespace"),
+    )
+    .expect("allocator state");
+    pg.local
+        .replace_allocator_state(state)
+        .expect("persist exhausted allocator state");
+
+    pg.bootstrap_allocator_state();
+
+    let authority = MetaReplication::metadata_authority_status(&pg);
+    assert!(!authority.inode_id_headroom);
+    assert!(authority.object_id_headroom);
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
