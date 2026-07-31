@@ -171,6 +171,35 @@ fn allocator_bootstrap_marks_exhausted_persisted_record_read_only() {
 }
 
 #[test]
+fn allocator_refill_restores_headroom_after_a_large_request_fails() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let remaining = 5_000;
+    let state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, COUNTER_LIMIT - remaining).expect("inode namespace"),
+        AllocatorRecord::new(2, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    pg.local
+        .replace_allocator_state(state)
+        .expect("persist partial allocator state");
+    pg.bootstrap_allocator_state();
+
+    assert!(
+        pg.next_inode_ids(8_192).is_err(),
+        "a request larger than the remaining range must fail"
+    );
+    assert!(!MetaReplication::metadata_authority_status(&pg).inode_id_headroom);
+
+    pg.next_inode().expect("smaller refill should succeed");
+
+    let authority = MetaReplication::metadata_authority_status(&pg);
+    assert!(
+        authority.inode_id_headroom,
+        "successful refill must restore persisted allocator headroom"
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
